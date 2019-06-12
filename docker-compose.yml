@@ -1,0 +1,26 @@
+version: '3.6'
+
+services:
+  agent:
+    build: .
+    depends_on:
+      - db
+    entrypoint: /go/bin/ttracerd
+    command: ["--dbuser", "ttracer", "--dbhost", "db", "--dbpass", "ttracer"]
+  db:
+    image: postgres:11.3
+    ports:
+      - 5432
+    environment:
+      - POSTGRES_USER=ttracer
+      - POSTGRES_DB=ttracer
+    restart: always
+    user: postgres
+    volumes:
+      - ./postgres/init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ttracer"]
+      interval: 3s
+      timeout: 3s
+      retries: 5
+      start_period: 3s

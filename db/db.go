@@ -11,12 +11,12 @@ import (
 	"github.com/lib/pq" // database/sql driver
 	"github.com/pkg/errors"
 	"github.com/yuuki/lstf/tcpflow"
-	"github.com/yuuki/mftracer/data"
+	"github.com/yuuki/ttracer/data"
 )
 
 const (
-	DefaultDBName     = "mftracer"
-	DefaultDBUserName = "mftracer"
+	DefaultDBName     = "ttracer"
+	DefaultDBUserName = "ttracer"
 	DefaultDBHostname = "localhost"
 	DefaultDBPort     = "5432"
 	ConnectTimeout    = 5

@@ -8,13 +8,21 @@ BUILD_LDFLAGS = -X $(PKG).commit=$(COMMIT) -X $(PKG).date=$(DATE)
 CREDITS = ./CREDITS
 
 .PHONY: build
-build:
+build: deps
 	go generate ./...
 	go build -ldflags="$(BUILD_LDFLAGS)" ./cmd/ttracerd/
+
+.PHONY: install
+install:
+	go install $(PKG)/cmd/...
 
 .PHONY: test
 test:
 	go test -v ./...
+
+.PHONY: deps
+deps:
+	GO111MODULE=off go get -v github.com/go-bindata/go-bindata/...
 
 .PHONY: devel-deps
 devel-deps:
@@ -28,8 +36,9 @@ devel-deps:
         github.com/Songmu/gocredits/cmd/gocredits
 
 .PHONY: credits
-credits:
-	GO111MODULE=off go get -v github.com/go-bindata/go-bindata/...
+credits: devel-deps
+	GO111MODULE=off go get -v \
+		github.com/go-bindata/go-bindata/...
 	gocredits -w .
 ifneq (,$(git status -s $(CREDITS)))
 	go generate -x ./...
