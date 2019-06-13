@@ -11,7 +11,7 @@ import (
 	"github.com/lib/pq" // database/sql driver
 	"github.com/pkg/errors"
 	"github.com/yuuki/lstf/tcpflow"
-	"github.com/yuuki/ttracer/data"
+	"github.com/yuuki/transtracer/data"
 )
 
 const (
