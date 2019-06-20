@@ -12,6 +12,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/yuuki/lstf/tcpflow"
 	"github.com/yuuki/transtracer/data"
+	"golang.org/x/xerrors"
 )
 
 const (
@@ -80,11 +81,11 @@ func (db *DB) CreateSchema() error {
 	for _, schema := range schemas {
 		sql, err := data.Asset(schema)
 		if err != nil {
-			return errors.Wrapf(err, "get schema error: %v", schema)
+			return xerrors.Errorf("get schema error '%v': %v", schema, err)
 		}
 		_, err = db.Exec(fmt.Sprintf("%s", sql))
 		if err != nil {
-			return errors.Wrapf(err, "exec schema error: %s", sql)
+			return xerrors.Errorf("exec schema error '%v': %s", sql, err)
 		}
 	}
 	return nil
@@ -100,7 +101,7 @@ func (db *DB) InsertOrUpdateHostFlows(flows tcpflow.HostFlows) error {
 	defer cancel()
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		return errors.Wrap(err, "begin transaction error")
+		return xerrors.Errorf("begin transaction error: %v", err)
 	}
 	q1 := `
 	INSERT INTO nodes (ipv4, port) VALUES ($1, $2)
@@ -109,7 +110,7 @@ func (db *DB) InsertOrUpdateHostFlows(flows tcpflow.HostFlows) error {
 `
 	stmt1, err := tx.PrepareContext(ctx, q1)
 	if err != nil {
-		return errors.Wrapf(err, "query prepare error: %s", q1)
+		return xerrors.Errorf("query prepare error '%s': %v", q1, err)
 	}
 	stmtFindNodeID, err := tx.PrepareContext(ctx, `
 	SELECT node_id FROM nodes WHERE ipv4 = $1 AND port = $2
@@ -127,7 +128,7 @@ func (db *DB) InsertOrUpdateHostFlows(flows tcpflow.HostFlows) error {
 `
 	stmt2, err := tx.PrepareContext(ctx, q2)
 	if err != nil {
-		return errors.Wrapf(err, "query prepare error: %s", q2)
+		return xerrors.Errorf("query prepare error '%s': %v", q2, err)
 	}
 
 	for _, flow := range flows {
@@ -140,14 +141,14 @@ func (db *DB) InsertOrUpdateHostFlows(flows tcpflow.HostFlows) error {
 			err = stmtFindNodeID.QueryRowContext(ctx, flow.Local.Addr, flow.Local.PortInt()).Scan(&localNodeid)
 		}
 		if err != nil {
-			return errors.Wrapf(err, "query error")
+			return xerrors.Errorf("query error: %v", err)
 		}
 		err = stmt1.QueryRowContext(ctx, flow.Peer.Addr, flow.Peer.PortInt()).Scan(&peerNodeid)
 		if err == sql.ErrNoRows {
 			err = stmtFindNodeID.QueryRowContext(ctx, flow.Peer.Addr, flow.Peer.PortInt()).Scan(&peerNodeid)
 		}
 		if err != nil {
-			return errors.Wrapf(err, "query error")
+			return xerrors.Errorf("query error: %v", err)
 		}
 		if flow.Direction == tcpflow.FlowActive {
 			_, err = stmt2.ExecContext(ctx, flow.Direction.String(), localNodeid, peerNodeid, flow.Connections)
@@ -155,11 +156,11 @@ func (db *DB) InsertOrUpdateHostFlows(flows tcpflow.HostFlows) error {
 			_, err = stmt2.ExecContext(ctx, flow.Direction.String(), peerNodeid, localNodeid, flow.Connections)
 		}
 		if err != nil {
-			return errors.Wrapf(err, "query error")
+			return xerrors.Errorf("query error: %v", err)
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return errors.Wrap(err, "transaction commit error")
+		return xerrors.Errorf("transaction commit error: %v", err)
 	}
 	return nil
 }
