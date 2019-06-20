@@ -98,7 +98,7 @@ func (c *CLI) Run(args []string) int {
 	return exitCodeOK
 }
 
-var helpText = `Usage: transtracerd [options]
+var helpText = `Usage: ttracerd [options]
 
   
 

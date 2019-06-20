@@ -11,6 +11,7 @@ CREDITS = ./CREDITS
 build: deps
 	go generate ./...
 	go build -ldflags="$(BUILD_LDFLAGS)" ./cmd/ttracerd/
+	go build -ldflags="$(BUILD_LDFLAGS)" ./cmd/ttctl/
 
 .PHONY: install
 install:
