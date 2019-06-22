@@ -81,7 +81,7 @@ func DataSchemaFlowsSql() (*asset, error) {
 		return nil, err
 	}
 
-	info := bindataFileInfo{name: "../data/schema/flows.sql", size: 1157, mode: os.FileMode(420), modTime: time.Unix(1555776771, 0)}
+	info := bindataFileInfo{name: "../data/schema/flows.sql", size: 1157, mode: os.FileMode(420), modTime: time.Unix(1561212803, 0)}
 	a := &asset{bytes: bytes, info: info}
 	return a, nil
 }

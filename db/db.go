@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/lib/pq" // database/sql driver
-	"github.com/pkg/errors"
 	"github.com/yuuki/lstf/tcpflow"
 	"github.com/yuuki/transtracer/data"
 	"golang.org/x/xerrors"
@@ -68,10 +67,10 @@ func New(opt *Opt) (*DB, error) {
 		user, opt.Password, host, port, dbname, sslmode, ConnectTimeout,
 	))
 	if err != nil {
-		return nil, errors.Wrap(err, "postgres open error")
+		return nil, xerrors.Errorf("postgres open error: %v", err)
 	}
 	if err = db.Ping(); err != nil {
-		return nil, errors.Wrap(err, "postgres ping error")
+		return nil, xerrors.Errorf("postgres ping error: %v", err)
 	}
 	return &DB{db}, nil
 }
@@ -116,7 +115,7 @@ func (db *DB) InsertOrUpdateHostFlows(flows tcpflow.HostFlows) error {
 	SELECT node_id FROM nodes WHERE ipv4 = $1 AND port = $2
 `)
 	if err != nil {
-		return errors.Wrap(err, "query prepare error")
+		return xerrors.Errorf("query prepare error: %v", err)
 	}
 	q2 := `
 	INSERT INTO flows
@@ -195,7 +194,7 @@ func (db *DB) FindListeningPortsByAddrs(addrs []net.IP) (map[string][]int16, err
 		return map[string][]int16{}, nil
 	}
 	if err != nil {
-		return nil, errors.Wrapf(err, "query error")
+		return nil, xerrors.Errorf("query error: %v", err)
 	}
 	defer rows.Close()
 
@@ -206,7 +205,7 @@ func (db *DB) FindListeningPortsByAddrs(addrs []net.IP) (map[string][]int16, err
 			port int16
 		)
 		if err := rows.Scan(&addr, &port); err != nil {
-			return nil, errors.Wrap(err, "postgres query error")
+			return nil, xerrors.Errorf("query error: %v", err)
 		}
 		if port == 0 { // port == 0 means 'many'
 			continue
@@ -241,7 +240,7 @@ func (db *DB) FindSourceByDestAddrAndPort(addr net.IP, port int16) ([]*AddrPort,
 			sport       int16
 		)
 		if err := rows.Scan(&connections, &updated, &sipv4, &sport); err != nil {
-			return nil, errors.Wrap(err, "postgres query error")
+			return nil, xerrors.Errorf("query error: %v", err)
 		}
 		addrports = append(addrports, &AddrPort{
 			IPAddr:      net.ParseIP(sipv4),
@@ -250,7 +249,7 @@ func (db *DB) FindSourceByDestAddrAndPort(addr net.IP, port int16) ([]*AddrPort,
 		})
 	}
 	if err := rows.Err(); err != nil {
-		return nil, errors.Wrap(err, "postgres rows error")
+		return nil, xerrors.Errorf("postgres rows error: %v", err)
 	}
 	return addrports, nil
 }
