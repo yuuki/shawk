@@ -5,11 +5,10 @@ import (
 )
 
 // NewTestDB creates a database instance for mock.
-func NewTestDB() (*DB, sqlmock.Sqlmock, error) {
+func NewTestDB() (*DB, sqlmock.Sqlmock) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
-		return nil, mock, err
+		panic(err)
 	}
-
-	return &DB{db}, mock, nil
+	return &DB{db}, mock
 }

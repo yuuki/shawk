@@ -7,15 +7,12 @@ import (
 )
 
 func TestCreateSchema(t *testing.T) {
-	db, mock, err := NewTestDB()
-	if err != nil {
-		panic(err)
-	}
+	db, mock := NewTestDB()
 	defer db.Close()
 
 	mock.ExpectExec("CREATE TYPE (.+)").WillReturnResult(sqlmock.NewResult(1, 1))
 
-	err = db.CreateSchema()
+	err := db.CreateSchema()
 	if err != nil {
 		t.Fatal(err)
 	}
