@@ -80,11 +80,11 @@ func (db *DB) CreateSchema() error {
 	for _, schema := range schemas {
 		sql, err := data.Asset(schema)
 		if err != nil {
-			return xerrors.Errorf("get schema error '%v': %v", schema, err)
+			return xerrors.Errorf("get schema error '%s': %v", schema, err)
 		}
 		_, err = db.Exec(fmt.Sprintf("%s", sql))
 		if err != nil {
-			return xerrors.Errorf("exec schema error '%v': %s", sql, err)
+			return xerrors.Errorf("exec schema error '%s': %s", sql, err)
 		}
 	}
 	return nil
