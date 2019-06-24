@@ -27,7 +27,7 @@ func TestInsertOrUpdateHostFlows_empty(t *testing.T) {
 	db, mock := NewTestDB()
 	defer db.Close()
 
-	flows := tcpflow.HostFlows{}
+	flows := []*tcpflow.HostFlow{}
 
 	mock.ExpectBegin()
 	mock.ExpectPrepare("INSERT INTO nodes")
@@ -37,7 +37,7 @@ func TestInsertOrUpdateHostFlows_empty(t *testing.T) {
 
 	err := db.InsertOrUpdateHostFlows(flows)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("%+v", err)
 	}
 
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -49,21 +49,19 @@ func TestInsertOrUpdateHostFlows(t *testing.T) {
 	db, mock := NewTestDB()
 	defer db.Close()
 
-	flow1 := &tcpflow.HostFlow{
-		Direction:   tcpflow.FlowActive,
-		Local:       &tcpflow.AddrPort{Addr: "10.0.10.1", Port: "many"},
-		Peer:        &tcpflow.AddrPort{Addr: "10.0.10.2", Port: "5432"},
-		Connections: 10,
-	}
-	flow2 := &tcpflow.HostFlow{
-		Direction:   tcpflow.FlowPassive,
-		Local:       &tcpflow.AddrPort{Addr: "10.0.10.1", Port: "80"},
-		Peer:        &tcpflow.AddrPort{Addr: "10.0.10.2", Port: "many"},
-		Connections: 12,
-	}
-	flows := tcpflow.HostFlows{
-		flow1.UniqKey(): flow1,
-		flow2.UniqKey(): flow2,
+	flows := []*tcpflow.HostFlow{
+		{
+			Direction:   tcpflow.FlowActive,
+			Local:       &tcpflow.AddrPort{Addr: "10.0.10.1", Port: "many"},
+			Peer:        &tcpflow.AddrPort{Addr: "10.0.10.2", Port: "5432"},
+			Connections: 10,
+		},
+		{
+			Direction:   tcpflow.FlowPassive,
+			Local:       &tcpflow.AddrPort{Addr: "10.0.10.1", Port: "80"},
+			Peer:        &tcpflow.AddrPort{Addr: "10.0.10.2", Port: "many"},
+			Connections: 12,
+		},
 	}
 
 	mock.ExpectBegin()
@@ -85,7 +83,7 @@ func TestInsertOrUpdateHostFlows(t *testing.T) {
 
 	err := db.InsertOrUpdateHostFlows(flows)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("%+v", err)
 	}
 
 	if err := mock.ExpectationsWereMet(); err != nil {

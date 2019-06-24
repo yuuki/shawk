@@ -95,7 +95,7 @@ const (
 )
 
 // InsertOrUpdateHostFlows insert host flows or update it if the same flow exists.
-func (db *DB) InsertOrUpdateHostFlows(flows tcpflow.HostFlows) error {
+func (db *DB) InsertOrUpdateHostFlows(flows []*tcpflow.HostFlow) error {
 	ctx, cancel := context.WithTimeout(context.Background(), InsertOrUpdateTimeoutSec*time.Second)
 	defer cancel()
 	tx, err := db.BeginTx(ctx, nil)
