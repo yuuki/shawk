@@ -19,8 +19,8 @@ github.com/shirou/gopsutil v0.0.0-20180524063240-eeb1d38d6959/go.mod h1:5b4v6he4
 github.com/stretchr/objx v0.1.0/go.mod h1:HFkY916IF+rwdDfMAkV7OtwuqBVzrE8GR6GFx+wExME=
 github.com/stretchr/testify v1.3.0 h1:TivCn/peBQ7UY8ooIcPgZFpTNSz0Q2U6UrFlUfqbe0Q=
 github.com/stretchr/testify v1.3.0/go.mod h1:M5WIy9Dh21IEIfnGCwXGc5bZfKNJtfHm1UVUgZn+9EI=
-github.com/yuuki/lstf v0.5.3 h1:YHFRfZ9znq/2V8SLoGlPaQN/819wmlufANjrADB5GAE=
-github.com/yuuki/lstf v0.5.3/go.mod h1:k75QAf3S/Kbc7SV4K7YAdXT1PUJCO8j9HuK8aGNXRGE=
+github.com/yuuki/lstf v0.5.4 h1:ao8Z+q8IcBtP6gcD8A6f1lP9P7w1VcPlnVQqc5eO2wc=
+github.com/yuuki/lstf v0.5.4/go.mod h1:k75QAf3S/Kbc7SV4K7YAdXT1PUJCO8j9HuK8aGNXRGE=
 golang.org/x/sys v0.0.0-20180616030259-6c888cc515d3 h1:FCfAlbS73+IQQJktaKGHldMdL2bGDVpm+OrCEbVz1f4=
 golang.org/x/sys v0.0.0-20180616030259-6c888cc515d3/go.mod h1:STP8DvDyc/dI5b8T5hshtkjS+E42TnysNCUPdjciGhY=
 golang.org/x/xerrors v0.0.0-20190513163551-3ee3066db522 h1:bhOzK9QyoD0ogCnFro1m2mz41+Ib0oOhfJnBp5MR4K4=

@@ -7,6 +7,5 @@ import (
 // local cache
 
 func CollectHostFlows() (tcpflow.HostFlows, error) {
-	processes := true
-	return tcpflow.GetHostFlows(processes)
+	return tcpflow.GetHostFlows(&tcpflow.GetHostFlowsOption{Processes: true})
 }
