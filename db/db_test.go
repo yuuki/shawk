@@ -3,6 +3,7 @@ package db
 import (
 	"net"
 	"testing"
+	"time"
 
 	"github.com/lib/pq"
 	"github.com/yuuki/lstf/tcpflow"
@@ -119,6 +120,42 @@ func TestFindListeningPortsByAddrs(t *testing.T) {
 	}
 	if ports, ok := portsbyaddr["192.0.2.2"]; !ok || ports[0] != 443 {
 		t.Errorf("portsbyaddr should have '192.0.2.2' as key. value should be 443: %v", ports)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("there were unfulfilled expectations: %s", err)
+	}
+}
+
+func TestFindSourceByDestAddrAndPort(t *testing.T) {
+	db, mock := NewTestDB()
+	defer db.Close()
+
+	addr := net.ParseIP("192.0.10.1")
+	port := int16(8000)
+
+	columns := sqlmock.NewRows([]string{"connections", "updated", "source_ipv4", "source_port"})
+	mock.ExpectQuery("SELECT (.+) FROM flows").WithArgs(addr.String(), port).WillReturnRows(
+		columns.AddRow(10, time.Now(), "192.0.10.2", 0),
+	)
+
+	addrports, err := db.FindSourceByDestAddrAndPort(addr, port)
+	if err != nil {
+		t.Fatalf("%+v", err)
+	}
+
+	if len(addrports) != 1 {
+		t.Errorf("addrports should be 1, but %v", len(addrports))
+	}
+
+	if addrports[0].IPAddr.String() != "192.0.10.2" {
+		t.Errorf("addrports[0].Addr should be '192.0.10.2', but %s", addrports[0].IPAddr)
+	}
+	if addrports[0].Port != 0 {
+		t.Errorf("addrports[0].Port should be '8000', but %v", addrports[0].Port)
+	}
+	if addrports[0].Connections != 10 {
+		t.Errorf("addrports[0].Connections should be '10', but %v", addrports[0].Connections)
 	}
 
 	if err := mock.ExpectationsWereMet(); err != nil {
