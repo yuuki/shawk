@@ -15,7 +15,7 @@ import (
 const (
 	exitCodeOK         = 0
 	exitCodeErr        = 10 + iota
-	defaultIntervalSec = 30
+	defaultIntervalSec = 5
 )
 
 var (
@@ -38,12 +38,13 @@ func (c *CLI) Run(args []string) int {
 		ver     bool
 		credits bool
 
-		once   bool
-		dbuser string
-		dbpass string
-		dbhost string
-		dbport string
-		dbname string
+		once        bool
+		dbuser      string
+		dbpass      string
+		dbhost      string
+		dbport      string
+		dbname      string
+		intervalSec int
 	)
 	flags := flag.NewFlagSet("transtracerd", flag.ContinueOnError)
 	flags.SetOutput(c.errStream)
@@ -56,6 +57,7 @@ func (c *CLI) Run(args []string) int {
 	flags.StringVar(&dbhost, "dbhost", "", "")
 	flags.StringVar(&dbport, "dbport", "", "")
 	flags.StringVar(&dbname, "dbname", "", "")
+	flags.IntVar(&intervalSec, "interval-sec", defaultIntervalSec, "")
 	flags.BoolVar(&ver, "version", false, "")
 	flags.BoolVar(&credits, "credits", false, "")
 	if err := flags.Parse(args[1:]); err != nil {
@@ -92,7 +94,7 @@ func (c *CLI) Run(args []string) int {
 			return exitCodeErr
 		}
 	} else {
-		agent.Start(defaultIntervalSec*time.Second, db)
+		agent.Start(time.Duration(intervalSec)*time.Second, db)
 	}
 
 	return exitCodeOK

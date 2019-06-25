@@ -43,7 +43,6 @@ func Watch(interval time.Duration, db *db.DB) error {
 		case <-ticker.C:
 			go collectAndPostHostFlows(db, errChan)
 		}
-		time.Sleep(1 * time.Second)
 	}
 	return nil
 }
