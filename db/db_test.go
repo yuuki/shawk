@@ -1,10 +1,13 @@
 package db
 
 import (
+	"net"
 	"testing"
 
-	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/lib/pq"
 	"github.com/yuuki/lstf/tcpflow"
+
+	"github.com/DATA-DOG/go-sqlmock"
 )
 
 func TestCreateSchema(t *testing.T) {
@@ -84,6 +87,38 @@ func TestInsertOrUpdateHostFlows(t *testing.T) {
 	err := db.InsertOrUpdateHostFlows(flows)
 	if err != nil {
 		t.Fatalf("%+v", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("there were unfulfilled expectations: %s", err)
+	}
+}
+
+func TestFindListeningPortsByAddrs(t *testing.T) {
+	db, mock := NewTestDB()
+	defer db.Close()
+
+	straddrs := pq.Array([]string{"192.0.2.1", "192.0.2.2"})
+	columns := sqlmock.NewRows([]string{"ipv4", "port"})
+	mock.ExpectQuery("SELECT ipv4, port FROM nodes").WithArgs(straddrs).WillReturnRows(columns.AddRow("192.0.2.1", 80).AddRow("192.0.2.2", 443))
+
+	addrs := []net.IP{
+		net.ParseIP("192.0.2.1"),
+		net.ParseIP("192.0.2.2"),
+	}
+	portsbyaddr, err := db.FindListeningPortsByAddrs(addrs)
+	if err != nil {
+		t.Fatalf("%+v", err)
+	}
+
+	if len(portsbyaddr) != 2 {
+		t.Errorf("portsbyaddr should be 2, but %v", len(portsbyaddr))
+	}
+	if ports, ok := portsbyaddr["192.0.2.1"]; !ok || ports[0] != 80 {
+		t.Errorf("portsbyaddr should have '192.0.2.1' as key. value should be 80: %v", ports)
+	}
+	if ports, ok := portsbyaddr["192.0.2.2"]; !ok || ports[0] != 443 {
+		t.Errorf("portsbyaddr should have '192.0.2.2' as key. value should be 443: %v", ports)
 	}
 
 	if err := mock.ExpectationsWereMet(); err != nil {
