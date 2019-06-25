@@ -111,6 +111,7 @@ Options:
   --dbhost                  postgres host
   --dbport                  postgres port
   --dbname                  postgres database name
+  --interval-sec            interval of scan connection stats
   --version, -v	            print version
   --help, -h                print help
 `
