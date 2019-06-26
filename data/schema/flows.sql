@@ -10,9 +10,9 @@ CREATE TABLE IF NOT EXISTS nodes (
 
     UNIQUE (ipv4, port, pid)
 );
-CREATE UNIQUE INDEX IF NOT EXISTS nodes_ipv4_port_pid ON nodes USING btree (ipv4, port, pid);
-CREATE INDEX IF NOT EXISTS nodes_pname ON nodes USING btree (pname);
-CREATE INDEX IF NOT EXISTS nodes_ipv4_pname ON nodes USING btree (ipv4, pname);
+CREATE UNIQUE INDEX IF NOT EXISTS nodes_ipv4_port_pid_idx ON nodes USING btree (ipv4, port, pid);
+CREATE INDEX IF NOT EXISTS nodes_pname_idx ON nodes USING btree (pname);
+CREATE INDEX IF NOT EXISTS nodes_ipv4_pname_idx ON nodes USING btree (ipv4, pname);
 
 CREATE TABLE IF NOT EXISTS flows (
     flow_id                 bigserial NOT NULL PRIMARY KEY,
