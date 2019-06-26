@@ -151,36 +151,6 @@ func (c *CLI) destIPv4(ipv4 string, depth int, opt *db.Opt) int {
 	return exitCodeOK
 }
 
-func (c *CLI) destServiceAndRoles(roles map[string][]net.IP, depth int, opt *db.Opt) int {
-	db, err := db.New(opt)
-	if err != nil {
-		log.Printf("postgres initialize error: %v\n", err)
-		return exitCodeErr
-	}
-	for role, ipaddrs := range roles {
-		portsbyaddr, err := db.FindListeningPortsByAddrs(ipaddrs)
-		if err != nil {
-			log.Println(err)
-			return exitCodeErr
-		}
-		addrsbyport := make(map[int16][]net.IP, len(portsbyaddr))
-		for addr, ports := range portsbyaddr {
-			for _, port := range ports {
-				addrsbyport[port] = append(addrsbyport[port], net.ParseIP(addr))
-			}
-		}
-		for port, addrs := range addrsbyport {
-			fmt.Fprintf(c.outStream, "%s:%d\n", role, port)
-			for _, addr := range addrs {
-				if err := c.printDestIPv4(db, addr, port, 1, depth); err != nil {
-					return exitCodeErr
-				}
-			}
-		}
-	}
-	return exitCodeOK
-}
-
 func (c *CLI) printDestIPv4(db *db.DB, addr net.IP, port int16, curDepth, depth int) error {
 	addrports, err := db.FindSourceByDestAddrAndPort(addr, port)
 	if err != nil {
