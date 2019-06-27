@@ -8,9 +8,9 @@ CREATE TABLE IF NOT EXISTS nodes (
     pgid    integer NOT NULL CHECK (pgid >= 0) DEFAULT 0,
     pname   varchar(50) NOT NULL DEFAULT '',
 
-    UNIQUE (ipv4, port, pname)
+    UNIQUE (ipv4, port, pgid, pname)
 );
-CREATE UNIQUE INDEX IF NOT EXISTS nodes_ipv4_port_pname_idx ON nodes USING btree (ipv4, port, pname);
+CREATE UNIQUE INDEX IF NOT EXISTS nodes_ipv4_port_pname_idx ON nodes USING btree (ipv4, port, pgid, pname);
 CREATE INDEX IF NOT EXISTS nodes_pname_idx ON nodes USING btree (pname);
 CREATE INDEX IF NOT EXISTS nodes_ipv4_pname_idx ON nodes USING btree (ipv4, pname);
 
