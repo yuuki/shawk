@@ -26,3 +26,11 @@ transtracer --level 2 --dest-ipv4 10.0.0.21
 10.0.0.21:22
 └<-- 10.0.0.100:many
 ```
+
+## License
+
+[MIT][license]
+
+## Author
+
+[yuuki](https://github.com/yuuki)
