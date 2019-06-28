@@ -4,7 +4,6 @@ CREATE TABLE IF NOT EXISTS nodes (
     node_id bigserial NOT NULL PRIMARY KEY,
     ipv4    inet NOT NULL,
     port    integer NOT NULL CHECK (port >= 0),
-    pid     integer NOT NULL CHECK (pid >= 0) DEFAULT 0,
     pgid    integer NOT NULL CHECK (pgid >= 0) DEFAULT 0,
     pname   varchar(50) NOT NULL DEFAULT '',
 
