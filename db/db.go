@@ -103,8 +103,8 @@ func (db *DB) InsertOrUpdateHostFlows(flows []*tcpflow.HostFlow) error {
 		return xerrors.Errorf("begin transaction error: %v", err)
 	}
 	q1 := `
-	INSERT INTO nodes (ipv4, port) VALUES ($1, $2)
-	ON CONFLICT (ipv4, port) DO NOTHING
+	INSERT INTO nodes (ipv4, port, pgid, pname) VALUES ($1, $2, $3, $4)
+	ON CONFLICT (ipv4, port, pgid, pname) DO NOTHING
 	RETURNING node_id
 `
 	stmt1, err := tx.PrepareContext(ctx, q1)
@@ -121,7 +121,7 @@ func (db *DB) InsertOrUpdateHostFlows(flows []*tcpflow.HostFlow) error {
 	INSERT INTO flows
 	(direction, source_node_id, destination_node_id, connections, updated)
 	VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
-	ON CONFLICT (source_node_id, destination_node_id, direction) 
+	ON CONFLICT (source_node_id, destination_node_id, direction)
 	DO UPDATE SET
 	direction=$1, source_node_id=$2, destination_node_id=$3, connections=$4, updated=CURRENT_TIMESTAMP
 `
@@ -134,15 +134,23 @@ func (db *DB) InsertOrUpdateHostFlows(flows []*tcpflow.HostFlow) error {
 		if flow.Local.Addr == "127.0.0.1" || flow.Local.Addr == "::1" || flow.Peer.Addr == "127.0.0.1" || flow.Peer.Addr == "::1" {
 			continue
 		}
-		var localNodeid, peerNodeid int64
-		err := stmt1.QueryRowContext(ctx, flow.Local.Addr, flow.Local.PortInt()).Scan(&localNodeid)
+		var (
+			localNodeid, peerNodeid int64
+			pgid                    int
+			pname                   string
+		)
+		if flow.Process != nil {
+			pgid = flow.Process.Pgid
+			pname = flow.Process.Name
+		}
+		err := stmt1.QueryRowContext(ctx, flow.Local.Addr, flow.Local.PortInt(), pgid, pname).Scan(&localNodeid)
 		if err == sql.ErrNoRows {
 			err = stmtFindNodeID.QueryRowContext(ctx, flow.Local.Addr, flow.Local.PortInt()).Scan(&localNodeid)
 		}
 		if err != nil {
 			return xerrors.Errorf("query error: %v", err)
 		}
-		err = stmt1.QueryRowContext(ctx, flow.Peer.Addr, flow.Peer.PortInt()).Scan(&peerNodeid)
+		err = stmt1.QueryRowContext(ctx, flow.Peer.Addr, flow.Peer.PortInt(), pgid, pname).Scan(&peerNodeid)
 		if err == sql.ErrNoRows {
 			err = stmtFindNodeID.QueryRowContext(ctx, flow.Peer.Addr, flow.Peer.PortInt()).Scan(&peerNodeid)
 		}
