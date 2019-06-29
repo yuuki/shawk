@@ -150,6 +150,7 @@ func (db *DB) InsertOrUpdateHostFlows(flows []*tcpflow.HostFlow) error {
 		if err != nil {
 			return xerrors.Errorf("query error: %v", err)
 		}
+		// Set an empty value into process because a local node has no way of knowing a process on a peer node.
 		err = stmt1.QueryRowContext(ctx, flow.Peer.Addr, flow.Peer.PortInt(), 0, "").Scan(&peerNodeid)
 		if err == sql.ErrNoRows {
 			err = stmtFindNodeID.QueryRowContext(ctx, flow.Peer.Addr, flow.Peer.PortInt(), 0, "").Scan(&peerNodeid)
