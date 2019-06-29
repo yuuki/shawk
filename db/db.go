@@ -112,7 +112,7 @@ func (db *DB) InsertOrUpdateHostFlows(flows []*tcpflow.HostFlow) error {
 		return xerrors.Errorf("query prepare error '%s': %v", q1, err)
 	}
 	stmtFindNodeID, err := tx.PrepareContext(ctx, `
-	SELECT node_id FROM nodes WHERE ipv4 = $1 AND port = $2
+	SELECT node_id FROM nodes WHERE ipv4 = $1 AND port = $2 AND pgid = $3 AND pname = $4
 `)
 	if err != nil {
 		return xerrors.Errorf("query prepare error: %v", err)
@@ -145,14 +145,14 @@ func (db *DB) InsertOrUpdateHostFlows(flows []*tcpflow.HostFlow) error {
 		}
 		err := stmt1.QueryRowContext(ctx, flow.Local.Addr, flow.Local.PortInt(), pgid, pname).Scan(&localNodeid)
 		if err == sql.ErrNoRows {
-			err = stmtFindNodeID.QueryRowContext(ctx, flow.Local.Addr, flow.Local.PortInt()).Scan(&localNodeid)
+			err = stmtFindNodeID.QueryRowContext(ctx, flow.Local.Addr, flow.Local.PortInt(), pgid, pname).Scan(&localNodeid)
 		}
 		if err != nil {
 			return xerrors.Errorf("query error: %v", err)
 		}
-		err = stmt1.QueryRowContext(ctx, flow.Peer.Addr, flow.Peer.PortInt(), pgid, pname).Scan(&peerNodeid)
+		err = stmt1.QueryRowContext(ctx, flow.Peer.Addr, flow.Peer.PortInt(), 0, "").Scan(&peerNodeid)
 		if err == sql.ErrNoRows {
-			err = stmtFindNodeID.QueryRowContext(ctx, flow.Peer.Addr, flow.Peer.PortInt()).Scan(&peerNodeid)
+			err = stmtFindNodeID.QueryRowContext(ctx, flow.Peer.Addr, flow.Peer.PortInt(), 0, "").Scan(&peerNodeid)
 		}
 		if err != nil {
 			return xerrors.Errorf("query error: %v", err)
