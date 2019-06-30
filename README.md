@@ -9,6 +9,11 @@ Transtracer is a tracing infrastructure for discovering network services depende
 ![System structure](/doc/images/system_structure.png "System structure")
 ![Socket diagnosis](/doc/images/socket_diagnosis.png "Socket diagnosis")
 
+## Requirements
+
+- OS: Linux
+- RDBMS: PostgreSQL 10+
+
 ## Usage
 
 ### CLI
