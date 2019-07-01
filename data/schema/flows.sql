@@ -3,9 +3,15 @@ CREATE TYPE flow_direction AS ENUM ('active', 'passive');
 CREATE TABLE IF NOT EXISTS nodes (
     node_id bigserial NOT NULL PRIMARY KEY,
     ipv4    inet NOT NULL,
-    port    integer NOT NULL CHECK (port >= 0)
+    port    integer NOT NULL CHECK (port >= 0),
+    pgid    integer NOT NULL CHECK (pgid >= 0) DEFAULT 0,
+    pname   varchar(50) NOT NULL DEFAULT '',
+
+    UNIQUE (ipv4, port, pgid, pname)
 );
-CREATE UNIQUE INDEX IF NOT EXISTS nodes_ipv4_port ON nodes USING btree (ipv4, port);
+CREATE UNIQUE INDEX IF NOT EXISTS nodes_ipv4_port_pname_idx ON nodes USING btree (ipv4, port, pgid, pname);
+CREATE INDEX IF NOT EXISTS nodes_pname_idx ON nodes USING btree (pname);
+CREATE INDEX IF NOT EXISTS nodes_ipv4_pname_idx ON nodes USING btree (ipv4, pname);
 
 CREATE TABLE IF NOT EXISTS flows (
     flow_id                 bigserial NOT NULL PRIMARY KEY,

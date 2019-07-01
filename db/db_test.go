@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/lib/pq"
 	"github.com/yuuki/lstf/tcpflow"
 
@@ -58,12 +59,14 @@ func TestInsertOrUpdateHostFlows(t *testing.T) {
 			Direction:   tcpflow.FlowActive,
 			Local:       &tcpflow.AddrPort{Addr: "10.0.10.1", Port: "many"},
 			Peer:        &tcpflow.AddrPort{Addr: "10.0.10.2", Port: "5432"},
+			Process:     &tcpflow.Process{Pgid: 1001, Name: "python"},
 			Connections: 10,
 		},
 		{
 			Direction:   tcpflow.FlowPassive,
 			Local:       &tcpflow.AddrPort{Addr: "10.0.10.1", Port: "80"},
 			Peer:        &tcpflow.AddrPort{Addr: "10.0.10.2", Port: "many"},
+			Process:     &tcpflow.Process{Pgid: 1002, Name: "nginx"},
 			Connections: 12,
 		},
 	}
@@ -74,14 +77,50 @@ func TestInsertOrUpdateHostFlows(t *testing.T) {
 	stmt3 := mock.ExpectPrepare("INSERT INTO flows")
 
 	// first loop
-	stmt1.ExpectQuery().WithArgs("10.0.10.1", 0).WillReturnRows(sqlmock.NewRows([]string{"node_id"}).AddRow(1))
-	stmt1.ExpectQuery().WithArgs("10.0.10.2", 5432).WillReturnRows(sqlmock.NewRows([]string{"node_id"}).AddRow(2))
+	stmt1.ExpectQuery().WithArgs("10.0.10.1", 0, 1001, "python").WillReturnRows(sqlmock.NewRows([]string{"node_id"}).AddRow(1))
+	stmt1.ExpectQuery().WithArgs("10.0.10.2", 5432, 0, "").WillReturnRows(sqlmock.NewRows([]string{"node_id"}).AddRow(2))
 	stmt3.ExpectExec().WithArgs("active", 1, 2, 10).WillReturnResult(sqlmock.NewResult(1, 1))
 
 	// second loop
-	stmt1.ExpectQuery().WithArgs("10.0.10.1", 80).WillReturnRows(sqlmock.NewRows([]string{"node_id"}).AddRow(3))
-	stmt1.ExpectQuery().WithArgs("10.0.10.2", 0).WillReturnRows(sqlmock.NewRows([]string{"node_id"}).AddRow(4))
+	stmt1.ExpectQuery().WithArgs("10.0.10.1", 80, 1002, "nginx").WillReturnRows(sqlmock.NewRows([]string{"node_id"}).AddRow(3))
+	stmt1.ExpectQuery().WithArgs("10.0.10.2", 0, 0, "").WillReturnRows(sqlmock.NewRows([]string{"node_id"}).AddRow(4))
 	stmt3.ExpectExec().WithArgs("passive", 4, 3, 12).WillReturnResult(sqlmock.NewResult(1, 1))
+
+	mock.ExpectCommit()
+
+	err := db.InsertOrUpdateHostFlows(flows)
+	if err != nil {
+		t.Fatalf("%+v", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("there were unfulfilled expectations: %s", err)
+	}
+}
+
+func TestInsertOrUpdateHostFlows_empty_process(t *testing.T) {
+	db, mock := NewTestDB()
+	defer db.Close()
+
+	flows := []*tcpflow.HostFlow{
+		{
+			Direction:   tcpflow.FlowActive,
+			Local:       &tcpflow.AddrPort{Addr: "10.0.10.1", Port: "many"},
+			Peer:        &tcpflow.AddrPort{Addr: "10.0.10.2", Port: "5432"},
+			Process:     nil,
+			Connections: 10,
+		},
+	}
+
+	mock.ExpectBegin()
+	stmt1 := mock.ExpectPrepare("INSERT INTO nodes")
+	mock.ExpectPrepare("SELECT node_id FROM nodes")
+	stmt3 := mock.ExpectPrepare("INSERT INTO flows")
+
+	// first loop
+	stmt1.ExpectQuery().WithArgs("10.0.10.1", 0, 0, "").WillReturnRows(sqlmock.NewRows([]string{"node_id"}).AddRow(1))
+	stmt1.ExpectQuery().WithArgs("10.0.10.2", 5432, 0, "").WillReturnRows(sqlmock.NewRows([]string{"node_id"}).AddRow(2))
+	stmt3.ExpectExec().WithArgs("active", 1, 2, 10).WillReturnResult(sqlmock.NewResult(1, 1))
 
 	mock.ExpectCommit()
 
@@ -131,12 +170,13 @@ func TestFindSourceByDestAddrAndPort(t *testing.T) {
 	db, mock := NewTestDB()
 	defer db.Close()
 
-	addr := net.ParseIP("192.0.10.1")
-	port := int16(8000)
+	addr, port := net.ParseIP("192.0.10.1"), 0
+	pgid, pname := 3008, "nginx"
+	connections := 10
 
-	columns := sqlmock.NewRows([]string{"connections", "updated", "source_ipv4", "source_port"})
+	columns := sqlmock.NewRows([]string{"connections", "updated", "source_ipv4", "source_port", "source_pgid", "source_pname"})
 	mock.ExpectQuery("SELECT (.+) FROM flows").WithArgs(addr.String(), port).WillReturnRows(
-		columns.AddRow(10, time.Now(), "192.0.10.2", 0),
+		columns.AddRow(connections, time.Now(), addr.String(), port, pgid, pname),
 	)
 
 	addrports, err := db.FindSourceByDestAddrAndPort(addr, port)
@@ -148,14 +188,17 @@ func TestFindSourceByDestAddrAndPort(t *testing.T) {
 		t.Errorf("addrports should be 1, but %v", len(addrports))
 	}
 
-	if addrports[0].IPAddr.String() != "192.0.10.2" {
-		t.Errorf("addrports[0].Addr should be '192.0.10.2', but %s", addrports[0].IPAddr)
+	want := []*AddrPort{
+		{
+			IPAddr:      addr,
+			Port:        port,
+			Pgid:        pgid,
+			Pname:       pname,
+			Connections: connections,
+		},
 	}
-	if addrports[0].Port != 0 {
-		t.Errorf("addrports[0].Port should be '8000', but %v", addrports[0].Port)
-	}
-	if addrports[0].Connections != 10 {
-		t.Errorf("addrports[0].Connections should be '10', but %v", addrports[0].Connections)
+	if diff := cmp.Diff(want, addrports); diff != "" {
+		t.Errorf("FindSourceByDestAddrAndPort() mismatch (-want +got):\n%s", diff)
 	}
 
 	if err := mock.ExpectationsWereMet(); err != nil {
