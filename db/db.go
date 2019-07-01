@@ -176,8 +176,8 @@ func (db *DB) InsertOrUpdateHostFlows(flows []*tcpflow.HostFlow) error {
 // AddrPort are IP addr and port.
 type AddrPort struct {
 	IPAddr      net.IP
-	Port        int16
-	Pgid        int16
+	Port        int
+	Pgid        int
 	Pname       string
 	Connections int
 }
@@ -191,7 +191,7 @@ func (a *AddrPort) String() string {
 }
 
 // FindListeningPortsByAddrs find listening ports for multiple `addrs`.
-func (db *DB) FindListeningPortsByAddrs(addrs []net.IP) (map[string][]int16, error) {
+func (db *DB) FindListeningPortsByAddrs(addrs []net.IP) (map[string][]int, error) {
 	ipv4s := make([]string, 0, len(addrs))
 	for _, addr := range addrs {
 		ipv4s = append(ipv4s, addr.String())
@@ -202,18 +202,18 @@ func (db *DB) FindListeningPortsByAddrs(addrs []net.IP) (map[string][]int16, err
 	SELECT ipv4, port FROM nodes WHERE nodes.ipv4 = ANY($1)
 `, pq.Array(ipv4s))
 	if err == sql.ErrNoRows {
-		return map[string][]int16{}, nil
+		return map[string][]int{}, nil
 	}
 	if err != nil {
 		return nil, xerrors.Errorf("query error: %v", err)
 	}
 	defer rows.Close()
 
-	portsbyaddr := map[string][]int16{}
+	portsbyaddr := map[string][]int{}
 	for rows.Next() {
 		var (
 			addr string
-			port int16
+			port int
 		)
 		if err := rows.Scan(&addr, &port); err != nil {
 			return nil, xerrors.Errorf("query error: %v", err)
@@ -227,7 +227,7 @@ func (db *DB) FindListeningPortsByAddrs(addrs []net.IP) (map[string][]int16, err
 }
 
 // FindSourceByDestAddrAndPort find source nodes.
-func (db *DB) FindSourceByDestAddrAndPort(addr net.IP, port int16) ([]*AddrPort, error) {
+func (db *DB) FindSourceByDestAddrAndPort(addr net.IP, port int) ([]*AddrPort, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	rows, err := db.QueryContext(ctx, `
@@ -248,8 +248,8 @@ func (db *DB) FindSourceByDestAddrAndPort(addr net.IP, port int16) ([]*AddrPort,
 			connections int
 			updated     time.Time
 			sipv4       string
-			sport       int16
-			spgid       int16
+			sport       int
+			spgid       int
 			spname      string
 		)
 		if err := rows.Scan(&connections, &updated, &sipv4, &sport, &spgid, &spname); err != nil {

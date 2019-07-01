@@ -151,7 +151,7 @@ func (c *CLI) destIPv4(ipv4 string, depth int, opt *db.Opt) int {
 	return exitCodeOK
 }
 
-func (c *CLI) printDestIPv4(db *db.DB, addr net.IP, port int16, curDepth, depth int) error {
+func (c *CLI) printDestIPv4(db *db.DB, addr net.IP, port int, curDepth, depth int) error {
 	addrports, err := db.FindSourceByDestAddrAndPort(addr, port)
 	if err != nil {
 		return err
