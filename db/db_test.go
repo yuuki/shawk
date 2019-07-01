@@ -97,6 +97,42 @@ func TestInsertOrUpdateHostFlows(t *testing.T) {
 	}
 }
 
+func TestInsertOrUpdateHostFlows_empty_process(t *testing.T) {
+	db, mock := NewTestDB()
+	defer db.Close()
+
+	flows := []*tcpflow.HostFlow{
+		{
+			Direction:   tcpflow.FlowActive,
+			Local:       &tcpflow.AddrPort{Addr: "10.0.10.1", Port: "many"},
+			Peer:        &tcpflow.AddrPort{Addr: "10.0.10.2", Port: "5432"},
+			Process:     nil,
+			Connections: 10,
+		},
+	}
+
+	mock.ExpectBegin()
+	stmt1 := mock.ExpectPrepare("INSERT INTO nodes")
+	mock.ExpectPrepare("SELECT node_id FROM nodes")
+	stmt3 := mock.ExpectPrepare("INSERT INTO flows")
+
+	// first loop
+	stmt1.ExpectQuery().WithArgs("10.0.10.1", 0, 0, "").WillReturnRows(sqlmock.NewRows([]string{"node_id"}).AddRow(1))
+	stmt1.ExpectQuery().WithArgs("10.0.10.2", 5432, 0, "").WillReturnRows(sqlmock.NewRows([]string{"node_id"}).AddRow(2))
+	stmt3.ExpectExec().WithArgs("active", 1, 2, 10).WillReturnResult(sqlmock.NewResult(1, 1))
+
+	mock.ExpectCommit()
+
+	err := db.InsertOrUpdateHostFlows(flows)
+	if err != nil {
+		t.Fatalf("%+v", err)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("there were unfulfilled expectations: %s", err)
+	}
+}
+
 func TestFindListeningPortsByAddrs(t *testing.T) {
 	db, mock := NewTestDB()
 	defer db.Close()
