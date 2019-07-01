@@ -16,9 +16,21 @@ Transtracer is a tracing infrastructure for discovering network services depende
 
 ## Usage
 
+### ttracerd
+
+```shell-session
+# ttracerd --dbuser ttracer --dbpass ttracer --dbhost 10.0.0.20 --dbname "ttctl"
+```
+
+Make ttracer run once.
+
+```shell-session
+# ttracerd --once --interval-sec 3 --dbuser ttracer --dbpass ttracer --dbhost 10.0.0.20 --dbname "ttctl"
+```
+
 ### ttctl
 
-```shell
+```shell-session
 $ ttctl --level 2 --dest-ipv4 10.0.0.21
 10.0.0.21:80
 └<-- 10.0.0.22:many ('nginx', pgid=2000, connections=30)
