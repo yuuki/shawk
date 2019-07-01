@@ -34,7 +34,7 @@ $ ttctl --level 2 --dest-ipv4 10.0.0.21
 
 ## License
 
-[MIT][license]
+[MIT](LICENSE)
 
 ## Author
 
