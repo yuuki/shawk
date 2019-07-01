@@ -177,6 +177,8 @@ func (db *DB) InsertOrUpdateHostFlows(flows []*tcpflow.HostFlow) error {
 type AddrPort struct {
 	IPAddr      net.IP
 	Port        int16
+	Pgid        int16
+	Pname       string
 	Connections int
 }
 
@@ -185,7 +187,7 @@ func (a *AddrPort) String() string {
 	if a.Port == 0 {
 		port = "many"
 	}
-	return fmt.Sprintf("%s:%s (connections:%d)", a.IPAddr, port, a.Connections)
+	return fmt.Sprintf("%s:%s ('%s', pgid=%d, connections=%d)", a.IPAddr, port, a.Pname, a.Pgid, a.Connections)
 }
 
 // FindListeningPortsByAddrs find listening ports for multiple `addrs`.
@@ -230,7 +232,7 @@ func (db *DB) FindSourceByDestAddrAndPort(addr net.IP, port int16) ([]*AddrPort,
 	defer cancel()
 	rows, err := db.QueryContext(ctx, `
 	SELECT
-		connections, updated, source_nodes.ipv4 AS source_ipv4, source_nodes.port AS source_port 
+		connections, updated, source_nodes.ipv4 AS source_ipv4, source_nodes.port AS source_port, source_nodes.pgid AS pgid, source_nodes.pname AS pname
 	FROM flows
 	INNER JOIN nodes AS source_nodes ON source_nodes.node_id = flows.source_node_id
 	INNER JOIN nodes AS dest_nodes on dest_nodes.node_id = flows.destination_node_id
@@ -247,13 +249,17 @@ func (db *DB) FindSourceByDestAddrAndPort(addr net.IP, port int16) ([]*AddrPort,
 			updated     time.Time
 			sipv4       string
 			sport       int16
+			spgid       int16
+			spname      string
 		)
-		if err := rows.Scan(&connections, &updated, &sipv4, &sport); err != nil {
+		if err := rows.Scan(&connections, &updated, &sipv4, &sport, &spgid, &spname); err != nil {
 			return nil, xerrors.Errorf("query error: %v", err)
 		}
 		addrports = append(addrports, &AddrPort{
 			IPAddr:      net.ParseIP(sipv4),
 			Port:        sport,
+			Pgid:        spgid,
+			Pname:       spname,
 			Connections: connections,
 		})
 	}
