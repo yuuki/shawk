@@ -6,12 +6,13 @@ CREATE TABLE IF NOT EXISTS nodes (
     port    integer NOT NULL CHECK (port >= 0),
     pgid    integer NOT NULL CHECK (pgid >= 0) DEFAULT 0,
     pname   varchar(50) NOT NULL DEFAULT '',
+    created timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
     UNIQUE (ipv4, port, pgid, pname)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS nodes_ipv4_port_pname_idx ON nodes USING btree (ipv4, port, pgid, pname);
-CREATE INDEX IF NOT EXISTS nodes_pname_idx ON nodes USING btree (pname);
-CREATE INDEX IF NOT EXISTS nodes_ipv4_pname_idx ON nodes USING btree (ipv4, pname);
+CREATE INDEX IF NOT EXISTS nodes_pname_idx ON nodes USING btree (pname, created);
+CREATE INDEX IF NOT EXISTS nodes_ipv4_pname_idx ON nodes USING btree (ipv4, pname, created);
 
 CREATE TABLE IF NOT EXISTS flows (
     flow_id                 bigserial NOT NULL PRIMARY KEY,
