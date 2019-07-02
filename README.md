@@ -1,6 +1,9 @@
 # Transtracer
 
-[licence]: https://github.com/yuuki/transtracer/blog/master/LICENSE
+[![Build Status](https://travis-ci.org/yuuki/transtracer.svg?branch=master)](https://travis-ci.org/yuuki/transtracer)
+[![Latest Version](http://img.shields.io/github/release/yuuki/transtracer.svg?style=flat-square)](https://github.com/yuuki/transtracer/releases)
+[![Go Report Card](https://goreportcard.com/badge/github.com/yuuki/transtracer)](https://goreportcard.com/report/github.com/yuuki/transtracer)
+[![License](http://img.shields.io/:license-mit-blue.svg)](http://doge.mit-license.org)
 
 Transtracer is a tracing infrastructure for discovering network services dependecies on the transport network layer.
 
