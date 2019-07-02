@@ -191,7 +191,7 @@ func (a *AddrPort) String() string {
 }
 
 // FindListeningPortsByAddrs find listening ports for multiple `addrs`.
-func (db *DB) FindListeningPortsByAddrs(addrs []net.IP) (map[string][]int, error) {
+func (db *DB) FindListeningPortsByAddrs(addrs []net.IP) (map[string][]*AddrPort, error) {
 	ipv4s := make([]string, 0, len(addrs))
 	for _, addr := range addrs {
 		ipv4s = append(ipv4s, addr.String())
@@ -199,29 +199,36 @@ func (db *DB) FindListeningPortsByAddrs(addrs []net.IP) (map[string][]int, error
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	rows, err := db.QueryContext(ctx, `
-	SELECT ipv4, port FROM nodes WHERE nodes.ipv4 = ANY($1)
+	SELECT ipv4, port, pgid, pname FROM nodes WHERE nodes.ipv4 = ANY($1)
 `, pq.Array(ipv4s))
 	if err == sql.ErrNoRows {
-		return map[string][]int{}, nil
+		return map[string][]*AddrPort{}, nil
 	}
 	if err != nil {
 		return nil, xerrors.Errorf("query error: %v", err)
 	}
 	defer rows.Close()
 
-	portsbyaddr := map[string][]int{}
+	portsbyaddr := make(map[string][]*AddrPort)
 	for rows.Next() {
 		var (
-			addr string
-			port int
+			addr  string
+			port  int
+			pgid  int
+			pname string
 		)
-		if err := rows.Scan(&addr, &port); err != nil {
+		if err := rows.Scan(&addr, &port, &pgid, &pname); err != nil {
 			return nil, xerrors.Errorf("query error: %v", err)
 		}
 		if port == 0 { // port == 0 means 'many'
 			continue
 		}
-		portsbyaddr[addr] = append(portsbyaddr[addr], port)
+		portsbyaddr[addr] = append(portsbyaddr[addr], &AddrPort{
+			IPAddr: net.ParseIP(addr),
+			Port:   port,
+			Pgid:   pgid,
+			Pname:  pname,
+		})
 	}
 	return portsbyaddr, nil
 }

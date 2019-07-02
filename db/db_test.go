@@ -1,6 +1,7 @@
 package db
 
 import (
+	"log"
 	"net"
 	"testing"
 	"time"
@@ -139,8 +140,8 @@ func TestFindListeningPortsByAddrs(t *testing.T) {
 	defer db.Close()
 
 	straddrs := pq.Array([]string{"192.0.2.1", "192.0.2.2"})
-	columns := sqlmock.NewRows([]string{"ipv4", "port"})
-	mock.ExpectQuery("SELECT ipv4, port FROM nodes").WithArgs(straddrs).WillReturnRows(columns.AddRow("192.0.2.1", 80).AddRow("192.0.2.2", 443))
+	columns := sqlmock.NewRows([]string{"ipv4", "port", "pgid", "pname"})
+	mock.ExpectQuery("SELECT (.+) FROM nodes").WithArgs(straddrs).WillReturnRows(columns.AddRow("192.0.2.1", 80, 833, "nginx").AddRow("192.0.2.2", 443, 1001, "nginx"))
 
 	addrs := []net.IP{
 		net.ParseIP("192.0.2.1"),
@@ -154,10 +155,11 @@ func TestFindListeningPortsByAddrs(t *testing.T) {
 	if len(portsbyaddr) != 2 {
 		t.Errorf("portsbyaddr should be 2, but %v", len(portsbyaddr))
 	}
-	if ports, ok := portsbyaddr["192.0.2.1"]; !ok || ports[0] != 80 {
+	if ports, ok := portsbyaddr[addrs[0].String()]; !ok || ports[0].Port != 80 {
+		log.Println(ports)
 		t.Errorf("portsbyaddr should have '192.0.2.1' as key. value should be 80: %v", ports)
 	}
-	if ports, ok := portsbyaddr["192.0.2.2"]; !ok || ports[0] != 443 {
+	if ports, ok := portsbyaddr[addrs[1].String()]; !ok || ports[0].Port != 443 {
 		t.Errorf("portsbyaddr should have '192.0.2.2' as key. value should be 443: %v", ports)
 	}
 
