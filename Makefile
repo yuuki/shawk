@@ -44,3 +44,7 @@ credits: devel-deps
 ifneq (,$(git status -s $(CREDITS)))
 	go generate -x ./...
 endif
+
+.PHONY: lint
+lint:
+	golint -set_exit_status ./...

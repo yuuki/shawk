@@ -1,4 +1,5 @@
 //go:generate go-bindata -o ../data/bindata.go -pkg data ../data/schema/
+
 package db
 
 import (
@@ -15,11 +16,16 @@ import (
 )
 
 const (
-	DefaultDBName     = "ttracer"
+	// DefaultDBName is the default name of postgres database.
+	DefaultDBName = "ttracer"
+	// DefaultDBUserName is the default postgres user name.
 	DefaultDBUserName = "ttracer"
+	// DefaultDBHostname is the default postgres host name.
 	DefaultDBHostname = "localhost"
-	DefaultDBPort     = "5432"
-	ConnectTimeout    = 5
+	// DefaultDBPort is the default postgres port.
+	DefaultDBPort = "5432"
+	// ConnectTimeout is the default timeout of the connection to the postgres server.
+	ConnectTimeout = 5
 )
 
 var (
@@ -91,6 +97,7 @@ func (db *DB) CreateSchema() error {
 }
 
 const (
+	// InsertOrUpdateTimeoutSec is the timeout seconds of InsertOrUpdateHostFlows.
 	InsertOrUpdateTimeoutSec = 10
 )
 
