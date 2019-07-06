@@ -48,3 +48,7 @@ endif
 .PHONY: lint
 lint:
 	golint -set_exit_status ./...
+
+.PHONY: check
+check:
+	errcheck -asserts -blank -ignoretests -ignoregenerated -ignore 'Close,Fprint' ./...
