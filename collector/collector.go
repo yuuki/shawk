@@ -5,8 +5,7 @@ import (
 	"golang.org/x/xerrors"
 )
 
-// local cache
-
+// CollectHostFlows collects the host flows from localhost.
 func CollectHostFlows() ([]*tcpflow.HostFlow, error) {
 	mapFlows, err := tcpflow.GetHostFlows(
 		&tcpflow.GetHostFlowsOption{Processes: true},
