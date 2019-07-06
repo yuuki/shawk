@@ -47,6 +47,7 @@ endif
 
 .PHONY: lint
 lint:
+	go vet ./...
 	golint -set_exit_status ./...
 
 .PHONY: check

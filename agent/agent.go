@@ -30,7 +30,7 @@ func Start(interval time.Duration, db *db.DB) {
 }
 
 // Watch watches host flows for localhost.
-func Watch(interval time.Duration, db *db.DB) error {
+func Watch(interval time.Duration, db *db.DB) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	errChan := make(chan error, 1)
@@ -44,7 +44,6 @@ func Watch(interval time.Duration, db *db.DB) error {
 			go collectAndPostHostFlows(db, errChan)
 		}
 	}
-	return nil
 }
 
 // RunOnce runs agent once.
