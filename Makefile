@@ -50,6 +50,13 @@ lint:
 	go vet ./...
 	golint -set_exit_status ./...
 
+.PHONY: check-deps
+check-deps:
+	GO111MODULE=off go get -v \
+        honnef.co/go/tools/cmd/staticcheck \
+		github.com/kisielk/errcheck
+
 .PHONY: check
 check:
-	errcheck -asserts -blank -ignoretests -ignoregenerated -ignore 'Close,Fprint' ./...
+	errcheck -asserts -blank -ignoretests -ignoregenerated -ignore 'Close,Fprint' ./... || true
+	staticcheck ./... || true

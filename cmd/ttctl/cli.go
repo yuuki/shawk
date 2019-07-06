@@ -22,17 +22,6 @@ var (
 	creditsText = string(MustAsset("../../CREDITS"))
 )
 
-type rolesFlag []string
-
-func (r *rolesFlag) String() string {
-	return strings.Join(*r, ",")
-}
-
-func (r *rolesFlag) Set(v string) error {
-	*r = append(*r, v)
-	return nil
-}
-
 // CLI is the command line object.
 type CLI struct {
 	// outStream and errStream are the stdout and stderr
