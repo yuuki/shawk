@@ -1,4 +1,3 @@
-//go:generate go-bindata -pkg main -o credits.go ../../CREDITS
 package main
 
 import (
@@ -10,16 +9,13 @@ import (
 	"strings"
 
 	"github.com/yuuki/transtracer/db"
+	"github.com/yuuki/transtracer/statik"
 )
 
 const (
 	exitCodeOK    = 0
 	exitCodeErr   = 10 + iota
 	maxGraphDepth = 4
-)
-
-var (
-	creditsText = string(MustAsset("../../CREDITS"))
 )
 
 // CLI is the command line object.
@@ -72,7 +68,11 @@ func (c *CLI) Run(args []string) int {
 	}
 
 	if credits {
-		fmt.Fprintln(c.outStream, creditsText)
+		text, err := statik.FindString("CREDITS")
+		if err != nil {
+			log.Fatalln(err)
+		}
+		fmt.Fprintln(c.outStream, text)
 		return exitCodeOK
 	}
 
