@@ -5,7 +5,7 @@ PKG = github.com/yuuki/$(PROJECT)
 COMMIT = $$(git describe --tags --always)
 DATE = $$(date --utc '+%Y-%m-%d_%H:%M:%S')
 BUILD_LDFLAGS = -X $(PKG).commit=$(COMMIT) -X $(PKG).date=$(DATE)
-CREDITS = ./data/CREDITS
+CREDITS = ./assets/CREDITS
 
 .PHONY: build
 build:
