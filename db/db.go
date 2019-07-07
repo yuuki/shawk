@@ -1,5 +1,3 @@
-//go:generate go-bindata -o ../data/bindata.go -pkg data ../data/schema/
-
 package db
 
 import (
@@ -11,7 +9,7 @@ import (
 
 	"github.com/lib/pq" // database/sql driver
 	"github.com/yuuki/lstf/tcpflow"
-	"github.com/yuuki/transtracer/data"
+	"github.com/yuuki/transtracer/statik"
 	"golang.org/x/xerrors"
 )
 
@@ -30,7 +28,7 @@ const (
 
 var (
 	schemas = []string{
-		"../data/schema/flows.sql",
+		"/schema/flows.sql",
 	}
 )
 
@@ -84,7 +82,7 @@ func New(opt *Opt) (*DB, error) {
 // CreateSchema creates the table schemas defined by the paths including Schemas.
 func (db *DB) CreateSchema() error {
 	for _, schema := range schemas {
-		sql, err := data.Asset(schema)
+		sql, err := statik.FindString(schema)
 		if err != nil {
 			return xerrors.Errorf("get schema error '%s': %v", schema, err)
 		}

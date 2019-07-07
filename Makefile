@@ -5,10 +5,10 @@ PKG = github.com/yuuki/$(PROJECT)
 COMMIT = $$(git describe --tags --always)
 DATE = $$(date --utc '+%Y-%m-%d_%H:%M:%S')
 BUILD_LDFLAGS = -X $(PKG).commit=$(COMMIT) -X $(PKG).date=$(DATE)
-CREDITS = ./CREDITS
+CREDITS = ./assets/CREDITS
 
 .PHONY: build
-build: deps
+build:
 	go generate ./...
 	go build -ldflags="$(BUILD_LDFLAGS)" ./cmd/ttracerd/
 	go build -ldflags="$(BUILD_LDFLAGS)" ./cmd/ttctl/
@@ -20,10 +20,6 @@ install:
 .PHONY: test
 test:
 	go test -v ./...
-
-.PHONY: deps
-deps:
-	GO111MODULE=off go get -v github.com/go-bindata/go-bindata/...
 
 .PHONY: devel-deps
 devel-deps:
@@ -38,9 +34,7 @@ devel-deps:
 
 .PHONY: credits
 credits: devel-deps
-	GO111MODULE=off go get -v \
-		github.com/go-bindata/go-bindata/...
-	gocredits -w .
+	gocredits > $(CREDITS)
 ifneq (,$(git status -s $(CREDITS)))
 	go generate -x ./...
 endif
