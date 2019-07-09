@@ -18,6 +18,7 @@ var commit string
 // date describes build date.
 var date string
 
+// PrintVersion prints version.
 func PrintVersion(w io.Writer) {
 	fmt.Fprintf(w, "%s version %s, build %s, date %s \n", name, version, commit, date)
 }
