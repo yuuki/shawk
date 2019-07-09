@@ -4,7 +4,7 @@ PROJECT = transtracer
 PKG = github.com/yuuki/$(PROJECT)
 COMMIT = $$(git describe --tags --always)
 DATE = $$(date --utc '+%Y-%m-%d_%H:%M:%S')
-BUILD_LDFLAGS = -X $(PKG).commit=$(COMMIT) -X $(PKG).date=$(DATE)
+BUILD_LDFLAGS = -X $(PKG)/version.commit=$(COMMIT) -X $(PKG)/version.date=$(DATE)
 CREDITS = ./assets/CREDITS
 
 .PHONY: build

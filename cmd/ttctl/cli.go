@@ -10,6 +10,7 @@ import (
 
 	"github.com/yuuki/transtracer/db"
 	"github.com/yuuki/transtracer/statik"
+	"github.com/yuuki/transtracer/version"
 )
 
 const (
@@ -63,7 +64,7 @@ func (c *CLI) Run(args []string) int {
 	}
 
 	if ver {
-		// fmt.Fprintf(c.errStream, "%s version %s, build %s, date %s \n", name, version, commit, date)
+		version.PrintVersion(c.errStream)
 		return exitCodeOK
 	}
 
