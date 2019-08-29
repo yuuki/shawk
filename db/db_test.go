@@ -17,7 +17,7 @@ func TestCreateSchema(t *testing.T) {
 	db, mock := NewTestDB()
 	defer db.Close()
 
-	mock.ExpectExec("CREATE TYPE (.+)").WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec("CREATE TABLE IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(1, 1))
 
 	err := db.CreateSchema()
 	if err != nil {
@@ -36,9 +36,9 @@ func TestInsertOrUpdateHostFlows_empty(t *testing.T) {
 	flows := []*tcpflow.HostFlow{}
 
 	mock.ExpectBegin()
-	mock.ExpectPrepare("INSERT INTO nodes")
-	mock.ExpectPrepare("SELECT node_id FROM nodes")
-	mock.ExpectPrepare("INSERT INTO flows")
+	mock.ExpectPrepare("SELECT flows.source_node_id FROM flows")
+	mock.ExpectPrepare("SELECT node_id FROM passive_nodes")
+	mock.ExpectPrepare("INSERT INTO processes")
 	mock.ExpectCommit()
 
 	err := db.InsertOrUpdateHostFlows(flows)
