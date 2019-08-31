@@ -138,20 +138,22 @@ func (db *DB) InsertOrUpdateHostFlows(flows []*tcpflow.HostFlow) error {
 		return xerrors.Errorf("query prepare error 'INSERT INTO processes': %v", err)
 	}
 
+	// do update on conflict to avoid to return no rows
 	stmtInsertActiveNodes, err := tx.PrepareContext(ctx, `
 	INSERT INTO active_nodes (process_id) VALUES ($1)
 	ON CONFLICT (process_id)
-	DO NOTHING
+	DO UPDATE SET process_id=$1
 	RETURNING node_id
 	`)
 	if err != nil {
 		return xerrors.Errorf("query prepare error 'INSERT INTO passive_nodes': %v", err)
 	}
 
+	// do update on conflict to avoid to return no rows
 	stmtInsertPassiveNodes, err := tx.PrepareContext(ctx, `
 	INSERT INTO passive_nodes (process_id, port) VALUES ($1, $2)
 	ON CONFLICT (process_id, port)
-	DO NOTHING
+	DO UPDATE SET process_id=$1
 	RETURNING node_id
 	`)
 	if err != nil {
@@ -245,14 +247,14 @@ func (db *DB) InsertOrUpdateHostFlows(flows []*tcpflow.HostFlow) error {
 			case err == sql.ErrNoRows:
 				err := stmtInsertProcesses.QueryRowContext(ctx, flow.Peer.Addr, 0, "").Scan(&peerProcessID)
 				if err != nil {
-					return xerrors.Errorf("query error: %v", err)
+					return xerrors.Errorf("insert processes error: %v", err)
 				}
 				err = stmtInsertActiveNodes.QueryRowContext(ctx, peerProcessID).Scan(&peerNodeID)
 				if err != nil {
-					return xerrors.Errorf("query error: %v", err)
+					return xerrors.Errorf("insert active_nodes error: %v", err)
 				}
 			case err != nil:
-				return xerrors.Errorf("query error: %v", err)
+				return xerrors.Errorf("find active_nodes error: %v", err)
 			default:
 				// TODO: update
 			}
