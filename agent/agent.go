@@ -61,6 +61,8 @@ func collectAndPostHostFlows(db *db.DB, errChan chan error) {
 		errChan <- err
 		return
 	}
+	for _, f := range flows {
+		log.Printf("%s [collect] %s\n", time.Now().Format("2006-01-02 15:04:05"), f)
+	}
 	errChan <- db.InsertOrUpdateHostFlows(flows)
-	log.Printf("Post host flows (%d)", len(flows))
 }
