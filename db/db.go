@@ -122,7 +122,8 @@ func (db *DB) InsertOrUpdateHostFlows(flows []*tcpflow.HostFlow) error {
 	}
 
 	stmtFindPassiveNode, err := tx.PrepareContext(ctx, `
-	SELECT node_id FROM passive_nodes WHERE process_id IN (SELECT process_id FROM processes WHERE ipv4 = $1) AND port = $2
+	SELECT node_id FROM passive_nodes
+	WHERE process_id IN ( SELECT process_id FROM processes WHERE ipv4 = $1) AND port = $2
 	`)
 	if err != nil {
 		return xerrors.Errorf("find passive_nodes prepare error: %v", err)
@@ -334,7 +335,9 @@ func (db *DB) FindListeningPortsByAddrs(addrs []net.IP) (map[string][]*AddrPort,
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	rows, err := db.QueryContext(ctx, `
-	SELECT ipv4, port, pgid, pname FROM nodes WHERE nodes.ipv4 = ANY($1)
+	SELECT ipv4, port, pgid, pname FROM passive_nodes
+	INNER JOIN processes ON processes.process_id = passive_nodes.process_id
+	WHERE processes.ipv4 = ANY($1)
 `, pq.Array(ipv4s))
 	if err == sql.ErrNoRows {
 		return map[string][]*AddrPort{}, nil
@@ -374,14 +377,17 @@ func (db *DB) FindSourceByDestAddrAndPort(addr net.IP, port int) ([]*AddrPort, e
 	defer cancel()
 	rows, err := db.QueryContext(ctx, `
 	SELECT
-		connections, updated, source_nodes.ipv4 AS source_ipv4, source_nodes.port AS source_port, source_nodes.pgid AS pgid, source_nodes.pname AS pname
+		connections, flows.updated AS updated, processes.ipv4 AS source_ipv4, passive_nodes.port AS source_port, processes.pgid AS pgid, processes.pname AS pname
 	FROM flows
-	INNER JOIN nodes AS source_nodes ON source_nodes.node_id = flows.source_node_id
-	INNER JOIN nodes AS dest_nodes on dest_nodes.node_id = flows.destination_node_id
-	WHERE direction = 'passive' AND dest_nodes.ipv4 = $1 AND dest_nodes.port = $2
+	INNER JOIN passive_nodes ON passive_nodes.node_id = flows.destination_node_id
+	INNER JOIN processes ON processes.process_id = passive_nodes.process_id
+	WHERE processes.ipv4 = $1 AND passive_nodes.port = $2
 `, addr.String(), port)
-	if err == sql.ErrNoRows {
+	switch {
+	case err == sql.ErrNoRows:
 		return []*AddrPort{}, nil
+	case err != nil:
+		return []*AddrPort{}, xerrors.Errorf("find source nodes error: %v", err)
 	}
 	defer rows.Close()
 	addrports := make([]*AddrPort, 0)
@@ -395,7 +401,7 @@ func (db *DB) FindSourceByDestAddrAndPort(addr net.IP, port int) ([]*AddrPort, e
 			spname      string
 		)
 		if err := rows.Scan(&connections, &updated, &sipv4, &sport, &spgid, &spname); err != nil {
-			return nil, xerrors.Errorf("query error: %v", err)
+			return nil, xerrors.Errorf("rows scan error: %v", err)
 		}
 		addrports = append(addrports, &AddrPort{
 			IPAddr:      net.ParseIP(sipv4),
@@ -406,7 +412,7 @@ func (db *DB) FindSourceByDestAddrAndPort(addr net.IP, port int) ([]*AddrPort, e
 		})
 	}
 	if err := rows.Err(); err != nil {
-		return nil, xerrors.Errorf("postgres rows error: %v", err)
+		return nil, xerrors.Errorf("rows error: %v", err)
 	}
 	return addrports, nil
 }
