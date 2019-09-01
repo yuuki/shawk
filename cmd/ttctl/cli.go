@@ -143,10 +143,6 @@ func (c *CLI) destIPv4(ipv4 string, depth int, opt *db.Opt) int {
 }
 
 func (c *CLI) printDestIPv4(db *db.DB, addrport *db.AddrPort, curDepth, depth int) error {
-	if curDepth > depth {
-		return nil
-	}
-
 	addrports, err := db.FindSourceByDestAddrAndPort(addrport.IPAddr, addrport.Port)
 	if err != nil {
 		return err

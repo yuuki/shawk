@@ -377,11 +377,15 @@ func (db *DB) FindSourceByDestAddrAndPort(addr net.IP, port int) ([]*AddrPort, e
 	defer cancel()
 	rows, err := db.QueryContext(ctx, `
 	SELECT
-		connections, flows.updated AS updated, processes.ipv4 AS source_ipv4, passive_nodes.port AS source_port, processes.pgid AS pgid, processes.pname AS pname
+		connections, flows.updated AS updated, processes.ipv4 AS source_ipv4, pn.port AS source_port, processes.pgid AS pgid, processes.pname AS pname
 	FROM flows
-	INNER JOIN passive_nodes ON passive_nodes.node_id = flows.destination_node_id
-	INNER JOIN processes ON processes.process_id = passive_nodes.process_id
-	WHERE processes.ipv4 = $1 AND passive_nodes.port = $2
+	INNER JOIN active_nodes ON active_nodes.node_id = flows.source_node_id
+	INNER JOIN processes ON processes.process_id = active_nodes.process_id
+    INNER JOIN (
+		SELECT passive_nodes.node_id, passive_nodes.port FROM passive_nodes
+		INNER JOIN processes ON processes.process_id = passive_nodes.process_id
+		WHERE processes.ipv4 = $1 AND passive_nodes.port = $2
+	) AS pn ON flows.destination_node_id = pn.node_id
 `, addr.String(), port)
 	switch {
 	case err == sql.ErrNoRows:

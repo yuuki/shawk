@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS passive_nodes (
 
     UNIQUE (process_id, port)
 );
+CREATE INDEX IF NOT EXISTS passive_nodes_port_key ON passive_nodes USING btree (port);
 
 CREATE TABLE IF NOT EXISTS flows (
     flow_id                 bigserial NOT NULL PRIMARY KEY,
