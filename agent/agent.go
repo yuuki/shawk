@@ -56,13 +56,17 @@ func RunOnce(db *db.DB) error {
 // collectAndPostHostFlows collect host flows and
 // post it to the data store.
 func collectAndPostHostFlows(db *db.DB, errChan chan error) {
+	start := time.Now()
 	flows, err := collector.CollectHostFlows()
 	if err != nil {
 		errChan <- err
 		return
 	}
+	elapsed := time.Since(start)
+	logtime := time.Now().Format("2006-01-02 15:04:05")
 	for _, f := range flows {
-		log.Printf("%s [collect] %s\n", time.Now().Format("2006-01-02 15:04:05"), f)
+		log.Printf("%s [collect] %s\n", logtime, f)
 	}
+	log.Printf("%s [elapsed] %s\n", logtime, elapsed)
 	errChan <- db.InsertOrUpdateHostFlows(flows)
 }
