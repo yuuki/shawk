@@ -39,7 +39,12 @@ func TestInsertOrUpdateHostFlows_empty(t *testing.T) {
 	mock.ExpectPrepare("SELECT flows.source_node_id FROM flows")
 	mock.ExpectPrepare("SELECT node_id FROM passive_nodes")
 	mock.ExpectPrepare("INSERT INTO processes")
-	mock.ExpectCommit()
+	mock.ExpectPrepare("INSERT INTO active_nodes")
+	mock.ExpectPrepare("INSERT INTO passive_nodes")
+	mock.ExpectPrepare("SELECT node_id FROM active_nodes")
+	mock.ExpectPrepare("SELECT node_id FROM passive_nodes")
+	mock.ExpectPrepare("INSERT INTO flows")
+	mock.ExpectCommit() // executed only prepare statement
 
 	err := db.InsertOrUpdateHostFlows(flows)
 	if err != nil {
