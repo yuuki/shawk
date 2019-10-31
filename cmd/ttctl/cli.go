@@ -127,13 +127,14 @@ func (c *CLI) destIPv4(ipv4 string, depth int, opt *db.Opt) int {
 	addr := net.ParseIP(ipv4)
 	portsbyaddr, err := db.FindListeningPortsByAddrs([]net.IP{addr})
 	if err != nil {
-		log.Println(err)
+		log.Printf("find listening ports by addrs error: %v\n", err)
 		return exitCodeErr
 	}
 	for _, addrports := range portsbyaddr {
 		for _, addrport := range addrports {
 			fmt.Fprintf(c.outStream, "%s:%d ('%s', pgid=%d)\n", addrport.IPAddr, addrport.Port, addrport.Pname, addrport.Pgid)
 			if err := c.printDestIPv4(db, addrport, 1, depth); err != nil {
+				log.Printf("print dest ipv4 error: %v\n", err)
 				return exitCodeErr
 			}
 		}
