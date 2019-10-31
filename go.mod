@@ -1,6 +1,6 @@
 module github.com/yuuki/transtracer
 
-go 1.12
+go 1.13
 
 require (
 	github.com/DATA-DOG/go-sqlmock v1.3.3
