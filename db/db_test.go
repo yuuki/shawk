@@ -183,28 +183,54 @@ func TestInsertOrUpdateHostFlows_empty_process(t *testing.T) {
 			Direction:   tcpflow.FlowActive,
 			Local:       &tcpflow.AddrPort{Addr: "10.0.10.1", Port: "many"},
 			Peer:        &tcpflow.AddrPort{Addr: "10.0.10.2", Port: "5432"},
-			Process:     nil,
 			Connections: 10,
 		},
 	}
 
 	mock.ExpectBegin()
-	mock.ExpectPrepare("SELECT flows.source_node_id FROM flows")
-	mock.ExpectPrepare("SELECT node_id FROM passive_nodes")
-	mock.ExpectPrepare("INSERT INTO processes")
-	mock.ExpectPrepare("INSERT INTO active_nodes")
-	mock.ExpectPrepare("INSERT INTO passive_nodes")
-	mock.ExpectPrepare("SELECT node_id FROM active_nodes")
-	mock.ExpectPrepare("INSERT INTO flows")
 
-	stmt2 := mock.ExpectPrepare("INSERT INTO nodes")
-	mock.ExpectPrepare("SELECT node_id FROM nodes")
-	stmt3 := mock.ExpectPrepare("INSERT INTO flows")
+	mock.ExpectPrepare("SELECT flows.source_node_id FROM flows")
+	stmtFindPassiveNodes := mock.ExpectPrepare("SELECT node_id FROM passive_nodes WHERE process_id IN (.+)")
+	stmtInsertProcesses := mock.ExpectPrepare("INSERT INTO processes")
+	stmtInsertActiveNodes := mock.ExpectPrepare("INSERT INTO active_nodes")
+	stmtInsertPassiveNodes := mock.ExpectPrepare("INSERT INTO passive_nodes")
+	stmtFindActiveNodesByProcess := mock.ExpectPrepare("SELECT node_id FROM active_nodes")
+	mock.ExpectPrepare("SELECT node_id FROM passive_nodes WHERE process_id = (.+) AND port = (.+)")
+	stmtInsertFlows := mock.ExpectPrepare("INSERT INTO flows")
 
 	// first loop
-	stmt2.ExpectQuery().WithArgs("10.0.10.1", 0, 0, "").WillReturnRows(sqlmock.NewRows([]string{"node_id"}).AddRow(1))
-	stmt2.ExpectQuery().WithArgs("10.0.10.2", 5432, 0, "").WillReturnRows(sqlmock.NewRows([]string{"node_id"}).AddRow(2))
-	stmt3.ExpectExec().WithArgs("active", 1, 2, 10).WillReturnResult(sqlmock.NewResult(1, 1))
+	localProcessID, peerProcessID, localNodeID, peerNodeID := 101, 301, 501, 701
+
+	stmtInsertProcesses.ExpectQuery().WithArgs(
+		flows[0].Local.Addr, 0, "",
+	).WillReturnRows(
+		sqlmock.NewRows([]string{"process_id"}).AddRow(localProcessID),
+	)
+
+	stmtInsertActiveNodes.ExpectQuery().WithArgs(localProcessID).WillReturnError(
+		sql.ErrNoRows,
+	) // conflict when inserting
+	stmtFindActiveNodesByProcess.ExpectQuery().WithArgs(localProcessID).WillReturnRows(
+		sqlmock.NewRows([]string{"node_id"}).AddRow(localNodeID),
+	)
+
+	stmtFindPassiveNodes.ExpectQuery().WithArgs(
+		flows[0].Peer.Addr, flows[0].Peer.Port,
+	).WillReturnError(sql.ErrNoRows) // return empty
+	stmtInsertProcesses.ExpectQuery().WithArgs(
+		flows[0].Peer.Addr, 0, "",
+	).WillReturnRows(
+		sqlmock.NewRows([]string{"process_id"}).AddRow(peerProcessID),
+	)
+	stmtInsertPassiveNodes.ExpectQuery().WithArgs(
+		peerProcessID, flows[0].Peer.Port,
+	).WillReturnRows(
+		sqlmock.NewRows([]string{"node_id"}).AddRow(peerNodeID),
+	)
+
+	stmtInsertFlows.ExpectExec().WithArgs(
+		localNodeID, peerNodeID, flows[0].Connections,
+	).WillReturnResult(sqlmock.NewResult(0, 1))
 
 	mock.ExpectCommit()
 
