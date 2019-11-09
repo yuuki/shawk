@@ -224,7 +224,9 @@ func TestFindListeningPortsByAddrs(t *testing.T) {
 
 	straddrs := pq.Array([]string{"192.0.2.1", "192.0.2.2"})
 	columns := sqlmock.NewRows([]string{"ipv4", "port", "pgid", "pname"})
-	mock.ExpectQuery("SELECT (.+) FROM nodes").WithArgs(straddrs).WillReturnRows(columns.AddRow("192.0.2.1", 80, 833, "nginx").AddRow("192.0.2.2", 443, 1001, "nginx"))
+	mock.ExpectQuery("SELECT (.+) FROM passive_nodes").WithArgs(straddrs).WillReturnRows(
+		columns.AddRow("192.0.2.1", 80, 833, "nginx").AddRow("192.0.2.2", 443, 1001, "nginx"),
+	)
 
 	addrs := []net.IP{
 		net.ParseIP("192.0.2.1"),
