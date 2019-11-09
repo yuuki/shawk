@@ -108,7 +108,7 @@ func (db *DB) InsertOrUpdateHostFlows(flows []*tcpflow.HostFlow) error {
 		return xerrors.Errorf("begin transaction error: %v", err)
 	}
 
-	stmtFindActiveNode, err := tx.PrepareContext(ctx, `
+	stmtFindActiveNodes, err := tx.PrepareContext(ctx, `
 		SELECT flows.source_node_id FROM flows
 		INNER JOIN (SELECT node_id FROM passive_nodes WHERE port = $1)
 			AS pn ON pn.node_id = flows.destination_node_id
@@ -121,7 +121,7 @@ func (db *DB) InsertOrUpdateHostFlows(flows []*tcpflow.HostFlow) error {
 		return xerrors.Errorf("find active_nodes prepare error: %v", err)
 	}
 
-	stmtFindPassiveNode, err := tx.PrepareContext(ctx, `
+	stmtFindPassiveNodes, err := tx.PrepareContext(ctx, `
 	SELECT node_id FROM passive_nodes
 	WHERE process_id IN ( SELECT process_id FROM processes WHERE ipv4 = $1) AND port = $2
 	`)
@@ -243,7 +243,7 @@ func (db *DB) InsertOrUpdateHostFlows(flows []*tcpflow.HostFlow) error {
 			}
 
 			// Create or update peer node and process
-			err = stmtFindActiveNode.QueryRowContext(ctx, flow.Local.Port, flow.Peer.Addr).Scan(&peerNodeID)
+			err = stmtFindActiveNodes.QueryRowContext(ctx, flow.Local.Port, flow.Peer.Addr).Scan(&peerNodeID)
 			switch {
 			case err == sql.ErrNoRows:
 				err := stmtInsertProcesses.QueryRowContext(ctx, flow.Peer.Addr, 0, "").Scan(&peerProcessID)
@@ -280,7 +280,7 @@ func (db *DB) InsertOrUpdateHostFlows(flows []*tcpflow.HostFlow) error {
 			}
 
 			// Create or update peer node and process
-			err = stmtFindPassiveNode.QueryRowContext(ctx, flow.Peer.Addr, flow.Peer.Port).Scan(&peerNodeID)
+			err = stmtFindPassiveNodes.QueryRowContext(ctx, flow.Peer.Addr, flow.Peer.Port).Scan(&peerNodeID)
 			switch {
 			case err == sql.ErrNoRows:
 				err := stmtInsertProcesses.QueryRowContext(ctx, flow.Peer.Addr, 0, "").Scan(&peerProcessID)
