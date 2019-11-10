@@ -176,7 +176,7 @@ Options:
   --dbhost                  postgres host
   --dbport                  postgres port
   --dbname                  postgres database name
-  --dest-ipv4               filter by destination ipv4 address
+  --ipv4               		print trees regarding the ipv4 address as a root node
   --version, -v	            print version
   --help, -h                print help
 `
