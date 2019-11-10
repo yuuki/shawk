@@ -65,7 +65,7 @@ check:
 crossbuild: devel-deps credits
 	$(eval ver = $(shell gobump show -r version))
 	goxz -pv=v$(ver) -os=linux -arch=386,amd64 -build-ldflags="$(RELEASE_BUILD_LDFLAGS)" \
-	  -d=./dist/v$(ver)
+	  -d=./dist/v$(ver) $(PKG)/cmd/ttracerd $(PKG)/cmd/ttctl
 
 .PHONY: release
 release: devel-deps
