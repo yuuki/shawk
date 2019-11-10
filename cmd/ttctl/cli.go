@@ -41,7 +41,7 @@ func (c *CLI) Run(args []string) int {
 		dbhost       string
 		dbport       string
 		dbname       string
-		destipv4     string
+		ipv4         string
 		depth        int
 	)
 	flags := flag.NewFlagSet("mftctl", flag.ContinueOnError)
@@ -50,7 +50,7 @@ func (c *CLI) Run(args []string) int {
 		fmt.Fprint(c.errStream, helpText)
 	}
 	flags.BoolVar(&createSchema, "create-schema", false, "")
-	flags.StringVar(&destipv4, "dest-ipv4", "", "")
+	flags.StringVar(&ipv4, "ipv4", "", "")
 	flags.StringVar(&dbuser, "dbuser", "", "")
 	flags.StringVar(&dbpass, "dbpass", "", "")
 	flags.StringVar(&dbhost, "dbhost", "", "")
@@ -94,8 +94,8 @@ func (c *CLI) Run(args []string) int {
 		return c.createSchema(dbopt)
 	}
 
-	if destipv4 != "" {
-		return c.destIPv4(destipv4, depth, dbopt)
+	if ipv4 != "" {
+		return c.doIPv4(ipv4, depth, dbopt)
 	}
 
 	return exitCodeOK
@@ -118,7 +118,7 @@ func (c *CLI) createSchema(opt *db.Opt) int {
 	return exitCodeOK
 }
 
-func (c *CLI) destIPv4(ipv4 string, depth int, opt *db.Opt) int {
+func (c *CLI) doIPv4(ipv4 string, depth int, opt *db.Opt) int {
 	db, err := db.New(opt)
 	if err != nil {
 		log.Printf("postgres initialize error: %v\n", err)
@@ -133,7 +133,7 @@ func (c *CLI) destIPv4(ipv4 string, depth int, opt *db.Opt) int {
 	for _, addrports := range portsbyaddr {
 		for _, addrport := range addrports {
 			fmt.Fprintf(c.outStream, "%s:%d ('%s', pgid=%d)\n", addrport.IPAddr, addrport.Port, addrport.Pname, addrport.Pgid)
-			if err := c.printDestIPv4(db, addrport, 1, depth); err != nil {
+			if err := c.printIPv4(db, addrport, 1, depth); err != nil {
 				log.Printf("print dest ipv4 error: %v\n", err)
 				return exitCodeErr
 			}
@@ -142,7 +142,7 @@ func (c *CLI) destIPv4(ipv4 string, depth int, opt *db.Opt) int {
 	return exitCodeOK
 }
 
-func (c *CLI) printDestIPv4(db *db.DB, addrport *db.AddrPort, curDepth, depth int) error {
+func (c *CLI) printIPv4(db *db.DB, addrport *db.AddrPort, curDepth, depth int) error {
 	addrports, err := db.FindSourceByDestAddrAndPort(addrport.IPAddr, addrport.Port)
 	if err != nil {
 		return err
@@ -158,7 +158,7 @@ func (c *CLI) printDestIPv4(db *db.DB, addrport *db.AddrPort, curDepth, depth in
 		fmt.Fprint(c.outStream, "└<-- ")
 		fmt.Fprint(c.outStream, addrport)
 		fmt.Fprintln(c.outStream)
-		if err := c.printDestIPv4(db, addrport, curDepth, depth); err != nil {
+		if err := c.printIPv4(db, addrport, curDepth, depth); err != nil {
 			return err
 		}
 	}
