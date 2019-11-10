@@ -63,7 +63,7 @@ check:
 
 .PHONY: crossbuild
 crossbuild: devel-deps credits
-	$(eval ver = $(shell gobump show -r))
+	$(eval ver = $(shell gobump show -r version))
 	goxz -pv=v$(ver) -os=linux -arch=386,amd64 -build-ldflags="$(RELEASE_BUILD_LDFLAGS)" \
 	  -d=./dist/v$(ver)
 
