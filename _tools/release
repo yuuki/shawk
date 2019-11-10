@@ -6,13 +6,13 @@ if [[ $(git status -s) != "" ]]; then
     exit 1
 fi
 
-current_version=$(gobump show -r)
+current_version=$(gobump show -r version)
 
 echo "current version: $current_version"
 read -p "input next version: " next_version
 
 echo "--> Bumping version $next_version"
-gobump set "$next_version" -w
+gobump set "$next_version" -w version
 echo "--> Generating CHANGELOG"
 ghch -w -N "v$next_version"
 
