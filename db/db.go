@@ -430,23 +430,22 @@ func (db *DB) FindDestNodes(addr net.IP) ([]*AddrPort, error) {
 		connections,
 		flows.updated AS updated,
 		processes.ipv4 AS dest_ipv4,
-		pn.port AS dest_port,
 		processes.pgid AS dest_pgid,
 		processes.pname AS dest_pname
 	FROM flows
 	INNER JOIN passive_nodes ON passive_nodes.node_id = flows.source_node_id
-	INNER JOIN processes ON processes.process_id = active_nodes.process_id
+	INNER JOIN processes ON processes.process_id = passive_nodes.process_id
     INNER JOIN (
-		SELECT active_nodes.node_id, active_nodes.port FROM active_nodes
+		SELECT active_nodes.node_id FROM active_nodes
 		INNER JOIN processes ON processes.process_id = active_nodes.process_id
 		WHERE processes.ipv4 = $1
-	) AS pn ON flows.destination_node_id = pn.node_id
+	) AS an ON flows.destination_node_id = an.node_id
 `, addr.String())
 	switch {
 	case err == sql.ErrNoRows:
 		return []*AddrPort{}, nil
 	case err != nil:
-		return []*AddrPort{}, xerrors.Errorf("find destination nodes error: %v", err)
+		return []*AddrPort{}, xerrors.Errorf("find destination nodes query error: %v", err)
 	}
 	defer rows.Close()
 	addrports := make([]*AddrPort, 0)
@@ -455,16 +454,15 @@ func (db *DB) FindDestNodes(addr net.IP) ([]*AddrPort, error) {
 			connections int
 			updated     time.Time
 			dipv4       string
-			dport       int
 			dpgid       int
 			dpname      string
 		)
-		if err := rows.Scan(&connections, &updated, &dipv4, &dport, &dpgid, &dpname); err != nil {
+		if err := rows.Scan(&connections, &updated, &dipv4, &dpgid, &dpname); err != nil {
 			return nil, xerrors.Errorf("rows scan error: %v", err)
 		}
 		addrports = append(addrports, &AddrPort{
 			IPAddr:      net.ParseIP(dipv4),
-			Port:        dport,
+			Port:        0,
 			Pgid:        dpgid,
 			Pname:       dpname,
 			Connections: connections,
