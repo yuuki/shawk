@@ -318,3 +318,43 @@ func TestFindSourceByDestAddrAndPort(t *testing.T) {
 		t.Errorf("there were unfulfilled expectations: %s", err)
 	}
 }
+
+func TestFindDestNodes(t *testing.T) {
+	db, mock := NewTestDB()
+	defer db.Close()
+
+	addr, port := net.ParseIP("192.0.10.1"), 0
+	pgid, pname := 3008, "nginx"
+	connections := 10
+
+	columns := sqlmock.NewRows([]string{"connections", "updated", "dest_ipv4", "dest_port", "dest_pgid", "dest_pname"})
+	mock.ExpectQuery("SELECT (.+) FROM flows").WithArgs(addr.String()).WillReturnRows(
+		columns.AddRow(connections, time.Now(), addr.String(), port, pgid, pname),
+	)
+
+	addrports, err := db.FindDestNodes(addr)
+	if err != nil {
+		t.Fatalf("%+v", err)
+	}
+
+	if len(addrports) != 1 {
+		t.Errorf("addrports should be 1, but %v", len(addrports))
+	}
+
+	want := []*AddrPort{
+		{
+			IPAddr:      addr,
+			Port:        port,
+			Pgid:        pgid,
+			Pname:       pname,
+			Connections: connections,
+		},
+	}
+	if diff := cmp.Diff(want, addrports); diff != "" {
+		t.Errorf("FindDestNodes() mismatch (-want +got):\n%s", diff)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("there were unfulfilled expectations: %s", err)
+	}
+}

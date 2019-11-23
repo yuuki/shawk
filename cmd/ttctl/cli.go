@@ -6,7 +6,6 @@ import (
 	"io"
 	"log"
 	"net"
-	"strings"
 
 	"github.com/yuuki/transtracer/db"
 	"github.com/yuuki/transtracer/statik"
@@ -125,6 +124,8 @@ func (c *CLI) doIPv4(ipv4 string, depth int, opt *db.Opt) int {
 		return exitCodeErr
 	}
 	addr := net.ParseIP(ipv4)
+
+	// print thet flows of passive nodes
 	portsbyaddr, err := db.FindListeningPortsByAddrs([]net.IP{addr})
 	if err != nil {
 		log.Printf("find listening ports by addrs error: %v\n", err)
@@ -133,44 +134,43 @@ func (c *CLI) doIPv4(ipv4 string, depth int, opt *db.Opt) int {
 	for _, addrports := range portsbyaddr {
 		for _, addrport := range addrports {
 			fmt.Fprintf(c.outStream, "%s:%d ('%s', pgid=%d)\n", addrport.IPAddr, addrport.Port, addrport.Pname, addrport.Pgid)
-			if err := c.printIPv4(db, addrport, 1, depth); err != nil {
-				log.Printf("print dest ipv4 error: %v\n", err)
+
+			addrports, err := db.FindSourceByDestAddrAndPort(addrport.IPAddr, addrport.Port)
+			if err != nil {
+				log.Printf("find source by addr and port error: %v\n", err)
 				return exitCodeErr
 			}
+			if len(addrports) == 0 {
+				continue
+			}
+			c.printFlow(addrports)
 		}
 	}
+
+	// print the flows of active nodes
+	addrports, err := db.FindDestNodes(addr)
+	if err != nil {
+		log.Printf("find destination nodes error: %v\n", err)
+		return exitCodeErr
+	}
+	c.printFlow(addrports)
+
 	return exitCodeOK
 }
 
-func (c *CLI) printIPv4(db *db.DB, addrport *db.AddrPort, curDepth, depth int) error {
-	addrports, err := db.FindSourceByDestAddrAndPort(addrport.IPAddr, addrport.Port)
-	if err != nil {
-		return err
-	}
-	if len(addrports) == 0 {
-		return nil
-	}
-	indent := strings.Repeat("\t", curDepth-1)
-	curDepth++
-	depth--
+func (c *CLI) printFlow(addrports []*db.AddrPort) {
+	// No implementation of printing tree with depth > 1
 	for _, addrport := range addrports {
-		fmt.Fprint(c.outStream, indent)
-		fmt.Fprint(c.outStream, "└<-- ")
-		fmt.Fprint(c.outStream, addrport)
-		fmt.Fprintln(c.outStream)
-		if err := c.printIPv4(db, addrport, curDepth, depth); err != nil {
-			return err
-		}
+		fmt.Fprintf(c.outStream, "└<-- %s\n", addrport)
 	}
-	return nil
 }
 
 var helpText = `Usage: ttctl [options]
 
-ttctl is a CLI controller for mftracer system.
+ttctl is a CLI controller for transtracer.
 
 Options:
-  --create-schema           create mftracer table schema for postgres
+  --create-schema           create transtracer table schema for postgres
   --dbuser                  postgres user
   --dbpass                  postgres user password
   --dbhost                  postgres host
