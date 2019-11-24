@@ -34,7 +34,8 @@ Make ttracer run once.
 ### ttctl
 
 ```shell-session
-$ ttctl --dbhost 10.0.0.20 --ipv4 10.0.0.10 10.0.0.10:80 (’nginx’, pgid=4656)
+$ ttctl --dbhost 10.0.0.20 --ipv4 10.0.0.10
+10.0.0.10:80 (’nginx’, pgid=4656)
 └<-- 10.0.0.11:many (’wrk’, pgid=5982) 10.0.0.10:80 (’nginx’, pgid=4656)
 └--> 10.0.0.12:8080 (’python’, pgid=6111) 10.0.0.10:many (’fluentd’, pgid=2127)
 └--> 10.0.0.13:24224 (’fluentd’, pgid=2001)
