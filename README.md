@@ -34,17 +34,10 @@ Make ttracer run once.
 ### ttctl
 
 ```shell-session
-$ ttctl --level 2 --dest-ipv4 10.0.0.21
-10.0.0.21:80
-└<-- 10.0.0.22:many ('nginx', pgid=2000, connections=30)
-└<-- 10.0.0.23:many ('nginx', pgid=891, connections=30)
-└<-- 10.0.0.24:many ('nginx', pgid=1002, connections=30)
-        └<-- 10.0.0.30:many ('python', pgid=1889 connections=1)
-        └<-- 10.0.0.31:many ('python', pgid=1998 connections=1)
-└<-- 10.0.0.25:many (connections:30)
-
-10.0.0.21:22
-└<-- 10.0.0.100:many
+$ ttctl --dbhost 10.0.0.20 --ipv4 10.0.0.10 10.0.0.10:80 (’nginx’, pgid=4656)
+└<-- 10.0.0.11:many (’wrk’, pgid=5982) 10.0.0.10:80 (’nginx’, pgid=4656)
+└--> 10.0.0.12:8080 (’python’, pgid=6111) 10.0.0.10:many (’fluentd’, pgid=2127)
+└--> 10.0.0.13:24224 (’fluentd’, pgid=2001)
 ```
 
 ## License

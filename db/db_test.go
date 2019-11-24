@@ -2,7 +2,6 @@ package db
 
 import (
 	"database/sql"
-	"log"
 	"net"
 	"testing"
 	"time"
@@ -244,34 +243,85 @@ func TestInsertOrUpdateHostFlows_empty_process(t *testing.T) {
 	}
 }
 
-func TestFindListeningPortsByAddrs(t *testing.T) {
+func TestFindPassiveFlows(t *testing.T) {
 	db, mock := NewTestDB()
 	defer db.Close()
 
-	straddrs := pq.Array([]string{"192.0.2.1", "192.0.2.2"})
-	columns := sqlmock.NewRows([]string{"ipv4", "port", "pgid", "pname"})
-	mock.ExpectQuery("SELECT (.+) FROM passive_nodes").WithArgs(straddrs).WillReturnRows(
-		columns.AddRow("192.0.2.1", 80, 833, "nginx").AddRow("192.0.2.2", 443, 1001, "nginx"),
-	)
+	paddrs := []net.IP{net.ParseIP("192.168.3.1"), net.ParseIP("192.168.3.2")}
 
-	addrs := []net.IP{
-		net.ParseIP("192.0.2.1"),
-		net.ParseIP("192.0.2.2"),
-	}
-	portsbyaddr, err := db.FindListeningPortsByAddrs(addrs)
+	columns := sqlmock.NewRows([]string{
+		"pipv4",
+		"ppname",
+		"pport",
+		"ppgid",
+		"aipv4",
+		"apname",
+		"apgid",
+		"connections",
+		"updated",
+	})
+
+	// flow1
+	pipv4, ppname, ppgid, pport := "192.168.3.1", "unicorn", 10021, 8000
+	aipv4, apname, apgid := "192.168.2.1", "nginx", 4123
+	connections := 10
+	columns.AddRow(pipv4, ppname, pport, ppgid, aipv4, apname, apgid, connections, time.Now())
+
+	// flow2
+	pipv4, ppname, ppgid, pport = "192.168.3.1", "unicorn", 10021, 8000
+	aipv4, apname, apgid = "192.168.5.1", "varnish", 13456
+	connections = 20
+	columns.AddRow(pipv4, ppname, pport, ppgid, aipv4, apname, apgid, connections, time.Now())
+
+	mock.ExpectQuery("SELECT (.+) FROM flows").WithArgs(
+		pq.Array([]string{"192.168.3.1", "192.168.3.2"}),
+	).WillReturnRows(columns)
+
+	flows, err := db.FindPassiveFlows(paddrs)
 	if err != nil {
 		t.Fatalf("%+v", err)
 	}
 
-	if len(portsbyaddr) != 2 {
-		t.Errorf("portsbyaddr should be 2, but %v", len(portsbyaddr))
+	if len(flows) != 1 {
+		t.Errorf("flows should be 2, but %v", len(flows))
 	}
-	if ports, ok := portsbyaddr[addrs[0].String()]; !ok || ports[0].Port != 80 {
-		log.Println(ports)
-		t.Errorf("portsbyaddr should have '192.0.2.1' as key. value should be 80: %v", ports)
+
+	want := Flows{
+		"192.168.3.1-unicorn": []*Flow{
+			{
+				ActiveNode: &Node{
+					IPAddr: net.ParseIP("192.168.2.1"),
+					Port:   0,
+					Pgid:   4123,
+					Pname:  "nginx",
+				},
+				PassiveNode: &Node{
+					IPAddr: net.ParseIP("192.168.3.1"),
+					Port:   8000,
+					Pgid:   10021,
+					Pname:  "unicorn",
+				},
+				Connections: 10,
+			},
+			{
+				ActiveNode: &Node{
+					IPAddr: net.ParseIP("192.168.5.1"),
+					Port:   0,
+					Pgid:   13456,
+					Pname:  "varnish",
+				},
+				PassiveNode: &Node{
+					IPAddr: net.ParseIP("192.168.3.1"),
+					Port:   8000,
+					Pgid:   10021,
+					Pname:  "unicorn",
+				},
+				Connections: 20,
+			},
+		},
 	}
-	if ports, ok := portsbyaddr[addrs[1].String()]; !ok || ports[0].Port != 443 {
-		t.Errorf("portsbyaddr should have '192.0.2.2' as key. value should be 443: %v", ports)
+	if diff := cmp.Diff(want, flows); diff != "" {
+		t.Errorf("FindDestNodes() mismatch (-want +got):\n%s", diff)
 	}
 
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -279,39 +329,85 @@ func TestFindListeningPortsByAddrs(t *testing.T) {
 	}
 }
 
-func TestFindSourceByDestAddrAndPort(t *testing.T) {
+func TestFindActiveFlows(t *testing.T) {
 	db, mock := NewTestDB()
 	defer db.Close()
 
-	addr, port := net.ParseIP("192.0.10.1"), 0
-	pgid, pname := 3008, "nginx"
+	aaddrs := []net.IP{net.ParseIP("192.168.2.1"), net.ParseIP("192.168.2.2")}
+
+	columns := sqlmock.NewRows([]string{
+		"aipv4",
+		"apname",
+		"pport",
+		"apgid",
+		"pipv4",
+		"ppname",
+		"ppgid",
+		"connections",
+		"updated",
+	})
+
+	// flow1
+	aipv4, apname, apgid := "192.168.2.1", "unicorn", 4123
+	pipv4, ppname, ppgid, pport := "192.168.3.1", "mysqld", 10021, 3306
 	connections := 10
+	columns.AddRow(aipv4, apname, pport, apgid, pipv4, ppname, ppgid, connections, time.Now())
 
-	columns := sqlmock.NewRows([]string{"connections", "updated", "source_ipv4", "source_port", "source_pgid", "source_pname"})
-	mock.ExpectQuery("SELECT (.+) FROM flows").WithArgs(addr.String(), port).WillReturnRows(
-		columns.AddRow(connections, time.Now(), addr.String(), port, pgid, pname),
-	)
+	// flow2
+	aipv4, apname, apgid = "192.168.2.1", "unicorn", 4123
+	pipv4, ppname, ppgid, pport = "192.168.4.1", "memcached", 21199, 11211
+	connections = 20
+	columns.AddRow(aipv4, apname, pport, apgid, pipv4, ppname, ppgid, connections, time.Now())
 
-	addrports, err := db.FindSourceByDestAddrAndPort(addr, port)
+	mock.ExpectQuery("SELECT (.+) FROM flows").WithArgs(
+		pq.Array([]string{"192.168.2.1", "192.168.2.2"}),
+	).WillReturnRows(columns)
+
+	flows, err := db.FindActiveFlows(aaddrs)
 	if err != nil {
 		t.Fatalf("%+v", err)
 	}
 
-	if len(addrports) != 1 {
-		t.Errorf("addrports should be 1, but %v", len(addrports))
+	if len(flows) != 1 {
+		t.Errorf("flows should be 2, but %v", len(flows))
 	}
 
-	want := []*AddrPort{
-		{
-			IPAddr:      addr,
-			Port:        port,
-			Pgid:        pgid,
-			Pname:       pname,
-			Connections: connections,
+	want := Flows{
+		"192.168.2.1-unicorn": []*Flow{
+			{
+				ActiveNode: &Node{
+					IPAddr: net.ParseIP("192.168.2.1"),
+					Port:   0,
+					Pgid:   4123,
+					Pname:  "unicorn",
+				},
+				PassiveNode: &Node{
+					IPAddr: net.ParseIP("192.168.3.1"),
+					Port:   3306,
+					Pgid:   10021,
+					Pname:  "mysqld",
+				},
+				Connections: 10,
+			},
+			{
+				ActiveNode: &Node{
+					IPAddr: net.ParseIP("192.168.2.1"),
+					Port:   0,
+					Pgid:   4123,
+					Pname:  "unicorn",
+				},
+				PassiveNode: &Node{
+					IPAddr: net.ParseIP("192.168.4.1"),
+					Port:   11211,
+					Pgid:   21199,
+					Pname:  "memcached",
+				},
+				Connections: 20,
+			},
 		},
 	}
-	if diff := cmp.Diff(want, addrports); diff != "" {
-		t.Errorf("FindSourceByDestAddrAndPort() mismatch (-want +got):\n%s", diff)
+	if diff := cmp.Diff(want, flows); diff != "" {
+		t.Errorf("FindDestNodes() mismatch (-want +got):\n%s", diff)
 	}
 
 	if err := mock.ExpectationsWereMet(); err != nil {

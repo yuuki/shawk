@@ -309,114 +309,191 @@ func (db *DB) InsertOrUpdateHostFlows(flows []*tcpflow.HostFlow) error {
 	return nil
 }
 
-// AddrPort are IP addr and port.
-type AddrPort struct {
-	IPAddr      net.IP
-	Port        int
-	Pgid        int
-	Pname       string
+// Node represents a minimum unit of a graph tree.
+type Node struct {
+	IPAddr net.IP
+	Port   int    // 0 if active node
+	Pgid   int    // Process Group ID (Linux)
+	Pname  string // Process Name (Linux)
+}
+
+func (n *Node) String() string {
+	port := fmt.Sprintf("%d", n.Port)
+	if n.Port == 0 {
+		port = "many"
+	}
+	return fmt.Sprintf("%s:%s ('%s', pgid=%d)",
+		n.IPAddr, port, n.Pname, n.Pgid)
+}
+
+// Flows represents a flow between a active node and a passive node.
+type Flow struct {
+	ActiveNode  *Node
+	PassiveNode *Node
 	Connections int
 }
 
-func (a *AddrPort) String() string {
-	port := fmt.Sprintf("%d", a.Port)
-	if a.Port == 0 {
-		port = "many"
-	}
-	return fmt.Sprintf("%s:%s ('%s', pgid=%d, connections=%d)", a.IPAddr, port, a.Pname, a.Pgid, a.Connections)
-}
+// Flows represents a collection of flow.
+type Flows map[string][]*Flow // flows group by
 
-// FindListeningPortsByAddrs find listening ports for multiple `addrs`.
-func (db *DB) FindListeningPortsByAddrs(addrs []net.IP) (map[string][]*AddrPort, error) {
+// FindPassiveFlows queries passive flows to CMDB by the slice of ipaddrs.
+func (db *DB) FindPassiveFlows(addrs []net.IP) (Flows, error) {
 	ipv4s := make([]string, 0, len(addrs))
 	for _, addr := range addrs {
 		ipv4s = append(ipv4s, addr.String())
 	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	rows, err := db.QueryContext(ctx, `
-	SELECT ipv4, port, pgid, pname FROM passive_nodes
-	INNER JOIN processes ON processes.process_id = passive_nodes.process_id
-	WHERE processes.ipv4 = ANY($1)
-`, pq.Array(ipv4s))
-	if err == sql.ErrNoRows {
-		return map[string][]*AddrPort{}, nil
-	}
-	if err != nil {
-		return nil, xerrors.Errorf("query error: %v", err)
-	}
-	defer rows.Close()
 
-	portsbyaddr := make(map[string][]*AddrPort)
-	for rows.Next() {
-		var (
-			addr  string
-			port  int
-			pgid  int
-			pname string
-		)
-		if err := rows.Scan(&addr, &port, &pgid, &pname); err != nil {
-			return nil, xerrors.Errorf("query error: %v", err)
-		}
-		if port == 0 { // port == 0 means 'many'
-			continue
-		}
-		portsbyaddr[addr] = append(portsbyaddr[addr], &AddrPort{
-			IPAddr: net.ParseIP(addr),
-			Port:   port,
-			Pgid:   pgid,
-			Pname:  pname,
-		})
-	}
-	return portsbyaddr, nil
-}
-
-// FindSourceByDestAddrAndPort find source nodes.
-func (db *DB) FindSourceByDestAddrAndPort(addr net.IP, port int) ([]*AddrPort, error) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	rows, err := db.QueryContext(ctx, `
 	SELECT
-		connections, flows.updated AS updated, processes.ipv4 AS source_ipv4, pn.port AS source_port, processes.pgid AS pgid, processes.pname AS pname
+		DISTINCT ON (pipv4, pn.pname)
+		pn.ipv4 AS pipv4,
+		pn.pname AS ppname,
+		pn.port AS pport,
+		pn.pgid AS ppgid,
+		active_processes.ipv4 AS aipv4,
+		active_processes.pname AS apname,
+		active_processes.pgid AS apgid,
+		connections,
+		flows.updated AS updated
 	FROM flows
 	INNER JOIN active_nodes ON active_nodes.node_id = flows.source_node_id
-	INNER JOIN processes ON processes.process_id = active_nodes.process_id
-    INNER JOIN (
-		SELECT passive_nodes.node_id, passive_nodes.port FROM passive_nodes
-		INNER JOIN processes ON processes.process_id = passive_nodes.process_id
-		WHERE processes.ipv4 = $1 AND passive_nodes.port = $2
-	) AS pn ON flows.destination_node_id = pn.node_id
-`, addr.String(), port)
+	INNER JOIN processes AS active_processes ON active_nodes.process_id = active_processes.process_id
+	INNER JOIN (
+		SELECT passive_nodes.node_id, passive_nodes.port, passive_processes.* FROM passive_nodes
+		INNER JOIN processes AS passive_processes ON passive_processes.process_id = passive_nodes.process_id
+		WHERE passive_processes.ipv4 = ANY($1)
+	) AS pn ON pn.node_id = flows.destination_node_id
+	ORDER BY pn.ipv4, pn.pname, flows.updated DESC
+`, pq.Array(ipv4s))
 	switch {
 	case err == sql.ErrNoRows:
-		return []*AddrPort{}, nil
+		return Flows{}, nil
 	case err != nil:
-		return []*AddrPort{}, xerrors.Errorf("find source nodes error: %v", err)
+		return Flows{}, xerrors.Errorf("find passive flows query error: %v", err)
 	}
 	defer rows.Close()
-	addrports := make([]*AddrPort, 0)
+
+	flows := make(Flows, 0)
 	for rows.Next() {
 		var (
+			pipv4       string
+			ppname      string
+			pport       int
+			ppgid       int
+			aipv4       string
+			apname      string
+			apgid       int
 			connections int
 			updated     time.Time
-			sipv4       string
-			sport       int
-			spgid       int
-			spname      string
 		)
-		if err := rows.Scan(&connections, &updated, &sipv4, &sport, &spgid, &spname); err != nil {
+		if err := rows.Scan(
+			&pipv4, &ppname, &pport, &ppgid, &aipv4, &apname, &apgid, &connections, &updated,
+		); err != nil {
 			return nil, xerrors.Errorf("rows scan error: %v", err)
 		}
-		addrports = append(addrports, &AddrPort{
-			IPAddr:      net.ParseIP(sipv4),
-			Port:        sport,
-			Pgid:        spgid,
-			Pname:       spname,
+		key := fmt.Sprintf("%s-%s", pipv4, ppname)
+		flows[key] = append(flows[key], &Flow{
+			ActiveNode: &Node{
+				IPAddr: net.ParseIP(aipv4),
+				Port:   0,
+				Pgid:   apgid,
+				Pname:  apname,
+			},
+			PassiveNode: &Node{
+				IPAddr: net.ParseIP(pipv4),
+				Port:   pport,
+				Pgid:   ppgid,
+				Pname:  ppname,
+			},
 			Connections: connections,
 		})
 	}
 	if err := rows.Err(); err != nil {
 		return nil, xerrors.Errorf("rows error: %v", err)
 	}
-	return addrports, nil
+
+	return flows, nil
+}
+
+// FindActiveFlows queries active flows to CMDB by the slice of ipaddrs.
+func (db *DB) FindActiveFlows(addrs []net.IP) (Flows, error) {
+	ipv4s := make([]string, 0, len(addrs))
+	for _, addr := range addrs {
+		ipv4s = append(ipv4s, addr.String())
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	rows, err := db.QueryContext(ctx, `
+	SELECT
+		DISTINCT ON (aipv4, an.pname)
+		an.ipv4 AS aipv4,
+		an.pname AS apname,
+		passive_nodes.port AS pport,
+		an.pgid AS apgid,
+		passive_processes.ipv4 AS pipv4,
+		passive_processes.pname AS ppname,
+		passive_processes.pgid AS ppgid,
+		connections,
+		flows.updated AS updated
+	FROM flows
+	INNER JOIN passive_nodes ON passive_nodes.node_id = flows.destination_node_id
+	INNER JOIN processes AS passive_processes ON passive_nodes.process_id = passive_processes.process_id
+	INNER JOIN (
+		SELECT node_id, active_processes.* FROM active_nodes
+		INNER JOIN processes AS active_processes ON active_processes.process_id = active_nodes.process_id
+		WHERE active_processes.ipv4 = ANY($1)
+	) AS an ON an.node_id = flows.source_node_id
+	ORDER BY an.ipv4, an.pname, flows.updated DESC
+`, pq.Array(ipv4s))
+	switch {
+	case err == sql.ErrNoRows:
+		return Flows{}, nil
+	case err != nil:
+		return Flows{}, xerrors.Errorf("find active flows query error: %v", err)
+	}
+	defer rows.Close()
+
+	flows := make(Flows, 0)
+	for rows.Next() {
+		var (
+			aipv4       string
+			apname      string
+			pport       int
+			apgid       int
+			pipv4       string
+			ppname      string
+			ppgid       int
+			connections int
+			updated     time.Time
+		)
+		if err := rows.Scan(&aipv4, &apname, &pport, &apgid, &pipv4, &ppname, &ppgid, &connections, &updated); err != nil {
+			return nil, xerrors.Errorf("rows scan error: %v", err)
+		}
+		key := fmt.Sprintf("%s-%s", aipv4, apname)
+		flows[key] = append(flows[key], &Flow{
+			ActiveNode: &Node{
+				IPAddr: net.ParseIP(aipv4),
+				Port:   0,
+				Pgid:   apgid,
+				Pname:  apname,
+			},
+			PassiveNode: &Node{
+				IPAddr: net.ParseIP(pipv4),
+				Port:   pport,
+				Pgid:   ppgid,
+				Pname:  ppname,
+			},
+			Connections: connections,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, xerrors.Errorf("rows error: %v", err)
+	}
+
+	return flows, nil
 }

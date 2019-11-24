@@ -6,7 +6,6 @@ import (
 	"io"
 	"log"
 	"net"
-	"strings"
 
 	"github.com/yuuki/transtracer/db"
 	"github.com/yuuki/transtracer/statik"
@@ -125,58 +124,64 @@ func (c *CLI) doIPv4(ipv4 string, depth int, opt *db.Opt) int {
 		return exitCodeErr
 	}
 	addr := net.ParseIP(ipv4)
-	portsbyaddr, err := db.FindListeningPortsByAddrs([]net.IP{addr})
+
+	// print thet flows of passive nodes
+	pflows, err := db.FindPassiveFlows([]net.IP{addr})
 	if err != nil {
-		log.Printf("find listening ports by addrs error: %v\n", err)
+		log.Printf("find active flows error: %v\n", err)
 		return exitCodeErr
 	}
-	for _, addrports := range portsbyaddr {
-		for _, addrport := range addrports {
-			fmt.Fprintf(c.outStream, "%s:%d ('%s', pgid=%d)\n", addrport.IPAddr, addrport.Port, addrport.Pname, addrport.Pgid)
-			if err := c.printIPv4(db, addrport, 1, depth); err != nil {
-				log.Printf("print dest ipv4 error: %v\n", err)
-				return exitCodeErr
-			}
-		}
+	for _, flows := range pflows {
+		pnode := flows[0].PassiveNode
+		fmt.Fprintf(c.outStream,
+			"%s:%d ('%s', pgid=%d)\n", pnode.IPAddr, pnode.Port, pnode.Pname, pnode.Pgid)
+
+		c.printPassiveFlows(flows)
 	}
+
+	// print the flows of active nodes
+	aflows, err := db.FindActiveFlows([]net.IP{addr})
+	if err != nil {
+		log.Printf("find active flows error: %v\n", err)
+		return exitCodeErr
+	}
+	for _, flows := range aflows {
+		anode := flows[0].ActiveNode
+		fmt.Fprintf(c.outStream,
+			"%s ('%s', pgid=%d)\n", anode.IPAddr, anode.Pname, anode.Pgid)
+
+		c.printActiveFlows(flows)
+	}
+
 	return exitCodeOK
 }
 
-func (c *CLI) printIPv4(db *db.DB, addrport *db.AddrPort, curDepth, depth int) error {
-	addrports, err := db.FindSourceByDestAddrAndPort(addrport.IPAddr, addrport.Port)
-	if err != nil {
-		return err
+func (c *CLI) printPassiveFlows(flows []*db.Flow) {
+	// No implementation of printing tree with depth > 1
+	for _, flow := range flows {
+		fmt.Fprintf(c.outStream, "└<-- %s\n", flow.ActiveNode)
 	}
-	if len(addrports) == 0 {
-		return nil
+}
+
+func (c *CLI) printActiveFlows(flows []*db.Flow) {
+	// No implementation of printing tree with depth > 1
+	for _, flow := range flows {
+		fmt.Fprintf(c.outStream, "└--> %s\n", flow.PassiveNode)
 	}
-	indent := strings.Repeat("\t", curDepth-1)
-	curDepth++
-	depth--
-	for _, addrport := range addrports {
-		fmt.Fprint(c.outStream, indent)
-		fmt.Fprint(c.outStream, "└<-- ")
-		fmt.Fprint(c.outStream, addrport)
-		fmt.Fprintln(c.outStream)
-		if err := c.printIPv4(db, addrport, curDepth, depth); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 var helpText = `Usage: ttctl [options]
 
-ttctl is a CLI controller for mftracer system.
+ttctl is a CLI controller for transtracer.
 
 Options:
-  --create-schema           create mftracer table schema for postgres
+  --create-schema           create transtracer table schema for postgres
   --dbuser                  postgres user
   --dbpass                  postgres user password
   --dbhost                  postgres host
   --dbport                  postgres port
   --dbname                  postgres database name
-  --dest-ipv4               filter by destination ipv4 address
+  --ipv4               		print trees regarding the ipv4 address as a root node
   --version, -v	            print version
   --help, -h                print help
 `
