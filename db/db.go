@@ -433,11 +433,11 @@ func (db *DB) FindDestNodes(addr net.IP) ([]*AddrPort, error) {
 		processes.pgid AS dest_pgid,
 		processes.pname AS dest_pname
 	FROM flows
-	INNER JOIN passive_nodes ON passive_nodes.node_id = flows.source_node_id
-	INNER JOIN processes ON processes.process_id = passive_nodes.process_id
+	INNER JOIN active_nodes ON active_nodes.node_id = flows.source_node_id
+	INNER JOIN processes ON processes.process_id = active_nodes.process_id
     INNER JOIN (
-		SELECT active_nodes.node_id FROM active_nodes
-		INNER JOIN processes ON processes.process_id = active_nodes.process_id
+		SELECT passive_nodes.node_id FROM passive_nodes
+		INNER JOIN processes ON processes.process_id = passive_nodes.process_id
 		WHERE processes.ipv4 = $1
 	) AS an ON flows.destination_node_id = an.node_id
 `, addr.String())

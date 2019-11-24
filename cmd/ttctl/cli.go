@@ -143,7 +143,7 @@ func (c *CLI) doIPv4(ipv4 string, depth int, opt *db.Opt) int {
 			if len(addrports) == 0 {
 				continue
 			}
-			c.printFlow(addrports)
+			c.printPassiveFlow(addrports)
 		}
 	}
 
@@ -153,15 +153,22 @@ func (c *CLI) doIPv4(ipv4 string, depth int, opt *db.Opt) int {
 		log.Printf("find destination nodes error: %v\n", err)
 		return exitCodeErr
 	}
-	c.printFlow(addrports)
+	c.printActiveFlow(addrports)
 
 	return exitCodeOK
 }
 
-func (c *CLI) printFlow(addrports []*db.AddrPort) {
+func (c *CLI) printPassiveFlow(addrports []*db.AddrPort) {
 	// No implementation of printing tree with depth > 1
 	for _, addrport := range addrports {
 		fmt.Fprintf(c.outStream, "└<-- %s\n", addrport)
+	}
+}
+
+func (c *CLI) printActiveFlow(addrports []*db.AddrPort) {
+	// No implementation of printing tree with depth > 1
+	for _, addrport := range addrports {
+		fmt.Fprintf(c.outStream, "└--> %s\n", addrport)
 	}
 }
 
