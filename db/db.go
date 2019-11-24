@@ -335,7 +335,9 @@ func (db *DB) FindListeningPortsByAddrs(addrs []net.IP) (map[string][]*AddrPort,
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	rows, err := db.QueryContext(ctx, `
-	SELECT ipv4, port, pgid, pname FROM passive_nodes
+	SELECT DISTINCT ON (ipv4, port)
+	ipv4, port, pgid, pname
+	FROM passive_nodes
 	INNER JOIN processes ON processes.process_id = passive_nodes.process_id
 	WHERE processes.ipv4 = ANY($1)
 `, pq.Array(ipv4s))
@@ -377,7 +379,13 @@ func (db *DB) FindSourceByDestAddrAndPort(addr net.IP, port int) ([]*AddrPort, e
 	defer cancel()
 	rows, err := db.QueryContext(ctx, `
 	SELECT
-		connections, flows.updated AS updated, processes.ipv4 AS source_ipv4, pn.port AS source_port, processes.pgid AS pgid, processes.pname AS pname
+		DISTINCT ON (processes.ipv4, pn.port)
+		processes.ipv4 AS source_ipv4,
+		pn.port AS source_port,
+		processes.pgid AS pgid,
+		processes.pname AS pname,
+		connections,
+		flows.updated AS updated
 	FROM flows
 	INNER JOIN active_nodes ON active_nodes.node_id = flows.source_node_id
 	INNER JOIN processes ON processes.process_id = active_nodes.process_id
@@ -386,6 +394,7 @@ func (db *DB) FindSourceByDestAddrAndPort(addr net.IP, port int) ([]*AddrPort, e
 		INNER JOIN processes ON processes.process_id = passive_nodes.process_id
 		WHERE processes.ipv4 = $1 AND passive_nodes.port = $2
 	) AS pn ON flows.destination_node_id = pn.node_id
+	ORDER BY processes.ipv4, pn.port, flows.updated DESC
 `, addr.String(), port)
 	switch {
 	case err == sql.ErrNoRows:
@@ -397,14 +406,14 @@ func (db *DB) FindSourceByDestAddrAndPort(addr net.IP, port int) ([]*AddrPort, e
 	addrports := make([]*AddrPort, 0)
 	for rows.Next() {
 		var (
-			connections int
-			updated     time.Time
 			sipv4       string
 			sport       int
 			spgid       int
 			spname      string
+			connections int
+			updated     time.Time
 		)
-		if err := rows.Scan(&connections, &updated, &sipv4, &sport, &spgid, &spname); err != nil {
+		if err := rows.Scan(&sipv4, &sport, &spgid, &spname, &connections, &updated); err != nil {
 			return nil, xerrors.Errorf("rows scan error: %v", err)
 		}
 		addrports = append(addrports, &AddrPort{
@@ -428,9 +437,9 @@ func (db *DB) FindDestNodes(addr net.IP) ([]*AddrPort, error) {
 	rows, err := db.QueryContext(ctx, `
 	SELECT
 		DISTINCT ON (processes.ipv4, processes.pname)
-    processes.ipv4 AS dest_ipv4,
+    	processes.ipv4 AS dest_ipv4,
 		processes.pname AS dest_pname,
-    processes.pgid AS dest_pgid,
+    	processes.pgid AS dest_pgid,
 		connections,
 		flows.updated AS updated
 	FROM flows
