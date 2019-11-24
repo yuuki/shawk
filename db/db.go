@@ -8,9 +8,10 @@ import (
 	"time"
 
 	"github.com/lib/pq" // database/sql driver
-	"github.com/yuuki/lstf/tcpflow"
-	"github.com/yuuki/transtracer/statik"
 	"golang.org/x/xerrors"
+
+	"github.com/yuuki/transtracer/internal/lstf/tcpflow"
+	"github.com/yuuki/transtracer/statik"
 )
 
 const (

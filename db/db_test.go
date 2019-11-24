@@ -6,11 +6,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/google/go-cmp/cmp"
 	"github.com/lib/pq"
-	"github.com/yuuki/lstf/tcpflow"
 
-	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/yuuki/transtracer/internal/lstf/tcpflow"
 )
 
 func TestCreateSchema(t *testing.T) {
