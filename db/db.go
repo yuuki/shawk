@@ -482,7 +482,89 @@ type Flow struct {
 // Flows represents a collection of flow.
 type Flows map[string][]*Flow // flows group by
 
-// FindActiveFlows queries active flows to DB by the slice of ipaddrs.
+// FindPassiveFlows queries passive flows to CMDB by the slice of ipaddrs.
+func (db *DB) FindPassiveFlows(addrs []net.IP) (Flows, error) {
+	ipv4s := make([]string, 0, len(addrs))
+	for _, addr := range addrs {
+		ipv4s = append(ipv4s, addr.String())
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	rows, err := db.QueryContext(ctx, `
+	SELECT
+		DISTINCT ON (pipv4, pn.pname)
+		pn.ipv4 AS pipv4,
+		pn.pname AS ppname,
+		pn.port AS pport,
+		pn.pgid AS ppgid,
+		active_processes.ipv4 AS aipv4,
+		active_processes.pname AS apname,
+		active_processes.pgid AS apgid,
+		connections,
+		flows.updated AS updated
+	FROM flows
+	INNER JOIN active_nodes ON active_nodes.node_id = flows.source_node_id
+	INNER JOIN processes AS active_processes ON active_nodes.process_id = active_processes.process_id
+	INNER JOIN (
+		SELECT passive_nodes.node_id, passive_nodes.port, passive_processes.* FROM passive_nodes
+		INNER JOIN processes AS passive_processes ON passive_processes.process_id = passive_nodes.process_id
+		WHERE passive_processes.ipv4 = ANY($1)
+	) AS pn ON pn.node_id = flows.destination_node_id
+	ORDER BY pn.ipv4, pn.pname, flows.updated DESC
+`, pq.Array(ipv4s))
+	switch {
+	case err == sql.ErrNoRows:
+		return Flows{}, nil
+	case err != nil:
+		return Flows{}, xerrors.Errorf("find passive flows query error: %v", err)
+	}
+	defer rows.Close()
+
+	flows := make(Flows, 0)
+	for rows.Next() {
+		var (
+			pipv4       string
+			ppname      string
+			pport       int
+			ppgid       int
+			aipv4       string
+			apname      string
+			apgid       int
+			connections int
+			updated     time.Time
+		)
+		if err := rows.Scan(
+			&pipv4, &ppname, &pport, &ppgid, &aipv4, &apname, &apgid, &connections, &updated,
+		); err != nil {
+			return nil, xerrors.Errorf("rows scan error: %v", err)
+		}
+		key := fmt.Sprintf("%s-%s", pipv4, ppname)
+		flows[key] = append(flows[key], &Flow{
+			ActiveNode: &AddrPort{
+				IPAddr: net.ParseIP(aipv4),
+				Port:   0,
+				Pgid:   apgid,
+				Pname:  apname,
+			},
+			PassiveNode: &AddrPort{
+				IPAddr: net.ParseIP(pipv4),
+				Port:   pport,
+				Pgid:   ppgid,
+				Pname:  ppname,
+			},
+			Connections: connections,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, xerrors.Errorf("rows error: %v", err)
+	}
+
+	return flows, nil
+}
+
+// FindActiveFlows queries active flows to CMDB by the slice of ipaddrs.
 func (db *DB) FindActiveFlows(addrs []net.IP) (Flows, error) {
 	ipv4s := make([]string, 0, len(addrs))
 	for _, addr := range addrs {
