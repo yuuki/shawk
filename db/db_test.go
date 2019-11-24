@@ -289,13 +289,13 @@ func TestFindPassiveFlows(t *testing.T) {
 	want := Flows{
 		"192.168.3.1-unicorn": []*Flow{
 			{
-				ActiveNode: &AddrPort{
+				ActiveNode: &Node{
 					IPAddr: net.ParseIP("192.168.2.1"),
 					Port:   0,
 					Pgid:   4123,
 					Pname:  "nginx",
 				},
-				PassiveNode: &AddrPort{
+				PassiveNode: &Node{
 					IPAddr: net.ParseIP("192.168.3.1"),
 					Port:   8000,
 					Pgid:   10021,
@@ -304,13 +304,13 @@ func TestFindPassiveFlows(t *testing.T) {
 				Connections: 10,
 			},
 			{
-				ActiveNode: &AddrPort{
+				ActiveNode: &Node{
 					IPAddr: net.ParseIP("192.168.5.1"),
 					Port:   0,
 					Pgid:   13456,
 					Pname:  "varnish",
 				},
-				PassiveNode: &AddrPort{
+				PassiveNode: &Node{
 					IPAddr: net.ParseIP("192.168.3.1"),
 					Port:   8000,
 					Pgid:   10021,
@@ -375,13 +375,13 @@ func TestFindActiveFlows(t *testing.T) {
 	want := Flows{
 		"192.168.2.1-unicorn": []*Flow{
 			{
-				ActiveNode: &AddrPort{
+				ActiveNode: &Node{
 					IPAddr: net.ParseIP("192.168.2.1"),
 					Port:   0,
 					Pgid:   4123,
 					Pname:  "unicorn",
 				},
-				PassiveNode: &AddrPort{
+				PassiveNode: &Node{
 					IPAddr: net.ParseIP("192.168.3.1"),
 					Port:   3306,
 					Pgid:   10021,
@@ -390,13 +390,13 @@ func TestFindActiveFlows(t *testing.T) {
 				Connections: 10,
 			},
 			{
-				ActiveNode: &AddrPort{
+				ActiveNode: &Node{
 					IPAddr: net.ParseIP("192.168.2.1"),
 					Port:   0,
 					Pgid:   4123,
 					Pname:  "unicorn",
 				},
-				PassiveNode: &AddrPort{
+				PassiveNode: &Node{
 					IPAddr: net.ParseIP("192.168.4.1"),
 					Port:   11211,
 					Pgid:   21199,

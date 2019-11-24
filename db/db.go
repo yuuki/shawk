@@ -309,26 +309,27 @@ func (db *DB) InsertOrUpdateHostFlows(flows []*tcpflow.HostFlow) error {
 	return nil
 }
 
-// AddrPort are IP addr and port.
-type AddrPort struct {
-	IPAddr      net.IP
-	Port        int
-	Pgid        int
-	Pname       string
-	Connections int
+// Node represents a minimum unit of a graph tree.
+type Node struct {
+	IPAddr net.IP
+	Port   int    // 0 if active node
+	Pgid   int    // Process Group ID (Linux)
+	Pname  string // Process Name (Linux)
 }
 
-func (a *AddrPort) String() string {
-	port := fmt.Sprintf("%d", a.Port)
-	if a.Port == 0 {
+func (n *Node) String() string {
+	port := fmt.Sprintf("%d", n.Port)
+	if n.Port == 0 {
 		port = "many"
 	}
-	return fmt.Sprintf("%s:%s ('%s', pgid=%d, connections=%d)", a.IPAddr, port, a.Pname, a.Pgid, a.Connections)
+	return fmt.Sprintf("%s:%s ('%s', pgid=%d)",
+		n.IPAddr, port, n.Pname, n.Pgid)
 }
 
+// Flows represents a flow between a active node and a passive node.
 type Flow struct {
-	ActiveNode  *AddrPort
-	PassiveNode *AddrPort
+	ActiveNode  *Node
+	PassiveNode *Node
 	Connections int
 }
 
@@ -395,13 +396,13 @@ func (db *DB) FindPassiveFlows(addrs []net.IP) (Flows, error) {
 		}
 		key := fmt.Sprintf("%s-%s", pipv4, ppname)
 		flows[key] = append(flows[key], &Flow{
-			ActiveNode: &AddrPort{
+			ActiveNode: &Node{
 				IPAddr: net.ParseIP(aipv4),
 				Port:   0,
 				Pgid:   apgid,
 				Pname:  apname,
 			},
-			PassiveNode: &AddrPort{
+			PassiveNode: &Node{
 				IPAddr: net.ParseIP(pipv4),
 				Port:   pport,
 				Pgid:   ppgid,
@@ -475,13 +476,13 @@ func (db *DB) FindActiveFlows(addrs []net.IP) (Flows, error) {
 		}
 		key := fmt.Sprintf("%s-%s", aipv4, apname)
 		flows[key] = append(flows[key], &Flow{
-			ActiveNode: &AddrPort{
+			ActiveNode: &Node{
 				IPAddr: net.ParseIP(aipv4),
 				Port:   0,
 				Pgid:   apgid,
 				Pname:  apname,
 			},
-			PassiveNode: &AddrPort{
+			PassiveNode: &Node{
 				IPAddr: net.ParseIP(pipv4),
 				Port:   pport,
 				Pgid:   ppgid,
