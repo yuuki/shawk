@@ -436,22 +436,21 @@ func (db *DB) FindDestNodes(addr net.IP) ([]*AddrPort, error) {
 	defer cancel()
 	rows, err := db.QueryContext(ctx, `
 	SELECT
-		DISTINCT ON (processes.ipv4, processes.pname)
-    	processes.ipv4 AS ipv4,
-		processes.pname AS pname,
-    	processes.pgid AS pgid,
+		DISTINCT ON (source_processes.ipv4, source_processes.pname)
+    source_processes.ipv4 AS ipv4,
+		source_processes.pname AS pname,
+    source_processes.pgid AS pgid,
 		connections,
 		flows.updated AS updated
 	FROM flows
-	INNER JOIN active_nodes ON active_nodes.node_id = flows.source_node_id
-	INNER JOIN processes ON processes.process_id = active_nodes.process_id
-    INNER JOIN (
-		SELECT passive_nodes.node_id FROM passive_nodes
-		INNER JOIN processes ON processes.process_id = passive_nodes.process_id
-		WHERE processes.ipv4 = $1
-	) AS an ON flows.destination_node_id = an.node_id
-  ORDER BY processes.ipv4, processes.pname, flows.updated DESC
-
+	INNER JOIN passive_nodes ON passive_nodes.node_id = flows.destination_node_id
+  	INNER JOIN processes AS source_processes ON passive_nodes.process_id = source_processes.process_id
+  	INNER JOIN (
+		SELECT node_id FROM active_nodes
+		INNER JOIN processes AS dest_processes ON dest_processes.process_id = active_nodes.process_id
+		WHERE dest_processes.ipv4 = $1
+  	) AS an ON an.node_id = flows.source_node_id
+  	ORDER BY source_processes.ipv4, source_processes.pname, flows.updated DESC
 `, addr.String())
 	switch {
 	case err == sql.ErrNoRows:
