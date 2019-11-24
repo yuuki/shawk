@@ -437,9 +437,9 @@ func (db *DB) FindDestNodes(addr net.IP) ([]*AddrPort, error) {
 	rows, err := db.QueryContext(ctx, `
 	SELECT
 		DISTINCT ON (processes.ipv4, processes.pname)
-    	processes.ipv4 AS dest_ipv4,
-		processes.pname AS dest_pname,
-    	processes.pgid AS dest_pgid,
+    	processes.ipv4 AS ipv4,
+		processes.pname AS pname,
+    	processes.pgid AS pgid,
 		connections,
 		flows.updated AS updated
 	FROM flows

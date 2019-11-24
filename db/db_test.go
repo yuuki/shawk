@@ -287,9 +287,16 @@ func TestFindSourceByDestAddrAndPort(t *testing.T) {
 	pgid, pname := 3008, "nginx"
 	connections := 10
 
-	columns := sqlmock.NewRows([]string{"connections", "updated", "source_ipv4", "source_port", "source_pgid", "source_pname"})
+	columns := sqlmock.NewRows([]string{
+		"source_ipv4",
+		"source_port",
+		"source_pgid",
+		"source_pname",
+		"connections",
+		"updated",
+	})
 	mock.ExpectQuery("SELECT (.+) FROM flows").WithArgs(addr.String(), port).WillReturnRows(
-		columns.AddRow(connections, time.Now(), addr.String(), port, pgid, pname),
+		columns.AddRow(addr.String(), port, pgid, pname, connections, time.Now()),
 	)
 
 	addrports, err := db.FindSourceByDestAddrAndPort(addr, port)
@@ -327,9 +334,15 @@ func TestFindDestNodes(t *testing.T) {
 	pgid, pname := 3008, "nginx"
 	connections := 10
 
-	columns := sqlmock.NewRows([]string{"connections", "updated", "dest_ipv4", "dest_port", "dest_pgid", "dest_pname"})
+	columns := sqlmock.NewRows([]string{
+		"ipv4",
+		"pgid",
+		"pname",
+		"connections",
+		"updated",
+	})
 	mock.ExpectQuery("SELECT (.+) FROM flows").WithArgs(addr.String()).WillReturnRows(
-		columns.AddRow(connections, time.Now(), addr.String(), port, pgid, pname),
+		columns.AddRow(addr.String(), pname, pgid, connections, time.Now()),
 	)
 
 	addrports, err := db.FindDestNodes(addr)
