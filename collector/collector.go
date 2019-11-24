@@ -1,8 +1,9 @@
 package collector
 
 import (
-	"github.com/yuuki/lstf/tcpflow"
 	"golang.org/x/xerrors"
+
+	"github.com/yuuki/transtracer/internal/lstf/tcpflow"
 )
 
 // CollectHostFlows collects the host flows from localhost.
