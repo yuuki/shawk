@@ -427,11 +427,12 @@ func (db *DB) FindDestNodes(addr net.IP) ([]*AddrPort, error) {
 	defer cancel()
 	rows, err := db.QueryContext(ctx, `
 	SELECT
+		DISTINCT ON (processes.ipv4, processes.pname)
+    processes.ipv4 AS dest_ipv4,
+		processes.pname AS dest_pname,
+    processes.pgid AS dest_pgid,
 		connections,
-		flows.updated AS updated,
-		processes.ipv4 AS dest_ipv4,
-		processes.pgid AS dest_pgid,
-		processes.pname AS dest_pname
+		flows.updated AS updated
 	FROM flows
 	INNER JOIN active_nodes ON active_nodes.node_id = flows.source_node_id
 	INNER JOIN processes ON processes.process_id = active_nodes.process_id
@@ -440,6 +441,8 @@ func (db *DB) FindDestNodes(addr net.IP) ([]*AddrPort, error) {
 		INNER JOIN processes ON processes.process_id = passive_nodes.process_id
 		WHERE processes.ipv4 = $1
 	) AS an ON flows.destination_node_id = an.node_id
+  ORDER BY processes.ipv4, processes.pname, flows.updated DESC
+
 `, addr.String())
 	switch {
 	case err == sql.ErrNoRows:
@@ -457,7 +460,7 @@ func (db *DB) FindDestNodes(addr net.IP) ([]*AddrPort, error) {
 			dpgid       int
 			dpname      string
 		)
-		if err := rows.Scan(&connections, &updated, &dipv4, &dpgid, &dpname); err != nil {
+		if err := rows.Scan(&dipv4, &dpname, &dpgid, &connections, &updated); err != nil {
 			return nil, xerrors.Errorf("rows scan error: %v", err)
 		}
 		addrports = append(addrports, &AddrPort{
