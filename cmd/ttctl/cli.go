@@ -148,12 +148,18 @@ func (c *CLI) doIPv4(ipv4 string, depth int, opt *db.Opt) int {
 	}
 
 	// print the flows of active nodes
-	addrports, err := db.FindDestNodes(addr)
+	aflows, err := db.FindActiveFlows([]net.IP{addr})
 	if err != nil {
-		log.Printf("find destination nodes error: %v\n", err)
+		log.Printf("find active flows error: %v\n", err)
 		return exitCodeErr
 	}
-	c.printActiveFlow(addrports)
+	for _, flows := range aflows {
+		anode := flows[0].ActiveNode
+		fmt.Fprintf(c.outStream,
+			"%s ('%s', pgid=%d)\n", anode.IPAddr, anode.Pname, anode.Pgid)
+
+		c.printActiveFlows(flows)
+	}
 
 	return exitCodeOK
 }
@@ -165,10 +171,10 @@ func (c *CLI) printPassiveFlow(addrports []*db.AddrPort) {
 	}
 }
 
-func (c *CLI) printActiveFlow(addrports []*db.AddrPort) {
+func (c *CLI) printActiveFlows(flows []*db.Flow) {
 	// No implementation of printing tree with depth > 1
-	for _, addrport := range addrports {
-		fmt.Fprintf(c.outStream, "└--> %s\n", addrport)
+	for _, flow := range flows {
+		fmt.Fprintf(c.outStream, "└--> %s\n", flow.PassiveNode)
 	}
 }
 

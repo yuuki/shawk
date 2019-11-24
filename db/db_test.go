@@ -326,44 +326,84 @@ func TestFindSourceByDestAddrAndPort(t *testing.T) {
 	}
 }
 
-func TestFindDestNodes(t *testing.T) {
+func TestFindActiveFlows(t *testing.T) {
 	db, mock := NewTestDB()
 	defer db.Close()
 
-	addr, port := net.ParseIP("192.0.10.1"), 0
-	pgid, pname := 3008, "nginx"
-	connections := 10
+	aaddrs := []net.IP{net.ParseIP("192.168.2.1"), net.ParseIP("192.168.2.2")}
 
 	columns := sqlmock.NewRows([]string{
-		"ipv4",
-		"pgid",
-		"pname",
+		"aipv4",
+		"apname",
+		"pport",
+		"apgid",
+		"pipv4",
+		"ppname",
+		"ppgid",
 		"connections",
 		"updated",
 	})
-	mock.ExpectQuery("SELECT (.+) FROM flows").WithArgs(addr.String()).WillReturnRows(
-		columns.AddRow(addr.String(), pname, pgid, connections, time.Now()),
-	)
 
-	addrports, err := db.FindDestNodes(addr)
+	// flow1
+	aipv4, apname, apgid := "192.168.2.1", "unicorn", 4123
+	pipv4, ppname, ppgid, pport := "192.168.3.1", "mysqld", 10021, 3306
+	connections := 10
+	columns.AddRow(aipv4, apname, pport, apgid, pipv4, ppname, ppgid, connections, time.Now())
+
+	// flow2
+	aipv4, apname, apgid = "192.168.2.1", "unicorn", 4123
+	pipv4, ppname, ppgid, pport = "192.168.4.1", "memcached", 21199, 11211
+	connections = 20
+	columns.AddRow(aipv4, apname, pport, apgid, pipv4, ppname, ppgid, connections, time.Now())
+
+	mock.ExpectQuery("SELECT (.+) FROM flows").WithArgs(
+		pq.Array([]string{"192.168.2.1", "192.168.2.2"}),
+	).WillReturnRows(columns)
+
+	flows, err := db.FindActiveFlows(aaddrs)
 	if err != nil {
 		t.Fatalf("%+v", err)
 	}
 
-	if len(addrports) != 1 {
-		t.Errorf("addrports should be 1, but %v", len(addrports))
+	if len(flows) != 1 {
+		t.Errorf("flows should be 2, but %v", len(flows))
 	}
 
-	want := []*AddrPort{
-		{
-			IPAddr:      addr,
-			Port:        port,
-			Pgid:        pgid,
-			Pname:       pname,
-			Connections: connections,
+	want := Flows{
+		"192.168.2.1-unicorn": []*Flow{
+			{
+				ActiveNode: &AddrPort{
+					IPAddr: net.ParseIP("192.168.2.1"),
+					Port:   0,
+					Pgid:   4123,
+					Pname:  "unicorn",
+				},
+				PassiveNode: &AddrPort{
+					IPAddr: net.ParseIP("192.168.3.1"),
+					Port:   3306,
+					Pgid:   10021,
+					Pname:  "mysqld",
+				},
+				Connections: 10,
+			},
+			{
+				ActiveNode: &AddrPort{
+					IPAddr: net.ParseIP("192.168.2.1"),
+					Port:   0,
+					Pgid:   4123,
+					Pname:  "unicorn",
+				},
+				PassiveNode: &AddrPort{
+					IPAddr: net.ParseIP("192.168.4.1"),
+					Port:   11211,
+					Pgid:   21199,
+					Pname:  "memcached",
+				},
+				Connections: 20,
+			},
 		},
 	}
-	if diff := cmp.Diff(want, addrports); diff != "" {
+	if diff := cmp.Diff(want, flows); diff != "" {
 		t.Errorf("FindDestNodes() mismatch (-want +got):\n%s", diff)
 	}
 
