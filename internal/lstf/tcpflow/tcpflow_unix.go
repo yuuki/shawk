@@ -7,7 +7,7 @@ import (
 	"net"
 
 	gnet "github.com/shirou/gopsutil/net"
-	"github.com/yuuki/lstf/netutil"
+	"github.com/yuuki/transtracer/internal/lstf/netutil"
 	"golang.org/x/xerrors"
 )
 

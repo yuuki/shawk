@@ -6,7 +6,7 @@ import (
 	"net"
 	"strconv"
 
-	"github.com/yuuki/lstf/netutil"
+	"github.com/yuuki/transtracer/internal/lstf/netutil"
 )
 
 // FlowDirection are bitmask that represents both Active or Passive.

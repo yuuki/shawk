@@ -8,7 +8,7 @@ import (
 	"github.com/elastic/gosigar/sys/linux"
 	"golang.org/x/xerrors"
 
-	"github.com/yuuki/lstf/netutil"
+	"github.com/yuuki/transtracer/internal/lstf/netutil"
 )
 
 // GetHostFlows gets host flows by netlink, and try to get by procfs if it fails.
