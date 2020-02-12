@@ -8,10 +8,14 @@ BUILD_LDFLAGS = -X $(PKG)/version.commit=$(COMMIT) -X $(PKG)/version.date=$(DATE
 CREDITS = ./assets/CREDITS
 
 .PHONY: build
-build:
+build: build-deps
 	go generate ./...
 	go build -ldflags="$(BUILD_LDFLAGS)" ./cmd/ttracerd/
 	go build -ldflags="$(BUILD_LDFLAGS)" ./cmd/ttctl/
+
+.PHONY: build-deps
+build-deps:
+	go get github.com/rakyll/statik
 
 .PHONY: install
 install:
