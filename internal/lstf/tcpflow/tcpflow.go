@@ -99,7 +99,7 @@ func (f *HostFlow) String() string {
 
 // UniqKey returns the unique identifier key for connections flow.
 func (f *HostFlow) UniqKey() string {
-	return fmt.Sprintf("%d-%s-%s", f.Direction, f.Local, f.Peer)
+	return f.Direction.String() + "-" + f.Local.String() + "-" + f.Peer.String()
 }
 
 // setLookupedName replaces f.Addr into lookuped name.
