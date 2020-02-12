@@ -3,7 +3,7 @@ export GO111MODULE=on
 PROJECT = transtracer
 PKG = github.com/yuuki/$(PROJECT)
 COMMIT = $$(git describe --tags --always)
-DATE = $$(date --utc '+%Y-%m-%d_%H:%M:%S')
+DATE = $$(date -u '+%Y-%m-%d_%H:%M:%S')
 BUILD_LDFLAGS = -X $(PKG)/version.commit=$(COMMIT) -X $(PKG)/version.date=$(DATE)
 CREDITS = ./assets/CREDITS
 
