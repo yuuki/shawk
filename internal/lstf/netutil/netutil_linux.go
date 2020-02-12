@@ -221,20 +221,23 @@ func parseProcStat(root string, pid int) (*procStat, error) {
 
 const socketPrefix = "socket:["
 
+// parse inode number from 'socket:[<inode number>]'.
 func parseSocketInode(lnk string) (uint32, error) {
 	ind := strings.Index(lnk, socketPrefix)
 	if ind == -1 {
 		return 0, nil
 	}
-	var ino uint32
-	n, err := fmt.Sscanf(lnk, "socket:[%d]", &ino)
+	open := ind + len(socketPrefix)
+	close := open + strings.Index(lnk[open:], "]")
+	if close == -1 {
+		return 0, xerrors.Errorf("'%s' should be the expected pattern '[socket:\\%d]'", lnk)
+	}
+	inode := lnk[open : close-1]
+	ino, err := strconv.ParseUint(inode, 10, 32)
 	if err != nil {
-		return 0, err
+		return 0, xerrors.Errorf("'%s' should be a number string", inode)
 	}
-	if n != 1 {
-		return 0, xerrors.Errorf("'%s' should be pattern '[socket:\\%d]'", lnk)
-	}
-	return ino, nil
+	return uint32(ino), nil
 }
 
 // BuildUserEntries scans under /proc/%pid/fd/.
