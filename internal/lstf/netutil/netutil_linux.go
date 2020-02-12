@@ -219,9 +219,10 @@ func parseProcStat(root string, pid int) (*procStat, error) {
 	}, nil
 }
 
+const socketPrefix = "socket:["
+
 func parseSocketInode(lnk string) (uint32, error) {
-	const pattern = "socket:["
-	ind := strings.Index(lnk, pattern)
+	ind := strings.Index(lnk, socketPrefix)
 	if ind == -1 {
 		return 0, nil
 	}
