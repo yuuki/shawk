@@ -11,7 +11,7 @@ require (
 	github.com/google/go-cmp v0.3.0
 	github.com/lib/pq v1.2.0
 	github.com/pkg/errors v0.8.1 // indirect
-	github.com/rakyll/statik v0.1.6
+	github.com/rakyll/statik v0.1.7
 	github.com/shirou/gopsutil v2.19.9+incompatible
 	github.com/stretchr/testify v1.3.0 // indirect
 	golang.org/x/sys v0.0.0-20191029155521-f43be2a4598c // indirect

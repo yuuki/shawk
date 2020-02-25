@@ -5,8 +5,8 @@ ROOT=$(dirname "${BASH_SOURCE}")/..
 cd "${ROOT}"
 
 echo '=========================================================================================='
-echo "= lstf licensed under: ="
-echo "https://github.com/yuuki/lstf/"
+echo "= transtracer licensed under: ="
+echo "https://github.com/yuuki/transtracer/"
 echo
 cat "${ROOT}"/LICENSE
 echo
