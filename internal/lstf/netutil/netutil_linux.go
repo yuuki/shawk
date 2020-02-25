@@ -232,7 +232,7 @@ func parseSocketInode(lnk string) (uint32, error) {
 	if close == -1 {
 		return 0, xerrors.Errorf("'%s' should be the expected pattern '[socket:\\%d]'", lnk)
 	}
-	inode := lnk[open : close-1]
+	inode := lnk[open:close]
 	ino, err := strconv.ParseUint(inode, 10, 32)
 	if err != nil {
 		return 0, xerrors.Errorf("'%s' should be a number string", inode)
