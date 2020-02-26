@@ -1,4 +1,4 @@
-FROM golang:1.13.3
+FROM golang:1.14
 
 ENV PKG github.com/yuuki/transtracer
 WORKDIR /go/src/$PKG
