@@ -1,4 +1,5 @@
 export GO111MODULE=on
+export GOFLAGS=-mod=vendor
 
 PROJECT = transtracer
 PKG = github.com/yuuki/$(PROJECT)
