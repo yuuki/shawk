@@ -1,6 +1,10 @@
 # github.com/DATA-DOG/go-sqlmock v1.3.3
 ## explicit
 github.com/DATA-DOG/go-sqlmock
+# github.com/EricLagergren/go-gnulib v0.0.0-20191129172535-039a51fc60f4
+## explicit
+github.com/EricLagergren/go-gnulib/dirent
+github.com/EricLagergren/go-gnulib/util
 # github.com/StackExchange/wmi v0.0.0-20190523213315-cbe66965904d
 ## explicit
 github.com/StackExchange/wmi
