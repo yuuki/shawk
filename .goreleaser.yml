@@ -5,14 +5,16 @@ before:
   hooks:
     - go mod tidy
 builds:
-  - main: cmd/ttracerd/
+  - id: "ttracerd"
+    main: cmd/ttracerd/
     binary: ttracerd
     ldflags:
       - -s -w
       - -X version.version={{.Version}}
       - -X version.commit={{.ShortCommit}}
       - -X version.date={{.Date}}
-  - main: cmd/ttctl/
+  - id: "ttctl"
+    main: cmd/ttctl/
     binary: ttctl
     ldflags:
       - -s -w
