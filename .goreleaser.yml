@@ -6,15 +6,20 @@ before:
     - go mod tidy
 builds:
   - id: "ttracerd"
-    main: cmd/ttracerd/
+    main: ./cmd/ttracerd/
     binary: ttracerd
     ldflags:
       - -s -w
       - -X version.version={{.Version}}
       - -X version.commit={{.ShortCommit}}
       - -X version.date={{.Date}}
+    goos:
+      - linux
+    goarch:
+      - 386
+      - amd64
   - id: "ttctl"
-    main: cmd/ttctl/
+    main: ./cmd/ttctl/
     binary: ttctl
     ldflags:
       - -s -w
@@ -23,11 +28,16 @@ builds:
       - -X version.date={{.Date}}
     env:
       - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - 386
+      - amd64
+    ignore:
+      - goos: darwin
+        goarch: 386
 archives:
   - name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}{{ if .Arm }}v{{ .Arm }}{{ end }}"
-    replacements:
-      linux: linux
-      386: i386
-      amd64: x86_64
 release:
   prerelease: auto
