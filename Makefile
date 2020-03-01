@@ -32,10 +32,7 @@ devel-deps:
         golang.org/x/tools/cmd/cover \
         github.com/mattn/goveralls \
         github.com/motemen/gobump/cmd/gobump \
-        github.com/Songmu/ghch/cmd/ghch \
-        github.com/Songmu/goxz/cmd/goxz \
-        github.com/tcnksm/ghr \
-        github.com/Songmu/gocredits/cmd/gocredits
+        github.com/Songmu/ghch/cmd/ghch
 
 .PHONY: credits
 credits: devel-deps
@@ -66,13 +63,6 @@ check:
 	structcheck ./... || true
 	varcheck ./... || true
 
-.PHONY: crossbuild
-crossbuild: devel-deps credits
-	$(eval ver = $(shell gobump show -r version))
-	goxz -pv=v$(ver) -os=linux -arch=386,amd64 -build-ldflags="$(RELEASE_BUILD_LDFLAGS)" \
-	  -d=./dist/v$(ver) $(PKG)/cmd/ttracerd $(PKG)/cmd/ttctl
-
 .PHONY: release
 release: devel-deps
 	_tools/release
-	_tools/upload_artifacts

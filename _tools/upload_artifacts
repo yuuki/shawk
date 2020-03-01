@@ -1,6 +1,0 @@
-#!/bin/bash
-set -e
-
-ver=v$(gobump show -r version)
-make crossbuild
-ghr -username yuuki -replace ${ver} dist/${ver}
