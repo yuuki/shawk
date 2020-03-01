@@ -9,7 +9,7 @@ BUILD_LDFLAGS = -X $(PKG)/version.commit=$(COMMIT) -X $(PKG)/version.date=$(DATE
 CREDITS = ./assets/CREDITS
 
 .PHONY: build
-build: build-deps
+build: build-deps credits
 	go generate ./...
 	go build -ldflags="$(BUILD_LDFLAGS)" ./cmd/ttracerd/
 	go build -ldflags="$(BUILD_LDFLAGS)" ./cmd/ttctl/
@@ -35,7 +35,7 @@ devel-deps:
         github.com/Songmu/ghch/cmd/ghch
 
 .PHONY: credits
-credits: devel-deps
+credits:
 	gocredits > $(CREDITS)
 ifneq (,$(git status -s $(CREDITS)))
 	go generate -x ./...
