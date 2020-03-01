@@ -1,7 +1,6 @@
 project_name: transtracer
 env:
   - GO111MODULE=on
-  - GOPROXY=https://gocenter.io
 before:
   hooks:
     - go mod tidy
