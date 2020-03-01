@@ -1,0 +1,32 @@
+project_name: transtracer
+env:
+  - GO111MODULE=on
+  - GOPROXY=https://gocenter.io
+before:
+  hooks:
+    - go mod tidy
+builds:
+  - main: cmd/ttracerd/
+    binary: ttracerd
+    ldflags:
+      - -s -w
+      - -X version.version={{.Version}}
+      - -X version.commit={{.ShortCommit}}
+      - -X version.date={{.Date}}
+  - main: cmd/ttctl/
+    binary: ttctl
+    ldflags:
+      - -s -w
+      - -X version.version={{.Version}}
+      - -X version.commit={{.ShortCommit}}
+      - -X version.date={{.Date}}
+    env:
+      - CGO_ENABLED=0
+archives:
+  - name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}{{ if .Arm }}v{{ .Arm }}{{ end }}"
+    replacements:
+      linux: linux
+      386: i386
+      amd64: x86_64
+release:
+  prerelease: auto
