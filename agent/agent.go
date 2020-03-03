@@ -12,7 +12,7 @@ import (
 )
 
 // Start starts agent.
-func Start(interval time.Duration, db *db.DB) {
+func Start(interval time.Duration, flushInterval time.Duration, db *db.DB) {
 	go Watch(interval, db)
 
 	sigch := make(chan os.Signal, 1)
@@ -54,7 +54,7 @@ func RunOnce(db *db.DB) error {
 }
 
 // collectAndPostHostFlows collect host flows and
-// post it to the data store.
+// store it to the buffer store.
 func collectAndPostHostFlows(db *db.DB, errChan chan error) {
 	start := time.Now()
 	flows, err := collector.CollectHostFlows()
@@ -68,5 +68,25 @@ func collectAndPostHostFlows(db *db.DB, errChan chan error) {
 		log.Printf("%s [collect] %s\n", logtime, f)
 	}
 	log.Printf("%s [elapsed] %s\n", logtime, elapsed)
-	errChan <- db.InsertOrUpdateHostFlows(flows)
+}
+
+// Flusher flushes data into the CMDB periodically.
+func Flusher(interval time.Duration, db *db.DB) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	errChan := make(chan error, 1)
+	for {
+		select {
+		case err := <-errChan:
+			if err != nil {
+				log.Printf("%+v\n", err)
+			}
+		case <-ticker.C:
+			flush(db, errChan)
+		}
+	}
+}
+
+func flush(db *db.DB, errChan chan error) {
+	// errChan <- db.InsertOrUpdateHostFlows(flows)
 }

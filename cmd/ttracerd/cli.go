@@ -14,9 +14,10 @@ import (
 )
 
 const (
-	exitCodeOK         = 0
-	exitCodeErr        = 10 + iota
-	defaultIntervalSec = 5
+	exitCodeOK              = 0
+	exitCodeErr             = 10 + iota
+	defaultIntervalSec      = 5
+	defaultFlushIntervalSec = 30
 )
 
 // CLI is the command line object.
@@ -35,13 +36,14 @@ func (c *CLI) Run(args []string) int {
 		ver     bool
 		credits bool
 
-		once        bool
-		dbuser      string
-		dbpass      string
-		dbhost      string
-		dbport      string
-		dbname      string
-		intervalSec int
+		once             bool
+		dbuser           string
+		dbpass           string
+		dbhost           string
+		dbport           string
+		dbname           string
+		intervalSec      int
+		flushIntervalSec int
 	)
 	flags := flag.NewFlagSet("transtracerd", flag.ContinueOnError)
 	flags.SetOutput(c.errStream)
@@ -55,6 +57,7 @@ func (c *CLI) Run(args []string) int {
 	flags.StringVar(&dbport, "dbport", "", "")
 	flags.StringVar(&dbname, "dbname", "", "")
 	flags.IntVar(&intervalSec, "interval-sec", defaultIntervalSec, "")
+	flags.IntVar(&flushIntervalSec, "flush-interval-sec", defaultFlushIntervalSec, "")
 	flags.BoolVar(&ver, "version", false, "")
 	flags.BoolVar(&credits, "credits", false, "")
 	if err := flags.Parse(args[1:]); err != nil {
@@ -95,7 +98,8 @@ func (c *CLI) Run(args []string) int {
 			return exitCodeErr
 		}
 	} else {
-		agent.Start(time.Duration(intervalSec)*time.Second, db)
+		agent.Start(time.Duration(intervalSec)*time.Second,
+			time.Duration(flushIntervalSec)*time.Second, db)
 	}
 
 	return exitCodeOK
@@ -113,6 +117,7 @@ Options:
   --dbport                  postgres port
   --dbname                  postgres database name
   --interval-sec            interval of scan connection stats
+  --flush-interval-sec      interval of flushing data into the CMDB.
   --version, -v	            print version
   --help, -h                print help
 `
