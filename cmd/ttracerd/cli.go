@@ -105,7 +105,7 @@ func (c *CLI) Run(args []string) int {
 	return exitCodeOK
 }
 
-var helpText = `Usage: ttracerd [options]
+var helpText = fmt.Sprintf(`Usage: ttracerd [options]
 
   
 
@@ -116,8 +116,8 @@ Options:
   --dbhost                  postgres host
   --dbport                  postgres port
   --dbname                  postgres database name
-  --interval-sec            interval of scan connection stats
-  --flush-interval-sec      interval of flushing data into the CMDB.
+  --interval-sec            interval of scan connection stats (default: %d)
+  --flush-interval-sec      interval of flushing data into the CMDB (default: %d)
   --version, -v	            print version
   --help, -h                print help
-`
+`, defaultIntervalSec, defaultFlushIntervalSec)
