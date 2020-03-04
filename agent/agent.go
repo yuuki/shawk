@@ -48,7 +48,7 @@ func Watch(interval time.Duration, buffer flowBuffer, db *db.DB) {
 				log.Printf("%+v\n", err)
 			}
 		case <-ticker.C:
-			go collectAndPostHostFlows(db, buffer, errChan)
+			go scanFlows(db, buffer, errChan)
 		}
 	}
 }
@@ -57,13 +57,13 @@ func Watch(interval time.Duration, buffer flowBuffer, db *db.DB) {
 func RunOnce(db *db.DB) error {
 	errChan := make(chan error, 1)
 	buffer := make(flowBuffer, 1)
-	collectAndPostHostFlows(db, buffer, errChan)
+	scanFlows(db, buffer, errChan)
 	return <-errChan
 }
 
-// collectAndPostHostFlows collect host flows and
+// scanFlows scans host flows and
 // store it to the buffer store.
-func collectAndPostHostFlows(db *db.DB, buffer flowBuffer, errChan chan error) {
+func scanFlows(db *db.DB, buffer flowBuffer, errChan chan error) {
 	start := time.Now()
 	flows, err := collector.CollectHostFlows()
 	if err != nil {
