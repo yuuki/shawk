@@ -9,11 +9,18 @@ import (
 
 	"github.com/yuuki/transtracer/collector"
 	"github.com/yuuki/transtracer/db"
+	"github.com/yuuki/transtracer/internal/lstf/tcpflow"
 )
+
+type flowBuffer chan []*tcpflow.HostFlow
 
 // Start starts agent.
 func Start(interval time.Duration, flushInterval time.Duration, db *db.DB) {
-	go Watch(interval, db)
+	buffer := make(flowBuffer, flushInterval/interval+1)
+	defer close(buffer)
+
+	go Watch(interval, buffer, db)
+	go Flusher(flushInterval, buffer, db)
 
 	sigch := make(chan os.Signal, 1)
 	signal.Notify(sigch, syscall.SIGTERM, syscall.SIGINT)
@@ -30,7 +37,7 @@ func Start(interval time.Duration, flushInterval time.Duration, db *db.DB) {
 }
 
 // Watch watches host flows for localhost.
-func Watch(interval time.Duration, db *db.DB) {
+func Watch(interval time.Duration, buffer flowBuffer, db *db.DB) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	errChan := make(chan error, 1)
@@ -41,7 +48,7 @@ func Watch(interval time.Duration, db *db.DB) {
 				log.Printf("%+v\n", err)
 			}
 		case <-ticker.C:
-			go collectAndPostHostFlows(db, errChan)
+			go collectAndPostHostFlows(db, buffer, errChan)
 		}
 	}
 }
@@ -49,13 +56,14 @@ func Watch(interval time.Duration, db *db.DB) {
 // RunOnce runs agent once.
 func RunOnce(db *db.DB) error {
 	errChan := make(chan error, 1)
-	collectAndPostHostFlows(db, errChan)
+	buffer := make(flowBuffer, 1)
+	collectAndPostHostFlows(db, buffer, errChan)
 	return <-errChan
 }
 
 // collectAndPostHostFlows collect host flows and
 // store it to the buffer store.
-func collectAndPostHostFlows(db *db.DB, errChan chan error) {
+func collectAndPostHostFlows(db *db.DB, buffer flowBuffer, errChan chan error) {
 	start := time.Now()
 	flows, err := collector.CollectHostFlows()
 	if err != nil {
@@ -68,10 +76,12 @@ func collectAndPostHostFlows(db *db.DB, errChan chan error) {
 		log.Printf("%s [collect] %s\n", logtime, f)
 	}
 	log.Printf("%s [elapsed] %s\n", logtime, elapsed)
+
+	buffer <- flows
 }
 
 // Flusher flushes data into the CMDB periodically.
-func Flusher(interval time.Duration, db *db.DB) {
+func Flusher(interval time.Duration, buffer flowBuffer, db *db.DB) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	errChan := make(chan error, 1)
@@ -82,11 +92,21 @@ func Flusher(interval time.Duration, db *db.DB) {
 				log.Printf("%+v\n", err)
 			}
 		case <-ticker.C:
-			flush(db, errChan)
+			go flush(db, buffer, errChan)
 		}
 	}
 }
 
-func flush(db *db.DB, errChan chan error) {
-	// errChan <- db.InsertOrUpdateHostFlows(flows)
+func flush(db *db.DB, buffer flowBuffer, errChan chan error) {
+	size := len(buffer)
+	for i := 0; i < size; i++ {
+		flows := <-buffer
+		if err := db.InsertOrUpdateHostFlows(flows); err != nil {
+			errChan <- err
+			break
+		}
+	}
+
+	logtime := time.Now().Format("2006-01-02 15:04:05")
+	log.Printf("%s: [buffer size] %d, completed to insert flows to the CMDB\n", logtime, size)
 }
