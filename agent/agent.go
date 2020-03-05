@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -15,7 +16,13 @@ import (
 type flowBuffer chan []*tcpflow.HostFlow
 
 // Start starts agent.
-func Start(interval time.Duration, flushInterval time.Duration, db *db.DB) {
+func Start(interval time.Duration, flushInterval time.Duration, db *db.DB) error {
+	if interval > flushInterval {
+		return fmt.Errorf(
+			"polling interval (%s) must not exceed flush interval (%s)",
+			interval, flushInterval)
+	}
+
 	buffer := make(flowBuffer, flushInterval/interval+1)
 	defer close(buffer)
 
@@ -30,10 +37,11 @@ func Start(interval time.Duration, flushInterval time.Duration, db *db.DB) {
 	time.Sleep(3 * time.Second)
 	log.Println("--> Closing db connection...")
 	if err := db.Close(); err != nil {
-		log.Println(err)
-		return
+		return err
 	}
 	log.Println("Closed db connection")
+
+	return nil
 }
 
 // Watch watches host flows for localhost.
