@@ -1,3 +1,7 @@
+## [v0.3.0](https://github.com/yuuki/transtracer/compare/v0.2.0...v0.3.0) (2020-03-07)
+
+* Variable interval of flushing to the CMDB [#14](https://github.com/yuuki/transtracer/pull/14) ([yuuki](https://github.com/yuuki))
+
 ## [v0.2.0](https://github.com/yuuki/transtracer/compare/v0.1.2...v0.2.0) (2020-03-01)
 
 * Release by GitHub actions [#13](https://github.com/yuuki/transtracer/pull/13) ([yuuki](https://github.com/yuuki))
