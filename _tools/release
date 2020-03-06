@@ -18,4 +18,4 @@ ghch -w -N "v$next_version"
 
 git commit -am "Bump version $next_version"
 git tag "v$next_version"
-git push && git push --tags
+git push origin HEAD && git push --tags
