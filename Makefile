@@ -44,7 +44,7 @@ endif
 .PHONY: lint
 lint:
 	go vet ./...
-	golint -set_exit_status ./...
+	golint -set_exit_status `go list -mod=vendor ./...`
 
 .PHONY: check-deps
 check-deps:
