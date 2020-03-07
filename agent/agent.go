@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"log"
 	"os"
 	"os/signal"
 	"syscall"
@@ -28,15 +27,15 @@ func Start(interval time.Duration, flushInterval time.Duration, db *db.DB) {
 	sigch := make(chan os.Signal, 1)
 	signal.Notify(sigch, syscall.SIGTERM, syscall.SIGINT)
 	sig := <-sigch
-	log.Printf("Received %s gracefully shutdown...\n", sig)
+	logger.Infof("Received %s gracefully shutdown...", sig)
 
 	time.Sleep(3 * time.Second)
-	log.Println("--> Closing db connection...")
+	logger.Infof("--> Closing db connection...")
 	if err := db.Close(); err != nil {
-		log.Println(err)
+		logger.Infof("%s", err)
 		return
 	}
-	log.Println("Closed db connection")
+	logger.Infof("Closed db connection")
 }
 
 // Watch watches host flows for localhost.
@@ -48,7 +47,7 @@ func Watch(interval time.Duration, buffer flowBuffer, db *db.DB) {
 		select {
 		case err := <-errChan:
 			if err != nil {
-				log.Printf("%+v\n", err)
+				logger.Errorf("%+v", err)
 			}
 		case <-ticker.C:
 			go scanFlows(db, buffer, errChan)
@@ -91,7 +90,7 @@ func Flusher(interval time.Duration, buffer flowBuffer, db *db.DB) {
 		select {
 		case err := <-errChan:
 			if err != nil {
-				log.Printf("%+v\n", err)
+				logger.Errorf("%+v\n", err)
 			}
 		case <-ticker.C:
 			go flush(db, buffer, errChan)

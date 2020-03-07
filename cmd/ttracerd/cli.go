@@ -77,7 +77,7 @@ func (c *CLI) Run(args []string) int {
 	if credits {
 		text, err := statik.FindString("/CREDITS")
 		if err != nil {
-			log.Fatalln(err)
+			logger.Criticalf("%v", err)
 		}
 		fmt.Fprintln(c.outStream, text)
 		return exitCodeOK
