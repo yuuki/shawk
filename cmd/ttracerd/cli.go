@@ -35,6 +35,7 @@ func (c *CLI) Run(args []string) int {
 	var (
 		ver     bool
 		credits bool
+		debug   bool
 
 		once             bool
 		dbuser           string
@@ -60,6 +61,7 @@ func (c *CLI) Run(args []string) int {
 	flags.IntVar(&flushIntervalSec, "flush-interval-sec", defaultFlushIntervalSec, "")
 	flags.BoolVar(&ver, "version", false, "")
 	flags.BoolVar(&credits, "credits", false, "")
+	flags.BoolVar(&debug, "debug", false, "")
 	if err := flags.Parse(args[1:]); err != nil {
 		return exitCodeErr
 	}
@@ -107,7 +109,7 @@ func (c *CLI) Run(args []string) int {
 
 var helpText = fmt.Sprintf(`Usage: ttracerd [options]
 
-  
+An agent process for collecting flows and processes.
 
 Options:
   --once                    run once
@@ -118,6 +120,8 @@ Options:
   --dbname                  postgres database name
   --interval-sec            interval of scan connection stats (default: %d)
   --flush-interval-sec      interval of flushing data into the CMDB (default: %d)
+  --debug                   run with debug information
+  --credits                 print credits
   --version, -v	            print version
   --help, -h                print help
 `, defaultIntervalSec, defaultFlushIntervalSec)

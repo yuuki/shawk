@@ -7,12 +7,15 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/mackerelio/golib/logging"
 	"github.com/yuuki/transtracer/collector"
 	"github.com/yuuki/transtracer/db"
 	"github.com/yuuki/transtracer/internal/lstf/tcpflow"
 )
 
 type flowBuffer chan []*tcpflow.HostFlow
+
+var logger = logging.GetLogger("agent")
 
 // Start starts agent.
 func Start(interval time.Duration, flushInterval time.Duration, db *db.DB) {
@@ -71,11 +74,10 @@ func scanFlows(db *db.DB, buffer flowBuffer, errChan chan error) {
 		return
 	}
 	elapsed := time.Since(start)
-	logtime := time.Now().Format("2006-01-02 15:04:05")
 	for _, f := range flows {
-		log.Printf("%s [collect] %s\n", logtime, f)
+		logger.Debugf("completed to collect flows: %s", f)
 	}
-	log.Printf("%s [elapsed] %s\n", logtime, elapsed)
+	logger.Debugf("elapsed time for collect flows [%s]", elapsed)
 
 	buffer <- flows
 }
@@ -107,6 +109,5 @@ func flush(db *db.DB, buffer flowBuffer, errChan chan error) {
 		}
 	}
 
-	logtime := time.Now().Format("2006-01-02 15:04:05")
-	log.Printf("%s: [buffer size] %d, completed to insert flows to the CMDB\n", logtime, size)
+	logger.Debugf("completed to insert flows to the CMDB (buffer size: %d) \n", size)
 }
