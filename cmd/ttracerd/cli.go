@@ -7,9 +7,9 @@ import (
 	"log"
 	"time"
 
-	"github.com/mackerelio/golib/logging"
 	"github.com/yuuki/transtracer/agent"
 	"github.com/yuuki/transtracer/db"
+	"github.com/yuuki/transtracer/logging"
 	"github.com/yuuki/transtracer/statik"
 	"github.com/yuuki/transtracer/version"
 )
@@ -21,7 +21,7 @@ const (
 	defaultFlushIntervalSec = 30
 )
 
-var logger = logging.GetLogger("main")
+var logger = logging.New("main")
 
 // CLI is the command line object.
 type CLI struct {
@@ -77,7 +77,7 @@ func (c *CLI) Run(args []string) int {
 	if credits {
 		text, err := statik.FindString("/CREDITS")
 		if err != nil {
-			logger.Criticalf("%v", err)
+			logger.Fatalf("%v", err)
 		}
 		fmt.Fprintln(c.outStream, text)
 		return exitCodeOK
@@ -96,14 +96,14 @@ func (c *CLI) Run(args []string) int {
 		Port:     dbport,
 	})
 	if err != nil {
-		logger.Infof("postgres initialize error: %v", err)
+		logger.Errorf("postgres initialize error: %v", err)
 		return exitCodeErr
 	}
 	logger.Infof("Connected postgres")
 
 	if once {
 		if err := agent.RunOnce(db); err != nil {
-			log.Printf("%+v\n", err)
+			logger.Errorf("%+v", err)
 			return exitCodeErr
 		}
 	} else {

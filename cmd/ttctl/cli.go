@@ -4,11 +4,10 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
 	"net"
 
-	"github.com/mackerelio/golib/logging"
 	"github.com/yuuki/transtracer/db"
+	"github.com/yuuki/transtracer/logging"
 	"github.com/yuuki/transtracer/statik"
 	"github.com/yuuki/transtracer/version"
 )
@@ -26,12 +25,12 @@ type CLI struct {
 	outStream, errStream io.Writer
 }
 
-var logger = logging.GetLogger("main")
+var logger = logging.New("main")
 
 // Run execute the main process.
 // It returns exit code.
 func (c *CLI) Run(args []string) int {
-	log.SetOutput(c.errStream)
+	logger.SetOutput(c.errStream)
 
 	var (
 		ver     bool
@@ -73,7 +72,7 @@ func (c *CLI) Run(args []string) int {
 	if credits {
 		text, err := statik.FindString("CREDITS")
 		if err != nil {
-			logger.Criticalf("%v", err)
+			logger.Fatalf("%v", err)
 		}
 		fmt.Fprintln(c.outStream, text)
 		return exitCodeOK

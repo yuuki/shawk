@@ -6,15 +6,15 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/mackerelio/golib/logging"
 	"github.com/yuuki/transtracer/collector"
 	"github.com/yuuki/transtracer/db"
 	"github.com/yuuki/transtracer/internal/lstf/tcpflow"
+	"github.com/yuuki/transtracer/logging"
 )
 
 type flowBuffer chan []*tcpflow.HostFlow
 
-var logger = logging.GetLogger("agent")
+var logger = logging.New("agent")
 
 // Start starts agent.
 func Start(interval time.Duration, flushInterval time.Duration, db *db.DB) {
@@ -32,7 +32,7 @@ func Start(interval time.Duration, flushInterval time.Duration, db *db.DB) {
 	time.Sleep(3 * time.Second)
 	logger.Infof("--> Closing db connection...")
 	if err := db.Close(); err != nil {
-		logger.Infof("%s", err)
+		logger.Errorf("%s", err)
 		return
 	}
 	logger.Infof("Closed db connection")
