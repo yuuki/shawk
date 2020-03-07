@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -19,9 +18,12 @@ import (
 	"github.com/EricLagergren/go-gnulib/dirent"
 	"github.com/elastic/gosigar/sys/linux"
 	gnet "github.com/shirou/gopsutil/net"
+	"github.com/yuuki/transtracer/logging"
 	"golang.org/x/sys/unix"
 	"golang.org/x/xerrors"
 )
+
+var logger = logging.New("netutil")
 
 // NetlinkError represents netlink error.
 type NetlinkError struct {
@@ -111,7 +113,7 @@ func ProcfsConnections() ([]*ConnectionStat, error) {
 		raddr := l[2]
 		status, err := strconv.ParseUint(l[3], 16, 8)
 		if err != nil {
-			log.Printf("decode error: %v", err)
+			logger.Tracef("decode error: %v", err)
 		}
 		la, err := decodeAddress(laddr)
 		if err != nil {
