@@ -4,10 +4,10 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
 	"net"
 
 	"github.com/yuuki/transtracer/db"
+	"github.com/yuuki/transtracer/logging"
 	"github.com/yuuki/transtracer/statik"
 	"github.com/yuuki/transtracer/version"
 )
@@ -25,10 +25,12 @@ type CLI struct {
 	outStream, errStream io.Writer
 }
 
+var logger = logging.New("main")
+
 // Run execute the main process.
 // It returns exit code.
 func (c *CLI) Run(args []string) int {
-	log.SetOutput(c.errStream)
+	logger.SetOutput(c.errStream)
 
 	var (
 		ver     bool
@@ -43,7 +45,7 @@ func (c *CLI) Run(args []string) int {
 		ipv4         string
 		depth        int
 	)
-	flags := flag.NewFlagSet("mftctl", flag.ContinueOnError)
+	flags := flag.NewFlagSet("ttctl", flag.ContinueOnError)
 	flags.SetOutput(c.errStream)
 	flags.Usage = func() {
 		fmt.Fprint(c.errStream, helpText)
@@ -70,7 +72,7 @@ func (c *CLI) Run(args []string) int {
 	if credits {
 		text, err := statik.FindString("CREDITS")
 		if err != nil {
-			log.Fatalln(err)
+			logger.Fatalf("%v", err)
 		}
 		fmt.Fprintln(c.outStream, text)
 		return exitCodeOK
@@ -85,7 +87,7 @@ func (c *CLI) Run(args []string) int {
 	}
 
 	if depth <= 0 || depth > maxGraphDepth {
-		log.Printf("depth must be 0 < depth < %d, but specified %d\n", maxGraphDepth, depth)
+		logger.Errorf("depth must be 0 < depth < %d, but specified %d\n", maxGraphDepth, depth)
 		return exitCodeErr
 	}
 
@@ -101,17 +103,17 @@ func (c *CLI) Run(args []string) int {
 }
 
 func (c *CLI) createSchema(opt *db.Opt) int {
-	log.Println("Connecting postgres ...")
+	logger.Infof("Connecting postgres ...")
 
 	db, err := db.New(opt)
 	if err != nil {
-		log.Printf("postgres initialize error: %v\n", err)
+		logger.Errorf("postgres initialize error: %v", err)
 		return exitCodeErr
 	}
 
-	log.Println("Creating postgres schema ...")
+	logger.Infof("Creating postgres schema ...")
 	if err := db.CreateSchema(); err != nil {
-		log.Printf("postgres initialize error: %v\n", err)
+		logger.Errorf("postgres initialize error: %v", err)
 		return exitCodeErr
 	}
 	return exitCodeOK
@@ -120,7 +122,7 @@ func (c *CLI) createSchema(opt *db.Opt) int {
 func (c *CLI) doIPv4(ipv4 string, depth int, opt *db.Opt) int {
 	db, err := db.New(opt)
 	if err != nil {
-		log.Printf("postgres initialize error: %v\n", err)
+		logger.Errorf("postgres initialize error: %v", err)
 		return exitCodeErr
 	}
 	addr := net.ParseIP(ipv4)
@@ -128,7 +130,7 @@ func (c *CLI) doIPv4(ipv4 string, depth int, opt *db.Opt) int {
 	// print thet flows of passive nodes
 	pflows, err := db.FindPassiveFlows([]net.IP{addr})
 	if err != nil {
-		log.Printf("find active flows error: %v\n", err)
+		logger.Errorf("find active flows error: %v", err)
 		return exitCodeErr
 	}
 	for _, flows := range pflows {
@@ -142,7 +144,7 @@ func (c *CLI) doIPv4(ipv4 string, depth int, opt *db.Opt) int {
 	// print the flows of active nodes
 	aflows, err := db.FindActiveFlows([]net.IP{addr})
 	if err != nil {
-		log.Printf("find active flows error: %v\n", err)
+		logger.Errorf("find active flows error: %v", err)
 		return exitCodeErr
 	}
 	for _, flows := range aflows {

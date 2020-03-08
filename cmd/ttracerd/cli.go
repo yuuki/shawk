@@ -9,6 +9,7 @@ import (
 
 	"github.com/yuuki/transtracer/agent"
 	"github.com/yuuki/transtracer/db"
+	"github.com/yuuki/transtracer/logging"
 	"github.com/yuuki/transtracer/statik"
 	"github.com/yuuki/transtracer/version"
 )
@@ -19,6 +20,8 @@ const (
 	defaultIntervalSec      = 5
 	defaultFlushIntervalSec = 30
 )
+
+var logger = logging.New("main")
 
 // CLI is the command line object.
 type CLI struct {
@@ -35,6 +38,7 @@ func (c *CLI) Run(args []string) int {
 	var (
 		ver     bool
 		credits bool
+		debug   bool
 
 		once             bool
 		dbuser           string
@@ -60,6 +64,7 @@ func (c *CLI) Run(args []string) int {
 	flags.IntVar(&flushIntervalSec, "flush-interval-sec", defaultFlushIntervalSec, "")
 	flags.BoolVar(&ver, "version", false, "")
 	flags.BoolVar(&credits, "credits", false, "")
+	flags.BoolVar(&debug, "debug", false, "")
 	if err := flags.Parse(args[1:]); err != nil {
 		return exitCodeErr
 	}
@@ -72,13 +77,17 @@ func (c *CLI) Run(args []string) int {
 	if credits {
 		text, err := statik.FindString("/CREDITS")
 		if err != nil {
-			log.Fatalln(err)
+			logger.Fatalf("%v", err)
 		}
 		fmt.Fprintln(c.outStream, text)
 		return exitCodeOK
 	}
 
-	log.Println("--> Connecting postgres ...")
+	if debug {
+		logging.SetLogLevel(logging.DEBUG)
+	}
+
+	logger.Infof("--> Connecting postgres ...")
 	db, err := db.New(&db.Opt{
 		DBName:   dbname,
 		User:     dbuser,
@@ -87,14 +96,14 @@ func (c *CLI) Run(args []string) int {
 		Port:     dbport,
 	})
 	if err != nil {
-		log.Printf("postgres initialize error: %v\n", err)
+		logger.Errorf("postgres initialize error: %v", err)
 		return exitCodeErr
 	}
-	log.Println("Connected postgres")
+	logger.Infof("Connected postgres")
 
 	if once {
 		if err := agent.RunOnce(db); err != nil {
-			log.Printf("%+v\n", err)
+			logger.Errorf("%+v", err)
 			return exitCodeErr
 		}
 	} else {
@@ -107,7 +116,7 @@ func (c *CLI) Run(args []string) int {
 
 var helpText = fmt.Sprintf(`Usage: ttracerd [options]
 
-  
+An agent process for collecting flows and processes.
 
 Options:
   --once                    run once
@@ -118,6 +127,8 @@ Options:
   --dbname                  postgres database name
   --interval-sec            interval of scan connection stats (default: %d)
   --flush-interval-sec      interval of flushing data into the CMDB (default: %d)
+  --debug                   run with debug information
+  --credits                 print credits
   --version, -v	            print version
   --help, -h                print help
 `, defaultIntervalSec, defaultFlushIntervalSec)

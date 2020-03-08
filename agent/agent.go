@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"log"
 	"os"
 	"os/signal"
 	"syscall"
@@ -10,9 +9,12 @@ import (
 	"github.com/yuuki/transtracer/collector"
 	"github.com/yuuki/transtracer/db"
 	"github.com/yuuki/transtracer/internal/lstf/tcpflow"
+	"github.com/yuuki/transtracer/logging"
 )
 
 type flowBuffer chan []*tcpflow.HostFlow
+
+var logger = logging.New("agent")
 
 // Start starts agent.
 func Start(interval time.Duration, flushInterval time.Duration, db *db.DB) {
@@ -25,15 +27,15 @@ func Start(interval time.Duration, flushInterval time.Duration, db *db.DB) {
 	sigch := make(chan os.Signal, 1)
 	signal.Notify(sigch, syscall.SIGTERM, syscall.SIGINT)
 	sig := <-sigch
-	log.Printf("Received %s gracefully shutdown...\n", sig)
+	logger.Infof("Received %s gracefully shutdown...", sig)
 
 	time.Sleep(3 * time.Second)
-	log.Println("--> Closing db connection...")
+	logger.Infof("--> Closing db connection...")
 	if err := db.Close(); err != nil {
-		log.Println(err)
+		logger.Errorf("%s", err)
 		return
 	}
-	log.Println("Closed db connection")
+	logger.Infof("Closed db connection")
 }
 
 // Watch watches host flows for localhost.
@@ -45,7 +47,7 @@ func Watch(interval time.Duration, buffer flowBuffer, db *db.DB) {
 		select {
 		case err := <-errChan:
 			if err != nil {
-				log.Printf("%+v\n", err)
+				logger.Errorf("%+v", err)
 			}
 		case <-ticker.C:
 			go scanFlows(db, buffer, errChan)
@@ -71,11 +73,10 @@ func scanFlows(db *db.DB, buffer flowBuffer, errChan chan error) {
 		return
 	}
 	elapsed := time.Since(start)
-	logtime := time.Now().Format("2006-01-02 15:04:05")
 	for _, f := range flows {
-		log.Printf("%s [collect] %s\n", logtime, f)
+		logger.Debugf("completed to collect flows: %s", f)
 	}
-	log.Printf("%s [elapsed] %s\n", logtime, elapsed)
+	logger.Debugf("elapsed time for collect flows [%s]", elapsed)
 
 	buffer <- flows
 }
@@ -89,7 +90,7 @@ func Flusher(interval time.Duration, buffer flowBuffer, db *db.DB) {
 		select {
 		case err := <-errChan:
 			if err != nil {
-				log.Printf("%+v\n", err)
+				logger.Errorf("%+v\n", err)
 			}
 		case <-ticker.C:
 			go flush(db, buffer, errChan)
@@ -107,6 +108,5 @@ func flush(db *db.DB, buffer flowBuffer, errChan chan error) {
 		}
 	}
 
-	logtime := time.Now().Format("2006-01-02 15:04:05")
-	log.Printf("%s: [buffer size] %d, completed to insert flows to the CMDB\n", logtime, size)
+	logger.Debugf("completed to insert flows to the CMDB (buffer size: %d) \n", size)
 }
