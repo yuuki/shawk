@@ -4,7 +4,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
 	"time"
 
 	"github.com/yuuki/transtracer/agent"
@@ -33,7 +32,7 @@ type CLI struct {
 // Run execute the main process.
 // It returns exit code.
 func (c *CLI) Run(args []string) int {
-	log.SetOutput(c.errStream)
+	logging.SetOutput(c.errStream)
 
 	var (
 		ver     bool
