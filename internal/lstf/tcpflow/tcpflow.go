@@ -20,8 +20,11 @@ const (
 	// FlowPassive are 'passive open'
 	FlowPassive
 
-	FilterAll     = "all"
-	FilterPublic  = "public"
+	// FilterAll is the filter condition including public and private IP address.
+	FilterAll = "all"
+	// FilterPublic is the filter condition including public IP address.
+	FilterPublic = "public"
+	// FilterPrivate is the filter condition including private IP address.
 	FilterPrivate = "private"
 )
 

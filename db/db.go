@@ -327,7 +327,7 @@ func (n *Node) String() string {
 		n.IPAddr, port, n.Pname, n.Pgid)
 }
 
-// Flows represents a flow between a active node and a passive node.
+// Flow represents a flow between a active node and a passive node.
 type Flow struct {
 	ActiveNode  *Node
 	PassiveNode *Node
