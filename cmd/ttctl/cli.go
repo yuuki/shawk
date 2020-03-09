@@ -30,7 +30,7 @@ var logger = logging.New("main")
 // Run execute the main process.
 // It returns exit code.
 func (c *CLI) Run(args []string) int {
-	logger.SetOutput(c.errStream)
+	logging.SetOutput(c.errStream)
 
 	var (
 		ver     bool

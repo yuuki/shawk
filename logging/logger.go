@@ -35,7 +35,7 @@ func SetLogLevel(lv level) {
 }
 
 // SetOutput sets the output destination for the logger.
-func (logger *Logger) SetOutput(w io.Writer) {
+func SetOutput(w io.Writer) {
 	lgr.SetOutput(w)
 }
 
