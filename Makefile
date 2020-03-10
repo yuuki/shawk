@@ -9,7 +9,7 @@ BUILD_LDFLAGS = -X $(PKG)/version.commit=$(COMMIT) -X $(PKG)/version.date=$(DATE
 CREDITS = ./assets/CREDITS
 
 .PHONY: build
-build: build-deps credits
+build: build-deps tidy-module credits
 	go generate ./...
 	go build -ldflags="$(BUILD_LDFLAGS)" ./cmd/ttracerd/
 	go build -ldflags="$(BUILD_LDFLAGS)" ./cmd/ttctl/
@@ -18,12 +18,17 @@ build: build-deps credits
 build-deps:
 	go get github.com/rakyll/statik
 
+.PHONY: tidy-module
+tidy-module:
+	go mod tidy
+	go mod vendor
+
 .PHONY: install
 install:
 	go install $(PKG)/cmd/...
 
 .PHONY: test
-test:
+test: tidy-module
 	go test -v ./...
 
 .PHONY: devel-deps
