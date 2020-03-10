@@ -106,8 +106,12 @@ func (c *CLI) Run(args []string) int {
 			return exitCodeErr
 		}
 	} else {
-		agent.Start(time.Duration(intervalSec)*time.Second,
+		err := agent.Start(time.Duration(intervalSec)*time.Second,
 			time.Duration(flushIntervalSec)*time.Second, db)
+		if err != nil {
+			logger.Errorf("%+v", err)
+			return exitCodeErr
+		}
 	}
 
 	return exitCodeOK

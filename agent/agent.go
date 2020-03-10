@@ -10,6 +10,7 @@ import (
 	"github.com/yuuki/transtracer/db"
 	"github.com/yuuki/transtracer/internal/lstf/tcpflow"
 	"github.com/yuuki/transtracer/logging"
+	"golang.org/x/xerrors"
 )
 
 type flowBuffer chan []*tcpflow.HostFlow
@@ -17,7 +18,13 @@ type flowBuffer chan []*tcpflow.HostFlow
 var logger = logging.New("agent")
 
 // Start starts agent.
-func Start(interval time.Duration, flushInterval time.Duration, db *db.DB) {
+func Start(interval time.Duration, flushInterval time.Duration, db *db.DB) error {
+	if interval > flushInterval {
+		return xerrors.Errorf(
+			"polling interval (%s) must not exceed flush interval (%s)",
+			interval, flushInterval)
+	}
+
 	buffer := make(flowBuffer, flushInterval/interval+1)
 	defer close(buffer)
 
@@ -32,10 +39,11 @@ func Start(interval time.Duration, flushInterval time.Duration, db *db.DB) {
 	time.Sleep(3 * time.Second)
 	logger.Infof("--> Closing db connection...")
 	if err := db.Close(); err != nil {
-		logger.Errorf("%s", err)
-		return
+		return xerrors.Errorf("db close error: %w", err)
 	}
 	logger.Infof("Closed db connection")
+
+	return nil
 }
 
 // Watch watches host flows for localhost.
