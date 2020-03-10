@@ -9,7 +9,7 @@ import (
 const name = "transtracer"
 
 // version is application version.
-const version = "0.3.0"
+const version = "0.3.1"
 
 // commit describes latest git commit hash.
 // This is automatically extracted by git describe --always.
