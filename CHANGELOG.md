@@ -1,3 +1,8 @@
+## [v0.3.2](https://github.com/yuuki/transtracer/compare/v0.3.1...v0.3.2) (2020-03-10)
+
+* Validate interval option [#15](https://github.com/yuuki/transtracer/pull/15) ([yuuki](https://github.com/yuuki))
+* Release v0.3.1 [#19](https://github.com/yuuki/transtracer/pull/19) ([yuuki](https://github.com/yuuki))
+
 ## [v0.3.1](https://github.com/yuuki/transtracer/compare/v0.3.0...v0.3.1) (2020-03-09)
 
 * Make logging package set output [#18](https://github.com/yuuki/transtracer/pull/18) ([yuuki](https://github.com/yuuki))
