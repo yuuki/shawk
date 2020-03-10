@@ -8,6 +8,8 @@ github.com/EricLagergren/go-gnulib/util
 # github.com/StackExchange/wmi v0.0.0-20190523213315-cbe66965904d
 ## explicit
 github.com/StackExchange/wmi
+# github.com/davecgh/go-spew v1.1.1
+## explicit
 # github.com/elastic/gosigar v0.10.5
 ## explicit
 github.com/elastic/gosigar/sys
@@ -28,10 +30,8 @@ github.com/google/go-cmp/cmp/internal/value
 github.com/lib/pq
 github.com/lib/pq/oid
 github.com/lib/pq/scram
-# github.com/mackerelio/golib v1.0.0
-## explicit
-github.com/mackerelio/golib/logging
 # github.com/pkg/errors v0.9.1
+## explicit
 github.com/pkg/errors
 # github.com/rakyll/statik v0.1.7
 ## explicit
@@ -40,6 +40,8 @@ github.com/rakyll/statik/fs
 ## explicit
 github.com/shirou/gopsutil/internal/common
 github.com/shirou/gopsutil/net
+# github.com/stretchr/testify v1.3.0
+## explicit
 # golang.org/x/sys v0.0.0-20191029155521-f43be2a4598c
 ## explicit
 golang.org/x/sys/unix
