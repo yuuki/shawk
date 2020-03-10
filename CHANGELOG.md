@@ -1,3 +1,8 @@
+## [v0.3.1](https://github.com/yuuki/transtracer/compare/v0.3.0...v0.3.1) (2020-03-09)
+
+* Make logging package set output [#18](https://github.com/yuuki/transtracer/pull/18) ([yuuki](https://github.com/yuuki))
+* Debug option [#17](https://github.com/yuuki/transtracer/pull/17) ([yuuki](https://github.com/yuuki))
+
 ## [v0.3.0](https://github.com/yuuki/transtracer/compare/v0.2.0...v0.3.0) (2020-03-07)
 
 * Variable interval of flushing to the CMDB [#14](https://github.com/yuuki/transtracer/pull/14) ([yuuki](https://github.com/yuuki))
