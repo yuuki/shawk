@@ -9,15 +9,17 @@ BUILD_LDFLAGS = -X $(PKG)/version.commit=$(COMMIT) -X $(PKG)/version.date=$(DATE
 CREDITS = ./assets/CREDITS
 
 .PHONY: build
-build: build-deps tidy-module credits
+build: build-deps credits
 	go generate ./...
 	go build -ldflags="$(BUILD_LDFLAGS)" ./cmd/ttracerd/
 	go build -ldflags="$(BUILD_LDFLAGS)" ./cmd/ttctl/
 
 .PHONY: build-deps
-build-deps:
+build-deps: _build-deps tidy-module
+
+.PHONY: _build-deps
+_build-deps:
 	go get github.com/rakyll/statik
-	go mod tidy
 
 .PHONY: tidy-module
 tidy-module:
@@ -29,18 +31,20 @@ install:
 	go install $(PKG)/cmd/...
 
 .PHONY: test
-test: tidy-module
+test:
 	go test -v ./...
 
 .PHONY: devel-deps
-devel-deps:
+devel-deps: _devel-deps tidy-module
+
+.PHONY: _devel-deps
+_devel-deps:
 	go get \
         golang.org/x/tools/cmd/cover \
         github.com/mattn/goveralls \
         github.com/x-motemen/gobump/cmd/gobump \
         github.com/Songmu/ghch/cmd/ghch \
         github.com/Songmu/gocredits/cmd/gocredits
-	go mod tidy
 
 .PHONY: credits
 credits:
