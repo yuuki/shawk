@@ -64,7 +64,7 @@ check-deps:
 	go mod tidy
 
 .PHONY: check
-check:
+check: check-deps
 	errcheck -asserts -blank -ignoretests -ignoregenerated -ignore 'Close,Fprint' ./... || true
 	staticcheck ./... || true
 	aligncheck ./... || true
