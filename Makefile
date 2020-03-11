@@ -17,6 +17,7 @@ build: build-deps tidy-module credits
 .PHONY: build-deps
 build-deps:
 	go get github.com/rakyll/statik
+	go mod tidy
 
 .PHONY: tidy-module
 tidy-module:
@@ -33,11 +34,12 @@ test: tidy-module
 
 .PHONY: devel-deps
 devel-deps:
-	GO111MODULE=off go get -v \
+	go get \
         golang.org/x/tools/cmd/cover \
         github.com/mattn/goveralls \
         github.com/motemen/gobump/cmd/gobump \
         github.com/Songmu/ghch/cmd/ghch
+	go mod tidy
 
 .PHONY: credits
 credits:
@@ -53,12 +55,13 @@ lint:
 
 .PHONY: check-deps
 check-deps:
-	GO111MODULE=off go get -v \
+	go get \
         honnef.co/go/tools/cmd/staticcheck \
 		github.com/kisielk/errcheck \
 		gitlab.com/opennota/check/cmd/aligncheck \
 		gitlab.com/opennota/check/cmd/structcheck \
 		gitlab.com/opennota/check/cmd/varcheck
+	go mod tidy
 
 .PHONY: check
 check:
