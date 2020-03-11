@@ -57,24 +57,6 @@ endif
 lint:
 	golangci-lint run ./...
 
-.PHONY: check-deps
-check-deps:
-	go get \
-        honnef.co/go/tools/cmd/staticcheck \
-		github.com/kisielk/errcheck \
-		gitlab.com/opennota/check/cmd/aligncheck \
-		gitlab.com/opennota/check/cmd/structcheck \
-		gitlab.com/opennota/check/cmd/varcheck
-	go mod tidy
-
-.PHONY: check
-check: check-deps
-	errcheck -asserts -blank -ignoretests -ignoregenerated -ignore 'Close,Fprint' ./... || true
-	staticcheck ./... || true
-	aligncheck ./... || true
-	structcheck ./... || true
-	varcheck ./... || true
-
 .PHONY: release
 release: devel-deps
 	_tools/release
