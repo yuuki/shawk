@@ -37,8 +37,9 @@ devel-deps:
 	go get \
         golang.org/x/tools/cmd/cover \
         github.com/mattn/goveralls \
-        github.com/motemen/gobump/cmd/gobump \
-        github.com/Songmu/ghch/cmd/ghch
+        github.com/x-motemen/gobump/cmd/gobump \
+        github.com/Songmu/ghch/cmd/ghch \
+        github.com/Songmu/gocredits/cmd/gocredits
 	go mod tidy
 
 .PHONY: credits

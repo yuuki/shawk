@@ -15,6 +15,6 @@ require (
 	github.com/rakyll/statik v0.1.7
 	github.com/shirou/gopsutil v2.19.9+incompatible
 	github.com/stretchr/testify v1.3.0 // indirect
-	golang.org/x/sys v0.0.0-20191029155521-f43be2a4598c
-	golang.org/x/xerrors v0.0.0-20191011141410-1b5146add898
+	golang.org/x/sys v0.0.0-20200122134326-e047566fdf82
+	golang.org/x/xerrors v0.0.0-20191204190536-9bdfabe68543
 )
