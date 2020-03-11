@@ -14,8 +14,10 @@ import (
 )
 
 const (
-	exitCodeOK              = 0
-	exitCodeErr             = 10 + iota
+	exitCodeOK  = 0
+	exitCodeErr = 10 + iota
+
+	defaultMode             = agent.POLLING_MODE
 	defaultIntervalSec      = 5
 	defaultFlushIntervalSec = 30
 )
@@ -39,6 +41,7 @@ func (c *CLI) Run(args []string) int {
 		credits bool
 		debug   bool
 
+		mode             string
 		once             bool
 		dbuser           string
 		dbpass           string
@@ -53,6 +56,7 @@ func (c *CLI) Run(args []string) int {
 	flags.Usage = func() {
 		fmt.Fprint(c.errStream, helpText)
 	}
+	flags.StringVar(&mode, "mode", defaultMode, "")
 	flags.BoolVar(&once, "once", false, "")
 	flags.StringVar(&dbuser, "dbuser", "", "")
 	flags.StringVar(&dbpass, "dbpass", "", "")
@@ -100,14 +104,23 @@ func (c *CLI) Run(args []string) int {
 	}
 	logger.Infof("Connected postgres")
 
-	if once {
-		if err := agent.RunOnce(db); err != nil {
-			logger.Errorf("%+v", err)
-			return exitCodeErr
+	switch mode {
+	case agent.POLLING_MODE:
+		if once {
+			if err := agent.RunOnce(db); err != nil {
+				logger.Errorf("%+v", err)
+				return exitCodeErr
+			}
+		} else {
+			err := agent.Start(time.Duration(intervalSec)*time.Second,
+				time.Duration(flushIntervalSec)*time.Second, db)
+			if err != nil {
+				logger.Errorf("%+v", err)
+				return exitCodeErr
+			}
 		}
-	} else {
-		err := agent.Start(time.Duration(intervalSec)*time.Second,
-			time.Duration(flushIntervalSec)*time.Second, db)
+	case agent.STREAMING_MODE:
+		err := agent.StartWithStreaming(db)
 		if err != nil {
 			logger.Errorf("%+v", err)
 			return exitCodeErr
@@ -122,15 +135,17 @@ var helpText = fmt.Sprintf(`Usage: ttracerd [options]
 An agent process for collecting flows and processes.
 
 Options:
-  --once                    run once
+  --mode                    agent mode ('polling' or 'streaming'. default: 'polling')
+  --once                    run once only if --mode='polling'
   --dbuser                  postgres user
   --dbpass                  postgres user password
   --dbhost                  postgres host
   --dbport                  postgres port
   --dbname                  postgres database name
-  --interval-sec            interval of scan connection stats (default: %d)
-  --flush-interval-sec      interval of flushing data into the CMDB (default: %d)
+  --interval-sec            interval of scan connection stats (default: %d) only if --mode='polling'
+  --flush-interval-sec      interval of flushing data into the CMDB (default: %d) only if --mode='polling'
   --debug                   run with debug information
+
   --credits                 print credits
   --version, -v	            print version
   --help, -h                print help

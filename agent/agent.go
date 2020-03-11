@@ -13,6 +13,11 @@ import (
 	"golang.org/x/xerrors"
 )
 
+const (
+	STREAMING_MODE = "streaming"
+	POLLING_MODE   = "polling"
+)
+
 type flowBuffer chan []*tcpflow.HostFlow
 
 var logger = logging.New("agent")
