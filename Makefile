@@ -50,8 +50,7 @@ endif
 
 .PHONY: lint
 lint:
-	go vet ./...
-	golint -set_exit_status `go list -mod=vendor ./...`
+	golangci-lint run ./...
 
 .PHONY: check-deps
 check-deps:
