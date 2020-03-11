@@ -47,7 +47,10 @@ func (logger *Logger) log(lv level, message string, args ...interface{}) {
 	if lv >= logLv {
 		// caller -> Infof() -> log()
 		const depth = 3
-		lgr.Output(depth, fmt.Sprintf(logger.message(lv, message), args...))
+		err := lgr.Output(depth, fmt.Sprintf(logger.message(lv, message), args...))
+		if err != nil {
+			log.Println(err)
+		}
 	}
 }
 
