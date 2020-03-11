@@ -153,9 +153,8 @@ func decodeAddress(src string) (Addr, error) {
 	if err != nil {
 		return Addr{}, xerrors.Errorf("decode error, %s", err)
 	}
-	var ip net.IP
 	// Assumes this is little_endian
-	ip = net.IP(gnet.Reverse(decoded))
+	ip := net.IP(gnet.Reverse(decoded))
 	return Addr{
 		IP:   ip.String(),
 		Port: uint32(port),
@@ -270,7 +269,7 @@ func BuildUserEntries() (UserEnts, error) {
 	}
 	defer stream.Close()
 
-	userEnts := make(UserEnts, 0)
+	userEnts := make(UserEnts)
 
 	for {
 		entry, err := stream.Read()

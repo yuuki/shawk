@@ -87,7 +87,7 @@ func (db *DB) CreateSchema() error {
 		if err != nil {
 			return xerrors.Errorf("get schema error '%s': %v", schema, err)
 		}
-		_, err = db.Exec(fmt.Sprintf("%s", sql))
+		_, err = db.Exec(sql)
 		if err != nil {
 			return xerrors.Errorf("exec schema error '%s': %s", sql, err)
 		}
@@ -377,7 +377,7 @@ func (db *DB) FindPassiveFlows(addrs []net.IP) (Flows, error) {
 	}
 	defer rows.Close()
 
-	flows := make(Flows, 0)
+	flows := make(Flows)
 	for rows.Next() {
 		var (
 			pipv4       string
@@ -459,7 +459,7 @@ func (db *DB) FindActiveFlows(addrs []net.IP) (Flows, error) {
 	}
 	defer rows.Close()
 
-	flows := make(Flows, 0)
+	flows := make(Flows)
 	for rows.Next() {
 		var (
 			aipv4       string
