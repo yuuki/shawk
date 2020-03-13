@@ -125,6 +125,10 @@ func (c *CLI) Run(args []string) int {
 			logger.Errorf("%+v", err)
 			return exitCodeErr
 		}
+	default:
+		fmt.Fprintf(c.errStream, "The value of --mode option must be '%s' or '%s'\n", agent.POLLING_MODE, agent.STREAMING_MODE)
+		fmt.Fprint(c.errStream, helpText)
+		return exitCodeErr
 	}
 
 	return exitCodeOK
