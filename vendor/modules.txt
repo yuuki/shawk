@@ -25,6 +25,11 @@ github.com/google/go-cmp/cmp/internal/diff
 github.com/google/go-cmp/cmp/internal/flags
 github.com/google/go-cmp/cmp/internal/function
 github.com/google/go-cmp/cmp/internal/value
+# github.com/iovisor/gobpf v0.0.0-20200311173154-8078b203833d
+## explicit
+github.com/iovisor/gobpf/elf
+github.com/iovisor/gobpf/pkg/bpffs
+github.com/iovisor/gobpf/pkg/cpuonline
 # github.com/lib/pq v1.2.0
 ## explicit
 github.com/lib/pq
