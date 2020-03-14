@@ -51,11 +51,9 @@ func (c *CLI) Run(args []string) int {
 		intervalSec      int
 		flushIntervalSec int
 	)
-	flags := flag.NewFlagSet("transtracerd", flag.ContinueOnError)
+	flags := flag.NewFlagSet("ttracerd", flag.ContinueOnError)
 	flags.SetOutput(c.errStream)
-	flags.Usage = func() {
-		fmt.Fprint(c.errStream, helpText)
-	}
+	flags.Usage = func() { printHelp(c.errStream) }
 	flags.StringVar(&mode, "mode", defaultMode, "")
 	flags.BoolVar(&once, "once", false, "")
 	flags.StringVar(&dbuser, "dbuser", "", "")
@@ -127,7 +125,7 @@ func (c *CLI) Run(args []string) int {
 		}
 	default:
 		fmt.Fprintf(c.errStream, "The value of --mode option must be '%s' or '%s'\n", agent.POLLING_MODE, agent.STREAMING_MODE)
-		fmt.Fprint(c.errStream, helpText)
+		printHelp(c.errStream)
 		return exitCodeErr
 	}
 
@@ -154,3 +152,7 @@ Options:
   --version, -v	            print version
   --help, -h                print help
 `, defaultIntervalSec, defaultFlushIntervalSec)
+
+func printHelp(w io.Writer) {
+	fmt.Fprint(w, helpText)
+}
