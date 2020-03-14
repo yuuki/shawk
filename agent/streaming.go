@@ -9,7 +9,11 @@ import (
 
 // StartWithStreaming starts agent process on streaming mode.
 func StartWithStreaming(db *db.DB) error {
-	if !ebpf.IsSupportedLinux() {
+	ok, err := ebpf.IsSupportedLinux()
+	if err != nil {
+		return err
+	}
+	if !ok {
 		return xerrors.Errorf("Your linux kernel is out of supoort")
 	}
 	// launch collector
