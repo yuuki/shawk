@@ -3,15 +3,11 @@ package ebpf
 import (
 	bpflib "github.com/iovisor/gobpf/elf"
 	"golang.org/x/xerrors"
-
-	"github.com/yuuki/transtracer/logging"
 )
 
 const (
 	kprobeSupportVersion = "4.1.0"
 )
-
-var logger = logging.New("ebpf")
 
 // IsSupportedLinux returns whether or not the current version of linux kernel supports eBPF tracer.
 func IsSupportedLinux() (bool, error) {

@@ -14,6 +14,8 @@ jobs:
           go-version: ${{ matrix.go-version }}
       - name: Checkout code
         uses: actions/checkout@v1
+      - name: Install libc-dev
+        run: sudo apt install libc-dev
       - name: Install GolangCI-Lint
         run: curl -sfL https://install.goreleaser.com/github.com/golangci/golangci-lint.sh | sh -s -- -b $(go env GOPATH)/bin
       - name: Lint
