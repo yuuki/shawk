@@ -103,7 +103,7 @@ func (c *CLI) Run(args []string) int {
 	logger.Infof("Connected postgres")
 
 	switch mode {
-	case agent.POLLING_MODE:
+	case agent.PollingMode:
 		if once {
 			if err := agent.RunOnce(db); err != nil {
 				logger.Errorf("%+v", err)
@@ -117,14 +117,14 @@ func (c *CLI) Run(args []string) int {
 				return exitCodeErr
 			}
 		}
-	case agent.STREAMING_MODE:
+	case agent.StreamingMode:
 		err := agent.StartWithStreaming(db)
 		if err != nil {
 			logger.Errorf("%+v", err)
 			return exitCodeErr
 		}
 	default:
-		fmt.Fprintf(c.errStream, "The value of --mode option must be '%s' or '%s'\n", agent.POLLING_MODE, agent.STREAMING_MODE)
+		fmt.Fprintf(c.errStream, "The value of --mode option must be '%s' or '%s'\n", agent.PollingMode, agent.StreamingMode)
 		printHelp(c.errStream)
 		return exitCodeErr
 	}

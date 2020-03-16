@@ -14,8 +14,10 @@ import (
 )
 
 const (
-	STREAMING_MODE = "streaming"
-	POLLING_MODE   = "polling"
+	// StreamingMode indicates that the agent collects flows by streaming.
+	StreamingMode = "streaming"
+	// PollingMode indicates that the agent collects flows by polling.
+	PollingMode = "polling"
 )
 
 type flowBuffer chan []*tcpflow.HostFlow
