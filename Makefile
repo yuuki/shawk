@@ -1,5 +1,6 @@
 export GO111MODULE=on
 export GOFLAGS=-mod=vendor
+export GOOS=linux
 
 PROJECT = transtracer
 PKG = github.com/yuuki/$(PROJECT)
@@ -40,11 +41,13 @@ devel-deps: _devel-deps tidy-module
 .PHONY: _devel-deps
 _devel-deps:
 	go get \
+		golang.org/x/lint/golint \
         golang.org/x/tools/cmd/cover \
         github.com/mattn/goveralls \
         github.com/x-motemen/gobump/cmd/gobump \
         github.com/Songmu/ghch/cmd/ghch \
         github.com/Songmu/gocredits/cmd/gocredits
+
 
 .PHONY: credits
 credits:
@@ -55,7 +58,8 @@ endif
 
 .PHONY: lint
 lint:
-	golangci-lint run ./...
+	# golangci-lint run ./... error: failed prerequisites:
+	golint -set_exit_status $$(go list -mod=vendor ./...)
 
 .PHONY: release
 release: devel-deps
