@@ -47,6 +47,9 @@ github.com/shirou/gopsutil/internal/common
 github.com/shirou/gopsutil/net
 # github.com/stretchr/testify v1.3.0
 ## explicit
+# github.com/weaveworks/tcptracer-bpf v0.0.0-20190731111909-cd53e7c84bac
+## explicit
+github.com/weaveworks/tcptracer-bpf/pkg/tracer
 # golang.org/x/sys v0.0.0-20200122134326-e047566fdf82
 ## explicit
 golang.org/x/sys/unix
