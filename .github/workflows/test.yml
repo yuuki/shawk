@@ -17,6 +17,7 @@ jobs:
       - name: Install dev tools
         run: make devel-deps
       - name: Lint
-        run: make lint
+        run: PATH=$(go env GOPATH)/bin:${PATH} make lint
+        shell: bash
       - name: Test
         run: make test
