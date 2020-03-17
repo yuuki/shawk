@@ -10,7 +10,7 @@ BUILD_LDFLAGS = -X $(PKG)/version.commit=$(COMMIT) -X $(PKG)/version.date=$(DATE
 CREDITS = ./assets/CREDITS
 
 .PHONY: build
-build: build-deps credits
+build: build-deps
 	go generate ./...
 	go build -ldflags="$(BUILD_LDFLAGS)" ./cmd/ttracerd/
 	go build -ldflags="$(BUILD_LDFLAGS)" ./cmd/ttctl/
@@ -50,7 +50,7 @@ _devel-deps:
 
 
 .PHONY: credits
-credits:
+credits: devel-deps
 	gocredits > $(CREDITS)
 ifneq (,$(git status -s $(CREDITS)))
 	go generate -x ./...
@@ -62,5 +62,5 @@ lint:
 	golint -set_exit_status $$(go list -mod=vendor ./...)
 
 .PHONY: release
-release: devel-deps
+release: devel-deps credits
 	_tools/release
