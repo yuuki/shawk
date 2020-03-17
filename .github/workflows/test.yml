@@ -17,7 +17,7 @@ jobs:
       - name: Install deps
         run: make deps
       - name: Lint
-        run: PATH=$(go env GOPATH)/bin:${PATH} make lint
+        run: make ci-lint
         shell: bash
       - name: Test
-        run: make test
+        run: make ci-test
