@@ -8,7 +8,7 @@ DATE = $$(date -u '+%Y-%m-%d_%H:%M:%S')
 BUILD_LDFLAGS = -X $(PKG)/version.commit=$(COMMIT) -X $(PKG)/version.date=$(DATE)
 CREDITS = ./assets/CREDITS
 
-GOLINT = $(go env GOPATH)/bin/golint -set_exit_status $$(go list -mod=vendor ./...)
+GOLINT = $$(go env GOPATH)/bin/golint -set_exit_status $$(go list -mod=vendor ./...)
 GOTEST = go test -v ./...
 
 DOCKER_IMAGE_NAME="transtracer-test"
