@@ -17,7 +17,7 @@ const (
 	exitCodeOK  = 0
 	exitCodeErr = 10 + iota
 
-	defaultMode             = agent.POLLING_MODE
+	defaultMode             = agent.PollingMode
 	defaultIntervalSec      = 5
 	defaultFlushIntervalSec = 30
 )
