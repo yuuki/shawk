@@ -55,6 +55,7 @@ func IsSupportedLinux() (bool, error) {
 	return true, nil
 }
 
+// StartTracer starts an ebpf tracing process.
 func StartTracer() error {
 	t := &tcpTracer{}
 	t.evChan = make(chan interface{})
