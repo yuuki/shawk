@@ -43,3 +43,24 @@ archives:
   - name_template: "{{ .ProjectName }}_v{{ .Version }}_{{ .Os }}_{{ .Arch }}{{ if .Arm }}v{{ .Arm }}{{ end }}"
 release:
   prerelease: auto
+
+nfpms:
+  - id: "transtracer"
+    package_name: transtracer
+    file_name_template: "{{ .ProjectName }}_v{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    replacements:
+    vendor: Yuuki TSUBOUCHI
+    homepage: https://github.com/yuuki/transtracer
+    maintainer: Yuuki TSUBOUCHI <yuki.tsubo@gmail.com>
+    description: A socket-based tracing system for discovering network dependencies in distributed applications
+    license: MIT
+    formats:
+      - deb
+      - rpm
+    bindir: /usr/bin
+    epoch: 1
+    empty_folders:
+    files:
+      "scripts/systemd/ttracerd.service": "/etc/systemd/system/multi-user.target.wants/ttracerd.service"
+    config_files:
+    scripts:
