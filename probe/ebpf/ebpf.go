@@ -20,8 +20,6 @@ type tcpTracer struct {
 
 func (t *tcpTracer) TCPEventV4(ev tracer.TcpV4) {
 	t.evChan <- ev
-	logger.Infof("%v cpu#%d %s %v %s %v\n",
-		ev.Timestamp, ev.CPU, ev.Type, ev.Pid, ev.Comm, ev.Fd)
 }
 
 func (t *tcpTracer) TCPEventV6(ev tracer.TcpV6) {
@@ -59,17 +57,22 @@ func IsSupportedLinux() (bool, error) {
 func StartTracer() error {
 	t := &tcpTracer{}
 	t.evChan = make(chan interface{})
-	tracer, err := tracer.NewTracer(t)
+	tr, err := tracer.NewTracer(t)
 	if err != nil {
-		return xerrors.Errorf("failed to create an instance of tcp-tracer")
+		return xerrors.Errorf("failed to create an instance of tcp-tracer: %w", err)
 	}
 
-	tracer.Start()
+	tr.Start()
 
 	// TODO: scan /proc
-	tracer.AddFdInstallWatcher(uint32(1620))
-	tracer.AddFdInstallWatcher(uint32(1622))
-	tracer.AddFdInstallWatcher(uint32(1625))
+	// Should tr.AddFdInstallWatcher be executed each listening process here?
+
+	for ev := range t.evChan {
+		switch v := ev.(type) {
+		case tracer.TcpV4:
+			logger.Infof("%+v\n", v)
+		}
+	}
 
 	return nil
 }
