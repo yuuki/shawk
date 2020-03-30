@@ -9,8 +9,11 @@ import (
 	"golang.org/x/xerrors"
 
 	"github.com/yuuki/transtracer/db"
+	"github.com/yuuki/transtracer/internal/lstf/tcpflow"
 	"github.com/yuuki/transtracer/probe/ebpf"
 )
+
+type flowBPFBuffer chan []*tcpflow.HostFlow
 
 // StartWithStreaming starts agent process on streaming mode.
 func StartWithStreaming(db *db.DB) error {
@@ -25,7 +28,10 @@ func StartWithStreaming(db *db.DB) error {
 	// TODO: go launch flusher
 	// TODO: pass channel to flusher
 
-	if err := ebpf.StartTracer(); err != nil {
+	cb := func(v *tcpflow.HostFlow) {
+		logger.Infof("%+v\n", v)
+	}
+	if err := ebpf.StartTracer(cb); err != nil {
 		return err
 	}
 
