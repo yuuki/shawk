@@ -90,13 +90,13 @@ func StartTracer(cb func(*tcpflow.HostFlow)) error {
 				cb(&tcpflow.HostFlow{
 					Direction: tcpflow.FlowActive,
 					Local:     &tcpflow.AddrPort{Addr: v.SAddr.String(), Port: "many"},
-					Peer:      &tcpflow.AddrPort{Addr: v.DAddr.String(), Port: fmt.Sprintf("%s", v.DPort)},
+					Peer:      &tcpflow.AddrPort{Addr: v.DAddr.String(), Port: fmt.Sprintf("%d", v.DPort)},
 					Process:   proc,
 				})
 			} else if v.Type == tracer.EventAccept {
 				cb(&tcpflow.HostFlow{
 					Direction: tcpflow.FlowPassive,
-					Local:     &tcpflow.AddrPort{Addr: v.SAddr.String(), Port: fmt.Sprintf("%s", v.SPort)},
+					Local:     &tcpflow.AddrPort{Addr: v.SAddr.String(), Port: fmt.Sprintf("%d", v.SPort)},
 					Peer:      &tcpflow.AddrPort{Addr: v.DAddr.String(), Port: "many"},
 					Process:   proc,
 				})
