@@ -69,6 +69,9 @@ func aggregator(db *db.DB, interval time.Duration, buffer chan *tcpflow.HostFlow
 		case <-ticker.C:
 			aggMap := make(map[string]*tcpflow.HostFlow)
 			size := len(buffer)
+			if size == 0 {
+				break
+			}
 
 			for i := 0; i < size; i++ {
 				flow := <-buffer
@@ -81,6 +84,7 @@ func aggregator(db *db.DB, interval time.Duration, buffer chan *tcpflow.HostFlow
 						aggMap[key].Process = flow.Process
 					}
 				}
+				aggMap[key].Connections++
 			}
 
 			flows := make([]*tcpflow.HostFlow, 0, len(aggMap))
