@@ -118,7 +118,7 @@ func (c *CLI) Run(args []string) int {
 			}
 		}
 	case agent.StreamingMode:
-		err := agent.StartWithStreaming(db)
+		err := agent.StartWithStreaming(time.Duration(intervalSec)*time.Second, db)
 		if err != nil {
 			logger.Errorf("%+v", err)
 			return exitCodeErr

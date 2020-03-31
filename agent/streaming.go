@@ -13,10 +13,12 @@ import (
 	"github.com/yuuki/transtracer/probe/ebpf"
 )
 
-type flowBPFBuffer chan []*tcpflow.HostFlow
+const flowBufferSize uint16 = 0xffff
+
+type flowAggBuffer chan *tcpflow.HostFlow
 
 // StartWithStreaming starts agent process on streaming mode.
-func StartWithStreaming(db *db.DB) error {
+func StartWithStreaming(interval time.Duration, db *db.DB) error {
 	ok, err := ebpf.IsSupportedLinux()
 	if err != nil {
 		return err
@@ -25,11 +27,14 @@ func StartWithStreaming(db *db.DB) error {
 		return xerrors.Errorf("this linux kernel is out of supoort")
 	}
 
-	// TODO: go launch flusher
-	// TODO: pass channel to flusher
+	aggBuffer := make(flowAggBuffer, flowBufferSize)
+	defer close(aggBuffer)
+
+	go aggregator(db, interval, aggBuffer)
 
 	cb := func(v *tcpflow.HostFlow) {
-		logger.Infof("%+v\n", v)
+		logger.Infof("%s\n", v)
+		aggBuffer <- v
 	}
 	if err := ebpf.StartTracer(cb); err != nil {
 		return err
@@ -48,4 +53,45 @@ func StartWithStreaming(db *db.DB) error {
 	logger.Infof("Closed db connection")
 
 	return nil
+}
+
+func aggregator(db *db.DB, interval time.Duration, buffer chan *tcpflow.HostFlow) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	errChan := make(chan error, 1)
+
+	for {
+		select {
+		case err := <-errChan:
+			if err != nil {
+				logger.Errorf("%+v\n", err)
+			}
+		case <-ticker.C:
+			aggMap := make(map[string]*tcpflow.HostFlow)
+			size := len(buffer)
+
+			for i := 0; i < size; i++ {
+				flow := <-buffer
+				key := flow.UniqKey()
+
+				if _, ok := aggMap[key]; !ok {
+					aggMap[key] = flow
+				} else {
+					if aggMap[key].Process == nil {
+						aggMap[key].Process = flow.Process
+					}
+				}
+			}
+
+			flows := make([]*tcpflow.HostFlow, 0, len(aggMap))
+			for _, flow := range aggMap {
+				flows = append(flows, flow)
+			}
+
+			if err := db.InsertOrUpdateHostFlows(flows); err != nil {
+				errChan <- err
+			}
+			logger.Debugf("completed to insert flows to the CMDB (buffer size: %d) \n", size)
+		}
+	}
 }
