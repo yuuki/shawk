@@ -101,4 +101,6 @@ func aggregate(buffer chan *tcpflow.HostFlow) []*tcpflow.HostFlow {
 	for _, flow := range aggMap {
 		flows = append(flows, flow)
 	}
+
+	return flows
 }
