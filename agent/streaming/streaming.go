@@ -1,4 +1,4 @@
-package agent
+package streaming
 
 import (
 	"os"
@@ -10,15 +10,18 @@ import (
 
 	"github.com/yuuki/transtracer/db"
 	"github.com/yuuki/transtracer/internal/lstf/tcpflow"
+	"github.com/yuuki/transtracer/logging"
 	"github.com/yuuki/transtracer/probe/ebpf"
 )
 
-const flowBufferSize uint16 = 0xffff
-
 type flowAggBuffer chan *tcpflow.HostFlow
 
-// StartWithStreaming starts agent process on streaming mode.
-func StartWithStreaming(interval time.Duration, db *db.DB) error {
+const flowBufferSize uint16 = 0xffff
+
+var logger = logging.New("streaming")
+
+// Run starts agent process on streaming mode.
+func Run(interval time.Duration, db *db.DB) error {
 	ok, err := ebpf.IsSupportedLinux()
 	if err != nil {
 		return err

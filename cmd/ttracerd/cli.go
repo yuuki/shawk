@@ -6,7 +6,8 @@ import (
 	"io"
 	"time"
 
-	"github.com/yuuki/transtracer/agent"
+	"github.com/yuuki/transtracer/agent/polling"
+	"github.com/yuuki/transtracer/agent/streaming"
 	"github.com/yuuki/transtracer/db"
 	"github.com/yuuki/transtracer/logging"
 	"github.com/yuuki/transtracer/statik"
@@ -17,9 +18,14 @@ const (
 	exitCodeOK  = 0
 	exitCodeErr = 10 + iota
 
-	defaultMode             = agent.PollingMode
+	defaultMode             = pollingMode
 	defaultIntervalSec      = 5
 	defaultFlushIntervalSec = 30
+
+	// streamingMode indicates that the agent collects flows by streaming.
+	streamingMode = "streaming"
+	// pollingMode indicates that the agent collects flows by polling.
+	pollingMode = "polling"
 )
 
 var logger = logging.New("main")
@@ -103,28 +109,28 @@ func (c *CLI) Run(args []string) int {
 	logger.Infof("Connected postgres")
 
 	switch mode {
-	case agent.PollingMode:
+	case pollingMode:
 		if once {
-			if err := agent.RunOnce(db); err != nil {
+			if err := polling.RunOnce(db); err != nil {
 				logger.Errorf("%+v", err)
 				return exitCodeErr
 			}
 		} else {
-			err := agent.Start(time.Duration(intervalSec)*time.Second,
+			err := polling.Run(time.Duration(intervalSec)*time.Second,
 				time.Duration(flushIntervalSec)*time.Second, db)
 			if err != nil {
 				logger.Errorf("%+v", err)
 				return exitCodeErr
 			}
 		}
-	case agent.StreamingMode:
-		err := agent.StartWithStreaming(time.Duration(intervalSec)*time.Second, db)
+	case streamingMode:
+		err := streaming.Run(time.Duration(intervalSec)*time.Second, db)
 		if err != nil {
 			logger.Errorf("%+v", err)
 			return exitCodeErr
 		}
 	default:
-		fmt.Fprintf(c.errStream, "The value of --mode option must be '%s' or '%s'\n", agent.PollingMode, agent.StreamingMode)
+		fmt.Fprintf(c.errStream, "The value of --mode option must be '%s' or '%s'\n", pollingMode, streamingMode)
 		printHelp(c.errStream)
 		return exitCodeErr
 	}

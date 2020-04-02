@@ -1,0 +1,120 @@
+package polling
+
+import (
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/yuuki/transtracer/collector"
+	"github.com/yuuki/transtracer/db"
+	"github.com/yuuki/transtracer/internal/lstf/tcpflow"
+	"github.com/yuuki/transtracer/logging"
+	"golang.org/x/xerrors"
+)
+
+type flowBuffer chan []*tcpflow.HostFlow
+
+var logger = logging.New("polling")
+
+// Run starts agent.
+func Run(interval time.Duration, flushInterval time.Duration, db *db.DB) error {
+	if interval > flushInterval {
+		return xerrors.Errorf(
+			"polling interval (%s) must not exceed flush interval (%s)",
+			interval, flushInterval)
+	}
+
+	buffer := make(flowBuffer, flushInterval/interval+1)
+	defer close(buffer)
+
+	go watch(interval, buffer, db)
+	go flusher(flushInterval, buffer, db)
+
+	sigch := make(chan os.Signal, 1)
+	signal.Notify(sigch, syscall.SIGTERM, syscall.SIGINT)
+	sig := <-sigch
+	logger.Infof("Received %s gracefully shutdown...", sig)
+
+	time.Sleep(3 * time.Second)
+	logger.Infof("--> Closing db connection...")
+	if err := db.Close(); err != nil {
+		return xerrors.Errorf("db close error: %w", err)
+	}
+	logger.Infof("Closed db connection")
+
+	return nil
+}
+
+// RunOnce runs agent once.
+func RunOnce(db *db.DB) error {
+	errChan := make(chan error, 1)
+	buffer := make(flowBuffer, 1)
+	scanFlows(db, buffer, errChan)
+	return <-errChan
+}
+
+// watch watches host flows for localhost.
+func watch(interval time.Duration, buffer flowBuffer, db *db.DB) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	errChan := make(chan error, 1)
+	for {
+		select {
+		case err := <-errChan:
+			if err != nil {
+				logger.Errorf("%+v", err)
+			}
+		case <-ticker.C:
+			go scanFlows(db, buffer, errChan)
+		}
+	}
+}
+
+// scanFlows scans host flows and
+// store it to the buffer store.
+func scanFlows(db *db.DB, buffer flowBuffer, errChan chan error) {
+	start := time.Now()
+	flows, err := collector.CollectHostFlows()
+	if err != nil {
+		errChan <- err
+		return
+	}
+	elapsed := time.Since(start)
+	for _, f := range flows {
+		logger.Debugf("completed to collect flows: %s", f)
+	}
+	logger.Debugf("elapsed time for collect flows [%s]", elapsed)
+
+	buffer <- flows
+}
+
+// flusher flushes data into the CMDB periodically.
+func flusher(interval time.Duration, buffer flowBuffer, db *db.DB) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	errChan := make(chan error, 1)
+	for {
+		select {
+		case err := <-errChan:
+			if err != nil {
+				logger.Errorf("%+v\n", err)
+			}
+		case <-ticker.C:
+			go flush(db, buffer, errChan)
+		}
+	}
+}
+
+func flush(db *db.DB, buffer flowBuffer, errChan chan error) {
+	size := len(buffer)
+	for i := 0; i < size; i++ {
+		flows := <-buffer
+		if err := db.InsertOrUpdateHostFlows(flows); err != nil {
+			errChan <- err
+			break
+		}
+	}
+
+	logger.Debugf("completed to insert flows to the CMDB (buffer size: %d) \n", size)
+}
