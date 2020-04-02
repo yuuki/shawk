@@ -67,35 +67,38 @@ func aggregator(db *db.DB, interval time.Duration, buffer chan *tcpflow.HostFlow
 				logger.Errorf("%+v\n", err)
 			}
 		case <-ticker.C:
-			aggMap := make(map[string]*tcpflow.HostFlow)
-			size := len(buffer)
-			if size == 0 {
-				break
-			}
-
-			for i := 0; i < size; i++ {
-				flow := <-buffer
-				key := flow.UniqKey()
-
-				if _, ok := aggMap[key]; !ok {
-					aggMap[key] = flow
-				} else {
-					if aggMap[key].Process == nil {
-						aggMap[key].Process = flow.Process
-					}
-				}
-				aggMap[key].Connections++
-			}
-
-			flows := make([]*tcpflow.HostFlow, 0, len(aggMap))
-			for _, flow := range aggMap {
-				flows = append(flows, flow)
-			}
-
+			flows := aggregate(buffer)
 			if err := db.InsertOrUpdateHostFlows(flows); err != nil {
 				errChan <- err
 			}
-			logger.Debugf("completed to insert flows to the CMDB (buffer size: %d) \n", size)
+			logger.Debugf("completed to insert flows to the CMDB (the number of flows: %d) \n", len(flows))
 		}
+	}
+}
+
+func aggregate(buffer chan *tcpflow.HostFlow) []*tcpflow.HostFlow {
+	aggMap := make(map[string]*tcpflow.HostFlow)
+	size := len(buffer)
+	if size == 0 {
+		return []*tcpflow.HostFlow{}
+	}
+
+	for i := 0; i < size; i++ {
+		flow := <-buffer
+		key := flow.UniqKey()
+
+		if _, ok := aggMap[key]; !ok {
+			aggMap[key] = flow
+		} else {
+			if aggMap[key].Process == nil {
+				aggMap[key].Process = flow.Process
+			}
+		}
+		aggMap[key].Connections++
+	}
+
+	flows := make([]*tcpflow.HostFlow, 0, len(aggMap))
+	for _, flow := range aggMap {
+		flows = append(flows, flow)
 	}
 }
