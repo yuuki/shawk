@@ -6,7 +6,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/yuuki/transtracer/collector"
 	"github.com/yuuki/transtracer/db"
 	"github.com/yuuki/transtracer/internal/lstf/tcpflow"
 	"github.com/yuuki/transtracer/logging"
@@ -71,15 +70,22 @@ func watch(interval time.Duration, buffer flowBuffer, db *db.DB) {
 	}
 }
 
-// scanFlows scans host flows and
-// store it to the buffer store.
+// scanFlows scans host flows and store it to the buffer store.
 func scanFlows(db *db.DB, buffer flowBuffer, errChan chan error) {
 	start := time.Now()
-	flows, err := collector.CollectHostFlows()
+
+	mapFlows, err := tcpflow.GetHostFlows(
+		&tcpflow.GetHostFlowsOption{Processes: true},
+	)
 	if err != nil {
 		errChan <- err
-		return
 	}
+	// convert map into slice to solve the order problem in testing
+	flows := make([]*tcpflow.HostFlow, 0, len(mapFlows))
+	for _, f := range mapFlows {
+		flows = append(flows, f)
+	}
+
 	elapsed := time.Since(start)
 	for _, f := range flows {
 		logger.Debugf("completed to collect flows: %s", f)
