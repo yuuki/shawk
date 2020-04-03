@@ -13,6 +13,7 @@ import (
 
 var logger = logging.New("agent")
 
+// Wait waits a signal or shutdowns the db.
 func Wait(db *db.DB) error {
 	sigch := make(chan os.Signal, 1)
 	signal.Notify(sigch, syscall.SIGTERM, syscall.SIGINT)
