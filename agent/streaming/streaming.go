@@ -36,7 +36,7 @@ func Run(interval time.Duration, db *db.DB) error {
 	go aggregator(db, interval, aggBuffer)
 
 	cb := func(v *tcpflow.HostFlow) {
-		logger.Infof("%s\n", v)
+		logger.Debugf("%s\n", v)
 		aggBuffer <- v
 	}
 	if err := ebpf.StartTracer(cb); err != nil {
