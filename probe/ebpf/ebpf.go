@@ -6,8 +6,8 @@ import (
 
 	bpflib "github.com/iovisor/gobpf/elf"
 	"github.com/weaveworks/tcptracer-bpf/pkg/tracer"
-	"github.com/yuuki/transtracer/internal/lstf/tcpflow"
 	"github.com/yuuki/transtracer/logging"
+	"github.com/yuuki/transtracer/probe"
 	"golang.org/x/xerrors"
 )
 
@@ -58,7 +58,7 @@ func IsSupportedLinux() (bool, error) {
 }
 
 // StartTracer starts an ebpf tracing process.
-func StartTracer(cb func(*tcpflow.HostFlow)) error {
+func StartTracer(cb func(*probe.HostFlow)) error {
 	t := &tcpTracer{}
 	t.evChan = make(chan interface{})
 	tr, err := tracer.NewTracer(t)
@@ -82,20 +82,20 @@ func StartTracer(cb func(*tcpflow.HostFlow)) error {
 					pgid = int(v.Pid)
 				}
 			}
-			proc := &tcpflow.Process{Name: v.Comm, Pgid: pgid}
+			proc := &probe.Process{Name: v.Comm, Pgid: pgid}
 
 			if v.Type == tracer.EventConnect {
-				cb(&tcpflow.HostFlow{
-					Direction: tcpflow.FlowActive,
-					Local:     &tcpflow.AddrPort{Addr: v.SAddr.String(), Port: "many"},
-					Peer:      &tcpflow.AddrPort{Addr: v.DAddr.String(), Port: fmt.Sprintf("%d", v.DPort)},
+				cb(&probe.HostFlow{
+					Direction: probe.FlowActive,
+					Local:     &probe.AddrPort{Addr: v.SAddr.String(), Port: "many"},
+					Peer:      &probe.AddrPort{Addr: v.DAddr.String(), Port: fmt.Sprintf("%d", v.DPort)},
 					Process:   proc,
 				})
 			} else if v.Type == tracer.EventAccept {
-				cb(&tcpflow.HostFlow{
-					Direction: tcpflow.FlowPassive,
-					Local:     &tcpflow.AddrPort{Addr: v.SAddr.String(), Port: fmt.Sprintf("%d", v.SPort)},
-					Peer:      &tcpflow.AddrPort{Addr: v.DAddr.String(), Port: "many"},
+				cb(&probe.HostFlow{
+					Direction: probe.FlowPassive,
+					Local:     &probe.AddrPort{Addr: v.SAddr.String(), Port: fmt.Sprintf("%d", v.SPort)},
+					Peer:      &probe.AddrPort{Addr: v.DAddr.String(), Port: "many"},
 					Process:   proc,
 				})
 			}

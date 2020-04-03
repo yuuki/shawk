@@ -10,7 +10,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/lib/pq"
 
-	"github.com/yuuki/transtracer/internal/lstf/tcpflow"
+	"github.com/yuuki/transtracer/probe"
 )
 
 func TestCreateSchema(t *testing.T) {
@@ -33,7 +33,7 @@ func TestInsertOrUpdateHostFlows_empty(t *testing.T) {
 	db, mock := NewTestDB()
 	defer db.Close()
 
-	flows := []*tcpflow.HostFlow{}
+	flows := []*probe.HostFlow{}
 
 	mock.ExpectBegin()
 	mock.ExpectPrepare("SELECT flows.source_node_id FROM flows")
@@ -60,19 +60,19 @@ func TestInsertOrUpdateHostFlows(t *testing.T) {
 	db, mock := NewTestDB()
 	defer db.Close()
 
-	flows := []*tcpflow.HostFlow{
+	flows := []*probe.HostFlow{
 		{
-			Direction:   tcpflow.FlowActive,
-			Local:       &tcpflow.AddrPort{Addr: "10.0.10.1", Port: "many"},
-			Peer:        &tcpflow.AddrPort{Addr: "10.0.10.2", Port: "5432"},
-			Process:     &tcpflow.Process{Pgid: 1001, Name: "python"},
+			Direction:   probe.FlowActive,
+			Local:       &probe.AddrPort{Addr: "10.0.10.1", Port: "many"},
+			Peer:        &probe.AddrPort{Addr: "10.0.10.2", Port: "5432"},
+			Process:     &probe.Process{Pgid: 1001, Name: "python"},
 			Connections: 10,
 		},
 		{
-			Direction:   tcpflow.FlowPassive,
-			Local:       &tcpflow.AddrPort{Addr: "10.0.10.1", Port: "80"},
-			Peer:        &tcpflow.AddrPort{Addr: "10.0.10.2", Port: "many"},
-			Process:     &tcpflow.Process{Pgid: 1002, Name: "nginx"},
+			Direction:   probe.FlowPassive,
+			Local:       &probe.AddrPort{Addr: "10.0.10.1", Port: "80"},
+			Peer:        &probe.AddrPort{Addr: "10.0.10.2", Port: "many"},
+			Process:     &probe.Process{Pgid: 1002, Name: "nginx"},
 			Connections: 12,
 		},
 	}
@@ -177,11 +177,11 @@ func TestInsertOrUpdateHostFlows_empty_process(t *testing.T) {
 	db, mock := NewTestDB()
 	defer db.Close()
 
-	flows := []*tcpflow.HostFlow{
+	flows := []*probe.HostFlow{
 		{
-			Direction:   tcpflow.FlowActive,
-			Local:       &tcpflow.AddrPort{Addr: "10.0.10.1", Port: "many"},
-			Peer:        &tcpflow.AddrPort{Addr: "10.0.10.2", Port: "5432"},
+			Direction:   probe.FlowActive,
+			Local:       &probe.AddrPort{Addr: "10.0.10.1", Port: "many"},
+			Peer:        &probe.AddrPort{Addr: "10.0.10.2", Port: "5432"},
 			Connections: 10,
 		},
 	}

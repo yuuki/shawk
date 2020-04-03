@@ -5,12 +5,13 @@ import (
 
 	"github.com/yuuki/transtracer/agent"
 	"github.com/yuuki/transtracer/db"
-	"github.com/yuuki/transtracer/internal/lstf/tcpflow"
 	"github.com/yuuki/transtracer/logging"
+	"github.com/yuuki/transtracer/probe"
+	"github.com/yuuki/transtracer/probe/netlink"
 	"golang.org/x/xerrors"
 )
 
-type flowBuffer chan []*tcpflow.HostFlow
+type flowBuffer chan []*probe.HostFlow
 
 var logger = logging.New("agent/polling")
 
@@ -60,14 +61,14 @@ func watch(interval time.Duration, buffer flowBuffer, db *db.DB) {
 func scanFlows(db *db.DB, buffer flowBuffer, errChan chan error) {
 	start := time.Now()
 
-	mapFlows, err := tcpflow.GetHostFlows(
-		&tcpflow.GetHostFlowsOption{Processes: true},
+	mapFlows, err := netlink.GetHostFlows(
+		&netlink.GetHostFlowsOption{Processes: true},
 	)
 	if err != nil {
 		errChan <- err
 	}
 	// convert map into slice to solve the order problem in testing
-	flows := make([]*tcpflow.HostFlow, 0, len(mapFlows))
+	flows := make([]*probe.HostFlow, 0, len(mapFlows))
 	for _, f := range mapFlows {
 		flows = append(flows, f)
 	}

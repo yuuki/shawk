@@ -7,12 +7,12 @@ import (
 
 	"github.com/yuuki/transtracer/agent"
 	"github.com/yuuki/transtracer/db"
-	"github.com/yuuki/transtracer/internal/lstf/tcpflow"
 	"github.com/yuuki/transtracer/logging"
+	"github.com/yuuki/transtracer/probe"
 	"github.com/yuuki/transtracer/probe/ebpf"
 )
 
-type flowAggBuffer chan *tcpflow.HostFlow
+type flowAggBuffer chan *probe.HostFlow
 
 const flowBufferSize uint16 = 0xffff
 
@@ -33,7 +33,7 @@ func Run(interval time.Duration, db *db.DB) error {
 
 	go aggregator(db, interval, aggBuffer)
 
-	cb := func(v *tcpflow.HostFlow) {
+	cb := func(v *probe.HostFlow) {
 		logger.Debugf("%s\n", v)
 		aggBuffer <- v
 	}
@@ -44,7 +44,7 @@ func Run(interval time.Duration, db *db.DB) error {
 	return agent.Wait(db)
 }
 
-func aggregator(db *db.DB, interval time.Duration, buffer chan *tcpflow.HostFlow) {
+func aggregator(db *db.DB, interval time.Duration, buffer chan *probe.HostFlow) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	errChan := make(chan error, 1)
@@ -65,13 +65,13 @@ func aggregator(db *db.DB, interval time.Duration, buffer chan *tcpflow.HostFlow
 	}
 }
 
-func aggregate(buffer chan *tcpflow.HostFlow) []*tcpflow.HostFlow {
+func aggregate(buffer chan *probe.HostFlow) []*probe.HostFlow {
 	size := len(buffer)
 	if size == 0 {
-		return []*tcpflow.HostFlow{}
+		return []*probe.HostFlow{}
 	}
 
-	aggMap := make(map[string]*tcpflow.HostFlow)
+	aggMap := make(map[string]*probe.HostFlow)
 	for i := 0; i < size; i++ {
 		flow := <-buffer
 		key := flow.UniqKey()
@@ -86,7 +86,7 @@ func aggregate(buffer chan *tcpflow.HostFlow) []*tcpflow.HostFlow {
 		aggMap[key].Connections++
 	}
 
-	flows := make([]*tcpflow.HostFlow, 0, len(aggMap))
+	flows := make([]*probe.HostFlow, 0, len(aggMap))
 	for _, flow := range aggMap {
 		flows = append(flows, flow)
 	}
