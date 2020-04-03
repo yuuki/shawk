@@ -1,4 +1,4 @@
-package tcpflow
+package probe
 
 import (
 	"encoding/json"
@@ -6,7 +6,7 @@ import (
 	"net"
 	"strconv"
 
-	"github.com/yuuki/transtracer/internal/lstf/netutil"
+	"github.com/yuuki/transtracer/probe/netlink/netutil"
 )
 
 // FlowDirection are bitmask that represents both Active or Passive.
@@ -105,8 +105,8 @@ func (f *HostFlow) UniqKey() string {
 	return f.Direction.String() + "-" + f.Local.String() + "-" + f.Peer.String()
 }
 
-// setLookupedName replaces f.Addr into lookuped name.
-func (f *HostFlow) setLookupedName() {
+// SetLookupedName replaces f.Addr into lookuped name.
+func (f *HostFlow) SetLookupedName() {
 	f.Local.Name = netutil.ResolveAddr(f.Local.Addr)
 	f.Peer.Name = netutil.ResolveAddr(f.Peer.Addr)
 }
@@ -123,7 +123,8 @@ func (hf HostFlows) MarshalJSON() ([]byte, error) {
 	return json.Marshal(list)
 }
 
-func (hf HostFlows) insert(flow *HostFlow) {
+// Insert inserts a flow into the HostFlows.
+func (hf HostFlows) Insert(flow *HostFlow) {
 	key := flow.UniqKey()
 	if _, ok := hf[key]; !ok {
 		hf[key] = flow
@@ -133,20 +134,4 @@ func (hf HostFlows) insert(flow *HostFlow) {
 		}
 	}
 	hf[key].Connections++
-}
-
-func contains(strs []string, s string) bool {
-	for _, str := range strs {
-		if str == s {
-			return true
-		}
-	}
-	return false
-}
-
-// GetHostFlowsOption represens an option for func GetHostFlows().
-type GetHostFlowsOption struct {
-	Numeric   bool
-	Processes bool
-	Filter    string
 }

@@ -6,7 +6,8 @@ import (
 	"io"
 	"time"
 
-	"github.com/yuuki/transtracer/agent"
+	"github.com/yuuki/transtracer/agent/polling"
+	"github.com/yuuki/transtracer/agent/streaming"
 	"github.com/yuuki/transtracer/db"
 	"github.com/yuuki/transtracer/logging"
 	"github.com/yuuki/transtracer/statik"
@@ -14,10 +15,17 @@ import (
 )
 
 const (
-	exitCodeOK              = 0
-	exitCodeErr             = 10 + iota
+	exitCodeOK  = 0
+	exitCodeErr = 10 + iota
+
+	defaultMode             = pollingMode
 	defaultIntervalSec      = 5
 	defaultFlushIntervalSec = 30
+
+	// streamingMode indicates that the agent collects flows by streaming.
+	streamingMode = "streaming"
+	// pollingMode indicates that the agent collects flows by polling.
+	pollingMode = "polling"
 )
 
 var logger = logging.New("main")
@@ -39,6 +47,7 @@ func (c *CLI) Run(args []string) int {
 		credits bool
 		debug   bool
 
+		mode             string
 		once             bool
 		dbuser           string
 		dbpass           string
@@ -48,11 +57,10 @@ func (c *CLI) Run(args []string) int {
 		intervalSec      int
 		flushIntervalSec int
 	)
-	flags := flag.NewFlagSet("transtracerd", flag.ContinueOnError)
+	flags := flag.NewFlagSet("ttracerd", flag.ContinueOnError)
 	flags.SetOutput(c.errStream)
-	flags.Usage = func() {
-		fmt.Fprint(c.errStream, helpText)
-	}
+	flags.Usage = func() { printHelp(c.errStream) }
+	flags.StringVar(&mode, "mode", defaultMode, "")
 	flags.BoolVar(&once, "once", false, "")
 	flags.StringVar(&dbuser, "dbuser", "", "")
 	flags.StringVar(&dbpass, "dbpass", "", "")
@@ -100,18 +108,31 @@ func (c *CLI) Run(args []string) int {
 	}
 	logger.Infof("Connected postgres")
 
-	if once {
-		if err := agent.RunOnce(db); err != nil {
-			logger.Errorf("%+v", err)
-			return exitCodeErr
+	switch mode {
+	case pollingMode:
+		if once {
+			if err := polling.RunOnce(db); err != nil {
+				logger.Errorf("%+v", err)
+				return exitCodeErr
+			}
+		} else {
+			err := polling.Run(time.Duration(intervalSec)*time.Second,
+				time.Duration(flushIntervalSec)*time.Second, db)
+			if err != nil {
+				logger.Errorf("%+v", err)
+				return exitCodeErr
+			}
 		}
-	} else {
-		err := agent.Start(time.Duration(intervalSec)*time.Second,
-			time.Duration(flushIntervalSec)*time.Second, db)
+	case streamingMode:
+		err := streaming.Run(time.Duration(intervalSec)*time.Second, db)
 		if err != nil {
 			logger.Errorf("%+v", err)
 			return exitCodeErr
 		}
+	default:
+		fmt.Fprintf(c.errStream, "The value of --mode option must be '%s' or '%s'\n", pollingMode, streamingMode)
+		printHelp(c.errStream)
+		return exitCodeErr
 	}
 
 	return exitCodeOK
@@ -122,16 +143,22 @@ var helpText = fmt.Sprintf(`Usage: ttracerd [options]
 An agent process for collecting flows and processes.
 
 Options:
-  --once                    run once
+  --mode                    agent mode ('polling' or 'streaming'. default: 'polling')
+  --once                    run once only if --mode='polling'
   --dbuser                  postgres user
   --dbpass                  postgres user password
   --dbhost                  postgres host
   --dbport                  postgres port
   --dbname                  postgres database name
-  --interval-sec            interval of scan connection stats (default: %d)
-  --flush-interval-sec      interval of flushing data into the CMDB (default: %d)
+  --interval-sec            interval of scan connection stats (default: %d) only if --mode='polling'
+  --flush-interval-sec      interval of flushing data into the CMDB (default: %d) only if --mode='polling'
   --debug                   run with debug information
+
   --credits                 print credits
   --version, -v	            print version
   --help, -h                print help
 `, defaultIntervalSec, defaultFlushIntervalSec)
+
+func printHelp(w io.Writer) {
+	fmt.Fprint(w, helpText)
+}

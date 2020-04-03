@@ -14,11 +14,11 @@ Transtracer is a socket-based tracing infrastructure for discovering network dep
 
 ## System Overview
 
-![System structure](/doc/images/system_structure.png "System configuration")
+![System structure](/doc/images/system_structure.png "System structure")
 
 This figure shows the system conﬁguration for matching the connection information related to multiple hosts and for creating a dependency graph. Tracer running on each host sends connection information to the central Connection Management DataBase (CMDB).
 
-![Socket diagnosis](/doc/images/socket_diagnosis.png "Socket diagnosis")
+![Socket diagnosis in polling mode](/doc/images/socket_diagnosis.png "Socket diagnosis in polling mode")
 
 This figure shows how to retrieve socket information for TCP connections. When the Tracer process runs on the host, the Tracer process queries the Linux kernel and obtains a snapshot of the active TCP connection status from the socket corresponding to each connection. At the same time, the Tracer process acquires the process information corresponding to each connection. Then it links each connection and each process.
 
@@ -31,11 +31,19 @@ This figure shows how to retrieve socket information for TCP connections. When t
 
 ### ttracerd
 
+Run a daemon process of scanning connections in polling mode.
+
 ```shell-session
-# ttracerd --dbuser ttracer --dbpass ttracer --dbhost 10.0.0.20 --dbname "ttctl"
+# ttracerd --dbuser ttracer --dbpass ttracer --dbhost 10.0.0.20 --dbname "ttctl" --mode polling --interval 1 --flush-interval 10
 ```
 
-Make ttracer run once.
+Run ttracerd in streaming mode, which internaly uses eBPF.
+
+```shell-session
+# ttracerd --dbuser ttracer --dbpass ttracer --dbhost 10.0.0.20 --dbname "ttctl" --mode=streaming --interval 1
+```
+
+Run scanning connections only once.
 
 ```shell-session
 # ttracerd --once --interval-sec 3 --dbuser ttracer --dbpass ttracer --dbhost 10.0.0.20 --dbname "ttctl"
