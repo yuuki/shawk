@@ -1,13 +1,11 @@
 package streaming
 
 import (
-	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
 	"golang.org/x/xerrors"
 
+	"github.com/yuuki/transtracer/agent"
 	"github.com/yuuki/transtracer/db"
 	"github.com/yuuki/transtracer/internal/lstf/tcpflow"
 	"github.com/yuuki/transtracer/logging"
@@ -18,7 +16,7 @@ type flowAggBuffer chan *tcpflow.HostFlow
 
 const flowBufferSize uint16 = 0xffff
 
-var logger = logging.New("streaming")
+var logger = logging.New("agent/streaming")
 
 // Run starts agent process on streaming mode.
 func Run(interval time.Duration, db *db.DB) error {
@@ -43,19 +41,7 @@ func Run(interval time.Duration, db *db.DB) error {
 		return err
 	}
 
-	sigch := make(chan os.Signal, 1)
-	signal.Notify(sigch, syscall.SIGTERM, syscall.SIGINT)
-	sig := <-sigch
-	logger.Infof("Received %s gracefully shutdown...", sig)
-
-	time.Sleep(3 * time.Second)
-	logger.Infof("--> Closing db connection...")
-	if err := db.Close(); err != nil {
-		return xerrors.Errorf("db close error: %w", err)
-	}
-	logger.Infof("Closed db connection")
-
-	return nil
+	return agent.Wait(db)
 }
 
 func aggregator(db *db.DB, interval time.Duration, buffer chan *tcpflow.HostFlow) {

@@ -1,11 +1,9 @@
 package polling
 
 import (
-	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
+	"github.com/yuuki/transtracer/agent"
 	"github.com/yuuki/transtracer/db"
 	"github.com/yuuki/transtracer/internal/lstf/tcpflow"
 	"github.com/yuuki/transtracer/logging"
@@ -14,7 +12,7 @@ import (
 
 type flowBuffer chan []*tcpflow.HostFlow
 
-var logger = logging.New("polling")
+var logger = logging.New("agent/polling")
 
 // Run starts agent.
 func Run(interval time.Duration, flushInterval time.Duration, db *db.DB) error {
@@ -30,19 +28,7 @@ func Run(interval time.Duration, flushInterval time.Duration, db *db.DB) error {
 	go watch(interval, buffer, db)
 	go flusher(flushInterval, buffer, db)
 
-	sigch := make(chan os.Signal, 1)
-	signal.Notify(sigch, syscall.SIGTERM, syscall.SIGINT)
-	sig := <-sigch
-	logger.Infof("Received %s gracefully shutdown...", sig)
-
-	time.Sleep(3 * time.Second)
-	logger.Infof("--> Closing db connection...")
-	if err := db.Close(); err != nil {
-		return xerrors.Errorf("db close error: %w", err)
-	}
-	logger.Infof("Closed db connection")
-
-	return nil
+	return agent.Wait(db)
 }
 
 // RunOnce runs agent once.
