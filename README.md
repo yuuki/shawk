@@ -10,7 +10,7 @@ Transtracer is a tracing infrastructure for discovering network services depende
 ## System Overview
 
 ![System structure](/doc/images/system_structure.png "System structure")
-![Socket diagnosis](/doc/images/socket_diagnosis.png "Socket diagnosis")
+![Socket diagnosis in polling mode](/doc/images/socket_diagnosis.png "Socket diagnosis in polling mode")
 
 ## Requirements
 
@@ -21,11 +21,19 @@ Transtracer is a tracing infrastructure for discovering network services depende
 
 ### ttracerd
 
+Run a daemon process of scanning connections in polling mode.
+
 ```shell-session
-# ttracerd --dbuser ttracer --dbpass ttracer --dbhost 10.0.0.20 --dbname "ttctl"
+# ttracerd --dbuser ttracer --dbpass ttracer --dbhost 10.0.0.20 --dbname "ttctl" --mode polling --interval 1 --flush-interval 10
 ```
 
-Make ttracer run once.
+Run ttracerd in streaming mode, which internaly uses eBPF.
+
+```shell-session
+# ttracerd --dbuser ttracer --dbpass ttracer --dbhost 10.0.0.20 --dbname "ttctl" --mode=streaming --interval 1
+```
+
+Run scanning connections only once.
 
 ```shell-session
 # ttracerd --once --interval-sec 3 --dbuser ttracer --dbpass ttracer --dbhost 10.0.0.20 --dbname "ttctl"
