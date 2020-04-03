@@ -5,12 +5,22 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/yuuki/transtracer)](https://goreportcard.com/report/github.com/yuuki/transtracer)
 [![License](http://img.shields.io/:license-mit-blue.svg)](http://doge.mit-license.org)
 
-Transtracer is a tracing infrastructure for discovering network services dependecies on the transport network layer.
+Transtracer is a socket-based tracing infrastructure for discovering network dependencies among processes in distributed applications. Transtracer has an architecture of monitoring network sockets, which are endpoints of TCP connections, to trace the dependency.
+
+## Contributions
+
+- As long as applications use the TCP protocol stack in the Linux kernel, the dependencies are discovered by Transtracer.
+- The monitoring does not affect the network delay of the applications because the processing that only reads the connection information from network sockets is independent of the application communication.
 
 ## System Overview
 
 ![System structure](/doc/images/system_structure.png "System structure")
+
+This figure shows the system conﬁguration for matching the connection information related to multiple hosts and for creating a dependency graph. Tracer running on each host sends connection information to the central Connection Management DataBase (CMDB).
+
 ![Socket diagnosis in polling mode](/doc/images/socket_diagnosis.png "Socket diagnosis in polling mode")
+
+This figure shows how to retrieve socket information for TCP connections. When the Tracer process runs on the host, the Tracer process queries the Linux kernel and obtains a snapshot of the active TCP connection status from the socket corresponding to each connection. At the same time, the Tracer process acquires the process information corresponding to each connection. Then it links each connection and each process.
 
 ## Requirements
 
