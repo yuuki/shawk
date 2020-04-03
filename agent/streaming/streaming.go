@@ -66,12 +66,12 @@ func aggregator(db *db.DB, interval time.Duration, buffer chan *tcpflow.HostFlow
 }
 
 func aggregate(buffer chan *tcpflow.HostFlow) []*tcpflow.HostFlow {
-	aggMap := make(map[string]*tcpflow.HostFlow)
 	size := len(buffer)
 	if size == 0 {
 		return []*tcpflow.HostFlow{}
 	}
 
+	aggMap := make(map[string]*tcpflow.HostFlow)
 	for i := 0; i < size; i++ {
 		flow := <-buffer
 		key := flow.UniqKey()
