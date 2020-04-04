@@ -16,7 +16,6 @@ builds:
     goos:
       - linux
     goarch:
-      - 386
       - amd64
   - id: "ttctl"
     main: ./cmd/ttctl/
@@ -32,11 +31,7 @@ builds:
       - linux
       - darwin
     goarch:
-      - 386
       - amd64
-    ignore:
-      - goos: darwin
-        goarch: 386
 changelog:
   skip: true
 archives:
