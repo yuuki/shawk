@@ -1,7 +1,7 @@
 export GO111MODULE=on
 export GOOS=linux
 
-PROJECT = transtracer
+PROJECT = shawk
 PKG = github.com/yuuki/$(PROJECT)
 COMMIT = $$(git describe --tags --always)
 DATE = $$(date -u '+%Y-%m-%d_%H:%M:%S')
@@ -11,9 +11,9 @@ CREDITS = ./assets/CREDITS
 GOLINT = $$(go env GOPATH)/bin/golint -set_exit_status $$(go list -mod=vendor ./...)
 GOTEST = go test -v ./...
 
-DOCKER_IMAGE_NAME="transtracer-test"
-DOCKER_CONTAINER_NAME="transtracer-test-container"
-DOCKER = docker run --rm -v $$(PWD):/go/src/github.com/yuuki/transtracer --name $(DOCKER_CONTAINER_NAME) $(DOCKER_IMAGE_NAME)
+DOCKER_IMAGE_NAME="shawk-test"
+DOCKER_CONTAINER_NAME="shawk-test-container"
+DOCKER = docker run --rm -v $$(PWD):/go/src/github.com/yuuki/shawk --name $(DOCKER_CONTAINER_NAME) $(DOCKER_IMAGE_NAME)
 container = docker ps -a -q -f "name=$(DOCKER_CONTAINER_NAME)"
 
 all: init build

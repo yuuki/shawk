@@ -10,8 +10,8 @@ import (
 	"github.com/lib/pq" // database/sql driver
 	"golang.org/x/xerrors"
 
-	"github.com/yuuki/transtracer/probe"
-	"github.com/yuuki/transtracer/statik"
+	"github.com/yuuki/shawk/probe"
+	"github.com/yuuki/shawk/statik"
 )
 
 const (

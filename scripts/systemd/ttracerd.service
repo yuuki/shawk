@@ -1,6 +1,6 @@
 [Unit]
-Description=transtracer tracer agent
-Documentation=https://github.com/yuuki/transtracer/
+Description=shawk tracer agent
+Documentation=https://github.com/yuuki/shawk/
 After=network-online.target nss-lookup.target
 
 [Service]

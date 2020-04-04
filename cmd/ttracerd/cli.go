@@ -6,12 +6,12 @@ import (
 	"io"
 	"time"
 
-	"github.com/yuuki/transtracer/agent/polling"
-	"github.com/yuuki/transtracer/agent/streaming"
-	"github.com/yuuki/transtracer/db"
-	"github.com/yuuki/transtracer/logging"
-	"github.com/yuuki/transtracer/statik"
-	"github.com/yuuki/transtracer/version"
+	"github.com/yuuki/shawk/agent/polling"
+	"github.com/yuuki/shawk/agent/streaming"
+	"github.com/yuuki/shawk/db"
+	"github.com/yuuki/shawk/logging"
+	"github.com/yuuki/shawk/statik"
+	"github.com/yuuki/shawk/version"
 )
 
 const (

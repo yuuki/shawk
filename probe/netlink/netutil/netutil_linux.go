@@ -18,7 +18,7 @@ import (
 	"github.com/EricLagergren/go-gnulib/dirent"
 	"github.com/elastic/gosigar/sys/linux"
 	gnet "github.com/shirou/gopsutil/net"
-	"github.com/yuuki/transtracer/logging"
+	"github.com/yuuki/shawk/logging"
 	"golang.org/x/sys/unix"
 	"golang.org/x/xerrors"
 )

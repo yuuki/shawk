@@ -9,7 +9,7 @@ import (
 	"golang.org/x/xerrors"
 
 	// local import
-	_ "github.com/yuuki/transtracer/statik/genstatik"
+	_ "github.com/yuuki/shawk/statik/genstatik"
 )
 
 // FindString returns the string representation of the given file path.

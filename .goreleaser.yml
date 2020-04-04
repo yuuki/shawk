@@ -1,4 +1,4 @@
-project_name: transtracer
+project_name: shawk
 env:
   - GO111MODULE=on
 before:
@@ -40,12 +40,12 @@ release:
   prerelease: auto
 
 nfpms:
-  - id: "transtracer"
-    package_name: transtracer
+  - id: "shawk"
+    package_name: shawk
     file_name_template: "{{ .ProjectName }}_v{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     replacements:
     vendor: Yuuki TSUBOUCHI
-    homepage: https://github.com/yuuki/transtracer
+    homepage: https://github.com/yuuki/shawk
     maintainer: Yuuki TSUBOUCHI <yuki.tsubo@gmail.com>
     description: A socket-based tracing system for discovering network dependencies in distributed applications
     license: MIT

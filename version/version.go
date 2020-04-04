@@ -6,7 +6,7 @@ import (
 )
 
 // name is application name.
-const name = "transtracer"
+const name = "shawk"
 
 // version is application version.
 const version = "0.4.0"

@@ -6,10 +6,10 @@ import (
 	"io"
 	"net"
 
-	"github.com/yuuki/transtracer/db"
-	"github.com/yuuki/transtracer/logging"
-	"github.com/yuuki/transtracer/statik"
-	"github.com/yuuki/transtracer/version"
+	"github.com/yuuki/shawk/db"
+	"github.com/yuuki/shawk/logging"
+	"github.com/yuuki/shawk/statik"
+	"github.com/yuuki/shawk/version"
 )
 
 const (
@@ -174,10 +174,10 @@ func (c *CLI) printActiveFlows(flows []*db.Flow) {
 
 var helpText = `Usage: ttctl [options]
 
-ttctl is a CLI controller for transtracer.
+ttctl is a CLI controller for shawk.
 
 Options:
-  --create-schema           create transtracer table schema for postgres
+  --create-schema           create shawk table schema for postgres
   --dbuser                  postgres user
   --dbpass                  postgres user password
   --dbhost                  postgres host
