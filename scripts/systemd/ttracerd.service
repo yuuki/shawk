@@ -1,0 +1,13 @@
+[Unit]
+Description=transtracer tracer agent
+Documentation=https://github.com/yuuki/transtracer/
+After=network-online.target nss-lookup.target
+
+[Service]
+EnvironmentFile=-/etc/default/ttracerd
+ExecStart=/usr/bin/ttracerd
+LimitNOFILE=65536
+LimitNPROC=65536
+
+[Install]
+WantedBy=multi-user.target
