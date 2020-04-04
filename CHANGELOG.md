@@ -1,3 +1,10 @@
+## [v0.4.0](https://github.com/yuuki/transtracer/compare/v0.3.2...v0.4.0) (2020-04-04)
+
+* Generate both rpm and deb packages by nfpm [#23](https://github.com/yuuki/transtracer/pull/23) ([yuuki](https://github.com/yuuki))
+* Implement streaming mode [#21](https://github.com/yuuki/transtracer/pull/21) ([yuuki](https://github.com/yuuki))
+* [readme] Add additional explanations of transtracer's overview [#22](https://github.com/yuuki/transtracer/pull/22) ([yuuki](https://github.com/yuuki))
+* Prepare and apply golangci-lint [#20](https://github.com/yuuki/transtracer/pull/20) ([yuuki](https://github.com/yuuki))
+
 ## [v0.3.2](https://github.com/yuuki/transtracer/compare/v0.3.1...v0.3.2) (2020-03-10)
 
 * Validate interval option [#15](https://github.com/yuuki/transtracer/pull/15) ([yuuki](https://github.com/yuuki))
