@@ -54,7 +54,7 @@ ci-lint:
 	$(GOLINT)
 
 .PHONY: credits
-credits: devel-deps
+credits: deps
 	gocredits > $(CREDITS)
 ifneq (,$(git status -s $(CREDITS)))
 	go generate -x ./...
