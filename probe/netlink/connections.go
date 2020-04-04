@@ -1,6 +1,6 @@
 // +build linux
 
-package tcpflow
+package netlink
 
 import (
 	"fmt"
@@ -8,11 +8,19 @@ import (
 	"github.com/elastic/gosigar/sys/linux"
 	"golang.org/x/xerrors"
 
-	"github.com/yuuki/transtracer/internal/lstf/netutil"
+	"github.com/yuuki/transtracer/probe"
+	"github.com/yuuki/transtracer/probe/netlink/netutil"
 )
 
+// GetHostFlowsOption represens an option for func GetHostFlows().
+type GetHostFlowsOption struct {
+	Numeric   bool
+	Processes bool
+	Filter    string
+}
+
 // GetHostFlows gets host flows by netlink, and try to get by procfs if it fails.
-func GetHostFlows(opt *GetHostFlowsOption) (HostFlows, error) {
+func GetHostFlows(opt *GetHostFlowsOption) (probe.HostFlows, error) {
 	flows, err := GetHostFlowsByNetlink(opt)
 	if err != nil {
 		var netlinkErr *netutil.NetlinkError
@@ -26,7 +34,7 @@ func GetHostFlows(opt *GetHostFlowsOption) (HostFlows, error) {
 }
 
 // GetHostFlowsByNetlink gets host flows by Linux netlink API.
-func GetHostFlowsByNetlink(opt *GetHostFlowsOption) (HostFlows, error) {
+func GetHostFlowsByNetlink(opt *GetHostFlowsOption) (probe.HostFlows, error) {
 	var userEnts netutil.UserEnts
 	if opt.Processes {
 		var err error
@@ -54,7 +62,7 @@ func GetHostFlowsByNetlink(opt *GetHostFlowsOption) (HostFlows, error) {
 		}
 	}
 
-	flows := HostFlows{}
+	flows := probe.HostFlows{}
 	for _, conn := range conns {
 		switch linux.TCPState(conn.State) {
 		case linux.TCP_LISTEN:
@@ -66,12 +74,12 @@ func GetHostFlowsByNetlink(opt *GetHostFlowsOption) (HostFlows, error) {
 		}
 
 		switch opt.Filter {
-		case FilterAll:
-		case FilterPublic:
+		case probe.FilterAll:
+		case probe.FilterPublic:
 			if netutil.IsPrivateIP(conn.DstIP()) {
 				continue
 			}
-		case FilterPrivate:
+		case probe.FilterPrivate:
 			if !netutil.IsPrivateIP(conn.DstIP()) {
 				continue
 			}
@@ -89,45 +97,45 @@ func GetHostFlowsByNetlink(opt *GetHostFlowsOption) (HostFlows, error) {
 			if ent == nil {
 				ent = lportEnt[lport]
 			}
-			hf := &HostFlow{
-				Direction: FlowPassive,
-				Local:     &AddrPort{Addr: conn.SrcIP().String(), Port: lport},
-				Peer:      &AddrPort{Addr: conn.DstIP().String(), Port: "many"},
+			hf := &probe.HostFlow{
+				Direction: probe.FlowPassive,
+				Local:     &probe.AddrPort{Addr: conn.SrcIP().String(), Port: lport},
+				Peer:      &probe.AddrPort{Addr: conn.DstIP().String(), Port: "many"},
 			}
 			if ent != nil {
-				hf.Process = &Process{
+				hf.Process = &probe.Process{
 					Name: ent.Pname(),
 					Pgid: ent.Pgrp(),
 				}
 			}
-			flows.insert(hf)
+			flows.Insert(hf)
 		} else {
 			// active open
-			hf := &HostFlow{
-				Direction: FlowActive,
-				Local:     &AddrPort{Addr: conn.SrcIP().String(), Port: "many"},
-				Peer:      &AddrPort{Addr: conn.DstIP().String(), Port: rport},
+			hf := &probe.HostFlow{
+				Direction: probe.FlowActive,
+				Local:     &probe.AddrPort{Addr: conn.SrcIP().String(), Port: "many"},
+				Peer:      &probe.AddrPort{Addr: conn.DstIP().String(), Port: rport},
 			}
 			if ent != nil {
-				hf.Process = &Process{
+				hf.Process = &probe.Process{
 					Name: ent.Pname(),
 					Pgid: ent.Pgrp(),
 				}
 			}
-			flows.insert(hf)
+			flows.Insert(hf)
 		}
 	}
 
 	if !opt.Numeric {
 		for _, flow := range flows {
-			flow.setLookupedName()
+			flow.SetLookupedName()
 		}
 	}
 	return flows, nil
 }
 
 // GetHostFlowsByProcfs gets host flows from procfs.
-func GetHostFlowsByProcfs() (HostFlows, error) {
+func GetHostFlowsByProcfs() (probe.HostFlows, error) {
 	conns, err := netutil.ProcfsConnections()
 	if err != nil {
 		return nil, err
@@ -136,7 +144,7 @@ func GetHostFlowsByProcfs() (HostFlows, error) {
 	if err != nil {
 		return nil, err
 	}
-	flows := HostFlows{}
+	flows := probe.HostFlows{}
 	for _, conn := range conns {
 		switch conn.Status {
 		case linux.TCP_LISTEN:
@@ -150,18 +158,27 @@ func GetHostFlowsByProcfs() (HostFlows, error) {
 		lport := fmt.Sprintf("%d", conn.Laddr.Port)
 		rport := fmt.Sprintf("%d", conn.Raddr.Port)
 		if contains(ports, lport) {
-			flows.insert(&HostFlow{
-				Direction: FlowPassive,
-				Local:     &AddrPort{Addr: conn.Laddr.IP, Port: lport},
-				Peer:      &AddrPort{Addr: conn.Raddr.IP, Port: "many"},
+			flows.Insert(&probe.HostFlow{
+				Direction: probe.FlowPassive,
+				Local:     &probe.AddrPort{Addr: conn.Laddr.IP, Port: lport},
+				Peer:      &probe.AddrPort{Addr: conn.Raddr.IP, Port: "many"},
 			})
 		} else {
-			flows.insert(&HostFlow{
-				Direction: FlowActive,
-				Local:     &AddrPort{Addr: conn.Laddr.IP, Port: "many"},
-				Peer:      &AddrPort{Addr: conn.Raddr.IP, Port: rport},
+			flows.Insert(&probe.HostFlow{
+				Direction: probe.FlowActive,
+				Local:     &probe.AddrPort{Addr: conn.Laddr.IP, Port: "many"},
+				Peer:      &probe.AddrPort{Addr: conn.Raddr.IP, Port: rport},
 			})
 		}
 	}
 	return flows, nil
+}
+
+func contains(strs []string, s string) bool {
+	for _, str := range strs {
+		if str == s {
+			return true
+		}
+	}
+	return false
 }

@@ -44,6 +44,7 @@ func NetlinkConnections() ([]*linux.InetDiagMsg, error) {
 	return msgs, nil
 }
 
+// UserEntByLport is a map that key is listening port, value is UserEnt structure.
 type UserEntByLport map[string]*UserEnt
 
 // NetlinkFilterByLocalListeningPorts filters ConnectionStat slice by the local listening ports.
@@ -61,7 +62,7 @@ func NetlinkFilterByLocalListeningPorts(conns []*linux.InetDiagMsg) ([]*linux.In
 	return lconns, nil
 }
 
-// NetlinkLodalListeningPorts returns the local listening ports.
+// NetlinkLocalListeningPorts returns the local listening ports.
 func NetlinkLocalListeningPorts() ([]string, error) {
 	msgs, err := NetlinkConnections()
 	if err != nil {

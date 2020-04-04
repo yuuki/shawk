@@ -10,7 +10,7 @@ import (
 	"github.com/lib/pq" // database/sql driver
 	"golang.org/x/xerrors"
 
-	"github.com/yuuki/transtracer/internal/lstf/tcpflow"
+	"github.com/yuuki/transtracer/probe"
 	"github.com/yuuki/transtracer/statik"
 )
 
@@ -101,7 +101,7 @@ const (
 )
 
 // InsertOrUpdateHostFlows insert host flows or update it if the same flow exists.
-func (db *DB) InsertOrUpdateHostFlows(flows []*tcpflow.HostFlow) error {
+func (db *DB) InsertOrUpdateHostFlows(flows []*probe.HostFlow) error {
 	ctx, cancel := context.WithTimeout(context.Background(), InsertOrUpdateTimeoutSec*time.Second)
 	defer cancel()
 	tx, err := db.BeginTx(ctx, nil)
@@ -201,7 +201,7 @@ func (db *DB) InsertOrUpdateHostFlows(flows []*tcpflow.HostFlow) error {
 			pname = flow.Process.Name
 		}
 		// lookup the same node before insert node
-		// - if flow.Direction == tcpflow.FlowActive {
+		// - if flow.Direction == probe.FlowActive {
 		//   - SELECT node_id, port FROM passive_nodes WHERE process_id IN (SELECT process_id FROM processes WHERE ipv4 = flow.Peer.Addr) AND port = flow.Peer.Port
 		//   - if not found
 		//     - INSERT INTO processes (ipv4, pgid, pname) INTO (flow.Peer.Addr, 0, "")
@@ -228,7 +228,7 @@ func (db *DB) InsertOrUpdateHostFlows(flows []*tcpflow.HostFlow) error {
 			return xerrors.Errorf("query error: %v", err)
 		}
 
-		if flow.Direction == tcpflow.FlowPassive {
+		if flow.Direction == probe.FlowPassive {
 			// local node is passive open, peer node is active open.
 
 			// Insert or update local node
@@ -265,7 +265,7 @@ func (db *DB) InsertOrUpdateHostFlows(flows []*tcpflow.HostFlow) error {
 			if err != nil {
 				return xerrors.Errorf("query error: %v", err)
 			}
-		} else if flow.Direction == tcpflow.FlowActive {
+		} else if flow.Direction == probe.FlowActive {
 			// peer node is passive open, local node is active open.
 
 			// Insert or update local node
