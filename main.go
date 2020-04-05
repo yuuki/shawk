@@ -128,9 +128,9 @@ Options:
 
 const defaultDepth = 1
 
-func (cli *CLI) doLook(args []string) error {
+func (c *CLI) doLook(args []string) error {
 	var param command.LookParam
-	flags := cli.prepareFlags(lookHelpText)
+	flags := c.prepareFlags(lookHelpText)
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -172,9 +172,9 @@ const (
 	defaultFlushIntervalSec = 30
 )
 
-func (cli *CLI) doProbe(args []string) error {
+func (c *CLI) doProbe(args []string) error {
 	var param command.ProbeParam
-	flags := cli.prepareFlags(probeHelpText)
+	flags := c.prepareFlags(probeHelpText)
 	flags.StringVar(&param.Mode, "mode", defaultMode, "")
 	flags.IntVar(&param.IntervalSec, "interval-sec", defaultIntervalSec, "")
 	flags.IntVar(&param.FlushIntervalSec, "flush-interval-sec", defaultFlushIntervalSec, "")
@@ -207,9 +207,9 @@ Options:
   --dbname                  postgres database name
 `
 
-func (cli *CLI) doCreateScheme(args []string) error {
+func (c *CLI) doCreateScheme(args []string) error {
 	var param command.CreateSchemeParam
-	flags := cli.prepareFlags(probeHelpText)
+	flags := c.prepareFlags(probeHelpText)
 	flags.StringVar(&param.DB.User, "dbuser", "", "")
 	flags.StringVar(&param.DB.Password, "dbpass", "", "")
 	flags.StringVar(&param.DB.Host, "dbhost", "", "")

@@ -16,6 +16,7 @@ const (
 	PollingMode = "polling"
 )
 
+// ProbeParam represents a probe command parameter.
 type ProbeParam struct {
 	Mode             string
 	Once             bool
@@ -24,6 +25,7 @@ type ProbeParam struct {
 	DB               db.Opt
 }
 
+// Probe runs probe subcommand.
 func Probe(param *ProbeParam) error {
 	logger.Infof("--> Connecting postgres ...")
 

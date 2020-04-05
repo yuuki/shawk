@@ -9,15 +9,18 @@ import (
 )
 
 const (
+	// MaxGraphDepth is maximum depth of dependency graph.
 	MaxGraphDepth = 4
 )
 
+// LookParam represents a look command parameter.
 type LookParam struct {
 	IPv4  string
 	Depth int
 	DB    db.Opt
 }
 
+// Look runs look subcommand.
 func Look(param *LookParam) error {
 	if param.IPv4 != "" {
 		return doIPv4(param.IPv4, param.Depth, &param.DB)

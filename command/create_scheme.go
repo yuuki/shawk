@@ -5,10 +5,12 @@ import (
 	"golang.org/x/xerrors"
 )
 
+// CreateSchemeParam represents a create-scheme command parameter.
 type CreateSchemeParam struct {
 	DB db.Opt
 }
 
+// CreateScheme runs create-scheme subcommand.
 func CreateScheme(param *CreateSchemeParam) error {
 	logger.Infof("Connecting postgres ...")
 
