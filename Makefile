@@ -27,8 +27,7 @@ clean:
 .PHONY: build
 build: clean
 	go generate ./...
-	$(DOCKER) go build -ldflags="$(BUILD_LDFLAGS)" ./cmd/ttracerd/
-	$(DOCKER) go build -ldflags="$(BUILD_LDFLAGS)" ./cmd/ttctl/
+	$(DOCKER) go build -ldflags="$(BUILD_LDFLAGS)" ./...
 	go mod tidy
 
 .PHONY: install
