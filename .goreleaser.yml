@@ -5,9 +5,9 @@ before:
   hooks:
     - go mod tidy
 builds:
-  - id: "ttracerd"
-    main: ./cmd/ttracerd/
-    binary: ttracerd
+  - id: "shawk"
+    main: ./...
+    binary: shawk
     ldflags:
       - -s -w
       - -X version.version={{.Version}}
@@ -15,21 +15,6 @@ builds:
       - -X version.date={{.Date}}
     goos:
       - linux
-    goarch:
-      - amd64
-  - id: "ttctl"
-    main: ./cmd/ttctl/
-    binary: ttctl
-    ldflags:
-      - -s -w
-      - -X version.version={{.Version}}
-      - -X version.commit={{.ShortCommit}}
-      - -X version.date={{.Date}}
-    env:
-      - CGO_ENABLED=0
-    goos:
-      - linux
-      - darwin
     goarch:
       - amd64
 changelog:
@@ -56,6 +41,6 @@ nfpms:
     epoch: 1
     empty_folders:
     files:
-      "scripts/systemd/ttracerd.service": "/etc/systemd/system/multi-user.target.wants/ttracerd.service"
+      "scripts/systemd/shawk.service": "/etc/systemd/system/multi-user.target.wants/shawk.service"
     config_files:
     scripts:
