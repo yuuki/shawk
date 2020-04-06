@@ -1,11 +1,10 @@
-# Transtracer
+# Shawk
 
-[![Build Status](https://travis-ci.org/yuuki/shawk.svg?branch=master)](https://travis-ci.org/yuuki/shawk)
 [![Latest Version](http://img.shields.io/github/release/yuuki/shawk.svg?style=flat-square)](https://github.com/yuuki/shawk/releases)
 [![Go Report Card](https://goreportcard.com/badge/github.com/yuuki/shawk)](https://goreportcard.com/report/github.com/yuuki/shawk)
 [![License](http://img.shields.io/:license-mit-blue.svg)](http://doge.mit-license.org)
 
-Transtracer is a socket-based tracing infrastructure for discovering network dependencies among processes in distributed applications. Transtracer has an architecture of monitoring network sockets, which are endpoints of TCP connections, to trace the dependency.
+Shawk is a socket-based tracing infrastructure for discovering network dependencies among processes in distributed applications. Transtracer has an architecture of monitoring network sockets, which are endpoints of TCP connections, to trace the dependency.
 
 ## Contributions
 
@@ -29,30 +28,47 @@ This figure shows how to retrieve socket information for TCP connections. When t
 
 ## Usage
 
-### ttracerd
-
-Run a daemon process of scanning connections in polling mode.
-
 ```shell-session
-# ttracerd --dbuser ttracer --dbpass ttracer --dbhost 10.0.0.20 --dbname "ttctl" --mode polling --interval 1 --flush-interval 10
+$ shawk --help
+Usage: shawk [options]
+
+  A socket-based tracing system for discovering network dependencies in distributed applications.
+
+Commands:
+  look           show dependencies starting from a specified node.
+  probe          start agent for collecting flows and processes.
+  create-scheme  create CMDB scheme.
+
+Options:
+  --version         print version
+  --credits         print credits
+  --help, -h        print help
 ```
 
-Run ttracerd in streaming mode, which internaly uses eBPF.
+### shawk probe
+
+Run a daemon process of scanning connections in polling mode (default).
 
 ```shell-session
-# ttracerd --dbuser ttracer --dbpass ttracer --dbhost 10.0.0.20 --dbname "ttctl" --mode=streaming --interval 1
+# shawk probe --mode polling --interval 1 --flush-interval 10 --dbuser shawk --dbpass shawk --dbhost 10.0.0.20 --dbname shawk
+```
+
+Run a daemon process in streaming mode, which internaly uses eBPF.
+
+```shell-session
+# shawk --mode streaming --interval 1 probe --dbuser shawk --dbpass shawk --dbhost 10.0.0.20 --dbname shawk
 ```
 
 Run scanning connections only once.
 
 ```shell-session
-# ttracerd --once --interval-sec 3 --dbuser ttracer --dbpass ttracer --dbhost 10.0.0.20 --dbname "ttctl"
+# shawk --mode polling --once --dbuser shawk --dbpass shawk --dbhost 10.0.0.20 --dbname shawk
 ```
 
-### ttctl
+### shawk look
 
 ```shell-session
-$ ttctl --dbhost 10.0.0.20 --ipv4 10.0.0.10
+$ shawk look --dbhost 10.0.0.20 --ipv4 10.0.0.10
 10.0.0.10:80 (’nginx’, pgid=4656)
 └<-- 10.0.0.11:many (’wrk’, pgid=5982) 10.0.0.10:80 (’nginx’, pgid=4656)
 └--> 10.0.0.12:8080 (’python’, pgid=6111) 10.0.0.10:many (’fluentd’, pgid=2127)
