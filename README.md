@@ -4,7 +4,7 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/yuuki/shawk)](https://goreportcard.com/report/github.com/yuuki/shawk)
 [![License](http://img.shields.io/:license-mit-blue.svg)](http://doge.mit-license.org)
 
-Shawk is a socket-based tracing infrastructure for discovering network dependencies among processes in distributed applications. Transtracer has an architecture of monitoring network sockets, which are endpoints of TCP connections, to trace the dependency.
+Shawk is a socket-based tracing infrastructure for discovering network dependencies among processes in distributed applications. Shawk has an architecture of monitoring network sockets, which are endpoints of TCP connections, to trace the dependencies.
 
 ## Contributions
 
