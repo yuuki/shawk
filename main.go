@@ -112,11 +112,7 @@ Usage: shawk look [options]
 
 show dependencies starting from a specified node.
 
-	flags.BoolVar(&createSchema, "create-schema", false, "")
-	flags.StringVar(&ipv4, "ipv4", "", "")
-
 Options:
-  --create-schema           create shawk table schema for postgres
   --ipv4               		print trees regarding the ipv4 address as a root node
   --depth                   depth of dependency graph
   --dbuser                  postgres user
@@ -131,16 +127,16 @@ const defaultDepth = 1
 func (c *CLI) doLook(args []string) error {
 	var param command.LookParam
 	flags := c.prepareFlags(lookHelpText)
-	if err := flags.Parse(args); err != nil {
-		return err
-	}
 	flags.StringVar(&param.IPv4, "ipv4", "", "")
+	flags.IntVar(&param.Depth, "depth", defaultDepth, "")
 	flags.StringVar(&param.DB.User, "dbuser", "", "")
 	flags.StringVar(&param.DB.Password, "dbpass", "", "")
 	flags.StringVar(&param.DB.Host, "dbhost", "", "")
 	flags.StringVar(&param.DB.Port, "dbport", "", "")
 	flags.StringVar(&param.DB.DBName, "dbname", "", "")
-	flags.IntVar(&param.Depth, "depth", defaultDepth, "")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
 
 	if param.Depth <= 0 || param.Depth > command.MaxGraphDepth {
 		return fmt.Errorf("depth must be 0 < depth < %d, but specified %d",
@@ -187,8 +183,10 @@ func (c *CLI) doProbe(args []string) error {
 		return err
 	}
 
-	if param.Mode == command.PollingMode || param.Mode == command.StreamingMode {
-		return fmt.Errorf("--mode option must be '%s' or '%s'", command.PollingMode, command.StreamingMode)
+	if param.Mode != command.PollingMode &&
+		param.Mode != command.StreamingMode {
+		return fmt.Errorf("--mode option must be '%s' or '%s'",
+			command.PollingMode, command.StreamingMode)
 	}
 
 	return command.Probe(&param)
@@ -209,7 +207,7 @@ Options:
 
 func (c *CLI) doCreateScheme(args []string) error {
 	var param command.CreateSchemeParam
-	flags := c.prepareFlags(probeHelpText)
+	flags := c.prepareFlags(createSchemeHelpText)
 	flags.StringVar(&param.DB.User, "dbuser", "", "")
 	flags.StringVar(&param.DB.Password, "dbpass", "", "")
 	flags.StringVar(&param.DB.Host, "dbhost", "", "")
