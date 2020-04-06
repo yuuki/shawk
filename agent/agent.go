@@ -6,8 +6,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/yuuki/transtracer/db"
-	"github.com/yuuki/transtracer/logging"
+	"github.com/yuuki/shawk/db"
+	"github.com/yuuki/shawk/logging"
 	"golang.org/x/xerrors"
 )
 

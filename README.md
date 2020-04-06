@@ -1,11 +1,10 @@
-# Transtracer
+# Shawk
 
-[![Build Status](https://travis-ci.org/yuuki/transtracer.svg?branch=master)](https://travis-ci.org/yuuki/transtracer)
-[![Latest Version](http://img.shields.io/github/release/yuuki/transtracer.svg?style=flat-square)](https://github.com/yuuki/transtracer/releases)
-[![Go Report Card](https://goreportcard.com/badge/github.com/yuuki/transtracer)](https://goreportcard.com/report/github.com/yuuki/transtracer)
+[![Latest Version](http://img.shields.io/github/release/yuuki/shawk.svg?style=flat-square)](https://github.com/yuuki/shawk/releases)
+[![Go Report Card](https://goreportcard.com/badge/github.com/yuuki/shawk)](https://goreportcard.com/report/github.com/yuuki/shawk)
 [![License](http://img.shields.io/:license-mit-blue.svg)](http://doge.mit-license.org)
 
-Transtracer is a socket-based tracing infrastructure for discovering network dependencies among processes in distributed applications. Transtracer has an architecture of monitoring network sockets, which are endpoints of TCP connections, to trace the dependency.
+Shawk is a socket-based tracing infrastructure for discovering network dependencies among processes in distributed applications. Shawk has an architecture of monitoring network sockets, which are endpoints of TCP connections, to trace the dependencies.
 
 ## Contributions
 
@@ -29,30 +28,47 @@ This figure shows how to retrieve socket information for TCP connections. When t
 
 ## Usage
 
-### ttracerd
-
-Run a daemon process of scanning connections in polling mode.
-
 ```shell-session
-# ttracerd --dbuser ttracer --dbpass ttracer --dbhost 10.0.0.20 --dbname "ttctl" --mode polling --interval 1 --flush-interval 10
+$ shawk --help
+Usage: shawk [options]
+
+  A socket-based tracing system for discovering network dependencies in distributed applications.
+
+Commands:
+  look           show dependencies starting from a specified node.
+  probe          start agent for collecting flows and processes.
+  create-scheme  create CMDB scheme.
+
+Options:
+  --version         print version
+  --credits         print credits
+  --help, -h        print help
 ```
 
-Run ttracerd in streaming mode, which internaly uses eBPF.
+### shawk probe
+
+Run a daemon process of scanning connections in polling mode (default).
 
 ```shell-session
-# ttracerd --dbuser ttracer --dbpass ttracer --dbhost 10.0.0.20 --dbname "ttctl" --mode=streaming --interval 1
+# shawk probe --mode polling --interval 1 --flush-interval 10 --dbuser shawk --dbpass shawk --dbhost 10.0.0.20 --dbname shawk
+```
+
+Run a daemon process in streaming mode, which internaly uses eBPF.
+
+```shell-session
+# shawk --mode streaming --interval 1 probe --dbuser shawk --dbpass shawk --dbhost 10.0.0.20 --dbname shawk
 ```
 
 Run scanning connections only once.
 
 ```shell-session
-# ttracerd --once --interval-sec 3 --dbuser ttracer --dbpass ttracer --dbhost 10.0.0.20 --dbname "ttctl"
+# shawk --mode polling --once --dbuser shawk --dbpass shawk --dbhost 10.0.0.20 --dbname shawk
 ```
 
-### ttctl
+### shawk look
 
 ```shell-session
-$ ttctl --dbhost 10.0.0.20 --ipv4 10.0.0.10
+$ shawk look --dbhost 10.0.0.20 --ipv4 10.0.0.10
 10.0.0.10:80 (’nginx’, pgid=4656)
 └<-- 10.0.0.11:many (’wrk’, pgid=5982) 10.0.0.10:80 (’nginx’, pgid=4656)
 └--> 10.0.0.12:8080 (’python’, pgid=6111) 10.0.0.10:many (’fluentd’, pgid=2127)
@@ -61,7 +77,7 @@ $ ttctl --dbhost 10.0.0.20 --ipv4 10.0.0.10
 
 ## Papers (including proceedings)
 
-1. Yuuki Tsubouchi, Masahiro Furukawa, Ryosoke Matsumoto, Transtracer: Automatically Tracing for Processes Dependencies in Distributed Systems by Monitoring Endpoints of TCP/UDP, IPSJ Internet and Operation Technology Symposium (IOTS2019), Vol. 2019, pp. 64-71, 2019. [[paper](https://yuuk.io/papers/transtracer_iots2019.pdf)] [[slide](https://speakerdeck.com/yuukit/udptong-xin-falsezhong-duan-dian-falsejian-shi-niyoruhurosesujian-yi-cun-guan-xi-falsezi-dong-zhui-ji-8bc9ca63-0751-40fd-9ad5-2f1ea692b9b0)]
+1. Yuuki Tsubouchi, Masahiro Furukawa, Ryosoke Matsumoto, Transtracer: Automatically Tracing for Processes Dependencies in Distributed Systems by Monitoring Endpoints of TCP/UDP, IPSJ Internet and Operation Technology Symposium (IOTS2019), Vol. 2019, pp. 64-71, 2019. [[paper](https://yuuk.io/papers/shawk_iots2019.pdf)] [[slide](https://speakerdeck.com/yuukit/udptong-xin-falsezhong-duan-dian-falsejian-shi-niyoruhurosesujian-yi-cun-guan-xi-falsezi-dong-zhui-ji-8bc9ca63-0751-40fd-9ad5-2f1ea692b9b0)]
 
 ## License
 

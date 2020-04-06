@@ -10,7 +10,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/lib/pq"
 
-	"github.com/yuuki/transtracer/probe"
+	"github.com/yuuki/shawk/probe"
 )
 
 func TestCreateSchema(t *testing.T) {

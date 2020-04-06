@@ -1,4 +1,4 @@
-module github.com/yuuki/transtracer
+module github.com/yuuki/shawk
 
 go 1.14
 

@@ -6,8 +6,8 @@ import (
 
 	bpflib "github.com/iovisor/gobpf/elf"
 	"github.com/weaveworks/tcptracer-bpf/pkg/tracer"
-	"github.com/yuuki/transtracer/logging"
-	"github.com/yuuki/transtracer/probe"
+	"github.com/yuuki/shawk/logging"
+	"github.com/yuuki/shawk/probe"
 	"golang.org/x/xerrors"
 )
 

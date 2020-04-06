@@ -5,11 +5,11 @@ import (
 
 	"golang.org/x/xerrors"
 
-	"github.com/yuuki/transtracer/agent"
-	"github.com/yuuki/transtracer/db"
-	"github.com/yuuki/transtracer/logging"
-	"github.com/yuuki/transtracer/probe"
-	"github.com/yuuki/transtracer/probe/ebpf"
+	"github.com/yuuki/shawk/agent"
+	"github.com/yuuki/shawk/db"
+	"github.com/yuuki/shawk/logging"
+	"github.com/yuuki/shawk/probe"
+	"github.com/yuuki/shawk/probe/ebpf"
 )
 
 type flowAggBuffer chan *probe.HostFlow

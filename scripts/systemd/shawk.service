@@ -1,0 +1,13 @@
+[Unit]
+Description=shawk probe agent
+Documentation=https://github.com/yuuki/shawk/
+After=network-online.target nss-lookup.target
+
+[Service]
+EnvironmentFile=-/etc/default/shawk
+ExecStart=/usr/bin/shawk probe
+LimitNOFILE=65536
+LimitNPROC=65536
+
+[Install]
+WantedBy=multi-user.target

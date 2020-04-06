@@ -1,19 +1,19 @@
-version: '3.6'
+version: "3.6"
 
 services:
   agent:
     build: .
     depends_on:
       - db
-    entrypoint: /go/bin/ttracerd
-    command: ["--dbuser", "ttracer", "--dbhost", "db", "--dbpass", "ttracer"]
+    entrypoint: /go/bin/shawk
+    command: ["--dbuser", "ttracer", "--dbhost", "db", "--dbpass", "shawk"]
   db:
     image: postgres:11.3
     ports:
       - 5432
     environment:
-      - POSTGRES_USER=ttracer
-      - POSTGRES_DB=ttracer
+      - POSTGRES_USER=shawk
+      - POSTGRES_DB=shawk
     restart: always
     user: postgres
     volumes:

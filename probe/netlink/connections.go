@@ -8,8 +8,8 @@ import (
 	"github.com/elastic/gosigar/sys/linux"
 	"golang.org/x/xerrors"
 
-	"github.com/yuuki/transtracer/probe"
-	"github.com/yuuki/transtracer/probe/netlink/netutil"
+	"github.com/yuuki/shawk/probe"
+	"github.com/yuuki/shawk/probe/netlink/netutil"
 )
 
 // GetHostFlowsOption represens an option for func GetHostFlows().
