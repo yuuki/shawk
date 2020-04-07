@@ -6,7 +6,7 @@ services:
     depends_on:
       - db
     entrypoint: /go/bin/shawk
-    command: ["--dbuser", "ttracer", "--dbhost", "db", "--dbpass", "shawk"]
+    command: ["--dbhost", "db"]
   db:
     image: postgres:11.3
     ports:

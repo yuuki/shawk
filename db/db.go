@@ -16,9 +16,9 @@ import (
 
 const (
 	// DefaultDBName is the default name of postgres database.
-	DefaultDBName = "ttracer"
+	DefaultDBName = "shawk"
 	// DefaultDBUserName is the default postgres user name.
-	DefaultDBUserName = "ttracer"
+	DefaultDBUserName = "shawk"
 	// DefaultDBHostname is the default postgres host name.
 	DefaultDBHostname = "localhost"
 	// DefaultDBPort is the default postgres port.
