@@ -42,9 +42,31 @@ func (c *CLI) Run(args []string) int {
 		return exitCodeErr
 	}
 
-	var err error
+	var (
+		debug bool
+		help  bool
+	)
+	flags := flag.NewFlagSet("shawk", flag.ContinueOnError)
+	flags.SetOutput(c.errStream)
+	flags.Usage = func() {
+		printHelp(c.errStream)
+	}
+	flags.BoolVar(&help, "help", false, "")
+	flags.BoolVar(&debug, "debug", false, "")
+	if err := flags.Parse(args[1:]); err != nil {
+		return exitCodeErr
+	}
 
-next:
+	if help {
+		printHelp(c.outStream)
+		return exitCodeOK
+	}
+
+	if debug {
+		logging.SetLogLevel(logging.DEBUG)
+	}
+
+	var err error
 	switch args[1] {
 	case "look":
 		err = c.doLook(args[2:])
@@ -52,24 +74,21 @@ next:
 		err = c.doProbe(args[2:])
 	case "create-scheme":
 		err = c.doCreateScheme(args[2:])
-	case "version", "--version":
+	case "version":
 		version.PrintVersion(c.errStream)
 		return exitCodeOK
-	case "help", "-h", "--help":
-		printHelp(c.outStream)
-		return exitCodeOK
-	case "credits", "--credits":
+	case "credits":
 		text, err := statik.FindString("/CREDITS")
 		if err != nil {
 			logger.Fatalf("%v", err)
 		}
 		fmt.Fprintln(c.outStream, text)
 		return exitCodeOK
-	case "--debug":
-		logging.SetLogLevel(logging.DEBUG)
-		args = args[1:]
-		goto next
+	case "help":
+		printHelp(c.outStream)
+		return exitCodeOK
 	default:
+		fmt.Fprintf(c.errStream, "No such sub command: %s\n", args[1])
 		printHelp(c.errStream)
 		return exitCodeErr
 	}
@@ -91,18 +110,21 @@ Commands:
   probe          start agent for collecting flows and processes.
   create-scheme  create CMDB scheme.
 
+  version        print version
+  credits        print credits
+  help           print help
+
 Options:
-  --version         print version
-  --credits         print credits
-  --help, -h        print help
+  --help         print help
+  --debug        enable debug logging
 `
 
 func printHelp(w io.Writer) {
 	fmt.Fprint(w, helpText)
 }
 
-func (c *CLI) prepareFlags(help string) *flag.FlagSet {
-	flags := flag.NewFlagSet("shawk", flag.ContinueOnError)
+func (c *CLI) prepareFlags(name, help string) *flag.FlagSet {
+	flags := flag.NewFlagSet(name, flag.ContinueOnError)
 	flags.SetOutput(c.errStream)
 	flags.Usage = func() {
 		fmt.Fprint(c.errStream, help)
@@ -129,7 +151,7 @@ const defaultDepth = 1
 
 func (c *CLI) doLook(args []string) error {
 	var param command.LookParam
-	flags := c.prepareFlags(lookHelpText)
+	flags := c.prepareFlags("look", lookHelpText)
 	flags.StringVar(&param.IPv4, "ipv4", "", "")
 	flags.IntVar(&param.Depth, "depth", defaultDepth, "")
 	flags.StringVar(&param.DB.User, "dbuser", "", "")
@@ -173,7 +195,7 @@ const (
 
 func (c *CLI) doProbe(args []string) error {
 	var param command.ProbeParam
-	flags := c.prepareFlags(probeHelpText)
+	flags := c.prepareFlags("probe", probeHelpText)
 	flags.StringVar(&param.Mode, "mode", defaultMode, "")
 	flags.IntVar(&param.IntervalSec, "interval-sec", defaultIntervalSec, "")
 	flags.IntVar(&param.FlushIntervalSec, "flush-interval-sec", defaultFlushIntervalSec, "")
@@ -210,7 +232,7 @@ Options:
 
 func (c *CLI) doCreateScheme(args []string) error {
 	var param command.CreateSchemeParam
-	flags := c.prepareFlags(createSchemeHelpText)
+	flags := c.prepareFlags("create-scheme", createSchemeHelpText)
 	flags.StringVar(&param.DB.User, "dbuser", "", "")
 	flags.StringVar(&param.DB.Password, "dbpass", "", "")
 	flags.StringVar(&param.DB.Host, "dbhost", "", "")
