@@ -6,7 +6,7 @@ before:
     - go mod tidy
 builds:
   - id: "shawk"
-    main: ./...
+    main: .
     binary: shawk
     ldflags:
       - -s -w
