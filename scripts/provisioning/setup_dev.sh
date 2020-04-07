@@ -2,8 +2,8 @@
 
 set -eux
 
-sudo apt-get -yq update
-sudo apt-get -yq install build-essential gcc make git
+sudo apt-get update
+sudo apt-get install -y --no-install-recommends  build-essential gcc make git
 
 # Install Go
 GOVER='1.14.1'
@@ -21,6 +21,13 @@ PG_VERSION=11
 
 wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
 sudo bash -c "echo 'deb http://apt.postgresql.org/pub/repos/apt/ bionic-pgdg main' > /etc/apt/sources.list.d/pgdg.list"
-sudo apt-get -yq update
-sudo apt-get install -yq postgresql-${PG_VERSION} postgresql-client-${PG_VERSION} postgresql-contrib-${PG_VERSION}
+sudo apt-get update
+sudo apt-get install -y --no-install-recommends postgresql-${PG_VERSION} postgresql-client-${PG_VERSION} postgresql-contrib-${PG_VERSION}
+
+PG_USER='shawk'
+PG_PASSWD='shawk'
+PG_DB='shawk'
+sudo -u postgres psql -c "create role ${PG_USER} with login password '${PG_PASSWD}';"
+sudo -u postgres createdb --owner ${PG_USER} ${PG_DB} --echo
+
 echo 'Completed to setup'
