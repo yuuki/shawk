@@ -44,6 +44,7 @@ func (c *CLI) Run(args []string) int {
 
 	var err error
 
+next:
 	switch args[1] {
 	case "look":
 		err = c.doLook(args[2:])
@@ -51,21 +52,23 @@ func (c *CLI) Run(args []string) int {
 		err = c.doProbe(args[2:])
 	case "create-scheme":
 		err = c.doCreateScheme(args[2:])
-	case "--debug":
-		logging.SetLogLevel(logging.DEBUG)
-	case "--version":
+	case "version", "--version":
 		version.PrintVersion(c.errStream)
 		return exitCodeOK
-	case "-h", "--help":
+	case "help", "-h", "--help":
 		printHelp(c.outStream)
 		return exitCodeOK
-	case "--credits":
+	case "credits", "--credits":
 		text, err := statik.FindString("/CREDITS")
 		if err != nil {
 			logger.Fatalf("%v", err)
 		}
 		fmt.Fprintln(c.outStream, text)
 		return exitCodeOK
+	case "--debug":
+		logging.SetLogLevel(logging.DEBUG)
+		args = args[1:]
+		goto next
 	default:
 		printHelp(c.errStream)
 		return exitCodeErr
