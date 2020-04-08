@@ -1,5 +1,6 @@
 # Shawk
 
+[![GitHub Actions status](https://github.com/yuuki/shawk/workflows/Test/badge.svg)](https://github.com/yuuki/shawk/actions)
 [![Latest Version](http://img.shields.io/github/release/yuuki/shawk.svg?style=flat-square)](https://github.com/yuuki/shawk/releases)
 [![Go Report Card](https://goreportcard.com/badge/github.com/yuuki/shawk)](https://goreportcard.com/report/github.com/yuuki/shawk)
 [![License](http://img.shields.io/:license-mit-blue.svg)](http://doge.mit-license.org)
