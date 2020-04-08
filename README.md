@@ -5,6 +5,10 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/yuuki/shawk)](https://goreportcard.com/report/github.com/yuuki/shawk)
 [![License](http://img.shields.io/:license-mit-blue.svg)](http://doge.mit-license.org)
 
+<img alt="shawk-logo" src="https://github.com/yuuki/shawk/raw/master/doc/images/logo.png" width="140">
+
+----
+
 Shawk is a socket-based tracing infrastructure for discovering network dependencies among processes in distributed applications. Shawk has an architecture of monitoring network sockets, which are endpoints of TCP connections, to trace the dependencies.
 
 ## Contributions
