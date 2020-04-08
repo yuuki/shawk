@@ -5,7 +5,7 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/yuuki/shawk)](https://goreportcard.com/report/github.com/yuuki/shawk)
 [![License](http://img.shields.io/:license-mit-blue.svg)](http://doge.mit-license.org)
 
-<img alt="shawk-logo" src="https://github.com/yuuki/shawk/raw/master/doc/images/logo.png" width="140">
+<img alt="shawk-logo" src="https://github.com/yuuki/shawk/raw/master/doc/images/logo.png" width="200">
 
 ----
 
