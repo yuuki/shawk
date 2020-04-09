@@ -41,7 +41,7 @@ github.com/pkg/errors
 # github.com/rakyll/statik v0.1.7
 ## explicit
 github.com/rakyll/statik/fs
-# github.com/shirou/gopsutil v2.19.9+incompatible
+# github.com/shirou/gopsutil v2.20.3+incompatible
 ## explicit
 github.com/shirou/gopsutil/internal/common
 github.com/shirou/gopsutil/net
