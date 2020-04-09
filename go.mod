@@ -11,7 +11,7 @@ require (
 	github.com/go-ole/go-ole v1.2.4 // indirect
 	github.com/google/go-cmp v0.3.0
 	github.com/iovisor/gobpf v0.0.0-20200311173154-8078b203833d
-	github.com/lib/pq v1.2.0
+	github.com/lib/pq v1.3.0
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/rakyll/statik v0.1.7
 	github.com/shirou/gopsutil v2.19.9+incompatible
