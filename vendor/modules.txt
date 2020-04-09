@@ -50,7 +50,7 @@ github.com/shirou/gopsutil/net
 # github.com/weaveworks/tcptracer-bpf v0.0.0-20190731111909-cd53e7c84bac
 ## explicit
 github.com/weaveworks/tcptracer-bpf/pkg/tracer
-# golang.org/x/sys v0.0.0-20200122134326-e047566fdf82
+# golang.org/x/sys v0.0.0-20200409092240-59c9f1ba88fa
 ## explicit
 golang.org/x/sys/unix
 golang.org/x/sys/windows

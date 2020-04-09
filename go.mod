@@ -17,6 +17,6 @@ require (
 	github.com/shirou/gopsutil v2.19.9+incompatible
 	github.com/stretchr/testify v1.3.0 // indirect
 	github.com/weaveworks/tcptracer-bpf v0.0.0-20190731111909-cd53e7c84bac
-	golang.org/x/sys v0.0.0-20200122134326-e047566fdf82
+	golang.org/x/sys v0.0.0-20200409092240-59c9f1ba88fa
 	golang.org/x/xerrors v0.0.0-20191204190536-9bdfabe68543
 )
