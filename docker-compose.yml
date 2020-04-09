@@ -8,7 +8,7 @@ services:
     entrypoint: /go/bin/shawk
     command: ["--dbhost", "db"]
   db:
-    image: postgres:11.3
+    image: postgres:11.7
     ports:
       - 5432
     environment:
