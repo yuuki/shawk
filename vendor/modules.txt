@@ -1,4 +1,4 @@
-# github.com/DATA-DOG/go-sqlmock v1.3.3
+# github.com/DATA-DOG/go-sqlmock v1.4.1
 ## explicit
 github.com/DATA-DOG/go-sqlmock
 # github.com/EricLagergren/go-gnulib v0.0.0-20191129172535-039a51fc60f4

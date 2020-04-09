@@ -3,7 +3,7 @@ module github.com/yuuki/shawk
 go 1.14
 
 require (
-	github.com/DATA-DOG/go-sqlmock v1.3.3
+	github.com/DATA-DOG/go-sqlmock v1.4.1
 	github.com/EricLagergren/go-gnulib v0.0.0-20191129172535-039a51fc60f4
 	github.com/StackExchange/wmi v0.0.0-20190523213315-cbe66965904d // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
