@@ -22,3 +22,8 @@ var date string
 func PrintVersion(w io.Writer) {
 	fmt.Fprintf(w, "%s version %s, build %s, date %s \n", name, version, commit, date)
 }
+
+// GetVersion returns version.
+func GetVersion() string {
+	return version
+}
