@@ -75,9 +75,15 @@ deps:
 			golang.org/x/lint/golint \
 			github.com/x-motemen/gobump/cmd/gobump \
 			github.com/Songmu/ghch/cmd/ghch \
-			github.com/Songmu/gocredits/cmd/gocredits; \
+			github.com/Songmu/gocredits/cmd/gocredits \
+			github.com/goware/modvendor; \
 		rm -rf $$tmpdir'
 
 .PHONY: docker-build
 docker-build:
 	docker build -t $(DOCKER_IMAGE_NAME) .
+
+# Run to copy .c and .h files after receiving PR by Renovate.
+.PHONY: modvendor
+modvendor:
+	modvendor -copy="**/*.c **/*.h" -v
