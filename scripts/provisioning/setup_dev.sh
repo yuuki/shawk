@@ -6,7 +6,7 @@ sudo apt-get update
 sudo apt-get install -y --no-install-recommends  build-essential gcc make git
 
 # Install Go
-GOVER='1.14.1'
+GOVER='1.14.2'
 GOTAR="go${GOVER}.linux-amd64.tar.gz"
 
 wget https://dl.google.com/go/${GOTAR}
