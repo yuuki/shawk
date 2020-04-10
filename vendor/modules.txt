@@ -1,4 +1,4 @@
-# github.com/DATA-DOG/go-sqlmock v1.3.3
+# github.com/DATA-DOG/go-sqlmock v1.4.1
 ## explicit
 github.com/DATA-DOG/go-sqlmock
 # github.com/EricLagergren/go-gnulib v0.0.0-20191129172535-039a51fc60f4
@@ -18,19 +18,19 @@ github.com/elastic/gosigar/sys/linux
 ## explicit
 github.com/go-ole/go-ole
 github.com/go-ole/go-ole/oleutil
-# github.com/google/go-cmp v0.3.0
+# github.com/google/go-cmp v0.4.0
 ## explicit
 github.com/google/go-cmp/cmp
 github.com/google/go-cmp/cmp/internal/diff
 github.com/google/go-cmp/cmp/internal/flags
 github.com/google/go-cmp/cmp/internal/function
 github.com/google/go-cmp/cmp/internal/value
-# github.com/iovisor/gobpf v0.0.0-20200311173154-8078b203833d
+# github.com/iovisor/gobpf v0.0.0-20200329161226-8b2cce9dac28
 ## explicit
 github.com/iovisor/gobpf/elf
 github.com/iovisor/gobpf/pkg/bpffs
 github.com/iovisor/gobpf/pkg/cpuonline
-# github.com/lib/pq v1.2.0
+# github.com/lib/pq v1.3.0
 ## explicit
 github.com/lib/pq
 github.com/lib/pq/oid
@@ -41,16 +41,18 @@ github.com/pkg/errors
 # github.com/rakyll/statik v0.1.7
 ## explicit
 github.com/rakyll/statik/fs
-# github.com/shirou/gopsutil v2.19.9+incompatible
+# github.com/shirou/gopsutil v2.20.3+incompatible
 ## explicit
 github.com/shirou/gopsutil/internal/common
 github.com/shirou/gopsutil/net
-# github.com/stretchr/testify v1.3.0
+# github.com/stretchr/objx v0.2.0
+## explicit
+# github.com/stretchr/testify v1.5.1
 ## explicit
 # github.com/weaveworks/tcptracer-bpf v0.0.0-20190731111909-cd53e7c84bac
 ## explicit
 github.com/weaveworks/tcptracer-bpf/pkg/tracer
-# golang.org/x/sys v0.0.0-20200122134326-e047566fdf82
+# golang.org/x/sys v0.0.0-20200409092240-59c9f1ba88fa
 ## explicit
 golang.org/x/sys/unix
 golang.org/x/sys/windows
@@ -58,3 +60,5 @@ golang.org/x/sys/windows
 ## explicit
 golang.org/x/xerrors
 golang.org/x/xerrors/internal
+# gopkg.in/yaml.v2 v2.2.8
+## explicit
