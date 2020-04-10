@@ -277,7 +277,9 @@ func TestFindPassiveFlows(t *testing.T) {
 		pq.Array([]string{"192.168.3.1", "192.168.3.2"}),
 	).WillReturnRows(columns)
 
-	flows, err := db.FindPassiveFlows(paddrs)
+	flows, err := db.FindPassiveFlows(&FindFlowsCond{
+		Addrs: paddrs,
+	})
 	if err != nil {
 		t.Fatalf("%+v", err)
 	}
@@ -363,7 +365,9 @@ func TestFindActiveFlows(t *testing.T) {
 		pq.Array([]string{"192.168.2.1", "192.168.2.2"}),
 	).WillReturnRows(columns)
 
-	flows, err := db.FindActiveFlows(aaddrs)
+	flows, err := db.FindActiveFlows(&FindFlowsCond{
+		Addrs: aaddrs,
+	})
 	if err != nil {
 		t.Fatalf("%+v", err)
 	}
