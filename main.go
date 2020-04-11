@@ -135,16 +135,18 @@ func (c *CLI) prepareFlags(name, help string) *flag.FlagSet {
 var lookHelpText = `
 Usage: shawk look [options]
 
-show dependencies starting from a specified node.
+print dependencies starting from a specified node.
 
 Options:
-  --ipv4               		print trees regarding the ipv4 address as a root node
+  --ipv4 ADDR              	filter flows regarding a specific ipv4 address as a root node
+  --since                   filter flows since a specific date (relative duration such as '5m', '2h45m')
+  --until                   filter flows until a specific date (relative duration such as '5m', '2h45m')
   --depth                   depth of dependency graph
-  --dbuser                  postgres user
-  --dbpass                  postgres user password
-  --dbhost                  postgres host
-  --dbport                  postgres port
-  --dbname                  postgres database name
+  --dbuser                  CMDB postgres user
+  --dbpass                  CMDB postgres user password
+  --dbhost                  CMDB postgres host
+  --dbport                  CMDB postgres port
+  --dbname                  CMDB postgres database name
 `
 
 const defaultDepth = 1
@@ -153,6 +155,8 @@ func (c *CLI) doLook(args []string) error {
 	var param command.LookParam
 	flags := c.prepareFlags("look", lookHelpText)
 	flags.StringVar(&param.IPv4, "ipv4", "", "")
+	flags.StringVar(&param.Since, "since", "", "")
+	flags.StringVar(&param.Until, "until", "", "")
 	flags.IntVar(&param.Depth, "depth", defaultDepth, "")
 	flags.StringVar(&param.DB.User, "dbuser", "", "")
 	flags.StringVar(&param.DB.Password, "dbpass", "", "")
@@ -180,11 +184,11 @@ Options:
   --once                    run once only if --mode='polling'
   --interval-sec            interval of scan connection stats (default: %d) only if --mode='polling'
   --flush-interval-sec      interval of flushing data into the CMDB (default: %d) only if --mode='polling'
-  --dbuser                  postgres user
-  --dbpass                  postgres user password
-  --dbhost                  postgres host
-  --dbport                  postgres port
-  --dbname                  postgres database name
+  --dbuser                  CMDB postgres user
+  --dbpass                  CMDB postgres user password
+  --dbhost                  CMDB postgres host
+  --dbport                  CMDB postgres port
+  --dbname                  CMDB postgres database name
 `
 
 const (
