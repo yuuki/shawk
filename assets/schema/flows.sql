@@ -37,4 +37,7 @@ CREATE TABLE IF NOT EXISTS flows (
 
     UNIQUE (source_node_id, destination_node_id)
 );
+CREATE INDEX IF NOT EXISTS flows_destination_node_id_updated_key ON flows USING btree (destination_node_id, updated);
+CREATE INDEX IF NOT EXISTS flows_source_node_id_destination_node_id_updated_key ON flows USING btree (source_node_id, destination_node_id, updated);
 CREATE INDEX IF NOT EXISTS flows_destination_node_id_source_node_id_key ON flows USING btree (destination_node_id, source_node_id);
+CREATE INDEX IF NOT EXISTS flows_source_node_id_destination_node_id_key ON flows USING btree (source_node_id, destination_node_id);
