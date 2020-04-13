@@ -351,6 +351,10 @@ func (db *DB) FindPassiveFlows(cond *FindFlowsCond) (Flows, error) {
 		ipv4s = append(ipv4s, addr.String())
 	}
 
+	if cond.Until.IsZero() {
+		cond.Until = time.Now()
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -374,8 +378,9 @@ func (db *DB) FindPassiveFlows(cond *FindFlowsCond) (Flows, error) {
 		INNER JOIN processes AS passive_processes ON passive_processes.process_id = passive_nodes.process_id
 		WHERE passive_processes.ipv4 = ANY($1)
 	) AS pn ON pn.node_id = flows.destination_node_id
+	WHERE flows.updated BETWEEN $2 AND $3
 	ORDER BY pn.ipv4, pn.pname, flows.updated DESC
-`, pq.Array(ipv4s))
+`, pq.Array(ipv4s), pq.FormatTimestamp(cond.Since), pq.FormatTimestamp(cond.Until))
 	switch {
 	case err == sql.ErrNoRows:
 		return Flows{}, nil
@@ -456,8 +461,9 @@ func (db *DB) FindActiveFlows(cond *FindFlowsCond) (Flows, error) {
 		INNER JOIN processes AS active_processes ON active_processes.process_id = active_nodes.process_id
 		WHERE active_processes.ipv4 = ANY($1)
 	) AS an ON an.node_id = flows.source_node_id
+	WHERE flows.updated BETWEEN $2 AND $3
 	ORDER BY an.ipv4, an.pname, flows.updated DESC
-`, pq.Array(ipv4s))
+`, pq.Array(ipv4s), pq.FormatTimestamp(cond.Since), pq.FormatTimestamp(cond.Until))
 	switch {
 	case err == sql.ErrNoRows:
 		return Flows{}, nil
