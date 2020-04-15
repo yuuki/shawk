@@ -3,6 +3,7 @@ package command
 import (
 	"fmt"
 	"net"
+	"time"
 
 	"github.com/yuuki/shawk/db"
 	"golang.org/x/xerrors"
@@ -18,28 +19,60 @@ type LookParam struct {
 	IPv4  string
 	Depth int
 	DB    db.Opt
+	Since string
+	Until string
 }
 
 // Look runs look subcommand.
 func Look(param *LookParam) error {
+	var (
+		since, until time.Time
+		err          error
+	)
+	if param.Since != "" {
+		since, err = durationFromString(param.Since)
+		if err != nil {
+			return err
+		}
+	}
+	if param.Until != "" {
+		until, err = durationFromString(param.Until)
+		if err != nil {
+			return err
+		}
+	}
+
 	if param.IPv4 != "" {
-		return doIPv4(param.IPv4, param.Depth, &param.DB)
+		return doIPv4(param.IPv4, param.Depth, since, until, &param.DB)
 	}
 	return nil
 }
 
-func doIPv4(ipv4 string, depth int, opt *db.Opt) error {
-	db, err := db.New(opt)
+func durationFromString(s string) (time.Time, error) {
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return time.Time{}, xerrors.Errorf("time parse error: %w", err)
+	}
+	return time.Now().Add(-d), nil
+}
+
+func doIPv4(ipv4 string, depth int, since, until time.Time, opt *db.Opt) error {
+	dbCon, err := db.New(opt)
 	if err != nil {
 		return xerrors.Errorf("postgres initialize error: %w", err)
 	}
 	addr := net.ParseIP(ipv4)
 
-	// print thet flows of passive nodes
-	pflows, err := db.FindPassiveFlows([]net.IP{addr})
+	pflows, err := dbCon.FindPassiveFlows(&db.FindFlowsCond{
+		Addrs: []net.IP{addr},
+		Since: since,
+		Until: until,
+	})
 	if err != nil {
 		return xerrors.Errorf("find active flows error: %w", err)
 	}
+
+	// print thet flows of passive nodes
 	for _, flows := range pflows {
 		pn := flows[0].PassiveNode
 		fmt.Printf("%s:%d ('%s', pgid=%d)\n", pn.IPAddr, pn.Port, pn.Pname, pn.Pgid)
@@ -47,11 +80,16 @@ func doIPv4(ipv4 string, depth int, opt *db.Opt) error {
 		printPassiveFlows(flows)
 	}
 
-	// print the flows of active nodes
-	aflows, err := db.FindActiveFlows([]net.IP{addr})
+	aflows, err := dbCon.FindActiveFlows(&db.FindFlowsCond{
+		Addrs: []net.IP{addr},
+		Since: since,
+		Until: until,
+	})
 	if err != nil {
 		return xerrors.Errorf("find active flows error: %w", err)
 	}
+
+	// print the flows of active nodes
 	for _, flows := range aflows {
 		anode := flows[0].ActiveNode
 		fmt.Printf("%s ('%s', pgid=%d)\n", anode.IPAddr, anode.Pname, anode.Pgid)

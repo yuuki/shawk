@@ -273,11 +273,18 @@ func TestFindPassiveFlows(t *testing.T) {
 	connections = 20
 	columns.AddRow(pipv4, ppname, pport, ppgid, aipv4, apname, apgid, connections, time.Now())
 
+	until := time.Now()
+
 	mock.ExpectQuery("SELECT (.+) FROM flows").WithArgs(
 		pq.Array([]string{"192.168.3.1", "192.168.3.2"}),
+		pq.FormatTimestamp(time.Time{}),
+		pq.FormatTimestamp(until),
 	).WillReturnRows(columns)
 
-	flows, err := db.FindPassiveFlows(paddrs)
+	flows, err := db.FindPassiveFlows(&FindFlowsCond{
+		Addrs: paddrs,
+		Until: until,
+	})
 	if err != nil {
 		t.Fatalf("%+v", err)
 	}
@@ -359,11 +366,18 @@ func TestFindActiveFlows(t *testing.T) {
 	connections = 20
 	columns.AddRow(aipv4, apname, pport, apgid, pipv4, ppname, ppgid, connections, time.Now())
 
+	until := time.Now()
+
 	mock.ExpectQuery("SELECT (.+) FROM flows").WithArgs(
 		pq.Array([]string{"192.168.2.1", "192.168.2.2"}),
+		pq.FormatTimestamp(time.Time{}),
+		pq.FormatTimestamp(until),
 	).WillReturnRows(columns)
 
-	flows, err := db.FindActiveFlows(aaddrs)
+	flows, err := db.FindActiveFlows(&FindFlowsCond{
+		Addrs: aaddrs,
+		Until: until,
+	})
 	if err != nil {
 		t.Fatalf("%+v", err)
 	}

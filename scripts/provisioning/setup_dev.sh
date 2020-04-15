@@ -27,7 +27,8 @@ sudo apt-get install -y --no-install-recommends postgresql-${PG_VERSION} postgre
 PG_USER='shawk'
 PG_PASSWD='shawk'
 PG_DB='shawk'
-sudo -u postgres psql -c "create role ${PG_USER} with login password '${PG_PASSWD}';"
+sudo -u postgres psql -c "CREATE ROLE ${PG_USER} WITH LOGIN PASSWORD '${PG_PASSWD}';"
 sudo -u postgres createdb --owner ${PG_USER} ${PG_DB} --echo
+sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE ${PG_DB} TO ${PG_USER};"
 
 echo 'Completed to setup'
