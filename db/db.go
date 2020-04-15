@@ -438,6 +438,10 @@ func (db *DB) FindActiveFlows(cond *FindFlowsCond) (Flows, error) {
 		ipv4s = append(ipv4s, addr.String())
 	}
 
+	if cond.Until.IsZero() {
+		cond.Until = time.Now()
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
