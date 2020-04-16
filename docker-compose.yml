@@ -5,7 +5,7 @@ services:
     build: .
     depends_on:
       - db
-    entrypoint: /go/bin/shawk
+    entrypoint: /go/bin/shawk probe
     command: ["--dbhost", "db"]
   db:
     image: postgres:11.7
