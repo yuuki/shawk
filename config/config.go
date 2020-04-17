@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"time"
 
 	"golang.org/x/xerrors"
@@ -32,5 +33,11 @@ func Load() error {
 	if err != nil {
 		return xerrors.Errorf("envconfig process error: %w", err)
 	}
+	switch Config.ProbeMode {
+	case "streaming", "polling":
+	default:
+		return fmt.Errorf("the value of probe mode should be 'streaming' or 'polling'")
+	}
+
 	return nil
 }
