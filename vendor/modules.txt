@@ -30,6 +30,9 @@ github.com/google/go-cmp/cmp/internal/value
 github.com/iovisor/gobpf/elf
 github.com/iovisor/gobpf/pkg/bpffs
 github.com/iovisor/gobpf/pkg/cpuonline
+# github.com/kelseyhightower/envconfig v1.4.0
+## explicit
+github.com/kelseyhightower/envconfig
 # github.com/lib/pq v1.3.0
 ## explicit
 github.com/lib/pq
@@ -45,8 +48,6 @@ github.com/rakyll/statik/fs
 ## explicit
 github.com/shirou/gopsutil/internal/common
 github.com/shirou/gopsutil/net
-# github.com/stretchr/objx v0.2.0
-## explicit
 # github.com/stretchr/testify v1.5.1
 ## explicit
 # github.com/weaveworks/tcptracer-bpf v0.0.0-20190731111909-cd53e7c84bac
