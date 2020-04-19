@@ -18,6 +18,8 @@ func TestLoad(t *testing.T) {
 	os.Setenv("SHAWK_PROBE_INTERVAL", "3s")
 	os.Setenv("SHAWK_PROBE_FLUSH_INTERVAL", "10s")
 
+	os.Setenv("SHAWK_DEBUG", "1")
+
 	err := Load()
 	if err != nil {
 		t.Fatal(err)
@@ -53,5 +55,9 @@ func TestLoad(t *testing.T) {
 	want, _ = time.ParseDuration("10s")
 	if v := Config.ProbeFlushInterval; v != want {
 		t.Errorf("Config.ProbeFlushInterval should be not '%v', but '%v'", v, want)
+	}
+
+	if v := Config.Debug; !v {
+		t.Errorf("Config.ProbeFlushInterval should be not '%v', but true", v)
 	}
 }
