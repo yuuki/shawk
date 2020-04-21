@@ -25,23 +25,23 @@ func TestLoad(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if v := Config.CMDBName; v != "testdb" {
+	if v := Config.CMDB.Name; v != "testdb" {
 		t.Errorf("Config.CNDBName should be not '%v', but 'testdb'", v)
 	}
-	if v := Config.CMDBHost; v != "testhost" {
+	if v := Config.CMDB.Host; v != "testhost" {
 		t.Errorf("Config.CNDBHost should be not '%v', but 'testhost'", v)
 	}
-	if v := Config.CMDBPort; v != "12345" {
+	if v := Config.CMDB.Port; v != "12345" {
 		t.Errorf("Config.CNDBPort should be not '%v', but '12345'", v)
 	}
-	if v := Config.CMDBUser; v != "testuser" {
+	if v := Config.CMDB.User; v != "testuser" {
 		t.Errorf("Config.CNDBUser should be not '%v', but 'testuser'", v)
 	}
-	if v := Config.CMDBPassword; v != "testpassword" {
+	if v := Config.CMDB.Password; v != "testpassword" {
 		t.Errorf("Config.CNDBPassword should be not '%v', but 'testpassword'", v)
 	}
 	want, _ := time.ParseDuration("10s")
-	if v := Config.CMDBConnectTimeout; v != want {
+	if v := Config.CMDB.ConnectTimeout; v != want {
 		t.Errorf("Config.CNDBConnectTimeout should be not '%v', but %v", v, want)
 	}
 
