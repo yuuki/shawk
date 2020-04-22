@@ -1,10 +1,9 @@
 package command
 
 import (
-	"time"
-
 	"github.com/yuuki/shawk/agent/polling"
 	"github.com/yuuki/shawk/agent/streaming"
+	"github.com/yuuki/shawk/config"
 	"github.com/yuuki/shawk/db"
 	"golang.org/x/xerrors"
 )
@@ -18,25 +17,28 @@ const (
 
 // ProbeParam represents a probe command parameter.
 type ProbeParam struct {
-	Mode             string
-	Once             bool
-	IntervalSec      int
-	FlushIntervalSec int
-	DB               db.Opt
+	Once bool
 }
 
 // Probe runs probe subcommand.
 func Probe(param *ProbeParam) error {
 	logger.Infof("--> Connecting postgres ...")
 
-	db, err := db.New(&param.DB)
+	db, err := db.New(&db.Opt{
+		DBName:         config.Config.CMDB.Name,
+		Host:           config.Config.CMDB.Host,
+		Port:           config.Config.CMDB.Port,
+		User:           config.Config.CMDB.User,
+		Password:       config.Config.CMDB.Password,
+		ConnectTimeout: config.Config.CMDB.ConnectTimeout,
+	})
 	if err != nil {
 		return xerrors.Errorf("postgres connecting error: %w", err)
 	}
 
 	logger.Infof("Connected postgres")
 
-	switch param.Mode {
+	switch config.Config.ProbeMode {
 	case PollingMode:
 		if param.Once {
 			if err := polling.RunOnce(db); err != nil {
@@ -44,8 +46,8 @@ func Probe(param *ProbeParam) error {
 			}
 		} else {
 			err := polling.Run(
-				time.Duration(param.IntervalSec)*time.Second,
-				time.Duration(param.FlushIntervalSec)*time.Second,
+				config.Config.ProbeInterval,
+				config.Config.ProbeFlushInterval,
 				db,
 			)
 			if err != nil {
@@ -54,7 +56,7 @@ func Probe(param *ProbeParam) error {
 		}
 	case StreamingMode:
 		err := streaming.Run(
-			time.Duration(param.IntervalSec)*time.Second,
+			config.Config.ProbeInterval,
 			db,
 		)
 		if err != nil {

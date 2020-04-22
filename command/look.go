@@ -5,6 +5,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/yuuki/shawk/config"
 	"github.com/yuuki/shawk/db"
 	"golang.org/x/xerrors"
 )
@@ -18,7 +19,6 @@ const (
 type LookParam struct {
 	IPv4  string
 	Depth int
-	DB    db.Opt
 	Since string
 	Until string
 }
@@ -43,7 +43,7 @@ func Look(param *LookParam) error {
 	}
 
 	if param.IPv4 != "" {
-		return doIPv4(param.IPv4, param.Depth, since, until, &param.DB)
+		return doIPv4(param.IPv4, param.Depth, since, until)
 	}
 	return nil
 }
@@ -56,8 +56,15 @@ func durationFromString(s string) (time.Time, error) {
 	return time.Now().Add(-d), nil
 }
 
-func doIPv4(ipv4 string, depth int, since, until time.Time, opt *db.Opt) error {
-	dbCon, err := db.New(opt)
+func doIPv4(ipv4 string, depth int, since, until time.Time) error {
+	dbCon, err := db.New(&db.Opt{
+		DBName:         config.Config.CMDB.Name,
+		Host:           config.Config.CMDB.Host,
+		Port:           config.Config.CMDB.Port,
+		User:           config.Config.CMDB.User,
+		Password:       config.Config.CMDB.Password,
+		ConnectTimeout: config.Config.CMDB.ConnectTimeout,
+	})
 	if err != nil {
 		return xerrors.Errorf("postgres initialize error: %w", err)
 	}
