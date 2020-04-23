@@ -21,7 +21,7 @@ func TestRun_version(t *testing.T) {
 
 	expected := fmt.Sprintf("shawk version %s", version.GetVersion())
 	if !strings.Contains(errStream.String(), expected) {
-		t.Errorf("expected %q to eq %q", errStream.String(), expected)
+		t.Errorf("expected %q to contain %q", expected, errStream.String())
 	}
 }
 
@@ -37,7 +37,7 @@ func TestRun_parseError(t *testing.T) {
 
 	expected := "Usage: shawk"
 	if !strings.Contains(errStream.String(), expected) {
-		t.Fatalf("expected %q to contain %q", errStream.String(), expected)
+		t.Errorf("expected %q to contain %q", expected, errStream.String())
 	}
 }
 
@@ -53,7 +53,7 @@ func TestRun_noCommandError(t *testing.T) {
 
 	expected := "No such sub command"
 	if !strings.Contains(errStream.String(), expected) {
-		t.Fatalf("expected %q to contain %q", errStream.String(), expected)
+		t.Errorf("expected %q to contain %q", expected, errStream.String())
 	}
 }
 
@@ -69,22 +69,6 @@ func TestRun_lookError(t *testing.T) {
 
 	expected := "depth must be 0 < depth"
 	if !strings.Contains(errStream.String(), expected) {
-		t.Fatalf("expected %q to contain %q", errStream.String(), expected)
-	}
-}
-
-func TestRun_probeError(t *testing.T) {
-	outStream, errStream := new(bytes.Buffer), new(bytes.Buffer)
-	cli := &CLI{outStream: outStream, errStream: errStream}
-	args := strings.Split("shawk probe --mode nonexistent-mode", " ")
-
-	status := cli.Run(args)
-	if status != exitCodeErr {
-		t.Errorf("expected %d to eq %d", status, exitCodeErr)
-	}
-
-	expected := "--mode option must be"
-	if !strings.Contains(errStream.String(), expected) {
-		t.Fatalf("expected %q to contain %q", errStream.String(), expected)
+		t.Errorf("expected %q to contain %q", expected, errStream.String())
 	}
 }
