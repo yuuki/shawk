@@ -24,14 +24,7 @@ type ProbeParam struct {
 func Probe(param *ProbeParam) error {
 	logger.Infof("--> Connecting postgres ...")
 
-	db, err := db.New(&db.Opt{
-		DBName:         config.Config.CMDB.Name,
-		Host:           config.Config.CMDB.Host,
-		Port:           config.Config.CMDB.Port,
-		User:           config.Config.CMDB.User,
-		Password:       config.Config.CMDB.Password,
-		ConnectTimeout: config.Config.CMDB.ConnectTimeout,
-	})
+	dbCon, err := db.New(config.Config.CMDB.URL)
 	if err != nil {
 		return xerrors.Errorf("postgres connecting error: %w", err)
 	}
@@ -41,14 +34,14 @@ func Probe(param *ProbeParam) error {
 	switch config.Config.ProbeMode {
 	case PollingMode:
 		if param.Once {
-			if err := polling.RunOnce(db); err != nil {
+			if err := polling.RunOnce(dbCon); err != nil {
 				return err
 			}
 		} else {
 			err := polling.Run(
 				config.Config.ProbeInterval,
 				config.Config.ProbeFlushInterval,
-				db,
+				dbCon,
 			)
 			if err != nil {
 				return err
@@ -57,7 +50,7 @@ func Probe(param *ProbeParam) error {
 	case StreamingMode:
 		err := streaming.Run(
 			config.Config.ProbeInterval,
-			db,
+			dbCon,
 		)
 		if err != nil {
 			return err

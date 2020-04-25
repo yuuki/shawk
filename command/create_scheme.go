@@ -1,20 +1,19 @@
 package command
 
 import (
+	"github.com/yuuki/shawk/config"
 	"github.com/yuuki/shawk/db"
 	"golang.org/x/xerrors"
 )
 
-// CreateSchemeParam represents a create-scheme command parameter.
-type CreateSchemeParam struct {
-	DB db.Opt
-}
+// CreateSchemeParam is
+type CreateSchemeParam struct{}
 
 // CreateScheme runs create-scheme subcommand.
 func CreateScheme(param *CreateSchemeParam) error {
 	logger.Infof("Connecting postgres ...")
 
-	db, err := db.New(&param.DB)
+	db, err := db.New(config.Config.CMDB.URL)
 	if err != nil {
 		return xerrors.Errorf("postgres initialize error: %w", err)
 	}

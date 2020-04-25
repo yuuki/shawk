@@ -17,6 +17,7 @@ type config struct {
 		User           string        `default:"shawk" split_words:"true"`
 		Password       string        `default:"shawk" split_words:"true"`
 		ConnectTimeout time.Duration `default:"5s" split_words:"true"`
+		URL            string        `default:"postgres://shawk:shawk@127.0.0.1:5432/shawk?sslmode=disable&connect_timeout=5"`
 	}
 	ProbeMode          string        `default:"polling" split_words:"true"`
 	ProbeInterval      time.Duration `default:"1s" split_words:"true"`

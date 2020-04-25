@@ -57,14 +57,7 @@ func durationFromString(s string) (time.Time, error) {
 }
 
 func doIPv4(ipv4 string, depth int, since, until time.Time) error {
-	dbCon, err := db.New(&db.Opt{
-		DBName:         config.Config.CMDB.Name,
-		Host:           config.Config.CMDB.Host,
-		Port:           config.Config.CMDB.Port,
-		User:           config.Config.CMDB.User,
-		Password:       config.Config.CMDB.Password,
-		ConnectTimeout: config.Config.CMDB.ConnectTimeout,
-	})
+	dbCon, err := db.New(config.Config.CMDB.URL)
 	if err != nil {
 		return xerrors.Errorf("postgres initialize error: %w", err)
 	}

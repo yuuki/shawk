@@ -25,28 +25,9 @@ type DB struct {
 	*sql.DB
 }
 
-// Opt are options for database connection.
-// https://godoc.org/github.com/lib/pq
-type Opt struct {
-	DBName         string
-	User           string
-	Password       string
-	Host           string
-	Port           string
-	SSLMode        string
-	ConnectTimeout time.Duration
-}
-
 // New creates the DB object.
-func New(opt *Opt) (*DB, error) {
-	var user, dbname, host, port, sslmode string
-	if sslmode = opt.SSLMode; sslmode == "" {
-		sslmode = "disable"
-	}
-	db, err := sql.Open("postgres", fmt.Sprintf(
-		"user=%s password=%s host=%s port=%s dbname=%s sslmode=%s connect_timeout=%d",
-		user, opt.Password, host, port, dbname, sslmode, int(opt.ConnectTimeout.Seconds()),
-	))
+func New(dbURL string) (*DB, error) {
+	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
 		return nil, xerrors.Errorf("postgres open error: %v", err)
 	}
