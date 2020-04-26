@@ -206,13 +206,6 @@ var createSchemeHelpText = `
 Usage: shawk create-scheme [options]
 
 create CMDB scheme.
-
-Options:
-  --dbuser                  postgres user
-  --dbpass                  postgres user password
-  --dbhost                  postgres host
-  --dbport                  postgres port
-  --dbname                  postgres database name
 `
 
 func (c *CLI) doCreateScheme(args []string) error {
