@@ -4,9 +4,13 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"os"
 
+	"github.com/joho/godotenv"
+
 	"github.com/yuuki/shawk/command"
+	"github.com/yuuki/shawk/config"
 	"github.com/yuuki/shawk/logging"
 	"github.com/yuuki/shawk/statik"
 	"github.com/yuuki/shawk/version"
@@ -40,6 +44,16 @@ func (c *CLI) Run(args []string) int {
 	if len(args) <= 1 {
 		printHelp(c.errStream)
 		return exitCodeErr
+	}
+
+	if env := os.Getenv("SHAWK_ENV_FILE"); env != "" {
+		if err := godotenv.Load(env); err != nil {
+			log.Fatalf("Cannot start load config from env: %v\n", err)
+		}
+	}
+
+	if err := config.Load(); err != nil {
+		log.Fatalf("Cannot load config from env: %v\n", err)
 	}
 
 	var (
@@ -117,6 +131,9 @@ Commands:
 Options:
   --help         print help
   --debug        enable debug logging
+
+Environs:
+  SHAWK_ENV_FILE=/path/to/envfile
 `
 
 func printHelp(w io.Writer) {
@@ -142,11 +159,6 @@ Options:
   --since                   filter flows since a specific date (relative duration such as '5m', '2h45m')
   --until                   filter flows until a specific date (relative duration such as '5m', '2h45m')
   --depth                   depth of dependency graph
-  --dbuser                  CMDB postgres user
-  --dbpass                  CMDB postgres user password
-  --dbhost                  CMDB postgres host
-  --dbport                  CMDB postgres port
-  --dbname                  CMDB postgres database name
 `
 
 const defaultDepth = 1
@@ -158,11 +170,6 @@ func (c *CLI) doLook(args []string) error {
 	flags.StringVar(&param.Since, "since", "", "")
 	flags.StringVar(&param.Until, "until", "", "")
 	flags.IntVar(&param.Depth, "depth", defaultDepth, "")
-	flags.StringVar(&param.DB.User, "dbuser", "", "")
-	flags.StringVar(&param.DB.Password, "dbpass", "", "")
-	flags.StringVar(&param.DB.Host, "dbhost", "", "")
-	flags.StringVar(&param.DB.Port, "dbport", "", "")
-	flags.StringVar(&param.DB.DBName, "dbname", "", "")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -180,42 +187,16 @@ Usage: shawk probe [options]
 start agent for collecting flows and processes.
 
 Options:
-  --mode                    agent mode ('polling' or 'streaming'. default: 'polling')
+  --env
   --once                    run once only if --mode='polling'
-  --interval-sec            interval of scan connection stats (default: %d) only if --mode='polling'
-  --flush-interval-sec      interval of flushing data into the CMDB (default: %d) only if --mode='polling'
-  --dbuser                  CMDB postgres user
-  --dbpass                  CMDB postgres user password
-  --dbhost                  CMDB postgres host
-  --dbport                  CMDB postgres port
-  --dbname                  CMDB postgres database name
 `
-
-const (
-	defaultMode             = command.PollingMode
-	defaultIntervalSec      = 5
-	defaultFlushIntervalSec = 30
-)
 
 func (c *CLI) doProbe(args []string) error {
 	var param command.ProbeParam
 	flags := c.prepareFlags("probe", probeHelpText)
-	flags.StringVar(&param.Mode, "mode", defaultMode, "")
-	flags.IntVar(&param.IntervalSec, "interval-sec", defaultIntervalSec, "")
-	flags.IntVar(&param.FlushIntervalSec, "flush-interval-sec", defaultFlushIntervalSec, "")
-	flags.StringVar(&param.DB.User, "dbuser", "", "")
-	flags.StringVar(&param.DB.Password, "dbpass", "", "")
-	flags.StringVar(&param.DB.Host, "dbhost", "", "")
-	flags.StringVar(&param.DB.Port, "dbport", "", "")
-	flags.StringVar(&param.DB.DBName, "dbname", "", "")
+	flags.BoolVar(&param.Once, "once", false, "")
 	if err := flags.Parse(args); err != nil {
 		return err
-	}
-
-	if param.Mode != command.PollingMode &&
-		param.Mode != command.StreamingMode {
-		return fmt.Errorf("--mode option must be '%s' or '%s'",
-			command.PollingMode, command.StreamingMode)
 	}
 
 	return command.Probe(&param)
@@ -225,23 +206,11 @@ var createSchemeHelpText = `
 Usage: shawk create-scheme [options]
 
 create CMDB scheme.
-
-Options:
-  --dbuser                  postgres user
-  --dbpass                  postgres user password
-  --dbhost                  postgres host
-  --dbport                  postgres port
-  --dbname                  postgres database name
 `
 
 func (c *CLI) doCreateScheme(args []string) error {
 	var param command.CreateSchemeParam
 	flags := c.prepareFlags("create-scheme", createSchemeHelpText)
-	flags.StringVar(&param.DB.User, "dbuser", "", "")
-	flags.StringVar(&param.DB.Password, "dbpass", "", "")
-	flags.StringVar(&param.DB.Host, "dbhost", "", "")
-	flags.StringVar(&param.DB.Port, "dbport", "", "")
-	flags.StringVar(&param.DB.DBName, "dbname", "", "")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}

@@ -55,25 +55,25 @@ Options:
 Run a daemon process of scanning connections in polling mode (default).
 
 ```shell-session
-# shawk probe --mode polling --interval 1 --flush-interval 10 --dbuser shawk --dbpass shawk --dbhost 10.0.0.20 --dbname shawk
+# SHAWK_PROBE_MODE=polling SHAWK_PROBE_INTERVAL=1s SHAWK_FLUSH_INTERVAL=10s SHAWK_CMDB_URL=postgres://shawk:password@127.0.0.1:5432/shawk?sslmode=disable&connect_timeout=1 shawk probe
 ```
 
 Run a daemon process in streaming mode, which internaly uses eBPF.
 
 ```shell-session
-# shawk --mode streaming --interval 1 probe --dbuser shawk --dbpass shawk --dbhost 10.0.0.20 --dbname shawk
+# SHAWK_PROBE_MODE=streaming SHAWK_PROBE_INTERVAL=1s SHAWK_CMDB_URL=postgres://shawk:password@127.0.0.1:5432/shawk?sslmode=disable&connect_timeout=1 shawk probe
 ```
 
 Run scanning connections only once.
 
 ```shell-session
-# shawk --mode polling --once --dbuser shawk --dbpass shawk --dbhost 10.0.0.20 --dbname shawk
+# SHAWK_PROBE_MODE=streaming SHAWK_PROBE_INTERVAL=1s SHAWK_CMDB_URL=postgres://shawk:password@127.0.0.1:5432/shawk?sslmode=disable shawk probe --once
 ```
 
 ### shawk look
 
 ```shell-session
-$ shawk look --dbhost 10.0.0.20 --ipv4 10.0.0.10
+# SHAWK_CMDB_URL=postgres://shawk:password@127.0.0.1:5432/shawk?sslmode=disable shawk look --ipv4 10.0.0.10
 10.0.0.10:80 (’nginx’, pgid=4656)
 └<-- 10.0.0.11:many (’wrk’, pgid=5982) 10.0.0.10:80 (’nginx’, pgid=4656)
 └--> 10.0.0.12:8080 (’python’, pgid=6111) 10.0.0.10:many (’fluentd’, pgid=2127)

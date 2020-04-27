@@ -14,19 +14,6 @@ import (
 	"github.com/yuuki/shawk/statik"
 )
 
-const (
-	// DefaultDBName is the default name of postgres database.
-	DefaultDBName = "shawk"
-	// DefaultDBUserName is the default postgres user name.
-	DefaultDBUserName = "shawk"
-	// DefaultDBHostname is the default postgres host name.
-	DefaultDBHostname = "localhost"
-	// DefaultDBPort is the default postgres port.
-	DefaultDBPort = "5432"
-	// ConnectTimeout is the default timeout of the connection to the postgres server.
-	ConnectTimeout = 5
-)
-
 var (
 	schemas = []string{
 		"/schema/flows.sql",
@@ -38,39 +25,9 @@ type DB struct {
 	*sql.DB
 }
 
-// Opt are options for database connection.
-// https://godoc.org/github.com/lib/pq
-type Opt struct {
-	DBName   string
-	User     string
-	Password string
-	Host     string
-	Port     string
-	SSLMode  string
-}
-
 // New creates the DB object.
-func New(opt *Opt) (*DB, error) {
-	var user, dbname, host, port, sslmode string
-	if user = opt.User; user == "" {
-		user = DefaultDBUserName
-	}
-	if dbname = opt.DBName; dbname == "" {
-		dbname = DefaultDBName
-	}
-	if host = opt.Host; host == "" {
-		host = DefaultDBHostname
-	}
-	if port = opt.Port; port == "" {
-		port = DefaultDBPort
-	}
-	if sslmode = opt.SSLMode; sslmode == "" {
-		sslmode = "disable"
-	}
-	db, err := sql.Open("postgres", fmt.Sprintf(
-		"user=%s password=%s host=%s port=%s dbname=%s sslmode=%s connect_timeout=%d",
-		user, opt.Password, host, port, dbname, sslmode, ConnectTimeout,
-	))
+func New(dbURL string) (*DB, error) {
+	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
 		return nil, xerrors.Errorf("postgres open error: %v", err)
 	}
