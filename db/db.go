@@ -2,12 +2,11 @@ package db
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"net"
 	"time"
 
-	"github.com/lib/pq" // database/sql driver
+	"github.com/jackc/pgx/v4"
 	"golang.org/x/xerrors"
 
 	"github.com/yuuki/shawk/probe"
@@ -22,29 +21,36 @@ var (
 
 // DB represents a Database handler.
 type DB struct {
-	*sql.DB
+	*pgx.Conn
 }
 
 // New creates the DB object.
 func New(dbURL string) (*DB, error) {
-	db, err := sql.Open("postgres", dbURL)
+	ctx := context.Background()
+	db, err := pgx.Connect(ctx, dbURL)
 	if err != nil {
 		return nil, xerrors.Errorf("postgres open error: %v", err)
 	}
-	if err = db.Ping(); err != nil {
+	if err = db.Ping(ctx); err != nil {
 		return nil, xerrors.Errorf("postgres ping error: %v", err)
 	}
 	return &DB{db}, nil
 }
 
+// Close finishes the DB connection.
+func (db *DB) Close() error {
+	return db.Close()
+}
+
 // CreateSchema creates the table schemas defined by the paths including Schemas.
 func (db *DB) CreateSchema() error {
+	ctx := context.Background()
 	for _, schema := range schemas {
 		sql, err := statik.FindString(schema)
 		if err != nil {
 			return xerrors.Errorf("get schema error '%s': %v", schema, err)
 		}
-		_, err = db.Exec(sql)
+		_, err = db.Exec(ctx, sql)
 		if err != nil {
 			return xerrors.Errorf("exec schema error '%s': %s", sql, err)
 		}
@@ -55,18 +61,8 @@ func (db *DB) CreateSchema() error {
 const (
 	// InsertOrUpdateTimeoutSec is the timeout seconds of InsertOrUpdateHostFlows.
 	InsertOrUpdateTimeoutSec = 10
-)
 
-// InsertOrUpdateHostFlows insert host flows or update it if the same flow exists.
-func (db *DB) InsertOrUpdateHostFlows(flows []*probe.HostFlow) error {
-	ctx, cancel := context.WithTimeout(context.Background(), InsertOrUpdateTimeoutSec*time.Second)
-	defer cancel()
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return xerrors.Errorf("begin transaction error: %v", err)
-	}
-
-	stmtFindActiveNodes, err := tx.PrepareContext(ctx, `
+	findActiveNodesSQL = `
 		SELECT flows.source_node_id FROM flows
 		INNER JOIN (SELECT node_id FROM passive_nodes WHERE port = $1)
 			AS pn ON pn.node_id = flows.destination_node_id
@@ -74,73 +70,63 @@ func (db *DB) InsertOrUpdateHostFlows(flows []*probe.HostFlow) error {
 			SELECT process_id FROM processes WHERE ipv4 = $2
 		)) AS an ON an.node_id = flows.source_node_id
 		LIMIT 1
-	`)
-	if err != nil {
-		return xerrors.Errorf("find active_nodes prepare error: %v", err)
-	}
+	`
 
-	stmtFindPassiveNodes, err := tx.PrepareContext(ctx, `
-	SELECT node_id FROM passive_nodes
-	WHERE process_id IN ( SELECT process_id FROM processes WHERE ipv4 = $1) AND port = $2
-	`)
-	if err != nil {
-		return xerrors.Errorf("find passive_nodes prepare error: %v", err)
-	}
+	findPassiveNodesSQL = `
+		SELECT node_id FROM passive_nodes
+		WHERE process_id IN ( 
+			SELECT process_id FROM processes WHERE ipv4 = $1
+		) AND port = $2
+	`
 
-	stmtInsertProcesses, err := tx.PrepareContext(ctx, `
-	INSERT INTO processes (ipv4, pgid, pname, updated) VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
-	ON CONFLICT (ipv4, pgid, pname)
-	DO UPDATE SET updated=CURRENT_TIMESTAMP
-	RETURNING process_id
-	`)
-	if err != nil {
-		return xerrors.Errorf("query prepare error 'INSERT INTO processes': %v", err)
-	}
+	insertProcessesSQL = `
+		INSERT INTO processes (ipv4, pgid, pname, updated)
+		VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
+		ON CONFLICT (ipv4, pgid, pname)
+		DO UPDATE SET updated=CURRENT_TIMESTAMP
+		RETURNING process_id
+	`
 
 	// do update on conflict to avoid to return no rows
-	stmtInsertActiveNodes, err := tx.PrepareContext(ctx, `
-	INSERT INTO active_nodes (process_id) VALUES ($1)
-	ON CONFLICT (process_id)
-	DO UPDATE SET process_id=$1
-	RETURNING node_id
-	`)
-	if err != nil {
-		return xerrors.Errorf("query prepare error 'INSERT INTO passive_nodes': %v", err)
-	}
+	insertActiveNodesSQL = `
+		INSERT INTO active_nodes (process_id) VALUES ($1)
+		ON CONFLICT (process_id)
+		DO UPDATE SET process_id=$1
+		RETURNING node_id
+	`
 
 	// do update on conflict to avoid to return no rows
-	stmtInsertPassiveNodes, err := tx.PrepareContext(ctx, `
-	INSERT INTO passive_nodes (process_id, port) VALUES ($1, $2)
-	ON CONFLICT (process_id, port)
-	DO UPDATE SET process_id=$1
-	RETURNING node_id
-	`)
-	if err != nil {
-		return xerrors.Errorf("query prepare error 'INSERT INTO passive_nodes': %v", err)
-	}
+	insertPassiveNodesSQL = `
+		INSERT INTO passive_nodes (process_id, port) VALUES ($1, $2)
+		ON CONFLICT (process_id, port)
+		DO UPDATE SET process_id=$1
+		RETURNING node_id
+	`
 
-	stmtFindActiveNodesByProcess, err := tx.PrepareContext(ctx, `
-	SELECT node_id FROM active_nodes WHERE process_id = $1
-	`)
-	if err != nil {
-		return xerrors.Errorf("query prepare error 'SELECT node_id FROM active_nodes': %v", err)
-	}
-	stmtFindPassiveNodesByProcess, err := tx.PrepareContext(ctx, `
-	SELECT node_id FROM passive_nodes WHERE process_id = $1 AND port = $2
-	`)
-	if err != nil {
-		return xerrors.Errorf("query prepare error 'SELECT node_id FROM passive_node': %v", err)
-	}
+	findActiveNodesByProcessSQL = `
+		SELECT node_id FROM active_nodes WHERE process_id = $1
+	`
 
-	stmtInsertFlows, err := tx.PrepareContext(ctx, `
-	INSERT INTO flows
-	(source_node_id, destination_node_id, connections)
-	VALUES ($1, $2, $3)
-	ON CONFLICT (source_node_id, destination_node_id)
-	DO UPDATE SET connections=$3, updated=CURRENT_TIMESTAMP
-	`)
+	findPassiveNodesByProcessSQL = `
+		SELECT node_id FROM passive_nodes WHERE process_id = $1 AND port = $2
+	`
+
+	insertFlowsSQL = `
+		INSERT INTO flows
+		(source_node_id, destination_node_id, connections)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (source_node_id, destination_node_id)
+		DO UPDATE SET connections=$3, updated=CURRENT_TIMESTAMP
+	`
+)
+
+// InsertOrUpdateHostFlows insert host flows or update it if the same flow exists.
+func (db *DB) InsertOrUpdateHostFlows(flows []*probe.HostFlow) error {
+	ctx, cancel := context.WithTimeout(context.Background(), InsertOrUpdateTimeoutSec*time.Second)
+	defer cancel()
+	tx, err := db.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return xerrors.Errorf("query prepare error 'INSERT INTO flows': %v", err)
+		return xerrors.Errorf("begin transaction error: %v", err)
 	}
 
 	for _, flow := range flows {
@@ -180,7 +166,7 @@ func (db *DB) InsertOrUpdateHostFlows(flows []*probe.HostFlow) error {
 		//   - INSERT INTO flows
 
 		// Insert or update local process
-		err := stmtInsertProcesses.QueryRowContext(ctx, flow.Local.Addr, pgid, pname).Scan(&localProcessID)
+		err := db.QueryRow(ctx, insertProcessesSQL, flow.Local.Addr, pgid, pname).Scan(&localProcessID)
 		if err != nil {
 			return xerrors.Errorf("query error: %v", err)
 		}
@@ -189,10 +175,15 @@ func (db *DB) InsertOrUpdateHostFlows(flows []*probe.HostFlow) error {
 			// local node is passive open, peer node is active open.
 
 			// Insert or update local node
-			err := stmtInsertPassiveNodes.QueryRowContext(ctx, localProcessID, flow.Local.Port).Scan(&localNodeID)
+			err := db.QueryRow(ctx, insertPassiveNodesSQL, localProcessID, flow.Local.Port).Scan(&localNodeID)
 			switch {
-			case err == sql.ErrNoRows:
-				err := stmtFindPassiveNodesByProcess.QueryRowContext(ctx, localProcessID, flow.Local.Port).Scan(&localNodeID)
+			case err == pgx.ErrNoRows:
+				err := db.QueryRow(
+					ctx,
+					findPassiveNodesByProcessSQL,
+					localProcessID,
+					flow.Local.Port,
+				).Scan(&localNodeID)
 				if err != nil {
 					return xerrors.Errorf("query error: %v", err)
 				}
@@ -201,14 +192,14 @@ func (db *DB) InsertOrUpdateHostFlows(flows []*probe.HostFlow) error {
 			}
 
 			// Create or update peer node and process
-			err = stmtFindActiveNodes.QueryRowContext(ctx, flow.Local.Port, flow.Peer.Addr).Scan(&peerNodeID)
+			err = db.QueryRow(ctx, findActiveNodesSQL, flow.Local.Port, flow.Peer.Addr).Scan(&peerNodeID)
 			switch {
-			case err == sql.ErrNoRows:
-				err := stmtInsertProcesses.QueryRowContext(ctx, flow.Peer.Addr, 0, "").Scan(&peerProcessID)
+			case err == pgx.ErrNoRows:
+				err := db.QueryRow(ctx, insertProcessesSQL, flow.Peer.Addr, 0, "").Scan(&peerProcessID)
 				if err != nil {
 					return xerrors.Errorf("insert processes error: %v", err)
 				}
-				err = stmtInsertActiveNodes.QueryRowContext(ctx, peerProcessID).Scan(&peerNodeID)
+				err = db.QueryRow(ctx, insertActiveNodesSQL, peerProcessID).Scan(&peerNodeID)
 				if err != nil {
 					return xerrors.Errorf("insert active_nodes error: %v", err)
 				}
@@ -218,7 +209,7 @@ func (db *DB) InsertOrUpdateHostFlows(flows []*probe.HostFlow) error {
 				// TODO: update
 			}
 
-			_, err = stmtInsertFlows.ExecContext(ctx, peerNodeID, localNodeID, flow.Connections)
+			_, err = db.Exec(ctx, insertFlowsSQL, peerNodeID, localNodeID, flow.Connections)
 			if err != nil {
 				return xerrors.Errorf("query error: %v", err)
 			}
@@ -226,10 +217,10 @@ func (db *DB) InsertOrUpdateHostFlows(flows []*probe.HostFlow) error {
 			// peer node is passive open, local node is active open.
 
 			// Insert or update local node
-			err := stmtInsertActiveNodes.QueryRowContext(ctx, localProcessID).Scan(&localNodeID)
+			err := db.QueryRow(ctx, insertActiveNodesSQL, localProcessID).Scan(&localNodeID)
 			switch {
-			case err == sql.ErrNoRows:
-				err := stmtFindActiveNodesByProcess.QueryRowContext(ctx, localProcessID).Scan(&localNodeID)
+			case err == pgx.ErrNoRows:
+				err := db.QueryRow(ctx, findActiveNodesSQL, localProcessID).Scan(&localNodeID)
 				if err != nil {
 					return xerrors.Errorf("query error: %v", err)
 				}
@@ -238,14 +229,14 @@ func (db *DB) InsertOrUpdateHostFlows(flows []*probe.HostFlow) error {
 			}
 
 			// Create or update peer node and process
-			err = stmtFindPassiveNodes.QueryRowContext(ctx, flow.Peer.Addr, flow.Peer.Port).Scan(&peerNodeID)
+			err = db.QueryRow(ctx, findPassiveNodesSQL, flow.Peer.Addr, flow.Peer.Port).Scan(&peerNodeID)
 			switch {
-			case err == sql.ErrNoRows:
-				err := stmtInsertProcesses.QueryRowContext(ctx, flow.Peer.Addr, 0, "").Scan(&peerProcessID)
+			case err == pgx.ErrNoRows:
+				err := db.QueryRow(ctx, insertProcessesSQL, flow.Peer.Addr, 0, "").Scan(&peerProcessID)
 				if err != nil {
 					return xerrors.Errorf("query error: %v", err)
 				}
-				err = stmtInsertPassiveNodes.QueryRowContext(ctx, peerProcessID, flow.Peer.Port).Scan(&peerNodeID)
+				err = db.QueryRow(ctx, insertPassiveNodesSQL, peerProcessID, flow.Peer.Port).Scan(&peerNodeID)
 				if err != nil {
 					return xerrors.Errorf("query error: %v", err)
 				}
@@ -255,13 +246,13 @@ func (db *DB) InsertOrUpdateHostFlows(flows []*probe.HostFlow) error {
 				// TODO: update
 			}
 
-			_, err = stmtInsertFlows.ExecContext(ctx, localNodeID, peerNodeID, flow.Connections)
+			_, err = db.Exec(ctx, insertFlowsSQL, localNodeID, peerNodeID, flow.Connections)
 			if err != nil {
-				return xerrors.Errorf("query error: localNodeID:%d, peerNodeID: %d, %v", localNodeID, peerNodeID, err)
+				return xerrors.Errorf("query error: localNodeID=%d, peerNodeID=%d: %v", localNodeID, peerNodeID, err)
 			}
 		}
 	}
-	if err := tx.Commit(); err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		return xerrors.Errorf("transaction commit error: %v", err)
 	}
 	return nil
@@ -315,7 +306,7 @@ func (db *DB) FindPassiveFlows(cond *FindFlowsCond) (Flows, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	rows, err := db.QueryContext(ctx, `
+	rows, err := db.Query(ctx, `
 	SELECT
 		DISTINCT ON (pipv4, pn.pname)
 		pn.ipv4 AS pipv4,
@@ -337,9 +328,9 @@ func (db *DB) FindPassiveFlows(cond *FindFlowsCond) (Flows, error) {
 	) AS pn ON pn.node_id = flows.destination_node_id
 	WHERE flows.updated BETWEEN $2 AND $3
 	ORDER BY pn.ipv4, pn.pname, flows.updated DESC
-`, pq.Array(ipv4s), pq.FormatTimestamp(cond.Since), pq.FormatTimestamp(cond.Until))
+`, ipv4s, cond.Since, cond.Until)
 	switch {
-	case err == sql.ErrNoRows:
+	case err == pgx.ErrNoRows:
 		return Flows{}, nil
 	case err != nil:
 		return Flows{}, xerrors.Errorf("find passive flows query error: %v", err)
@@ -402,7 +393,7 @@ func (db *DB) FindActiveFlows(cond *FindFlowsCond) (Flows, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	rows, err := db.QueryContext(ctx, `
+	rows, err := db.Query(ctx, `
 	SELECT
 		DISTINCT ON (aipv4, an.pname)
 		an.ipv4 AS aipv4,
@@ -424,9 +415,9 @@ func (db *DB) FindActiveFlows(cond *FindFlowsCond) (Flows, error) {
 	) AS an ON an.node_id = flows.source_node_id
 	WHERE flows.updated BETWEEN $2 AND $3
 	ORDER BY an.ipv4, an.pname, flows.updated DESC
-`, pq.Array(ipv4s), pq.FormatTimestamp(cond.Since), pq.FormatTimestamp(cond.Until))
+`, ipv4s, cond.Since, cond.Until)
 	switch {
-	case err == sql.ErrNoRows:
+	case err == pgx.ErrNoRows:
 		return Flows{}, nil
 	case err != nil:
 		return Flows{}, xerrors.Errorf("find active flows query error: %v", err)
