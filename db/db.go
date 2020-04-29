@@ -299,7 +299,7 @@ type FindFlowsCond struct {
 // FindPassiveFlows queries passive flows to CMDB by the slice of ipaddrs.
 func (db *DB) FindPassiveFlows(cond *FindFlowsCond) (Flows, error) {
 	if len(cond.Addrs) < 1 {
-		return &Flows{}	, nil
+		return Flows{}	, nil
 	}
 
 	ipv4s := make([]string, 0, len(cond.Addrs))
@@ -390,7 +390,7 @@ func (db *DB) FindPassiveFlows(cond *FindFlowsCond) (Flows, error) {
 // FindActiveFlows queries active flows to CMDB by the slice of ipaddrs.
 func (db *DB) FindActiveFlows(cond *FindFlowsCond) (Flows, error) {
 	if len(cond.Addrs) < 1 {
-		return &Flows{}	, nil
+		return Flows{}	, nil
 	}
 
 	ipv4s := make([]string, 0, len(cond.Addrs))
