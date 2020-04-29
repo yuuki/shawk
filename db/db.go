@@ -128,7 +128,7 @@ func (db *DB) InsertOrUpdateHostFlows(flows []*probe.HostFlow) error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), InsertOrUpdateTimeoutSec*time.Second)
 	defer cancel()
-	tx, err := db.BeginTx(ctx, pgx.TxOptions{})
+	tx, err := db.Begin(ctx)
 	if err != nil {
 		return xerrors.Errorf("begin transaction error: %v", err)
 	}
