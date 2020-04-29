@@ -74,7 +74,7 @@ const (
 
 	findPassiveNodesSQL = `
 		SELECT node_id FROM passive_nodes
-		WHERE process_id IN ( 
+		WHERE process_id IN (
 			SELECT process_id FROM processes WHERE ipv4 = $1
 		) AND port = $2
 	`
@@ -299,14 +299,8 @@ type FindFlowsCond struct {
 // FindPassiveFlows queries passive flows to CMDB by the slice of ipaddrs.
 func (db *DB) FindPassiveFlows(cond *FindFlowsCond) (Flows, error) {
 	if len(cond.Addrs) < 1 {
-		return Flows{}	, nil
+		return Flows{}, nil
 	}
-
-	ipv4s := make([]string, 0, len(cond.Addrs))
-	for _, addr := range cond.Addrs {
-		ipv4s = append(ipv4s, addr.String())
-	}
-
 	if cond.Until.IsZero() {
 		cond.Until = time.Now()
 	}
@@ -336,7 +330,7 @@ func (db *DB) FindPassiveFlows(cond *FindFlowsCond) (Flows, error) {
 	) AS pn ON pn.node_id = flows.destination_node_id
 	WHERE flows.updated BETWEEN $2 AND $3
 	ORDER BY pn.ipv4, pn.pname, flows.updated DESC
-`, ipv4s, cond.Since, cond.Until)
+`, cond.Addrs, cond.Since, cond.Until)
 	switch {
 	case err == pgx.ErrNoRows:
 		return Flows{}, nil
@@ -390,14 +384,8 @@ func (db *DB) FindPassiveFlows(cond *FindFlowsCond) (Flows, error) {
 // FindActiveFlows queries active flows to CMDB by the slice of ipaddrs.
 func (db *DB) FindActiveFlows(cond *FindFlowsCond) (Flows, error) {
 	if len(cond.Addrs) < 1 {
-		return Flows{}	, nil
+		return Flows{}, nil
 	}
-
-	ipv4s := make([]string, 0, len(cond.Addrs))
-	for _, addr := range cond.Addrs {
-		ipv4s = append(ipv4s, addr.String())
-	}
-
 	if cond.Until.IsZero() {
 		cond.Until = time.Now()
 	}
@@ -427,7 +415,7 @@ func (db *DB) FindActiveFlows(cond *FindFlowsCond) (Flows, error) {
 	) AS an ON an.node_id = flows.source_node_id
 	WHERE flows.updated BETWEEN $2 AND $3
 	ORDER BY an.ipv4, an.pname, flows.updated DESC
-`, ipv4s, cond.Since, cond.Until)
+`, cond.Addrs, cond.Since, cond.Until)
 	switch {
 	case err == pgx.ErrNoRows:
 		return Flows{}, nil
