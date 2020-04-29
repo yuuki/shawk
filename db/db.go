@@ -122,6 +122,10 @@ const (
 
 // InsertOrUpdateHostFlows insert host flows or update it if the same flow exists.
 func (db *DB) InsertOrUpdateHostFlows(flows []*probe.HostFlow) error {
+	if len(flows) < 1 {
+		return nil
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), InsertOrUpdateTimeoutSec*time.Second)
 	defer cancel()
 	tx, err := db.BeginTx(ctx, pgx.TxOptions{})
@@ -294,6 +298,10 @@ type FindFlowsCond struct {
 
 // FindPassiveFlows queries passive flows to CMDB by the slice of ipaddrs.
 func (db *DB) FindPassiveFlows(cond *FindFlowsCond) (Flows, error) {
+	if len(cond.Addrs) < 1 {
+		return &Flows{}	, nil
+	}
+
 	ipv4s := make([]string, 0, len(cond.Addrs))
 	for _, addr := range cond.Addrs {
 		ipv4s = append(ipv4s, addr.String())
@@ -381,6 +389,10 @@ func (db *DB) FindPassiveFlows(cond *FindFlowsCond) (Flows, error) {
 
 // FindActiveFlows queries active flows to CMDB by the slice of ipaddrs.
 func (db *DB) FindActiveFlows(cond *FindFlowsCond) (Flows, error) {
+	if len(cond.Addrs) < 1 {
+		return &Flows{}	, nil
+	}
+
 	ipv4s := make([]string, 0, len(cond.Addrs))
 	for _, addr := range cond.Addrs {
 		ipv4s = append(ipv4s, addr.String())
