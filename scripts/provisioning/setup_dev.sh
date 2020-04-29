@@ -31,4 +31,9 @@ sudo -u postgres psql -c "CREATE ROLE ${PG_USER} WITH LOGIN PASSWORD '${PG_PASSW
 sudo -u postgres createdb --owner ${PG_USER} ${PG_DB} --echo
 sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE ${PG_DB} TO ${PG_USER};"
 
+# Install docker
+curl -fsSL get.docker.com -o get-docker.sh
+sudo /bin/bash get-docker.sh
+sudo usermod -aG docker vagrant
+
 echo 'Completed to setup'
