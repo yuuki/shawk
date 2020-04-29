@@ -20,6 +20,7 @@ require (
 	github.com/jackc/pgx/v4 v4.6.0
 	github.com/joho/godotenv v1.3.0
 	github.com/kelseyhightower/envconfig v1.4.0
+	github.com/kylelemons/godebug v1.1.0
 	github.com/lib/pq v1.3.0 // indirect
 	github.com/opencontainers/image-spec v1.0.1 // indirect
 	github.com/opencontainers/runc v0.1.1 // indirect

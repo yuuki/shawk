@@ -2,8 +2,6 @@
 ## explicit
 github.com/Azure/go-ansiterm
 github.com/Azure/go-ansiterm/winterm
-# github.com/DATA-DOG/go-sqlmock v1.4.1
-## explicit
 # github.com/EricLagergren/go-gnulib v0.0.0-20191129172535-039a51fc60f4
 ## explicit
 github.com/EricLagergren/go-gnulib/dirent
@@ -75,6 +73,10 @@ github.com/joho/godotenv
 github.com/kelseyhightower/envconfig
 # github.com/konsorten/go-windows-terminal-sequences v1.0.2
 github.com/konsorten/go-windows-terminal-sequences
+# github.com/kylelemons/godebug v1.1.0
+## explicit
+github.com/kylelemons/godebug/diff
+github.com/kylelemons/godebug/pretty
 # github.com/lib/pq v1.3.0
 ## explicit
 # github.com/opencontainers/go-digest v1.0.0-rc1
