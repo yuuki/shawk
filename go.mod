@@ -14,13 +14,12 @@ require (
 	github.com/docker/go-units v0.4.0 // indirect
 	github.com/elastic/gosigar v0.10.5
 	github.com/go-ole/go-ole v1.2.4 // indirect
-	github.com/google/go-cmp v0.4.0 // indirect
+	github.com/google/go-cmp v0.4.0
 	github.com/gotestyourself/gotestyourself v2.2.0+incompatible // indirect
 	github.com/iovisor/gobpf v0.0.0-20200329161226-8b2cce9dac28
 	github.com/jackc/pgx/v4 v4.6.0
 	github.com/joho/godotenv v1.3.0
 	github.com/kelseyhightower/envconfig v1.4.0
-	github.com/kylelemons/godebug v1.1.0
 	github.com/lib/pq v1.3.0 // indirect
 	github.com/opencontainers/image-spec v1.0.1 // indirect
 	github.com/opencontainers/runc v0.1.1 // indirect

@@ -38,6 +38,11 @@ github.com/go-ole/go-ole
 github.com/go-ole/go-ole/oleutil
 # github.com/google/go-cmp v0.4.0
 ## explicit
+github.com/google/go-cmp/cmp
+github.com/google/go-cmp/cmp/internal/diff
+github.com/google/go-cmp/cmp/internal/flags
+github.com/google/go-cmp/cmp/internal/function
+github.com/google/go-cmp/cmp/internal/value
 # github.com/gotestyourself/gotestyourself v2.2.0+incompatible
 ## explicit
 # github.com/iovisor/gobpf v0.0.0-20200329161226-8b2cce9dac28
@@ -75,8 +80,6 @@ github.com/kelseyhightower/envconfig
 github.com/konsorten/go-windows-terminal-sequences
 # github.com/kylelemons/godebug v1.1.0
 ## explicit
-github.com/kylelemons/godebug/diff
-github.com/kylelemons/godebug/pretty
 # github.com/lib/pq v1.3.0
 ## explicit
 # github.com/opencontainers/go-digest v1.0.0-rc1
