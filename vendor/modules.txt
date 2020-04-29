@@ -4,7 +4,6 @@ github.com/Azure/go-ansiterm
 github.com/Azure/go-ansiterm/winterm
 # github.com/DATA-DOG/go-sqlmock v1.4.1
 ## explicit
-github.com/DATA-DOG/go-sqlmock
 # github.com/EricLagergren/go-gnulib v0.0.0-20191129172535-039a51fc60f4
 ## explicit
 github.com/EricLagergren/go-gnulib/dirent
@@ -41,11 +40,6 @@ github.com/go-ole/go-ole
 github.com/go-ole/go-ole/oleutil
 # github.com/google/go-cmp v0.4.0
 ## explicit
-github.com/google/go-cmp/cmp
-github.com/google/go-cmp/cmp/internal/diff
-github.com/google/go-cmp/cmp/internal/flags
-github.com/google/go-cmp/cmp/internal/function
-github.com/google/go-cmp/cmp/internal/value
 # github.com/gotestyourself/gotestyourself v2.2.0+incompatible
 ## explicit
 # github.com/iovisor/gobpf v0.0.0-20200329161226-8b2cce9dac28
@@ -83,9 +77,6 @@ github.com/kelseyhightower/envconfig
 github.com/konsorten/go-windows-terminal-sequences
 # github.com/lib/pq v1.3.0
 ## explicit
-github.com/lib/pq
-github.com/lib/pq/oid
-github.com/lib/pq/scram
 # github.com/opencontainers/go-digest v1.0.0-rc1
 github.com/opencontainers/go-digest
 # github.com/opencontainers/image-spec v1.0.1
