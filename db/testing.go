@@ -5,11 +5,20 @@ import (
 	"log"
 	"net"
 	"net/url"
+	"os"
+	"path/filepath"
 	"runtime"
 	"time"
 
 	"github.com/jackc/pgx/v4"
 	"github.com/ory/dockertest"
+)
+
+var (
+	_, b, _, _ = runtime.Caller(0)
+	root       = filepath.Join(filepath.Dir(b), "../")
+
+	remainTestContainer = os.Getenv("SHAWK_TEST_REMAIN_CONTAINER")
 )
 
 // TestDB represents a database resource for testing.
@@ -35,9 +44,12 @@ func NewTestDB() *TestDB {
 		log.Fatalf("Could not create new dockertest pool: %v", err)
 	}
 
+	// customizing postgres query logging conf for debugging
+	path := filepath.Join(root, "/scripts/docker-entrypoint-initdb.d")
 	runOpts := dockertest.RunOptions{
 		Repository: "postgres",
 		Tag:        "11.7",
+		Mounts:     []string{path + ":/docker-entrypoint-initdb.d"},
 		Env: []string{
 			"POSTGRES_USER=shawktest",
 			"POSTGRES_PASSWORD=shawktest",
@@ -88,6 +100,10 @@ func (tdb *TestDB) GetURL() *url.URL {
 
 // Purge purges the database
 func (tdb *TestDB) Purge() {
+	if remainTestContainer != "" {
+		return
+	}
+
 	err := tdb.pool.Purge(tdb.resource)
 	if err != nil {
 		log.Fatalf("Could not purge resource: %v", err)
