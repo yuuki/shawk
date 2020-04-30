@@ -7,8 +7,11 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v4"
+	"github.com/jackc/pgx/v4/log/log15adapter"
 	"golang.org/x/xerrors"
+	log15 "gopkg.in/inconshreveable/log15.v2"
 
+	"github.com/yuuki/shawk/config"
 	"github.com/yuuki/shawk/probe"
 	"github.com/yuuki/shawk/statik"
 )
@@ -26,10 +29,18 @@ type DB struct {
 
 // New creates the DB object.
 func New(dbURL string) (*DB, error) {
-	ctx := context.Background()
-	db, err := pgx.Connect(ctx, dbURL)
+	conf, err := pgx.ParseConfig(dbURL)
 	if err != nil {
-		return nil, xerrors.Errorf("postgres open error: %v", err)
+		return nil, xerrors.Errorf("Could not parse postgres config (%s): %v", dbURL, err)
+	}
+	if config.Config.Debug {
+		conf.Logger = log15adapter.NewLogger(log15.New("module", "pgx"))
+	}
+
+	ctx := context.Background()
+	db, err := pgx.ConnectConfig(ctx, conf)
+	if err != nil {
+		return nil, xerrors.Errorf("Could not connect to postgres: %v", err)
 	}
 	if err = db.Ping(ctx); err != nil {
 		return nil, xerrors.Errorf("postgres ping error: %v", err)
@@ -37,9 +48,9 @@ func New(dbURL string) (*DB, error) {
 	return &DB{db}, nil
 }
 
-// Close finishes the DB connection.
-func (db *DB) Close() error {
-	return db.Close()
+// Shutdown finishes the DB connection.
+func (db *DB) Shutdown() error {
+	return db.Close(context.Background())
 }
 
 // CreateSchema creates the table schemas defined by the paths including Schemas.
@@ -305,6 +316,11 @@ func (db *DB) FindPassiveFlows(cond *FindFlowsCond) (Flows, error) {
 		cond.Until = time.Now()
 	}
 
+	// Avoid that pgtype handles addrs as ipv6 address.
+	for i, v := range cond.Addrs {
+		cond.Addrs[i] = v.To4()
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -388,6 +404,11 @@ func (db *DB) FindActiveFlows(cond *FindFlowsCond) (Flows, error) {
 	}
 	if cond.Until.IsZero() {
 		cond.Until = time.Now()
+	}
+
+	// Avoid that pgtype handles addrs as ipv6 address.
+	for i, v := range cond.Addrs {
+		cond.Addrs[i] = v.To4()
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
