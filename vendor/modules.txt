@@ -36,6 +36,8 @@ github.com/elastic/gosigar/sys/linux
 ## explicit
 github.com/go-ole/go-ole
 github.com/go-ole/go-ole/oleutil
+# github.com/go-stack/stack v1.8.0
+github.com/go-stack/stack
 # github.com/google/go-cmp v0.4.0
 ## explicit
 github.com/google/go-cmp/cmp
@@ -52,8 +54,6 @@ github.com/iovisor/gobpf/pkg/bpffs
 github.com/iovisor/gobpf/pkg/cpuonline
 # github.com/jackc/chunkreader/v2 v2.0.1
 github.com/jackc/chunkreader/v2
-# github.com/jackc/fake v0.0.0-20150926172116-812a484cc733
-## explicit
 # github.com/jackc/pgconn v1.5.0
 github.com/jackc/pgconn
 github.com/jackc/pgconn/internal/ctxwatch
@@ -68,19 +68,11 @@ github.com/jackc/pgproto3/v2
 github.com/jackc/pgservicefile
 # github.com/jackc/pgtype v1.3.0
 github.com/jackc/pgtype
-# github.com/jackc/pgx v3.6.2+incompatible
-## explicit
-github.com/jackc/pgx
-github.com/jackc/pgx/chunkreader
-github.com/jackc/pgx/internal/sanitize
-github.com/jackc/pgx/log/log15adapter
-github.com/jackc/pgx/pgio
-github.com/jackc/pgx/pgproto3
-github.com/jackc/pgx/pgtype
 # github.com/jackc/pgx/v4 v4.6.0
 ## explicit
 github.com/jackc/pgx/v4
 github.com/jackc/pgx/v4/internal/sanitize
+github.com/jackc/pgx/v4/log/log15adapter
 # github.com/joho/godotenv v1.3.0
 ## explicit
 github.com/joho/godotenv
@@ -92,6 +84,11 @@ github.com/kelseyhightower/envconfig
 github.com/konsorten/go-windows-terminal-sequences
 # github.com/lib/pq v1.3.0
 ## explicit
+# github.com/mattn/go-colorable v0.1.6
+## explicit
+github.com/mattn/go-colorable
+# github.com/mattn/go-isatty v0.0.12
+github.com/mattn/go-isatty
 # github.com/opencontainers/go-digest v1.0.0-rc1
 github.com/opencontainers/go-digest
 # github.com/opencontainers/image-spec v1.0.1
@@ -172,6 +169,9 @@ golang.org/x/text/width
 ## explicit
 golang.org/x/xerrors
 golang.org/x/xerrors/internal
+# gopkg.in/inconshreveable/log15.v2 v2.0.0-20200109203555-b30bc20e4fd1
+## explicit
+gopkg.in/inconshreveable/log15.v2
 # gopkg.in/yaml.v2 v2.2.8
 ## explicit
 # gotest.tools v2.2.0+incompatible
