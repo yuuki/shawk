@@ -56,8 +56,9 @@ github.com/shirou/gopsutil/net
 # github.com/weaveworks/tcptracer-bpf v0.0.0-20190731111909-cd53e7c84bac
 ## explicit
 github.com/weaveworks/tcptracer-bpf/pkg/tracer
-# golang.org/x/sys v0.0.0-20200409092240-59c9f1ba88fa
+# golang.org/x/sys v0.0.0-20200501145240-bc7a7d42d5c3
 ## explicit
+golang.org/x/sys/internal/unsafeheader
 golang.org/x/sys/unix
 golang.org/x/sys/windows
 # golang.org/x/xerrors v0.0.0-20191204190536-9bdfabe68543
