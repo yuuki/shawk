@@ -36,7 +36,7 @@ github.com/joho/godotenv
 # github.com/kelseyhightower/envconfig v1.4.0
 ## explicit
 github.com/kelseyhightower/envconfig
-# github.com/lib/pq v1.3.0
+# github.com/lib/pq v1.4.0
 ## explicit
 github.com/lib/pq
 github.com/lib/pq/oid

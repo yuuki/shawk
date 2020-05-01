@@ -13,7 +13,7 @@ require (
 	github.com/iovisor/gobpf v0.0.0-20200329161226-8b2cce9dac28
 	github.com/joho/godotenv v1.3.0
 	github.com/kelseyhightower/envconfig v1.4.0
-	github.com/lib/pq v1.3.0
+	github.com/lib/pq v1.4.0
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/rakyll/statik v0.1.7
 	github.com/shirou/gopsutil v2.20.3+incompatible
