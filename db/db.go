@@ -358,11 +358,11 @@ func (db *DB) FindPassiveFlows(cond *FindFlowsCond) (Flows, error) {
 	flows := make(Flows)
 	for rows.Next() {
 		var (
-			pipv4       string
+			pipv4       net.IP
 			ppname      string
 			pport       int
 			ppgid       int
-			aipv4       string
+			aipv4       net.IP
 			apname      string
 			apgid       int
 			connections int
@@ -376,13 +376,13 @@ func (db *DB) FindPassiveFlows(cond *FindFlowsCond) (Flows, error) {
 		key := fmt.Sprintf("%s-%s", pipv4, ppname)
 		flows[key] = append(flows[key], &Flow{
 			ActiveNode: &Node{
-				IPAddr: net.ParseIP(aipv4),
+				IPAddr: aipv4,
 				Port:   0,
 				Pgid:   apgid,
 				Pname:  apname,
 			},
 			PassiveNode: &Node{
-				IPAddr: net.ParseIP(pipv4),
+				IPAddr: pipv4,
 				Port:   pport,
 				Pgid:   ppgid,
 				Pname:  ppname,
@@ -448,11 +448,11 @@ func (db *DB) FindActiveFlows(cond *FindFlowsCond) (Flows, error) {
 	flows := make(Flows)
 	for rows.Next() {
 		var (
-			aipv4       string
+			aipv4       net.IP
 			apname      string
 			pport       int
 			apgid       int
-			pipv4       string
+			pipv4       net.IP
 			ppname      string
 			ppgid       int
 			connections int
@@ -464,13 +464,13 @@ func (db *DB) FindActiveFlows(cond *FindFlowsCond) (Flows, error) {
 		key := fmt.Sprintf("%s-%s", aipv4, apname)
 		flows[key] = append(flows[key], &Flow{
 			ActiveNode: &Node{
-				IPAddr: net.ParseIP(aipv4),
+				IPAddr: aipv4,
 				Port:   0,
 				Pgid:   apgid,
 				Pname:  apname,
 			},
 			PassiveNode: &Node{
-				IPAddr: net.ParseIP(pipv4),
+				IPAddr: pipv4,
 				Port:   pport,
 				Pgid:   ppgid,
 				Pname:  ppname,
