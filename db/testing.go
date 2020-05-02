@@ -18,7 +18,7 @@ var (
 	_, b, _, _ = runtime.Caller(0)
 	root       = filepath.Join(filepath.Dir(b), "../")
 
-	remainTestContainer = os.Getenv("SHAWK_TEST_REMAIN_CONTAINER")
+	_, remainTestContainer = os.LookupEnv("SHAWK_TEST_REMAIN_CONTAINER")
 )
 
 // TestDB represents a database resource for testing.
@@ -100,7 +100,7 @@ func (tdb *TestDB) GetURL() *url.URL {
 
 // Purge purges the database
 func (tdb *TestDB) Purge() {
-	if remainTestContainer != "" {
+	if remainTestContainer {
 		return
 	}
 
