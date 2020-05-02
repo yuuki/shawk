@@ -1,15 +1,33 @@
-# github.com/DATA-DOG/go-sqlmock v1.4.1
+# github.com/Azure/go-ansiterm v0.0.0-20170929234023-d6e3b3328b78
 ## explicit
-github.com/DATA-DOG/go-sqlmock
+github.com/Azure/go-ansiterm
+github.com/Azure/go-ansiterm/winterm
 # github.com/EricLagergren/go-gnulib v0.0.0-20191129172535-039a51fc60f4
 ## explicit
 github.com/EricLagergren/go-gnulib/dirent
 github.com/EricLagergren/go-gnulib/util
+# github.com/Microsoft/go-winio v0.4.14
+## explicit
+github.com/Microsoft/go-winio
+github.com/Microsoft/go-winio/pkg/guid
+# github.com/Nvveen/Gotty v0.0.0-20120604004816-cd527374f1e5
+## explicit
+github.com/Nvveen/Gotty
 # github.com/StackExchange/wmi v0.0.0-20190523213315-cbe66965904d
 ## explicit
 github.com/StackExchange/wmi
-# github.com/davecgh/go-spew v1.1.1
+# github.com/cenkalti/backoff v2.2.1+incompatible
 ## explicit
+github.com/cenkalti/backoff
+# github.com/containerd/continuity v0.0.0-20200413184840-d3ef23f19fbb
+## explicit
+github.com/containerd/continuity/pathdriver
+# github.com/docker/go-connections v0.4.0
+## explicit
+github.com/docker/go-connections/nat
+# github.com/docker/go-units v0.4.0
+## explicit
+github.com/docker/go-units
 # github.com/elastic/gosigar v0.10.5
 ## explicit
 github.com/elastic/gosigar/sys
@@ -18,6 +36,8 @@ github.com/elastic/gosigar/sys/linux
 ## explicit
 github.com/go-ole/go-ole
 github.com/go-ole/go-ole/oleutil
+# github.com/go-stack/stack v1.8.0
+github.com/go-stack/stack
 # github.com/google/go-cmp v0.4.0
 ## explicit
 github.com/google/go-cmp/cmp
@@ -25,22 +45,86 @@ github.com/google/go-cmp/cmp/internal/diff
 github.com/google/go-cmp/cmp/internal/flags
 github.com/google/go-cmp/cmp/internal/function
 github.com/google/go-cmp/cmp/internal/value
-# github.com/iovisor/gobpf v0.0.0-20200329161226-8b2cce9dac28
+# github.com/gotestyourself/gotestyourself v2.2.0+incompatible
+## explicit
+# github.com/iovisor/gobpf v0.0.0-20200417061255-f0a208deaea5
 ## explicit
 github.com/iovisor/gobpf/elf
 github.com/iovisor/gobpf/pkg/bpffs
 github.com/iovisor/gobpf/pkg/cpuonline
+# github.com/jackc/chunkreader/v2 v2.0.1
+github.com/jackc/chunkreader/v2
+# github.com/jackc/pgconn v1.5.0
+github.com/jackc/pgconn
+github.com/jackc/pgconn/internal/ctxwatch
+github.com/jackc/pgconn/stmtcache
+# github.com/jackc/pgio v1.0.0
+github.com/jackc/pgio
+# github.com/jackc/pgpassfile v1.0.0
+github.com/jackc/pgpassfile
+# github.com/jackc/pgproto3/v2 v2.0.1
+github.com/jackc/pgproto3/v2
+# github.com/jackc/pgservicefile v0.0.0-20200307190119-3430c5407db8
+github.com/jackc/pgservicefile
+# github.com/jackc/pgtype v1.3.0
+github.com/jackc/pgtype
+# github.com/jackc/pgx/v4 v4.6.0
+## explicit
+github.com/jackc/pgx/v4
+github.com/jackc/pgx/v4/internal/sanitize
+github.com/jackc/pgx/v4/log/log15adapter
 # github.com/joho/godotenv v1.3.0
 ## explicit
 github.com/joho/godotenv
 # github.com/kelseyhightower/envconfig v1.4.0
 ## explicit
 github.com/kelseyhightower/envconfig
+# github.com/konsorten/go-windows-terminal-sequences v1.0.3
+## explicit
+github.com/konsorten/go-windows-terminal-sequences
 # github.com/lib/pq v1.3.0
 ## explicit
-github.com/lib/pq
-github.com/lib/pq/oid
-github.com/lib/pq/scram
+# github.com/mattn/go-colorable v0.1.6
+## explicit
+github.com/mattn/go-colorable
+# github.com/mattn/go-isatty v0.0.12
+github.com/mattn/go-isatty
+# github.com/opencontainers/go-digest v1.0.0-rc1
+github.com/opencontainers/go-digest
+# github.com/opencontainers/image-spec v1.0.1
+## explicit
+github.com/opencontainers/image-spec/specs-go
+github.com/opencontainers/image-spec/specs-go/v1
+# github.com/opencontainers/runc v0.1.1
+## explicit
+github.com/opencontainers/runc/libcontainer/user
+# github.com/ory/dockertest v3.3.5+incompatible
+## explicit
+github.com/ory/dockertest
+github.com/ory/dockertest/docker
+github.com/ory/dockertest/docker/opts
+github.com/ory/dockertest/docker/pkg/archive
+github.com/ory/dockertest/docker/pkg/fileutils
+github.com/ory/dockertest/docker/pkg/homedir
+github.com/ory/dockertest/docker/pkg/idtools
+github.com/ory/dockertest/docker/pkg/ioutils
+github.com/ory/dockertest/docker/pkg/jsonmessage
+github.com/ory/dockertest/docker/pkg/longpath
+github.com/ory/dockertest/docker/pkg/mount
+github.com/ory/dockertest/docker/pkg/pools
+github.com/ory/dockertest/docker/pkg/stdcopy
+github.com/ory/dockertest/docker/pkg/system
+github.com/ory/dockertest/docker/pkg/term
+github.com/ory/dockertest/docker/pkg/term/windows
+github.com/ory/dockertest/docker/types
+github.com/ory/dockertest/docker/types/blkiodev
+github.com/ory/dockertest/docker/types/container
+github.com/ory/dockertest/docker/types/filters
+github.com/ory/dockertest/docker/types/mount
+github.com/ory/dockertest/docker/types/network
+github.com/ory/dockertest/docker/types/registry
+github.com/ory/dockertest/docker/types/strslice
+github.com/ory/dockertest/docker/types/versions
 # github.com/pkg/errors v0.9.1
 ## explicit
 github.com/pkg/errors
@@ -51,18 +135,44 @@ github.com/rakyll/statik/fs
 ## explicit
 github.com/shirou/gopsutil/internal/common
 github.com/shirou/gopsutil/net
-# github.com/stretchr/testify v1.5.1
+# github.com/sirupsen/logrus v1.5.0
 ## explicit
+github.com/sirupsen/logrus
 # github.com/weaveworks/tcptracer-bpf v0.0.0-20190731111909-cd53e7c84bac
 ## explicit
 github.com/weaveworks/tcptracer-bpf/pkg/tracer
-# golang.org/x/sys v0.0.0-20200409092240-59c9f1ba88fa
+# golang.org/x/crypto v0.0.0-20200429183012-4b2356b1ed79
+## explicit
+golang.org/x/crypto/pbkdf2
+# golang.org/x/net v0.0.0-20200425230154-ff2c4b7c35a0
+## explicit
+golang.org/x/net/context
+# golang.org/x/sys v0.0.0-20200428200454-593003d681fa
 ## explicit
 golang.org/x/sys/unix
 golang.org/x/sys/windows
+# golang.org/x/text v0.3.2
+golang.org/x/text/cases
+golang.org/x/text/internal
+golang.org/x/text/internal/language
+golang.org/x/text/internal/language/compact
+golang.org/x/text/internal/tag
+golang.org/x/text/language
+golang.org/x/text/runes
+golang.org/x/text/secure/bidirule
+golang.org/x/text/secure/precis
+golang.org/x/text/transform
+golang.org/x/text/unicode/bidi
+golang.org/x/text/unicode/norm
+golang.org/x/text/width
 # golang.org/x/xerrors v0.0.0-20191204190536-9bdfabe68543
 ## explicit
 golang.org/x/xerrors
 golang.org/x/xerrors/internal
+# gopkg.in/inconshreveable/log15.v2 v2.0.0-20200109203555-b30bc20e4fd1
+## explicit
+gopkg.in/inconshreveable/log15.v2
 # gopkg.in/yaml.v2 v2.2.8
+## explicit
+# gotest.tools v2.2.0+incompatible
 ## explicit

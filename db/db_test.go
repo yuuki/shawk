@@ -1,64 +1,93 @@
 package db
 
 import (
-	"database/sql"
+	"context"
 	"net"
+	"os"
 	"testing"
-	"time"
 
-	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/google/go-cmp/cmp"
-	"github.com/lib/pq"
 
 	"github.com/yuuki/shawk/probe"
 )
 
+var (
+	testdb *TestDB
+)
+
+func TestMain(m *testing.M) {
+	code := 0
+	defer func() {
+		os.Exit(code)
+	}()
+
+	testdb = NewTestDB()
+	defer testdb.Purge()
+
+	code = m.Run()
+}
+
 func TestCreateSchema(t *testing.T) {
-	db, mock := NewTestDB()
-	defer db.Close()
-
-	mock.ExpectExec("CREATE TABLE IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(1, 1))
-
-	err := db.CreateSchema()
+	db, err := New(testdb.GetURL().String())
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer db.Shutdown()
 
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("there were unfulfilled expectations: %s", err)
+	if err = db.CreateSchema(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func setupTestCase(t *testing.T) (*DB, func(t *testing.T)) {
+	// setup
+	db, err := New(testdb.GetURL().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = db.CreateSchema(); err != nil {
+		t.Fatal(err)
+	}
+
+	return db, func(t *testing.T) {
+		// teardown
+		db.Exec(
+			context.Background(),
+			"drop schema public cascade; create schema public",
+		)
+		db.Shutdown()
 	}
 }
 
 func TestInsertOrUpdateHostFlows_empty(t *testing.T) {
-	db, mock := NewTestDB()
-	defer db.Close()
+	db, teardown := setupTestCase(t)
+	defer teardown(t)
 
 	flows := []*probe.HostFlow{}
 
-	mock.ExpectBegin()
-	mock.ExpectPrepare("SELECT flows.source_node_id FROM flows")
-	mock.ExpectPrepare("SELECT node_id FROM passive_nodes")
-	mock.ExpectPrepare("INSERT INTO processes")
-	mock.ExpectPrepare("INSERT INTO active_nodes")
-	mock.ExpectPrepare("INSERT INTO passive_nodes")
-	mock.ExpectPrepare("SELECT node_id FROM active_nodes")
-	mock.ExpectPrepare("SELECT node_id FROM passive_nodes")
-	mock.ExpectPrepare("INSERT INTO flows")
-	mock.ExpectCommit() // executed only prepare statement
-
-	err := db.InsertOrUpdateHostFlows(flows)
-	if err != nil {
+	if err := db.InsertOrUpdateHostFlows(flows); err != nil {
 		t.Fatalf("%+v", err)
 	}
 
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("there were unfulfilled expectations: %s", err)
+	ctx := context.Background()
+	rows, err := db.Query(ctx, "SELECT * FROM flows")
+	if err != nil {
+		t.Fatalf("%+v", err)
+	}
+	defer rows.Close()
+
+	vals, err := rows.Values()
+	if err != nil {
+		t.Fatalf("%+v", err)
+	}
+	if len(vals) > 0 {
+		t.Errorf("flows table should be empty")
 	}
 }
 
 func TestInsertOrUpdateHostFlows(t *testing.T) {
-	db, mock := NewTestDB()
-	defer db.Close()
+	db, teardown := setupTestCase(t)
+	defer teardown(t)
 
 	flows := []*probe.HostFlow{
 		{
@@ -77,105 +106,106 @@ func TestInsertOrUpdateHostFlows(t *testing.T) {
 		},
 	}
 
-	mock.ExpectBegin()
-	stmtFindActiveNodes := mock.ExpectPrepare("SELECT flows.source_node_id FROM flows")
-	stmtFindPassiveNodes := mock.ExpectPrepare("SELECT node_id FROM passive_nodes WHERE process_id IN (.+)")
-	stmtInsertProcesses := mock.ExpectPrepare("INSERT INTO processes")
-	stmtInsertActiveNodes := mock.ExpectPrepare("INSERT INTO active_nodes")
-	stmtInsertPassiveNodes := mock.ExpectPrepare("INSERT INTO passive_nodes")
-	stmtFindActiveNodesByProcess := mock.ExpectPrepare("SELECT node_id FROM active_nodes")
-	stmtFindPassiveNodesByProcess := mock.ExpectPrepare("SELECT node_id FROM passive_nodes WHERE process_id = (.+) AND port = (.+)")
-	stmtInsertFlows := mock.ExpectPrepare("INSERT INTO flows")
+	if err := db.InsertOrUpdateHostFlows(flows); err != nil {
+		t.Fatal(err)
+	}
 
-	// first loop
 	{
-		localProcessID, peerProcessID, localNodeID, peerNodeID := 101, 301, 501, 701
-
-		stmtInsertProcesses.ExpectQuery().WithArgs(
-			flows[0].Local.Addr, flows[0].Process.Pgid, flows[0].Process.Name,
-		).WillReturnRows(
-			sqlmock.NewRows([]string{"process_id"}).AddRow(localProcessID),
-		)
-
-		stmtInsertActiveNodes.ExpectQuery().WithArgs(localProcessID).WillReturnError(
-			sql.ErrNoRows,
-		) // conflict when inserting
-		stmtFindActiveNodesByProcess.ExpectQuery().WithArgs(localProcessID).WillReturnRows(
-			sqlmock.NewRows([]string{"node_id"}).AddRow(localNodeID),
-		)
-
-		stmtFindPassiveNodes.ExpectQuery().WithArgs(
-			flows[0].Peer.Addr, flows[0].Peer.Port,
-		).WillReturnError(sql.ErrNoRows) // return empty
-		stmtInsertProcesses.ExpectQuery().WithArgs(
-			flows[0].Peer.Addr, 0, "",
-		).WillReturnRows(
-			sqlmock.NewRows([]string{"process_id"}).AddRow(peerProcessID),
-		)
-		stmtInsertPassiveNodes.ExpectQuery().WithArgs(
-			peerProcessID, flows[0].Peer.Port,
-		).WillReturnRows(
-			sqlmock.NewRows([]string{"node_id"}).AddRow(peerNodeID),
-		)
-
-		stmtInsertFlows.ExpectExec().WithArgs(
-			localNodeID, peerNodeID, flows[0].Connections,
-		).WillReturnResult(sqlmock.NewResult(0, 1))
+		rows, err := db.Query(context.Background(), "SELECT pname from processes ORDER BY created")
+		if err != nil {
+			t.Fatalf("%+v", err)
+		}
+		defer rows.Close()
+		names := []string{}
+		for rows.Next() {
+			var pname string
+			if err := rows.Scan(&pname); err != nil {
+				t.Fatal(err)
+			}
+			names = append(names, pname)
+		}
+		// Empty process on "10.0.10.2" exists.
+		want := []string{"python", "nginx", ""}
+		if diff := cmp.Diff(names, want); diff != "" {
+			t.Errorf("InsertUpdateHostFlows() mismatch (-want +got):\n%s", diff)
+		}
 	}
 
-	// second loop
 	{
-		localProcessID, peerProcessID, localNodeID, peerNodeID := 102, 302, 502, 702
-
-		stmtInsertProcesses.ExpectQuery().WithArgs(
-			flows[1].Local.Addr, flows[1].Process.Pgid, flows[1].Process.Name,
-		).WillReturnRows(
-			sqlmock.NewRows([]string{"process_id"}).AddRow(localProcessID),
-		)
-
-		stmtInsertPassiveNodes.ExpectQuery().WithArgs(
-			localProcessID, flows[1].Local.Port,
-		).WillReturnError(sql.ErrNoRows)
-		stmtFindPassiveNodesByProcess.ExpectQuery().WithArgs(
-			localProcessID, flows[1].Local.Port,
-		).WillReturnRows(
-			sqlmock.NewRows([]string{"node_id"}).AddRow(localNodeID),
-		)
-
-		stmtFindActiveNodes.ExpectQuery().WithArgs(
-			flows[1].Local.Port, flows[1].Peer.Addr,
-		).WillReturnError(sql.ErrNoRows)
-		stmtInsertProcesses.ExpectQuery().WithArgs(
-			flows[1].Peer.Addr, 0, "",
-		).WillReturnRows(
-			sqlmock.NewRows([]string{"process_id"}).AddRow(peerProcessID),
-		)
-		stmtInsertActiveNodes.ExpectQuery().WithArgs(
-			peerProcessID,
-		).WillReturnRows(
-			sqlmock.NewRows([]string{"node_id"}).AddRow(peerNodeID),
-		)
-
-		stmtInsertFlows.ExpectExec().WithArgs(
-			peerNodeID, localNodeID, flows[1].Connections,
-		).WillReturnResult(sqlmock.NewResult(0, 1))
+		rows, err := db.Query(context.Background(), "SELECT * from active_nodes")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		ids := []int64{}
+		for rows.Next() {
+			var id, pid int64
+			if err := rows.Scan(&id, &pid); err != nil {
+				t.Fatal(err)
+			}
+			ids = append(ids, id)
+		}
+		// Empty active_nodes on "10.0.10.2" exists.
+		if size := len(ids); size != 2 {
+			t.Errorf("size of active_nodes should be 1, not %d", size)
+		}
 	}
 
-	mock.ExpectCommit()
-
-	err := db.InsertOrUpdateHostFlows(flows)
-	if err != nil {
-		t.Fatalf("%+v", err)
+	{
+		rows, err := db.Query(context.Background(), "SELECT node_id from passive_nodes")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		ids := []int64{}
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				t.Fatal(err)
+			}
+			ids = append(ids, id)
+		}
+		// Empty passive_nodes on "10.0.10.2" exists.
+		if size := len(ids); size != 2 {
+			t.Errorf("size of passive_nodes should be 2, not %d", size)
+		}
 	}
 
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("there were unfulfilled expectations: %s", err)
+	{
+		rows, err := db.Query(
+			context.Background(),
+			"SELECT source_node_id, destination_node_id FROM flows ORDER BY created",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		sids, dids := []int64{}, []int64{}
+		for rows.Next() {
+			var sid, did int64
+			if err := rows.Scan(&sid, &did); err != nil {
+				t.Fatal(err)
+			}
+			sids = append(sids, sid)
+			dids = append(dids, did)
+		}
+		want := []int64{1, 2}
+		if diff := cmp.Diff(want, sids); diff != "" {
+			t.Errorf("InsertUpdateHostFlows() mismatch (-want +got):\n%s", diff)
+		}
+		want = []int64{1, 2}
+		if diff := cmp.Diff(want, dids); diff != "" {
+			t.Errorf("InsertUpdateHostFlows() mismatch (-want +got):\n%s", diff)
+		}
+		if size := len(sids); size != len(flows) {
+			t.Errorf("size of flows should be %d, not %d", len(flows), size)
+		}
 	}
 }
 
 func TestInsertOrUpdateHostFlows_empty_process(t *testing.T) {
-	db, mock := NewTestDB()
-	defer db.Close()
+	db, teardown := setupTestCase(t)
+	defer teardown(t)
 
 	flows := []*probe.HostFlow{
 		{
@@ -186,245 +216,360 @@ func TestInsertOrUpdateHostFlows_empty_process(t *testing.T) {
 		},
 	}
 
-	mock.ExpectBegin()
-
-	mock.ExpectPrepare("SELECT flows.source_node_id FROM flows")
-	stmtFindPassiveNodes := mock.ExpectPrepare("SELECT node_id FROM passive_nodes WHERE process_id IN (.+)")
-	stmtInsertProcesses := mock.ExpectPrepare("INSERT INTO processes")
-	stmtInsertActiveNodes := mock.ExpectPrepare("INSERT INTO active_nodes")
-	stmtInsertPassiveNodes := mock.ExpectPrepare("INSERT INTO passive_nodes")
-	stmtFindActiveNodesByProcess := mock.ExpectPrepare("SELECT node_id FROM active_nodes")
-	mock.ExpectPrepare("SELECT node_id FROM passive_nodes WHERE process_id = (.+) AND port = (.+)")
-	stmtInsertFlows := mock.ExpectPrepare("INSERT INTO flows")
-
-	// first loop
-	localProcessID, peerProcessID, localNodeID, peerNodeID := 101, 301, 501, 701
-
-	stmtInsertProcesses.ExpectQuery().WithArgs(
-		flows[0].Local.Addr, 0, "",
-	).WillReturnRows(
-		sqlmock.NewRows([]string{"process_id"}).AddRow(localProcessID),
-	)
-
-	stmtInsertActiveNodes.ExpectQuery().WithArgs(localProcessID).WillReturnError(
-		sql.ErrNoRows,
-	) // conflict when inserting
-	stmtFindActiveNodesByProcess.ExpectQuery().WithArgs(localProcessID).WillReturnRows(
-		sqlmock.NewRows([]string{"node_id"}).AddRow(localNodeID),
-	)
-
-	stmtFindPassiveNodes.ExpectQuery().WithArgs(
-		flows[0].Peer.Addr, flows[0].Peer.Port,
-	).WillReturnError(sql.ErrNoRows) // return empty
-	stmtInsertProcesses.ExpectQuery().WithArgs(
-		flows[0].Peer.Addr, 0, "",
-	).WillReturnRows(
-		sqlmock.NewRows([]string{"process_id"}).AddRow(peerProcessID),
-	)
-	stmtInsertPassiveNodes.ExpectQuery().WithArgs(
-		peerProcessID, flows[0].Peer.Port,
-	).WillReturnRows(
-		sqlmock.NewRows([]string{"node_id"}).AddRow(peerNodeID),
-	)
-
-	stmtInsertFlows.ExpectExec().WithArgs(
-		localNodeID, peerNodeID, flows[0].Connections,
-	).WillReturnResult(sqlmock.NewResult(0, 1))
-
-	mock.ExpectCommit()
-
-	err := db.InsertOrUpdateHostFlows(flows)
-	if err != nil {
-		t.Fatalf("%+v", err)
+	if err := db.InsertOrUpdateHostFlows(flows); err != nil {
+		t.Fatal(err)
 	}
 
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("there were unfulfilled expectations: %s", err)
+	{
+		rows, err := db.Query(
+			context.Background(),
+			"SELECT source_node_id, destination_node_id FROM flows ORDER BY created",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		sids, dids := []int64{}, []int64{}
+		for rows.Next() {
+			var sid, did int64
+			if err := rows.Scan(&sid, &did); err != nil {
+				t.Fatal(err)
+			}
+			sids = append(sids, sid)
+			dids = append(dids, did)
+		}
+		want := []int64{1}
+		if diff := cmp.Diff(want, sids); diff != "" {
+			t.Errorf("InsertUpdateHostFlows() mismatch (-want +got):\n%s", diff)
+		}
+		want = []int64{1}
+		if diff := cmp.Diff(want, dids); diff != "" {
+			t.Errorf("InsertUpdateHostFlows() mismatch (-want +got):\n%s", diff)
+		}
+		if size := len(sids); size != len(flows) {
+			t.Errorf("size of flows should be %d, not %d", len(flows), size)
+		}
 	}
 }
 
 func TestFindPassiveFlows(t *testing.T) {
-	db, mock := NewTestDB()
-	defer db.Close()
+	db, teardown := setupTestCase(t)
+	defer teardown(t)
 
-	paddrs := []net.IP{net.ParseIP("192.168.3.1"), net.ParseIP("192.168.3.2")}
+	input := []*probe.HostFlow{
+		// haproxy(10.0.10.1:80) -> nginx(10.0.10.2:80) -> python(10.0.10.2:8000)
+		//                                              |-> postgres(10.0.10.3:5432)
+		//                                              |-> redis(10.0.10.4:6379)
+		{
+			Direction:   probe.FlowActive,
+			Local:       &probe.AddrPort{Addr: "10.0.10.1", Port: "many"},
+			Peer:        &probe.AddrPort{Addr: "10.0.10.2", Port: "80"},
+			Process:     &probe.Process{Pgid: 1001, Name: "haproxy"},
+			Connections: 100,
+		},
+		{
+			Direction:   probe.FlowPassive,
+			Local:       &probe.AddrPort{Addr: "10.0.10.2", Port: "80"},
+			Peer:        &probe.AddrPort{Addr: "10.0.10.1", Port: "many"},
+			Process:     &probe.Process{Pgid: 2001, Name: "nginx"},
+			Connections: 12,
+		},
+		{
+			Direction:   probe.FlowActive,
+			Local:       &probe.AddrPort{Addr: "10.0.10.1", Port: "many"},
+			Peer:        &probe.AddrPort{Addr: "10.0.10.2", Port: "8000"},
+			Process:     &probe.Process{Pgid: 2002, Name: "gunicorn"},
+			Connections: 18,
+		},
+		{
+			Direction:   probe.FlowPassive,
+			Local:       &probe.AddrPort{Addr: "10.0.10.2", Port: "8000"},
+			Peer:        &probe.AddrPort{Addr: "10.0.10.2", Port: "many"},
+			Process:     &probe.Process{Pgid: 2002, Name: "gunicorn"},
+			Connections: 10,
+		},
+		{
+			Direction:   probe.FlowActive,
+			Local:       &probe.AddrPort{Addr: "10.0.10.2", Port: "many"},
+			Peer:        &probe.AddrPort{Addr: "10.0.10.3", Port: "5432"},
+			Process:     &probe.Process{Pgid: 2002, Name: "gunicorn"},
+			Connections: 21,
+		},
+		{
+			Direction:   probe.FlowActive,
+			Local:       &probe.AddrPort{Addr: "10.0.10.2", Port: "many"},
+			Peer:        &probe.AddrPort{Addr: "10.0.10.4", Port: "6379"},
+			Process:     &probe.Process{Pgid: 2002, Name: "gunicorn"},
+			Connections: 14,
+		},
+		{
+			Direction:   probe.FlowPassive,
+			Local:       &probe.AddrPort{Addr: "10.0.10.3", Port: "5432"},
+			Peer:        &probe.AddrPort{Addr: "10.0.10.2", Port: "many"},
+			Process:     &probe.Process{Pgid: 3001, Name: "postgres"},
+			Connections: 20,
+		},
+		{
+			Direction:   probe.FlowPassive,
+			Local:       &probe.AddrPort{Addr: "10.0.10.4", Port: "6379"},
+			Peer:        &probe.AddrPort{Addr: "10.0.10.2", Port: "many"},
+			Process:     &probe.Process{Pgid: 4001, Name: "redis"},
+			Connections: 19,
+		},
+	}
 
-	columns := sqlmock.NewRows([]string{
-		"pipv4",
-		"ppname",
-		"pport",
-		"ppgid",
-		"aipv4",
-		"apname",
-		"apgid",
-		"connections",
-		"updated",
-	})
+	if err := db.InsertOrUpdateHostFlows(input); err != nil {
+		t.Fatal(err)
+	}
 
-	// flow1
-	pipv4, ppname, ppgid, pport := "192.168.3.1", "unicorn", 10021, 8000
-	aipv4, apname, apgid := "192.168.2.1", "nginx", 4123
-	connections := 10
-	columns.AddRow(pipv4, ppname, pport, ppgid, aipv4, apname, apgid, connections, time.Now())
-
-	// flow2
-	pipv4, ppname, ppgid, pport = "192.168.3.1", "unicorn", 10021, 8000
-	aipv4, apname, apgid = "192.168.5.1", "varnish", 13456
-	connections = 20
-	columns.AddRow(pipv4, ppname, pport, ppgid, aipv4, apname, apgid, connections, time.Now())
-
-	until := time.Now()
-
-	mock.ExpectQuery("SELECT (.+) FROM flows").WithArgs(
-		pq.Array([]string{"192.168.3.1", "192.168.3.2"}),
-		pq.FormatTimestamp(time.Time{}),
-		pq.FormatTimestamp(until),
-	).WillReturnRows(columns)
-
-	flows, err := db.FindPassiveFlows(&FindFlowsCond{
-		Addrs: paddrs,
-		Until: until,
+	got, err := db.FindPassiveFlows(&FindFlowsCond{
+		Addrs: []net.IP{
+			net.ParseIP("10.0.10.1"),
+			net.ParseIP("10.0.10.2"),
+			net.ParseIP("10.0.10.3"),
+			net.ParseIP("10.0.10.4"),
+		},
 	})
 	if err != nil {
 		t.Fatalf("%+v", err)
 	}
 
-	if len(flows) != 1 {
-		t.Errorf("flows should be 2, but %v", len(flows))
-	}
-
 	want := Flows{
-		"192.168.3.1-unicorn": []*Flow{
+		"10.0.10.2-": []*Flow{
 			{
 				ActiveNode: &Node{
-					IPAddr: net.ParseIP("192.168.2.1"),
+					IPAddr: net.ParseIP("10.0.10.1"),
 					Port:   0,
-					Pgid:   4123,
-					Pname:  "nginx",
+					Pgid:   1001,
+					Pname:  "haproxy",
 				},
 				PassiveNode: &Node{
-					IPAddr: net.ParseIP("192.168.3.1"),
+					IPAddr: net.ParseIP("10.0.10.2"),
+					Port:   80,
+				},
+				Connections: 100,
+			},
+		},
+		"10.0.10.2-nginx": []*Flow{
+			{
+				ActiveNode: &Node{
+					IPAddr: net.ParseIP("10.0.10.1"),
+					Port:   0,
+					Pgid:   1001,
+					Pname:  "haproxy",
+				},
+				PassiveNode: &Node{
+					IPAddr: net.ParseIP("10.0.10.2"),
+					Port:   80,
+					Pgid:   2001,
+					Pname:  "nginx",
+				},
+				Connections: 12,
+			},
+		},
+		"10.0.10.2-gunicorn": []*Flow{
+			{
+				ActiveNode: &Node{
+					IPAddr: net.ParseIP("10.0.10.2"),
+					Port:   0,
+				},
+				PassiveNode: &Node{
+					IPAddr: net.ParseIP("10.0.10.2"),
 					Port:   8000,
-					Pgid:   10021,
-					Pname:  "unicorn",
+					Pgid:   2002,
+					Pname:  "gunicorn",
 				},
 				Connections: 10,
 			},
+		},
+		"10.0.10.3-": []*Flow{
 			{
 				ActiveNode: &Node{
-					IPAddr: net.ParseIP("192.168.5.1"),
+					IPAddr: net.ParseIP("10.0.10.2"),
 					Port:   0,
-					Pgid:   13456,
-					Pname:  "varnish",
+					Pgid:   2002,
+					Pname:  "gunicorn",
 				},
 				PassiveNode: &Node{
-					IPAddr: net.ParseIP("192.168.3.1"),
-					Port:   8000,
-					Pgid:   10021,
-					Pname:  "unicorn",
+					IPAddr: net.ParseIP("10.0.10.3"),
+					Port:   5432,
+				},
+				Connections: 21,
+			},
+		},
+		"10.0.10.3-postgres": []*Flow{
+			{
+				ActiveNode: &Node{
+					IPAddr: net.ParseIP("10.0.10.2"),
+					Port:   0,
+					Pgid:   2002,
+					Pname:  "gunicorn",
+				},
+				PassiveNode: &Node{
+					IPAddr: net.ParseIP("10.0.10.3"),
+					Port:   5432,
+					Pgid:   3001,
+					Pname:  "postgres",
 				},
 				Connections: 20,
 			},
 		},
-	}
-	if diff := cmp.Diff(want, flows); diff != "" {
-		t.Errorf("FindDestNodes() mismatch (-want +got):\n%s", diff)
+		"10.0.10.4-": []*Flow{
+			{
+				ActiveNode: &Node{
+					IPAddr: net.ParseIP("10.0.10.2"),
+					Port:   0,
+					Pgid:   2002,
+					Pname:  "gunicorn",
+				},
+				PassiveNode: &Node{
+					IPAddr: net.ParseIP("10.0.10.4"),
+					Port:   6379,
+				},
+				Connections: 14,
+			},
+		},
+		"10.0.10.4-redis": []*Flow{
+			{
+				ActiveNode: &Node{
+					IPAddr: net.ParseIP("10.0.10.2"),
+					Port:   0,
+					Pgid:   2002,
+					Pname:  "gunicorn",
+				},
+				PassiveNode: &Node{
+					IPAddr: net.ParseIP("10.0.10.4"),
+					Port:   6379,
+					Pgid:   4001,
+					Pname:  "redis",
+				},
+				Connections: 19,
+			},
+		},
 	}
 
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("there were unfulfilled expectations: %s", err)
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("FindPassiveFlows() mismatch (-want +got):\n%s", diff)
 	}
 }
 
 func TestFindActiveFlows(t *testing.T) {
-	db, mock := NewTestDB()
-	defer db.Close()
+	db, teardown := setupTestCase(t)
+	defer teardown(t)
 
-	aaddrs := []net.IP{net.ParseIP("192.168.2.1"), net.ParseIP("192.168.2.2")}
+	input := []*probe.HostFlow{
+		// nginx(10.0.10.1:80) ->  python(10.0.10.2:8000)
+		//                          |-> postgres(10.0.10.3:5432)
+		//                          |-> redis(10.0.10.4:6379)
+		{
+			Direction:   probe.FlowActive,
+			Local:       &probe.AddrPort{Addr: "10.0.10.1", Port: "many"},
+			Peer:        &probe.AddrPort{Addr: "10.0.10.2", Port: "80"},
+			Process:     &probe.Process{Pgid: 1001, Name: "nginx"},
+			Connections: 100,
+		},
+		{
+			Direction:   probe.FlowPassive,
+			Local:       &probe.AddrPort{Addr: "10.0.10.2", Port: "8000"},
+			Peer:        &probe.AddrPort{Addr: "10.0.10.1", Port: "many"},
+			Process:     &probe.Process{Pgid: 2001, Name: "gunicorn"},
+			Connections: 10,
+		},
+		{
+			Direction:   probe.FlowActive,
+			Local:       &probe.AddrPort{Addr: "10.0.10.2", Port: "many"},
+			Peer:        &probe.AddrPort{Addr: "10.0.10.3", Port: "5432"},
+			Process:     &probe.Process{Pgid: 2001, Name: "gunicorn"},
+			Connections: 21,
+		},
+		{
+			Direction:   probe.FlowActive,
+			Local:       &probe.AddrPort{Addr: "10.0.10.2", Port: "many"},
+			Peer:        &probe.AddrPort{Addr: "10.0.10.4", Port: "6379"},
+			Process:     &probe.Process{Pgid: 2001, Name: "gunicorn"},
+			Connections: 14,
+		},
+		{
+			Direction:   probe.FlowPassive,
+			Local:       &probe.AddrPort{Addr: "10.0.10.3", Port: "5432"},
+			Peer:        &probe.AddrPort{Addr: "10.0.10.2", Port: "many"},
+			Process:     &probe.Process{Pgid: 3001, Name: "postgres"},
+			Connections: 20,
+		},
+		{
+			Direction:   probe.FlowPassive,
+			Local:       &probe.AddrPort{Addr: "10.0.10.4", Port: "6379"},
+			Peer:        &probe.AddrPort{Addr: "10.0.10.2", Port: "many"},
+			Process:     &probe.Process{Pgid: 4001, Name: "redis"},
+			Connections: 19,
+		},
+	}
 
-	columns := sqlmock.NewRows([]string{
-		"aipv4",
-		"apname",
-		"pport",
-		"apgid",
-		"pipv4",
-		"ppname",
-		"ppgid",
-		"connections",
-		"updated",
-	})
+	if err := db.InsertOrUpdateHostFlows(input); err != nil {
+		t.Fatal(err)
+	}
 
-	// flow1
-	aipv4, apname, apgid := "192.168.2.1", "unicorn", 4123
-	pipv4, ppname, ppgid, pport := "192.168.3.1", "mysqld", 10021, 3306
-	connections := 10
-	columns.AddRow(aipv4, apname, pport, apgid, pipv4, ppname, ppgid, connections, time.Now())
-
-	// flow2
-	aipv4, apname, apgid = "192.168.2.1", "unicorn", 4123
-	pipv4, ppname, ppgid, pport = "192.168.4.1", "memcached", 21199, 11211
-	connections = 20
-	columns.AddRow(aipv4, apname, pport, apgid, pipv4, ppname, ppgid, connections, time.Now())
-
-	until := time.Now()
-
-	mock.ExpectQuery("SELECT (.+) FROM flows").WithArgs(
-		pq.Array([]string{"192.168.2.1", "192.168.2.2"}),
-		pq.FormatTimestamp(time.Time{}),
-		pq.FormatTimestamp(until),
-	).WillReturnRows(columns)
-
-	flows, err := db.FindActiveFlows(&FindFlowsCond{
-		Addrs: aaddrs,
-		Until: until,
+	got, err := db.FindActiveFlows(&FindFlowsCond{
+		Addrs: []net.IP{
+			net.ParseIP("10.0.10.1"),
+			net.ParseIP("10.0.10.2"),
+			net.ParseIP("10.0.10.3"),
+			net.ParseIP("10.0.10.4"),
+		},
 	})
 	if err != nil {
 		t.Fatalf("%+v", err)
 	}
 
-	if len(flows) != 1 {
-		t.Errorf("flows should be 2, but %v", len(flows))
-	}
-
 	want := Flows{
-		"192.168.2.1-unicorn": []*Flow{
+		"10.0.10.1-": []*Flow{
 			{
 				ActiveNode: &Node{
-					IPAddr: net.ParseIP("192.168.2.1"),
+					IPAddr: net.ParseIP("10.0.10.1"),
 					Port:   0,
-					Pgid:   4123,
-					Pname:  "unicorn",
 				},
 				PassiveNode: &Node{
-					IPAddr: net.ParseIP("192.168.3.1"),
-					Port:   3306,
-					Pgid:   10021,
-					Pname:  "mysqld",
+					IPAddr: net.ParseIP("10.0.10.2"),
+					Port:   8000,
+					Pgid:   2001,
+					Pname:  "gunicorn",
 				},
 				Connections: 10,
 			},
+		},
+		"10.0.10.1-nginx": []*Flow{
 			{
 				ActiveNode: &Node{
-					IPAddr: net.ParseIP("192.168.2.1"),
+					IPAddr: net.ParseIP("10.0.10.1"),
 					Port:   0,
-					Pgid:   4123,
-					Pname:  "unicorn",
+					Pgid:   1001,
+					Pname:  "nginx",
 				},
 				PassiveNode: &Node{
-					IPAddr: net.ParseIP("192.168.4.1"),
-					Port:   11211,
-					Pgid:   21199,
-					Pname:  "memcached",
+					IPAddr: net.ParseIP("10.0.10.2"),
+					Port:   80,
 				},
-				Connections: 20,
+				Connections: 100,
+			},
+		},
+		"10.0.10.2-gunicorn": []*Flow{
+			{
+				ActiveNode: &Node{
+					IPAddr: net.ParseIP("10.0.10.2"),
+					Port:   0,
+					Pgid:   2001,
+					Pname:  "gunicorn",
+				},
+				PassiveNode: &Node{
+					IPAddr: net.ParseIP("10.0.10.3"),
+					Port:   5432,
+				},
+				Connections: 21,
 			},
 		},
 	}
-	if diff := cmp.Diff(want, flows); diff != "" {
-		t.Errorf("FindDestNodes() mismatch (-want +got):\n%s", diff)
-	}
 
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("there were unfulfilled expectations: %s", err)
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("FindActiveFlows() mismatch (-want +got):\n%s", diff)
 	}
 }
