@@ -468,49 +468,35 @@ func TestFindActiveFlows(t *testing.T) {
 	}
 
 	input := []*probe.HostFlow{
-		// haproxy(10.0.10.1:80) -> nginx(10.0.10.2:80) -> python(10.0.10.2:8000)
-		//                                              |-> postgres(10.0.10.3:5432)
-		//                                              |-> redis(10.0.10.4:6379)
+		// nginx(10.0.10.1:80) ->  python(10.0.10.2:8000)
+		//                          |-> postgres(10.0.10.3:5432)
+		//                          |-> redis(10.0.10.4:6379)
 		{
 			Direction:   probe.FlowActive,
 			Local:       &probe.AddrPort{Addr: "10.0.10.1", Port: "many"},
 			Peer:        &probe.AddrPort{Addr: "10.0.10.2", Port: "80"},
-			Process:     &probe.Process{Pgid: 1001, Name: "haproxy"},
+			Process:     &probe.Process{Pgid: 1001, Name: "nginx"},
 			Connections: 100,
 		},
 		{
 			Direction:   probe.FlowPassive,
-			Local:       &probe.AddrPort{Addr: "10.0.10.2", Port: "80"},
-			Peer:        &probe.AddrPort{Addr: "10.0.10.1", Port: "many"},
-			Process:     &probe.Process{Pgid: 2001, Name: "nginx"},
-			Connections: 12,
-		},
-		{
-			Direction:   probe.FlowActive,
-			Local:       &probe.AddrPort{Addr: "10.0.10.1", Port: "many"},
-			Peer:        &probe.AddrPort{Addr: "10.0.10.2", Port: "8000"},
-			Process:     &probe.Process{Pgid: 2002, Name: "gunicorn"},
-			Connections: 18,
-		},
-		{
-			Direction:   probe.FlowPassive,
 			Local:       &probe.AddrPort{Addr: "10.0.10.2", Port: "8000"},
-			Peer:        &probe.AddrPort{Addr: "10.0.10.2", Port: "many"},
-			Process:     &probe.Process{Pgid: 2002, Name: "gunicorn"},
+			Peer:        &probe.AddrPort{Addr: "10.0.10.1", Port: "many"},
+			Process:     &probe.Process{Pgid: 2001, Name: "gunicorn"},
 			Connections: 10,
 		},
 		{
 			Direction:   probe.FlowActive,
 			Local:       &probe.AddrPort{Addr: "10.0.10.2", Port: "many"},
 			Peer:        &probe.AddrPort{Addr: "10.0.10.3", Port: "5432"},
-			Process:     &probe.Process{Pgid: 2002, Name: "gunicorn"},
+			Process:     &probe.Process{Pgid: 2001, Name: "gunicorn"},
 			Connections: 21,
 		},
 		{
 			Direction:   probe.FlowActive,
 			Local:       &probe.AddrPort{Addr: "10.0.10.2", Port: "many"},
 			Peer:        &probe.AddrPort{Addr: "10.0.10.4", Port: "6379"},
-			Process:     &probe.Process{Pgid: 2002, Name: "gunicorn"},
+			Process:     &probe.Process{Pgid: 2001, Name: "gunicorn"},
 			Connections: 14,
 		},
 		{
@@ -546,36 +532,34 @@ func TestFindActiveFlows(t *testing.T) {
 	}
 
 	want := Flows{
-		"10.0.10.1-haproxy": []*Flow{
+		"10.0.10.1-": []*Flow{
 			{
 				ActiveNode: &Node{
 					IPAddr: net.ParseIP("10.0.10.1"),
-					Port:   0,
-					Pgid:   1001,
-					Pname:  "haproxy",
-				},
-				PassiveNode: &Node{
-					IPAddr: net.ParseIP("10.0.10.2"),
-					Port:   80,
-					Pgid:   2001,
-					Pname:  "nginx",
-				},
-				Connections: 12,
-			},
-		},
-		"10.0.10.2-": []*Flow{
-			{
-				ActiveNode: &Node{
-					IPAddr: net.ParseIP("10.0.10.2"),
 					Port:   0,
 				},
 				PassiveNode: &Node{
 					IPAddr: net.ParseIP("10.0.10.2"),
 					Port:   8000,
-					Pgid:   2002,
+					Pgid:   2001,
 					Pname:  "gunicorn",
 				},
 				Connections: 10,
+			},
+		},
+		"10.0.10.1-nginx": []*Flow{
+			{
+				ActiveNode: &Node{
+					IPAddr: net.ParseIP("10.0.10.1"),
+					Port:   0,
+					Pgid:   1001,
+					Pname:  "nginx",
+				},
+				PassiveNode: &Node{
+					IPAddr: net.ParseIP("10.0.10.2"),
+					Port:   80,
+				},
+				Connections: 100,
 			},
 		},
 		"10.0.10.2-gunicorn": []*Flow{
@@ -583,16 +567,14 @@ func TestFindActiveFlows(t *testing.T) {
 				ActiveNode: &Node{
 					IPAddr: net.ParseIP("10.0.10.2"),
 					Port:   0,
-					Pgid:   2002,
+					Pgid:   2001,
 					Pname:  "gunicorn",
 				},
 				PassiveNode: &Node{
-					IPAddr: net.ParseIP("10.0.10.4"),
-					Port:   6379,
-					Pgid:   4001,
-					Pname:  "redis",
+					IPAddr: net.ParseIP("10.0.10.3"),
+					Port:   5432,
 				},
-				Connections: 19,
+				Connections: 21,
 			},
 		},
 	}

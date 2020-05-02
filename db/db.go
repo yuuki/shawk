@@ -74,13 +74,12 @@ const (
 	InsertOrUpdateTimeoutSec = 10
 
 	findActiveNodesSQL = `
-		SELECT flows.source_node_id FROM flows
+		SELECT an.node_id FROM flows
 		INNER JOIN (SELECT node_id FROM passive_nodes WHERE port = $1)
 			AS pn ON pn.node_id = flows.destination_node_id
 		INNER JOIN (SELECT node_id FROM active_nodes WHERE process_id IN (
 			SELECT process_id FROM processes WHERE ipv4 = $2
 		)) AS an ON an.node_id = flows.source_node_id
-		LIMIT 1
 	`
 
 	findPassiveNodesSQL = `
