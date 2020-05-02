@@ -190,11 +190,11 @@ func TestInsertOrUpdateHostFlows(t *testing.T) {
 			dids = append(dids, did)
 		}
 		want := []int64{1, 2}
-		if diff := cmp.Diff(sids, want); diff != "" {
+		if diff := cmp.Diff(want, sids); diff != "" {
 			t.Errorf("InsertUpdateHostFlows() mismatch (-want +got):\n%s", diff)
 		}
 		want = []int64{1, 2}
-		if diff := cmp.Diff(dids, want); diff != "" {
+		if diff := cmp.Diff(want, dids); diff != "" {
 			t.Errorf("InsertUpdateHostFlows() mismatch (-want +got):\n%s", diff)
 		}
 		if size := len(sids); size != len(flows) {
@@ -238,12 +238,12 @@ func TestInsertOrUpdateHostFlows_empty_process(t *testing.T) {
 			sids = append(sids, sid)
 			dids = append(dids, did)
 		}
-		want := []int64{1, 2}
-		if diff := cmp.Diff(sids, want); diff != "" {
+		want := []int64{1}
+		if diff := cmp.Diff(want, sids); diff != "" {
 			t.Errorf("InsertUpdateHostFlows() mismatch (-want +got):\n%s", diff)
 		}
-		want = []int64{1, 2}
-		if diff := cmp.Diff(dids, want); diff != "" {
+		want = []int64{1}
+		if diff := cmp.Diff(want, dids); diff != "" {
 			t.Errorf("InsertUpdateHostFlows() mismatch (-want +got):\n%s", diff)
 		}
 		if size := len(sids); size != len(flows) {
