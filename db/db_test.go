@@ -39,15 +39,29 @@ func TestCreateSchema(t *testing.T) {
 	}
 }
 
-func TestInsertOrUpdateHostFlows_empty(t *testing.T) {
+func setupTestCase(t *testing.T) (*DB, func(t *testing.T)) {
+	// setup
 	db, err := New(testdb.GetURL().String())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Shutdown()
 	if err = db.CreateSchema(); err != nil {
 		t.Fatal(err)
 	}
+
+	return db, func(t *testing.T) {
+		// teardown
+		db.Exec(
+			context.Background(),
+			"select 'drop table if exists \"' || tablename || '\" cascade;' from pg_tables",
+		)
+		db.Shutdown()
+	}
+}
+
+func TestInsertOrUpdateHostFlows_empty(t *testing.T) {
+	db, teardown := setupTestCase(t)
+	defer teardown(t)
 
 	flows := []*probe.HostFlow{}
 
@@ -72,14 +86,8 @@ func TestInsertOrUpdateHostFlows_empty(t *testing.T) {
 }
 
 func TestInsertOrUpdateHostFlows(t *testing.T) {
-	db, err := New(testdb.GetURL().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Shutdown()
-	if err = db.CreateSchema(); err != nil {
-		t.Fatal(err)
-	}
+	db, teardown := setupTestCase(t)
+	defer teardown(t)
 
 	flows := []*probe.HostFlow{
 		{
@@ -196,14 +204,8 @@ func TestInsertOrUpdateHostFlows(t *testing.T) {
 }
 
 func TestInsertOrUpdateHostFlows_empty_process(t *testing.T) {
-	db, err := New(testdb.GetURL().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Shutdown()
-	if err = db.CreateSchema(); err != nil {
-		t.Fatal(err)
-	}
+	db, teardown := setupTestCase(t)
+	defer teardown(t)
 
 	flows := []*probe.HostFlow{
 		{
@@ -251,14 +253,8 @@ func TestInsertOrUpdateHostFlows_empty_process(t *testing.T) {
 }
 
 func TestFindPassiveFlows(t *testing.T) {
-	db, err := New(testdb.GetURL().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Shutdown()
-	if err := db.CreateSchema(); err != nil {
-		t.Fatal(err)
-	}
+	db, teardown := setupTestCase(t)
+	defer teardown(t)
 
 	input := []*probe.HostFlow{
 		// haproxy(10.0.10.1:80) -> nginx(10.0.10.2:80) -> python(10.0.10.2:8000)
@@ -458,14 +454,8 @@ func TestFindPassiveFlows(t *testing.T) {
 }
 
 func TestFindActiveFlows(t *testing.T) {
-	db, err := New(testdb.GetURL().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Shutdown()
-	if err := db.CreateSchema(); err != nil {
-		t.Fatal(err)
-	}
+	db, teardown := setupTestCase(t)
+	defer teardown(t)
 
 	input := []*probe.HostFlow{
 		// nginx(10.0.10.1:80) ->  python(10.0.10.2:8000)
