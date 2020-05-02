@@ -22,7 +22,7 @@ func Wait(db *db.DB) error {
 
 	time.Sleep(3 * time.Second)
 	logger.Infof("--> Closing db connection...")
-	if err := db.Close(); err != nil {
+	if err := db.Shutdown(); err != nil {
 		return xerrors.Errorf("db close error: %w", err)
 	}
 	logger.Infof("Closed db connection")
