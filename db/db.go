@@ -145,9 +145,13 @@ func (db *DB) InsertOrUpdateHostFlows(flows []*probe.HostFlow) error {
 	}
 
 	for _, flow := range flows {
-		if flow.Local.Addr == "127.0.0.1" || flow.Local.Addr == "::1" || flow.Peer.Addr == "127.0.0.1" || flow.Peer.Addr == "::1" {
+		if flow.Local.Addr == "127.0.0.1" ||
+			flow.Local.Addr == "::1" ||
+			flow.Peer.Addr == "127.0.0.1" ||
+			flow.Peer.Addr == "::1" {
 			continue
 		}
+
 		var (
 			localNodeID, peerNodeID       int64
 			localProcessID, peerProcessID int64
