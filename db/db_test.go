@@ -53,7 +53,7 @@ func setupTestCase(t *testing.T) (*DB, func(t *testing.T)) {
 		// teardown
 		db.Exec(
 			context.Background(),
-			"select 'drop table if exists \"' || tablename || '\" cascade;' from pg_tables",
+			"drop schema public cascade; create schema public",
 		)
 		db.Shutdown()
 	}
