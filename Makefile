@@ -71,6 +71,7 @@ deps:
 		tmpdir=$$(mktemp -d); \
 		cd $$tmpdir; \
 		go get -u \
+			github.com/golang/protobuf/protoc-gen-go \
 			github.com/rakyll/statik \
 			golang.org/x/lint/golint \
 			github.com/x-motemen/gobump/cmd/gobump \

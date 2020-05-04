@@ -14,6 +14,7 @@ require (
 	github.com/docker/go-units v0.4.0 // indirect
 	github.com/elastic/gosigar v0.10.5
 	github.com/go-ole/go-ole v1.2.4 // indirect
+	github.com/golang/protobuf v1.4.0
 	github.com/google/go-cmp v0.4.0
 	github.com/gotestyourself/gotestyourself v2.2.0+incompatible // indirect
 	github.com/iovisor/gobpf v0.0.0-20200417061255-f0a208deaea5
@@ -35,6 +36,8 @@ require (
 	golang.org/x/net v0.0.0-20200425230154-ff2c4b7c35a0 // indirect
 	golang.org/x/sys v0.0.0-20200428200454-593003d681fa
 	golang.org/x/xerrors v0.0.0-20191204190536-9bdfabe68543
+	google.golang.org/grpc v1.29.1
+	google.golang.org/protobuf v1.21.0
 	gopkg.in/inconshreveable/log15.v2 v2.0.0-20200109203555-b30bc20e4fd1
 	gopkg.in/yaml.v2 v2.2.8 // indirect
 	gotest.tools v2.2.0+incompatible // indirect

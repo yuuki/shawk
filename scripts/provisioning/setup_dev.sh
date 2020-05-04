@@ -3,7 +3,7 @@
 set -eux
 
 sudo apt-get update
-sudo apt-get install -y --no-install-recommends  build-essential gcc make git
+sudo apt-get install -y --no-install-recommends build-essential gcc make git unzip
 
 # Install Go
 GOVER='1.14.2'
@@ -35,5 +35,11 @@ sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE ${PG_DB} TO ${PG_USER
 curl -fsSL get.docker.com -o get-docker.sh
 sudo /bin/bash get-docker.sh
 sudo usermod -aG docker vagrant
+
+# Install the protoc compiler for protocol buffer
+PB_REL="https://github.com/protocolbuffers/protobuf/releases"
+curl -sSLO ${PB_REL}/download/v3.11.4/protoc-3.11.4-linux-x86_64.zip
+unzip protoc-3.11.4-linux-x86_64.zip -d /home/vagrant/protoc
+echo "PATH=\"$PATH:$HOME/.local/bin\"" >> /home/vagrant/.bashrc
 
 echo 'Completed to setup'
