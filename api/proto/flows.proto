@@ -1,0 +1,19 @@
+syntax="proto3";
+
+option go_package = ".;flows";
+
+package flows;
+
+import "google/protobuf/timestamp.proto";
+
+service Flow {
+  rpc GetFlows (GetFlowsRequest) returns (FlowsResponse) {}
+}
+
+message GetFlowsRequest {
+  string name = 1;
+}
+
+message FlowsResponse {
+  string message = 1;
+}
