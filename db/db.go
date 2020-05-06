@@ -138,10 +138,12 @@ func (db *DB) InsertOrUpdateHostFlows(flows []*probe.HostFlow) error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), InsertOrUpdateTimeoutSec*time.Second)
 	defer cancel()
+
 	tx, err := db.Begin(ctx)
 	if err != nil {
 		return xerrors.Errorf("begin transaction error: %v", err)
 	}
+	defer tx.Rollback(ctx)
 
 	for _, flow := range flows {
 		if flow.Local.Addr == "127.0.0.1" ||
