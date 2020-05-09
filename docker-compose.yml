@@ -5,7 +5,7 @@ services:
     build: .
     depends_on:
       - db
-    entrypoint: /go/bin/shawk probe
+    command: bash -c "/go/bin/shawk create-scheme && /go/bin/shawk probe"
     volumes:
       - ./shawk:/go/bin/shawk
     environment:
