@@ -5,8 +5,11 @@ services:
     build: .
     depends_on:
       - db
-    entrypoint: /go/bin/shawk probe
-    command: ["--dbhost", "db"]
+    command: bash -c "/go/bin/shawk create-scheme && /go/bin/shawk probe"
+    volumes:
+      - ./shawk:/go/bin/shawk
+    environment:
+      - SHAWK_CMDB_URL=postgres://shawk:shawk@db:5432/shawk?sslmode=disable
   db:
     image: postgres:11.7
     ports:
@@ -14,12 +17,13 @@ services:
     environment:
       - POSTGRES_USER=shawk
       - POSTGRES_DB=shawk
+      - POSTGRES_PASSWORD=shawk
     restart: always
     user: postgres
     volumes:
       - ./postgres/init:/docker-entrypoint-initdb.d
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ttracer"]
+      test: ["CMD-SHELL", "pg_isready -U shawk"]
       interval: 3s
       timeout: 3s
       retries: 5
