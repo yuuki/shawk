@@ -29,8 +29,3 @@ func (b *BPFKProbePerf) PollStop(mapName string) {
 	// not supported
 	return
 }
-
-func (m *Map) Fd() int {
-        // not supported
-	return -1
-}
