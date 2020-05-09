@@ -26,6 +26,10 @@ This figure shows the system conﬁguration for matching the connection informat
 
 This figure shows how to retrieve socket information for TCP connections. When the Tracer process runs on the host, the Tracer process queries the Linux kernel and obtains a snapshot of the active TCP connection status from the socket corresponding to each connection. At the same time, the Tracer process acquires the process information corresponding to each connection. Then it links each connection and each process.
 
+## Getting Started
+
+See [Quickstart document](./doc/quickstart.md).
+
 ## Requirements
 
 - OS: Linux
