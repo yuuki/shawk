@@ -32,7 +32,7 @@ require (
 	github.com/weaveworks/tcptracer-bpf v0.0.0-20190731111909-cd53e7c84bac
 	golang.org/x/crypto v0.0.0-20200429183012-4b2356b1ed79 // indirect
 	golang.org/x/net v0.0.0-20200506145744-7e3656a0809f // indirect
-	golang.org/x/sys v0.0.0-20200508214444-3aab700007d7
+	golang.org/x/sys v0.0.0-20200615200032-f1bc736245b1
 	golang.org/x/xerrors v0.0.0-20191204190536-9bdfabe68543
 	gopkg.in/inconshreveable/log15.v2 v2.0.0-20200109203555-b30bc20e4fd1
 	gopkg.in/yaml.v2 v2.2.8 // indirect
