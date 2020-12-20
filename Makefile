@@ -86,4 +86,5 @@ docker-build:
 # Run to copy .c and .h files after receiving PR by Renovate.
 .PHONY: modvendor
 modvendor:
+	go mod vendor
 	modvendor -copy="**/*.c **/*.h" -v
