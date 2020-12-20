@@ -9,7 +9,7 @@ import (
 const name = "shawk"
 
 // version is application version.
-const version = "0.7.0"
+const version = "0.7.1"
 
 // commit describes latest git commit hash.
 // This is automatically extracted by git describe --always.
