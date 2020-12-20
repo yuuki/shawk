@@ -1,3 +1,54 @@
+# 1.6.2 (December 3, 2020)
+
+* Fix panic on assigning empty array to non-slice or array
+* Fix text array parsing disambiguates NULL and "NULL"
+* Fix Timestamptz.DecodeText with too short text
+
+# 1.6.1 (October 31, 2020)
+
+* Fix simple protocol empty array support
+
+# 1.6.0 (October 24, 2020)
+
+* Fix AssignTo pointer to pointer to slice and named types.
+* Fix zero length array assignment (Simo Haasanen)
+* Add float64, float32 convert to int2, int4, int8 (lqu3j)
+* Support setting infinite timestamps (Erik Agsjö)
+* Polygon improvements (duohedron)
+* Fix Inet.Set with nil (Tomas Volf)
+
+# 1.5.0 (September 26, 2020)
+
+* Add slice of slice mapping to multi-dimensional arrays (Simo Haasanen)
+* Fix JSONBArray
+* Fix selecting empty array
+* Text formatted values except bytea can be directly scanned to []byte
+* Add JSON marshalling for UUID (bakmataliev)
+* Improve point type conversions (bakmataliev)
+
+# 1.4.2 (July 22, 2020)
+
+* Fix encoding of a large composite data type (Yaz Saito)
+
+# 1.4.1 (July 14, 2020)
+
+* Fix ArrayType DecodeBinary empty array breaks future reads
+
+# 1.4.0 (June 27, 2020)
+
+* Add JSON support to ext/gofrs-uuid
+* Performance improvements in Scan path
+* Improved ext/shopspring-numeric binary decoding performance
+* Add composite type support (Maxim Ivanov and Jack Christensen)
+* Add better generic enum type support
+* Add generic array type support
+* Clarify and normalize Value semantics
+* Fix hstore with empty string values
+* Numeric supports NaN values (leighhopcroft)
+* Add slice of pointer support to array types (megaturbo)
+* Add jsonb array type (tserakhau)
+* Allow converting intervals with months and days to duration
+
 # 1.3.0 (March 30, 2020)
 
 * Get implemented on T instead of *T

@@ -68,6 +68,94 @@ func (dst *Int8) Set(src interface{}) error {
 			return err
 		}
 		*dst = Int8{Int: num, Status: Present}
+	case float32:
+		if value > math.MaxInt64 {
+			return errors.Errorf("%d is greater than maximum value for Int8", value)
+		}
+		*dst = Int8{Int: int64(value), Status: Present}
+	case float64:
+		if value > math.MaxInt64 {
+			return errors.Errorf("%d is greater than maximum value for Int8", value)
+		}
+		*dst = Int8{Int: int64(value), Status: Present}
+	case *int8:
+		if value == nil {
+			*dst = Int8{Status: Null}
+		} else {
+			return dst.Set(*value)
+		}
+	case *uint8:
+		if value == nil {
+			*dst = Int8{Status: Null}
+		} else {
+			return dst.Set(*value)
+		}
+	case *int16:
+		if value == nil {
+			*dst = Int8{Status: Null}
+		} else {
+			return dst.Set(*value)
+		}
+	case *uint16:
+		if value == nil {
+			*dst = Int8{Status: Null}
+		} else {
+			return dst.Set(*value)
+		}
+	case *int32:
+		if value == nil {
+			*dst = Int8{Status: Null}
+		} else {
+			return dst.Set(*value)
+		}
+	case *uint32:
+		if value == nil {
+			*dst = Int8{Status: Null}
+		} else {
+			return dst.Set(*value)
+		}
+	case *int64:
+		if value == nil {
+			*dst = Int8{Status: Null}
+		} else {
+			return dst.Set(*value)
+		}
+	case *uint64:
+		if value == nil {
+			*dst = Int8{Status: Null}
+		} else {
+			return dst.Set(*value)
+		}
+	case *int:
+		if value == nil {
+			*dst = Int8{Status: Null}
+		} else {
+			return dst.Set(*value)
+		}
+	case *uint:
+		if value == nil {
+			*dst = Int8{Status: Null}
+		} else {
+			return dst.Set(*value)
+		}
+	case *string:
+		if value == nil {
+			*dst = Int8{Status: Null}
+		} else {
+			return dst.Set(*value)
+		}
+	case *float32:
+		if value == nil {
+			*dst = Int8{Status: Null}
+		} else {
+			return dst.Set(*value)
+		}
+	case *float64:
+		if value == nil {
+			*dst = Int8{Status: Null}
+		} else {
+			return dst.Set(*value)
+		}
 	default:
 		if originalSrc, ok := underlyingNumberType(src); ok {
 			return dst.Set(originalSrc)

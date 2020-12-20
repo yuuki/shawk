@@ -37,18 +37,38 @@ func (dst *Inet) Set(src interface{}) error {
 	switch value := src.(type) {
 	case net.IPNet:
 		*dst = Inet{IPNet: &value, Status: Present}
-	case *net.IPNet:
-		*dst = Inet{IPNet: value, Status: Present}
 	case net.IP:
-		bitCount := len(value) * 8
-		mask := net.CIDRMask(bitCount, bitCount)
-		*dst = Inet{IPNet: &net.IPNet{Mask: mask, IP: value}, Status: Present}
+		if len(value) == 0 {
+			*dst = Inet{Status: Null}
+		} else {
+			bitCount := len(value) * 8
+			mask := net.CIDRMask(bitCount, bitCount)
+			*dst = Inet{IPNet: &net.IPNet{Mask: mask, IP: value}, Status: Present}
+		}
 	case string:
 		_, ipnet, err := net.ParseCIDR(value)
 		if err != nil {
 			return err
 		}
 		*dst = Inet{IPNet: ipnet, Status: Present}
+	case *net.IPNet:
+		if value == nil {
+			*dst = Inet{Status: Null}
+		} else {
+			return dst.Set(*value)
+		}
+	case *net.IP:
+		if value == nil {
+			*dst = Inet{Status: Null}
+		} else {
+			return dst.Set(*value)
+		}
+	case *string:
+		if value == nil {
+			*dst = Inet{Status: Null}
+		} else {
+			return dst.Set(*value)
+		}
 	default:
 		if originalSrc, ok := underlyingPtrType(src); ok {
 			return dst.Set(originalSrc)

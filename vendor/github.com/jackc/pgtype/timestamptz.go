@@ -42,6 +42,14 @@ func (dst *Timestamptz) Set(src interface{}) error {
 	switch value := src.(type) {
 	case time.Time:
 		*dst = Timestamptz{Time: value, Status: Present}
+	case *time.Time:
+		if value == nil {
+			*dst = Timestamptz{Status: Null}
+		} else {
+			return dst.Set(*value)
+		}
+	case InfinityModifier:
+		*dst = Timestamptz{InfinityModifier: value, Status: Present}
 	default:
 		if originalSrc, ok := underlyingTimeType(src); ok {
 			return dst.Set(originalSrc)
@@ -103,9 +111,9 @@ func (dst *Timestamptz) DecodeText(ci *ConnInfo, src []byte) error {
 		*dst = Timestamptz{Status: Present, InfinityModifier: -Infinity}
 	default:
 		var format string
-		if sbuf[len(sbuf)-9] == '-' || sbuf[len(sbuf)-9] == '+' {
+		if len(sbuf) >= 9 && (sbuf[len(sbuf)-9] == '-' || sbuf[len(sbuf)-9] == '+') {
 			format = pgTimestamptzSecondFormat
-		} else if sbuf[len(sbuf)-6] == '-' || sbuf[len(sbuf)-6] == '+' {
+		} else if len(sbuf) >= 6 && (sbuf[len(sbuf)-6] == '-' || sbuf[len(sbuf)-6] == '+') {
 			format = pgTimestamptzMinuteFormat
 		} else {
 			format = pgTimestamptzHourFormat
