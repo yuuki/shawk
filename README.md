@@ -62,10 +62,16 @@ Run a daemon process of scanning connections in polling mode (default).
 # SHAWK_PROBE_MODE=polling SHAWK_PROBE_INTERVAL=1s SHAWK_FLUSH_INTERVAL=10s SHAWK_CMDB_URL=postgres://shawk:password@127.0.0.1:5432/shawk?sslmode=disable&connect_timeout=1 shawk probe
 ```
 
-Run a daemon process in streaming mode, which internaly uses eBPF.
+Run a daemon process in streaming mode, which internaly uses eBPF/kprobe.
 
 ```shell-session
 # SHAWK_PROBE_MODE=streaming SHAWK_PROBE_INTERVAL=1s SHAWK_CMDB_URL=postgres://shawk:password@127.0.0.1:5432/shawk?sslmode=disable&connect_timeout=1 shawk probe
+```
+
+Run a daemon process in streaming2 mode, which internaly uses [go-conntracer-bpf](https://github.com/yuuki/go-conntracer-bpf).
+
+```shell-session
+# SHAWK_PROBE_MODE=streaming2 SHAWK_PROBE_INTERVAL=1s SHAWK_CMDB_URL=postgres://shawk:password@127.0.0.1:5432/shawk?sslmode=disable&connect_timeout=1 shawk probe
 ```
 
 Run scanning connections only once.
