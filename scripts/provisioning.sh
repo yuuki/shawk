@@ -2,11 +2,16 @@
 
 set -eux
 
-sudo apt-get update
-sudo apt-get install -y --no-install-recommends  build-essential gcc make git
+sudo apt-get -y update
+sudo apt-get -y install --no-install-recommends --fix-missing \
+    gpg gpg-agent libz-dev libelf-dev ca-certificates \
+    git make curl vim clang llvm build-essential gcc \
+    pkg-config linux-headers-$(uname -r) \
+    sysstat
+sudo apt-get purge --auto-remove && sudo apt-get clean
 
 # Install Go
-GOVER='1.14.2'
+GOVER='1.15.5'
 GOTAR="go${GOVER}.linux-amd64.tar.gz"
 
 wget https://dl.google.com/go/${GOTAR}
@@ -20,7 +25,7 @@ mkdir -p /home/vagrant/go/src/github.com/yuuki/shawk/
 PG_VERSION=11
 
 wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
-sudo bash -c "echo 'deb http://apt.postgresql.org/pub/repos/apt/ bionic-pgdg main' > /etc/apt/sources.list.d/pgdg.list"
+sudo bash -c "echo 'deb http://apt.postgresql.org/pub/repos/apt/ groovy-pgdg main' > /etc/apt/sources.list.d/pgdg.list"
 sudo apt-get update
 sudo apt-get install -y --no-install-recommends postgresql-${PG_VERSION} postgresql-client-${PG_VERSION} postgresql-contrib-${PG_VERSION}
 

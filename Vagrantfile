@@ -6,10 +6,11 @@
 end
 
 Vagrant.configure("2") do |config|
-  config.vm.box = "generic/ubuntu1804"
-  config.vm.provision :shell, :privileged => false, :path => "scripts/provisioning/setup_dev.sh"
-  config.vm.synced_folder "./", "/home/vagrant/go/src/github.com/yuuki/shawk", mount_options: ['dmode=777','fmode=777']
+  config.vm.box = "generic/ubuntu2010"
+  config.vm.provision :shell, :privileged => false, :path => "scripts/provisioning.sh"
+  config.vm.synced_folder "./", "/home/vagrant/shawk", mount_options: ['dmode=777','fmode=777']
   config.vm.provider "virtualbox" do |vb|
-     vb.memory = "1280"
-  end          
+    vb.memory = "2000"
+  end
+
 end
