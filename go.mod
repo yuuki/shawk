@@ -16,7 +16,7 @@ require (
 	github.com/go-ole/go-ole v1.2.4 // indirect
 	github.com/google/go-cmp v0.5.1
 	github.com/gotestyourself/gotestyourself v2.2.0+incompatible // indirect
-	github.com/iovisor/gobpf v0.0.0-20200504095308-90dbbdfb1358
+	github.com/iovisor/gobpf v0.0.0-20210109143822-fb892541d416
 	github.com/jackc/pgx/v4 v4.6.0
 	github.com/joho/godotenv v1.3.0
 	github.com/kelseyhightower/envconfig v1.4.0

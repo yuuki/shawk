@@ -7,7 +7,8 @@
  */
 
 #include <errno.h>
-#include "include/nlattr.h"
+#include "libbpf.h"
+#include "nlattr.h"
 #include <linux/rtnetlink.h>
 #include <string.h>
 #include <stdio.h>
