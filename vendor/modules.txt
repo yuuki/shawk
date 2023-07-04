@@ -146,7 +146,7 @@ golang.org/x/crypto/pbkdf2
 # golang.org/x/net v0.0.0-20201216054612-986b41b23924
 ## explicit
 golang.org/x/net/context
-# golang.org/x/sys v0.0.0-20201214210602-f9fddec55a1e
+# golang.org/x/sys v0.9.1-0.20230627171937-a1a9c4b846b3
 ## explicit
 golang.org/x/sys/internal/unsafeheader
 golang.org/x/sys/unix
