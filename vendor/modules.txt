@@ -47,11 +47,14 @@ github.com/google/go-cmp/cmp/internal/function
 github.com/google/go-cmp/cmp/internal/value
 # github.com/gotestyourself/gotestyourself v2.2.0+incompatible
 ## explicit
-# github.com/iovisor/gobpf v0.0.0-20200504095308-90dbbdfb1358
+# github.com/iovisor/gobpf v0.2.0
 ## explicit
 github.com/iovisor/gobpf/elf
+github.com/iovisor/gobpf/elf/include
+github.com/iovisor/gobpf/elf/include/uapi/linux
 github.com/iovisor/gobpf/pkg/bpffs
 github.com/iovisor/gobpf/pkg/cpuonline
+github.com/iovisor/gobpf/pkg/cpurange
 # github.com/jackc/chunkreader/v2 v2.0.1
 github.com/jackc/chunkreader/v2
 # github.com/jackc/pgconn v1.5.0
