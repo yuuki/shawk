@@ -13,7 +13,6 @@ require (
 	github.com/docker/go-connections v0.4.0 // indirect
 	github.com/docker/go-units v0.4.0 // indirect
 	github.com/elastic/gosigar v0.10.5
-	github.com/go-ole/go-ole v1.2.4 // indirect
 	github.com/google/go-cmp v0.5.1
 	github.com/gotestyourself/gotestyourself v2.2.0+incompatible // indirect
 	github.com/iovisor/gobpf v0.0.0-20200504095308-90dbbdfb1358
@@ -27,9 +26,10 @@ require (
 	github.com/ory/dockertest v3.3.5+incompatible
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/rakyll/statik v0.1.7
-	github.com/shirou/gopsutil v2.20.4+incompatible
+	github.com/shirou/gopsutil v2.21.11+incompatible
 	github.com/sirupsen/logrus v1.6.0 // indirect
 	github.com/weaveworks/tcptracer-bpf v0.0.0-20190731111909-cd53e7c84bac
+	github.com/yusufpapurcu/wmi v1.2.4 // indirect
 	golang.org/x/crypto v0.0.0-20200622213623-75b288015ac9 // indirect
 	golang.org/x/net v0.0.0-20201216054612-986b41b23924 // indirect
 	golang.org/x/sys v0.0.0-20201214210602-f9fddec55a1e
