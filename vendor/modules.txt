@@ -15,7 +15,6 @@ github.com/Microsoft/go-winio/pkg/guid
 github.com/Nvveen/Gotty
 # github.com/StackExchange/wmi v0.0.0-20190523213315-cbe66965904d
 ## explicit
-github.com/StackExchange/wmi
 # github.com/cenkalti/backoff v2.2.1+incompatible
 ## explicit
 github.com/cenkalti/backoff
@@ -32,8 +31,7 @@ github.com/docker/go-units
 ## explicit
 github.com/elastic/gosigar/sys
 github.com/elastic/gosigar/sys/linux
-# github.com/go-ole/go-ole v1.2.4
-## explicit
+# github.com/go-ole/go-ole v1.2.6
 github.com/go-ole/go-ole
 github.com/go-ole/go-ole/oleutil
 # github.com/go-stack/stack v1.8.0
@@ -130,7 +128,7 @@ github.com/pkg/errors
 # github.com/rakyll/statik v0.1.7
 ## explicit
 github.com/rakyll/statik/fs
-# github.com/shirou/gopsutil v2.20.4+incompatible
+# github.com/shirou/gopsutil v2.21.11+incompatible
 ## explicit
 github.com/shirou/gopsutil/internal/common
 github.com/shirou/gopsutil/net
@@ -140,6 +138,9 @@ github.com/sirupsen/logrus
 # github.com/weaveworks/tcptracer-bpf v0.0.0-20190731111909-cd53e7c84bac
 ## explicit
 github.com/weaveworks/tcptracer-bpf/pkg/tracer
+# github.com/yusufpapurcu/wmi v1.2.4
+## explicit
+github.com/yusufpapurcu/wmi
 # golang.org/x/crypto v0.0.0-20200622213623-75b288015ac9
 ## explicit
 golang.org/x/crypto/pbkdf2
