@@ -1,6 +1,11 @@
 [![](https://godoc.org/github.com/jackc/pgx?status.svg)](https://pkg.go.dev/github.com/jackc/pgx/v4)
 [![Build Status](https://travis-ci.org/jackc/pgx.svg)](https://travis-ci.org/jackc/pgx)
 
+---
+
+This is the previous stable `v4` release. `v5` been released.
+
+---
 # pgx - PostgreSQL Driver and Toolkit
 
 pgx is a pure Go driver and toolkit for PostgreSQL.
@@ -29,6 +34,7 @@ import (
 )
 
 func main() {
+	// urlExample := "postgres://username:password@localhost:5432/database_name"
 	conn, err := pgx.Connect(context.Background(), os.Getenv("DATABASE_URL"))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Unable to connect to database: %v\n", err)
@@ -48,6 +54,8 @@ func main() {
 }
 ```
 
+See the [getting started guide](https://github.com/jackc/pgx/wiki/Getting-started-with-pgx) for more information.
+
 ## Choosing Between the pgx and database/sql Interfaces
 
 It is recommended to use the pgx interface if:
@@ -58,7 +66,7 @@ The pgx interface is faster and exposes more features.
 
 The `database/sql` interface only allows the underlying driver to return or receive the following types: `int64`,
 `float64`, `bool`, `[]byte`, `string`, `time.Time`, or `nil`. Handling other types requires implementing the
-`database/sql.Scanner` and the `database/sq/driver.Valuer` interfaces which require transmission of values in text format. The binary format can be substantially faster, which is what the pgx interface uses.
+`database/sql.Scanner` and the `database/sql/driver/driver.Valuer` interfaces which require transmission of values in text format. The binary format can be substantially faster, which is what the pgx interface uses.
 
 ## Features
 
@@ -70,7 +78,7 @@ pgx supports many features beyond what is available through `database/sql`:
 * Single-round trip query mode
 * Full TLS connection control
 * Binary format support for custom types (allows for much quicker encoding/decoding)
-* Copy protocol support for faster bulk data loads
+* COPY protocol support for faster bulk data loads
 * Extendable logging support including built-in support for `log15adapter`, [`logrus`](https://github.com/sirupsen/logrus), [`zap`](https://github.com/uber-go/zap), and [`zerolog`](https://github.com/rs/zerolog)
 * Connection pool with after-connect hook for arbitrary connection setup
 * Listen / notify
@@ -94,26 +102,6 @@ There are three areas in particular where pgx can provide a significant performa
    significant free improvement to code that does not explicitly use prepared statements. Under certain workloads, it can
    perform nearly 3x the number of queries per second.
 3. Batched queries - Multiple queries can be batched together to minimize network round trips.
-
-## Comparison with Alternatives
-
-* [pq](http://godoc.org/github.com/lib/pq)
-* [go-pg](https://github.com/go-pg/pg)
-
-For prepared queries with small sets of simple data types, all drivers will have have similar performance. However, if prepared statements aren't being explicitly used, pgx can have a significant performance advantage due to automatic statement preparation.
-pgx also can perform better when using PostgreSQL-specific data types or query batching. See
-[go_db_bench](https://github.com/jackc/go_db_bench) for some database driver benchmarks.
-
-### Compatibility with `database/sql`
-
-pq is exclusively used with `database/sql`. go-pg does not use `database/sql` at all. pgx supports `database/sql` as well as
-its own interface.
-
-### Level of access, ORM
-
-go-pg is a PostgreSQL client and ORM. It includes many features that traditionally sit above the database driver, such as ORM, struct mapping, soft deletes, schema migrations, and sharding support.
-
-pgx is "closer to the metal" and such abstractions are beyond the scope of the pgx project, which first and foremost, aims to be a performant driver and toolkit.
 
 ## Testing
 
@@ -144,43 +132,65 @@ PGX_TEST_DATABASE="host=/var/run/postgresql database=pgx_test" go test ./...
 
 In addition, there are tests specific for PgBouncer that will be executed if `PGX_TEST_PGBOUNCER_CONN_STRING` is set.
 
+## Supported Go and PostgreSQL Versions
+
+pgx supports the same versions of Go and PostgreSQL that are supported by their respective teams. For [Go](https://golang.org/doc/devel/release.html#policy) that is the two most recent major releases and for [PostgreSQL](https://www.postgresql.org/support/versioning/) the major releases in the last 5 years. This means pgx supports Go 1.17 and higher and PostgreSQL 10 and higher. pgx also is tested against the latest version of [CockroachDB](https://www.cockroachlabs.com/product/).
+
 ## Version Policy
 
 pgx follows semantic versioning for the documented public API on stable releases. `v4` is the latest stable major version.
 
-## Related Libraries
+## PGX Family Libraries
 
 pgx is the head of a family of PostgreSQL libraries. Many of these can be used independently. Many can also be accessed
 from pgx for lower-level control.
 
-### github.com/jackc/pgconn
+### [github.com/jackc/pgconn](https://github.com/jackc/pgconn)
 
 `pgconn` is a lower-level PostgreSQL database driver that operates at nearly the same level as the C library `libpq`.
 
-### github.com/jackc/pgx/v4/pgxpool
+### [github.com/jackc/pgx/v4/pgxpool](https://github.com/jackc/pgx/tree/master/pgxpool)
 
-`pgxpool` is a connection pool for pgx. pgx is entirely decoupled from its default pool implementation. This means that pgx can be used with a different pool. or without any pool at all.
+`pgxpool` is a connection pool for pgx. pgx is entirely decoupled from its default pool implementation. This means that pgx can be used with a different pool or without any pool at all.
 
-### github.com/jackc/pgx/v4/stdlib
+### [github.com/jackc/pgx/v4/stdlib](https://github.com/jackc/pgx/tree/master/stdlib)
 
 This is a `database/sql` compatibility layer for pgx. pgx can be used as a normal `database/sql` driver, but at any time, the native interface can be acquired for more performance or PostgreSQL specific functionality.
 
-### github.com/jackc/pgtype
+### [github.com/jackc/pgtype](https://github.com/jackc/pgtype)
 
 Over 70 PostgreSQL types are supported including `uuid`, `hstore`, `json`, `bytea`, `numeric`, `interval`, `inet`, and arrays. These types support `database/sql` interfaces and are usable outside of pgx. They are fully tested in pgx and pq. They also support a higher performance interface when used with the pgx driver.
 
-### github.com/jackc/pgproto3
+### [github.com/jackc/pgproto3](https://github.com/jackc/pgproto3)
 
 pgproto3 provides standalone encoding and decoding of the PostgreSQL v3 wire protocol. This is useful for implementing very low level PostgreSQL tooling.
 
-### github.com/jackc/pglogrepl
+### [github.com/jackc/pglogrepl](https://github.com/jackc/pglogrepl)
 
 pglogrepl provides functionality to act as a client for PostgreSQL logical replication.
 
-### github.com/jackc/pgmock
+### [github.com/jackc/pgmock](https://github.com/jackc/pgmock)
 
 pgmock offers the ability to create a server that mocks the PostgreSQL wire protocol. This is used internally to test pgx by purposely inducing unusual errors. pgproto3 and pgmock together provide most of the foundational tooling required to implement a PostgreSQL proxy or MitM (such as for a custom connection pooler).
 
-### github.com/jackc/tern
+### [github.com/jackc/tern](https://github.com/jackc/tern)
 
 tern is a stand-alone SQL migration system.
+
+### [github.com/jackc/pgerrcode](https://github.com/jackc/pgerrcode)
+
+pgerrcode contains constants for the PostgreSQL error codes.
+
+## 3rd Party Libraries with PGX Support
+
+### [github.com/georgysavva/scany](https://github.com/georgysavva/scany)
+
+Library for scanning data from a database into Go structs and more.
+
+### [https://github.com/otan/gopgkrb5](https://github.com/otan/gopgkrb5)
+
+Adds GSSAPI / Kerberos authentication support.
+
+### [https://github.com/vgarvardt/pgx-google-uuid](https://github.com/vgarvardt/pgx-google-uuid)
+
+Adds support for [`github.com/google/uuid`](https://github.com/google/uuid).

@@ -1,3 +1,205 @@
+# 4.18.2 (March 4, 2024)
+
+Fix CVE-2024-27289
+
+SQL injection can occur when all of the following conditions are met:
+
+1. The non-default simple protocol is used.
+2. A placeholder for a numeric value must be immediately preceded by a minus.
+3. There must be a second placeholder for a string value after the first placeholder; both must be on the same line.
+4. Both parameter values must be user-controlled.
+
+Thanks to Paul Gerste for reporting this issue.
+
+Fix CVE-2024-27304
+
+SQL injection can occur if an attacker can cause a single query or bind message to exceed 4 GB in size. An integer
+overflow in the calculated message size can cause the one large message to be sent as multiple messages under the
+attacker's control.
+
+Thanks to Paul Gerste for reporting this issue.
+
+* Fix *dbTx.Exec not checking if it is already closed
+
+# 4.18.1 (February 27, 2023)
+
+* Fix: Support pgx v4 and v5 stdlib in same program (Tomáš Procházka)
+
+# 4.18.0 (February 11, 2023)
+
+* Upgrade pgconn to v1.14.0
+* Upgrade pgproto3 to v2.3.2
+* Upgrade pgtype to v1.14.0
+* Fix query sanitizer when query text contains Unicode replacement character
+* Fix context with value in BeforeConnect (David Harju)
+* Support pgx v4 and v5 stdlib in same program (Vitalii Solodilov)
+
+# 4.17.2 (September 3, 2022)
+
+* Fix panic when logging batch error (Tom Möller)
+
+# 4.17.1 (August 27, 2022)
+
+* Upgrade puddle to v1.3.0 - fixes context failing to cancel Acquire when acquire is creating resource which was introduced in v4.17.0 (James Hartig)
+* Fix atomic alignment on 32-bit platforms
+
+# 4.17.0 (August 6, 2022)
+
+* Upgrade pgconn to v1.13.0
+* Upgrade pgproto3 to v2.3.1
+* Upgrade pgtype to v1.12.0
+* Allow background pool connections to continue even if cause is canceled (James Hartig)
+* Add LoggerFunc (Gabor Szabad)
+* pgxpool: health check should avoid going below minConns (James Hartig)
+* Add pgxpool.Conn.Hijack()
+* Logging improvements (Stepan Rabotkin)
+
+# 4.16.1 (May 7, 2022)
+
+* Upgrade pgconn to v1.12.1
+* Fix explicitly prepared statements with describe statement cache mode
+
+# 4.16.0 (April 21, 2022)
+
+* Upgrade pgconn to v1.12.0
+* Upgrade pgproto3 to v2.3.0
+* Upgrade pgtype to v1.11.0
+* Fix: Do not panic when context cancelled while getting statement from cache.
+* Fix: Less memory pinning from old Rows.
+* Fix: Support '\r' line ending when sanitizing SQL comment.
+* Add pluggable GSSAPI support (Oliver Tan)
+
+# 4.15.0 (February 7, 2022)
+
+* Upgrade to pgconn v1.11.0
+* Upgrade to pgtype v1.10.0
+* Upgrade puddle to v1.2.1
+* Make BatchResults.Close safe to be called multiple times
+
+# 4.14.1 (November 28, 2021)
+
+* Upgrade pgtype to v1.9.1 (fixes unintentional change to timestamp binary decoding)
+* Start pgxpool background health check after initial connections
+
+# 4.14.0 (November 20, 2021)
+
+* Upgrade pgconn to v1.10.1
+* Upgrade pgproto3 to v2.2.0
+* Upgrade pgtype to v1.9.0
+* Upgrade puddle to v1.2.0
+* Add QueryFunc to BatchResults
+* Add context options to zerologadapter (Thomas Frössman)
+* Add zerologadapter.NewContextLogger (urso)
+* Eager initialize minpoolsize on connect (Daniel)
+* Unpin memory used by large queries immediately after use
+
+# 4.13.0 (July 24, 2021)
+
+* Trimmed pseudo-dependencies in Go modules from other packages tests
+* Upgrade pgconn -- context cancellation no longer will return a net.Error
+* Support time durations for simple protocol (Michael Darr)
+
+# 4.12.0 (July 10, 2021)
+
+* ResetSession hook is called before a connection is reused from pool for another query (Dmytro Haranzha)
+* stdlib: Add RandomizeHostOrderFunc (dkinder)
+* stdlib: add OptionBeforeConnect (dkinder)
+* stdlib: Do not reuse ConnConfig strings (Andrew Kimball)
+* stdlib: implement Conn.ResetSession (Jonathan Amsterdam)
+* Upgrade pgconn to v1.9.0
+* Upgrade pgtype to v1.8.0
+
+# 4.11.0 (March 25, 2021)
+
+* Add BeforeConnect callback to pgxpool.Config (Robert Froehlich)
+* Add Ping method to pgxpool.Conn (davidsbond)
+* Added a kitlog level log adapter (Fabrice Aneche)
+* Make ScanArgError public to allow identification of offending column (Pau Sanchez)
+* Add *pgxpool.AcquireFunc
+* Add BeginFunc and BeginTxFunc
+* Add prefer_simple_protocol to connection string
+* Add logging on CopyFrom (Patrick Hemmer)
+* Add comment support when sanitizing SQL queries (Rusakow Andrew)
+* Do not panic on double close of pgxpool.Pool (Matt Schultz)
+* Avoid panic on SendBatch on closed Tx (Matt Schultz)
+* Update pgconn to v1.8.1
+* Update pgtype to v1.7.0
+
+# 4.10.1 (December 19, 2020)
+
+* Fix panic on Query error with nil stmtcache.
+
+# 4.10.0 (December 3, 2020)
+
+* Add CopyFromSlice to simplify CopyFrom usage (Egon Elbre)
+* Remove broken prepared statements from stmtcache (Ethan Pailes)
+* stdlib: consider any Ping error as fatal
+* Update puddle to v1.1.3 - this fixes an issue where concurrent Acquires can hang when a connection cannot be established
+* Update pgtype to v1.6.2
+
+# 4.9.2 (November 3, 2020)
+
+The underlying library updates fix an issue where appending to a scanned slice could corrupt other data.
+
+* Update pgconn to v1.7.2
+* Update pgproto3 to v2.0.6
+
+# 4.9.1 (October 31, 2020)
+
+* Update pgconn to v1.7.1
+* Update pgtype to v1.6.1
+* Fix SendBatch of all prepared statements with statement cache disabled
+
+# 4.9.0 (September 26, 2020)
+
+* pgxpool now waits for connection cleanup to finish before making room in pool for another connection. This prevents temporarily exceeding max pool size.
+* Fix when scanning a column to nil to skip it on the first row but scanning it to a real value on a subsequent row.
+* Fix prefer simple protocol with prepared statements. (Jinzhu)
+* Fix FieldDescriptions not being available on Rows before calling Next the first time.
+* Various minor fixes in updated versions of pgconn, pgtype, and puddle.
+
+# 4.8.1 (July 29, 2020)
+
+* Update pgconn to v1.6.4
+    * Fix deadlock on error after CommandComplete but before ReadyForQuery
+    * Fix panic on parsing DSN with trailing '='
+
+# 4.8.0 (July 22, 2020)
+
+* All argument types supported by native pgx should now also work through database/sql
+* Update pgconn to v1.6.3
+* Update pgtype to v1.4.2
+
+# 4.7.2 (July 14, 2020)
+
+* Improve performance of Columns() (zikaeroh)
+* Fix fatal Commit() failure not being considered fatal
+* Update pgconn to v1.6.2
+* Update pgtype to v1.4.1
+
+# 4.7.1 (June 29, 2020)
+
+* Fix stdlib decoding error with certain order and combination of fields
+
+# 4.7.0 (June 27, 2020)
+
+* Update pgtype to v1.4.0
+* Update pgconn to v1.6.1
+* Update puddle to v1.1.1
+* Fix context propagation with Tx commit and Rollback (georgysavva)
+* Add lazy connect option to pgxpool (georgysavva)
+* Fix connection leak if pgxpool.BeginTx() fail (Jean-Baptiste Bronisz)
+* Add native Go slice support for strings and numbers to simple protocol
+* stdlib add default timeouts for Conn.Close() and Stmt.Close() (georgysavva)
+* Assorted performance improvements especially with large result sets
+* Fix close pool on not lazy connect failure (Yegor Myskin)
+* Add Config copy (georgysavva)
+* Support SendBatch with Simple Protocol (Jordan Lewis)
+* Better error logging on rows close (Igor V. Kozinov)
+* Expose stdlib.Conn.Conn() to enable database/sql.Conn.Raw()
+* Improve unknown type support for database/sql
+* Fix transaction commit failure closing connection
+
 # 4.6.0 (March 30, 2020)
 
 * stdlib: Bail early if preloading rows.Next() results in rows.Err() (Bas van Beek)
