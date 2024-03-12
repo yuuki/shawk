@@ -3,12 +3,11 @@ package sanitize
 import (
 	"bytes"
 	"encoding/hex"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
-
-	errors "golang.org/x/xerrors"
 )
 
 // Part is either a string or an int. A string is raw SQL. An int is a
@@ -18,6 +17,12 @@ type Part interface{}
 type Query struct {
 	Parts []Part
 }
+
+// utf.DecodeRune returns the utf8.RuneError for errors. But that is actually rune U+FFFD -- the unicode replacement
+// character. utf8.RuneError is not an error if it is also width 3.
+//
+// https://github.com/jackc/pgx/issues/1380
+const replacementcharacterwidth = 3
 
 func (q *Query) Sanitize(args ...interface{}) (string, error) {
 	argUse := make([]bool, len(args))
@@ -31,7 +36,7 @@ func (q *Query) Sanitize(args ...interface{}) (string, error) {
 		case int:
 			argIdx := part - 1
 			if argIdx >= len(args) {
-				return "", errors.Errorf("insufficient arguments")
+				return "", fmt.Errorf("insufficient arguments")
 			}
 			arg := args[argIdx]
 			switch arg := arg.(type) {
@@ -50,18 +55,22 @@ func (q *Query) Sanitize(args ...interface{}) (string, error) {
 			case time.Time:
 				str = arg.Truncate(time.Microsecond).Format("'2006-01-02 15:04:05.999999999Z07:00:00'")
 			default:
-				return "", errors.Errorf("invalid arg type: %T", arg)
+				return "", fmt.Errorf("invalid arg type: %T", arg)
 			}
 			argUse[argIdx] = true
+
+			// Prevent SQL injection via Line Comment Creation
+			// https://github.com/jackc/pgx/security/advisories/GHSA-m7wr-2xf7-cm9p
+			str = "(" + str + ")"
 		default:
-			return "", errors.Errorf("invalid Part type: %T", part)
+			return "", fmt.Errorf("invalid Part type: %T", part)
 		}
 		buf.WriteString(str)
 	}
 
 	for i, used := range argUse {
 		if !used {
-			return "", errors.Errorf("unused argument: %d", i)
+			return "", fmt.Errorf("unused argument: %d", i)
 		}
 	}
 	return buf.String(), nil
@@ -83,7 +92,7 @@ func NewQuery(sql string) (*Query, error) {
 }
 
 func QuoteString(str string) string {
-	return "'" + strings.Replace(str, "'", "''", -1) + "'"
+	return "'" + strings.ReplaceAll(str, "'", "''") + "'"
 }
 
 func QuoteBytes(buf []byte) string {
@@ -94,6 +103,7 @@ type sqlLexer struct {
 	src     string
 	start   int
 	pos     int
+	nested  int // multiline comment nesting level.
 	stateFn stateFn
 	parts   []Part
 }
@@ -125,12 +135,26 @@ func rawState(l *sqlLexer) stateFn {
 				l.start = l.pos
 				return placeholderState
 			}
-		case utf8.RuneError:
-			if l.pos-l.start > 0 {
-				l.parts = append(l.parts, l.src[l.start:l.pos])
-				l.start = l.pos
+		case '-':
+			nextRune, width := utf8.DecodeRuneInString(l.src[l.pos:])
+			if nextRune == '-' {
+				l.pos += width
+				return oneLineCommentState
 			}
-			return nil
+		case '/':
+			nextRune, width := utf8.DecodeRuneInString(l.src[l.pos:])
+			if nextRune == '*' {
+				l.pos += width
+				return multilineCommentState
+			}
+		case utf8.RuneError:
+			if width != replacementcharacterwidth {
+				if l.pos-l.start > 0 {
+					l.parts = append(l.parts, l.src[l.start:l.pos])
+					l.start = l.pos
+				}
+				return nil
+			}
 		}
 	}
 }
@@ -148,11 +172,13 @@ func singleQuoteState(l *sqlLexer) stateFn {
 			}
 			l.pos += width
 		case utf8.RuneError:
-			if l.pos-l.start > 0 {
-				l.parts = append(l.parts, l.src[l.start:l.pos])
-				l.start = l.pos
+			if width != replacementcharacterwidth {
+				if l.pos-l.start > 0 {
+					l.parts = append(l.parts, l.src[l.start:l.pos])
+					l.start = l.pos
+				}
+				return nil
 			}
-			return nil
 		}
 	}
 }
@@ -170,11 +196,13 @@ func doubleQuoteState(l *sqlLexer) stateFn {
 			}
 			l.pos += width
 		case utf8.RuneError:
-			if l.pos-l.start > 0 {
-				l.parts = append(l.parts, l.src[l.start:l.pos])
-				l.start = l.pos
+			if width != replacementcharacterwidth {
+				if l.pos-l.start > 0 {
+					l.parts = append(l.parts, l.src[l.start:l.pos])
+					l.start = l.pos
+				}
+				return nil
 			}
-			return nil
 		}
 	}
 }
@@ -216,11 +244,72 @@ func escapeStringState(l *sqlLexer) stateFn {
 			}
 			l.pos += width
 		case utf8.RuneError:
-			if l.pos-l.start > 0 {
-				l.parts = append(l.parts, l.src[l.start:l.pos])
-				l.start = l.pos
+			if width != replacementcharacterwidth {
+				if l.pos-l.start > 0 {
+					l.parts = append(l.parts, l.src[l.start:l.pos])
+					l.start = l.pos
+				}
+				return nil
 			}
-			return nil
+		}
+	}
+}
+
+func oneLineCommentState(l *sqlLexer) stateFn {
+	for {
+		r, width := utf8.DecodeRuneInString(l.src[l.pos:])
+		l.pos += width
+
+		switch r {
+		case '\\':
+			_, width = utf8.DecodeRuneInString(l.src[l.pos:])
+			l.pos += width
+		case '\n', '\r':
+			return rawState
+		case utf8.RuneError:
+			if width != replacementcharacterwidth {
+				if l.pos-l.start > 0 {
+					l.parts = append(l.parts, l.src[l.start:l.pos])
+					l.start = l.pos
+				}
+				return nil
+			}
+		}
+	}
+}
+
+func multilineCommentState(l *sqlLexer) stateFn {
+	for {
+		r, width := utf8.DecodeRuneInString(l.src[l.pos:])
+		l.pos += width
+
+		switch r {
+		case '/':
+			nextRune, width := utf8.DecodeRuneInString(l.src[l.pos:])
+			if nextRune == '*' {
+				l.pos += width
+				l.nested++
+			}
+		case '*':
+			nextRune, width := utf8.DecodeRuneInString(l.src[l.pos:])
+			if nextRune != '/' {
+				continue
+			}
+
+			l.pos += width
+			if l.nested == 0 {
+				return rawState
+			}
+			l.nested--
+
+		case utf8.RuneError:
+			if width != replacementcharacterwidth {
+				if l.pos-l.start > 0 {
+					l.parts = append(l.parts, l.src[l.start:l.pos])
+					l.start = l.pos
+				}
+				return nil
+			}
 		}
 	}
 }
