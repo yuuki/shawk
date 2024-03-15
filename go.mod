@@ -12,7 +12,7 @@ require (
 	github.com/containerd/continuity v0.0.0-20200413184840-d3ef23f19fbb // indirect
 	github.com/docker/go-connections v0.4.0 // indirect
 	github.com/docker/go-units v0.4.0 // indirect
-	github.com/elastic/gosigar v0.10.5
+	github.com/elastic/gosigar v0.14.3
 	github.com/go-ole/go-ole v1.2.4 // indirect
 	github.com/google/go-cmp v0.5.1
 	github.com/gotestyourself/gotestyourself v2.2.0+incompatible // indirect
