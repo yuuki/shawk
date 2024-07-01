@@ -29,7 +29,7 @@ require (
 	github.com/rakyll/statik v0.1.7
 	github.com/shirou/gopsutil v2.20.4+incompatible
 	github.com/sirupsen/logrus v1.6.0 // indirect
-	github.com/weaveworks/tcptracer-bpf v0.0.0-20190731111909-cd53e7c84bac
+	github.com/weaveworks/tcptracer-bpf v0.0.0-20231024151203-7376bfdc7f68
 	golang.org/x/crypto v0.0.0-20200622213623-75b288015ac9 // indirect
 	golang.org/x/net v0.0.0-20201216054612-986b41b23924 // indirect
 	golang.org/x/sys v0.0.0-20201214210602-f9fddec55a1e
