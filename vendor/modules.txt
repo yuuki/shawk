@@ -149,8 +149,11 @@ golang.org/x/net/context
 # golang.org/x/sys v0.0.0-20201214210602-f9fddec55a1e
 ## explicit
 golang.org/x/sys/internal/unsafeheader
+golang.org/x/sys/plan9
 golang.org/x/sys/unix
 golang.org/x/sys/windows
+# golang.org/x/term v0.0.0-20201126162022-7de9c90e9dd1
+golang.org/x/term
 # golang.org/x/text v0.3.3
 golang.org/x/text/cases
 golang.org/x/text/internal
@@ -169,7 +172,7 @@ golang.org/x/text/width
 ## explicit
 golang.org/x/xerrors
 golang.org/x/xerrors/internal
-# gopkg.in/inconshreveable/log15.v2 v2.0.0-20200109203555-b30bc20e4fd1
+# gopkg.in/inconshreveable/log15.v2 v2.16.0
 ## explicit
 gopkg.in/inconshreveable/log15.v2
 # gopkg.in/yaml.v2 v2.2.8
