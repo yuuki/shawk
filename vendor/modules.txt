@@ -73,7 +73,7 @@ github.com/jackc/pgtype
 github.com/jackc/pgx/v4
 github.com/jackc/pgx/v4/internal/sanitize
 github.com/jackc/pgx/v4/log/log15adapter
-# github.com/joho/godotenv v1.3.0
+# github.com/joho/godotenv v1.5.1
 ## explicit
 github.com/joho/godotenv
 # github.com/kelseyhightower/envconfig v1.4.0
