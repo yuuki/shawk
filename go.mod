@@ -26,7 +26,7 @@ require (
 	github.com/opencontainers/runc v0.1.1 // indirect
 	github.com/ory/dockertest v3.3.5+incompatible
 	github.com/pkg/errors v0.9.1 // indirect
-	github.com/rakyll/statik v0.1.7
+	github.com/rakyll/statik v0.1.8
 	github.com/shirou/gopsutil v2.20.4+incompatible
 	github.com/sirupsen/logrus v1.6.0 // indirect
 	github.com/weaveworks/tcptracer-bpf v0.0.0-20190731111909-cd53e7c84bac
