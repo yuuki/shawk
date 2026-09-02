@@ -1,4 +1,4 @@
-FROM golang:1.15.5
+FROM golang:1.27.1
 
 ENV PKG github.com/yuuki/shawk
 WORKDIR /go/src/$PKG
