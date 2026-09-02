@@ -1,16 +1,21 @@
 module github.com/jackc/pgconn
 
-go 1.12
+go 1.17
 
 require (
 	github.com/jackc/chunkreader/v2 v2.0.1
 	github.com/jackc/pgio v1.0.0
-	github.com/jackc/pgmock v0.0.0-20190831213851-13a1b77aafa2
+	github.com/jackc/pgmock v0.0.0-20210724152146-4ad1a8207f65
 	github.com/jackc/pgpassfile v1.0.0
-	github.com/jackc/pgproto3/v2 v2.0.1
-	github.com/jackc/pgservicefile v0.0.0-20200307190119-3430c5407db8
-	github.com/stretchr/testify v1.5.1
-	golang.org/x/crypto v0.0.0-20200323165209-0ec3e9974c59
-	golang.org/x/text v0.3.2
-	golang.org/x/xerrors v0.0.0-20190717185122-a985d3407aa7
+	github.com/jackc/pgproto3/v2 v2.3.3
+	github.com/jackc/pgservicefile v0.0.0-20221227161230-091c0ba34f0a
+	github.com/stretchr/testify v1.8.1
+	golang.org/x/crypto v0.20.0
+	golang.org/x/text v0.14.0
+)
+
+require (
+	github.com/davecgh/go-spew v1.1.1 // indirect
+	github.com/pmezard/go-difflib v1.0.0 // indirect
+	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

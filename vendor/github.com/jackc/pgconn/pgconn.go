@@ -6,9 +6,12 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,7 +19,6 @@ import (
 	"github.com/jackc/pgconn/internal/ctxwatch"
 	"github.com/jackc/pgio"
 	"github.com/jackc/pgproto3/v2"
-	errors "golang.org/x/xerrors"
 )
 
 const (
@@ -43,7 +45,8 @@ type Notification struct {
 // DialFunc is a function that can be used to connect to a PostgreSQL server.
 type DialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
 
-// LookupFunc is a function that can be used to lookup IPs addrs from host.
+// LookupFunc is a function that can be used to lookup IPs addrs from host. Optionally an ip:port combination can be
+// returned in order to override the connection string's port.
 type LookupFunc func(ctx context.Context, host string) (addrs []string, err error)
 
 // BuildFrontendFunc is a function that can be used to create Frontend implementation for connection.
@@ -84,17 +87,33 @@ type PgConn struct {
 	bufferingReceiveMsg pgproto3.BackendMessage
 	bufferingReceiveErr error
 
+	peekedMsg pgproto3.BackendMessage
+
 	// Reusable / preallocated resources
 	wbuf              []byte // write buffer
 	resultReader      ResultReader
 	multiResultReader MultiResultReader
 	contextWatcher    *ctxwatch.ContextWatcher
+
+	cleanupDone chan struct{}
 }
 
 // Connect establishes a connection to a PostgreSQL server using the environment and connString (in URL or DSN format)
-// to provide configuration. See documention for ParseConfig for details. ctx can be used to cancel a connect attempt.
+// to provide configuration. See documentation for ParseConfig for details. ctx can be used to cancel a connect attempt.
 func Connect(ctx context.Context, connString string) (*PgConn, error) {
 	config, err := ParseConfig(connString)
+	if err != nil {
+		return nil, err
+	}
+
+	return ConnectConfig(ctx, config)
+}
+
+// Connect establishes a connection to a PostgreSQL server using the environment and connString (in URL or DSN format)
+// and ParseConfigOptions to provide additional configuration. See documentation for ParseConfig for details. ctx can be
+// used to cancel a connect attempt.
+func ConnectWithOptions(ctx context.Context, connString string, parseConfigOptions ParseConfigOptions) (*PgConn, error) {
+	config, err := ParseConfigWithOptions(connString, parseConfigOptions)
 	if err != nil {
 		return nil, err
 	}
@@ -109,7 +128,7 @@ func Connect(ctx context.Context, connString string) (*PgConn, error) {
 // authentication error will terminate the chain of attempts (like libpq:
 // https://www.postgresql.org/docs/11/libpq-connect.html#LIBPQ-MULTIPLE-HOSTS) and be returned as the error. Otherwise,
 // if all attempts fail the last error is returned.
-func ConnectConfig(ctx context.Context, config *Config) (pgConn *PgConn, err error) {
+func ConnectConfig(octx context.Context, config *Config) (pgConn *PgConn, err error) {
 	// Default values are set in ParseConfig. Enforce initial creation by ParseConfig rather than setting defaults from
 	// zero values.
 	if !config.createdByParseConfig {
@@ -125,7 +144,7 @@ func ConnectConfig(ctx context.Context, config *Config) (pgConn *PgConn, err err
 		},
 	}
 	fallbackConfigs = append(fallbackConfigs, config.Fallbacks...)
-
+	ctx := octx
 	fallbackConfigs, err = expandWithIPs(ctx, config.LookupFunc, fallbackConfigs)
 	if err != nil {
 		return nil, &connectError{config: config, msg: "hostname resolving error", err: err}
@@ -135,12 +154,47 @@ func ConnectConfig(ctx context.Context, config *Config) (pgConn *PgConn, err err
 		return nil, &connectError{config: config, msg: "hostname resolving error", err: errors.New("ip addr wasn't found")}
 	}
 
-	for _, fc := range fallbackConfigs {
-		pgConn, err = connect(ctx, config, fc)
+	foundBestServer := false
+	var fallbackConfig *FallbackConfig
+	for i, fc := range fallbackConfigs {
+		// ConnectTimeout restricts the whole connection process.
+		if config.ConnectTimeout != 0 {
+			// create new context first time or when previous host was different
+			if i == 0 || (fallbackConfigs[i].Host != fallbackConfigs[i-1].Host) {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(octx, config.ConnectTimeout)
+				defer cancel()
+			}
+		} else {
+			ctx = octx
+		}
+		pgConn, err = connect(ctx, config, fc, false)
 		if err == nil {
+			foundBestServer = true
 			break
-		} else if err, ok := err.(*PgError); ok {
-			return nil, &connectError{config: config, msg: "server error", err: err}
+		} else if pgerr, ok := err.(*PgError); ok {
+			err = &connectError{config: config, msg: "server error", err: pgerr}
+			const ERRCODE_INVALID_PASSWORD = "28P01"                    // wrong password
+			const ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION = "28000" // wrong password or bad pg_hba.conf settings
+			const ERRCODE_INVALID_CATALOG_NAME = "3D000"                // db does not exist
+			const ERRCODE_INSUFFICIENT_PRIVILEGE = "42501"              // missing connect privilege
+			if pgerr.Code == ERRCODE_INVALID_PASSWORD ||
+				pgerr.Code == ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION && fc.TLSConfig != nil ||
+				pgerr.Code == ERRCODE_INVALID_CATALOG_NAME ||
+				pgerr.Code == ERRCODE_INSUFFICIENT_PRIVILEGE {
+				break
+			}
+		} else if cerr, ok := err.(*connectError); ok {
+			if _, ok := cerr.err.(*NotPreferredError); ok {
+				fallbackConfig = fc
+			}
+		}
+	}
+
+	if !foundBestServer && fallbackConfig != nil {
+		pgConn, err = connect(ctx, config, fallbackConfig, true)
+		if pgerr, ok := err.(*PgError); ok {
+			err = &connectError{config: config, msg: "server error", err: pgerr}
 		}
 	}
 
@@ -164,7 +218,7 @@ func expandWithIPs(ctx context.Context, lookupFn LookupFunc, fallbacks []*Fallba
 
 	for _, fb := range fallbacks {
 		// skip resolve for unix sockets
-		if strings.HasPrefix(fb.Host, "/") {
+		if isAbsolutePath(fb.Host) {
 			configs = append(configs, &FallbackConfig{
 				Host:      fb.Host,
 				Port:      fb.Port,
@@ -180,47 +234,69 @@ func expandWithIPs(ctx context.Context, lookupFn LookupFunc, fallbacks []*Fallba
 		}
 
 		for _, ip := range ips {
-			configs = append(configs, &FallbackConfig{
-				Host:      ip,
-				Port:      fb.Port,
-				TLSConfig: fb.TLSConfig,
-			})
+			splitIP, splitPort, err := net.SplitHostPort(ip)
+			if err == nil {
+				port, err := strconv.ParseUint(splitPort, 10, 16)
+				if err != nil {
+					return nil, fmt.Errorf("error parsing port (%s) from lookup: %w", splitPort, err)
+				}
+				configs = append(configs, &FallbackConfig{
+					Host:      splitIP,
+					Port:      uint16(port),
+					TLSConfig: fb.TLSConfig,
+				})
+			} else {
+				configs = append(configs, &FallbackConfig{
+					Host:      ip,
+					Port:      fb.Port,
+					TLSConfig: fb.TLSConfig,
+				})
+			}
 		}
 	}
 
 	return configs, nil
 }
 
-func connect(ctx context.Context, config *Config, fallbackConfig *FallbackConfig) (*PgConn, error) {
+func connect(ctx context.Context, config *Config, fallbackConfig *FallbackConfig,
+	ignoreNotPreferredErr bool) (*PgConn, error) {
 	pgConn := new(PgConn)
 	pgConn.config = config
 	pgConn.wbuf = make([]byte, 0, wbufLen)
+	pgConn.cleanupDone = make(chan struct{})
 
 	var err error
 	network, address := NetworkAddress(fallbackConfig.Host, fallbackConfig.Port)
-	pgConn.conn, err = config.DialFunc(ctx, network, address)
+	netConn, err := config.DialFunc(ctx, network, address)
 	if err != nil {
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			err = &errTimeout{err: err}
+		}
 		return nil, &connectError{config: config, msg: "dial error", err: err}
 	}
 
-	pgConn.parameterStatuses = make(map[string]string)
+	pgConn.conn = netConn
+	pgConn.contextWatcher = newContextWatcher(netConn)
+	pgConn.contextWatcher.Watch(ctx)
 
 	if fallbackConfig.TLSConfig != nil {
-		if err := pgConn.startTLS(fallbackConfig.TLSConfig); err != nil {
-			pgConn.conn.Close()
+		tlsConn, err := startTLS(netConn, fallbackConfig.TLSConfig)
+		pgConn.contextWatcher.Unwatch() // Always unwatch `netConn` after TLS.
+		if err != nil {
+			netConn.Close()
 			return nil, &connectError{config: config, msg: "tls error", err: err}
 		}
+
+		pgConn.conn = tlsConn
+		pgConn.contextWatcher = newContextWatcher(tlsConn)
+		pgConn.contextWatcher.Watch(ctx)
 	}
 
-	pgConn.status = connStatusConnecting
-	pgConn.contextWatcher = ctxwatch.NewContextWatcher(
-		func() { pgConn.conn.SetDeadline(time.Date(1, 1, 1, 1, 1, 1, 1, time.UTC)) },
-		func() { pgConn.conn.SetDeadline(time.Time{}) },
-	)
-
-	pgConn.contextWatcher.Watch(ctx)
 	defer pgConn.contextWatcher.Unwatch()
 
+	pgConn.parameterStatuses = make(map[string]string)
+	pgConn.status = connStatusConnecting
 	pgConn.frontend = config.BuildFrontend(pgConn.conn, pgConn.conn)
 
 	startupMsg := pgproto3.StartupMessage{
@@ -238,7 +314,11 @@ func connect(ctx context.Context, config *Config, fallbackConfig *FallbackConfig
 		startupMsg.Parameters["database"] = config.Database
 	}
 
-	if _, err := pgConn.conn.Write(startupMsg.Encode(pgConn.wbuf)); err != nil {
+	buf, err := startupMsg.Encode(pgConn.wbuf)
+	if err != nil {
+		return nil, &connectError{config: config, msg: "failed to write startup message", err: err}
+	}
+	if _, err := pgConn.conn.Write(buf); err != nil {
 		pgConn.conn.Close()
 		return nil, &connectError{config: config, msg: "failed to write startup message", err: err}
 	}
@@ -250,7 +330,7 @@ func connect(ctx context.Context, config *Config, fallbackConfig *FallbackConfig
 			if err, ok := err.(*PgError); ok {
 				return nil, err
 			}
-			return nil, &connectError{config: config, msg: "failed to receive message", err: err}
+			return nil, &connectError{config: config, msg: "failed to receive message", err: preferContextOverNetTimeoutError(ctx, err)}
 		}
 
 		switch msg := msg.(type) {
@@ -278,18 +358,33 @@ func connect(ctx context.Context, config *Config, fallbackConfig *FallbackConfig
 				pgConn.conn.Close()
 				return nil, &connectError{config: config, msg: "failed SASL auth", err: err}
 			}
-
+		case *pgproto3.AuthenticationGSS:
+			err = pgConn.gssAuth()
+			if err != nil {
+				pgConn.conn.Close()
+				return nil, &connectError{config: config, msg: "failed GSS auth", err: err}
+			}
 		case *pgproto3.ReadyForQuery:
 			pgConn.status = connStatusIdle
 			if config.ValidateConnect != nil {
+				// ValidateConnect may execute commands that cause the context to be watched again. Unwatch first to avoid
+				// the watch already in progress panic. This is that last thing done by this method so there is no need to
+				// restart the watch after ValidateConnect returns.
+				//
+				// See https://github.com/jackc/pgconn/issues/40.
+				pgConn.contextWatcher.Unwatch()
+
 				err := config.ValidateConnect(ctx, pgConn)
 				if err != nil {
+					if _, ok := err.(*NotPreferredError); ignoreNotPreferredErr && ok {
+						return pgConn, nil
+					}
 					pgConn.conn.Close()
 					return nil, &connectError{config: config, msg: "ValidateConnect failed", err: err}
 				}
 			}
 			return pgConn, nil
-		case *pgproto3.ParameterStatus:
+		case *pgproto3.ParameterStatus, *pgproto3.NoticeResponse:
 			// handled by ReceiveMessage
 		case *pgproto3.ErrorResponse:
 			pgConn.conn.Close()
@@ -301,29 +396,38 @@ func connect(ctx context.Context, config *Config, fallbackConfig *FallbackConfig
 	}
 }
 
-func (pgConn *PgConn) startTLS(tlsConfig *tls.Config) (err error) {
-	err = binary.Write(pgConn.conn, binary.BigEndian, []int32{8, 80877103})
+func newContextWatcher(conn net.Conn) *ctxwatch.ContextWatcher {
+	return ctxwatch.NewContextWatcher(
+		func() { conn.SetDeadline(time.Date(1, 1, 1, 1, 1, 1, 1, time.UTC)) },
+		func() { conn.SetDeadline(time.Time{}) },
+	)
+}
+
+func startTLS(conn net.Conn, tlsConfig *tls.Config) (net.Conn, error) {
+	err := binary.Write(conn, binary.BigEndian, []int32{8, 80877103})
 	if err != nil {
-		return
+		return nil, err
 	}
 
 	response := make([]byte, 1)
-	if _, err = io.ReadFull(pgConn.conn, response); err != nil {
-		return
+	if _, err = io.ReadFull(conn, response); err != nil {
+		return nil, err
 	}
 
 	if response[0] != 'S' {
-		return errors.New("server refused TLS connection")
+		return nil, errors.New("server refused TLS connection")
 	}
 
-	pgConn.conn = tls.Client(pgConn.conn, tlsConfig)
-
-	return nil
+	return tls.Client(conn, tlsConfig), nil
 }
 
 func (pgConn *PgConn) txPasswordMessage(password string) (err error) {
 	msg := &pgproto3.PasswordMessage{Password: password}
-	_, err = pgConn.conn.Write(msg.Encode(pgConn.wbuf))
+	buf, err := msg.Encode(pgConn.wbuf)
+	if err != nil {
+		return err
+	}
+	_, err = pgConn.conn.Write(buf)
 	return err
 }
 
@@ -365,7 +469,7 @@ func (pgConn *PgConn) SendBytes(ctx context.Context, buf []byte) error {
 	if ctx != context.Background() {
 		select {
 		case <-ctx.Done():
-			return &contextAlreadyDoneError{err: ctx.Err()}
+			return newContextAlreadyDoneError(ctx)
 		default:
 		}
 		pgConn.contextWatcher.Watch(ctx)
@@ -397,7 +501,7 @@ func (pgConn *PgConn) ReceiveMessage(ctx context.Context) (pgproto3.BackendMessa
 	if ctx != context.Background() {
 		select {
 		case <-ctx.Done():
-			return nil, &contextAlreadyDoneError{err: ctx.Err()}
+			return nil, newContextAlreadyDoneError(ctx)
 		default:
 		}
 		pgConn.contextWatcher.Watch(ctx)
@@ -406,13 +510,20 @@ func (pgConn *PgConn) ReceiveMessage(ctx context.Context) (pgproto3.BackendMessa
 
 	msg, err := pgConn.receiveMessage()
 	if err != nil {
-		err = &pgconnError{msg: "receive message failed", err: err, safeToRetry: true}
+		err = &pgconnError{
+			msg:         "receive message failed",
+			err:         preferContextOverNetTimeoutError(ctx, err),
+			safeToRetry: true}
 	}
 	return msg, err
 }
 
-// receiveMessage receives a message without setting up context cancellation
-func (pgConn *PgConn) receiveMessage() (pgproto3.BackendMessage, error) {
+// peekMessage peeks at the next message without setting up context cancellation.
+func (pgConn *PgConn) peekMessage() (pgproto3.BackendMessage, error) {
+	if pgConn.peekedMsg != nil {
+		return pgConn.peekedMsg, nil
+	}
+
 	var msg pgproto3.BackendMessage
 	var err error
 	if pgConn.bufferingReceive {
@@ -423,7 +534,8 @@ func (pgConn *PgConn) receiveMessage() (pgproto3.BackendMessage, error) {
 		pgConn.bufferingReceive = false
 
 		// If a timeout error happened in the background try the read again.
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
 			msg, err = pgConn.frontend.Receive()
 		}
 	} else {
@@ -432,12 +544,33 @@ func (pgConn *PgConn) receiveMessage() (pgproto3.BackendMessage, error) {
 
 	if err != nil {
 		// Close on anything other than timeout error - everything else is fatal
-		if err, ok := err.(net.Error); !(ok && err.Timeout()) {
+		var netErr net.Error
+		isNetErr := errors.As(err, &netErr)
+		if !(isNetErr && netErr.Timeout()) {
 			pgConn.asyncClose()
 		}
 
 		return nil, err
 	}
+
+	pgConn.peekedMsg = msg
+	return msg, nil
+}
+
+// receiveMessage receives a message without setting up context cancellation
+func (pgConn *PgConn) receiveMessage() (pgproto3.BackendMessage, error) {
+	msg, err := pgConn.peekMessage()
+	if err != nil {
+		// Close on anything other than timeout error - everything else is fatal
+		var netErr net.Error
+		isNetErr := errors.As(err, &netErr)
+		if !(isNetErr && netErr.Timeout()) {
+			pgConn.asyncClose()
+		}
+
+		return nil, err
+	}
+	pgConn.peekedMsg = nil
 
 	switch msg := msg.(type) {
 	case *pgproto3.ReadyForQuery:
@@ -446,7 +579,9 @@ func (pgConn *PgConn) receiveMessage() (pgproto3.BackendMessage, error) {
 		pgConn.parameterStatuses[msg.Name] = msg.Value
 	case *pgproto3.ErrorResponse:
 		if msg.Severity == "FATAL" {
-			pgConn.asyncClose()
+			pgConn.status = connStatusClosed
+			pgConn.conn.Close() // Ignore error as the connection is already broken and there is already an error to return.
+			close(pgConn.cleanupDone)
 			return nil, ErrorResponseToPgError(msg)
 		}
 	case *pgproto3.NoticeResponse:
@@ -472,7 +607,15 @@ func (pgConn *PgConn) PID() uint32 {
 	return pgConn.pid
 }
 
-// TxStatus returns the current TxStatus as reported by the server.
+// TxStatus returns the current TxStatus as reported by the server in the ReadyForQuery message.
+//
+// Possible return values:
+//
+//	'I' - idle / not in transaction
+//	'T' - in a transaction
+//	'E' - in a failed transaction
+//
+// See https://www.postgresql.org/docs/current/protocol-message-formats.html.
 func (pgConn *PgConn) TxStatus() byte {
 	return pgConn.txStatus
 }
@@ -491,9 +634,17 @@ func (pgConn *PgConn) Close(ctx context.Context) error {
 	}
 	pgConn.status = connStatusClosed
 
+	defer close(pgConn.cleanupDone)
 	defer pgConn.conn.Close()
 
 	if ctx != context.Background() {
+		// Close may be called while a cancellable query is in progress. This will most often be triggered by panic when
+		// a defer closes the connection (possibly indirectly via a transaction or a connection pool). Unwatch to end any
+		// previous watch. It is safe to Unwatch regardless of whether a watch is already is progress.
+		//
+		// See https://github.com/jackc/pgconn/issues/29
+		pgConn.contextWatcher.Unwatch()
+
 		pgConn.contextWatcher.Watch(ctx)
 		defer pgConn.contextWatcher.Unwatch()
 	}
@@ -504,7 +655,6 @@ func (pgConn *PgConn) Close(ctx context.Context) error {
 	//
 	// See https://github.com/jackc/pgx/issues/637
 	pgConn.conn.Write([]byte{'X', 0, 0, 0, 4})
-	pgConn.conn.Read(make([]byte, 1))
 
 	return pgConn.conn.Close()
 }
@@ -518,6 +668,7 @@ func (pgConn *PgConn) asyncClose() {
 	pgConn.status = connStatusClosed
 
 	go func() {
+		defer close(pgConn.cleanupDone)
 		defer pgConn.conn.Close()
 
 		deadline := time.Now().Add(time.Second * 15)
@@ -530,11 +681,24 @@ func (pgConn *PgConn) asyncClose() {
 		pgConn.conn.SetDeadline(deadline)
 
 		pgConn.conn.Write([]byte{'X', 0, 0, 0, 4})
-		pgConn.conn.Read(make([]byte, 1))
 	}()
 }
 
+// CleanupDone returns a channel that will be closed after all underlying resources have been cleaned up. A closed
+// connection is no longer usable, but underlying resources, in particular the net.Conn, may not have finished closing
+// yet. This is because certain errors such as a context cancellation require that the interrupted function call return
+// immediately, but the error may also cause the connection to be closed. In these cases the underlying resources are
+// closed asynchronously.
+//
+// This is only likely to be useful to connection pools. It gives them a way avoid establishing a new connection while
+// an old connection is still being cleaned up and thereby exceeding the maximum pool size.
+func (pgConn *PgConn) CleanupDone() chan (struct{}) {
+	return pgConn.cleanupDone
+}
+
 // IsClosed reports if the connection has been closed.
+//
+// CleanupDone() can be used to determine if all cleanup has been completed.
 func (pgConn *PgConn) IsClosed() bool {
 	return pgConn.status < connStatusIdle
 }
@@ -668,7 +832,7 @@ func (pgConn *PgConn) Prepare(ctx context.Context, name, sql string, paramOIDs [
 	if ctx != context.Background() {
 		select {
 		case <-ctx.Done():
-			return nil, &contextAlreadyDoneError{err: ctx.Err()}
+			return nil, newContextAlreadyDoneError(ctx)
 		default:
 		}
 		pgConn.contextWatcher.Watch(ctx)
@@ -676,9 +840,19 @@ func (pgConn *PgConn) Prepare(ctx context.Context, name, sql string, paramOIDs [
 	}
 
 	buf := pgConn.wbuf
-	buf = (&pgproto3.Parse{Name: name, Query: sql, ParameterOIDs: paramOIDs}).Encode(buf)
-	buf = (&pgproto3.Describe{ObjectType: 'S', Name: name}).Encode(buf)
-	buf = (&pgproto3.Sync{}).Encode(buf)
+	var err error
+	buf, err = (&pgproto3.Parse{Name: name, Query: sql, ParameterOIDs: paramOIDs}).Encode(buf)
+	if err != nil {
+		return nil, err
+	}
+	buf, err = (&pgproto3.Describe{ObjectType: 'S', Name: name}).Encode(buf)
+	if err != nil {
+		return nil, err
+	}
+	buf, err = (&pgproto3.Sync{}).Encode(buf)
+	if err != nil {
+		return nil, err
+	}
 
 	n, err := pgConn.conn.Write(buf)
 	if err != nil {
@@ -695,7 +869,7 @@ readloop:
 		msg, err := pgConn.receiveMessage()
 		if err != nil {
 			pgConn.asyncClose()
-			return nil, err
+			return nil, preferContextOverNetTimeoutError(ctx, err)
 		}
 
 		switch msg := msg.(type) {
@@ -798,7 +972,7 @@ func (pgConn *PgConn) WaitForNotification(ctx context.Context) error {
 	if ctx != context.Background() {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return newContextAlreadyDoneError(ctx)
 		default:
 		}
 
@@ -809,7 +983,7 @@ func (pgConn *PgConn) WaitForNotification(ctx context.Context) error {
 	for {
 		msg, err := pgConn.receiveMessage()
 		if err != nil {
-			return err
+			return preferContextOverNetTimeoutError(ctx, err)
 		}
 
 		switch msg.(type) {
@@ -841,7 +1015,7 @@ func (pgConn *PgConn) Exec(ctx context.Context, sql string) *MultiResultReader {
 		select {
 		case <-ctx.Done():
 			multiResult.closed = true
-			multiResult.err = &contextAlreadyDoneError{err: ctx.Err()}
+			multiResult.err = newContextAlreadyDoneError(ctx)
 			pgConn.unlock()
 			return multiResult
 		default:
@@ -850,7 +1024,14 @@ func (pgConn *PgConn) Exec(ctx context.Context, sql string) *MultiResultReader {
 	}
 
 	buf := pgConn.wbuf
-	buf = (&pgproto3.Query{String: sql}).Encode(buf)
+	var err error
+	buf, err = (&pgproto3.Query{String: sql}).Encode(buf)
+	if err != nil {
+		return &MultiResultReader{
+			closed: true,
+			err:    err,
+		}
+	}
 
 	n, err := pgConn.conn.Write(buf)
 	if err != nil {
@@ -860,6 +1041,39 @@ func (pgConn *PgConn) Exec(ctx context.Context, sql string) *MultiResultReader {
 		multiResult.err = &writeError{err: err, safeToRetry: n == 0}
 		pgConn.unlock()
 		return multiResult
+	}
+
+	return multiResult
+}
+
+// ReceiveResults reads the result that might be returned by Postgres after a SendBytes
+// (e.a. after sending a CopyDone in a copy-both situation).
+//
+// This is a very low level method that requires deep understanding of the PostgreSQL wire protocol to use correctly.
+// See https://www.postgresql.org/docs/current/protocol.html.
+func (pgConn *PgConn) ReceiveResults(ctx context.Context) *MultiResultReader {
+	if err := pgConn.lock(); err != nil {
+		return &MultiResultReader{
+			closed: true,
+			err:    err,
+		}
+	}
+
+	pgConn.multiResultReader = MultiResultReader{
+		pgConn: pgConn,
+		ctx:    ctx,
+	}
+	multiResult := &pgConn.multiResultReader
+	if ctx != context.Background() {
+		select {
+		case <-ctx.Done():
+			multiResult.closed = true
+			multiResult.err = newContextAlreadyDoneError(ctx)
+			pgConn.unlock()
+			return multiResult
+		default:
+		}
+		pgConn.contextWatcher.Watch(ctx)
 	}
 
 	return multiResult
@@ -877,11 +1091,11 @@ func (pgConn *PgConn) Exec(ctx context.Context, sql string) *MultiResultReader {
 // ExecParams will panic if len(paramOIDs) is not 0, 1, or len(paramValues).
 //
 // paramFormats is a slice of format codes determining for each paramValue column whether it is encoded in text or
-// binary format. If paramFormats is nil all results will be in text protocol. ExecParams will panic if
+// binary format. If paramFormats is nil all params are text format. ExecParams will panic if
 // len(paramFormats) is not 0, 1, or len(paramValues).
 //
 // resultFormats is a slice of format codes determining for each result column whether it is encoded in text or
-// binary format. If resultFormats is nil all results will be in text protocol.
+// binary format. If resultFormats is nil all results will be in text format.
 //
 // ResultReader must be closed before PgConn can be used again.
 func (pgConn *PgConn) ExecParams(ctx context.Context, sql string, paramValues [][]byte, paramOIDs []uint32, paramFormats []int16, resultFormats []int16) *ResultReader {
@@ -891,8 +1105,24 @@ func (pgConn *PgConn) ExecParams(ctx context.Context, sql string, paramValues []
 	}
 
 	buf := pgConn.wbuf
-	buf = (&pgproto3.Parse{Query: sql, ParameterOIDs: paramOIDs}).Encode(buf)
-	buf = (&pgproto3.Bind{ParameterFormatCodes: paramFormats, Parameters: paramValues, ResultFormatCodes: resultFormats}).Encode(buf)
+	var err error
+	buf, err = (&pgproto3.Parse{Query: sql, ParameterOIDs: paramOIDs}).Encode(buf)
+	if err != nil {
+		result.concludeCommand(nil, err)
+		pgConn.contextWatcher.Unwatch()
+		result.closed = true
+		pgConn.unlock()
+		return result
+	}
+
+	buf, err = (&pgproto3.Bind{ParameterFormatCodes: paramFormats, Parameters: paramValues, ResultFormatCodes: resultFormats}).Encode(buf)
+	if err != nil {
+		result.concludeCommand(nil, err)
+		pgConn.contextWatcher.Unwatch()
+		result.closed = true
+		pgConn.unlock()
+		return result
+	}
 
 	pgConn.execExtendedSuffix(buf, result)
 
@@ -904,11 +1134,11 @@ func (pgConn *PgConn) ExecParams(ctx context.Context, sql string, paramValues []
 // paramValues are the parameter values. It must be encoded in the format given by paramFormats.
 //
 // paramFormats is a slice of format codes determining for each paramValue column whether it is encoded in text or
-// binary format. If paramFormats is nil all results will be in text protocol. ExecPrepared will panic if
+// binary format. If paramFormats is nil all params are text format. ExecPrepared will panic if
 // len(paramFormats) is not 0, 1, or len(paramValues).
 //
 // resultFormats is a slice of format codes determining for each result column whether it is encoded in text or
-// binary format. If resultFormats is nil all results will be in text protocol.
+// binary format. If resultFormats is nil all results will be in text format.
 //
 // ResultReader must be closed before PgConn can be used again.
 func (pgConn *PgConn) ExecPrepared(ctx context.Context, stmtName string, paramValues [][]byte, paramFormats []int16, resultFormats []int16) *ResultReader {
@@ -918,7 +1148,15 @@ func (pgConn *PgConn) ExecPrepared(ctx context.Context, stmtName string, paramVa
 	}
 
 	buf := pgConn.wbuf
-	buf = (&pgproto3.Bind{PreparedStatement: stmtName, ParameterFormatCodes: paramFormats, Parameters: paramValues, ResultFormatCodes: resultFormats}).Encode(buf)
+	var err error
+	buf, err = (&pgproto3.Bind{PreparedStatement: stmtName, ParameterFormatCodes: paramFormats, Parameters: paramValues, ResultFormatCodes: resultFormats}).Encode(buf)
+	if err != nil {
+		result.concludeCommand(nil, err)
+		pgConn.contextWatcher.Unwatch()
+		result.closed = true
+		pgConn.unlock()
+		return result
+	}
 
 	pgConn.execExtendedSuffix(buf, result)
 
@@ -939,7 +1177,7 @@ func (pgConn *PgConn) execExtendedPrefix(ctx context.Context, paramValues [][]by
 	}
 
 	if len(paramValues) > math.MaxUint16 {
-		result.concludeCommand(nil, errors.Errorf("extended protocol limited to %v parameters", math.MaxUint16))
+		result.concludeCommand(nil, fmt.Errorf("extended protocol limited to %v parameters", math.MaxUint16))
 		result.closed = true
 		pgConn.unlock()
 		return result
@@ -948,7 +1186,7 @@ func (pgConn *PgConn) execExtendedPrefix(ctx context.Context, paramValues [][]by
 	if ctx != context.Background() {
 		select {
 		case <-ctx.Done():
-			result.concludeCommand(nil, &contextAlreadyDoneError{err: ctx.Err()})
+			result.concludeCommand(nil, newContextAlreadyDoneError(ctx))
 			result.closed = true
 			pgConn.unlock()
 			return result
@@ -961,9 +1199,31 @@ func (pgConn *PgConn) execExtendedPrefix(ctx context.Context, paramValues [][]by
 }
 
 func (pgConn *PgConn) execExtendedSuffix(buf []byte, result *ResultReader) {
-	buf = (&pgproto3.Describe{ObjectType: 'P'}).Encode(buf)
-	buf = (&pgproto3.Execute{}).Encode(buf)
-	buf = (&pgproto3.Sync{}).Encode(buf)
+	var err error
+	buf, err = (&pgproto3.Describe{ObjectType: 'P'}).Encode(buf)
+	if err != nil {
+		result.concludeCommand(nil, err)
+		pgConn.contextWatcher.Unwatch()
+		result.closed = true
+		pgConn.unlock()
+		return
+	}
+	buf, err = (&pgproto3.Execute{}).Encode(buf)
+	if err != nil {
+		result.concludeCommand(nil, err)
+		pgConn.contextWatcher.Unwatch()
+		result.closed = true
+		pgConn.unlock()
+		return
+	}
+	buf, err = (&pgproto3.Sync{}).Encode(buf)
+	if err != nil {
+		result.concludeCommand(nil, err)
+		pgConn.contextWatcher.Unwatch()
+		result.closed = true
+		pgConn.unlock()
+		return
+	}
 
 	n, err := pgConn.conn.Write(buf)
 	if err != nil {
@@ -972,7 +1232,10 @@ func (pgConn *PgConn) execExtendedSuffix(buf []byte, result *ResultReader) {
 		pgConn.contextWatcher.Unwatch()
 		result.closed = true
 		pgConn.unlock()
+		return
 	}
+
+	result.readUntilRowDescription()
 }
 
 // CopyTo executes the copy command sql and copies the results to w.
@@ -985,7 +1248,7 @@ func (pgConn *PgConn) CopyTo(ctx context.Context, w io.Writer, sql string) (Comm
 		select {
 		case <-ctx.Done():
 			pgConn.unlock()
-			return nil, &contextAlreadyDoneError{err: ctx.Err()}
+			return nil, newContextAlreadyDoneError(ctx)
 		default:
 		}
 		pgConn.contextWatcher.Watch(ctx)
@@ -994,7 +1257,12 @@ func (pgConn *PgConn) CopyTo(ctx context.Context, w io.Writer, sql string) (Comm
 
 	// Send copy to command
 	buf := pgConn.wbuf
-	buf = (&pgproto3.Query{String: sql}).Encode(buf)
+	var err error
+	buf, err = (&pgproto3.Query{String: sql}).Encode(buf)
+	if err != nil {
+		pgConn.unlock()
+		return nil, err
+	}
 
 	n, err := pgConn.conn.Write(buf)
 	if err != nil {
@@ -1010,7 +1278,7 @@ func (pgConn *PgConn) CopyTo(ctx context.Context, w io.Writer, sql string) (Comm
 		msg, err := pgConn.receiveMessage()
 		if err != nil {
 			pgConn.asyncClose()
-			return nil, err
+			return nil, preferContextOverNetTimeoutError(ctx, err)
 		}
 
 		switch msg := msg.(type) {
@@ -1045,7 +1313,7 @@ func (pgConn *PgConn) CopyFrom(ctx context.Context, r io.Reader, sql string) (Co
 	if ctx != context.Background() {
 		select {
 		case <-ctx.Done():
-			return nil, &contextAlreadyDoneError{err: ctx.Err()}
+			return nil, newContextAlreadyDoneError(ctx)
 		default:
 		}
 		pgConn.contextWatcher.Watch(ctx)
@@ -1054,7 +1322,12 @@ func (pgConn *PgConn) CopyFrom(ctx context.Context, r io.Reader, sql string) (Co
 
 	// Send copy to command
 	buf := pgConn.wbuf
-	buf = (&pgproto3.Query{String: sql}).Encode(buf)
+	var err error
+	buf, err = (&pgproto3.Query{String: sql}).Encode(buf)
+	if err != nil {
+		pgConn.unlock()
+		return nil, err
+	}
 
 	n, err := pgConn.conn.Write(buf)
 	if err != nil {
@@ -1062,33 +1335,15 @@ func (pgConn *PgConn) CopyFrom(ctx context.Context, r io.Reader, sql string) (Co
 		return nil, &writeError{err: err, safeToRetry: n == 0}
 	}
 
-	// Read until copy in response or error.
-	var commandTag CommandTag
-	var pgErr error
-	pendingCopyInResponse := true
-	for pendingCopyInResponse {
-		msg, err := pgConn.receiveMessage()
-		if err != nil {
-			pgConn.asyncClose()
-			return nil, err
-		}
-
-		switch msg := msg.(type) {
-		case *pgproto3.CopyInResponse:
-			pendingCopyInResponse = false
-		case *pgproto3.ErrorResponse:
-			pgErr = ErrorResponseToPgError(msg)
-		case *pgproto3.ReadyForQuery:
-			return commandTag, pgErr
-		}
-	}
-
 	// Send copy data
 	abortCopyChan := make(chan struct{})
 	copyErrChan := make(chan error, 1)
 	signalMessageChan := pgConn.signalMessage()
+	var wg sync.WaitGroup
+	wg.Add(1)
 
 	go func() {
+		defer wg.Done()
 		buf := make([]byte, 0, 65536)
 		buf = append(buf, 'd')
 		sp := len(buf)
@@ -1121,6 +1376,7 @@ func (pgConn *PgConn) CopyFrom(ctx context.Context, r io.Reader, sql string) (Co
 		}
 	}()
 
+	var pgErr error
 	var copyErr error
 	for copyErr == nil && pgErr == nil {
 		select {
@@ -1129,7 +1385,7 @@ func (pgConn *PgConn) CopyFrom(ctx context.Context, r io.Reader, sql string) (Co
 			msg, err := pgConn.receiveMessage()
 			if err != nil {
 				pgConn.asyncClose()
-				return nil, err
+				return nil, preferContextOverNetTimeoutError(ctx, err)
 			}
 
 			switch msg := msg.(type) {
@@ -1138,18 +1394,29 @@ func (pgConn *PgConn) CopyFrom(ctx context.Context, r io.Reader, sql string) (Co
 			default:
 				signalMessageChan = pgConn.signalMessage()
 			}
-		default:
 		}
 	}
 	close(abortCopyChan)
+	// Make sure io goroutine finishes before writing.
+	wg.Wait()
 
 	buf = buf[:0]
 	if copyErr == io.EOF || pgErr != nil {
 		copyDone := &pgproto3.CopyDone{}
-		buf = copyDone.Encode(buf)
+		var err error
+		buf, err = copyDone.Encode(buf)
+		if err != nil {
+			pgConn.asyncClose()
+			return nil, err
+		}
 	} else {
 		copyFail := &pgproto3.CopyFail{Message: copyErr.Error()}
-		buf = copyFail.Encode(buf)
+		var err error
+		buf, err = copyFail.Encode(buf)
+		if err != nil {
+			pgConn.asyncClose()
+			return nil, err
+		}
 	}
 	_, err = pgConn.conn.Write(buf)
 	if err != nil {
@@ -1158,11 +1425,12 @@ func (pgConn *PgConn) CopyFrom(ctx context.Context, r io.Reader, sql string) (Co
 	}
 
 	// Read results
+	var commandTag CommandTag
 	for {
 		msg, err := pgConn.receiveMessage()
 		if err != nil {
 			pgConn.asyncClose()
-			return nil, err
+			return nil, preferContextOverNetTimeoutError(ctx, err)
 		}
 
 		switch msg := msg.(type) {
@@ -1204,7 +1472,7 @@ func (mrr *MultiResultReader) receiveMessage() (pgproto3.BackendMessage, error) 
 
 	if err != nil {
 		mrr.pgConn.contextWatcher.Unwatch()
-		mrr.err = err
+		mrr.err = preferContextOverNetTimeoutError(mrr.ctx, err)
 		mrr.closed = true
 		mrr.pgConn.asyncClose()
 		return nil, mrr.err
@@ -1383,6 +1651,26 @@ func (rr *ResultReader) Close() (CommandTag, error) {
 	return rr.commandTag, rr.err
 }
 
+// readUntilRowDescription ensures the ResultReader's fieldDescriptions are loaded. It does not return an error as any
+// error will be stored in the ResultReader.
+func (rr *ResultReader) readUntilRowDescription() {
+	for !rr.commandConcluded {
+		// Peek before receive to avoid consuming a DataRow if the result set does not include a RowDescription method.
+		// This should never happen under normal pgconn usage, but it is possible if SendBytes and ReceiveResults are
+		// manually used to construct a query that does not issue a describe statement.
+		msg, _ := rr.pgConn.peekMessage()
+		if _, ok := msg.(*pgproto3.DataRow); ok {
+			return
+		}
+
+		// Consume the message
+		msg, _ = rr.receiveMessage()
+		if _, ok := msg.(*pgproto3.RowDescription); ok {
+			return
+		}
+	}
+}
+
 func (rr *ResultReader) receiveMessage() (msg pgproto3.BackendMessage, err error) {
 	if rr.multiResultReader == nil {
 		msg, err = rr.pgConn.receiveMessage()
@@ -1391,6 +1679,7 @@ func (rr *ResultReader) receiveMessage() (msg pgproto3.BackendMessage, err error
 	}
 
 	if err != nil {
+		err = preferContextOverNetTimeoutError(rr.ctx, err)
 		rr.concludeCommand(nil, err)
 		rr.pgConn.contextWatcher.Unwatch()
 		rr.closed = true
@@ -1416,13 +1705,17 @@ func (rr *ResultReader) receiveMessage() (msg pgproto3.BackendMessage, err error
 }
 
 func (rr *ResultReader) concludeCommand(commandTag CommandTag, err error) {
+	// Keep the first error that is recorded. Store the error before checking if the command is already concluded to
+	// allow for receiving an error after CommandComplete but before ReadyForQuery.
+	if err != nil && rr.err == nil {
+		rr.err = err
+	}
+
 	if rr.commandConcluded {
 		return
 	}
 
 	rr.commandTag = commandTag
-	rr.err = err
-	rr.fieldDescriptions = nil
 	rr.rowValues = nil
 	rr.commandConcluded = true
 }
@@ -1430,24 +1723,54 @@ func (rr *ResultReader) concludeCommand(commandTag CommandTag, err error) {
 // Batch is a collection of queries that can be sent to the PostgreSQL server in a single round-trip.
 type Batch struct {
 	buf []byte
+	err error
 }
 
 // ExecParams appends an ExecParams command to the batch. See PgConn.ExecParams for parameter descriptions.
 func (batch *Batch) ExecParams(sql string, paramValues [][]byte, paramOIDs []uint32, paramFormats []int16, resultFormats []int16) {
-	batch.buf = (&pgproto3.Parse{Query: sql, ParameterOIDs: paramOIDs}).Encode(batch.buf)
+	if batch.err != nil {
+		return
+	}
+
+	batch.buf, batch.err = (&pgproto3.Parse{Query: sql, ParameterOIDs: paramOIDs}).Encode(batch.buf)
+	if batch.err != nil {
+		return
+	}
 	batch.ExecPrepared("", paramValues, paramFormats, resultFormats)
 }
 
 // ExecPrepared appends an ExecPrepared e command to the batch. See PgConn.ExecPrepared for parameter descriptions.
 func (batch *Batch) ExecPrepared(stmtName string, paramValues [][]byte, paramFormats []int16, resultFormats []int16) {
-	batch.buf = (&pgproto3.Bind{PreparedStatement: stmtName, ParameterFormatCodes: paramFormats, Parameters: paramValues, ResultFormatCodes: resultFormats}).Encode(batch.buf)
-	batch.buf = (&pgproto3.Describe{ObjectType: 'P'}).Encode(batch.buf)
-	batch.buf = (&pgproto3.Execute{}).Encode(batch.buf)
+	if batch.err != nil {
+		return
+	}
+
+	batch.buf, batch.err = (&pgproto3.Bind{PreparedStatement: stmtName, ParameterFormatCodes: paramFormats, Parameters: paramValues, ResultFormatCodes: resultFormats}).Encode(batch.buf)
+	if batch.err != nil {
+		return
+	}
+
+	batch.buf, batch.err = (&pgproto3.Describe{ObjectType: 'P'}).Encode(batch.buf)
+	if batch.err != nil {
+		return
+	}
+
+	batch.buf, batch.err = (&pgproto3.Execute{}).Encode(batch.buf)
+	if batch.err != nil {
+		return
+	}
 }
 
 // ExecBatch executes all the queries in batch in a single round-trip. Execution is implicitly transactional unless a
 // transaction is already in progress or SQL contains transaction control statements.
 func (pgConn *PgConn) ExecBatch(ctx context.Context, batch *Batch) *MultiResultReader {
+	if batch.err != nil {
+		return &MultiResultReader{
+			closed: true,
+			err:    batch.err,
+		}
+	}
+
 	if err := pgConn.lock(); err != nil {
 		return &MultiResultReader{
 			closed: true,
@@ -1465,7 +1788,7 @@ func (pgConn *PgConn) ExecBatch(ctx context.Context, batch *Batch) *MultiResultR
 		select {
 		case <-ctx.Done():
 			multiResult.closed = true
-			multiResult.err = &contextAlreadyDoneError{err: ctx.Err()}
+			multiResult.err = newContextAlreadyDoneError(ctx)
 			pgConn.unlock()
 			return multiResult
 		default:
@@ -1473,7 +1796,13 @@ func (pgConn *PgConn) ExecBatch(ctx context.Context, batch *Batch) *MultiResultR
 		pgConn.contextWatcher.Watch(ctx)
 	}
 
-	batch.buf = (&pgproto3.Sync{}).Encode(batch.buf)
+	batch.buf, batch.err = (&pgproto3.Sync{}).Encode(batch.buf)
+	if batch.err != nil {
+		multiResult.closed = true
+		multiResult.err = batch.err
+		pgConn.unlock()
+		return multiResult
+	}
 
 	// A large batch can deadlock without concurrent reading and writing. If the Write fails the underlying net.Conn is
 	// closed. This is all that can be done without introducing a race condition or adding a concurrent safe communication
@@ -1562,13 +1891,11 @@ func Construct(hc *HijackedConn) (*PgConn, error) {
 
 		status: connStatusIdle,
 
-		wbuf: make([]byte, 0, wbufLen),
+		wbuf:        make([]byte, 0, wbufLen),
+		cleanupDone: make(chan struct{}),
 	}
 
-	pgConn.contextWatcher = ctxwatch.NewContextWatcher(
-		func() { pgConn.conn.SetDeadline(time.Date(1, 1, 1, 1, 1, 1, 1, time.UTC)) },
-		func() { pgConn.conn.SetDeadline(time.Time{}) },
-	)
+	pgConn.contextWatcher = newContextWatcher(pgConn.conn)
 
 	return pgConn, nil
 }

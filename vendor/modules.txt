@@ -54,7 +54,7 @@ github.com/iovisor/gobpf/pkg/bpffs
 github.com/iovisor/gobpf/pkg/cpuonline
 # github.com/jackc/chunkreader/v2 v2.0.1
 github.com/jackc/chunkreader/v2
-# github.com/jackc/pgconn v1.5.0
+# github.com/jackc/pgconn v1.14.3
 github.com/jackc/pgconn
 github.com/jackc/pgconn/internal/ctxwatch
 github.com/jackc/pgconn/stmtcache
@@ -62,13 +62,13 @@ github.com/jackc/pgconn/stmtcache
 github.com/jackc/pgio
 # github.com/jackc/pgpassfile v1.0.0
 github.com/jackc/pgpassfile
-# github.com/jackc/pgproto3/v2 v2.0.1
+# github.com/jackc/pgproto3/v2 v2.3.3
 github.com/jackc/pgproto3/v2
-# github.com/jackc/pgservicefile v0.0.0-20200307190119-3430c5407db8
+# github.com/jackc/pgservicefile v0.0.0-20221227161230-091c0ba34f0a
 github.com/jackc/pgservicefile
-# github.com/jackc/pgtype v1.3.0
+# github.com/jackc/pgtype v1.14.0
 github.com/jackc/pgtype
-# github.com/jackc/pgx/v4 v4.6.0
+# github.com/jackc/pgx/v4 v4.18.2
 ## explicit
 github.com/jackc/pgx/v4
 github.com/jackc/pgx/v4/internal/sanitize
@@ -81,8 +81,6 @@ github.com/joho/godotenv
 github.com/kelseyhightower/envconfig
 # github.com/konsorten/go-windows-terminal-sequences v1.0.3
 github.com/konsorten/go-windows-terminal-sequences
-# github.com/lib/pq v1.3.0
-## explicit
 # github.com/mattn/go-colorable v0.1.8
 ## explicit
 github.com/mattn/go-colorable
@@ -140,18 +138,15 @@ github.com/sirupsen/logrus
 # github.com/weaveworks/tcptracer-bpf v0.0.0-20190731111909-cd53e7c84bac
 ## explicit
 github.com/weaveworks/tcptracer-bpf/pkg/tracer
-# golang.org/x/crypto v0.0.0-20200622213623-75b288015ac9
-## explicit
+# golang.org/x/crypto v0.20.0
 golang.org/x/crypto/pbkdf2
-# golang.org/x/net v0.0.0-20201216054612-986b41b23924
-## explicit
+# golang.org/x/net v0.21.0
 golang.org/x/net/context
-# golang.org/x/sys v0.0.0-20201214210602-f9fddec55a1e
+# golang.org/x/sys v0.17.0
 ## explicit
-golang.org/x/sys/internal/unsafeheader
 golang.org/x/sys/unix
 golang.org/x/sys/windows
-# golang.org/x/text v0.3.3
+# golang.org/x/text v0.14.0
 golang.org/x/text/cases
 golang.org/x/text/internal
 golang.org/x/text/internal/language
