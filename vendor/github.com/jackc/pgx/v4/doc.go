@@ -22,6 +22,11 @@ here. In addition, a config struct can be created by `ParseConfig` and modified 
 
     conn, err := pgx.ConnectConfig(context.Background(), config)
 
+Connection Pool
+
+`*pgx.Conn` represents a single connection to the database and is not concurrency safe. Use sub-package pgxpool for a
+concurrency safe connection pool.
+
 Query Interface
 
 pgx implements Query and Scan in the familiar database/sql style.
@@ -53,7 +58,7 @@ pgx implements Query and Scan in the familiar database/sql style.
 
     // Any errors encountered by rows.Next or rows.Scan will be returned here
     if rows.Err() != nil {
-        return err
+        return rows.Err()
     }
 
     // No errors found - do something with sum
@@ -77,9 +82,22 @@ Use Exec to execute a query that does not return a result set.
         return errors.New("No row found to delete")
     }
 
-Connection Pool
+QueryFunc can be used to execute a callback function for every row. This is often easier to use than Query.
 
-See sub-package pgxpool for a connection pool.
+    var sum, n int32
+	_, err = conn.QueryFunc(
+		context.Background(),
+		"select generate_series(1,$1)",
+		[]interface{}{10},
+		[]interface{}{&n},
+		func(pgx.QueryFuncRow) error {
+            sum += n
+			return nil
+		},
+	)
+	if err != nil {
+		return err
+	}
 
 Base Type Mapping
 
@@ -145,7 +163,7 @@ from a net.IP; it will assume a /32 netmask for IPv4 and a /128 for IPv6.
 Custom Type Support
 
 pgx includes support for the common data types like integers, floats, strings, dates, and times that have direct
-mappings between Go and SQL. In addition, pgx uses the github.com/jackc/pgx/pgtype library to support more types. See
+mappings between Go and SQL. In addition, pgx uses the github.com/jackc/pgtype library to support more types. See
 documention for that library for instructions on how to implement custom types.
 
 See example_custom_type_test.go for an example of a custom type for the PostgreSQL point type.
@@ -157,6 +175,51 @@ If pgx does cannot natively encode a type and that type is a renamed type (e.g. 
 to encode the underlying type. While this is usually desired behavior it can produce surprising behavior if one the
 underlying type and the renamed type each implement database/sql interfaces and the other implements pgx interfaces. It
 is recommended that this situation be avoided by implementing pgx interfaces on the renamed type.
+
+Composite types and row values
+
+Row values and composite types are represented as pgtype.Record (https://pkg.go.dev/github.com/jackc/pgtype?tab=doc#Record).
+It is possible to get values of your custom type by implementing DecodeBinary interface. Decoding into
+pgtype.Record first can simplify process by avoiding dealing with raw protocol directly.
+
+For example:
+
+    type MyType struct {
+        a int      // NULL will cause decoding error
+        b *string  // there can be NULL in this position in SQL
+    }
+
+    func (t *MyType) DecodeBinary(ci *pgtype.ConnInfo, src []byte) error {
+        r := pgtype.Record{
+            Fields: []pgtype.Value{&pgtype.Int4{}, &pgtype.Text{}},
+        }
+
+        if err := r.DecodeBinary(ci, src); err != nil {
+            return err
+        }
+
+        if r.Status != pgtype.Present {
+            return errors.New("BUG: decoding should not be called on NULL value")
+        }
+
+        a := r.Fields[0].(*pgtype.Int4)
+        b := r.Fields[1].(*pgtype.Text)
+
+        // type compatibility is checked by AssignTo
+        // only lossless assignments will succeed
+        if err := a.AssignTo(&t.a); err != nil {
+            return err
+        }
+
+        // AssignTo also deals with null value handling
+        if err := b.AssignTo(&t.b); err != nil {
+            return err
+        }
+        return nil
+    }
+
+    result := MyType{}
+    err := conn.QueryRow(context.Background(), "select row(1, 'foo'::text)", pgx.QueryResultFormats{pgx.BinaryFormatCode}).Scan(&r)
 
 Raw Bytes Mapping
 
@@ -189,6 +252,17 @@ These are internally implemented with savepoints.
 
 Use BeginTx to control the transaction mode.
 
+BeginFunc and BeginTxFunc are variants that begin a transaction, execute a function, and commit or rollback the
+transaction depending on the return value of the function. These can be simpler and less error prone to use.
+
+    err = conn.BeginFunc(context.Background(), func(tx pgx.Tx) error {
+        _, err := tx.Exec(context.Background(), "insert into foo(id) values (1)")
+        return err
+    })
+    if err != nil {
+        return err
+    }
+
 Prepared Statements
 
 Prepared statements can be manually created with the Prepare method. However, this is rarely necessary because pgx
@@ -214,12 +288,28 @@ interface. Or implement CopyFromSource to avoid buffering the entire data set in
         pgx.CopyFromRows(rows),
     )
 
+When you already have a typed array using CopyFromSlice can be more convenient.
+
+    rows := []User{
+        {"John", "Smith", 36},
+        {"Jane", "Doe", 29},
+    }
+
+    copyCount, err := conn.CopyFrom(
+        context.Background(),
+        pgx.Identifier{"people"},
+        []string{"first_name", "last_name", "age"},
+        pgx.CopyFromSlice(len(rows), func(i int) ([]interface{}, error) {
+            return []interface{}{rows[i].FirstName, rows[i].LastName, rows[i].Age}, nil
+        }),
+    )
+
 CopyFrom can be faster than an insert with as few as 5 rows.
 
 Listen and Notify
 
 pgx can listen to the PostgreSQL notification system with the `Conn.WaitForNotification` method. It blocks until a
-context is received or the context is canceled.
+notification is received or the context is canceled.
 
     _, err := conn.Exec(context.Background(), "listen channelname")
     if err != nil {
