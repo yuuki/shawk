@@ -122,5 +122,11 @@ streaming probes, the central PostgreSQL CMDB and
 
 ## License
 
-The Go code is [MIT](LICENSE). The BPF programs in `internal/tracer/bpf`
-are dual-licensed GPL-2.0-only OR BSD-2-Clause.
+shawk is licensed under the [Apache License 2.0](LICENSE).
+
+The eBPF programs (`internal/tracer/bpf/shawk.bpf.c` and `shawk.h`) are
+dual-licensed under [GPL-2.0-only](LICENSES/GPL-2.0-only.txt) OR
+[BSD-2-Clause](LICENSES/BSD-2-Clause.txt): the kernel requires a
+GPL-compatible license to load them, and the BSD option lets their compiled
+object ship inside the Apache-2.0 binary. See [NOTICE](NOTICE) for the
+licenses of the bundled libbpf headers and the generated `vmlinux.h`.

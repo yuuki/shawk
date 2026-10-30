@@ -41,6 +41,12 @@
 
 #include "shawk.h"
 
+/*
+ * The kernel rejects programs without a GPL-compatible license when they use
+ * GPL-only helpers such as bpf_probe_read_kernel() and bpf_seq_write(), or
+ * kernel types such as struct bpf_iter_meta. This file is dual-licensed so
+ * that its object can also be distributed with the Apache-2.0 user space.
+ */
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
 #define AF_INET 2

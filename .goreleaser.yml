@@ -20,6 +20,11 @@ builds:
 
 archives:
   - name_template: "{{ .ProjectName }}_v{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+      - LICENSE
+      - NOTICE
+      - LICENSES/*
 
 changelog:
   disable: true
@@ -35,7 +40,8 @@ nfpms:
     homepage: https://github.com/yuuki/shawk
     maintainer: Yuuki TSUBOUCHI <yuki.tsubo@gmail.com>
     description: A dependency ledger that records network dependencies among processes with eBPF
-    license: MIT
+    # The binary embeds the compiled eBPF programs.
+    license: Apache-2.0 AND (GPL-2.0-only OR BSD-2-Clause)
     formats:
       - deb
       - rpm
@@ -43,3 +49,11 @@ nfpms:
     contents:
       - src: packaging/systemd/shawk-agent.service
         dst: /usr/lib/systemd/system/shawk-agent.service
+      - src: LICENSE
+        dst: /usr/share/licenses/shawk/LICENSE
+      - src: NOTICE
+        dst: /usr/share/licenses/shawk/NOTICE
+      - src: LICENSES/GPL-2.0-only.txt
+        dst: /usr/share/licenses/shawk/GPL-2.0-only.txt
+      - src: LICENSES/BSD-2-Clause.txt
+        dst: /usr/share/licenses/shawk/BSD-2-Clause.txt
