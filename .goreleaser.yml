@@ -1,46 +1,45 @@
+version: 2
 project_name: shawk
-env:
-  - GO111MODULE=on
-before:
-  hooks:
-    - go mod tidy
+
 builds:
-  - id: "shawk"
-    main: .
+  - id: shawk
+    main: ./cmd/shawk
     binary: shawk
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
     ldflags:
       - -s -w
-      - -X version.version={{.Version}}
-      - -X version.commit={{.ShortCommit}}
-      - -X version.date={{.Date}}
+      - -X github.com/yuuki/shawk/internal/version.Version={{.Version}}
     goos:
       - linux
     goarch:
       - amd64
-changelog:
-  skip: true
+      - arm64
+
 archives:
-  - name_template: "{{ .ProjectName }}_v{{ .Version }}_{{ .Os }}_{{ .Arch }}{{ if .Arm }}v{{ .Arm }}{{ end }}"
+  - name_template: "{{ .ProjectName }}_v{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+changelog:
+  disable: true
+
 release:
   prerelease: auto
 
 nfpms:
-  - id: "shawk"
+  - id: shawk
     package_name: shawk
     file_name_template: "{{ .ProjectName }}_v{{ .Version }}_{{ .Os }}_{{ .Arch }}"
-    replacements:
     vendor: Yuuki TSUBOUCHI
     homepage: https://github.com/yuuki/shawk
     maintainer: Yuuki TSUBOUCHI <yuki.tsubo@gmail.com>
-    description: A socket-based tracing system for discovering network dependencies in distributed applications
+    description: A dependency ledger that records network dependencies among processes with eBPF
     license: MIT
     formats:
       - deb
       - rpm
     bindir: /usr/bin
-    epoch: 1
-    empty_folders:
-    files:
-      "scripts/systemd/shawk.service": "/etc/systemd/system/multi-user.target.wants/shawk.service"
-    config_files:
-    scripts:
+    contents:
+      - src: packaging/systemd/shawk-agent.service
+        dst: /usr/lib/systemd/system/shawk-agent.service

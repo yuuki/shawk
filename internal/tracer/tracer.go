@@ -1,0 +1,613 @@
+// Package tracer discovers network service dependencies by bundling TCP/UDP
+// flows in the Linux kernel with eBPF.
+package tracer
+
+import (
+	"bytes"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"maps"
+	"net/netip"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
+	"github.com/cilium/ebpf/rlimit"
+	"golang.org/x/sys/unix"
+)
+
+const (
+	defaultMaxFlows = 16384
+	// flipGrace is how long to wait after switching the active flow map so
+	// that BPF programs that read the old index finish their updates.
+	flipGrace = 20 * time.Millisecond
+)
+
+// Options configures a Tracer.
+type Options struct {
+	// NetNS restricts tracing to the network namespace with this inode
+	// number. Zero traces all network namespaces.
+	NetNS uint32
+	// MaxFlows is the capacity of the in-kernel flow table per interval.
+	MaxFlows uint32
+	// OwnerScanInterval is how often the owners of listening sockets are
+	// resolved by walking the file descriptors of all processes.
+	OwnerScanInterval time.Duration
+	// TraceSelf includes the flows of the tracing process itself, which are
+	// excluded by default. It is meant for testing.
+	TraceSelf bool
+	Logger    *slog.Logger
+}
+
+// Tracer loads the BPF programs and collects bundled flows.
+type Tracer struct {
+	opts  Options
+	log   *slog.Logger
+	colls []*ebpf.Collection
+	progs map[string]*ebpf.Program
+	links []link.Link
+	udp   bool
+
+	flowMaps    [2]*ebpf.Map
+	listenPorts *ebpf.Map
+	activeIdx   *ebpf.Variable
+	flowDrops   *ebpf.Variable
+	adopted     *ebpf.Variable
+
+	iterTCP      *link.Iter
+	iterUDP      *link.Iter
+	iterTaskFile *link.Iter
+
+	mu     sync.Mutex
+	idx    uint32
+	owners map[sockAddrKey]owner
+	// ownerless are the listeners whose owner the last scan could not find,
+	// e.g. sockets of the kernel. They do not trigger another scan.
+	ownerless   map[sockAddrKey]bool
+	lastOwnScan time.Time
+	lastAdopted uint64
+	statsCloser io.Closer
+}
+
+type sockAddrKey struct {
+	proto Proto
+	netns uint32
+	addr  [16]uint8
+	port  uint16
+}
+
+type owner struct {
+	pid      uint32
+	comm     string
+	cgroupID uint64
+}
+
+// udpPrograms hook kernel functions with BPF trampolines (fentry). They are
+// loaded separately so that TCP tracing keeps working on kernels that do not
+// support trampolines (e.g. arm64 before Linux 6.0).
+var udpPrograms = []struct{ prog, target string }{
+	{bpfProgShawkIpSendSkb, "ip_send_skb"},
+	{bpfProgShawkIp6SendSkb, "ip6_send_skb"},
+	{bpfProgShawkSkbConsumeUdp, "skb_consume_udp"},
+}
+
+// New loads and attaches the BPF programs. It requires CAP_BPF and
+// CAP_PERFMON (or root) and a kernel with BTF.
+func New(opts Options) (*Tracer, error) {
+	if opts.MaxFlows == 0 {
+		opts.MaxFlows = defaultMaxFlows
+	}
+	if opts.OwnerScanInterval == 0 {
+		opts.OwnerScanInterval = time.Minute
+	}
+	if opts.Logger == nil {
+		opts.Logger = slog.New(slog.DiscardHandler)
+	}
+	// Kernels before 5.11 charge BPF memory to RLIMIT_MEMLOCK.
+	if err := rlimit.RemoveMemlock(); err != nil {
+		return nil, fmt.Errorf("removing memlock limit: %w", err)
+	}
+
+	spec, err := loadBpf()
+	if err != nil {
+		return nil, err
+	}
+	t := &Tracer{
+		opts:   opts,
+		log:    opts.Logger,
+		owners: map[sockAddrKey]owner{},
+	}
+	if err := t.configure(spec); err != nil {
+		return nil, err
+	}
+
+	if err := t.loadCore(spec); err != nil {
+		t.Close()
+		return nil, err
+	}
+	if err := t.loadUDP(spec); err != nil {
+		t.log.Warn("UDP tracing is disabled", "error", err)
+	} else {
+		t.udp = true
+	}
+
+	// Adopt connections and listeners that existed before the tracer
+	// started, then resolve their owners.
+	if _, err := t.scanSockets(); err != nil {
+		t.Close()
+		return nil, err
+	}
+	if err := t.scanOwners(); err != nil {
+		t.Close()
+		return nil, err
+	}
+	return t, nil
+}
+
+// configure sets the load-time variables and the map sizes.
+func (t *Tracer) configure(spec *ebpf.CollectionSpec) error {
+	low, high := ephemeralPortRange()
+	self := uint32(os.Getpid())
+	if t.opts.TraceSelf {
+		self = ^uint32(0)
+	}
+	vars := map[string]any{
+		bpfVarSelfTgid:    self,
+		bpfVarTargetNetns: t.opts.NetNS,
+		bpfVarEphPortLow:  low,
+		bpfVarEphPortHigh: high,
+	}
+	for name, v := range vars {
+		if err := spec.Variables[name].Set(v); err != nil {
+			return fmt.Errorf("setting %s: %w", name, err)
+		}
+	}
+	for _, name := range []string{bpfMapFlows0, bpfMapFlows1} {
+		spec.Maps[name].MaxEntries = t.opts.MaxFlows
+	}
+	spec.Maps[bpfMapFlows].InnerMap.MaxEntries = t.opts.MaxFlows
+	return nil
+}
+
+// loadCore loads the maps, the TCP programs and the iterators.
+func (t *Tracer) loadCore(spec *ebpf.CollectionSpec) error {
+	core := spec.Copy()
+	for _, p := range udpPrograms {
+		delete(core.Programs, p.prog)
+	}
+	coll, err := ebpf.NewCollection(core)
+	if err != nil {
+		return fmt.Errorf("loading BPF objects: %w", verifierError(err))
+	}
+	t.colls = append(t.colls, coll)
+	t.progs = maps.Clone(coll.Programs)
+	t.flowMaps = [2]*ebpf.Map{coll.Maps[bpfMapFlows0], coll.Maps[bpfMapFlows1]}
+	t.listenPorts = coll.Maps[bpfMapListenPorts]
+	t.activeIdx = coll.Variables[bpfVarActiveIdx]
+	t.flowDrops = coll.Variables[bpfVarFlowDrops]
+	t.adopted = coll.Variables[bpfVarAdoptedUnowned]
+
+	l, err := link.AttachTracing(link.TracingOptions{Program: coll.Programs[bpfProgShawkInetSockSetState]})
+	if err != nil {
+		return fmt.Errorf("attaching inet_sock_set_state: %w", err)
+	}
+	t.links = append(t.links, l)
+
+	if t.iterTCP, err = link.AttachIter(link.IterOptions{Program: coll.Programs[bpfProgShawkIterTcp]}); err != nil {
+		return fmt.Errorf("attaching TCP iterator: %w", err)
+	}
+	t.links = append(t.links, t.iterTCP)
+	if t.iterUDP, err = link.AttachIter(link.IterOptions{Program: coll.Programs[bpfProgShawkIterUdp]}); err != nil {
+		return fmt.Errorf("attaching UDP iterator: %w", err)
+	}
+	t.links = append(t.links, t.iterUDP)
+	if t.iterTaskFile, err = link.AttachIter(link.IterOptions{Program: coll.Programs[bpfProgShawkIterTaskFile]}); err != nil {
+		return fmt.Errorf("attaching task_file iterator: %w", err)
+	}
+	t.links = append(t.links, t.iterTaskFile)
+	return nil
+}
+
+// loadUDP loads the UDP programs sharing the maps of the core collection.
+func (t *Tracer) loadUDP(spec *ebpf.CollectionSpec) error {
+	udp := spec.Copy()
+	want := map[string]bool{}
+	for _, p := range udpPrograms {
+		want[p.prog] = true
+	}
+	for name := range udp.Programs {
+		if !want[name] {
+			delete(udp.Programs, name)
+		}
+	}
+	coll, err := ebpf.NewCollectionWithOptions(udp, ebpf.CollectionOptions{MapReplacements: t.colls[0].Maps})
+	if err != nil {
+		return fmt.Errorf("loading UDP programs: %w", verifierError(err))
+	}
+	var links []link.Link
+	for _, p := range udpPrograms {
+		l, err := link.AttachTracing(link.TracingOptions{Program: coll.Programs[p.prog]})
+		if err != nil {
+			for _, l := range links {
+				l.Close()
+			}
+			coll.Close()
+			return fmt.Errorf("attaching %s: %w", p.target, err)
+		}
+		links = append(links, l)
+	}
+	t.colls = append(t.colls, coll)
+	t.links = append(t.links, links...)
+	for name, p := range coll.Programs {
+		t.progs[name] = p
+	}
+	return nil
+}
+
+func verifierError(err error) error {
+	var verr *ebpf.VerifierError
+	if errors.As(err, &verr) {
+		return fmt.Errorf("%+v", verr)
+	}
+	return err
+}
+
+// UDPEnabled reports whether UDP datagrams are traced.
+func (t *Tracer) UDPEnabled() bool { return t.udp }
+
+// Close detaches and unloads the BPF programs.
+func (t *Tracer) Close() error {
+	for _, l := range t.links {
+		l.Close()
+	}
+	t.links = nil
+	if t.statsCloser != nil {
+		t.statsCloser.Close()
+		t.statsCloser = nil
+	}
+	for _, c := range t.colls {
+		c.Close()
+	}
+	t.colls = nil
+	return nil
+}
+
+// Collect closes the current interval and returns the bundled flows and the
+// listening sockets observed in it.
+func (t *Tracer) Collect() (*Snapshot, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	// Walking sockets accounts the traffic of long-lived connections into the
+	// current interval and refreshes the listening ports.
+	listeners, err := t.scanSockets()
+	if err != nil {
+		return nil, err
+	}
+	var adopted uint64
+	if err := t.adopted.Get(&adopted); err != nil {
+		return nil, err
+	}
+	if adopted != t.lastAdopted || time.Since(t.lastOwnScan) >= t.opts.OwnerScanInterval || t.hasNewListener(listeners) {
+		if err := t.scanOwners(); err != nil {
+			return nil, err
+		}
+		t.lastAdopted = adopted
+		t.ownerless = map[sockAddrKey]bool{}
+		for i := range listeners {
+			if k := listenerKey(&listeners[i]); !t.hasOwner(k) {
+				t.ownerless[k] = true
+			}
+		}
+	}
+	for i := range listeners {
+		if o, ok := t.owners[listenerKey(&listeners[i])]; ok {
+			listeners[i].PID = o.pid
+			listeners[i].Comm = o.comm
+			listeners[i].CgroupID = o.cgroupID
+		}
+	}
+
+	flows, err := t.flip()
+	if err != nil {
+		return nil, err
+	}
+	flows = t.attribute(flows)
+	var drops uint64
+	if err := t.flowDrops.Get(&drops); err != nil {
+		return nil, err
+	}
+	return &Snapshot{Flows: flows, Listeners: listeners, Drops: drops}, nil
+}
+
+// flip switches the active flow map and drains the previous one.
+func (t *Tracer) flip() ([]Flow, error) {
+	old := t.idx
+	next := old ^ 1
+	if err := t.activeIdx.Set(next); err != nil {
+		return nil, fmt.Errorf("switching flow map: %w", err)
+	}
+	t.idx = next
+	time.Sleep(flipGrace)
+
+	m := t.flowMaps[old]
+	var (
+		key   bpfShawkFlowKey
+		val   bpfShawkFlowStats
+		flows []Flow
+		keys  []bpfShawkFlowKey
+	)
+	it := m.Iterate()
+	for it.Next(&key, &val) {
+		keys = append(keys, key)
+		flows = append(flows, convertFlow(&key, &val))
+	}
+	if err := it.Err(); err != nil {
+		return nil, fmt.Errorf("reading flows: %w", err)
+	}
+	for i := range keys {
+		if err := m.Delete(&keys[i]); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			return nil, fmt.Errorf("deleting flow: %w", err)
+		}
+	}
+	return flows, nil
+}
+
+// attribute assigns incoming TCP flows to the owner of the listening
+// socket, drops the flows of the tracer itself and merges flows that end up
+// with the same key.
+func (t *Tracer) attribute(flows []Flow) []Flow {
+	self := uint32(os.Getpid())
+	merged := make(map[FlowKey]int, len(flows))
+	out := flows[:0]
+	for _, f := range flows {
+		if f.Direction == DirIn && f.Proto == ProtoTCP {
+			if o, ok := t.listenerOwner(f.Proto, f.NetNS, f.LocalAddr, f.Port); ok {
+				f.Comm = o.comm
+				f.CgroupID = o.cgroupID
+				f.PID = o.pid
+			}
+		}
+		if !t.opts.TraceSelf && f.PID == self {
+			continue
+		}
+		if i, ok := merged[f.FlowKey]; ok {
+			out[i].FlowStats.Add(f.FlowStats)
+			continue
+		}
+		merged[f.FlowKey] = len(out)
+		out = append(out, f)
+	}
+	return out
+}
+
+// listenerOwner finds the owner of the socket listening on addr:port,
+// falling back to wildcard listeners.
+func (t *Tracer) listenerOwner(proto Proto, netns uint32, addr netip.Addr, port uint16) (owner, bool) {
+	for _, a := range []netip.Addr{addr, netip.IPv4Unspecified(), netip.IPv6Unspecified()} {
+		if o, ok := t.owners[sockAddrKey{proto: proto, netns: netns, addr: a.As16(), port: port}]; ok {
+			return o, true
+		}
+	}
+	return owner{}, false
+}
+
+func convertFlow(k *bpfShawkFlowKey, v *bpfShawkFlowStats) Flow {
+	return Flow{
+		FlowKey: FlowKey{
+			Direction:  Direction(k.Direction),
+			Proto:      Proto(k.Proto),
+			LocalAddr:  addrFrom16(k.Laddr),
+			RemoteAddr: addrFrom16(k.Raddr),
+			Port:       k.Port,
+			NetNS:      k.Netns,
+			CgroupID:   k.CgroupId,
+			Comm:       commString(k.Comm),
+		},
+		FlowStats: FlowStats{
+			Conns:      uint64(v.Conns),
+			ConnFails:  uint64(v.ConnFails),
+			OpenConns:  uint64(v.OpenConns),
+			BytesSent:  v.BytesSent,
+			BytesRecv:  v.BytesRecv,
+			MsgsSent:   uint64(v.MsgsSent),
+			MsgsRecv:   uint64(v.MsgsRecv),
+			Retrans:    uint64(v.Retrans),
+			RTTSumUs:   v.RttSumUs,
+			RTTSamples: uint64(v.RttSamples),
+			PID:        v.Pid,
+		},
+	}
+}
+
+// scanSockets walks TCP and UDP sockets and returns the listening sockets.
+func (t *Tracer) scanSockets() ([]Listener, error) {
+	if err := clearMap(t.listenPorts); err != nil {
+		return nil, err
+	}
+	var listeners []Listener
+	for _, it := range []*link.Iter{t.iterTCP, t.iterUDP} {
+		recs, err := readIter(it)
+		if err != nil {
+			return nil, err
+		}
+		for i := range recs {
+			if recs[i].Type != recListener {
+				continue
+			}
+			listeners = append(listeners, Listener{
+				Proto: Proto(recs[i].Proto),
+				Addr:  addrFrom16(recs[i].Addr),
+				Port:  recs[i].Port,
+				NetNS: recs[i].Netns,
+			})
+		}
+	}
+	return listeners, nil
+}
+
+// scanOwners walks the file descriptors of all processes. It assigns owners
+// to adopted connections in the kernel and caches the owners of listening
+// sockets.
+func (t *Tracer) scanOwners() error {
+	recs, err := readIter(t.iterTaskFile)
+	if err != nil {
+		return err
+	}
+	owners := make(map[sockAddrKey]owner, len(recs))
+	for i := range recs {
+		r := &recs[i]
+		if r.Type != recOwner {
+			continue
+		}
+		k := sockAddrKey{proto: Proto(r.Proto), netns: r.Netns, addr: r.Addr, port: r.Port}
+		if cur, ok := owners[k]; ok && !preferOwner(r.Pid, cur.pid) {
+			continue
+		}
+		owners[k] = owner{pid: r.Pid, comm: commString(r.Comm), cgroupID: r.CgroupId}
+	}
+	t.owners = owners
+	t.lastOwnScan = time.Now()
+	return nil
+}
+
+// preferOwner reports whether a process should be preferred to the current
+// owner of a socket shared by several processes. A socket-activated service
+// shares its listener with systemd (PID 1); the service is preferred. Among
+// forked workers, the parent (the lowest PID) is preferred.
+func preferOwner(pid, cur uint32) bool {
+	if cur == 1 {
+		return pid != 1
+	}
+	return pid != 1 && pid < cur
+}
+
+// hasNewListener reports whether a listener appeared whose owner is not
+// known yet.
+func (t *Tracer) hasNewListener(listeners []Listener) bool {
+	for i := range listeners {
+		k := listenerKey(&listeners[i])
+		if !t.hasOwner(k) && !t.ownerless[k] {
+			return true
+		}
+	}
+	return false
+}
+
+func (t *Tracer) hasOwner(k sockAddrKey) bool {
+	_, ok := t.owners[k]
+	return ok
+}
+
+func listenerKey(l *Listener) sockAddrKey {
+	return sockAddrKey{proto: l.Proto, netns: l.NetNS, addr: l.Addr.As16(), port: l.Port}
+}
+
+const (
+	recListener = 1
+	recOwner    = 2
+)
+
+func readIter(it *link.Iter) ([]bpfShawkIterRec, error) {
+	rd, err := it.Open()
+	if err != nil {
+		return nil, fmt.Errorf("opening iterator: %w", err)
+	}
+	defer rd.Close()
+	buf, err := io.ReadAll(rd)
+	if err != nil {
+		return nil, fmt.Errorf("reading iterator: %w", err)
+	}
+	size := binary.Size(bpfShawkIterRec{})
+	if len(buf)%size != 0 {
+		return nil, fmt.Errorf("iterator output has unexpected length %d", len(buf))
+	}
+	recs := make([]bpfShawkIterRec, len(buf)/size)
+	if err := binary.Read(bytes.NewReader(buf), binary.NativeEndian, recs); err != nil {
+		return nil, fmt.Errorf("decoding iterator output: %w", err)
+	}
+	return recs, nil
+}
+
+func clearMap(m *ebpf.Map) error {
+	var (
+		key  bpfShawkListenKey
+		val  uint8
+		keys []bpfShawkListenKey
+	)
+	it := m.Iterate()
+	for it.Next(&key, &val) {
+		keys = append(keys, key)
+	}
+	if err := it.Err(); err != nil {
+		return err
+	}
+	for i := range keys {
+		if err := m.Delete(&keys[i]); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			return err
+		}
+	}
+	return nil
+}
+
+// ProgramStat is the cumulative run time of a BPF program.
+type ProgramStat struct {
+	Name     string
+	RunCount uint64
+	Runtime  time.Duration
+}
+
+// EnableStats turns on the kernel's run time accounting of BPF programs,
+// which has a small overhead of its own.
+func (t *Tracer) EnableStats() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.statsCloser != nil {
+		return nil
+	}
+	c, err := ebpf.EnableStats(uint32(unix.BPF_STATS_RUN_TIME))
+	if err != nil {
+		return err
+	}
+	t.statsCloser = c
+	return nil
+}
+
+// ProgramStats returns the run time statistics of the attached programs.
+func (t *Tracer) ProgramStats() ([]ProgramStat, error) {
+	var out []ProgramStat
+	for name, prog := range t.progs {
+		s, err := prog.Stats()
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ProgramStat{Name: name, RunCount: s.RunCount, Runtime: s.Runtime})
+	}
+	return out, nil
+}
+
+// ephemeralPortRange returns the local port range used for ephemeral ports.
+func ephemeralPortRange() (uint16, uint16) {
+	low, high := uint16(32768), uint16(60999)
+	b, err := os.ReadFile("/proc/sys/net/ipv4/ip_local_port_range")
+	if err != nil {
+		return low, high
+	}
+	f := strings.Fields(string(b))
+	if len(f) != 2 {
+		return low, high
+	}
+	l, err1 := strconv.ParseUint(f[0], 10, 16)
+	h, err2 := strconv.ParseUint(f[1], 10, 16)
+	if err1 != nil || err2 != nil {
+		return low, high
+	}
+	return uint16(l), uint16(h)
+}

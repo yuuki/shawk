@@ -1,89 +1,44 @@
-export GO111MODULE=on
-export GOOS=linux
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+LDFLAGS := -s -w -X github.com/yuuki/shawk/internal/version.Version=$(VERSION)
+GO ?= go
 
-PROJECT = shawk
-PKG = github.com/yuuki/$(PROJECT)
-COMMIT = $$(git describe --tags --always)
-DATE = $$(date -u '+%Y-%m-%d_%H:%M:%S')
-BUILD_LDFLAGS = -X $(PKG)/version.commit=$(COMMIT) -X $(PKG)/version.date=$(DATE)
-CREDITS = ./assets/CREDITS
+.PHONY: all
+all: build
 
-GOLINT = $$(go env GOPATH)/bin/golint -set_exit_status $$(go list -mod=vendor ./...)
-GOTEST = go test -v ./...
+.PHONY: generate
+generate: ## compile the BPF programs (needs clang)
+	$(GO) generate ./internal/tracer/
 
-DOCKER_IMAGE_NAME="shawk-test"
-DOCKER_CONTAINER_NAME="shawk-test-container"
-DOCKER = docker run --rm -v $$(PWD):/go/src/github.com/yuuki/shawk --name $(DOCKER_CONTAINER_NAME) $(DOCKER_IMAGE_NAME)
-container = docker ps -a -q -f "name=$(DOCKER_CONTAINER_NAME)"
+.PHONY: build
+build:
+	CGO_ENABLED=0 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o shawk ./cmd/shawk
 
-all: init build
+.PHONY: vet
+vet:
+	$(GO) vet ./...
+	test -z "$$(gofmt -l .)"
+
+.PHONY: test
+test: ## unit tests; tests that load BPF programs are skipped without root
+	$(GO) test ./...
+
+.PHONY: test-root
+test-root: ## tests that load the BPF programs into the running kernel
+	$(GO) test -c -o tracer.test ./internal/tracer/
+	sudo ./tracer.test -test.v -test.count=1
+	rm -f tracer.test
+
+.PHONY: e2e
+e2e: build ## multi-host test with network namespaces
+	sudo test/e2e/run.sh ./shawk
+
+rocky9.btf:
+	scripts/fetch-kernel-btf.sh "" $@
+
+.PHONY: compat
+compat: rocky9.btf ## check the BPF programs against the Rocky Linux 9 kernel
+	SHAWK_TARGET_BTF=$(CURDIR)/rocky9.btf $(GO) test -run TestKernelCompatibility -v ./internal/tracer/
 
 .PHONY: clean
 clean:
-	@if [ "$(container || true)" != "" ] ; then \
-		docker rm -f $(DOCKER_CONTAINER_NAME) 2>/dev/null; \
-	fi
-
-.PHONY: build
-build: clean
-	go generate ./...
-	$(DOCKER) go build -ldflags="$(BUILD_LDFLAGS)"
-	go mod tidy
-
-.PHONY: install
-install:
-	go install $(PKG)/cmd/...
-
-.PHONY: test
-test:
-	$(DOCKER) $(GOTEST)
-	go mod tidy
-
-.PHONY: ci-test
-ci-test:
-	$(GOTEST)
-
-.PHONY: lint
-lint:
-	# golangci-lint run ./... error: failed prerequisites:
-	$(DOCKER) $(GOLINT)
-
-.PHONY: ci-lint
-ci-lint:
-	$(GOLINT)
-
-.PHONY: credits
-credits: deps
-	gocredits > $(CREDITS)
-ifneq (,$(git status -s $(CREDITS)))
-	go generate -x ./...
-endif
-
-.PHONY: release
-release: credits
-	_tools/release
-
-init: deps docker-build
-
-.PHONY: deps
-deps:
-	sh -c '\
-		tmpdir=$$(mktemp -d); \
-		cd $$tmpdir; \
-		go get -u \
-			github.com/rakyll/statik \
-			golang.org/x/lint/golint \
-			github.com/x-motemen/gobump/cmd/gobump \
-			github.com/Songmu/ghch/cmd/ghch \
-			github.com/Songmu/gocredits/cmd/gocredits \
-			github.com/goware/modvendor; \
-		rm -rf $$tmpdir'
-
-.PHONY: docker-build
-docker-build:
-	docker build -t $(DOCKER_IMAGE_NAME) .
-
-# Run to copy .c and .h files after receiving PR by Renovate.
-.PHONY: modvendor
-modvendor:
-	modvendor -copy="**/*.c **/*.h" -v
+	rm -f shawk tracer.test rocky9.btf

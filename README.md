@@ -1,97 +1,126 @@
-# Shawk
+# shawk
 
-[![GitHub Actions status](https://github.com/yuuki/shawk/workflows/Test/badge.svg)](https://github.com/yuuki/shawk/actions)
-[![Latest Version](http://img.shields.io/github/release/yuuki/shawk.svg?style=flat-square)](https://github.com/yuuki/shawk/releases)
-[![Go Report Card](https://goreportcard.com/badge/github.com/yuuki/shawk)](https://goreportcard.com/report/github.com/yuuki/shawk)
-[![License](http://img.shields.io/:license-mit-blue.svg)](http://doge.mit-license.org)
+<img alt="shawk-logo" src="docs/images/logo.png" width="160">
 
-<img alt="shawk-logo" src="https://github.com/yuuki/shawk/raw/master/doc/images/logo.png" width="200">
+**A dependency ledger for your servers.** shawk records which process talks
+to which network service on every host with eBPF, keeps the record for
+years, and answers the questions you ask before changing a system:
 
-----
+```console
+$ shawk who-uses db-01:5432 -depth 2
+db-01:5432/tcp (10.0.0.10)  postgres (postgresql.service)  conns=1.2M bytes=12.4GiB/3.1GiB last=just now
+├── app-01 (10.0.0.11)  puma (app.service)  conns=1.2M open=40 bytes=3.1GiB/12.4GiB last=just now
+│   └── app-01:8080/tcp (10.0.0.11)  puma (app.service)  conns=8.1M last=just now
+│       └── lb-01 (10.0.0.5)  haproxy (haproxy.service)  conns=8.1M last=just now
+├── batch-03 (10.0.0.31)  ruby (monthly-report.service)  conns=12 last=2026-10-01
+└── 10.0.8.7  (no agent)  conns=3 last=2026-08-14
 
-Shawk is a socket-based tracing infrastructure for discovering network dependencies among processes in distributed applications. Shawk has an architecture of monitoring network sockets, which are endpoints of TCP connections, to trace the dependencies.
+$ shawk can-i-remove old-cache-02
+NO: old-cache-02 is still used by remote processes since 2026-09-30 12:00:00:
+old-cache-02:11211/tcp (10.0.0.42)  memcached (memcached.service)  conns=31 last=3d ago
+└── app-07 (10.0.0.17)  php-fpm (php-fpm.service)  conns=31 last=3d ago
+```
 
-## Contributions
+* **Zero instrumentation.** Dependencies are observed at TCP/UDP sockets in
+  the kernel, so every process is covered — your code, middleware,
+  third-party software, cron jobs — whatever language it is written in.
+* **Low overhead, always on.** Flows to the same service are bundled in the
+  kernel; TCP is traced at connection state changes only, with no hook on the
+  send/receive path. Rare dependencies such as monthly batch jobs are not
+  missed by sampling.
+* **History, not just a live map.** Each host keeps a ledger of its
+  dependencies with first/last seen times and per-minute/hour/day activity.
+* **No central database.** Each agent owns the ledger of its host; queries
+  walk dependencies across agents.
 
-- As long as applications use the TCP protocol stack in the Linux kernel, the dependencies are discovered by Transtracer.
-- The monitoring does not affect the network delay of the applications because the processing that only reads the connection information from network sockets is independent of the application communication.
-
-## System Overview
-
-![System structure](/doc/images/system_structure.png "System structure")
-
-This figure shows the system conﬁguration for matching the connection information related to multiple hosts and for creating a dependency graph. Tracer running on each host sends connection information to the central Connection Management DataBase (CMDB).
-
-![Socket diagnosis in polling mode](/doc/images/socket_diagnosis.png "Socket diagnosis in polling mode")
-
-This figure shows how to retrieve socket information for TCP connections. When the Tracer process runs on the host, the Tracer process queries the Linux kernel and obtains a snapshot of the active TCP connection status from the socket corresponding to each connection. At the same time, the Tracer process acquires the process information corresponding to each connection. Then it links each connection and each process.
-
-## Getting Started
-
-See [Quickstart document](./doc/quickstart.md).
+shawk implements the socket-based tracing with in-kernel flow bundling from
+[Low Overhead TCP/UDP Socket-based Tracing for Discovering Network Services
+Dependencies](https://yuuk.io/papers/transtracer_jip2022.pdf) (JIP, 2022).
+See [docs/design.md](docs/design.md) for the design.
 
 ## Requirements
 
-- OS: Linux
-- RDBMS: PostgreSQL 10+
+* Linux 5.14 or later with BTF (`/sys/kernel/btf/vmlinux`), e.g. Rocky Linux /
+  RHEL 9, Ubuntu 22.04+, Debian 12+. Tested on x86_64; arm64 is expected to
+  work but untested.
+* UDP tracing additionally needs BPF trampolines (fentry), available on
+  x86_64 and on arm64 since Linux 6.0. Without them only TCP is traced.
+* The agent runs as root.
+
+## Install
+
+shawk is a single static binary.
+
+```bash
+make build                      # builds ./shawk (needs Go only)
+sudo install -m 0755 shawk /usr/local/bin/shawk
+sudo install -m 0644 packaging/systemd/shawk-agent.service /etc/systemd/system/
+sudo systemctl enable --now shawk-agent
+```
+
+Run the agent on every host you want to observe. It listens on TCP port
+7464; open it to the hosts you run queries from. To require a token, write
+it to a file and pass `-token-file` to the agent and the clients (or set
+`SHAWK_TOKEN_FILE`).
 
 ## Usage
 
-```shell-session
-$ shawk --help
-Usage: shawk [options]
+Targets are `HOST[:PORT][/UNIT]` or `HOST[:PORT][/@COMM]`, where `HOST` is a
+host name or an address of a host running the agent.
 
-  A socket-based tracing system for discovering network dependencies in distributed applications.
+| command | |
+|---|---|
+| `shawk agent` | run the agent (see `shawk agent -h` for retention and interval) |
+| `shawk flows` | show bundled flows on this host live, without an agent |
+| `shawk who-uses TARGET [-depth N]` | processes that use services on TARGET, transitively upstream |
+| `shawk deps TARGET [-depth N]` | services that processes on TARGET use, transitively downstream |
+| `shawk can-i-remove TARGET` | whether remote processes used TARGET; exits 1 if so |
+| `shawk unused TARGET` | listening services that nobody used |
+| `shawk diff TARGET -since 24h` | dependencies that appeared or disappeared |
+| `shawk graph TARGET... [-format mermaid\|dot\|json]` | export the dependency graph |
+| `shawk status TARGET` | agent status and BPF program statistics |
 
-Commands:
-  look           show dependencies starting from a specified node.
-  probe          start agent for collecting flows and processes.
-  create-scheme  create CMDB scheme.
+Every query accepts `-since` (default `30d`; units `m`, `h`, `d`, `w`) and
+`-json`.
 
-Options:
-  --version         print version
-  --credits         print credits
-  --help, -h        print help
+```console
+$ shawk deps lb-01 -depth 3
+lb-01 (10.0.0.5)  haproxy (haproxy.service)
+└── app-01:8080/tcp (10.0.0.11)  puma (app.service)  conns=8.1M last=just now
+    ├── db-01:5432/tcp (10.0.0.10)  postgres (postgresql.service)  conns=1.2M open=40 last=just now
+    ├── app-01:6379/tcp (10.0.0.11)  redis-server (redis.service)  conns=8.1M last=just now
+    └── 10.0.0.2:53/udp  (no agent)  msgs=310k last=just now
+
+$ shawk diff app-01 -since 2h
++  puma (app.service)  -> 10.0.0.20:6379/tcp        first seen 2026-10-30 10:12:41
+-  puma (app.service)  -> 10.0.0.21:11211/tcp       last seen 2026-10-29 23:58:02
+
+$ shawk graph app-01 -depth 3 -format mermaid
+flowchart LR
+  ...
 ```
 
-### shawk probe
+## Development
 
-Run a daemon process of scanning connections in polling mode (default).
-
-```shell-session
-# SHAWK_PROBE_MODE=polling SHAWK_PROBE_INTERVAL=1s SHAWK_FLUSH_INTERVAL=10s SHAWK_CMDB_URL=postgres://shawk:password@127.0.0.1:5432/shawk?sslmode=disable&connect_timeout=1 shawk probe
+```bash
+make generate   # compile the BPF programs (needs clang)
+make test       # unit tests
+make test-root  # load the BPF programs into the running kernel (sudo)
+make e2e        # multi-host test with network namespaces (sudo)
+make compat     # check CO-RE relocations against the Rocky Linux 9 kernel
 ```
 
-Run a daemon process in streaming mode, which internaly uses eBPF.
+The generated BPF object (`internal/tracer/bpf_bpfel.o`) is committed, so
+building shawk needs only Go.
 
-```shell-session
-# SHAWK_PROBE_MODE=streaming SHAWK_PROBE_INTERVAL=1s SHAWK_CMDB_URL=postgres://shawk:password@127.0.0.1:5432/shawk?sslmode=disable&connect_timeout=1 shawk probe
-```
+## History
 
-Run scanning connections only once.
-
-```shell-session
-# SHAWK_PROBE_MODE=streaming SHAWK_PROBE_INTERVAL=1s SHAWK_CMDB_URL=postgres://shawk:password@127.0.0.1:5432/shawk?sslmode=disable shawk probe --once
-```
-
-### shawk look
-
-```shell-session
-# SHAWK_CMDB_URL=postgres://shawk:password@127.0.0.1:5432/shawk?sslmode=disable shawk look --ipv4 10.0.0.10
-10.0.0.10:80 (’nginx’, pgid=4656)
-└<-- 10.0.0.11:many (’wrk’, pgid=5982) 10.0.0.10:80 (’nginx’, pgid=4656)
-└--> 10.0.0.12:8080 (’python’, pgid=6111) 10.0.0.10:many (’fluentd’, pgid=2127)
-└--> 10.0.0.13:24224 (’fluentd’, pgid=2001)
-```
-
-## Papers (including proceedings)
-
-1. Yuuki Tsubouchi, Masahiro Furukawa, Ryosoke Matsumoto, Transtracer: Automatically Tracing for Processes Dependencies in Distributed Systems by Monitoring Endpoints of TCP/UDP, IPSJ Internet and Operation Technology Symposium (IOTS2019), Vol. 2019, pp. 64-71, 2019. [[paper](https://yuuk.io/papers/shawk_iots2019.pdf)] [[slide](https://speakerdeck.com/yuukit/udptong-xin-falsezhong-duan-dian-falsejian-shi-niyoruhurosesujian-yi-cun-guan-xi-falsezi-dong-zhui-ji-8bc9ca63-0751-40fd-9ad5-2f1ea692b9b0)]
+shawk started as *Transtracer* ([IOTS 2019](https://yuuk.io/papers/shawk_iots2019.pdf))
+and was rewritten from scratch in 2026, replacing the previous polling and
+streaming probes, the central PostgreSQL CMDB and
+[go-conntracer-bpf](https://github.com/yuuki/go-conntracer-bpf).
 
 ## License
 
-[MIT](LICENSE)
-
-## Author
-
-[yuuki](https://github.com/yuuki)
+The Go code is [MIT](LICENSE). The BPF programs in `internal/tracer/bpf`
+are dual-licensed GPL-2.0-only OR BSD-2-Clause.

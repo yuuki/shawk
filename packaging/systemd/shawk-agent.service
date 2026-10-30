@@ -1,0 +1,22 @@
+[Unit]
+Description=shawk agent: records network dependencies of this host
+Documentation=https://github.com/yuuki/shawk
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/shawk agent -db /var/lib/shawk/ledger.db
+Restart=on-failure
+RestartSec=5s
+StateDirectory=shawk
+# Loading BPF programs needs root; restrict everything else.
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/shawk
+PrivateTmp=yes
+NoNewPrivileges=yes
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target
