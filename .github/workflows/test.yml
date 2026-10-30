@@ -15,10 +15,13 @@ jobs:
           go-version-file: go.mod
       - name: Install tools
         run: sudo apt-get update && sudo apt-get install -y clang llvm rpm2cpio cpio
-      - name: Check that the BPF object is up to date
+      # The object file differs byte by byte between builds of clang, so only
+      # the generated Go bindings are compared. The tests below run with the
+      # object compiled here from source.
+      - name: Compile the BPF programs
         run: |
           go generate ./internal/tracer/
-          git diff --exit-code -- internal/tracer/
+          git diff --exit-code -- 'internal/tracer/*.go'
       - name: Vet
         run: make vet
       - name: Unit tests
