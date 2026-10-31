@@ -8,7 +8,10 @@ permissions:
   contents: write
 
 jobs:
+  test:
+    uses: ./.github/workflows/test.yml
   goreleaser:
+    needs: test
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
@@ -17,7 +20,7 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-      - uses: goreleaser/goreleaser-action@v6
+      - uses: goreleaser/goreleaser-action@v7
         with:
           version: "~> v2"
           args: release --clean

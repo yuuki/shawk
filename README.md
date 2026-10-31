@@ -49,12 +49,16 @@ See [docs/design.md](docs/design.md) for the design.
 
 ## Install
 
-shawk is a single static binary.
+shawk is a single static binary. The deb and rpm packages of a release
+install it as `/usr/bin/shawk` with the systemd unit `shawk-agent.service`.
+To install a build by hand:
 
 ```bash
 make build                      # builds ./shawk (needs Go only)
 sudo install -m 0755 shawk /usr/local/bin/shawk
-sudo install -m 0644 packaging/systemd/shawk-agent.service /etc/systemd/system/
+sed 's|/usr/bin/shawk|/usr/local/bin/shawk|' packaging/systemd/shawk-agent.service |
+  sudo tee /etc/systemd/system/shawk-agent.service >/dev/null
+sudo systemctl daemon-reload
 sudo systemctl enable --now shawk-agent
 ```
 
@@ -117,6 +121,7 @@ make test       # unit tests
 make test-root  # load the BPF programs into the running kernel (sudo)
 make e2e        # multi-host test with network namespaces (sudo)
 make compat     # check CO-RE relocations against the Rocky Linux 9 kernel
+make check-object  # check that the committed BPF object matches the source
 ```
 
 The generated BPF object (`internal/tracer/bpf_bpfel.o`) is committed, so

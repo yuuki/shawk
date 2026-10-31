@@ -3,6 +3,7 @@ package tracer
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -111,4 +112,49 @@ func enumValues(t *testing.T, spec *btf.Spec, name string) map[uint64]bool {
 		}
 	}
 	return values
+}
+
+// TestCommittedObject checks that the BPF object embedded in the binary,
+// which is committed, matches the object given by SHAWK_FRESH_OBJECT,
+// compiled from the current source. The bytes of the object depend on the
+// directory it was built in, so the programs and maps are compared instead.
+func TestCommittedObject(t *testing.T) {
+	path := os.Getenv("SHAWK_FRESH_OBJECT")
+	if path == "" {
+		t.Skip("SHAWK_FRESH_OBJECT is not set")
+	}
+	fresh, err := ebpf.LoadCollectionSpec(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	committed, err := loadBpf()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := "the committed internal/tracer/bpf_bpfel.o does not match the source; run make generate"
+	if len(fresh.Programs) != len(committed.Programs) || len(fresh.Maps) != len(committed.Maps) {
+		t.Fatalf("%s: programs or maps differ", stale)
+	}
+	for name, fp := range fresh.Programs {
+		cp, ok := committed.Programs[name]
+		if !ok {
+			t.Fatalf("%s: program %s is missing", stale, name)
+		}
+		if fp.Type != cp.Type || fp.AttachType != cp.AttachType || fp.AttachTo != cp.AttachTo || fp.License != cp.License {
+			t.Errorf("%s: program %s differs", stale, name)
+		}
+		if f, c := fmt.Sprint(fp.Instructions), fmt.Sprint(cp.Instructions); f != c {
+			t.Errorf("%s: instructions of %s differ", stale, name)
+		}
+	}
+	for name, fm := range fresh.Maps {
+		cm, ok := committed.Maps[name]
+		if !ok {
+			t.Fatalf("%s: map %s is missing", stale, name)
+		}
+		if fm.Type != cm.Type || fm.KeySize != cm.KeySize || fm.ValueSize != cm.ValueSize ||
+			fm.MaxEntries != cm.MaxEntries || fm.Flags != cm.Flags || fmt.Sprint(fm.Contents) != fmt.Sprint(cm.Contents) {
+			t.Errorf("%s: map %s differs", stale, name)
+		}
+	}
 }

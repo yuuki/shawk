@@ -32,6 +32,10 @@ test-root: ## tests that load the BPF programs into the running kernel
 e2e: build ## multi-host test with network namespaces
 	sudo test/e2e/run.sh ./shawk
 
+.PHONY: check-object
+check-object: ## check that the committed BPF object matches the source
+	scripts/check-bpf-object.sh
+
 rocky9.btf:
 	scripts/fetch-kernel-btf.sh "" $@
 
