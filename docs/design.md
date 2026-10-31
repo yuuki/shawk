@@ -57,7 +57,8 @@ on VMs and on-premises hosts (the primary target is Rocky Linux 9, kernel
   incoming edge on the server tells the client address; the agent on that
   address tells which process the client is (and its own clients, and so on).
   When both ends run an agent, an edge is recorded on both hosts, so the
-  history of a decommissioned host survives on its peers.
+  edges of a decommissioned host remain in its peers' ledgers (queries
+  starting at the removed host itself need its agent).
 * Peers without an agent (external clients, managed services) appear as
   addresses.
 
@@ -87,7 +88,10 @@ distinguished (§5.3).
 Per flow and interval the kernel accumulates: established connections,
 failed connection attempts, connections open at the end of the interval,
 bytes sent/received, UDP datagrams, retransmissions and smoothed RTT samples.
-These are the edge weights listed in §2.4 of the paper.
+They cover the edge weights listed in §2.4 of the paper (throughput, RTT,
+messages, errors and connections), except that TCP messages are not counted
+since there is no hook on the data path; failed connection attempts and
+retransmissions stand for errors, and open connections are added.
 
 ### 3.2 TCP: tracepoints and socket iterators only
 
@@ -123,15 +127,18 @@ Consequences compared with the original implementation (kprobes on
   establishment, and the bundling method paid on every message. shawk gets
   both: per-connection cost for short-lived connections, zero per-message cost
   for persistent ones.
-* **Stable ABI.** `inet_sock_set_state` is a tracepoint; no kernel function
-  signature is assumed (e.g. `inet_csk_accept` changed in Linux 6.10).
+* **Stable ABI for TCP.** `inet_sock_set_state` is a tracepoint; no kernel
+  function signature is assumed (e.g. `inet_csk_accept` changed in Linux
+  6.10). The UDP hooks are fentry programs on kernel functions, whose
+  signatures can change.
 * **Works without BPF trampolines** (fentry/fexit), e.g. on kernels that
   restrict ftrace, or on arm64 before Linux 6.0.
 * **Connections that predate the agent are found** (DB connection pools,
   gRPC channels). The original streaming mode never saw them.
-* **IPv6** and **MPTCP** are handled. Go listens with MPTCP by default since
-  1.24; its listening socket is an MPTCP socket whose TCP subflows carry the
-  traffic, so MPTCP listeners are reported as TCP listeners.
+* **IPv6** is handled, and so are **MPTCP listeners**: Go listens with MPTCP
+  by default since 1.24; its listening socket is an MPTCP socket whose TCP
+  subflows carry the traffic, so MPTCP listeners are reported as TCP
+  listeners. MPTCP *clients* are not fully handled (see limitations).
 
 The owner of an incoming connection is a holder of its listening socket.
 The passive open records the cgroup of the accepted socket, which it
@@ -170,20 +177,32 @@ TCP and reports that UDP is not traced.
 Bundled flows are written into one of two hash maps selected through an
 `ARRAY_OF_MAPS`. At every interval user space walks the sockets (so that the
 traffic of long-lived connections lands in the closing interval), flips the
-active index, waits a grace period, and drains the inactive map. Programs
-never write to the map being read.
+active index, and drains the inactive map after an RCU grace period: storing
+the inactive map again in the `ARRAY_OF_MAPS` makes the kernel wait until
+every program that read the old index has finished, so no program writes to
+the map being read.
 
 ### 3.5 Kernel requirements and features used
 
-Linux ≥ 5.14 with BTF (`CONFIG_DEBUG_INFO_BTF`), e.g. Rocky Linux 9.
+The target is Rocky Linux 9 (5.14 with RHEL's backports) and upstream
+Linux with BTF (`CONFIG_DEBUG_INFO_BTF`). The programs load on upstream
+5.14 or later; the features they use are:
 
 | feature | since |
 |---|---|
 | BTF-enabled tracepoints (`tp_btf`) | 5.5 |
+| ring buffer (cgroup events) | 5.8 |
 | BPF iterators `tcp`, `udp`, `task_file` | 5.8 / 5.9 |
 | socket local storage in tracing programs | 5.11 |
 | `bpf_sock_from_file`, `bpf_get_current_task_btf` | 5.11 |
+| cgroup pointer in `sock_cgroup_data` (else the owner of accepted connections is resolved in user space only) | 5.15, RHEL 9 |
+| TCP iterator that locks each socket (else rare double counting) | 5.19, RHEL 9 |
 | fentry (UDP only) | 5.5 on x86_64, 6.0 on arm64 |
+
+What is tested: the programs are loaded and exercised on Ubuntu kernels
+(6.8 to 7.0) in CI, and checked statically against the BTF of the Rocky
+Linux 9.6 kernel. They have not run on an actual Rocky Linux kernel, on
+upstream 5.14 to 5.18, or on arm64.
 
 All struct accesses use CO-RE. `TestKernelCompatibility` checks every
 attach target, helper and CO-RE relocation against the BTF of the Rocky Linux
@@ -261,8 +280,18 @@ servers). Loopback and the host's own addresses refer to the same agent.
   work.
 * **Same port shared by different services** with `SO_REUSEPORT` cannot be
   told apart (§5.3 of the paper); this is rare.
-* **UDP peer-to-peer protocols** where neither side binds a port are recorded
-  with the peer's ephemeral port as the service port.
-* **Clocks**: `first_seen`/`last_seen` use the clock of each agent.
+* **UDP peer-to-peer protocols** where both sides send first are recorded as
+  clients of each other's port. A UDP client socket that existed before the
+  agent started and receives before it sends again is recorded as a server.
+* **MPTCP clients**: an outgoing MPTCP connection that existed before the
+  agent started is not attributed to its process (its subflows have no file
+  descriptor), and additional subflows opened by the kernel's path manager
+  are attributed to a kernel worker.
+* **Flow table capacity**: when more distinct flows than `-max-flows` occur
+  in one interval, e.g. on an internet-facing host, updates are dropped;
+  `can-i-remove` then answers "unknown".
+* **Clocks**: `first_seen`/`last_seen` use the clock of each agent. Wrong
+  timestamps are corrected once the clock is right and the edge is seen
+  again, and pruning is suspended for a day after the clock jumps.
 * The agent API is plain HTTP with an optional bearer token; put it on a
   management network or behind TLS termination.

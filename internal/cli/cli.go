@@ -357,7 +357,7 @@ func runFlows(ctx context.Context, args []string, w io.Writer) error {
 	}
 	defer tr.Close()
 	if !tr.UDPEnabled() {
-		fmt.Fprintln(os.Stderr, "warning: UDP is not traced: this kernel does not support BPF trampolines (fentry)")
+		fmt.Fprintln(os.Stderr, "warning: UDP is not traced: its programs could not be loaded (they need BPF trampolines, fentry)")
 	}
 	ticker := time.NewTicker(*interval)
 	defer ticker.Stop()

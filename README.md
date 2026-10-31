@@ -7,7 +7,7 @@ to which network service on every host with eBPF, keeps the record for
 years, and answers the questions you ask before changing a system:
 
 ```console
-$ shawk who-uses db-01:5432 -depth 2
+$ shawk who-uses db-01:5432 -depth 2 -since 90d
 db-01:5432/tcp (10.0.0.10)  postgres (postgresql.service)  conns=1.2M bytes=12.4GiB/3.1GiB last=just now
 ├── app-01 (10.0.0.11)  puma (app.service)  conns=1.2M open=40 bytes=3.1GiB/12.4GiB last=just now
 │   └── app-01:8080/tcp (10.0.0.11)  puma (app.service)  conns=8.1M last=just now
@@ -27,7 +27,7 @@ old-cache-02:11211/tcp (10.0.0.42)  memcached (memcached.service)  conns=31 last
 * **Low overhead, always on.** Flows to the same service are bundled in the
   kernel; TCP is traced at connection state changes only, with no hook on the
   send/receive path. Rare dependencies such as monthly batch jobs are not
-  missed by sampling.
+  missed by sampling, and `can-i-remove` says when the record has gaps.
 * **History, not just a live map.** Each host keeps a ledger of its
   dependencies with first/last seen times and per-minute/hour/day activity.
 * **No central database.** Each agent owns the ledger of its host; queries
@@ -40,9 +40,13 @@ See [docs/design.md](docs/design.md) for the design.
 
 ## Requirements
 
-* Linux 5.14 or later with BTF (`/sys/kernel/btf/vmlinux`), e.g. Rocky Linux /
-  RHEL 9, Ubuntu 22.04+, Debian 12+. Tested on x86_64. arm64 is untested; the
-  programs use only atomic operations that its JIT supports since 5.14.
+* Linux with BTF (`/sys/kernel/btf/vmlinux`): Rocky Linux / RHEL 9, or
+  upstream 5.14 or later (best 5.19 or later). The programs are tested by
+  loading them on Ubuntu kernels 6.8 to 7.0 and checked statically against
+  the Rocky Linux 9.6 kernel; they have not yet run on a Rocky Linux kernel
+  or on arm64. See [the design](docs/design.md#35-kernel-requirements-and-features-used).
+* The agent must run in the host PID namespace to resolve the owners of
+  sockets.
 * UDP tracing additionally needs BPF trampolines (fentry), available on
   x86_64 and on arm64 since Linux 6.0. Without them only TCP is traced.
 * The agent runs as root.
@@ -84,10 +88,11 @@ host name or an address of a host running the agent.
 | `shawk unused TARGET` | listening services that nobody used |
 | `shawk diff TARGET -since 24h` | dependencies that appeared or disappeared |
 | `shawk graph TARGET... [-format mermaid\|dot\|json]` | export the dependency graph |
-| `shawk status TARGET` | agent status and BPF program statistics |
+| `shawk status TARGET` | agent status, and BPF program statistics when the agent runs with `-bpf-stats` |
 
-Every query accepts `-since` (units `m`, `h`, `d`, `w`) and `-json`. Errors
-exit with status 2.
+Every query accepts `-since` (units `m`, `h`, `d`, `w`; `30d` by default,
+`24h` for `diff` and `7d` for `graph`) and `-json`. Errors exit with status
+2.
 
 Queries follow dependencies by asking the agents at the addresses recorded
 in ledgers. Since those include any client of a service, the CLI only
@@ -102,7 +107,7 @@ lb-01 (10.0.0.5)  haproxy (haproxy.service)
 └── app-01:8080/tcp (10.0.0.11)  puma (app.service)  conns=8.1M last=just now
     ├── db-01:5432/tcp (10.0.0.10)  postgres (postgresql.service)  conns=1.2M open=40 last=just now
     ├── app-01:6379/tcp (10.0.0.11)  redis-server (redis.service)  conns=8.1M last=just now
-    └── 10.0.0.2:53/udp  (no agent)  msgs=310k last=just now
+    └── 10.0.0.2:53/udp  (no agent)  msgs=310.0k last=just now
 
 $ shawk diff app-01 -since 2h
 +  puma (app.service)  -> 10.0.0.20:6379/tcp        first seen 2026-10-30 10:12:41
@@ -116,7 +121,7 @@ flowchart LR
 ## Development
 
 ```bash
-make generate   # compile the BPF programs (needs clang)
+make generate   # compile the BPF programs (needs clang and llvm-strip)
 make test       # unit tests
 make test-root  # load the BPF programs into the running kernel (sudo)
 make e2e        # multi-host test with network namespaces (sudo)
@@ -129,7 +134,7 @@ building shawk needs only Go.
 
 ## History
 
-shawk started as *Transtracer* ([IOTS 2019](https://yuuk.io/papers/shawk_iots2019.pdf))
+shawk started as *Transtracer* ([IOTS 2019](https://yuuk.io/papers/transtracer_iots2019.pdf))
 and was rewritten from scratch in 2026, replacing the previous polling and
 streaming probes, the central PostgreSQL CMDB and
 [go-conntracer-bpf](https://github.com/yuuki/go-conntracer-bpf).

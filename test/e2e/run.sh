@@ -7,7 +7,8 @@
 #                                        app puma ==persistent==> db:5433 postgres
 #                                                         db:9187 exporter (unused)
 #
-# Requires root, iproute2 and python3. Usage: test/e2e/run.sh path/to/shawk
+# Requires root, iproute2, python3, curl and unshare (util-linux).
+# Usage: test/e2e/run.sh path/to/shawk
 set -euo pipefail
 
 SHAWK="$(realpath "${1:?usage: run.sh path/to/shawk}")"
