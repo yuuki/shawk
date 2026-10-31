@@ -454,7 +454,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT client_host, client_service, client_unit, host(client_addr) AS client_addr,\n       server_host, server_service, host(server_addr) AS server_addr, port, proto,\n       observed_by, first_seen, last_seen, client_observed_until, server_observed_until\nFROM shawk_v1.dependencies\nWHERE client_service IN (${src:singlequote}) OR server_service IN (${dst:singlequote})\nORDER BY last_seen DESC\nLIMIT 500"
+          "rawSql": "SELECT client_host, client_service, client_unit, host(client_addr) AS client_addr,\n       server_host, server_service, host(server_addr) AS server_addr, port, proto,\n       observed_by, first_seen, last_seen, client_observed_until, server_observed_until\nFROM shawk_v1.dependencies_between($__timeFrom(), $__timeTo())\nWHERE client_service IN (${src:singlequote}) OR server_service IN (${dst:singlequote})\nORDER BY last_seen DESC\nLIMIT 500"
         }
       ],
       "options": {

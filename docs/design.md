@@ -426,6 +426,7 @@ names in PostgreSQL and Prometheus match.
 | `agent_addrs` | addresses of hosts whose agent reported in the last 5 minutes; used by the connector |
 | `agents` | the latest segment of every host and whether its agent is alive |
 | `unobserved(since, until, tolerance)` | the periods in which each host was not observed; Grafana overlays them as annotations |
+| `dependencies_between(since, until)`, `graph_edges_between`, `graph_nodes_between`, `dependency_changes_between` | the same for the dependencies active in a period. They filter edges before matching them, so a recent window does not scan the history (about 0.3 s instead of 3 s with a million edges); the dashboards and alerts use them |
 
 The connector role writes `shawk` and reads `shawk_v1`; Grafana reads
 `shawk_v1` only (`packaging/postgres`).

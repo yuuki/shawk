@@ -141,9 +141,8 @@ In SQL, against the contract views of `shawk_v1`:
 ```sql
 -- Who used postgres on db-01 in the last 90 days, and were they watching?
 SELECT client_host, client_service, port, last_seen, client_observed_until, observed_by
-FROM shawk_v1.dependencies
-WHERE server_host = 'db-01' AND server_service = 'postgres'
-  AND last_seen > now() - interval '90 days';
+FROM shawk_v1.dependencies_between(now() - interval '90 days', now())
+WHERE server_host = 'db-01' AND server_service = 'postgres';
 
 -- When was db-01 not observed?
 SELECT * FROM shawk_v1.unobserved(now() - interval '90 days', now()) WHERE host = 'db-01';

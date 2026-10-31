@@ -49,7 +49,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT time, change || ': ' || client_service || ' -> ' || server_service || ':' || port AS text, change AS tags\nFROM shawk_v1.dependency_changes\nWHERE $__timeFilter(time)"
+          "rawSql": "SELECT time, change || ': ' || client_service || ' -> ' || server_service || ':' || port AS text, change AS tags\nFROM shawk_v1.dependency_changes_between($__timeFrom(), $__timeTo())"
         }
       },
       {
@@ -111,7 +111,7 @@
           "editorMode": "code",
           "format": "time_series",
           "rawQuery": true,
-          "rawSql": "SELECT $__timeGroupAlias(time, '1h'), change AS metric, count(*) AS value\nFROM shawk_v1.dependency_changes\nWHERE $__timeFilter(time)\nGROUP BY 1, 2\nORDER BY 1"
+          "rawSql": "SELECT $__timeGroupAlias(time, '1h'), change AS metric, count(*) AS value\nFROM shawk_v1.dependency_changes_between($__timeFrom(), $__timeTo())\nGROUP BY 1, 2\nORDER BY 1"
         }
       ],
       "fieldConfig": {
@@ -157,7 +157,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT time, change, client_service, server_service, port, proto\nFROM shawk_v1.dependency_changes\nWHERE $__timeFilter(time)\nORDER BY time DESC\nLIMIT 1000"
+          "rawSql": "SELECT time, change, client_service, server_service, port, proto\nFROM shawk_v1.dependency_changes_between($__timeFrom(), $__timeTo())\nORDER BY time DESC\nLIMIT 1000"
         }
       ],
       "options": {

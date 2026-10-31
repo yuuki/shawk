@@ -657,6 +657,8 @@ group by (src, dst) (
 
 - 共有されるアドレス（§10 から一部解決）：生きている複数のホストが同時に持つアドレス（docker0 の 172.17.0.1 など）は、ホストをまたいで引かない。connector は `agent_addrs` と受け取ったリクエストから、そのアドレスを持つホストが二つ以上あれば同じホストの待ち受けとクライアント側のエッジだけで名前を引き、自ホストも持っていれば相手は自ホスト（`shawk.peer.agent=true`）とみなす。`dependencies` ビューは、二つ以上のホストが重なる期間に持っていたアドレス（`shawk.shared_addrs`。期間は生存の窓 5 分だけ広げる）を含むエッジを同じホストの中だけで突き合わせる（マイグレーション 0005）。エージェントがアドレスのスコープ（bridge・veth・netns）を送る仕組みは §8 の P1 のまま残す。
 
+- 期間で絞る関数（§10 から解決）：`shawk_v1.dependencies_between(since, until)`、`graph_edges_between`、`graph_nodes_between`、`dependency_changes_between` を加えた（マイグレーション 0007。`SECURITY DEFINER`）。期間に活動したエッジだけを先に索引で絞ってから突き合わせる。100 万エッジ（うち直近 1 時間に活動 2 万）で、30 分の窓が 3.2 秒 → 0.27 秒、依存マップ（6 時間）が 3.3 秒 → 0.21 秒になった。同梱のダッシュボードと SQL のアラートはこれらを使う。ビューは互換のために残す。`dependency_changes_between` の「現れた」は、期間に活動したエッジの中での `first_seen` で判定する。
+
 ### 9.3 packaging
 
 - 置き場所：`packaging/prometheus/`（`shawk-rules.yml`、`prometheus.yml`）、`packaging/grafana/`（`dashboards/` と `provisioning/`）、`packaging/collector/config.yaml`、`packaging/postgres/`（`setup.sql`、`grants.sql`）、`packaging/systemd/`（エージェントと Collector のユニット、`agent.env`）。

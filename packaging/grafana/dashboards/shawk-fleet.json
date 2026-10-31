@@ -266,7 +266,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT count(*) AS dependencies FROM shawk_v1.dependency_changes\nWHERE change = 'appeared' AND time > date_trunc('day', now())"
+          "rawSql": "SELECT count(*) AS dependencies\nFROM shawk_v1.dependency_changes_between(date_trunc('day', now()), now())\nWHERE change = 'appeared'"
         }
       ],
       "fieldConfig": {
@@ -395,7 +395,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT time AS first_seen, client_service, server_service, port, proto\nFROM shawk_v1.dependency_changes\nWHERE change = 'appeared' AND time > date_trunc('day', now())\nORDER BY time DESC"
+          "rawSql": "SELECT time AS first_seen, client_service, server_service, port, proto\nFROM shawk_v1.dependency_changes_between(date_trunc('day', now()), now())\nWHERE change = 'appeared'\nORDER BY time DESC"
         }
       ],
       "options": {

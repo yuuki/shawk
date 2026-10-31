@@ -33,7 +33,7 @@ groups:
                 SELECT max(first_seen) AS time,
                        client_service, server_service, port::text AS port,
                        1 AS value
-                FROM shawk_v1.dependencies
+                FROM shawk_v1.dependencies_between(now() - interval '15 minutes', now())
                 WHERE first_seen > now() - interval '15 minutes'
                 GROUP BY client_service, server_service, port
           - refId: B
@@ -71,7 +71,8 @@ groups:
                 SELECT max(last_seen) AS time,
                        client_service, server_service, port::text AS port,
                        1 AS value
-                FROM shawk_v1.dependencies
+                -- Dependencies active in the last 30 minutes.
+                FROM shawk_v1.dependencies_between(now() - interval '30 minutes', now())
                 GROUP BY client_service, server_service, port
                 -- Every edge of the dependency ended 15 to 30 minutes ago,
                 -- and a host that saw it is still observing.

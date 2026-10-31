@@ -207,6 +207,28 @@ func TestPGPipeline(t *testing.T) {
 		t.Errorf("dependency_changes = %v", changes)
 	}
 
+	// The functions over a period return what the views return for the
+	// dependencies active in it.
+	for _, q := range [][2]string{
+		{`SELECT client_service, server_service, port, observed_by FROM shawk_v1.dependencies WHERE last_seen >= $1`,
+			`SELECT client_service, server_service, port, observed_by FROM shawk_v1.dependencies_between($1, now())`},
+		{`SELECT source, target, mainstat FROM shawk_v1.graph_edges WHERE last_seen >= $1`,
+			`SELECT source, target, mainstat FROM shawk_v1.graph_edges_between($1, now())`},
+		{`SELECT change, client_service, server_service FROM shawk_v1.dependency_changes WHERE time >= $1`,
+			`SELECT change, client_service, server_service FROM shawk_v1.dependency_changes_between($1, now())`},
+	} {
+		for _, since := range []time.Time{now.Add(-30 * time.Minute), now.Add(-2 * time.Hour)} {
+			view, fn := queryStrings(t, conn, q[0], since), queryStrings(t, conn, q[1], since)
+			if !slices.Equal(view, fn) || len(fn) == 0 {
+				t.Errorf("since %v:\n%s\n%v\n%s\n%v", since, q[0], view, q[1], fn)
+			}
+		}
+	}
+	if got := queryStrings(t, conn, `SELECT count(*) FROM shawk_v1.dependencies_between($1, $2)`,
+		now.Add(-48*time.Hour), now.Add(-47*time.Hour)); !slices.Equal(got, []string{"0"}) {
+		t.Errorf("dependencies two days ago = %v", got)
+	}
+
 	// The names of peers come from the database after a reload.
 	c2, sink2, _ := func() (*shawkConnector, *consumertest.MetricsSink, *pgx.Conn) {
 		cfg := *c.cfg
@@ -331,6 +353,11 @@ func TestPGReaderRole(t *testing.T) {
 		"SELECT count(*) FROM shawk_v1.agent_addrs",
 		"SELECT count(*) FROM shawk_v1.agents",
 		"SELECT count(*) FROM shawk_v1.unobserved(now() - interval '1 day', now())",
+		"SELECT count(*) FROM shawk_v1.client_endpoints",
+		"SELECT count(*) FROM shawk_v1.dependencies_between(now() - interval '1 day', now())",
+		"SELECT count(*) FROM shawk_v1.graph_edges_between(now() - interval '1 day', now())",
+		"SELECT count(*) FROM shawk_v1.graph_nodes_between(now() - interval '1 day', now())",
+		"SELECT count(*) FROM shawk_v1.dependency_changes_between(now() - interval '1 day', now())",
 	} {
 		var n int
 		if err := conn.QueryRow(ctx, q).Scan(&n); err != nil {
