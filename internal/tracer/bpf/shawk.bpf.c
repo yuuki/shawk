@@ -234,6 +234,24 @@ static __always_inline void set_current_owner(struct shawk_flow_key *key)
 	BPF_CORE_READ_STR_INTO(&key->comm, task, group_leader, comm);
 }
 
+/*
+ * Returns the id of the cgroup v2 a socket belongs to: that of the process
+ * that created it, which an accepted socket inherits from its listener.
+ * Kernels before 5.15 store the cgroup in a tagged union instead; there the
+ * owner is left to user space.
+ */
+static __always_inline __u64 sock_cgroup_id(const struct sock *sk)
+{
+	struct cgroup *cg;
+
+	if (!bpf_core_field_exists(sk->sk_cgrp_data.cgroup))
+		return 0;
+	cg = BPF_CORE_READ(sk, sk_cgrp_data.cgroup);
+	if (!cg)
+		return 0;
+	return BPF_CORE_READ(cg, kn, id);
+}
+
 static __always_inline __u64 task_cgroup_id(struct task_struct *task)
 {
 	return BPF_CORE_READ(task, cgroups, dfl_cgrp, kn, id);
@@ -371,6 +389,11 @@ static __always_inline void on_passive_open(struct sock *sk)
 		return;
 	if (!netns_ok(key.netns))
 		return;
+	/*
+	 * The cgroup tells apart different programs sharing a port with
+	 * SO_REUSEPORT; user space resolves the command name.
+	 */
+	key.cgroup_id = sock_cgroup_id(sk);
 
 	ss = bpf_sk_storage_get(&sock_states, sk, NULL,
 				BPF_SK_STORAGE_GET_F_CREATE);
@@ -462,6 +485,8 @@ static __always_inline void adopt_tcp(struct tcp_sock *tp, struct sock *sk,
 	dir = bpf_map_lookup_elem(&listen_ports, &lk) ? DIR_IN : DIR_OUT;
 	if (build_tcp_key(&key, sk, dir))
 		return;
+	if (dir == DIR_IN)
+		key.cgroup_id = sock_cgroup_id(sk);
 	ss = bpf_sk_storage_get(&sock_states, tp, NULL,
 				BPF_SK_STORAGE_GET_F_CREATE);
 	if (!ss)

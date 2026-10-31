@@ -133,11 +133,15 @@ Consequences compared with the original implementation (kprobes on
   1.24; its listening socket is an MPTCP socket whose TCP subflows carry the
   traffic, so MPTCP listeners are reported as TCP listeners.
 
-The owner of an incoming connection is the owner of the listening socket.
-User space resolves it from `iter/task_file`, preferring a service process to
-systemd (which shares listeners of socket-activated services) and the parent
-to forked workers. This makes the identity of the server side independent of
-which worker thread accepted the connection.
+The owner of an incoming connection is a holder of its listening socket.
+The passive open records the cgroup of the accepted socket, which it
+inherits from the listener and thus from the process that created the
+listener. User space matches it against the holders that `iter/task_file`
+found, so that programs sharing a port with `SO_REUSEPORT` are told apart; a
+socket-activated service is preferred to systemd, which created its
+listener, and the parent to forked workers. When no holder matches (the
+listener was closed or replaced since the last scan), the cgroup still names
+the service and another scan is requested.
 
 ### 3.3 UDP
 

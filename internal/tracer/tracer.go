@@ -12,6 +12,7 @@ import (
 	"maps"
 	"net/netip"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -73,7 +74,10 @@ type Tracer struct {
 
 	mu     sync.Mutex
 	idx    uint32
-	owners map[sockAddrKey]owner
+	owners map[sockAddrKey][]owner
+	// ownerMissing requests an owner scan after an accepted connection
+	// matched no holder of its listener.
+	ownerMissing bool
 	// ownerless are the listeners whose owner the last scan could not find,
 	// e.g. sockets of the kernel. They do not trigger another scan.
 	ownerless   map[sockAddrKey]bool
@@ -128,7 +132,7 @@ func New(opts Options) (*Tracer, error) {
 	t := &Tracer{
 		opts:   opts,
 		log:    opts.Logger,
-		owners: map[sockAddrKey]owner{},
+		owners: map[sockAddrKey][]owner{},
 	}
 	var st unix.Stat_t
 	if err := unix.Stat("/proc/self/ns/net", &st); err != nil {
@@ -323,11 +327,13 @@ func (t *Tracer) Collect() (*Snapshot, error) {
 	if err := t.adopted.Get(&adopted); err != nil {
 		return nil, err
 	}
-	if adopted != t.lastAdopted || time.Since(t.lastOwnScan) >= t.opts.OwnerScanInterval || t.hasNewListener(listeners) {
+	if adopted != t.lastAdopted || t.ownerMissing || time.Since(t.lastOwnScan) >= t.opts.OwnerScanInterval ||
+		t.hasNewListener(listeners) {
 		if err := t.scanOwners(); err != nil {
 			return nil, err
 		}
 		t.lastAdopted = adopted
+		t.ownerMissing = false
 		t.ownerless = map[sockAddrKey]bool{}
 		for i := range listeners {
 			if k := listenerKey(&listeners[i]); !t.hasOwner(k) {
@@ -336,7 +342,7 @@ func (t *Tracer) Collect() (*Snapshot, error) {
 		}
 	}
 	for i := range listeners {
-		if o, ok := t.owners[listenerKey(&listeners[i])]; ok {
+		if o, ok := preferredOwner(t.owners[listenerKey(&listeners[i])]); ok {
 			listeners[i].PID = o.pid
 			listeners[i].Comm = o.comm
 			listeners[i].CgroupID = o.cgroupID
@@ -396,10 +402,15 @@ func (t *Tracer) attribute(flows []Flow) []Flow {
 	out := flows[:0]
 	for _, f := range flows {
 		if f.Direction == DirIn && f.Proto == ProtoTCP {
-			if o, ok := t.listenerOwner(f.Proto, f.NetNS, f.LocalAddr, f.Port); ok {
+			cands := t.listenerOwners(f.Proto, f.NetNS, f.LocalAddr, f.Port)
+			if o, ok := chooseOwner(cands, f.CgroupID); ok {
 				f.Comm = o.comm
 				f.CgroupID = o.cgroupID
 				f.PID = o.pid
+			} else {
+				// The listener is gone or changed hands since the last scan.
+				// The cgroup taken from the socket still names the service.
+				t.ownerMissing = true
 			}
 		}
 		if !t.opts.TraceSelf && f.PID == t.self {
@@ -415,15 +426,68 @@ func (t *Tracer) attribute(flows []Flow) []Flow {
 	return out
 }
 
-// listenerOwner finds the owner of the socket listening on addr:port,
-// falling back to wildcard listeners.
-func (t *Tracer) listenerOwner(proto Proto, netns uint32, addr netip.Addr, port uint16) (owner, bool) {
-	for _, a := range []netip.Addr{addr, netip.IPv4Unspecified(), netip.IPv6Unspecified()} {
-		if o, ok := t.owners[sockAddrKey{proto: proto, netns: netns, addr: a.As16(), port: port}]; ok {
-			return o, true
+// listenerOwners returns the processes holding the socket listening on
+// addr:port, falling back to wildcard listeners of the address family. An
+// IPv4 connection may also be accepted by a dual-stack IPv6 listener.
+func (t *Tracer) listenerOwners(proto Proto, netns uint32, addr netip.Addr, port uint16) []owner {
+	candidates := []netip.Addr{addr, netip.IPv6Unspecified()}
+	if addr.Is4() {
+		candidates = []netip.Addr{addr, netip.IPv4Unspecified(), netip.IPv6Unspecified()}
+	}
+	for _, a := range candidates {
+		if holders := t.owners[sockAddrKey{proto: proto, netns: netns, addr: a.As16(), port: port}]; len(holders) > 0 {
+			return holders
 		}
 	}
-	return owner{}, false
+	return nil
+}
+
+// chooseOwner picks the process an accepted connection belongs to among the
+// holders of its listener. cgroupID is the cgroup of the accepted socket,
+// i.e. of the process that created the listener, or zero if unknown.
+func chooseOwner(cands []owner, cgroupID uint64) (owner, bool) {
+	if len(cands) == 0 {
+		return owner{}, false
+	}
+	// With socket activation, systemd (PID 1) creates the listener and shares
+	// it with the service, so accepted sockets carry systemd's cgroup; the
+	// service is the owner.
+	var (
+		rest      []owner
+		activated bool
+	)
+	for _, c := range cands {
+		if c.pid == 1 {
+			activated = true
+			continue
+		}
+		rest = append(rest, c)
+	}
+	if len(rest) == 0 {
+		return cands[0], true
+	}
+	if cgroupID != 0 && !activated {
+		// Programs sharing a port with SO_REUSEPORT have their own listeners
+		// created in their own cgroups.
+		return preferredOwner(slices.DeleteFunc(rest, func(c owner) bool { return c.cgroupID != cgroupID }))
+	}
+	return preferredOwner(rest)
+}
+
+// preferredOwner picks the owner of a socket held by several processes: the
+// service rather than systemd (PID 1) for socket activation, and the parent
+// (the lowest PID) among forked workers.
+func preferredOwner(cands []owner) (owner, bool) {
+	var (
+		best owner
+		ok   bool
+	)
+	for _, c := range cands {
+		if !ok || preferOwner(c.pid, best.pid) {
+			best, ok = c, true
+		}
+	}
+	return best, ok
 }
 
 func convertFlow(k *bpfShawkFlowKey, v *bpfShawkFlowStats) Flow {
@@ -514,27 +578,23 @@ func (t *Tracer) scanOwners() error {
 	if err != nil {
 		return err
 	}
-	owners := make(map[sockAddrKey]owner, len(recs))
+	owners := make(map[sockAddrKey][]owner, len(recs))
 	for i := range recs {
 		r := &recs[i]
 		if r.Type != recOwner {
 			continue
 		}
 		k := sockAddrKey{proto: Proto(r.Proto), netns: r.Netns, addr: r.Addr, port: r.Port}
-		if cur, ok := owners[k]; ok && !preferOwner(r.Pid, cur.pid) {
+		if slices.ContainsFunc(owners[k], func(o owner) bool { return o.pid == r.Pid }) {
 			continue
 		}
-		owners[k] = owner{pid: r.Pid, comm: commString(r.Comm), cgroupID: r.CgroupId}
+		owners[k] = append(owners[k], owner{pid: r.Pid, comm: commString(r.Comm), cgroupID: r.CgroupId})
 	}
 	t.owners = owners
 	t.lastOwnScan = time.Now()
 	return nil
 }
 
-// preferOwner reports whether a process should be preferred to the current
-// owner of a socket shared by several processes. A socket-activated service
-// shares its listener with systemd (PID 1); the service is preferred. Among
-// forked workers, the parent (the lowest PID) is preferred.
 func preferOwner(pid, cur uint32) bool {
 	if cur == 1 {
 		return pid != 1
@@ -555,8 +615,7 @@ func (t *Tracer) hasNewListener(listeners []Listener) bool {
 }
 
 func (t *Tracer) hasOwner(k sockAddrKey) bool {
-	_, ok := t.owners[k]
-	return ok
+	return len(t.owners[k]) > 0
 }
 
 func listenerKey(l *Listener) sockAddrKey {
