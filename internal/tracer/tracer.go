@@ -60,10 +60,13 @@ type Tracer struct {
 	activeIdx   *ebpf.Variable
 	flowDrops   *ebpf.Variable
 	adopted     *ebpf.Variable
+	selfTgid    *ebpf.Variable
 
 	iterTCP      *link.Iter
 	iterUDP      *link.Iter
 	iterTaskFile *link.Iter
+
+	self uint32 // global thread group id of this process
 
 	mu     sync.Mutex
 	idx    uint32
@@ -139,8 +142,13 @@ func New(opts Options) (*Tracer, error) {
 	}
 
 	// Adopt connections and listeners that existed before the tracer
-	// started, then resolve their owners.
+	// started, then resolve their owners. The first walk also tells the
+	// programs which process the tracer is.
 	if _, err := t.scanSockets(); err != nil {
+		t.Close()
+		return nil, err
+	}
+	if err := t.selfTgid.Get(&t.self); err != nil {
 		t.Close()
 		return nil, err
 	}
@@ -154,12 +162,8 @@ func New(opts Options) (*Tracer, error) {
 // configure sets the load-time variables and the map sizes.
 func (t *Tracer) configure(spec *ebpf.CollectionSpec) error {
 	low, high := ephemeralPortRange()
-	self := uint32(os.Getpid())
-	if t.opts.TraceSelf {
-		self = ^uint32(0)
-	}
 	vars := map[string]any{
-		bpfVarSelfTgid:    self,
+		bpfVarLearnSelf:   !t.opts.TraceSelf,
 		bpfVarTargetNetns: t.opts.NetNS,
 		bpfVarEphPortLow:  low,
 		bpfVarEphPortHigh: high,
@@ -193,6 +197,7 @@ func (t *Tracer) loadCore(spec *ebpf.CollectionSpec) error {
 	t.activeIdx = coll.Variables[bpfVarActiveIdx]
 	t.flowDrops = coll.Variables[bpfVarFlowDrops]
 	t.adopted = coll.Variables[bpfVarAdoptedUnowned]
+	t.selfTgid = coll.Variables[bpfVarSelfTgid]
 
 	l, err := link.AttachTracing(link.TracingOptions{Program: coll.Programs[bpfProgShawkInetSockSetState]})
 	if err != nil {
@@ -258,6 +263,11 @@ func verifierError(err error) error {
 	}
 	return err
 }
+
+// SelfPID returns the process id of the tracer as the kernel sees it. It
+// differs from os.Getpid() when the tracer runs in a PID namespace, in which
+// case processes outside the namespace cannot be resolved as owners.
+func (t *Tracer) SelfPID() uint32 { return t.self }
 
 // UDPEnabled reports whether UDP datagrams are traced.
 func (t *Tracer) UDPEnabled() bool { return t.udp }
@@ -364,7 +374,6 @@ func (t *Tracer) flip() ([]Flow, error) {
 // socket, drops the flows of the tracer itself and merges flows that end up
 // with the same key.
 func (t *Tracer) attribute(flows []Flow) []Flow {
-	self := uint32(os.Getpid())
 	merged := make(map[FlowKey]int, len(flows))
 	out := flows[:0]
 	for _, f := range flows {
@@ -375,7 +384,7 @@ func (t *Tracer) attribute(flows []Flow) []Flow {
 				f.PID = o.pid
 			}
 		}
-		if !t.opts.TraceSelf && f.PID == self {
+		if !t.opts.TraceSelf && f.PID == t.self {
 			continue
 		}
 		if i, ok := merged[f.FlowKey]; ok {

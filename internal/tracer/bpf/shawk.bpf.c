@@ -63,13 +63,19 @@ char LICENSE[] SEC("license") = "Dual BSD/GPL";
 #define MAX_FLOWS 16384 /* overridden by user space */
 
 /* Configuration set by user space before loading. */
-const volatile __u32 self_tgid = 0;
+const volatile bool learn_self = true; /* false to trace the tracer itself */
 const volatile __u32 target_netns = 0; /* 0 means all network namespaces */
 const volatile __u16 eph_port_low = 32768;
 const volatile __u16 eph_port_high = 60999;
 
 /* Runtime state shared with user space. */
 volatile __u32 active_idx = 0;
+/*
+ * The global thread group id of the tracer, learned by the iterators, which
+ * run in the context of the process reading them. os.Getpid() would differ
+ * when the tracer runs in a PID namespace.
+ */
+volatile __u32 self_tgid = 0xffffffff;
 __u64 flow_drops = 0;
 __u64 adopted_unowned = 0;
 
@@ -123,6 +129,12 @@ struct {
 
 /* Make bpf2go emit Go types for the records read from iterators. */
 const struct shawk_iter_rec *unused_iter_rec __attribute__((unused));
+
+static __always_inline void learn_self_tgid(void)
+{
+	if (learn_self)
+		self_tgid = bpf_get_current_pid_tgid() >> 32;
+}
 
 static __always_inline bool netns_ok(__u32 netns)
 {
@@ -466,6 +478,7 @@ int shawk_iter_tcp(struct bpf_iter__tcp *ctx)
 	__u32 netns, srtt;
 	__u8 state;
 
+	learn_self_tgid();
 	if (!skc)
 		return 0;
 	family = BPF_CORE_READ(skc, skc_family);
@@ -709,6 +722,7 @@ int shawk_iter_udp(struct bpf_iter__udp *ctx)
 	__u16 family, port;
 	__u32 netns;
 
+	learn_self_tgid();
 	if (!udp)
 		return 0;
 	sk = (struct sock *)udp;
@@ -751,6 +765,7 @@ int shawk_iter_task_file(struct bpf_iter__task_file *ctx)
 	__u32 netns, tgid;
 	__u8 state;
 
+	learn_self_tgid();
 	if (!task || !file)
 		return 0;
 	sock = bpf_sock_from_file(file);

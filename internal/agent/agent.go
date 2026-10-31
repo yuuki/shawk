@@ -83,6 +83,10 @@ func Run(ctx context.Context, cfg Config) error {
 			cfg.Logger.Warn("enabling BPF run time statistics", "error", err)
 		}
 	}
+	if tr.SelfPID() != uint32(os.Getpid()) {
+		cfg.Logger.Warn("the agent runs in a PID namespace; owners of sockets of processes outside it are not resolved, run it in the host PID namespace",
+			"pid", os.Getpid(), "host_pid", tr.SelfPID())
+	}
 	if !tr.UDPEnabled() {
 		cfg.Logger.Warn("UDP is not traced: this kernel does not support BPF trampolines (fentry)")
 	}
@@ -213,7 +217,7 @@ func (a *Agent) collect(ctx context.Context) error {
 
 	listeners := make([]ledger.ListenerRecord, 0, len(snap.Listeners))
 	for _, l := range snap.Listeners {
-		if l.Proto == tracer.ProtoTCP && l.Port == a.apiPort && l.PID == uint32(os.Getpid()) {
+		if l.Proto == tracer.ProtoTCP && l.Port == a.apiPort && l.PID == a.tracer.SelfPID() {
 			continue
 		}
 		cg := a.cgroups.CgroupPath(l.CgroupID)

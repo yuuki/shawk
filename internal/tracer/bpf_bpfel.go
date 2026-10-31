@@ -92,6 +92,7 @@ const (
 	bpfVarEphPortHigh            = "eph_port_high"
 	bpfVarEphPortLow             = "eph_port_low"
 	bpfVarFlowDrops              = "flow_drops"
+	bpfVarLearnSelf              = "learn_self"
 	bpfVarSelfTgid               = "self_tgid"
 	bpfVarTargetNetns            = "target_netns"
 	bpfVarUnusedIterRec          = "unused_iter_rec"
@@ -168,6 +169,7 @@ type bpfVariableSpecs struct {
 	EphPortHigh    *ebpf.VariableSpec `ebpf:"eph_port_high"`
 	EphPortLow     *ebpf.VariableSpec `ebpf:"eph_port_low"`
 	FlowDrops      *ebpf.VariableSpec `ebpf:"flow_drops"`
+	LearnSelf      *ebpf.VariableSpec `ebpf:"learn_self"`
 	SelfTgid       *ebpf.VariableSpec `ebpf:"self_tgid"`
 	TargetNetns    *ebpf.VariableSpec `ebpf:"target_netns"`
 	UnusedIterRec  *ebpf.VariableSpec `ebpf:"unused_iter_rec"`
@@ -219,6 +221,7 @@ type bpfVariables struct {
 	EphPortHigh    *ebpf.Variable `ebpf:"eph_port_high"`
 	EphPortLow     *ebpf.Variable `ebpf:"eph_port_low"`
 	FlowDrops      *ebpf.Variable `ebpf:"flow_drops"`
+	LearnSelf      *ebpf.Variable `ebpf:"learn_self"`
 	SelfTgid       *ebpf.Variable `ebpf:"self_tgid"`
 	TargetNetns    *ebpf.Variable `ebpf:"target_netns"`
 	UnusedIterRec  *ebpf.Variable `ebpf:"unused_iter_rec"`

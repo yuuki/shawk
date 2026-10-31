@@ -5,8 +5,10 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -338,14 +340,69 @@ func TestExcludeSelf(t *testing.T) {
 	}
 	roundTrip(t, c, 10)
 	c.Close()
+	// Another process connecting to the same server must be recorded.
+	helper := exec.Command(os.Args[0], "-test.run=^TestHelperDial$")
+	helper.Env = append(os.Environ(), "SHAWK_TEST_DIAL="+ln.Addr().String())
+	if out, err := helper.CombinedOutput(); err != nil {
+		t.Fatalf("helper: %v\n%s", err, out)
+	}
+	time.Sleep(100 * time.Millisecond)
+
 	snap, err := tr.Collect()
 	if err != nil {
 		t.Fatal(err)
 	}
 	port := ln.Addr().(*net.TCPAddr).AddrPort().Port()
+	var other int
 	for _, f := range snap.Flows {
-		if f.Port == port {
-			t.Errorf("flow of the tracer itself was recorded: %+v", f)
+		if f.Port != port {
+			continue
 		}
+		if f.PID == tr.SelfPID() || f.Direction == DirIn {
+			t.Errorf("flow of the tracer itself was recorded: %+v", f)
+			continue
+		}
+		other++
 	}
+	if other != 1 {
+		t.Errorf("flows of the helper process = %d, want 1 in %+v", other, snap.Flows)
+	}
+}
+
+// TestExcludeSelfInPIDNamespace runs TestExcludeSelf in a new PID namespace,
+// where os.Getpid() differs from the process id the kernel reports.
+func TestExcludeSelfInPIDNamespace(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root")
+	}
+	if os.Getenv("SHAWK_TEST_IN_PIDNS") != "" {
+		t.Skip("already in a PID namespace")
+	}
+	unshare, err := exec.LookPath("unshare")
+	if err != nil {
+		t.Skip("unshare is not available")
+	}
+	cmd := exec.Command(unshare, "--pid", "--fork", "--mount-proc", os.Args[0], "-test.run=^TestExcludeSelf$", "-test.v")
+	cmd.Env = append(os.Environ(), "SHAWK_TEST_IN_PIDNS=1")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "--- PASS: TestExcludeSelf") {
+		t.Fatalf("TestExcludeSelf did not pass in the PID namespace:\n%s", out)
+	}
+}
+
+// TestHelperDial is run as a separate process by other tests.
+func TestHelperDial(t *testing.T) {
+	addr := os.Getenv("SHAWK_TEST_DIAL")
+	if addr == "" {
+		t.Skip("helper process for other tests")
+	}
+	c, err := net.Dial("tcp4", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTrip(t, c, 10)
+	c.Close()
 }
