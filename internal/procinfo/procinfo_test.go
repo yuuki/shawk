@@ -90,3 +90,14 @@ func statIno(t *testing.T, fi os.FileInfo) uint64 {
 	}
 	return st.Ino
 }
+
+func TestLearn(t *testing.T) {
+	r := &Resolver{paths: map[uint64]string{}, learned: map[uint64]learnedPath{}}
+	r.Learn(42, "/system.slice/monthly-report.service")
+	if got := r.CgroupPath(42); got != "/system.slice/monthly-report.service" {
+		t.Errorf("CgroupPath(42) = %q", got)
+	}
+	if got := r.CgroupPath(43); got != "" {
+		t.Errorf("CgroupPath(43) = %q", got)
+	}
+}

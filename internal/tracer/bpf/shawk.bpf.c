@@ -150,8 +150,16 @@ struct {
 /* Set by user space while iter/udp marks the sockets that exist at startup. */
 volatile __u32 mark_udp_servers = 0;
 
-/* Make bpf2go emit Go types for the records read from iterators. */
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 256 * 1024);
+} cgroup_events SEC(".maps");
+
+__u64 cgroup_event_drops = 0;
+
+/* Make bpf2go emit Go types for the records read by user space. */
 const struct shawk_iter_rec *unused_iter_rec __attribute__((unused));
+const struct shawk_cgroup_event *unused_cgroup_event __attribute__((unused));
 
 static __always_inline void learn_self_tgid(void)
 {
@@ -813,6 +821,33 @@ int shawk_iter_udp(struct bpf_iter__udp *ctx)
 	lk.port = port;
 	bpf_map_update_elem(&udp_listen_ports, &lk, &one, BPF_ANY);
 	emit_listener(seq, sk, netns, port, IPPROTO_UDP);
+	return 0;
+}
+
+/* ------------------------------------------------------------ cgroups --- */
+
+/*
+ * Reports every cgroup v2 created on the host with its path. Flows carry
+ * cgroup ids, and the cgroup of a short-lived job (a cron job's session scope,
+ * a timer's service) is often removed before user space could look up its
+ * path in the cgroup file system.
+ */
+SEC("tp_btf/cgroup_mkdir")
+int BPF_PROG(shawk_cgroup_mkdir, struct cgroup *cgrp, const char *path)
+{
+	struct shawk_cgroup_event *e;
+
+	/* Hierarchy 0 is cgroup v2, whose ids the other programs record. */
+	if (BPF_CORE_READ(cgrp, root, hierarchy_id) != 0)
+		return 0;
+	e = bpf_ringbuf_reserve(&cgroup_events, sizeof(*e), 0);
+	if (!e) {
+		__sync_fetch_and_add(&cgroup_event_drops, 1);
+		return 0;
+	}
+	e->id = BPF_CORE_READ(cgrp, kn, id);
+	bpf_probe_read_kernel_str(e->path, sizeof(e->path), path);
+	bpf_ringbuf_submit(e, 0);
 	return 0;
 }
 

@@ -208,7 +208,10 @@ listeners(proto, addr, port, netns, unit, comm, cgroup, exe, pid,
   `unit` is derived from the cgroup path (`nginx.service`,
   `docker-0123456789ab`, `user-1000.slice/session.scope`, ...). Names that
   change on every run (login sessions, transient units) are normalized so that
-  a cron job accumulates under one edge.
+  a cron job accumulates under one edge. Flows carry cgroup ids; since the
+  cgroup of a short-lived job is often removed before the end of the
+  interval, `tp_btf/cgroup_mkdir` reports the path of every cgroup when it is
+  created, and the agent keeps it for an hour.
 * **activity** keeps counters in buckets of one minute, one hour and one day.
   All three are updated at every interval, so no roll-up job is needed;
   retention is per resolution (2 days, 90 days and 3 years by default).

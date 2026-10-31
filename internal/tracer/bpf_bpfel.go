@@ -13,6 +13,12 @@ import (
 	"github.com/cilium/ebpf"
 )
 
+type bpfShawkCgroupEvent struct {
+	_    structs.HostLayout
+	Id   uint64
+	Path [512]int8
+}
+
 type bpfShawkFlowKey struct {
 	_         structs.HostLayout
 	Laddr     [16]uint8
@@ -80,6 +86,7 @@ type bpfShawkUdpState struct {
 //
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
+	bpfMapCgroupEvents           = "cgroup_events"
 	bpfMapFlows                  = "flows"
 	bpfMapFlows0                 = "flows_0"
 	bpfMapFlows1                 = "flows_1"
@@ -87,6 +94,7 @@ const (
 	bpfMapSockStates             = "sock_states"
 	bpfMapUdpListenPorts         = "udp_listen_ports"
 	bpfMapUdpStates              = "udp_states"
+	bpfProgShawkCgroupMkdir      = "shawk_cgroup_mkdir"
 	bpfProgShawkInetSockSetState = "shawk_inet_sock_set_state"
 	bpfProgShawkIp6SendSkb       = "shawk_ip6_send_skb"
 	bpfProgShawkIpSendSkb        = "shawk_ip_send_skb"
@@ -96,6 +104,7 @@ const (
 	bpfProgShawkSkbConsumeUdp    = "shawk_skb_consume_udp"
 	bpfVarActiveIdx              = "active_idx"
 	bpfVarAdoptedUnowned         = "adopted_unowned"
+	bpfVarCgroupEventDrops       = "cgroup_event_drops"
 	bpfVarEphPortHigh            = "eph_port_high"
 	bpfVarEphPortLow             = "eph_port_low"
 	bpfVarFlowDrops              = "flow_drops"
@@ -103,6 +112,7 @@ const (
 	bpfVarMarkUdpServers         = "mark_udp_servers"
 	bpfVarSelfTgid               = "self_tgid"
 	bpfVarTargetNetns            = "target_netns"
+	bpfVarUnusedCgroupEvent      = "unused_cgroup_event"
 	bpfVarUnusedIterRec          = "unused_iter_rec"
 )
 
@@ -148,6 +158,7 @@ type bpfSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type bpfProgramSpecs struct {
+	ShawkCgroupMkdir      *ebpf.ProgramSpec `ebpf:"shawk_cgroup_mkdir"`
 	ShawkInetSockSetState *ebpf.ProgramSpec `ebpf:"shawk_inet_sock_set_state"`
 	ShawkIp6SendSkb       *ebpf.ProgramSpec `ebpf:"shawk_ip6_send_skb"`
 	ShawkIpSendSkb        *ebpf.ProgramSpec `ebpf:"shawk_ip_send_skb"`
@@ -161,6 +172,7 @@ type bpfProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type bpfMapSpecs struct {
+	CgroupEvents   *ebpf.MapSpec `ebpf:"cgroup_events"`
 	Flows          *ebpf.MapSpec `ebpf:"flows"`
 	Flows0         *ebpf.MapSpec `ebpf:"flows_0"`
 	Flows1         *ebpf.MapSpec `ebpf:"flows_1"`
@@ -174,16 +186,18 @@ type bpfMapSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type bpfVariableSpecs struct {
-	ActiveIdx      *ebpf.VariableSpec `ebpf:"active_idx"`
-	AdoptedUnowned *ebpf.VariableSpec `ebpf:"adopted_unowned"`
-	EphPortHigh    *ebpf.VariableSpec `ebpf:"eph_port_high"`
-	EphPortLow     *ebpf.VariableSpec `ebpf:"eph_port_low"`
-	FlowDrops      *ebpf.VariableSpec `ebpf:"flow_drops"`
-	LearnSelf      *ebpf.VariableSpec `ebpf:"learn_self"`
-	MarkUdpServers *ebpf.VariableSpec `ebpf:"mark_udp_servers"`
-	SelfTgid       *ebpf.VariableSpec `ebpf:"self_tgid"`
-	TargetNetns    *ebpf.VariableSpec `ebpf:"target_netns"`
-	UnusedIterRec  *ebpf.VariableSpec `ebpf:"unused_iter_rec"`
+	ActiveIdx         *ebpf.VariableSpec `ebpf:"active_idx"`
+	AdoptedUnowned    *ebpf.VariableSpec `ebpf:"adopted_unowned"`
+	CgroupEventDrops  *ebpf.VariableSpec `ebpf:"cgroup_event_drops"`
+	EphPortHigh       *ebpf.VariableSpec `ebpf:"eph_port_high"`
+	EphPortLow        *ebpf.VariableSpec `ebpf:"eph_port_low"`
+	FlowDrops         *ebpf.VariableSpec `ebpf:"flow_drops"`
+	LearnSelf         *ebpf.VariableSpec `ebpf:"learn_self"`
+	MarkUdpServers    *ebpf.VariableSpec `ebpf:"mark_udp_servers"`
+	SelfTgid          *ebpf.VariableSpec `ebpf:"self_tgid"`
+	TargetNetns       *ebpf.VariableSpec `ebpf:"target_netns"`
+	UnusedCgroupEvent *ebpf.VariableSpec `ebpf:"unused_cgroup_event"`
+	UnusedIterRec     *ebpf.VariableSpec `ebpf:"unused_iter_rec"`
 }
 
 // bpfObjects contains all objects after they have been loaded into the kernel.
@@ -206,6 +220,7 @@ func (o *bpfObjects) Close() error {
 //
 // It can be passed to loadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type bpfMaps struct {
+	CgroupEvents   *ebpf.Map `ebpf:"cgroup_events"`
 	Flows          *ebpf.Map `ebpf:"flows"`
 	Flows0         *ebpf.Map `ebpf:"flows_0"`
 	Flows1         *ebpf.Map `ebpf:"flows_1"`
@@ -217,6 +232,7 @@ type bpfMaps struct {
 
 func (m *bpfMaps) Close() error {
 	return _BpfClose(
+		m.CgroupEvents,
 		m.Flows,
 		m.Flows0,
 		m.Flows1,
@@ -231,22 +247,25 @@ func (m *bpfMaps) Close() error {
 //
 // It can be passed to loadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type bpfVariables struct {
-	ActiveIdx      *ebpf.Variable `ebpf:"active_idx"`
-	AdoptedUnowned *ebpf.Variable `ebpf:"adopted_unowned"`
-	EphPortHigh    *ebpf.Variable `ebpf:"eph_port_high"`
-	EphPortLow     *ebpf.Variable `ebpf:"eph_port_low"`
-	FlowDrops      *ebpf.Variable `ebpf:"flow_drops"`
-	LearnSelf      *ebpf.Variable `ebpf:"learn_self"`
-	MarkUdpServers *ebpf.Variable `ebpf:"mark_udp_servers"`
-	SelfTgid       *ebpf.Variable `ebpf:"self_tgid"`
-	TargetNetns    *ebpf.Variable `ebpf:"target_netns"`
-	UnusedIterRec  *ebpf.Variable `ebpf:"unused_iter_rec"`
+	ActiveIdx         *ebpf.Variable `ebpf:"active_idx"`
+	AdoptedUnowned    *ebpf.Variable `ebpf:"adopted_unowned"`
+	CgroupEventDrops  *ebpf.Variable `ebpf:"cgroup_event_drops"`
+	EphPortHigh       *ebpf.Variable `ebpf:"eph_port_high"`
+	EphPortLow        *ebpf.Variable `ebpf:"eph_port_low"`
+	FlowDrops         *ebpf.Variable `ebpf:"flow_drops"`
+	LearnSelf         *ebpf.Variable `ebpf:"learn_self"`
+	MarkUdpServers    *ebpf.Variable `ebpf:"mark_udp_servers"`
+	SelfTgid          *ebpf.Variable `ebpf:"self_tgid"`
+	TargetNetns       *ebpf.Variable `ebpf:"target_netns"`
+	UnusedCgroupEvent *ebpf.Variable `ebpf:"unused_cgroup_event"`
+	UnusedIterRec     *ebpf.Variable `ebpf:"unused_iter_rec"`
 }
 
 // bpfPrograms contains all programs after they have been loaded into the kernel.
 //
 // It can be passed to loadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type bpfPrograms struct {
+	ShawkCgroupMkdir      *ebpf.Program `ebpf:"shawk_cgroup_mkdir"`
 	ShawkInetSockSetState *ebpf.Program `ebpf:"shawk_inet_sock_set_state"`
 	ShawkIp6SendSkb       *ebpf.Program `ebpf:"shawk_ip6_send_skb"`
 	ShawkIpSendSkb        *ebpf.Program `ebpf:"shawk_ip_send_skb"`
@@ -258,6 +277,7 @@ type bpfPrograms struct {
 
 func (p *bpfPrograms) Close() error {
 	return _BpfClose(
+		p.ShawkCgroupMkdir,
 		p.ShawkInetSockSetState,
 		p.ShawkIp6SendSkb,
 		p.ShawkIpSendSkb,

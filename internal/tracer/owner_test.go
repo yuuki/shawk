@@ -172,3 +172,72 @@ func cgroup2Root() string {
 	}
 	return ""
 }
+
+// TestCgroupEvents checks that a cgroup created while tracing is reported
+// with its path, and that flows of a process in it carry its id after the
+// cgroup is removed.
+func TestCgroupEvents(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root")
+	}
+	root := cgroup2Root()
+	if root == "" {
+		t.Skip("cgroup v2 is not mounted")
+	}
+	events := make(chan [2]any, 100)
+	tr, err := New(Options{TraceSelf: true, OnCgroup: func(id uint64, path string) {
+		events <- [2]any{id, path}
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+
+	name := fmt.Sprintf("shawktest-job-%d", os.Getpid())
+	cg := filepath.Join(root, name)
+	if err := os.Mkdir(cg, 0o755); err != nil {
+		t.Skipf("cannot create a cgroup: %v", err)
+	}
+	defer os.Remove(cg)
+	var st unix.Stat_t
+	if err := unix.Stat(cg, &st); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.After(2 * time.Second)
+	for found := false; !found; {
+		select {
+		case e := <-events:
+			found = e[0].(uint64) == st.Ino && e[1].(string) == "/"+name
+		case <-deadline:
+			t.Fatalf("no event for %s (id %d)", cg, st.Ino)
+		}
+	}
+
+	// A short-lived job in the cgroup.
+	ln := echoServer(t, "tcp4", "127.0.0.1:0")
+	helper := exec.Command(os.Args[0], "-test.run=^TestHelperDial$")
+	helper.Env = append(os.Environ(), "SHAWK_TEST_DIAL="+ln.Addr().String(), "SHAWK_TEST_WAIT=1")
+	stdin, _ := helper.StdinPipe()
+	if err := helper.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cg, "cgroup.procs"), []byte(strconv.Itoa(helper.Process.Pid)), 0o644); err != nil {
+		t.Skipf("cannot move a process to the cgroup: %v", err)
+	}
+	stdin.Close()
+	if err := helper.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(cg); err != nil {
+		t.Fatal(err)
+	}
+	snap, err := tr.Collect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := uint16(ln.Addr().(*net.TCPAddr).Port)
+	f := findFlow(snap.Flows, DirOut, ProtoTCP, port, ln.Addr().(*net.TCPAddr).AddrPort().Addr())
+	if f == nil || f.CgroupID != st.Ino || f.PID != uint32(helper.Process.Pid) {
+		t.Errorf("flow of the job = %+v, want cgroup %d", f, st.Ino)
+	}
+}

@@ -145,7 +145,9 @@ func addrFrom16(b [16]uint8) netip.Addr {
 	return netip.AddrFrom16(b).Unmap()
 }
 
-func commString(c [16]int8) string {
+func commString(c [16]int8) string { return cString(c[:]) }
+
+func cString(c []int8) string {
 	b := make([]byte, 0, len(c))
 	for _, v := range c {
 		if v == 0 {

@@ -399,6 +399,10 @@ func TestHelperDial(t *testing.T) {
 	if addr == "" {
 		t.Skip("helper process for other tests")
 	}
+	if os.Getenv("SHAWK_TEST_WAIT") != "" {
+		// Wait until the parent closes stdin, e.g. after moving this process.
+		io.ReadAll(os.Stdin)
+	}
 	c, err := net.Dial("tcp4", addr)
 	if err != nil {
 		t.Fatal(err)

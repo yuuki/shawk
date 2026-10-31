@@ -128,7 +128,7 @@ func (l *Ledger) Write(ctx context.Context, at time.Time, recs []Record, listene
 INSERT INTO edges (direction, proto, local_addr, remote_addr, port, netns, unit, comm, cgroup, exe, last_pid, first_seen, last_seen)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT (direction, proto, local_addr, remote_addr, port, netns, unit, comm) DO UPDATE SET
-	cgroup = excluded.cgroup,
+	cgroup = CASE WHEN excluded.cgroup != '' THEN excluded.cgroup ELSE edges.cgroup END,
 	exe = CASE WHEN excluded.exe != '' THEN excluded.exe ELSE edges.exe END,
 	last_pid = CASE WHEN excluded.last_pid != 0 THEN excluded.last_pid ELSE edges.last_pid END,
 	last_seen = max(edges.last_seen, excluded.last_seen)

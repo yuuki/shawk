@@ -154,3 +154,25 @@ func TestPrune(t *testing.T) {
 		t.Errorf("minute buckets older than the retention remain: %d", minutes)
 	}
 }
+
+func TestUnresolvedCgroupKeepsPath(t *testing.T) {
+	ctx := context.Background()
+	l := openTest(t)
+	now := time.Now().Truncate(time.Second)
+	r := clientRecord()
+	r.Cgroup = "/system.slice/app.service"
+	if err := l.Write(ctx, now.Add(-time.Minute), []Record{r}, nil); err != nil {
+		t.Fatal(err)
+	}
+	r.Cgroup = ""
+	if err := l.Write(ctx, now, []Record{r}, nil); err != nil {
+		t.Fatal(err)
+	}
+	edges, err := l.Edges(ctx, api.EdgeQuery{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(edges) != 1 || edges[0].Cgroup != "/system.slice/app.service" {
+		t.Errorf("edges = %+v", edges)
+	}
+}

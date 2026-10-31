@@ -15,9 +15,15 @@ import (
 	"time"
 )
 
-// rescanInterval limits how often the cgroup hierarchy is walked when an
-// unknown cgroup id is looked up.
-const rescanInterval = 5 * time.Second
+const (
+	// rescanInterval limits how often the cgroup hierarchy is walked when an
+	// unknown cgroup id is looked up.
+	rescanInterval = 5 * time.Second
+	// learnedTTL is how long a learned path is kept; flows of a removed
+	// cgroup are resolved at the end of their interval at the latest.
+	learnedTTL = time.Hour
+	maxLearned = 100000
+)
 
 // Resolver maps cgroup ids to cgroup paths.
 type Resolver struct {
@@ -25,19 +31,51 @@ type Resolver struct {
 
 	mu       sync.Mutex
 	paths    map[uint64]string
+	learned  map[uint64]learnedPath
 	lastScan time.Time
 }
 
-// NewResolver finds the cgroup v2 hierarchy. Cgroup paths are not resolved
-// when it is not mounted.
+type learnedPath struct {
+	path string
+	at   time.Time
+}
+
+// NewResolver finds the cgroup v2 hierarchy. Without it, only learned paths
+// are resolved.
 func NewResolver() *Resolver {
-	return &Resolver{root: cgroup2Mount("/proc/self/mountinfo"), paths: map[uint64]string{}}
+	return &Resolver{
+		root:    cgroup2Mount("/proc/self/mountinfo"),
+		paths:   map[uint64]string{},
+		learned: map[uint64]learnedPath{},
+	}
+}
+
+// Learn records the path of a cgroup reported when it was created, so that
+// it can be resolved after the cgroup is removed.
+func (r *Resolver) Learn(id uint64, path string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.learned) >= maxLearned {
+		r.expire(time.Now())
+		if len(r.learned) >= maxLearned {
+			clear(r.learned)
+		}
+	}
+	r.learned[id] = learnedPath{path: path, at: time.Now()}
+}
+
+func (r *Resolver) expire(now time.Time) {
+	for id, l := range r.learned {
+		if now.Sub(l.at) > learnedTTL {
+			delete(r.learned, id)
+		}
+	}
 }
 
 // CgroupPath returns the path of a cgroup relative to the hierarchy root,
 // such as "/system.slice/nginx.service", or "" if it is unknown.
 func (r *Resolver) CgroupPath(id uint64) string {
-	if r.root == "" || id == 0 {
+	if id == 0 {
 		return ""
 	}
 	r.mu.Lock()
@@ -45,7 +83,10 @@ func (r *Resolver) CgroupPath(id uint64) string {
 	if p, ok := r.paths[id]; ok {
 		return p
 	}
-	if time.Since(r.lastScan) < rescanInterval {
+	if l, ok := r.learned[id]; ok {
+		return l.path
+	}
+	if r.root == "" || time.Since(r.lastScan) < rescanInterval {
 		return ""
 	}
 	r.scan()
@@ -77,6 +118,7 @@ func (r *Resolver) scan() {
 	})
 	r.paths = paths
 	r.lastScan = time.Now()
+	r.expire(r.lastScan)
 }
 
 func cgroup2Mount(mountinfo string) string {

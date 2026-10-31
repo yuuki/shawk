@@ -73,7 +73,13 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	defer lg.Close()
 
-	tr, err := tracer.New(tracer.Options{NetNS: cfg.NetNS, MaxFlows: cfg.MaxFlows, Logger: cfg.Logger})
+	cgroups := procinfo.NewResolver()
+	tr, err := tracer.New(tracer.Options{
+		NetNS:    cfg.NetNS,
+		MaxFlows: cfg.MaxFlows,
+		OnCgroup: cgroups.Learn,
+		Logger:   cfg.Logger,
+	})
 	if err != nil {
 		return fmt.Errorf("starting tracer: %w", err)
 	}
@@ -97,7 +103,7 @@ func Run(ctx context.Context, cfg Config) error {
 		log:      cfg.Logger,
 		tracer:   tr,
 		ledger:   lg,
-		cgroups:  procinfo.NewResolver(),
+		cgroups:  cgroups,
 		apiPort:  uint16(ln.Addr().(*net.TCPAddr).Port),
 		started:  time.Now(),
 		hostname: hostname,

@@ -67,4 +67,12 @@ struct shawk_iter_rec {
 	__u32 _pad;
 };
 
+#define CGROUP_PATH_LEN 512
+
+/* A cgroup v2 created on the host, sent to user space through a ring buffer. */
+struct shawk_cgroup_event {
+	__u64 id;
+	char path[CGROUP_PATH_LEN];
+};
+
 #endif /* __SHAWK_H */

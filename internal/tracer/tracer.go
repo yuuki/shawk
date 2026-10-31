@@ -20,6 +20,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
+	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
 	"golang.org/x/sys/unix"
 )
@@ -44,7 +45,11 @@ type Options struct {
 	// TraceSelf includes the flows of the tracing process itself, which are
 	// excluded by default. It is meant for testing.
 	TraceSelf bool
-	Logger    *slog.Logger
+	// OnCgroup is called with the id and path of every cgroup v2 created on
+	// the host, so that the paths of short-lived cgroups can be resolved
+	// after they are removed. It is called from a separate goroutine.
+	OnCgroup func(id uint64, path string)
+	Logger   *slog.Logger
 }
 
 // Tracer loads the BPF programs and collects bundled flows.
@@ -64,6 +69,9 @@ type Tracer struct {
 	flowDrops      *ebpf.Variable
 	adopted        *ebpf.Variable
 	selfTgid       *ebpf.Variable
+
+	cgroupEvents *ringbuf.Reader
+	cgroupDone   chan struct{}
 
 	iterTCP      *link.Iter
 	iterUDP      *link.Iter
@@ -239,6 +247,46 @@ func (t *Tracer) loadCore(spec *ebpf.CollectionSpec) error {
 		return fmt.Errorf("attaching task_file iterator: %w", err)
 	}
 	t.links = append(t.links, t.iterTaskFile)
+
+	if t.opts.OnCgroup != nil {
+		if err := t.watchCgroups(coll); err != nil {
+			t.log.Warn("paths of short-lived cgroups are not resolved", "error", err)
+		}
+	}
+	return nil
+}
+
+// watchCgroups reports the cgroups created on the host to OnCgroup.
+func (t *Tracer) watchCgroups(coll *ebpf.Collection) error {
+	rd, err := ringbuf.NewReader(coll.Maps[bpfMapCgroupEvents])
+	if err != nil {
+		return err
+	}
+	l, err := link.AttachTracing(link.TracingOptions{Program: coll.Programs[bpfProgShawkCgroupMkdir]})
+	if err != nil {
+		rd.Close()
+		return fmt.Errorf("attaching cgroup_mkdir: %w", err)
+	}
+	t.links = append(t.links, l)
+	t.cgroupEvents = rd
+	t.cgroupDone = make(chan struct{})
+	go func() {
+		defer close(t.cgroupDone)
+		var e bpfShawkCgroupEvent
+		for {
+			rec, err := rd.Read()
+			if err != nil {
+				if !errors.Is(err, ringbuf.ErrClosed) {
+					t.log.Error("reading cgroup events", "error", err)
+				}
+				return
+			}
+			if err := binary.Read(bytes.NewReader(rec.RawSample), binary.NativeEndian, &e); err != nil {
+				continue
+			}
+			t.opts.OnCgroup(e.Id, cString(e.Path[:]))
+		}
+	}()
 	return nil
 }
 
@@ -296,6 +344,11 @@ func (t *Tracer) UDPEnabled() bool { return t.udp }
 
 // Close detaches and unloads the BPF programs.
 func (t *Tracer) Close() error {
+	if t.cgroupEvents != nil {
+		t.cgroupEvents.Close()
+		<-t.cgroupDone
+		t.cgroupEvents = nil
+	}
 	for _, l := range t.links {
 		l.Close()
 	}
