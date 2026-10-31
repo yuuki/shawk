@@ -103,8 +103,11 @@ These are the edge weights listed in §2.4 of the paper.
 Bytes are not counted on the send/receive path. They are read from the
 cumulative counters of `struct tcp_sock` (`bytes_acked`, `bytes_received`,
 `total_retrans`) at close and at every scan, and the difference to the last
-accounted value is added with an atomic exchange (`BPF_XCHG`), so the
-iterator and the tracepoint never double count. The direction of a
+accounted value is added to the flow. The iterator and the tracepoint do not
+interleave on a socket where the TCP iterator locks each socket (Linux 5.19+
+and RHEL 9 by backport); on older kernels, a connection closing during a scan
+may rarely be counted twice. Atomic exchange is avoided because the arm64 JIT
+supports it only since Linux 5.18. The direction of a
 connection is decided once, when it is opened, and kept in the socket local
 storage.
 
@@ -118,8 +121,8 @@ Consequences compared with the original implementation (kprobes on
   for persistent ones.
 * **Stable ABI.** `inet_sock_set_state` is a tracepoint; no kernel function
   signature is assumed (e.g. `inet_csk_accept` changed in Linux 6.10).
-* **Works without BPF trampolines** (fentry/fexit), e.g. on arm64 kernels
-  before 6.0 or kernels that restrict ftrace.
+* **Works without BPF trampolines** (fentry/fexit), e.g. on kernels that
+  restrict ftrace, or on arm64 before Linux 6.0.
 * **Connections that predate the agent are found** (DB connection pools,
   gRPC channels). The original streaming mode never saw them.
 * **IPv6** and **MPTCP** are handled. Go listens with MPTCP by default since
@@ -165,7 +168,6 @@ Linux ≥ 5.14 with BTF (`CONFIG_DEBUG_INFO_BTF`), e.g. Rocky Linux 9.
 | BPF iterators `tcp`, `udp`, `task_file` | 5.8 / 5.9 |
 | socket local storage in tracing programs | 5.11 |
 | `bpf_sock_from_file`, `bpf_get_current_task_btf` | 5.11 |
-| atomic exchange (`BPF_XCHG`) | 5.12 |
 | fentry (UDP only) | 5.5 on x86_64, 6.0 on arm64 |
 
 All struct accesses use CO-RE. `TestKernelCompatibility` checks every

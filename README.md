@@ -41,8 +41,8 @@ See [docs/design.md](docs/design.md) for the design.
 ## Requirements
 
 * Linux 5.14 or later with BTF (`/sys/kernel/btf/vmlinux`), e.g. Rocky Linux /
-  RHEL 9, Ubuntu 22.04+, Debian 12+. Tested on x86_64; arm64 is expected to
-  work but untested.
+  RHEL 9, Ubuntu 22.04+, Debian 12+. Tested on x86_64. arm64 is untested; the
+  programs use only atomic operations that its JIT supports since 5.14.
 * UDP tracing additionally needs BPF trampolines (fentry), available on
   x86_64 and on arm64 since Linux 6.0. Without them only TCP is traced.
 * The agent runs as root.

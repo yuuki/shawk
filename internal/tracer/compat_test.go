@@ -51,6 +51,11 @@ func TestKernelCompatibility(t *testing.T) {
 				if ins.IsBuiltinCall() && !helpers[uint64(ins.Constant)] {
 					t.Errorf("helper %v is not available", asm.BuiltinFunc(ins.Constant))
 				}
+				// The arm64 JIT supports atomic operations other than a plain
+				// add only since Linux 5.18.
+				if op := ins.OpCode.AtomicOp(); op != asm.InvalidAtomic && op != asm.AddAtomic {
+					t.Errorf("instruction %d: atomic operation %v is not supported by the arm64 JIT before Linux 5.18", i, op)
+				}
 			}
 			fixups, err := btf.CORERelocate(relos, []*btf.Spec{target}, binary.LittleEndian, spec.Types.TypeID)
 			if err != nil {

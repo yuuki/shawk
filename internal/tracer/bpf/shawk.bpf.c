@@ -232,9 +232,14 @@ flow_get(const struct shawk_flow_key *k)
 
 /*
  * Accounts the bytes transferred on a TCP connection since the last call by
- * reading the cumulative counters of struct tcp_sock. Exchanging the base
- * atomically prevents double counting when the iterator and the state change
- * tracepoint race on the same socket.
+ * reading the cumulative counters of struct tcp_sock.
+ *
+ * The bases are updated without atomic exchange, which the arm64 JIT only
+ * supports since Linux 5.18; atomic adds are supported everywhere. The
+ * iterator and the state change tracepoint do not interleave on a socket on
+ * kernels whose TCP iterator locks each socket (Linux 5.19+, and RHEL 9 by
+ * backport). On older kernels, the bytes of a connection that closes during
+ * a scan may rarely be counted twice.
  */
 static __always_inline void account_tcp(struct shawk_sock_state *ss,
 					struct tcp_sock *tp,
@@ -243,18 +248,19 @@ static __always_inline void account_tcp(struct shawk_sock_state *ss,
 	__u64 acked = BPF_CORE_READ(tp, bytes_acked);
 	__u64 rcvd = BPF_CORE_READ(tp, bytes_received);
 	__u32 retrans = BPF_CORE_READ(tp, total_retrans);
-	__u64 prev;
-	__u32 prev32;
 
-	prev = __sync_lock_test_and_set(&ss->sent_base, acked);
-	if (acked > prev)
-		__sync_fetch_and_add(&fs->bytes_sent, acked - prev);
-	prev = __sync_lock_test_and_set(&ss->recv_base, rcvd);
-	if (rcvd > prev)
-		__sync_fetch_and_add(&fs->bytes_recv, rcvd - prev);
-	prev32 = __sync_lock_test_and_set(&ss->retrans_base, retrans);
-	if (retrans > prev32)
-		__sync_fetch_and_add(&fs->retrans, retrans - prev32);
+	if (acked > ss->sent_base) {
+		__sync_fetch_and_add(&fs->bytes_sent, acked - ss->sent_base);
+		ss->sent_base = acked;
+	}
+	if (rcvd > ss->recv_base) {
+		__sync_fetch_and_add(&fs->bytes_recv, rcvd - ss->recv_base);
+		ss->recv_base = rcvd;
+	}
+	if (retrans > ss->retrans_base) {
+		__sync_fetch_and_add(&fs->retrans, retrans - ss->retrans_base);
+		ss->retrans_base = retrans;
+	}
 }
 
 /*
