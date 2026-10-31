@@ -413,3 +413,39 @@ func TestPGSharedAddresses(t *testing.T) {
 		t.Errorf("dependencies = %v, want %v", got, want)
 	}
 }
+
+// TestPGLastKnownEndpoints checks which endpoints name peers: the last
+// known listeners of each host, not those of hosts gone for a month or of
+// addresses taken over by another host.
+func TestPGLastKnownEndpoints(t *testing.T) {
+	c, sink, conn := pgConnector(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	day := 24 * time.Hour
+	report := func(at time.Time, ta tAgent) {
+		c.now = func() time.Time { return at }
+		ta.time, ta.segment = at, at.Add(-time.Hour)
+		ta.machineID = "m-" + ta.host
+		consume(t, c, sink, ta)
+	}
+	lst := func(addr string, port int64, svc string) tListener {
+		return tListener{proto: "tcp", addr: addr, port: port, svc: svc, comm: svc}
+	}
+	// The agent of quiet-01 stopped ten days ago; its services keep names.
+	report(now.Add(-10*day), tAgent{host: "quiet-01", addrs: []string{"10.0.0.5"}, listeners: []tListener{lst("0.0.0.0", 5432, "postgres")}})
+	// gone-01 stopped forty days ago.
+	report(now.Add(-40*day), tAgent{host: "gone-01", addrs: []string{"10.0.0.6"}, listeners: []tListener{lst("0.0.0.0", 6379, "redis")}})
+	// old-01 held 10.0.0.7 until three days ago; new-01 holds it since.
+	report(now.Add(-3*day), tAgent{host: "old-01", addrs: []string{"10.0.0.7"}, listeners: []tListener{lst("10.0.0.7", 80, "web-old")}})
+	report(now.Add(-2*day), tAgent{host: "new-01", addrs: []string{"10.0.0.7"}, listeners: []tListener{lst("10.0.0.7", 8080, "web-new")}})
+	// live-01 closed its port 9000 two hours ago.
+	report(now.Add(-2*time.Hour), tAgent{host: "live-01", addrs: []string{"10.0.0.8"},
+		listeners: []tListener{lst("0.0.0.0", 9000, "old-api"), lst("0.0.0.0", 9100, "api")}})
+	report(now, tAgent{host: "live-01", addrs: []string{"10.0.0.8"}, listeners: []tListener{lst("0.0.0.0", 9100, "api")}})
+	c.flush(ctx)
+	got := queryStrings(t, conn, `SELECT host(addr), port, service FROM shawk_v1.service_endpoints`)
+	want := []string{"10.0.0.5 5432 postgres", "10.0.0.7 8080 web-new", "10.0.0.8 9100 api"}
+	if !slices.Equal(got, want) {
+		t.Errorf("service_endpoints = %v, want %v", got, want)
+	}
+}
