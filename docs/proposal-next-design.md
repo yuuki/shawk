@@ -674,14 +674,22 @@ group by (src, dst) (
 - `internal/ledger`、`internal/query`、`internal/client`、`internal/api`、`internal/agent/http.go`、CLI の問い合わせコマンドと `modernc.org/sqlite` への依存を消した。CLI は `agent`、`flows`、`version` だけになった。
 - e2e テスト（`test/e2e/run.sh`、`make e2e`）は、ネットワーク名前空間の三つのホストのエージェントを、ocb で作った Collector と PostgreSQL（`SHAWK_E2E_POSTGRES_DSN`）につなぎ、`shawk_v1` のビューと転送したメトリクスを確かめる形に書き直した。三つのホストは machine-id を共有するので、複製した VM の区別も確かめている。
 - CI（`.github/workflows/test.yml`）は PostgreSQL のサービスコンテナを使い、`make test`（三つのモジュール）と `make e2e` を動かす。
-- deb / rpm には `/etc/shawk/agent.env`（設定ファイル）を加えた。Collector と `shawk-migrate` のパッケージはまだ作っていない（`make collector` / `make shawk-migrate` で作る）。
+- deb / rpm には `/etc/shawk/agent.env`（設定ファイル）を加えた。
+- Collector の配布（§10 から解決）：goreleaser の before フックで ocb を `--skip-compilation` で動かし（マニフェストの `dist.version` をリリースの版に置き換える）、生成した `collector/_build` を goreleaser がビルドする。エージェントと同じタグで、アーカイブと deb / rpm の `shawk-collector`（`/usr/bin/shawk-collector`、`/usr/bin/shawk-migrate`、`shawk-collector.service` と同名のシステムユーザ、`/etc/shawk/collector.yaml`（noreplace）、`/usr/share/shawk-collector/postgres/` の SQL）と、distroless のコンテナイメージ `ghcr.io/yuuki/shawk-collector`（amd64 / arm64。`/shawk-migrate` も入れる）を作る。
 
-## 10. 未決事項（実装中に見つけたもの）
+## 10. 実装中に見つけた未決事項と解決
 
-- **サーバ側の再送の `src`**：§4.4 の規約どおり再送は両側を使うが、相手にエージェントがあるサーバ側の系列は `service_peer_name="~agent"` なので、recording rule の `src` が `~agent` になり、どのクライアントへの再送かが Prometheus では分からない。PostgreSQL 側（`dependencies`）で突き合わせるか、connector がサーバ側の `~agent` の代わりにクライアントのサービス名を付けるか（その場合は二重計上の規約の作り直しが要る）を決める必要がある。
-- **共有されるプライベートアドレス**：docker0（172.17.0.1）のように多くのホストが同じアドレスを持つ場合、`service_endpoints` と `agent_addrs` の引き当てが誤る（同じホストのものを優先するだけ）。§8 の `host_addrs` のスコープの課題と同じ。
-- **`service_endpoints` の期間**：直近 7 日に見た待ち受けとサーバ側のエッジだけを使う。エージェントが 7 日以上止まっているホストのサービスは名前が引けなくなる。設定にするかどうかは未定。
-- **保持期間**：PostgreSQL の表を消す仕組みはまだない（`edges` は IP の入れ替わりで増え続ける）。現行の `-retention-*` に当たるものを connector の設定にするか、運用の SQL にするかを決める必要がある。
-- **`dependencies` ビューの重さ**：全期間のエッジを FULL JOIN するので、エッジが多いと遅い。期間で絞る関数版（`dependencies_between(since, until)` など）を足すかどうか。
-- **`unobserved()` の時刻の基準**：`last_heartbeat` はエージェントの時計、`now()` は PostgreSQL の時計。時計がずれたホストでは `alive` や空白の判定がずれる。
-- **Collector の配布**：ocb で作る Collector と `shawk-migrate` のリリース（バイナリ、パッケージ、コンテナイメージ）をどう作るかは決めていない。
+| 未決事項 | 状態 | 解決の内容 |
+|---|---|---|
+| サーバ側の再送の `src`：相手にエージェントがあるサーバ側の系列は `~agent` という名前なので、どのクライアントへの再送か分からない | 解決 | サーバ側でもクライアントのサービス名を `service.peer.name` に入れ（`client_endpoints` からの逆引き）、「相手にエージェントがあるか」を別の属性 `shawk.peer.agent` にした。二重計上の規約は `shawk_peer_agent="false"` で判定する（§4.2, §4.4）。Prometheus の契約にラベルが一つ増えた |
+| 共有されるプライベートアドレス（docker0 の 172.17.0.1 など） | 一部解決 | 複数の生きているホストが同時に持つアドレスは、名前の引き当てと `dependencies` の突き合わせを同じホストの中だけで行う（§9.2）。エージェントがアドレスのスコープ（bridge・veth・netns）を送る仕組みは §8 の P1 のまま |
+| `service_endpoints` の期間（7 日を過ぎると名前が引けない） | 解決 | 各ホストの最後に分かっていた待ち受けを返す。30 日報告のないホストと、別のホストに移ったアドレスは除く（§9.2） |
+| 保持期間 | 解決 | connector の `retention`（既定 3 年）と `shawk.prune()`（§9.2） |
+| `dependencies` ビューの重さ | 解決 | 期間で絞る関数 `*_between(since, until)` を加え、同梱のダッシュボードとアラートはそれを使う（§9.2） |
+| 時計のずれ | 解決 | 生死は connector の受信時刻で判定し、ずれを `clock_skew` に残してアラートする（§9.2）。エッジの時刻はエージェントの時計のまま（NTP を前提にする） |
+| Collector の配布 | 解決 | goreleaser が ocb の生成したソースを同じ版でビルドし、deb / rpm の `shawk-collector`（`shawk-migrate`、systemd ユニット、設定、PostgreSQL のスクリプトを含む）とコンテナイメージ `ghcr.io/yuuki/shawk-collector` を作る（§9.4） |
+
+残っているもの：
+
+- **アドレスのスコープ（§8 の P1）**：コンテナのネットワークのアドレスを一つのホストだけが持つ場合、エージェントのないホストの相手がそのホストのものとして引かれることがある。エージェントが `host.ip` をスコープつきで送り、`host_addrs` に `scope` 列を足す形で解決する。
+- **サーバ側の名前が付くまでの遅れ**：新しいクライアントの最初の数十秒（クライアント側のエッジが connector に届くまで）は、サーバ側の相手が `~unresolved` になる。`shawk.peer.agent` は正しいので、依存単位の値は変わらない。

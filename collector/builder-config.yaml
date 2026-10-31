@@ -10,6 +10,8 @@ dist:
   name: shawk-collector
   description: OpenTelemetry Collector with the shawk connector
   output_path: ./_build
+  # Replaced with the version of the release by .goreleaser.yml.
+  version: dev
 
 receivers:
   - gomod: go.opentelemetry.io/collector/receiver/otlpreceiver v0.164.0

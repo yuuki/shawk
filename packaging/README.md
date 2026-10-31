@@ -24,3 +24,13 @@ psql -v ON_ERROR_STOP=1 -d shawk -U shawk_owner -f packaging/postgres/grants.sql
 ```
 
 Prometheus must run with `--web.enable-otlp-receiver`.
+
+The release packages `shawk-collector` install the collector as the
+systemd service `shawk-collector` running as the user `shawk-collector`,
+with its configuration in `/etc/shawk/collector.yaml`. Write the connection
+string of the role `shawk_connector` to `/etc/shawk/postgres-dsn`, readable
+by that user only:
+
+```sh
+sudo install -m 0640 -g shawk-collector /dev/stdin /etc/shawk/postgres-dsn <<<'postgres://shawk_connector:...@db/shawk?sslmode=require'
+```

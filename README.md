@@ -97,8 +97,18 @@ systemd drop-in; OBI uses the same name.
 
 ### Collector
 
-The shawk connector is a component of the OpenTelemetry Collector. Build a
-collector that includes it with the OpenTelemetry Collector Builder:
+The shawk connector is a component of the OpenTelemetry Collector. A
+release ships a collector that includes it, of the same version as the
+agent:
+
+* the deb and rpm packages `shawk-collector`: `/usr/bin/shawk-collector`,
+  `/usr/bin/shawk-migrate`, the systemd unit `shawk-collector.service`
+  (user `shawk-collector`), `/etc/shawk/collector.yaml` and the PostgreSQL
+  scripts in `/usr/share/shawk-collector/postgres`;
+* the container image `ghcr.io/yuuki/shawk-collector` (amd64 and arm64),
+  which also contains `/shawk-migrate`.
+
+To build it yourself with the OpenTelemetry Collector Builder:
 
 ```bash
 make collector                  # collector/_build/shawk-collector

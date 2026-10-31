@@ -351,7 +351,9 @@ when the host holds the address too. Among several services
 on an endpoint, one on the same host, then the most recently seen, wins.
 Names are the best guess at the time of aggregation; PostgreSQL is the
 truth of attribution. A new server may show as `~unresolved` until its
-listener is written (up to one write interval).
+listener is written (up to one write interval), and a new client on the
+server side until its client edge reaches the connector;
+`shawk.peer.agent` is right meanwhile, so counting (§7) is not affected.
 
 ### 5.3 Metrics to Prometheus
 

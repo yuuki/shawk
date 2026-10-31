@@ -7,3 +7,4 @@
 *.db-wal
 /collector/_build/
 /shawk-migrate
+/collector/_release-builder-config.yaml
