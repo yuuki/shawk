@@ -2,6 +2,8 @@ package cli
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -53,5 +55,19 @@ func TestUsage(t *testing.T) {
 	}
 	if code := Main([]string{"version"}, &out, &errOut); code != 0 {
 		t.Errorf("exit code of version = %d", code)
+	}
+}
+
+func TestReadToken(t *testing.T) {
+	dir := t.TempDir()
+	empty := filepath.Join(dir, "empty")
+	os.WriteFile(empty, []byte(" \n"), 0o600)
+	if _, err := readToken(empty); err == nil {
+		t.Error("an empty token file was accepted")
+	}
+	ok := filepath.Join(dir, "token")
+	os.WriteFile(ok, []byte("s3cret\n"), 0o600)
+	if tok, err := readToken(ok); err != nil || tok != "s3cret" {
+		t.Errorf("readToken = %q, %v", tok, err)
 	}
 }

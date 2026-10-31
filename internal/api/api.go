@@ -2,6 +2,7 @@
 package api
 
 import (
+	"errors"
 	"net/url"
 	"strconv"
 	"time"
@@ -9,6 +10,10 @@ import (
 
 // DefaultPort is the default TCP port of the agent API.
 const DefaultPort = 7464
+
+// ErrPeerNotAllowed is returned for hosts outside the peers a client may
+// contact.
+var ErrPeerNotAllowed = errors.New("not queried: outside the allowed peers")
 
 // Info describes an agent.
 type Info struct {

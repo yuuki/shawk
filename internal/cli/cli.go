@@ -8,6 +8,8 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
+	"net/netip"
 	"os"
 	"os/signal"
 	"sort"
@@ -122,6 +124,7 @@ type queryFlags struct {
 	timeout   time.Duration
 	json      bool
 	since     string
+	peers     string
 }
 
 func (f *queryFlags) register(fs *flag.FlagSet, since string) {
@@ -130,18 +133,32 @@ func (f *queryFlags) register(fs *flag.FlagSet, since string) {
 	fs.DurationVar(&f.timeout, "timeout", 5*time.Second, "timeout of each request to an agent")
 	fs.BoolVar(&f.json, "json", false, "output JSON")
 	fs.StringVar(&f.since, "since", since, "time window to look back, e.g. 30d, 12h")
+	peers := os.Getenv("SHAWK_PEERS")
+	if peers == "" {
+		peers = "private"
+	}
+	fs.StringVar(&f.peers, "peers", peers, `addresses of agents to query besides the targets: "private" (loopback, RFC 1918, CGNAT, IPv6 ULA), CIDR prefixes or "any", comma-separated`)
 }
 
-func (f *queryFlags) client() (*client.Client, error) {
+// client returns a client that may contact the given target hosts and the
+// allowed peers.
+func (f *queryFlags) client(hosts ...string) (*client.Client, error) {
 	token, err := readToken(f.tokenFile)
 	if err != nil {
 		return nil, err
 	}
-	return client.New(f.port, token, f.timeout), nil
+	peers, err := client.ParsePeers(f.peers)
+	if err != nil {
+		return nil, fmt.Errorf("%w: -peers: %v", errUsage, err)
+	}
+	for _, h := range hosts {
+		peers.AddHost(h)
+	}
+	return client.New(f.port, token, f.timeout, peers), nil
 }
 
-func (f *queryFlags) querier() (*query.Querier, error) {
-	c, err := f.client()
+func (f *queryFlags) querier(hosts ...string) (*query.Querier, error) {
+	c, err := f.client(hosts...)
 	if err != nil {
 		return nil, err
 	}
@@ -154,6 +171,8 @@ func (f *queryFlags) querier() (*query.Querier, error) {
 	return query.New(c, time.Now().Add(-d), time.Time{}), nil
 }
 
+// readToken reads a bearer token. A file without a token is an error rather
+// than a silently disabled authentication.
 func readToken(path string) (string, error) {
 	if path == "" {
 		return "", nil
@@ -162,7 +181,11 @@ func readToken(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(string(b)), nil
+	token := strings.TrimSpace(string(b))
+	if token == "" {
+		return "", fmt.Errorf("token file %s is empty", path)
+	}
+	return token, nil
 }
 
 func parseFlags(fs *flag.FlagSet, args []string, nargs string) ([]string, error) {
@@ -279,6 +302,7 @@ func runAgent(ctx context.Context, args []string, _ io.Writer) error {
 	if err != nil {
 		return err
 	}
+	warnExposure(logger, *listen, *tokenFile, token)
 	if err := os.MkdirAll(dirOf(*db), 0o755); err != nil {
 		return err
 	}
@@ -286,6 +310,23 @@ func runAgent(ctx context.Context, args []string, _ io.Writer) error {
 		Listen: *listen, DBPath: *db, Interval: *interval, NetNS: ns, MaxFlows: uint32(*maxFlows),
 		Retention: ret, Token: token, BPFStats: *bpfStats, Logger: logger,
 	})
+}
+
+// warnExposure warns when the API, which reveals the processes and peers of
+// the host, is served to the network without a token, or when the token can
+// be read by other users.
+func warnExposure(logger *slog.Logger, listen, tokenFile, token string) {
+	if token == "" {
+		host, _, err := net.SplitHostPort(listen)
+		if a, perr := netip.ParseAddr(host); err != nil || perr != nil || !a.IsLoopback() {
+			logger.Warn("the agent API is served without authentication; set -token-file or listen on a management address",
+				"listen", listen)
+		}
+		return
+	}
+	if st, err := os.Stat(tokenFile); err == nil && st.Mode().Perm()&0o077 != 0 {
+		logger.Warn("the token file can be read by other users", "file", tokenFile, "mode", st.Mode().Perm())
+	}
 }
 
 func dirOf(p string) string {

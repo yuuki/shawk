@@ -2,6 +2,7 @@ package ledger
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -279,5 +280,21 @@ func TestClockCorrection(t *testing.T) {
 	}
 	if len(edges) != 1 || !edges[0].FirstSeen.Equal(now) || !edges[0].LastSeen.Equal(now) {
 		t.Errorf("edges = %+v", edges)
+	}
+}
+
+func TestFileMode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ledger.db")
+	l, err := Open(path, DefaultRetention)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != 0o600 {
+		t.Errorf("mode = %v", st.Mode().Perm())
 	}
 }

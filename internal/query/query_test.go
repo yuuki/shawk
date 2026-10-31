@@ -35,6 +35,9 @@ func (f *fakeSource) Info(_ context.Context, host string) (*api.Info, error) {
 	if i, ok := f.infos[host]; ok {
 		return i, nil
 	}
+	if host == "8.8.8.8" {
+		return nil, api.ErrPeerNotAllowed
+	}
 	return nil, errors.New("connection refused")
 }
 
@@ -360,5 +363,22 @@ func TestParseTarget(t *testing.T) {
 		if _, err := ParseTarget(in); err == nil {
 			t.Errorf("ParseTarget(%q) succeeded", in)
 		}
+	}
+}
+
+func TestUnqueriedPeer(t *testing.T) {
+	src := topology()
+	// A client on the internet, which the client must not contact.
+	src.edges["10.0.0.5"] = append(src.edges["10.0.0.5"], edge("in", "10.0.0.5", "8.8.8.8", 80, "haproxy.service", "haproxy", 1))
+	roots, err := New(src, now.Add(-30*24*time.Hour), now).WhoUses(context.Background(), "10.0.0.5", 80, "", "", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, c := range roots[0].Children {
+		got = append(got, c.Host+" "+c.Process())
+	}
+	if strings.Join(got, ", ") != "192.168.1.50 (no agent), 8.8.8.8 (not queried)" {
+		t.Errorf("clients = %v", got)
 	}
 }

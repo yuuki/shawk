@@ -59,9 +59,11 @@ sudo systemctl enable --now shawk-agent
 ```
 
 Run the agent on every host you want to observe. It listens on TCP port
-7464; open it to the hosts you run queries from. To require a token, write
-it to a file and pass `-token-file` to the agent and the clients (or set
-`SHAWK_TOKEN_FILE`).
+7464; open it to the hosts you run queries from. The API reveals the
+processes and peers of the host, so require a token: write it to a file
+readable only by root and pass `-token-file` to the agent and the clients
+(or set `SHAWK_TOKEN_FILE`). The agent warns when it serves the network
+without one.
 
 ## Usage
 
@@ -82,6 +84,13 @@ host name or an address of a host running the agent.
 
 Every query accepts `-since` (units `m`, `h`, `d`, `w`) and `-json`. Errors
 exit with status 2.
+
+Queries follow dependencies by asking the agents at the addresses recorded
+in ledgers. Since those include any client of a service, the CLI only
+contacts the targets you name and agents in private address ranges
+(loopback, RFC 1918, CGNAT, IPv6 ULA); other peers are shown as
+`(not queried)` and never receive the token. Use `-peers` (or
+`SHAWK_PEERS`) with CIDR prefixes, `private` or `any` to change it.
 
 ```console
 $ shawk deps lb-01 -depth 3

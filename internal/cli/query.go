@@ -25,7 +25,7 @@ func runWhoUses(ctx context.Context, args []string, w io.Writer) error {
 	if err != nil {
 		return err
 	}
-	q, err := f.querier()
+	q, err := f.querier(t.Host)
 	if err != nil {
 		return err
 	}
@@ -59,7 +59,7 @@ func runDeps(ctx context.Context, args []string, w io.Writer) error {
 	if err != nil {
 		return err
 	}
-	q, err := f.querier()
+	q, err := f.querier(t.Host)
 	if err != nil {
 		return err
 	}
@@ -104,7 +104,7 @@ func runCanIRemove(ctx context.Context, args []string, w io.Writer) error {
 	if err != nil {
 		return err
 	}
-	q, err := f.querier()
+	q, err := f.querier(t.Host)
 	if err != nil {
 		return err
 	}
@@ -177,7 +177,7 @@ func runUnused(ctx context.Context, args []string, w io.Writer) error {
 	if t.Port != 0 {
 		return fmt.Errorf("%w: unused does not take a port", errUsage)
 	}
-	q, err := f.querier()
+	q, err := f.querier(t.Host)
 	if err != nil {
 		return err
 	}
@@ -218,7 +218,7 @@ func runDiff(ctx context.Context, args []string, w io.Writer) error {
 	if t.Port != 0 {
 		return fmt.Errorf("%w: diff does not take a port", errUsage)
 	}
-	q, err := f.querier()
+	q, err := f.querier(t.Host)
 	if err != nil {
 		return err
 	}
@@ -275,7 +275,7 @@ func runGraph(ctx context.Context, args []string, w io.Writer) error {
 		}
 		hosts = append(hosts, t.Host)
 	}
-	q, err := f.querier()
+	q, err := f.querier(hosts...)
 	if err != nil {
 		return err
 	}
@@ -309,7 +309,7 @@ func runStatus(ctx context.Context, args []string, w io.Writer) error {
 	if err != nil {
 		return err
 	}
-	c, err := f.client()
+	c, err := f.client(t.Host)
 	if err != nil {
 		return err
 	}

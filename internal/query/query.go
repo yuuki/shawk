@@ -6,6 +6,7 @@ package query
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/netip"
 	"slices"
@@ -56,11 +57,16 @@ type Node struct {
 	Children  []*Node   `json:"children,omitempty"`
 	// Cycle is set when the node already appears in its ancestors.
 	Cycle bool `json:"cycle,omitempty"`
+	// Unqueried is set when the host is outside the peers the client may
+	// contact.
+	Unqueried bool `json:"unqueried,omitempty"`
 }
 
 // Process returns the display name of the process of the node.
 func (n *Node) Process() string {
 	switch {
+	case n.Unqueried:
+		return "(not queried)"
 	case !n.Agent:
 		return "(no agent)"
 	case n.Comm == "" && n.Unit == "":
@@ -77,6 +83,12 @@ func (n *Node) key() string { return n.Addr + "|" + n.Unit + "|" + n.Comm }
 
 func (q *Querier) window(e *api.EdgeQuery) {
 	e.Since, e.Until = q.Since, q.Until
+}
+
+// unqueried reports whether host is outside the peers the client may contact.
+func (q *Querier) unqueried(ctx context.Context, host string) bool {
+	_, err := q.src.Info(ctx, host)
+	return errors.Is(err, api.ErrPeerNotAllowed)
 }
 
 func (q *Querier) displayHost(ctx context.Context, host string) (string, bool) {
@@ -175,7 +187,10 @@ func (q *Querier) clientsOf(ctx context.Context, host string, in *api.Edge) []*N
 	clientHost := q.peerHost(ctx, host, in.RemoteAddr)
 	name, ok := q.displayHost(ctx, clientHost)
 	if !ok {
-		return []*Node{{Host: in.RemoteAddr, Addr: in.RemoteAddr, Stats: in.Stats, FirstSeen: in.FirstSeen, LastSeen: in.LastSeen}}
+		return []*Node{{
+			Host: in.RemoteAddr, Addr: in.RemoteAddr, Stats: in.Stats, FirstSeen: in.FirstSeen, LastSeen: in.LastSeen,
+			Unqueried: q.unqueried(ctx, clientHost),
+		}}
 	}
 	eq := api.EdgeQuery{Direction: "out", Proto: in.Proto, Port: in.Port, RemoteAddr: in.LocalAddr}
 	q.window(&eq)
@@ -262,6 +277,7 @@ func (q *Querier) serverOf(ctx context.Context, host string, out *api.Edge) *Nod
 	}
 	name, ok := q.displayHost(ctx, serverHost)
 	if !ok {
+		n.Unqueried = q.unqueried(ctx, serverHost)
 		return n
 	}
 	n.Host, n.Agent = name, true

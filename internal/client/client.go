@@ -16,12 +16,16 @@ import (
 	"github.com/yuuki/shawk/internal/api"
 )
 
+// maxResponse limits the size of a response from an agent.
+var maxResponse int64 = 64 << 20
+
 // Client queries agents. An agent is addressed by the host name or address
 // of the host it runs on; the API port is common to all agents.
 type Client struct {
 	Port    int
 	Token   string
 	Timeout time.Duration
+	Peers   *Peers
 	http    *http.Client
 
 	mu    sync.Mutex
@@ -33,18 +37,22 @@ type infoResult struct {
 	err  error
 }
 
-// New returns a client.
-func New(port int, token string, timeout time.Duration) *Client {
+// New returns a client that contacts the hosts peers allows.
+func New(port int, token string, timeout time.Duration, peers *Peers) *Client {
 	return &Client{
 		Port:    port,
 		Token:   token,
 		Timeout: timeout,
+		Peers:   peers,
 		http:    &http.Client{Timeout: timeout},
 		infos:   map[string]infoResult{},
 	}
 }
 
 func (c *Client) get(ctx context.Context, host, path string, query url.Values, out any) error {
+	if !c.Peers.Allow(host) {
+		return fmt.Errorf("%s: %w", host, api.ErrPeerNotAllowed)
+	}
 	u := url.URL{Scheme: "http", Host: net.JoinHostPort(host, strconv.Itoa(c.Port)), Path: path, RawQuery: query.Encode()}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
@@ -62,7 +70,11 @@ func (c *Client) get(ctx context.Context, host, path string, query url.Values, o
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 		return fmt.Errorf("%s: %s: %s", u.Host, resp.Status, b)
 	}
-	return json.NewDecoder(resp.Body).Decode(out)
+	body := io.LimitReader(resp.Body, maxResponse+1)
+	if err := json.NewDecoder(body).Decode(out); err != nil {
+		return fmt.Errorf("%s: decoding response: %w", u.Host, err)
+	}
+	return nil
 }
 
 // Info returns the information of the agent on host. Results, including
