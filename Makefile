@@ -44,8 +44,8 @@ test-root: ## tests that load the BPF programs into the running kernel
 	rm -f tracer.test
 
 .PHONY: e2e
-e2e: build ## multi-host test with network namespaces
-	sudo test/e2e/run.sh ./shawk
+e2e: build collector ## multi-host test with network namespaces; needs SHAWK_E2E_POSTGRES_DSN
+	sudo --preserve-env=SHAWK_E2E_POSTGRES_DSN test/e2e/run.sh ./shawk collector/_build/shawk-collector
 
 .PHONY: check-object
 check-object: ## check that the committed BPF object matches the source

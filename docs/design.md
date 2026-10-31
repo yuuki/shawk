@@ -1,9 +1,11 @@
 # Design of shawk
 
-shawk is a **dependency ledger**: it records which process talks to which
-network service on every host, keeps that record for years, and answers
-operational questions such as *"who still uses this database?"* or *"can I
-remove this host?"* with evidence.
+shawk keeps the **record of network dependencies** of a fleet: which process
+talks to which network service on every host, since when, until when, and
+how much. It answers the questions asked before changing a system — *who
+still uses this database? what appeared after the deployment? did anything
+use this host in the last 90 days, and were we watching?* — in Grafana, from
+PostgreSQL and Prometheus.
 
 It is built on the socket-based tracing method with in-kernel flow bundling
 proposed in
@@ -12,10 +14,7 @@ proposed in
 > Socket-based Tracing for Discovering Network Services Dependencies.* Journal of
 > Information Processing, Vol. 30, pp. 260–268, 2022.
 
-and follows the future work of the paper: a tool for containerized and
-classic hosts that works **without a central database**.
-
-## 1. Why a ledger
+## 1. Why
 
 The paper is motivated by changes whose impact administrators cannot
 predict: platform migrations where old and new systems coexist, and clients
@@ -26,41 +25,53 @@ sampling-based tracing misses. Answering those needs
   middleware and third-party software that cannot be instrumented;
 - **always-on tracing** with low overhead, so that rare dependencies are
   observed;
-- **long retention**, so that "nobody used it in the last 90 days" is a
-  statement backed by data.
+- **long retention with known coverage**, so that "nobody used it in the
+  last 90 days" is a statement backed by data, and "not observed" is not
+  mistaken for "not used".
 
-Existing eBPF service maps (Coroot, Pixie, Hubble, Beyla, ...) focus on the
-present state and on Kubernetes. shawk focuses on history and questions, and
-on VMs and on-premises hosts (the primary target is Rocky Linux 9, kernel
-5.14).
+Existing eBPF service maps focus on the present state and on Kubernetes,
+and application-layer instrumentation such as OBI (OpenTelemetry eBPF
+Instrumentation) sees only the protocols it parses. shawk focuses on history
+and coverage, for any TCP/UDP protocol, on VMs and on-premises hosts (the
+primary target is Rocky Linux 9, kernel 5.14), and runs beside OBI (§9).
 
 ## 2. Architecture
 
 ```
-          host A                          host B
- ┌──────────────────────────┐   ┌──────────────────────────┐
- │ processes                │   │ processes                │
- │   │ TCP/UDP sockets       │   │                          │
- │ ──┼────────────── kernel │   │                          │
- │ eBPF: bundle flows       │   │ eBPF                     │
- │   │ every interval       │   │                          │
- │ shawk agent ─ ledger.db  │   │ shawk agent ─ ledger.db  │
- │   └ HTTP API :7464       │   │   └ HTTP API :7464       │
- └───────────▲──────────────┘   └───────────▲──────────────┘
-             │      shawk who-uses / deps / graph ...      │
-             └──────────────── CLI (anywhere) ─────────────┘
+ every host
+   eBPF ─ shawk agent ── OTLP (edges with addresses) ──→ [collector] otlp/shawk ─→ shawk connector
+   OBI (application) ─── OTLP ─────────────────────────→ [collector] otlp ─→ OBI pipelines
+
+ shawk connector ─┬─→ PostgreSQL (relations, observation segments)
+                  └─→ aggregated metrics without addresses ─→ Prometheus
+ OBI pipelines ─→ Prometheus, trace store
+
+ PostgreSQL + Prometheus (+ traces) ─→ Grafana
 ```
 
-* The **agent** on each host traces flows, resolves process identities and
-  records the dependencies of *its own host* in a local SQLite ledger.
-* There is **no central database**. A query walks edges across agents: an
-  incoming edge on the server tells the client address; the agent on that
-  address tells which process the client is (and its own clients, and so on).
-  When both ends run an agent, an edge is recorded on both hosts, so the
-  edges of a decommissioned host remain in its peers' ledgers (queries
-  starting at the removed host itself need its agent).
-* Peers without an agent (external clients, managed services) appear as
-  addresses.
+- The **agent** on each host traces flows with eBPF, resolves the process
+  and service of each flow, and sends every 15 seconds all live series of
+  its host as cumulative OTLP metrics (§4). It keeps no database and opens
+  no port.
+- The **shawk connector** is a component of the OpenTelemetry Collector, run
+  in a collector built with the OpenTelemetry Collector Builder (§5). It
+  writes the relations of every host to PostgreSQL, names the peer of every
+  edge, and forwards aggregated metrics without addresses to Prometheus. Only
+  the connector holds database credentials.
+- **PostgreSQL is the truth of whether a dependency exists** (§6),
+  **Prometheus of how much flows** (§7). They are joined by names
+  (`service.name`, `service.peer.name`, `server.port`, `network.transport`,
+  `host.id`), never by a cross-database join.
+- **Grafana** is the user interface: dashboards and alerts are shipped as
+  examples in `packaging/` (§8).
+
+shawk promises two contracts: the views and functions of the PostgreSQL
+schema `shawk_v1`, and the names and labels of its metrics in Prometheus.
+The OTLP between agent and connector and the configuration of the connector
+are internal; agent and connector are released together.
+
+`shawk flows` shows the flows of the local host live, for debugging,
+without a collector.
 
 ## 3. Tracing
 
@@ -210,88 +221,270 @@ attach target, helper and CO-RE relocation against the BTF of the Rocky Linux
 plain byte in recent kernels but a 4-bit bitfield at a different offset in
 5.14.
 
-## 4. The ledger
+## 4. The agent
 
-### 4.1 Data model
+### 4.1 Identity of processes and services
 
-```
-edges(direction, proto, local_addr, remote_addr, port, netns, unit, comm,
-      cgroup, exe, last_pid, first_seen, last_seen)
-activity(edge_id, res, ts, conns, conn_fails, max_open_conns, bytes_sent,
-         bytes_recv, msgs_sent, msgs_recv, retrans, rtt_sum_us, rtt_count)
-listeners(proto, addr, port, netns, unit, comm, cgroup, exe, pid,
-          first_seen, last_seen)
-```
-
-* An **edge** is a bundled flow with a resolved, *stable* process identity:
-  `unit` is derived from the cgroup path (`nginx.service`,
+- `shawk.unit` is derived from the cgroup path (`nginx.service`,
   `docker-0123456789ab`, `user-1000.slice/session.scope`, ...). Names that
-  change on every run (login sessions, transient units) are normalized so that
-  a cron job accumulates under one edge. Flows carry cgroup ids; since the
-  cgroup of a short-lived job is often removed before the end of the
-  interval, `tp_btf/cgroup_mkdir` reports the path of every cgroup when it is
-  created, and the agent keeps it for an hour.
-* **activity** keeps counters in buckets of one minute, one hour and one day.
-  All three are updated at every interval, so no roll-up job is needed;
-  retention is per resolution (2 days, 90 days and 3 years by default).
-* `first_seen` / `last_seen` make the core questions cheap: *what appeared
-  since the deployment*, *who used this in the last 90 days*.
+  change on every run (login sessions, transient units) are normalized so
+  that a cron job accumulates under one name. Since the cgroup of a
+  short-lived job is often removed before the end of the interval,
+  `tp_btf/cgroup_mkdir` reports the path of every cgroup when it is created,
+  and the agent keeps it for an hour.
+- `service.name` follows the order of OBI, so that both name a service the
+  same way: `OTEL_SERVICE_NAME`, then `service.name` in
+  `OTEL_RESOURCE_ATTRIBUTES` of the process (only the `OTEL_` variables of
+  `/proc/PID/environ` are read; the rest is discarded as soon as it is
+  read), then the base name of the executable, then comm.
+  `-service-name-fallback=unit` uses the unit instead of the executable.
+  `service.namespace` is read from `OTEL_RESOURCE_ATTRIBUTES`.
+- Services that share an executable on a host (`ruby`, `python`, `java`,
+  `php-fpm`) share a name unless they set `OTEL_SERVICE_NAME`, e.g. with
+  `Environment=` in a systemd drop-in. PostgreSQL still tells them apart by
+  unit.
+- When a process exits before `/proc` is read, the latest identity seen for
+  the same unit and comm is used.
+- The host is identified by `host.id` (`/etc/machine-id`, else
+  `/var/lib/dbus/machine-id`) and `host.name`. In PostgreSQL a host is the
+  hash of both, so that VMs cloned with the same machine id stay apart.
 
-### 4.2 Choice of the storage engine
+### 4.2 What is sent
 
-Requirements: embedded in the agent (no server to operate), crash-safe,
-small footprint, a single static binary for easy deployment on RHEL-family
-hosts, flexible queries (by port, by peer, by time window, joins of edges and
-activity), and inspectable by operators. The write load is small *because of
-the in-kernel bundling*: one upsert per dependency and resolution per
-interval (a host with 500 dependencies and a 15 s interval does ~100 upserts
-per second in one transaction).
+Every edge (a bundled flow with its process identity) is a series with the
+attributes `service.name`, `service.namespace`, `process.executable.name`,
+`process.executable.path`, `process.command`, `shawk.unit`, `shawk.role`
+(`client` or `server`), `network.transport`, `network.local.address`,
+`network.peer.address`, `server.port` (the service port, whatever the role)
+and `shawk.netns`. The PID is not an attribute, so a restarted process
+continues the same series.
 
-| candidate | assessment |
+| metric | type, unit | |
+|---|---|---|
+| `shawk.connection.opened` | Counter, `{connection}` | established connections (TCP) |
+| `shawk.connection.failed` | Counter, `{connection}` | failed attempts (TCP client side only) |
+| `shawk.connection.count` | UpDownCounter, `{connection}` | connections open at the end of the interval (TCP) |
+| `shawk.network.io` | Counter, `By` | bytes, with `network.io.direction` |
+| `shawk.udp.datagrams` | Counter, `{datagram}` | UDP datagrams, with `network.io.direction` |
+| `shawk.tcp.retransmits` | Counter, `{segment}` | segments the local socket retransmitted |
+| `shawk.tcp.rtt` | Histogram without buckets, `s` | smoothed RTT samples (sum and count) |
+| `shawk.edge.first_seen`, `shawk.edge.last_seen` | Gauge, `s` | Unix time of the first and last activity |
+
+Listening sockets are sent as `shawk.listener.first_seen` and
+`shawk.listener.last_seen` with the transport, address, port, netns and
+process attributes. The agent itself sends `shawk.agent.up` (with
+`shawk.netns.scope`), `shawk.agent.segment.start`, `shawk.agent.udp.traced`,
+`shawk.agent.flows.dropped`, `shawk.agent.export.failures`, and with
+`-bpf-stats` the run count and time of each BPF program. The resource
+carries `host.id`, `host.name`, `host.ip` (addresses of the interfaces and of
+the live series, including containers), `os.version`, and
+`service.name=shawk-agent` with `service.version`.
+
+### 4.3 How it is sent
+
+- **One request per interval.** Every 15 seconds the agent sends all live
+  series of the host in one OTLP request (gRPC or HTTP/protobuf, gzip).
+- **Cumulative.** Counters are totals since the series started, so a failed
+  request is made up for by the next one. Requests are not retried.
+- **Idle TTL.** A series with no activity (connections, bytes, datagrams or
+  open connections) for `-idle-ttl` (15 minutes) is dropped; if it
+  reappears, its counters start again from zero. This bounds the series of
+  a host by its recent dependencies.
+- **Observation segments.** `shawk.agent.segment.start` is the time from
+  which every dependency active on the host has reached the connector. It
+  is the start of the agent; when requests fail for longer than the idle TTL
+  minus a minute, edges that ended meanwhile may have been dropped unsent,
+  so the request that succeeds afterwards carries now minus the idle TTL:
+  edges active since then are still being sent.
+
+## 5. The shawk connector
+
+### 5.1 Writes to PostgreSQL
+
+For every request (one host), the connector accumulates the changes of
+hosts, segments, addresses, processes, edges and listeners. Every
+`write_interval` (1 minute) it writes the changes of each host in one
+transaction. Edges and listeners are upserted with
+`first_seen = least(...)` and `last_seen = greatest(...)`, so replays and
+reordering give the same result and several connectors do not conflict. An
+edge whose `last_seen` alone advances is written once per interval, and an
+idle edge that agents keep sending until its TTL is not written again.
+
+The segment of the request is upserted into `agent_sessions` with
+`last_heartbeat` set to the time of the request: observations up to there
+are written. While the database is down, changes accumulate (in proportion
+to the number of edges, not to time) and are written when it returns. A
+crash of the connector loses at most one write interval, which agents send
+again while the edges are within their TTL.
+
+### 5.2 Names of peers
+
+The connector loads `shawk_v1.service_endpoints` and `shawk_v1.agent_addrs`
+every write interval, and adds what it learns from requests at once.
+
+| role | peer | `service.peer.name` |
+|---|---|---|
+| client | a service listens on the peer address and port | the service (`[namespace/]name`) |
+| client | unknown, in a range of `peer_cidrs` | the name of the narrowest range |
+| client | unknown, private address | `~unresolved` |
+| client | unknown, public address | `~external` |
+| server | an address of a host whose agent is alive, or loopback | `~agent` |
+| server | otherwise | named range, `~unresolved`, `~external` |
+
+Loopback peers are looked up on the same host only. Among several services
+on an endpoint, one on the same host, then the most recently seen, wins.
+Names are the best guess at the time of aggregation; PostgreSQL is the
+truth of attribution. A new server may show as `~unresolved` until its
+listener is written (up to one write interval).
+
+### 5.3 Metrics to Prometheus
+
+Edge metrics are reduced to `service.peer.name`, `shawk.role`,
+`server.port`, `network.transport` and, for bytes and datagrams,
+`network.io.direction`, and summed into **one resource per host and local
+service**: `service.name` and `service.namespace` of the resource are those
+of the local process, so Prometheus labels the series with the same `job`
+as the metrics of OBI for the service. `service.instance.id` is the host
+name, and `host.id` and `host.name` are promoted to labels by Prometheus.
+
+- Series are bounded by host × local service × peer service × port × role;
+  replicas and changing IPs of peers do not add series. Per host, local
+  service and role, at most `max_peers` (50) peer names are used; the rest
+  are folded into `~other`. `keep_peer_address` keeps
+  `network.peer.address` when it is really needed.
+- Inputs are cumulative per peer address; outputs merge several of them.
+  The connector keeps the last value of every input series and adds the
+  increase to the output, treating a decrease or a new start time as a
+  reset, so an output never decreases when an input disappears. An input
+  that started before the connector is taken as a baseline, so a restart of
+  the connector does not add past totals at once. Open connections are the
+  sum of the current inputs.
+- An output series without input is sent until `idle_ttl` and then dropped.
+- This state requires the data of a host to reach the same connector. With
+  several connectors, route by resource with the loadbalancing exporter of a
+  collector in front.
+- The metrics of the agents are forwarded under `job="shawk-agent"`.
+
+| Prometheus name | |
 |---|---|
-| **SQLite** (modernc.org/sqlite, pure Go) | Relational queries, upserts, indexes, WAL for concurrent readers, a single file that operators can open with `sqlite3` for audits. No cgo. Throughput is far beyond the load. **Chosen.** |
-| bbolt | Pure Go, ACID, but key-value only: every query and index would be hand-written. |
-| Pebble / BadgerDB | LSM trees optimized for high write throughput, which bundling makes unnecessary; compaction and tuning add operational weight; no query language. |
-| DuckDB | Excellent for analytics, but requires cgo, adds tens of MB, and is single-writer per process; analytical scans are not the workload. |
-| Embedded Prometheus TSDB / VictoriaMetrics | Good for numeric series, but a dependency is a relational entity with first/last seen and identity attributes; "edges by port" or "first seen" queries are awkward and label cardinality grows with peers. Exporting metrics to such systems is a better fit than storing the ledger in them. |
-| Plain files (JSON lines / Parquet) | Simple to write but every query becomes a scan; no transactional upserts. |
+| `shawk_connection_opened_total`, `shawk_connection_failed_total` | connections |
+| `shawk_connection_count` | open connections |
+| `shawk_network_io_bytes_total`, `shawk_udp_datagrams_total` | traffic |
+| `shawk_tcp_retransmits_total` | retransmitted segments |
+| `shawk_tcp_rtt_seconds_sum`, `shawk_tcp_rtt_seconds_count` | RTT |
+| `shawk_agent_*` | agents |
 
-## 5. Queries
+Prometheus needs `--web.enable-otlp-receiver`,
+`otlp.promote_resource_attributes: [host.id, host.name]` and an
+out-of-order window of 30 minutes; counters stay cumulative.
 
-| command | question |
+## 6. PostgreSQL
+
+PostgreSQL 14 or later (multiranges and `CYCLE`). The schema is bundled
+with the connector as migrations (`collector/shawkconnector/migrations`),
+applied by `shawk-migrate` or by the connector with `postgres.migrate`.
+
+### 6.1 Tables (internal, schema `shawk`)
+
+```
+hosts(id, machine_id, hostname, kernel, agent_version, first_seen, last_seen)
+agent_sessions(host_id, started_at, last_heartbeat, udp_traced, netns_scope, dropped_flows)
+host_addrs(host_id, addr, first_seen, last_seen)
+processes(id, host_id, unit, comm, exe, service_name, first_seen, last_seen)
+edges(id, host_id, process_id, role, proto, local_addr, remote_addr, port, netns, first_seen, last_seen)
+listeners(host_id, process_id, proto, addr, port, netns, first_seen, last_seen)
+```
+
+`service_name` has the form of the `job` label (`namespace/name`), so that
+names in PostgreSQL and Prometheus match.
+
+### 6.2 Contract (schema `shawk_v1`)
+
+| view or function | |
 |---|---|
-| `who-uses HOST[:PORT]` | Who uses this service? With `-depth N`, who is affected transitively (blast radius). |
-| `deps HOST[/UNIT]` | What does this process depend on, transitively? |
-| `can-i-remove HOST[:PORT]` | Did any remote process use it in the window? Exits 0 if none did, 1 if some did, and 3 ("unknown") if none was seen but the record may be incomplete: the agent did not record part of the window (not running, failed writes, retention), the kernel dropped flows, UDP was not traced, the agent traces only one network namespace, or nothing listened on the port. |
-| `unused HOST` | Which listening services had no client in the window? |
-| `diff HOST -since 24h` | Which dependencies appeared or disappeared (e.g. after a deployment)? |
-| `graph HOST... -depth N` | Export the graph around hosts as Mermaid, Graphviz or JSON. |
+| `dependencies` | one row per logical dependency: the client edge and the server edge matched by their addresses and port (loopback within a host and netns). `observed_by` is `both`, `client` or `server`; a one-sided row means no agent on the other side, or a NAT or load balancer between. `client_observed_until` and `server_observed_until` are the latest heartbeats of the hosts: an old `last_seen` with a recent `observed_until` means *no longer used*; both old means *no longer observed*. |
+| `graph_nodes`, `graph_edges` | the dependency map between services in the format of the Grafana Node Graph; peers without a service are named by address |
+| `dependency_changes` | dependencies between services that appeared, or disappeared while a host that saw them kept observing for 15 minutes |
+| `service_endpoints` | addresses and ports services accept connections on (listeners, with unspecified addresses expanded to the addresses of the host, and server edges); used by the connector |
+| `agent_addrs` | addresses of hosts whose agent reported in the last 5 minutes; used by the connector |
+| `agents` | the latest segment of every host and whether its agent is alive |
+| `unobserved(since, until, tolerance)` | the periods in which each host was not observed; Grafana overlays them as annotations |
 
-Traversal resolves the process at the other end of an edge by querying the
-peer's agent with the reverse edge (`direction=out, remote=<server address>,
-port=<port>` for clients; `direction=in, remote=<client address>` for
-servers). Loopback and the host's own addresses refer to the same agent.
+The connector role writes `shawk` and reads `shawk_v1`; Grafana reads
+`shawk_v1` only (`packaging/postgres`).
 
-## 6. Limitations
+## 7. Counting each dependency once
 
-* **Relays that rewrite addresses** (NAT, IPVS, kube-proxy, cloud load
-  balancers) hide the real peer, as discussed in §5.2 of the paper. Edges end
-  at the relay address. Resolving them through the conntrack table is future
-  work.
-* **Same port shared by different services** with `SO_REUSEPORT` cannot be
+When both ends run an agent, a dependency appears on the client side
+(`shawk_role="client"`) and on the server side (`shawk_role="server"`). The
+recording rules in `packaging/prometheus/shawk-rules.yml` count it once:
+
+| metric | per dependency |
+|---|---|
+| connections, open connections, bytes, datagrams, RTT | the client side; the server side only when the client has no agent (`service_peer_name != "~agent"`) |
+| connection failures | the client side only (the server never sees them) |
+| retransmissions | both sides: each counts its own retransmitted segments; `shawk_role` is the sender |
+
+The two sides differ in `shawk_role`, so their `or` is a union. The rules
+label the client `src` and the server `dst` whichever side observed the
+dependency, e.g. `shawk:dependency_connections:rate5m{src, dst,
+server_port, network_transport}`.
+
+## 8. Grafana
+
+`packaging/grafana` holds data sources, dashboards (fleet, dependency map,
+dependency details, changes, application layer of OBI) and alert rules.
+
+The PostgreSQL data source is used for alerts in the **time series
+format**: a `time` column, string columns as labels and one numeric
+`value`. A query that finds nothing returns no rows, which is No Data, so
+the rules treat No Data as Normal. A disappeared dependency is an explicit
+row — its `last_seen` falls in a window while a host that saw it is still
+observed — rather than a row that vanishes from the result, so a stopped
+agent does not look like a removed dependency. Agents that stopped are
+alerted by Prometheus (`ShawkAgentDown`) while their series are in the TSDB,
+and by PostgreSQL (`shawk_v1.agents`) afterwards.
+
+## 9. OBI
+
+OBI (OpenTelemetry eBPF Instrumentation) cannot replace the tracer of
+shawk: its network flows and TCP statistics do not tell which process
+communicates, and its application layer covers only the protocols it
+parses. shawk runs beside it instead:
+
+- OBI instruments the application layer (`application` and
+  `application_service_graph` features) of selected services and sends to
+  the `otlp` receiver of the same collector; its network and statistics
+  features stay disabled, since shawk observes the same per process.
+- Both name services the same way and both set the resource `service.name`,
+  so `job` matches; dashboards use one `$service` variable for both.
+- `host.id` is the machine id in both. Cloned VMs should regenerate it
+  (`systemd-machine-id-setup`) for OBI's sake; shawk tells them apart by
+  host name anyway.
+- Dependencies seen by shawk but absent from the service graph of OBI show
+  where application-layer instrumentation is missing.
+
+## 10. Limitations
+
+- **Relays that rewrite addresses** (NAT, IPVS, kube-proxy, cloud load
+  balancers) hide the real peer, as discussed in §5.2 of the paper.
+  Dependencies end at the relay address and are seen on one side only.
+- **Addresses shared by many hosts** (container bridges such as
+  172.17.0.1) can be attributed to the wrong host when naming peers.
+- **Same port shared by different services** with `SO_REUSEPORT` cannot be
   told apart (§5.3 of the paper); this is rare.
-* **UDP peer-to-peer protocols** where both sides send first are recorded as
-  clients of each other's port. A UDP client socket that existed before the
-  agent started and receives before it sends again is recorded as a server.
-* **MPTCP clients**: an outgoing MPTCP connection that existed before the
-  agent started is not attributed to its process (its subflows have no file
-  descriptor), and additional subflows opened by the kernel's path manager
-  are attributed to a kernel worker.
-* **Flow table capacity**: when more distinct flows than `-max-flows` occur
-  in one interval, e.g. on an internet-facing host, updates are dropped;
-  `can-i-remove` then answers "unknown".
-* **Clocks**: `first_seen`/`last_seen` use the clock of each agent. Wrong
-  timestamps are corrected once the clock is right and the edge is seen
-  again, and pruning is suspended for a day after the clock jumps.
-* The agent API is plain HTTP with an optional bearer token; put it on a
-  management network or behind TLS termination.
+- **UDP peer-to-peer protocols** where both sides send first are recorded
+  as clients of each other's port. A UDP client socket that existed before
+  the agent started and receives before it sends again is recorded as a
+  server.
+- **MPTCP clients**: an outgoing MPTCP connection that existed before the
+  agent started is not attributed to its process, and additional subflows
+  opened by the kernel's path manager are attributed to a kernel worker.
+- **Flow table capacity**: when more distinct flows than `-max-flows` occur
+  in one interval, updates are dropped and `shawk.agent.flows.dropped`
+  counts them.
+- **Clocks**: times come from the clock of each agent; heartbeats are
+  compared with the clock of PostgreSQL.
+- **Retention**: rows in PostgreSQL are not deleted yet.
+- **Retransmissions toward clients with an agent** are labeled `~agent` on
+  the server side in Prometheus.

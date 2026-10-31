@@ -39,7 +39,7 @@ nfpms:
     vendor: Yuuki TSUBOUCHI
     homepage: https://github.com/yuuki/shawk
     maintainer: Yuuki TSUBOUCHI <yuki.tsubo@gmail.com>
-    description: A dependency ledger that records network dependencies among processes with eBPF
+    description: Agent of shawk, which traces network dependencies among processes with eBPF and sends them over OTLP
     # The binary embeds the compiled eBPF programs.
     license: Apache-2.0 AND (GPL-2.0-only OR BSD-2-Clause)
     formats:
@@ -49,6 +49,9 @@ nfpms:
     contents:
       - src: packaging/systemd/shawk-agent.service
         dst: /usr/lib/systemd/system/shawk-agent.service
+      - src: packaging/systemd/agent.env
+        dst: /etc/shawk/agent.env
+        type: config|noreplace
       - src: LICENSE
         dst: /usr/share/licenses/shawk/LICENSE
       - src: NOTICE

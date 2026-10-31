@@ -1,6 +1,6 @@
 # shawk 次期設計案：PostgreSQL ＋ OpenTelemetry ＋ Grafana
 
-状態：提案（2026-10-31）。現行の実装（`docs/design.md`）からの変更案であり、まだ実装していない。
+状態：実装済み（2026-10-31、ブランチ `next-design`）。もとは SQLite 台帳の実装からの変更案として書いた。実装で決めた細部は §9、実装中に見つけた未決事項は §10 にある。英語の設計文書は `docs/design.md`。
 
 この案に反映済みの判断：
 
@@ -654,6 +654,13 @@ group by (src, dst) (
 - エージェントの `shawk.agent.up` と `shawk.agent.udp.traced` は単位を空にした。単位 `1` の Gauge には Prometheus が `_ratio` を付けるため。
 - 見本のテスト：recording rule とアラートは `test/packaging`（独自の go.mod）で Prometheus の PromQL エンジンに合成した系列を読ませて値を確かめる。ダッシュボードの PromQL は構文と recording rule の名前を確かめる。ダッシュボードと SQL アラートの SQL は、`grants.sql` を当てたうえで `shawk_grafana` ロールで実際の PostgreSQL に流す（Grafana のマクロは置き換える）。Grafana そのものでの読み込みは確かめていない。
 
+### 9.4 廃止と文書
+
+- `internal/ledger`、`internal/query`、`internal/client`、`internal/api`、`internal/agent/http.go`、CLI の問い合わせコマンドと `modernc.org/sqlite` への依存を消した。CLI は `agent`、`flows`、`version` だけになった。
+- e2e テスト（`test/e2e/run.sh`、`make e2e`）は、ネットワーク名前空間の三つのホストのエージェントを、ocb で作った Collector と PostgreSQL（`SHAWK_E2E_POSTGRES_DSN`）につなぎ、`shawk_v1` のビューと転送したメトリクスを確かめる形に書き直した。三つのホストは machine-id を共有するので、複製した VM の区別も確かめている。
+- CI（`.github/workflows/test.yml`）は PostgreSQL のサービスコンテナを使い、`make test`（三つのモジュール）と `make e2e` を動かす。
+- deb / rpm には `/etc/shawk/agent.env`（設定ファイル）を加えた。Collector と `shawk-migrate` のパッケージはまだ作っていない（`make collector` / `make shawk-migrate` で作る）。
+
 ## 10. 未決事項（実装中に見つけたもの）
 
 - **サーバ側の再送の `src`**：§4.4 の規約どおり再送は両側を使うが、相手にエージェントがあるサーバ側の系列は `service_peer_name="~agent"` なので、recording rule の `src` が `~agent` になり、どのクライアントへの再送かが Prometheus では分からない。PostgreSQL 側（`dependencies`）で突き合わせるか、connector がサーバ側の `~agent` の代わりにクライアントのサービス名を付けるか（その場合は二重計上の規約の作り直しが要る）を決める必要がある。
@@ -662,3 +669,4 @@ group by (src, dst) (
 - **保持期間**：PostgreSQL の表を消す仕組みはまだない（`edges` は IP の入れ替わりで増え続ける）。現行の `-retention-*` に当たるものを connector の設定にするか、運用の SQL にするかを決める必要がある。
 - **`dependencies` ビューの重さ**：全期間のエッジを FULL JOIN するので、エッジが多いと遅い。期間で絞る関数版（`dependencies_between(since, until)` など）を足すかどうか。
 - **`unobserved()` の時刻の基準**：`last_heartbeat` はエージェントの時計、`now()` は PostgreSQL の時計。時計がずれたホストでは `alive` や空白の判定がずれる。
+- **Collector の配布**：ocb で作る Collector と `shawk-migrate` のリリース（バイナリ、パッケージ、コンテナイメージ）をどう作るかは決めていない。

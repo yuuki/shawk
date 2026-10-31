@@ -1,17 +1,23 @@
 #!/usr/bin/env bash
 # End-to-end test: simulates hosts with network namespaces on a bridge, runs
-# an agent in each of them and queries dependencies across the agents.
+# an agent in each of them, sends to a collector with the shawk connector
+# and checks the dependencies it wrote to PostgreSQL and the metrics it
+# forwarded.
 #
 #   ext (no agent) --> lb:80 haproxy --> app:8080 puma --> db:5432 postgres
 #                                        app puma ------> 127.0.0.1:6379 redis-server (on app)
 #                                        app puma ==persistent==> db:5433 postgres
 #                                                         db:9187 exporter (unused)
 #
-# Requires root, iproute2, python3, curl and unshare (util-linux).
-# Usage: test/e2e/run.sh path/to/shawk
+# Requires root, iproute2, python3, psql and unshare (util-linux).
+# SHAWK_E2E_POSTGRES_DSN is a database dedicated to the test: its schemas
+# shawk and shawk_v1 are dropped and recreated.
+# Usage: test/e2e/run.sh path/to/shawk path/to/shawk-collector
 set -euo pipefail
 
-SHAWK="$(realpath "${1:?usage: run.sh path/to/shawk}")"
+SHAWK="$(realpath "${1:?usage: run.sh path/to/shawk path/to/shawk-collector}")"
+COLLECTOR="$(realpath "${2:?usage: run.sh path/to/shawk path/to/shawk-collector}")"
+DSN="${SHAWK_E2E_POSTGRES_DSN:?set SHAWK_E2E_POSTGRES_DSN to a database dedicated to the test}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 WORK="$(mktemp -d)"
 PREFIX="shawke2e"
@@ -36,6 +42,8 @@ fail() {
 	exit 1
 }
 
+sql() { PGOPTIONS='-c client_min_messages=warning' psql "$DSN" -v ON_ERROR_STOP=1 -AXqt -F ' ' -c "$1"; }
+
 # Network: a bridge in the root namespace and one namespace per host.
 ip link add "$PREFIX-br" type bridge
 ip addr add $NET.1/24 dev "$PREFIX-br"
@@ -51,7 +59,7 @@ for h in "${!ADDR[@]}"; do
 done
 
 # Services run as differently named executables so that their command
-# names differ.
+# names and service names differ.
 for name in haproxy puma postgres redis-server client; do
 	cp "$(command -v python3)" "$WORK/$name"
 done
@@ -71,87 +79,91 @@ svc app puma --listen 8080 --upstream ${ADDR[db]}:5432 --upstream 127.0.0.1:6379
 svc lb haproxy --listen 80 --upstream ${ADDR[app]}:8080
 sleep 2
 
+# The collector listens on the bridge, where the agents reach it.
+sql "DROP SCHEMA IF EXISTS shawk_v1 CASCADE; DROP SCHEMA IF EXISTS shawk CASCADE" >/dev/null
+echo "$DSN" >"$WORK/dsn"
+cat >"$WORK/collector.yaml" <<EOF
+receivers:
+  otlp/shawk:
+    protocols:
+      grpc: { endpoint: "$NET.1:4327" }
+connectors:
+  shawk:
+    postgres: { dsn_file: "$WORK/dsn", migrate: true }
+    write_interval: 2s
+exporters:
+  debug: { verbosity: detailed }
+service:
+  telemetry: { metrics: { level: none } }
+  pipelines:
+    metrics/in: { receivers: [otlp/shawk], exporters: [shawk] }
+    metrics/out: { receivers: [shawk], exporters: [debug] }
+EOF
+"$COLLECTOR" --config "$WORK/collector.yaml" >"$WORK/collector.log" 2>&1 &
+PIDS+=($!)
+
 for h in lb app db; do
-	# A UTS namespace gives each simulated host its own host name.
-	ip netns exec "$PREFIX-$h" unshare --uts sh -c "hostname $h-01 && exec \"$SHAWK\" agent -netns self -interval 1s -db \"$WORK/$h.db\"" >"$WORK/$h-agent.log" 2>&1 &
+	# A UTS namespace gives each simulated host its own host name. The hosts
+	# share the machine id, like cloned VMs.
+	ip netns exec "$PREFIX-$h" unshare --uts sh -c "hostname $h-01 && exec \"$SHAWK\" agent -netns self -interval 1s -otlp-endpoint http://$NET.1:4327" >"$WORK/$h-agent.log" 2>&1 &
 	PIDS+=($!)
 done
-for h in lb app db; do
-	for _ in $(seq 50); do
-		curl -sf "http://${ADDR[$h]}:7464/healthz" >/dev/null 2>&1 && break
-		sleep 0.2
-	done
-	curl -sf "http://${ADDR[$h]}:7464/healthz" >/dev/null || fail "agent on $h is not up"
+for _ in $(seq 60); do
+	[[ "$(sql "SELECT count(*) FROM shawk_v1.agents WHERE alive" 2>/dev/null)" == 3 ]] && break
+	sleep 0.5
 done
+[[ "$(sql "SELECT count(*) FROM shawk_v1.agents WHERE alive")" == 3 ]] || fail "the agents did not report"
 
 svc ext client --client ${ADDR[lb]}:80
-sleep 6
+sleep 8
 
-run() {
-	echo "\$ shawk $*"
-	"$SHAWK" "$@" | tee "$WORK/out"
-	local rc=${PIPESTATUS[0]}
+check() { # description, SQL, expected output
+	local got
+	got="$(sql "$2")"
+	echo "\$ $1"
+	echo "$got"
 	echo
-	return "$rc"
+	[[ "$got" == "$3" ]] || fail "$1: got '$got', want '$3'"
 }
-expect() { grep -qE -- "$1" "$WORK/out" || fail "expected /$1/"; }
 
-run who-uses ${ADDR[db]}:5432 -depth 3
-expect '^db-01:5432/tcp \(10\.231\.0\.10\) +postgres'
-expect '── app-01 \(10\.231\.0\.11\) +puma'
-expect '── app-01:8080/tcp \(10\.231\.0\.11\) +puma'
-expect '── lb-01 \(10\.231\.0\.5\) +haproxy'
-expect '── 10\.231\.0\.50 +\(no agent\)'
+check "dependencies" "
+SELECT coalesce(client_host, host(client_addr)), coalesce(client_service, '-'), coalesce(server_host, '-'),
+       coalesce(server_service, '-'), port, observed_by
+FROM shawk_v1.dependencies
+WHERE port IN (80, 8080, 5432, 5433, 6379)
+ORDER BY port, 1" \
+"10.231.0.50 - lb-01 haproxy 80 server
+app-01 puma db-01 postgres 5432 both
+app-01 puma db-01 postgres 5433 both
+app-01 puma app-01 redis-server 6379 both
+lb-01 haproxy app-01 puma 8080 both"
 
-run who-uses ${ADDR[db]}:5433
-expect 'puma'
+check "unused listeners" "
+SELECT s.host, s.port, s.service
+FROM shawk_v1.service_endpoints s
+WHERE NOT EXISTS (SELECT FROM shawk_v1.dependencies d WHERE d.server_host = s.host AND d.port = s.port)
+  AND s.port IN (5432, 5433, 9187) AND NOT s.addr << '127.0.0.0/8'
+ORDER BY 1, 2" \
+"db-01 9187 postgres"
 
-run deps ${ADDR[lb]} -depth 3
-expect 'haproxy'
-expect 'app-01:8080/tcp.* puma'
-expect 'db-01:5432/tcp.* postgres'
-expect 'app-01:6379/tcp.* redis-server'
+check "agents" "SELECT host, alive, netns_scope <> 'all' FROM shawk_v1.agents ORDER BY host" \
+"app-01 t t
+db-01 t t
+lb-01 t t"
 
-run unused ${ADDR[db]}
-expect '9187 +postgres'
+check "host ids of hosts sharing a machine id" \
+"SELECT count(DISTINCT id), count(DISTINCT machine_id) FROM shawk.hosts" "3 1"
 
-set +e
-run can-i-remove ${ADDR[db]}
-code=$?
-set -e
-[[ $code == 1 ]] || fail "can-i-remove exited with $code, want 1"
-expect '^NO:'
+check "dependency map" \
+"SELECT source, target FROM shawk_v1.graph_edges WHERE mainstat ~ '^(80|8080|5432)/' ORDER BY 1, 2" \
+"10.231.0.50 haproxy
+haproxy puma
+puma postgres"
 
-# Only local clients use redis, but each agent traces only its namespace and
-# a 30-day window is not covered by a ledger a few seconds old.
-set +e
-run can-i-remove ${ADDR[app]}:6379
-code=$?
-set -e
-[[ $code == 3 ]] || fail "can-i-remove exited with $code, want 3"
-expect '^UNKNOWN:'
-expect 'did not record'
-expect 'only network namespace'
-
-run graph ${ADDR[app]} -depth 3
-expect 'n[0-9]+ -->\|tcp/8080\| n[0-9]+'
-
-run graph ${ADDR[app]} -depth 3 -format json
-python3 - "$WORK/out" <<'PY' || fail "unexpected graph"
-import json, sys
-g = json.load(open(sys.argv[1]))
-label = {n["id"]: n["host"] + (":" + n.get("comm", "") if n["agent"] else "") for n in g["nodes"]}
-edges = {(label[e["from"]], label[e["to"]], e["port"]) for e in g["edges"]}
-want = {("lb-01:haproxy", "app-01:puma", 8080), ("app-01:puma", "db-01:postgres", 5432),
-        ("app-01:puma", "app-01:redis-server", 6379), ("10.231.0.50", "lb-01:haproxy", 80)}
-if want - edges or len(label) != len(set(label.values())):
-    sys.exit(f"missing {want - edges} or duplicate nodes in {sorted(edges)}")
-PY
-
-run diff ${ADDR[app]} -since 1h
-expect '^\+ +puma'
-
-run status ${ADDR[db]}
-expect 'ledger since'
+# The forwarded metrics name the peers and carry no addresses.
+grep -q 'service.peer.name: Str(postgres)' "$WORK/collector.log" || fail "no series of puma to postgres"
+grep -q 'service.peer.name: Str(~agent)' "$WORK/collector.log" || fail "no server side series of a client with an agent"
+grep -q 'service.peer.name: Str(~unresolved)' "$WORK/collector.log" || fail "no series of the client without an agent"
+if grep -q 'network.peer.address' "$WORK/collector.log"; then fail "peer addresses forwarded"; fi
 
 echo "PASS"
