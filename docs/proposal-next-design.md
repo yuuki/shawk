@@ -618,3 +618,28 @@ group by (src, dst) (
 - エージェントの HTTP API（`internal/agent/http.go`）はこの段階で消した。
 - `host.ip` には、インタフェースのアドレスに加えて、生きている系列のローカルアドレス（コンテナの名前空間のもの）を入れる。
 - machine-id がないホストでは `host.id` を送らない（現行の boot_id への代替はやめた。再起動のたびに別のホストになるため）。
+
+### 9.2 shawk connector
+
+- Go のモジュールは `collector/`（`github.com/yuuki/shawk/collector`）。部品は `collector/shawkconnector`、独自ビルドのマニフェストは `collector/builder-config.yaml`（`make collector`）。エージェントとの OTLP の形の一致は、エージェントのテストが書き出す `collector/shawkconnector/testdata/agent-request.json` を connector のテストが読むことで確かめる（二つのモジュールは互いに依存しない）。
+- `hosts.id` は connector が resource の `host.id` と `host.name` から求める（`sha256(machine-id + "\n" + hostname)` の先頭 8 バイト。現行の hostID と同じ）。
+- PostgreSQL の `processes.service_name` には Prometheus の `job` と同じ形（`namespace/name`）を入れる。`shawk_v1` のビューの `client_service` / `server_service` と recording rule の `src` / `dst` がそのまま一致する。
+- スキーマは `collector/shawkconnector/migrations/` の SQL を埋め込み、`shawk-migrate` コマンド（`make shawk-migrate`）か connector の `postgres.migrate: true` で当てる。適用済みの版は `shawk.schema_migrations` に残す。接続文字列は `postgres.dsn` か `postgres.dsn_file`。
+- connector の起動時に DB に届かなくても Collector は起動する。変化は手元に溜め、名前は前回読んだもの（なければ区分）で付ける。
+- `service.peer.name` の決め方の細部：
+  - ループバックの相手は同じホストとみなす。クライアント側は同じホストの待ち受けだけで名前を引き、サーバ側は `~agent` にする。
+  - 同じアドレスとポートに複数のサービスが見つかったら、同じホストのもの、次に最も新しく見たものを選ぶ。
+  - `peer_cidrs` の値はカンマ区切りで複数の範囲を書ける。`~` で始まる名前は使えない。
+  - 区分 `~unresolved` の「プライベート範囲」は、RFC 1918、ループバック、リンクローカル、CGNAT（100.64.0.0/10）、IPv6 ULA。
+- 累積値の合算の細部：
+  - connector が起動する前に始まった入力系列は、最初の値を基準にして差分 0 とする（再起動直後に過去の累計が一度に足されて率が跳ねないように）。
+  - `shawk.connection.count`（開いている接続）は差分をとらず、そのリクエストに含まれる入力の現在値の和にする。入力がなくなった出力は 0 になる。
+  - `max_peers` の枠は、出力の TTL の間使われなかった相手から空く。`~other` 自体は枠に数えない。
+- 出力のリソースには `service.name`、`service.namespace`（あれば）、`service.instance.id`（= `host.name`）、`host.id`、`host.name` を付ける。エージェント自身のメトリクスは `service.name=shawk-agent` のリソースで、`shawk.agent.segment.start` を除いて転送する。
+- `shawk_v1` のビューの細部：
+  - `service_endpoints` は、待ち受けポート（`0.0.0.0` は同じホストの IPv4 アドレスに、`::` は全アドレスに展開する）とサーバ側のエッジの（ローカルアドレス, ポート）から作る。直近 7 日に見たものだけを返す。列 `host_id` と `last_seen` を加えた。§8 の「`0.0.0.0` の待ち受けポートの展開」のうち、ホストのアドレスへの単純な展開だけを先に入れた（これがないと、ほとんどのサーバの名前が引けないため）。
+  - `agent_addrs` は、直近 5 分以内に報告したホストのアドレスだけを返す。クライアント側のエージェントが止まると、サーバ側の系列は 5 分ほどで `~agent` から区分の名前に変わり、依存単位の値に数えられるようになる。
+  - `dependencies` に `client_addr` と `server_unit` を加えた。ループバックのアドレスどうしは、同じホスト・同じ netns のエッジだけを突き合わせる。
+  - `graph_nodes` / `graph_edges` / `dependency_changes` はサービス単位にまとめる。サービス名のない相手はアドレスをノードの名前にする。`dependency_changes` の「消えた」は、その依存を見ていたホストが `last_seen` から 15 分以上観測を続けていることを条件にする。
+  - `unobserved()` は `SECURITY DEFINER` にした（読み取りのロールが `shawk` スキーマの表を読めなくても使えるように）。
+  - `agents` に `host_id`、`machine_id`、`kernel`、`agent_version` を加えた。

@@ -16,11 +16,24 @@ build:
 .PHONY: vet
 vet:
 	$(GO) vet ./...
-	test -z "$$(gofmt -l .)"
+	cd collector && $(GO) vet ./...
+	test -z "$$(gofmt -l cmd internal collector/shawkconnector collector/cmd)"
 
 .PHONY: test
-test: ## unit tests; tests that load BPF programs are skipped without root
+test: ## unit tests; BPF tests need root, PostgreSQL tests need SHAWK_TEST_POSTGRES_DSN
 	$(GO) test ./...
+	cd collector && $(GO) test ./...
+
+OCB_VERSION ?= v0.164.0
+
+.PHONY: collector
+collector: ## build the collector with the shawk connector (collector/_build/shawk-collector)
+	$(GO) install go.opentelemetry.io/collector/cmd/builder@$(OCB_VERSION)
+	cd collector && $$($(GO) env GOPATH)/bin/builder --config builder-config.yaml
+
+.PHONY: shawk-migrate
+shawk-migrate: ## build the command that applies the PostgreSQL schema
+	cd collector && CGO_ENABLED=0 $(GO) build -trimpath -o ../shawk-migrate ./cmd/shawk-migrate
 
 .PHONY: test-root
 test-root: ## tests that load the BPF programs into the running kernel
@@ -45,4 +58,4 @@ compat: rocky9.btf ## check the BPF programs against the Rocky Linux 9 kernel
 
 .PHONY: clean
 clean:
-	rm -f shawk tracer.test rocky9.btf
+	rm -rf shawk shawk-migrate tracer.test rocky9.btf collector/_build

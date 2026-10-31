@@ -5,3 +5,5 @@
 *.db
 *.db-shm
 *.db-wal
+/collector/_build/
+/shawk-migrate
