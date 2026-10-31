@@ -43,8 +43,8 @@ See [docs/design.md](docs/design.md) for the design.
 * Linux with BTF (`/sys/kernel/btf/vmlinux`): Rocky Linux / RHEL 9, or
   upstream 5.14 or later (best 5.19 or later). The programs are tested by
   loading them on Ubuntu kernels 6.8 to 7.0 and checked statically against
-  the Rocky Linux 9.6 kernel; they have not yet run on a Rocky Linux kernel
-  or on arm64. See [the design](docs/design.md#35-kernel-requirements-and-features-used).
+  the Rocky Linux 9.6 kernel; they have not yet run on a Rocky Linux kernel,
+  on upstream 5.14 to 5.18, or on arm64. See [the design](docs/design.md#35-kernel-requirements-and-features-used).
 * The agent must run in the host PID namespace to resolve the owners of
   sockets.
 * UDP tracing additionally needs BPF trampolines (fentry), available on

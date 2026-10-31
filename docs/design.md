@@ -185,8 +185,8 @@ the map being read.
 ### 3.5 Kernel requirements and features used
 
 The target is Rocky Linux 9 (5.14 with RHEL's backports) and upstream
-Linux with BTF (`CONFIG_DEBUG_INFO_BTF`). The programs load on upstream
-5.14 or later; the features they use are:
+Linux with BTF (`CONFIG_DEBUG_INFO_BTF`). The features the programs use
+require upstream 5.14 or later:
 
 | feature | since |
 |---|---|
