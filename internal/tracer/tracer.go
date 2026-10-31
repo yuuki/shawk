@@ -66,7 +66,8 @@ type Tracer struct {
 	iterUDP      *link.Iter
 	iterTaskFile *link.Iter
 
-	self uint32 // global thread group id of this process
+	self  uint32 // global thread group id of this process
+	netns uint32 // network namespace of this process
 
 	mu     sync.Mutex
 	idx    uint32
@@ -127,6 +128,11 @@ func New(opts Options) (*Tracer, error) {
 		log:    opts.Logger,
 		owners: map[sockAddrKey]owner{},
 	}
+	var st unix.Stat_t
+	if err := unix.Stat("/proc/self/ns/net", &st); err != nil {
+		return nil, fmt.Errorf("finding the network namespace: %w", err)
+	}
+	t.netns = uint32(st.Ino)
 	if err := t.configure(spec); err != nil {
 		return nil, err
 	}
@@ -437,13 +443,37 @@ func convertFlow(k *bpfShawkFlowKey, v *bpfShawkFlowStats) Flow {
 }
 
 // scanSockets walks TCP and UDP sockets and returns the listening sockets.
+//
+// The iterators are opened in every network namespace, since an iterator
+// only walks the namespace it was opened in.
 func (t *Tracer) scanSockets() ([]Listener, error) {
 	if err := clearMap(t.listenPorts); err != nil {
 		return nil, err
 	}
+	var readers []io.ReadCloser
+	for _, ns := range listNetNS(t.opts.NetNS) {
+		if ns.inode == t.netns {
+			rcs, err := openIters(t.iterTCP, t.iterUDP)
+			if err != nil {
+				closeAll(readers)
+				return nil, err
+			}
+			readers = append(readers, rcs...)
+			continue
+		}
+		rcs, err := openInNetNS(ns.path, t.iterTCP, t.iterUDP)
+		if err != nil {
+			// The namespace may have gone away since it was listed.
+			t.log.Debug("skipping network namespace", "netns", ns.inode, "error", err)
+			continue
+		}
+		readers = append(readers, rcs...)
+	}
+	defer closeAll(readers)
+
 	var listeners []Listener
-	for _, it := range []*link.Iter{t.iterTCP, t.iterUDP} {
-		recs, err := readIter(it)
+	for _, rd := range readers {
+		recs, err := readRecords(rd)
 		if err != nil {
 			return nil, err
 		}
@@ -530,11 +560,29 @@ func readIter(it *link.Iter) ([]bpfShawkIterRec, error) {
 		return nil, fmt.Errorf("opening iterator: %w", err)
 	}
 	defer rd.Close()
+	return readRecords(rd)
+}
+
+func readRecords(rd io.Reader) ([]bpfShawkIterRec, error) {
 	buf, err := readIterOutput(rd)
 	if err != nil {
 		return nil, fmt.Errorf("reading iterator: %w", err)
 	}
 	return decodeRecords(buf)
+}
+
+// openIters opens the iterators in the current network namespace.
+func openIters(its ...*link.Iter) ([]io.ReadCloser, error) {
+	var rcs []io.ReadCloser
+	for _, it := range its {
+		rc, err := it.Open()
+		if err != nil {
+			closeAll(rcs)
+			return nil, fmt.Errorf("opening iterator: %w", err)
+		}
+		rcs = append(rcs, rc)
+	}
+	return rcs, nil
 }
 
 // iterReadSize is the size of each read from an iterator. The kernel stops a

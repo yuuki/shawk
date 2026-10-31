@@ -100,6 +100,10 @@ These are the edge weights listed in §2.4 of the paper.
 | `iter/tcp` (every interval) | account byte deltas of long-lived connections, sample RTT, count open connections, list listening sockets, **adopt** connections established before the agent started |
 | `iter/task_file` | find the owners of adopted connections and of listening sockets |
 
+A socket iterator walks only the network namespace of the thread that opens
+it, so the agent opens the TCP and UDP iterators inside every network
+namespace of the host (found through `/proc/*/ns/net` and `/run/netns`).
+
 Bytes are not counted on the send/receive path. They are read from the
 cumulative counters of `struct tcp_sock` (`bytes_acked`, `bytes_received`,
 `total_retrans`) at close and at every scan, and the difference to the last
