@@ -1,28 +1,24 @@
 // Package agent runs the per-host daemon: it collects bundled flows from the
-// tracer, records them in the ledger and serves them to clients.
+// tracer and sends them as OTLP metrics to the shawk connector of an
+// OpenTelemetry Collector. It keeps no database of its own.
 package agent
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
-	"net/http"
 	"net/netip"
 	"os"
 	"slices"
 	"strconv"
-	"sync"
 	"time"
 
+	colmetricspb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
 	"golang.org/x/sys/unix"
 
-	"github.com/yuuki/shawk/internal/api"
-	"github.com/yuuki/shawk/internal/ledger"
+	"github.com/yuuki/shawk/internal/otlp"
 	"github.com/yuuki/shawk/internal/procinfo"
 	"github.com/yuuki/shawk/internal/tracer"
 	"github.com/yuuki/shawk/internal/version"
@@ -30,15 +26,17 @@ import (
 
 // Config configures an agent.
 type Config struct {
-	Listen    string // address of the API server
-	DBPath    string
-	Interval  time.Duration
-	NetNS     uint32 // 0 traces all network namespaces
-	MaxFlows  uint32
-	Retention ledger.Retention
-	Token     string // bearer token required by the API; empty disables auth
-	BPFStats  bool   // enable the kernel's run time accounting of BPF programs
-	Logger    *slog.Logger
+	Exporter otlp.ExporterConfig
+	Interval time.Duration
+	// IdleTTL is how long a series is sent after its last activity.
+	IdleTTL         time.Duration
+	NetNS           uint32 // 0 traces all network namespaces
+	MaxFlows        uint32
+	ServiceFallback procinfo.Fallback
+	BPFStats        bool // enable and send the run time statistics of the BPF programs
+	Logger          *slog.Logger
+
+	traceSelf bool // trace the agent's own flows; for tests
 }
 
 // Agent is a running agent.
@@ -46,21 +44,17 @@ type Agent struct {
 	cfg      Config
 	log      *slog.Logger
 	tracer   *tracer.Tracer
-	ledger   *ledger.Ledger
+	exporter otlp.Exporter
 	cgroups  *procinfo.Resolver
-	apiPort  uint16
+	state    *otlp.State
+	segment  *otlp.Segment
+	idents   *identities
 	started  time.Time
-	hostname string
-	hostID   string
+	res      otlp.Resource
 
-	// Owned by the collection loop.
-	lastWrite time.Time
-	prevDrops uint64
-
-	mu       sync.Mutex
-	drops    uint64
-	lastErr  error
-	lastTick time.Time
+	lastCollect time.Time
+	failures    uint64
+	drops       uint64
 }
 
 // Run starts the agent and blocks until ctx is canceled.
@@ -71,24 +65,25 @@ func Run(ctx context.Context, cfg Config) error {
 	if cfg.Interval <= 0 {
 		cfg.Interval = 15 * time.Second
 	}
-	ln, err := net.Listen("tcp", cfg.Listen)
+	if cfg.IdleTTL <= 0 {
+		cfg.IdleTTL = 15 * time.Minute
+	}
+	if cfg.IdleTTL < 2*time.Minute || cfg.IdleTTL < 4*cfg.Interval {
+		return fmt.Errorf("the idle TTL %s must be at least 2m and 4 intervals", cfg.IdleTTL)
+	}
+	exp, err := otlp.NewExporter(cfg.Exporter)
 	if err != nil {
 		return err
 	}
-	defer ln.Close()
-
-	lg, err := ledger.Open(cfg.DBPath, cfg.Retention)
-	if err != nil {
-		return fmt.Errorf("opening ledger %s: %w", cfg.DBPath, err)
-	}
-	defer lg.Close()
+	defer exp.Close()
 
 	cgroups := procinfo.NewResolver()
 	tr, err := tracer.New(tracer.Options{
-		NetNS:    cfg.NetNS,
-		MaxFlows: cfg.MaxFlows,
-		OnCgroup: cgroups.Learn,
-		Logger:   cfg.Logger,
+		NetNS:     cfg.NetNS,
+		MaxFlows:  cfg.MaxFlows,
+		OnCgroup:  cgroups.Learn,
+		TraceSelf: cfg.traceSelf,
+		Logger:    cfg.Logger,
 	})
 	if err != nil {
 		return fmt.Errorf("starting tracer: %w", err)
@@ -108,146 +103,103 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 
 	hostname, _ := os.Hostname()
+	machineID := procinfo.MachineID()
+	if machineID == "" {
+		cfg.Logger.Warn("the host has no machine id (/etc/machine-id); it is identified by its name only")
+	}
+	now := time.Now()
 	a := &Agent{
 		cfg:      cfg,
 		log:      cfg.Logger,
 		tracer:   tr,
-		ledger:   lg,
+		exporter: exp,
 		cgroups:  cgroups,
-		apiPort:  uint16(ln.Addr().(*net.TCPAddr).Port),
-		started:  time.Now(),
-		hostname: hostname,
-		hostID:   hostID(hostname),
+		state:    otlp.NewState(cfg.IdleTTL),
+		segment:  otlp.NewSegment(now, cfg.IdleTTL),
+		idents:   newIdentities(cfg.ServiceFallback, cfg.IdleTTL),
+		started:  now,
+		res: otlp.Resource{
+			MachineID:    machineID,
+			Hostname:     hostname,
+			Kernel:       kernelRelease(),
+			AgentVersion: version.Version,
+		},
+		// Flows are traced from here on.
+		lastCollect: now,
 	}
-	// Flows are traced from here on.
-	a.lastWrite = a.started
-
-	srv := &http.Server{Handler: a.handler(), ReadHeaderTimeout: 10 * time.Second}
-	errc := make(chan error, 1)
-	go func() { errc <- srv.Serve(ln) }()
-	a.log.Info("agent started", "listen", ln.Addr().String(), "db", cfg.DBPath, "interval", cfg.Interval, "udp", tr.UDPEnabled())
+	a.log.Info("agent started", "endpoint", cfg.Exporter.Endpoint, "protocol", cfg.Exporter.Protocol,
+		"interval", cfg.Interval, "idle_ttl", cfg.IdleTTL, "udp", tr.UDPEnabled())
 
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()
-	var (
-		lastPrune time.Time
-		prevTick  = time.Now()
-		clockJump time.Time // when the wall clock last jumped
-	)
 	for {
 		select {
 		case <-ctx.Done():
+			// Send the last partial interval.
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			srv.Shutdown(shutdownCtx)
-			// Record the last partial interval.
-			if err := a.collect(context.Background()); err != nil {
-				a.log.Error("collecting flows", "error", err)
+			if err := a.tick(shutdownCtx); err != nil {
+				a.log.Error("sending the last interval", "error", err)
 			}
 			return nil
-		case err := <-errc:
-			if errors.Is(err, http.ErrServerClosed) {
-				return nil
-			}
-			return err
 		case <-ticker.C:
-			now := time.Now()
-			if d := clockSkew(prevTick, now); d > maxClockJump || d < -maxClockJump {
-				a.log.Warn("the wall clock jumped; pruning is suspended for a day", "jump", d)
-				clockJump = now
+			tickCtx, cancel := context.WithTimeout(ctx, a.exportTimeout())
+			if err := a.tick(tickCtx); err != nil {
+				a.log.Error("collecting and sending flows", "error", err)
 			}
-			prevTick = now
-			if err := a.collect(ctx); err != nil {
-				a.log.Error("collecting flows", "error", err)
-			}
-			// A wrong clock would delete data as if it had expired.
-			if time.Since(lastPrune) > time.Hour && (clockJump.IsZero() || time.Since(clockJump) > 24*time.Hour) {
-				if err := lg.Prune(ctx, time.Now()); err != nil {
-					a.log.Error("pruning ledger", "error", err)
-				}
-				lastPrune = time.Now()
-			}
+			cancel()
 		}
 	}
 }
 
-// maxClockJump is how far the wall clock may move apart from the monotonic
-// clock between two ticks before it is considered to have jumped.
-const maxClockJump = 10 * time.Minute
-
-// clockSkew returns how much more the wall clock advanced than the
-// monotonic clock from prev to now. A suspended host also shows up as a
-// forward jump, since the monotonic clock stops while suspended.
-func clockSkew(prev, now time.Time) time.Duration {
-	return now.Round(0).Sub(prev.Round(0)) - now.Sub(prev)
+// exportTimeout keeps an export from delaying the next collection.
+func (a *Agent) exportTimeout() time.Duration {
+	return max(a.cfg.Interval*2/3, time.Second)
 }
 
-type recordKey struct {
-	dir, proto, laddr, raddr string
-	port                     uint16
-	netns                    uint32
-	unit, comm               string
-}
-
-// collect closes an interval of the tracer and records it.
-func (a *Agent) collect(ctx context.Context) error {
+// tick closes an interval of the tracer and sends all live series. A failed
+// request is made up for by the next one, since the series are cumulative.
+func (a *Agent) tick(ctx context.Context) error {
 	snap, err := a.tracer.Collect()
+	if err != nil {
+		return err
+	}
 	now := time.Now()
-	if err == nil {
-		err = a.record(ctx, now, snap)
+	a.observe(snap, a.lastCollect, now)
+	a.lastCollect = now
+	a.state.Expire(now)
+	a.idents.expire(now)
+
+	req, segStart := a.request(now)
+	if err := a.exporter.Export(ctx, req); err != nil {
+		a.failures++
+		return fmt.Errorf("sending to %s: %w", a.cfg.Exporter.Endpoint, err)
 	}
-	a.mu.Lock()
-	a.lastErr = err
-	a.lastTick = now
-	if snap != nil {
-		a.drops = snap.Drops
-	}
-	a.mu.Unlock()
-	return err
+	a.segment.Succeeded(segStart, now)
+	return nil
 }
 
-// record writes the flows of the interval ending at now to the ledger. An
-// interval that fails to be written becomes a gap in the coverage.
-func (a *Agent) record(ctx context.Context, now time.Time, snap *tracer.Snapshot) error {
-	tick := ledger.Tick{
-		At:       now,
-		Interval: now.Sub(a.lastWrite),
-		UDP:      a.tracer.UDPEnabled(),
-		Drops:    snap.Drops - a.prevDrops,
-	}
-	a.lastWrite, a.prevDrops = now, snap.Drops
-
-	exes := map[uint32]string{}
-	exe := func(pid uint32) string {
-		if s, ok := exes[pid]; ok {
-			return s
-		}
-		s := procinfo.Exe(pid)
-		exes[pid] = s
-		return s
-	}
-
-	index := make(map[recordKey]int, len(snap.Flows))
-	recs := make([]ledger.Record, 0, len(snap.Flows))
+// observe accounts a snapshot of the interval (start, end] to the series.
+func (a *Agent) observe(snap *tracer.Snapshot, start, end time.Time) {
+	a.drops = snap.Drops
+	a.idents.beginInterval()
+	a.state.BeginInterval()
 	for i := range snap.Flows {
 		f := &snap.Flows[i]
-		// Queries of shawk clients to this agent.
-		if f.Direction == tracer.DirOut && f.Port == a.apiPort && f.Comm == "shawk" {
-			continue
+		role := otlp.RoleClient
+		if f.Direction == tracer.DirIn {
+			role = otlp.RoleServer
 		}
-		cg := a.cgroups.CgroupPath(f.CgroupID)
-		r := ledger.Record{
-			Direction:  f.Direction.String(),
-			Proto:      f.Proto.String(),
-			LocalAddr:  f.LocalAddr.String(),
-			RemoteAddr: f.RemoteAddr.String(),
-			Port:       f.Port,
-			NetNS:      f.NetNS,
-			Unit:       procinfo.Unit(cg),
-			Comm:       f.Comm,
-			Cgroup:     cg,
-			Exe:        exe(f.PID),
-			PID:        f.PID,
+		k := otlp.EdgeKey{
+			Role:      role,
+			Proto:     f.Proto.String(),
+			LocalAddr: f.LocalAddr,
+			PeerAddr:  f.RemoteAddr,
+			Port:      f.Port,
+			NetNS:     f.NetNS,
+			Process:   a.idents.resolve(f.PID, f.Comm, procinfo.Unit(a.cgroups.CgroupPath(f.CgroupID)), end),
+		}
+		a.state.AddEdge(k, otlp.EdgeStats{
 			Conns:      f.Conns,
 			ConnFails:  f.ConnFails,
 			OpenConns:  f.OpenConns,
@@ -257,153 +209,80 @@ func (a *Agent) record(ctx context.Context, now time.Time, snap *tracer.Snapshot
 			MsgsRecv:   f.MsgsRecv,
 			Retrans:    f.Retrans,
 			RTTSumUs:   f.RTTSumUs,
-			RTTCount:   f.RTTSamples,
-		}
-		// Different cgroups may map to the same unit, e.g. login sessions.
-		k := recordKey{r.Direction, r.Proto, r.LocalAddr, r.RemoteAddr, r.Port, r.NetNS, r.Unit, r.Comm}
-		if j, ok := index[k]; ok {
-			mergeRecord(&recs[j], &r)
-			continue
-		}
-		index[k] = len(recs)
-		recs = append(recs, r)
+			RTTSamples: f.RTTSamples,
+		}, start, end)
 	}
-
-	listeners := make([]ledger.ListenerRecord, 0, len(snap.Listeners))
 	for _, l := range snap.Listeners {
-		if l.Proto == tracer.ProtoTCP && l.Port == a.apiPort && l.PID == a.tracer.SelfPID() {
-			continue
+		a.state.AddListener(otlp.ListenerKey{
+			Proto:   l.Proto.String(),
+			Addr:    l.Addr,
+			Port:    l.Port,
+			NetNS:   l.NetNS,
+			Process: a.idents.resolve(l.PID, l.Comm, procinfo.Unit(a.cgroups.CgroupPath(l.CgroupID)), end),
+		}, end)
+	}
+}
+
+// request builds the request of the live series at now, and returns the
+// start of the observation segment it carries.
+func (a *Agent) request(now time.Time) (*colmetricspb.ExportMetricsServiceRequest, time.Time) {
+	res := a.res
+	res.Addrs = hostAddrs()
+	// Addresses of containers in other network namespaces.
+	for _, addr := range a.state.LocalAddrs() {
+		if !slices.Contains(res.Addrs, addr) {
+			res.Addrs = append(res.Addrs, addr)
 		}
-		cg := a.cgroups.CgroupPath(l.CgroupID)
-		listeners = append(listeners, ledger.ListenerRecord{
-			Proto:  l.Proto.String(),
-			Addr:   l.Addr.String(),
-			Port:   l.Port,
-			NetNS:  l.NetNS,
-			Unit:   procinfo.Unit(cg),
-			Comm:   l.Comm,
-			Cgroup: cg,
-			Exe:    exe(l.PID),
-			PID:    l.PID,
-		})
 	}
-	return a.ledger.Write(ctx, tick, recs, listeners)
-}
-
-func mergeRecord(dst, src *ledger.Record) {
-	dst.Conns += src.Conns
-	dst.ConnFails += src.ConnFails
-	dst.OpenConns += src.OpenConns
-	dst.BytesSent += src.BytesSent
-	dst.BytesRecv += src.BytesRecv
-	dst.MsgsSent += src.MsgsSent
-	dst.MsgsRecv += src.MsgsRecv
-	dst.Retrans += src.Retrans
-	dst.RTTSumUs += src.RTTSumUs
-	dst.RTTCount += src.RTTCount
-	if src.PID != 0 {
-		dst.PID, dst.Exe, dst.Cgroup = src.PID, src.Exe, src.Cgroup
+	segStart := a.segment.Start(now)
+	st := otlp.AgentStatus{
+		Started:        a.started,
+		SegmentStart:   segStart,
+		NetNSScope:     a.netnsScope(),
+		UDPTraced:      a.tracer.UDPEnabled(),
+		FlowsDropped:   a.drops,
+		ExportFailures: a.failures,
 	}
-}
-
-func (a *Agent) info(ctx context.Context) (*api.Info, error) {
-	since, err := a.ledger.Since(ctx)
-	if err != nil {
-		return nil, err
-	}
-	var uts unix.Utsname
-	kernel := ""
-	if unix.Uname(&uts) == nil {
-		kernel = unix.ByteSliceToString(uts.Release[:])
-	}
-	a.mu.Lock()
-	drops := a.drops
-	a.mu.Unlock()
-	addrs := hostAddrs()
-	// Addresses of containers appear only in the ledger.
-	if local, err := a.ledger.LocalAddrs(ctx, time.Now().Add(-24*time.Hour)); err == nil {
-		for _, l := range local {
-			if ip, err := netip.ParseAddr(l); err == nil && !ip.IsUnspecified() && !slices.Contains(addrs, l) {
-				addrs = append(addrs, l)
+	if a.cfg.BPFStats {
+		if stats, err := a.tracer.ProgramStats(); err == nil {
+			for _, s := range stats {
+				st.BPFPrograms = append(st.BPFPrograms, otlp.BPFProgram{Name: s.Name, RunCount: s.RunCount, RunTime: s.Runtime})
 			}
 		}
 	}
-	return &api.Info{
-		ID:          a.hostID,
-		Hostname:    a.hostname,
-		Version:     version.Version,
-		Kernel:      kernel,
-		Addrs:       addrs,
-		StartedAt:   a.started,
-		LedgerSince: since,
-		Interval:    a.cfg.Interval.String(),
-		NetNS:       a.netnsMode(),
-		UDP:         a.tracer.UDPEnabled(),
-		Drops:       drops,
-	}, nil
+	return a.state.Request(res, st, now), segStart
 }
 
-func (a *Agent) netnsMode() string {
+func (a *Agent) netnsScope() string {
 	if a.cfg.NetNS == 0 {
 		return "all"
 	}
 	return strconv.FormatUint(uint64(a.cfg.NetNS), 10)
 }
 
-// coverageTolerance is the length of gaps in the coverage that are expected
-// from the scheduling of intervals.
-func (a *Agent) coverageTolerance() time.Duration {
-	return 2*a.cfg.Interval + time.Second
-}
-
-// hostID identifies the host from its machine id (or boot id) and its name;
-// the name tells apart hosts cloned with the same machine id.
-func hostID(hostname string) string {
-	id, err := os.ReadFile("/etc/machine-id")
-	if err != nil || len(bytes.TrimSpace(id)) == 0 {
-		id, _ = os.ReadFile("/proc/sys/kernel/random/boot_id")
+func kernelRelease() string {
+	var uts unix.Utsname
+	if unix.Uname(&uts) != nil {
+		return ""
 	}
-	sum := sha256.Sum256(append(bytes.TrimSpace(id), "\n"+hostname...))
-	return hex.EncodeToString(sum[:8])
+	return unix.ByteSliceToString(uts.Release[:])
 }
 
 // hostAddrs returns the addresses of the interfaces of the host.
-func hostAddrs() []string {
+func hostAddrs() []netip.Addr {
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
 		return nil
 	}
-	var out []string
+	var out []netip.Addr
 	for _, a := range addrs {
 		if ipn, ok := a.(*net.IPNet); ok {
-			out = append(out, ipn.IP.String())
+			if ip, ok := netip.AddrFromSlice(ipn.IP); ok {
+				out = append(out, ip.Unmap())
+			}
 		}
 	}
 	return out
-}
-
-// ProgramStats is a run time statistic of a BPF program.
-type ProgramStats struct {
-	Name      string  `json:"name"`
-	RunCount  uint64  `json:"run_count"`
-	RuntimeNs int64   `json:"runtime_ns"`
-	AvgNs     float64 `json:"avg_ns"`
-}
-
-func (a *Agent) programStats() ([]ProgramStats, error) {
-	stats, err := a.tracer.ProgramStats()
-	if err != nil {
-		return nil, err
-	}
-	out := make([]ProgramStats, 0, len(stats))
-	for _, s := range stats {
-		ps := ProgramStats{Name: s.Name, RunCount: s.RunCount, RuntimeNs: s.Runtime.Nanoseconds()}
-		if s.RunCount > 0 {
-			ps.AvgNs = float64(s.Runtime.Nanoseconds()) / float64(s.RunCount)
-		}
-		out = append(out, ps)
-	}
-	return out, nil
 }
 
 // ParseNetNS parses the --netns flag: "all", "self" or an inode number.

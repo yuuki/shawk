@@ -601,3 +601,20 @@ group by (src, dst) (
 - Java などで OBI と同じ名前の決め方（Spring Boot の名前、JAR 名）を取り入れるか。
 - `service_endpoints` から OBI の対象ポート（`OTEL_EBPF_OPEN_PORT`）を生成する仕組み。
 - Rocky Linux 9 の実カーネル（SELinux enforcing）での CI。
+
+## 9. 実装で決めたこと
+
+実装の途中で決めた細部を記録する（設計の大筋は変えていない）。
+
+### 9.1 エージェント
+
+- OTLP の送り方は gRPC（既定）と HTTP/protobuf（`-otlp-protocol=http/protobuf`）の二つ。どちらも gzip で圧縮する。送り先は `-otlp-endpoint`（URL。`http://` は平文、`https://` は TLS。`-otlp-ca-file` で CA を指定できる）。既定値は環境変数 `OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_EXPORTER_OTLP_PROTOCOL`、なければ `http://localhost:4327` と gRPC。
+- 一回の送信の時間切れは送信間隔の 2/3。送信は再試行しない（次の送信が累積値で追いつく）。部分的な拒否（partial success）も失敗として数える。
+- エッジの系列は (役割, プロトコル, ローカルアドレス, 相手アドレス, ポート, netns, ユニット, comm, 実行ファイルのパス, `service.name`, `service.namespace`) で区別する。プロセスが `/proc` を読む前に終了した場合（短命なバッチなど）は、同じ (ユニット, comm) の直近の名前を使う。それもなければ comm を名前にする。
+- `first_seen` と `last_seen` は、活動があった区間の終わりの時刻にする。
+- TCP のエッジは `connection.opened`、`connection.count`、`network.io`、`tcp.retransmits`、`tcp.rtt` を、クライアント側だけ `connection.failed` も送る。UDP のエッジは `network.io` と `udp.datagrams` を送る。
+- `-idle-ttl` は 2 分以上かつ送信間隔の 4 倍以上でなければならない（区間の始まりの規則が「TTL − 1 分」を使うため）。
+- `-bpf-stats` は残し、BPF プログラムの実行回数と実行時間を `shawk.agent.bpf.run_count` / `shawk.agent.bpf.run_time`（属性 `shawk.bpf.program`）として送る。HTTP API がなくなったため。
+- エージェントの HTTP API（`internal/agent/http.go`）はこの段階で消した。
+- `host.ip` には、インタフェースのアドレスに加えて、生きている系列のローカルアドレス（コンテナの名前空間のもの）を入れる。
+- machine-id がないホストでは `host.id` を送らない（現行の boot_id への代替はやめた。再起動のたびに別のホストになるため）。

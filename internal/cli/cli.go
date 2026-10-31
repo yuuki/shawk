@@ -8,8 +8,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"net"
-	"net/netip"
 	"os"
 	"os/signal"
 	"sort"
@@ -22,7 +20,8 @@ import (
 	"github.com/yuuki/shawk/internal/agent"
 	"github.com/yuuki/shawk/internal/api"
 	"github.com/yuuki/shawk/internal/client"
-	"github.com/yuuki/shawk/internal/ledger"
+	"github.com/yuuki/shawk/internal/otlp"
+	"github.com/yuuki/shawk/internal/procinfo"
 	"github.com/yuuki/shawk/internal/query"
 	"github.com/yuuki/shawk/internal/tracer"
 	"github.com/yuuki/shawk/internal/version"
@@ -265,17 +264,19 @@ func ParseDuration(s string) (time.Duration, error) {
 func runAgent(ctx context.Context, args []string, _ io.Writer) error {
 	fs := flag.NewFlagSet("agent", flag.ContinueOnError)
 	var (
-		listen    = fs.String("listen", fmt.Sprintf(":%d", api.DefaultPort), "address of the API server")
-		db        = fs.String("db", "/var/lib/shawk/ledger.db", "path of the ledger database")
-		interval  = fs.Duration("interval", 15*time.Second, "collection interval")
-		netns     = fs.String("netns", "all", `network namespaces to trace: "all", "self" or an inode number`)
-		maxFlows  = fs.Uint("max-flows", 16384, "capacity of the in-kernel flow table per interval")
-		retMinute = fs.String("retention-minute", "2d", "retention of per-minute activity")
-		retHour   = fs.String("retention-hour", "90d", "retention of per-hour activity")
-		retDay    = fs.String("retention-day", "1095d", "retention of per-day activity and of dependencies")
-		tokenFile = fs.String("token-file", os.Getenv("SHAWK_TOKEN_FILE"), "file containing a bearer token required by the API")
-		bpfStats  = fs.Bool("bpf-stats", false, "enable run time statistics of the BPF programs (small overhead)")
-		logLevel  = fs.String("log-level", "info", "log level: debug, info, warn or error")
+		endpoint = fs.String("otlp-endpoint", envOr("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4327"),
+			"URL of the OTLP receiver of the shawk connector; http:// disables TLS")
+		protocol = fs.String("otlp-protocol", envOr("OTEL_EXPORTER_OTLP_PROTOCOL", otlp.ProtocolGRPC),
+			"OTLP protocol: grpc or http/protobuf")
+		caFile   = fs.String("otlp-ca-file", "", "PEM file of the CAs that verify the collector (default: system roots)")
+		interval = fs.Duration("interval", 15*time.Second, "collection and export interval")
+		idleTTL  = fs.Duration("idle-ttl", 15*time.Minute, "how long a dependency is sent after its last activity")
+		netns    = fs.String("netns", "all", `network namespaces to trace: "all", "self" or an inode number`)
+		maxFlows = fs.Uint("max-flows", 16384, "capacity of the in-kernel flow table per interval")
+		fallback = fs.String("service-name-fallback", "exe",
+			`name of a service without OTEL_SERVICE_NAME: "exe" (executable name) or "unit" (systemd unit)`)
+		bpfStats = fs.Bool("bpf-stats", false, "enable and send run time statistics of the BPF programs (small overhead)")
+		logLevel = fs.String("log-level", "info", "log level: debug, info, warn or error")
 	)
 	if _, err := parseFlags(fs, args, "0"); err != nil {
 		return err
@@ -289,51 +290,27 @@ func runAgent(ctx context.Context, args []string, _ io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("%w: %v", errUsage, err)
 	}
-	var ret ledger.Retention
-	for _, r := range []struct {
-		s   string
-		dst *time.Duration
-	}{{*retMinute, &ret.Minute}, {*retHour, &ret.Hour}, {*retDay, &ret.Day}} {
-		if *r.dst, err = ParseDuration(r.s); err != nil {
-			return fmt.Errorf("%w: retention: %v", errUsage, err)
-		}
-	}
-	token, err := readToken(*tokenFile)
+	fb, err := procinfo.ParseFallback(*fallback)
 	if err != nil {
-		return err
-	}
-	warnExposure(logger, *listen, *tokenFile, token)
-	if err := os.MkdirAll(dirOf(*db), 0o755); err != nil {
-		return err
+		return fmt.Errorf("%w: %v", errUsage, err)
 	}
 	return agent.Run(ctx, agent.Config{
-		Listen: *listen, DBPath: *db, Interval: *interval, NetNS: ns, MaxFlows: uint32(*maxFlows),
-		Retention: ret, Token: token, BPFStats: *bpfStats, Logger: logger,
+		Exporter:        otlp.ExporterConfig{Endpoint: *endpoint, Protocol: *protocol, CAFile: *caFile},
+		Interval:        *interval,
+		IdleTTL:         *idleTTL,
+		NetNS:           ns,
+		MaxFlows:        uint32(*maxFlows),
+		ServiceFallback: fb,
+		BPFStats:        *bpfStats,
+		Logger:          logger,
 	})
 }
 
-// warnExposure warns when the API, which reveals the processes and peers of
-// the host, is served to the network without a token, or when the token can
-// be read by other users.
-func warnExposure(logger *slog.Logger, listen, tokenFile, token string) {
-	if token == "" {
-		host, _, err := net.SplitHostPort(listen)
-		if a, perr := netip.ParseAddr(host); err != nil || perr != nil || !a.IsLoopback() {
-			logger.Warn("the agent API is served without authentication; set -token-file or listen on a management address",
-				"listen", listen)
-		}
-		return
+func envOr(name, def string) string {
+	if v := os.Getenv(name); v != "" {
+		return v
 	}
-	if st, err := os.Stat(tokenFile); err == nil && st.Mode().Perm()&0o077 != 0 {
-		logger.Warn("the token file can be read by other users", "file", tokenFile, "mode", st.Mode().Perm())
-	}
-}
-
-func dirOf(p string) string {
-	if i := strings.LastIndexByte(p, '/'); i > 0 {
-		return p[:i]
-	}
-	return "."
+	return def
 }
 
 func runFlows(ctx context.Context, args []string, w io.Writer) error {
