@@ -1,0 +1,426 @@
+// Package agent runs the per-host daemon: it collects bundled flows from the
+// tracer, records them in the ledger and serves them to clients.
+package agent
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/http"
+	"net/netip"
+	"os"
+	"slices"
+	"strconv"
+	"sync"
+	"time"
+
+	"golang.org/x/sys/unix"
+
+	"github.com/yuuki/shawk/internal/api"
+	"github.com/yuuki/shawk/internal/ledger"
+	"github.com/yuuki/shawk/internal/procinfo"
+	"github.com/yuuki/shawk/internal/tracer"
+	"github.com/yuuki/shawk/internal/version"
+)
+
+// Config configures an agent.
+type Config struct {
+	Listen    string // address of the API server
+	DBPath    string
+	Interval  time.Duration
+	NetNS     uint32 // 0 traces all network namespaces
+	MaxFlows  uint32
+	Retention ledger.Retention
+	Token     string // bearer token required by the API; empty disables auth
+	BPFStats  bool   // enable the kernel's run time accounting of BPF programs
+	Logger    *slog.Logger
+}
+
+// Agent is a running agent.
+type Agent struct {
+	cfg      Config
+	log      *slog.Logger
+	tracer   *tracer.Tracer
+	ledger   *ledger.Ledger
+	cgroups  *procinfo.Resolver
+	apiPort  uint16
+	started  time.Time
+	hostname string
+	hostID   string
+
+	// Owned by the collection loop.
+	lastWrite time.Time
+	prevDrops uint64
+
+	mu       sync.Mutex
+	drops    uint64
+	lastErr  error
+	lastTick time.Time
+}
+
+// Run starts the agent and blocks until ctx is canceled.
+func Run(ctx context.Context, cfg Config) error {
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
+	}
+	if cfg.Interval <= 0 {
+		cfg.Interval = 15 * time.Second
+	}
+	ln, err := net.Listen("tcp", cfg.Listen)
+	if err != nil {
+		return err
+	}
+	defer ln.Close()
+
+	lg, err := ledger.Open(cfg.DBPath, cfg.Retention)
+	if err != nil {
+		return fmt.Errorf("opening ledger %s: %w", cfg.DBPath, err)
+	}
+	defer lg.Close()
+
+	cgroups := procinfo.NewResolver()
+	tr, err := tracer.New(tracer.Options{
+		NetNS:    cfg.NetNS,
+		MaxFlows: cfg.MaxFlows,
+		OnCgroup: cgroups.Learn,
+		Logger:   cfg.Logger,
+	})
+	if err != nil {
+		return fmt.Errorf("starting tracer: %w", err)
+	}
+	defer tr.Close()
+	if cfg.BPFStats {
+		if err := tr.EnableStats(); err != nil {
+			cfg.Logger.Warn("enabling BPF run time statistics", "error", err)
+		}
+	}
+	if tr.SelfPID() != uint32(os.Getpid()) {
+		cfg.Logger.Warn("the agent runs in a PID namespace; owners of sockets of processes outside it are not resolved, run it in the host PID namespace",
+			"pid", os.Getpid(), "host_pid", tr.SelfPID())
+	}
+	if !tr.UDPEnabled() {
+		cfg.Logger.Warn("UDP is not traced; see the error above (UDP tracing needs BPF trampolines, fentry)")
+	}
+
+	hostname, _ := os.Hostname()
+	a := &Agent{
+		cfg:      cfg,
+		log:      cfg.Logger,
+		tracer:   tr,
+		ledger:   lg,
+		cgroups:  cgroups,
+		apiPort:  uint16(ln.Addr().(*net.TCPAddr).Port),
+		started:  time.Now(),
+		hostname: hostname,
+		hostID:   hostID(hostname),
+	}
+	// Flows are traced from here on.
+	a.lastWrite = a.started
+
+	srv := &http.Server{Handler: a.handler(), ReadHeaderTimeout: 10 * time.Second}
+	errc := make(chan error, 1)
+	go func() { errc <- srv.Serve(ln) }()
+	a.log.Info("agent started", "listen", ln.Addr().String(), "db", cfg.DBPath, "interval", cfg.Interval, "udp", tr.UDPEnabled())
+
+	ticker := time.NewTicker(cfg.Interval)
+	defer ticker.Stop()
+	var (
+		lastPrune time.Time
+		prevTick  = time.Now()
+		clockJump time.Time // when the wall clock last jumped
+	)
+	for {
+		select {
+		case <-ctx.Done():
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			srv.Shutdown(shutdownCtx)
+			// Record the last partial interval.
+			if err := a.collect(context.Background()); err != nil {
+				a.log.Error("collecting flows", "error", err)
+			}
+			return nil
+		case err := <-errc:
+			if errors.Is(err, http.ErrServerClosed) {
+				return nil
+			}
+			return err
+		case <-ticker.C:
+			now := time.Now()
+			if d := clockSkew(prevTick, now); d > maxClockJump || d < -maxClockJump {
+				a.log.Warn("the wall clock jumped; pruning is suspended for a day", "jump", d)
+				clockJump = now
+			}
+			prevTick = now
+			if err := a.collect(ctx); err != nil {
+				a.log.Error("collecting flows", "error", err)
+			}
+			// A wrong clock would delete data as if it had expired.
+			if time.Since(lastPrune) > time.Hour && (clockJump.IsZero() || time.Since(clockJump) > 24*time.Hour) {
+				if err := lg.Prune(ctx, time.Now()); err != nil {
+					a.log.Error("pruning ledger", "error", err)
+				}
+				lastPrune = time.Now()
+			}
+		}
+	}
+}
+
+// maxClockJump is how far the wall clock may move apart from the monotonic
+// clock between two ticks before it is considered to have jumped.
+const maxClockJump = 10 * time.Minute
+
+// clockSkew returns how much more the wall clock advanced than the
+// monotonic clock from prev to now. A suspended host also shows up as a
+// forward jump, since the monotonic clock stops while suspended.
+func clockSkew(prev, now time.Time) time.Duration {
+	return now.Round(0).Sub(prev.Round(0)) - now.Sub(prev)
+}
+
+type recordKey struct {
+	dir, proto, laddr, raddr string
+	port                     uint16
+	netns                    uint32
+	unit, comm               string
+}
+
+// collect closes an interval of the tracer and records it.
+func (a *Agent) collect(ctx context.Context) error {
+	snap, err := a.tracer.Collect()
+	now := time.Now()
+	if err == nil {
+		err = a.record(ctx, now, snap)
+	}
+	a.mu.Lock()
+	a.lastErr = err
+	a.lastTick = now
+	if snap != nil {
+		a.drops = snap.Drops
+	}
+	a.mu.Unlock()
+	return err
+}
+
+// record writes the flows of the interval ending at now to the ledger. An
+// interval that fails to be written becomes a gap in the coverage.
+func (a *Agent) record(ctx context.Context, now time.Time, snap *tracer.Snapshot) error {
+	tick := ledger.Tick{
+		At:       now,
+		Interval: now.Sub(a.lastWrite),
+		UDP:      a.tracer.UDPEnabled(),
+		Drops:    snap.Drops - a.prevDrops,
+	}
+	a.lastWrite, a.prevDrops = now, snap.Drops
+
+	exes := map[uint32]string{}
+	exe := func(pid uint32) string {
+		if s, ok := exes[pid]; ok {
+			return s
+		}
+		s := procinfo.Exe(pid)
+		exes[pid] = s
+		return s
+	}
+
+	index := make(map[recordKey]int, len(snap.Flows))
+	recs := make([]ledger.Record, 0, len(snap.Flows))
+	for i := range snap.Flows {
+		f := &snap.Flows[i]
+		// Queries of shawk clients to this agent.
+		if f.Direction == tracer.DirOut && f.Port == a.apiPort && f.Comm == "shawk" {
+			continue
+		}
+		cg := a.cgroups.CgroupPath(f.CgroupID)
+		r := ledger.Record{
+			Direction:  f.Direction.String(),
+			Proto:      f.Proto.String(),
+			LocalAddr:  f.LocalAddr.String(),
+			RemoteAddr: f.RemoteAddr.String(),
+			Port:       f.Port,
+			NetNS:      f.NetNS,
+			Unit:       procinfo.Unit(cg),
+			Comm:       f.Comm,
+			Cgroup:     cg,
+			Exe:        exe(f.PID),
+			PID:        f.PID,
+			Conns:      f.Conns,
+			ConnFails:  f.ConnFails,
+			OpenConns:  f.OpenConns,
+			BytesSent:  f.BytesSent,
+			BytesRecv:  f.BytesRecv,
+			MsgsSent:   f.MsgsSent,
+			MsgsRecv:   f.MsgsRecv,
+			Retrans:    f.Retrans,
+			RTTSumUs:   f.RTTSumUs,
+			RTTCount:   f.RTTSamples,
+		}
+		// Different cgroups may map to the same unit, e.g. login sessions.
+		k := recordKey{r.Direction, r.Proto, r.LocalAddr, r.RemoteAddr, r.Port, r.NetNS, r.Unit, r.Comm}
+		if j, ok := index[k]; ok {
+			mergeRecord(&recs[j], &r)
+			continue
+		}
+		index[k] = len(recs)
+		recs = append(recs, r)
+	}
+
+	listeners := make([]ledger.ListenerRecord, 0, len(snap.Listeners))
+	for _, l := range snap.Listeners {
+		if l.Proto == tracer.ProtoTCP && l.Port == a.apiPort && l.PID == a.tracer.SelfPID() {
+			continue
+		}
+		cg := a.cgroups.CgroupPath(l.CgroupID)
+		listeners = append(listeners, ledger.ListenerRecord{
+			Proto:  l.Proto.String(),
+			Addr:   l.Addr.String(),
+			Port:   l.Port,
+			NetNS:  l.NetNS,
+			Unit:   procinfo.Unit(cg),
+			Comm:   l.Comm,
+			Cgroup: cg,
+			Exe:    exe(l.PID),
+			PID:    l.PID,
+		})
+	}
+	return a.ledger.Write(ctx, tick, recs, listeners)
+}
+
+func mergeRecord(dst, src *ledger.Record) {
+	dst.Conns += src.Conns
+	dst.ConnFails += src.ConnFails
+	dst.OpenConns += src.OpenConns
+	dst.BytesSent += src.BytesSent
+	dst.BytesRecv += src.BytesRecv
+	dst.MsgsSent += src.MsgsSent
+	dst.MsgsRecv += src.MsgsRecv
+	dst.Retrans += src.Retrans
+	dst.RTTSumUs += src.RTTSumUs
+	dst.RTTCount += src.RTTCount
+	if src.PID != 0 {
+		dst.PID, dst.Exe, dst.Cgroup = src.PID, src.Exe, src.Cgroup
+	}
+}
+
+func (a *Agent) info(ctx context.Context) (*api.Info, error) {
+	since, err := a.ledger.Since(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var uts unix.Utsname
+	kernel := ""
+	if unix.Uname(&uts) == nil {
+		kernel = unix.ByteSliceToString(uts.Release[:])
+	}
+	a.mu.Lock()
+	drops := a.drops
+	a.mu.Unlock()
+	addrs := hostAddrs()
+	// Addresses of containers appear only in the ledger.
+	if local, err := a.ledger.LocalAddrs(ctx, time.Now().Add(-24*time.Hour)); err == nil {
+		for _, l := range local {
+			if ip, err := netip.ParseAddr(l); err == nil && !ip.IsUnspecified() && !slices.Contains(addrs, l) {
+				addrs = append(addrs, l)
+			}
+		}
+	}
+	return &api.Info{
+		ID:          a.hostID,
+		Hostname:    a.hostname,
+		Version:     version.Version,
+		Kernel:      kernel,
+		Addrs:       addrs,
+		StartedAt:   a.started,
+		LedgerSince: since,
+		Interval:    a.cfg.Interval.String(),
+		NetNS:       a.netnsMode(),
+		UDP:         a.tracer.UDPEnabled(),
+		Drops:       drops,
+	}, nil
+}
+
+func (a *Agent) netnsMode() string {
+	if a.cfg.NetNS == 0 {
+		return "all"
+	}
+	return strconv.FormatUint(uint64(a.cfg.NetNS), 10)
+}
+
+// coverageTolerance is the length of gaps in the coverage that are expected
+// from the scheduling of intervals.
+func (a *Agent) coverageTolerance() time.Duration {
+	return 2*a.cfg.Interval + time.Second
+}
+
+// hostID identifies the host from its machine id (or boot id) and its name;
+// the name tells apart hosts cloned with the same machine id.
+func hostID(hostname string) string {
+	id, err := os.ReadFile("/etc/machine-id")
+	if err != nil || len(bytes.TrimSpace(id)) == 0 {
+		id, _ = os.ReadFile("/proc/sys/kernel/random/boot_id")
+	}
+	sum := sha256.Sum256(append(bytes.TrimSpace(id), "\n"+hostname...))
+	return hex.EncodeToString(sum[:8])
+}
+
+// hostAddrs returns the addresses of the interfaces of the host.
+func hostAddrs() []string {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, a := range addrs {
+		if ipn, ok := a.(*net.IPNet); ok {
+			out = append(out, ipn.IP.String())
+		}
+	}
+	return out
+}
+
+// ProgramStats is a run time statistic of a BPF program.
+type ProgramStats struct {
+	Name      string  `json:"name"`
+	RunCount  uint64  `json:"run_count"`
+	RuntimeNs int64   `json:"runtime_ns"`
+	AvgNs     float64 `json:"avg_ns"`
+}
+
+func (a *Agent) programStats() ([]ProgramStats, error) {
+	stats, err := a.tracer.ProgramStats()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ProgramStats, 0, len(stats))
+	for _, s := range stats {
+		ps := ProgramStats{Name: s.Name, RunCount: s.RunCount, RuntimeNs: s.Runtime.Nanoseconds()}
+		if s.RunCount > 0 {
+			ps.AvgNs = float64(s.Runtime.Nanoseconds()) / float64(s.RunCount)
+		}
+		out = append(out, ps)
+	}
+	return out, nil
+}
+
+// ParseNetNS parses the --netns flag: "all", "self" or an inode number.
+func ParseNetNS(s string) (uint32, error) {
+	switch s {
+	case "", "all":
+		return 0, nil
+	case "self":
+		ns := procinfo.NetNS()
+		if ns == 0 {
+			return 0, errors.New("cannot determine the network namespace")
+		}
+		return ns, nil
+	}
+	v, err := strconv.ParseUint(s, 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("invalid network namespace %q", s)
+	}
+	return uint32(v), nil
+}

@@ -1,3 +1,13 @@
+## Unreleased
+
+Rewritten from scratch as a dependency ledger.
+
+* New eBPF tracer (CO-RE, Linux 5.14+): TCP is traced with the `inet_sock_set_state` tracepoint and socket iterators only, connections established before the agent started are adopted, IPv6 and MPTCP are supported, and UDP is bundled per message with fentry.
+* Each agent records the dependencies of its host in a local SQLite ledger with minute/hour/day activity; there is no central database.
+* New commands: `who-uses`, `deps`, `can-i-remove`, `unused`, `diff`, `graph`, `status` and `flows`.
+* Relicensed under the Apache License 2.0 (previously MIT). The eBPF programs are dual-licensed GPL-2.0-only OR BSD-2-Clause.
+* Removed the polling/streaming probes, the PostgreSQL CMDB, `look` and `create-scheme`, and the dependency on go-conntracer-bpf.
+
 ## [v0.7.1](https://github.com/yuuki/shawk/compare/v0.7.0...v0.7.1) (2020-12-20)
 
 * Bump version Go 1.15 [#56](https://github.com/yuuki/shawk/pull/56) ([yuuki](https://github.com/yuuki))

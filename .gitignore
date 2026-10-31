@@ -1,3 +1,7 @@
 /shawk
 /dist
-/.vagrant
+/tracer.test
+/rocky9.btf
+*.db
+*.db-shm
+*.db-wal

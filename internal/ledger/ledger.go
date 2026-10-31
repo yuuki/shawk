@@ -1,0 +1,486 @@
+// Package ledger stores the dependencies observed on a host in SQLite.
+//
+// An edge is a bundled flow with a resolved process identity. Its activity
+// is kept in buckets of three resolutions (minute, hour and day), which are
+// updated together at every interval, so that recent activity is detailed
+// while the long history stays small.
+package ledger
+
+import (
+	"context"
+	"database/sql"
+	_ "embed"
+	"fmt"
+	"os"
+	"strings"
+	"sync"
+	"time"
+
+	_ "modernc.org/sqlite"
+
+	"github.com/yuuki/shawk/internal/api"
+)
+
+//go:embed schema.sql
+var schema string
+
+// Resolutions of the activity buckets in seconds.
+const (
+	ResMinute = 60
+	ResHour   = 3600
+	ResDay    = 86400
+)
+
+// Retention configures how long activity buckets and edges are kept.
+type Retention struct {
+	Minute time.Duration
+	Hour   time.Duration
+	Day    time.Duration // also the retention of edges and listeners
+}
+
+// DefaultRetention keeps minutes for 2 days, hours for 90 days and days
+// for 3 years.
+var DefaultRetention = Retention{
+	Minute: 48 * time.Hour,
+	Hour:   90 * 24 * time.Hour,
+	Day:    3 * 365 * 24 * time.Hour,
+}
+
+// Ledger is a dependency ledger backed by a SQLite database.
+type Ledger struct {
+	db        *sql.DB
+	retention Retention
+	mu        sync.Mutex // serializes writers
+}
+
+// Open opens or creates a ledger.
+func Open(path string, retention Retention) (*Ledger, error) {
+	// The ledger reveals the processes and peers of the host.
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	f.Close()
+	if err := os.Chmod(path, 0o600); err != nil {
+		return nil, err
+	}
+	dsn := "file:" + path + "?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)" +
+		"&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := db.Exec(schema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("creating schema: %w", err)
+	}
+	return &Ledger{db: db, retention: retention}, nil
+}
+
+// Close closes the database.
+func (l *Ledger) Close() error { return l.db.Close() }
+
+// Record is a bundled flow to record.
+type Record struct {
+	Direction  string
+	Proto      string
+	LocalAddr  string
+	RemoteAddr string
+	Port       uint16
+	NetNS      uint32
+	Unit       string
+	Comm       string
+	Cgroup     string
+	Exe        string
+	PID        uint32
+
+	Conns     uint64
+	ConnFails uint64
+	OpenConns uint64
+	BytesSent uint64
+	BytesRecv uint64
+	MsgsSent  uint64
+	MsgsRecv  uint64
+	Retrans   uint64
+	RTTSumUs  uint64
+	RTTCount  uint64
+}
+
+// ListenerRecord is a listening socket to record.
+type ListenerRecord struct {
+	Proto  string
+	Addr   string
+	Port   uint16
+	NetNS  uint32
+	Unit   string
+	Comm   string
+	Cgroup string
+	Exe    string
+	PID    uint32
+}
+
+// Tick describes an interval of recording.
+type Tick struct {
+	At       time.Time     // end of the interval
+	Interval time.Duration // length of the interval
+	UDP      bool          // whether UDP was traced
+	Drops    uint64        // flow updates the kernel dropped in the interval
+}
+
+// Write records the flows and listeners observed in an interval, and the
+// interval itself as covered. The latest write sets last_seen and the
+// earliest first_seen, so that timestamps written while the clock was wrong
+// are corrected once it is right again.
+func (l *Ledger) Write(ctx context.Context, tick Tick, recs []Record, listeners []ListenerRecord) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	tx, err := l.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	now := tick.At.Unix()
+	if err := recordCoverage(ctx, tx, tick); err != nil {
+		return fmt.Errorf("recording coverage: %w", err)
+	}
+	upsertEdge, err := tx.PrepareContext(ctx, `
+INSERT INTO edges (direction, proto, local_addr, remote_addr, port, netns, unit, comm, cgroup, exe, last_pid, first_seen, last_seen)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT (direction, proto, local_addr, remote_addr, port, netns, unit, comm) DO UPDATE SET
+	cgroup = CASE WHEN excluded.cgroup != '' THEN excluded.cgroup ELSE edges.cgroup END,
+	exe = CASE WHEN excluded.exe != '' THEN excluded.exe ELSE edges.exe END,
+	last_pid = CASE WHEN excluded.last_pid != 0 THEN excluded.last_pid ELSE edges.last_pid END,
+	first_seen = min(edges.first_seen, excluded.first_seen),
+	last_seen = excluded.last_seen
+RETURNING id`)
+	if err != nil {
+		return err
+	}
+	defer upsertEdge.Close()
+	upsertActivity, err := tx.PrepareContext(ctx, `
+INSERT INTO activity (edge_id, res, ts, conns, conn_fails, max_open_conns, bytes_sent, bytes_recv, msgs_sent, msgs_recv, retrans, rtt_sum_us, rtt_count)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT (edge_id, res, ts) DO UPDATE SET
+	conns = conns + excluded.conns,
+	conn_fails = conn_fails + excluded.conn_fails,
+	max_open_conns = max(max_open_conns, excluded.max_open_conns),
+	bytes_sent = bytes_sent + excluded.bytes_sent,
+	bytes_recv = bytes_recv + excluded.bytes_recv,
+	msgs_sent = msgs_sent + excluded.msgs_sent,
+	msgs_recv = msgs_recv + excluded.msgs_recv,
+	retrans = retrans + excluded.retrans,
+	rtt_sum_us = rtt_sum_us + excluded.rtt_sum_us,
+	rtt_count = rtt_count + excluded.rtt_count`)
+	if err != nil {
+		return err
+	}
+	defer upsertActivity.Close()
+
+	for i := range recs {
+		r := &recs[i]
+		var id int64
+		err := upsertEdge.QueryRowContext(ctx, r.Direction, r.Proto, r.LocalAddr, r.RemoteAddr, r.Port, r.NetNS,
+			r.Unit, r.Comm, r.Cgroup, r.Exe, r.PID, now, now).Scan(&id)
+		if err != nil {
+			return fmt.Errorf("upserting edge: %w", err)
+		}
+		for _, res := range []int64{ResMinute, ResHour, ResDay} {
+			_, err := upsertActivity.ExecContext(ctx, id, res, now-now%res, r.Conns, r.ConnFails, r.OpenConns,
+				r.BytesSent, r.BytesRecv, r.MsgsSent, r.MsgsRecv, r.Retrans, r.RTTSumUs, r.RTTCount)
+			if err != nil {
+				return fmt.Errorf("upserting activity: %w", err)
+			}
+		}
+	}
+
+	upsertListener, err := tx.PrepareContext(ctx, `
+INSERT INTO listeners (proto, addr, port, netns, unit, comm, cgroup, exe, pid, first_seen, last_seen)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT (proto, addr, port, netns) DO UPDATE SET
+	unit = CASE WHEN excluded.comm != '' THEN excluded.unit ELSE listeners.unit END,
+	comm = CASE WHEN excluded.comm != '' THEN excluded.comm ELSE listeners.comm END,
+	cgroup = CASE WHEN excluded.comm != '' THEN excluded.cgroup ELSE listeners.cgroup END,
+	exe = CASE WHEN excluded.exe != '' THEN excluded.exe ELSE listeners.exe END,
+	pid = CASE WHEN excluded.pid != 0 THEN excluded.pid ELSE listeners.pid END,
+	first_seen = min(listeners.first_seen, excluded.first_seen),
+	last_seen = excluded.last_seen`)
+	if err != nil {
+		return err
+	}
+	defer upsertListener.Close()
+	for i := range listeners {
+		ls := &listeners[i]
+		if _, err := upsertListener.ExecContext(ctx, ls.Proto, ls.Addr, ls.Port, ls.NetNS, ls.Unit, ls.Comm,
+			ls.Cgroup, ls.Exe, ls.PID, now, now); err != nil {
+			return fmt.Errorf("upserting listener: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
+// recordCoverage extends the latest covered period with the interval, or
+// starts a new period after a gap.
+func recordCoverage(ctx context.Context, tx *sql.Tx, tick Tick) error {
+	start, end := tick.At.Add(-tick.Interval).Unix(), tick.At.Unix()
+	udp := 0
+	if tick.UDP {
+		udp = 1
+	}
+	var (
+		rowid, lastEnd int64
+		lastUDP        int
+	)
+	err := tx.QueryRowContext(ctx, `SELECT rowid, end_ts, udp FROM coverage ORDER BY end_ts DESC LIMIT 1`).
+		Scan(&rowid, &lastEnd, &lastUDP)
+	if err != nil && err != sql.ErrNoRows {
+		return err
+	}
+	// Allow one interval of slack for the scheduling of ticks.
+	slack := int64(tick.Interval.Seconds())
+	if err == nil && lastUDP == udp && lastEnd >= start-slack && lastEnd <= end {
+		_, err = tx.ExecContext(ctx, `UPDATE coverage SET end_ts = ?, drops = drops + ? WHERE rowid = ?`, end, tick.Drops, rowid)
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO coverage (start_ts, end_ts, udp, drops) VALUES (?, ?, ?, ?)`,
+		start, end, udp, tick.Drops)
+	return err
+}
+
+// Coverage reports how much of [since, until] the ledger covers. Gaps
+// shorter than tolerance, such as the scheduling of intervals, are ignored.
+func (l *Ledger) Coverage(ctx context.Context, since, until time.Time, tolerance time.Duration) (api.Coverage, error) {
+	c := api.Coverage{Since: since, Until: until, UDP: true}
+	rows, err := l.db.QueryContext(ctx, `
+SELECT start_ts, end_ts, udp, drops FROM coverage
+WHERE end_ts >= ? AND start_ts <= ? ORDER BY start_ts`, since.Unix(), until.Unix())
+	if err != nil {
+		return c, err
+	}
+	defer rows.Close()
+	cursor := since
+	gap := func(to time.Time) {
+		if to.Sub(cursor) > tolerance {
+			c.Gaps = append(c.Gaps, api.Gap{From: cursor, To: to})
+		}
+	}
+	found := false
+	for rows.Next() {
+		var (
+			start, end int64
+			udp        int
+			drops      uint64
+		)
+		if err := rows.Scan(&start, &end, &udp, &drops); err != nil {
+			return c, err
+		}
+		found = true
+		s, e := time.Unix(start, 0), time.Unix(end, 0)
+		if s.After(cursor) {
+			gap(s)
+		}
+		if s.Before(cursor) {
+			s = cursor
+		}
+		if e.After(until) {
+			e = until
+		}
+		if e.After(s) {
+			c.Covered += e.Sub(s)
+		}
+		if e.After(cursor) {
+			cursor = e
+		}
+		c.Drops += drops
+		c.UDP = c.UDP && udp == 1
+	}
+	if err := rows.Err(); err != nil {
+		return c, err
+	}
+	if until.After(cursor) {
+		gap(until)
+	}
+	c.UDP = c.UDP && found
+	return c, nil
+}
+
+// Prune deletes activity, edges and listeners older than the retention.
+func (l *Ledger) Prune(ctx context.Context, now time.Time) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	stmts := []struct {
+		q   string
+		arg int64
+	}{
+		{`DELETE FROM activity WHERE res = 60 AND ts < ?`, now.Add(-l.retention.Minute).Unix()},
+		{`DELETE FROM activity WHERE res = 3600 AND ts < ?`, now.Add(-l.retention.Hour).Unix()},
+		{`DELETE FROM activity WHERE res = 86400 AND ts < ?`, now.Add(-l.retention.Day).Unix()},
+		{`DELETE FROM edges WHERE last_seen < ?`, now.Add(-l.retention.Day).Unix()},
+		{`DELETE FROM listeners WHERE last_seen < ?`, now.Add(-l.retention.Day).Unix()},
+		{`DELETE FROM coverage WHERE end_ts < ?`, now.Add(-l.retention.Day).Unix()},
+	}
+	for _, s := range stmts {
+		if _, err := l.db.ExecContext(ctx, s.q, s.arg); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Since returns the start of the oldest retained recording, or the zero
+// time if the ledger has not recorded anything.
+func (l *Ledger) Since(ctx context.Context) (time.Time, error) {
+	var v sql.NullInt64
+	if err := l.db.QueryRowContext(ctx, `SELECT min(start_ts) FROM coverage`).Scan(&v); err != nil {
+		return time.Time{}, err
+	}
+	if !v.Valid {
+		return time.Time{}, nil
+	}
+	return time.Unix(v.Int64, 0), nil
+}
+
+// resolution picks the finest bucket resolution still retained for a window
+// starting at since.
+func (l *Ledger) resolution(now, since time.Time) int64 {
+	switch {
+	case !since.Before(now.Add(-l.retention.Minute)):
+		return ResMinute
+	case !since.Before(now.Add(-l.retention.Hour)):
+		return ResHour
+	}
+	return ResDay
+}
+
+// Edges returns the edges active in the window of the query with their
+// statistics aggregated over the window.
+func (l *Ledger) Edges(ctx context.Context, q api.EdgeQuery) ([]api.Edge, error) {
+	now := time.Now()
+	until := q.Until
+	if until.IsZero() {
+		until = now
+	}
+	since := q.Since
+	if since.IsZero() {
+		since = time.Unix(0, 0)
+	}
+	res := l.resolution(now, since)
+
+	var (
+		where = []string{"e.last_seen >= ?", "e.first_seen <= ?"}
+		args  = []any{since.Unix(), until.Unix()}
+	)
+	add := func(cond string, v any) {
+		where = append(where, cond)
+		args = append(args, v)
+	}
+	if q.Direction != "" {
+		add("e.direction = ?", q.Direction)
+	}
+	if q.Proto != "" {
+		add("e.proto = ?", q.Proto)
+	}
+	if q.LocalAddr != "" {
+		add("e.local_addr = ?", q.LocalAddr)
+	}
+	if q.RemoteAddr != "" {
+		add("e.remote_addr = ?", q.RemoteAddr)
+	}
+	if q.Port != 0 {
+		add("e.port = ?", q.Port)
+	}
+	if q.Unit != "" {
+		add("e.unit = ?", q.Unit)
+	}
+	if q.Comm != "" {
+		add("e.comm = ?", q.Comm)
+	}
+	if q.NetNS != 0 {
+		add("e.netns = ?", q.NetNS)
+	}
+	query := `
+SELECT e.direction, e.proto, e.local_addr, e.remote_addr, e.port, e.netns, e.unit, e.comm, e.exe, e.cgroup, e.last_pid,
+	e.first_seen, e.last_seen,
+	coalesce(sum(a.conns), 0), coalesce(sum(a.conn_fails), 0), coalesce(max(a.max_open_conns), 0),
+	coalesce(sum(a.bytes_sent), 0), coalesce(sum(a.bytes_recv), 0), coalesce(sum(a.msgs_sent), 0),
+	coalesce(sum(a.msgs_recv), 0), coalesce(sum(a.retrans), 0), coalesce(sum(a.rtt_sum_us), 0), coalesce(sum(a.rtt_count), 0)
+FROM edges e
+LEFT JOIN activity a ON a.edge_id = e.id AND a.res = ? AND a.ts >= ? AND a.ts <= ?
+WHERE ` + strings.Join(where, " AND ") + `
+GROUP BY e.id
+ORDER BY e.direction, e.port, e.remote_addr, e.unit, e.comm`
+	args = append([]any{res, since.Unix() - since.Unix()%res, until.Unix()}, args...)
+
+	rows, err := l.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var edges []api.Edge
+	for rows.Next() {
+		var (
+			e                api.Edge
+			first, last      int64
+			rttSum, rttCount uint64
+		)
+		if err := rows.Scan(&e.Direction, &e.Proto, &e.LocalAddr, &e.RemoteAddr, &e.Port, &e.NetNS, &e.Unit, &e.Comm,
+			&e.Exe, &e.Cgroup, &e.PID, &first, &last,
+			&e.Stats.Conns, &e.Stats.ConnFails, &e.Stats.MaxOpenConns, &e.Stats.BytesSent, &e.Stats.BytesRecv,
+			&e.Stats.MsgsSent, &e.Stats.MsgsRecv, &e.Stats.Retrans, &rttSum, &rttCount); err != nil {
+			return nil, err
+		}
+		e.FirstSeen = time.Unix(first, 0)
+		e.LastSeen = time.Unix(last, 0)
+		if rttCount > 0 {
+			e.Stats.RTTAvgUs = float64(rttSum) / float64(rttCount)
+		}
+		edges = append(edges, e)
+	}
+	return edges, rows.Err()
+}
+
+// LocalAddrs returns the local addresses of the edges and listeners seen
+// since the given time, including those of containers.
+func (l *Ledger) LocalAddrs(ctx context.Context, since time.Time) ([]string, error) {
+	rows, err := l.db.QueryContext(ctx, `
+SELECT local_addr FROM edges WHERE last_seen >= ?
+UNION SELECT addr FROM listeners WHERE last_seen >= ?`, since.Unix(), since.Unix())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var a string
+		if err := rows.Scan(&a); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+// Listeners returns the listeners seen since the given time.
+func (l *Ledger) Listeners(ctx context.Context, since time.Time) ([]api.Listener, error) {
+	rows, err := l.db.QueryContext(ctx, `
+SELECT proto, addr, port, netns, unit, comm, exe, pid, first_seen, last_seen
+FROM listeners WHERE last_seen >= ? ORDER BY proto, port, addr`, since.Unix())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []api.Listener
+	for rows.Next() {
+		var (
+			ls          api.Listener
+			first, last int64
+		)
+		if err := rows.Scan(&ls.Proto, &ls.Addr, &ls.Port, &ls.NetNS, &ls.Unit, &ls.Comm, &ls.Exe, &ls.PID, &first, &last); err != nil {
+			return nil, err
+		}
+		ls.FirstSeen = time.Unix(first, 0)
+		ls.LastSeen = time.Unix(last, 0)
+		out = append(out, ls)
+	}
+	return out, rows.Err()
+}
