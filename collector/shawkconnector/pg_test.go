@@ -392,3 +392,24 @@ UNION ALL SELECT 'sessions', count(*)::text FROM shawk.agent_sessions`)
 		t.Errorf("after pruning %d rows: %v, want %v", total, got, want)
 	}
 }
+
+// TestPGSharedAddresses checks that edges through an address several hosts
+// hold, the gateway of a container bridge, match within their host only.
+func TestPGSharedAddresses(t *testing.T) {
+	c, sink, conn := pgConnector(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	for _, h := range []string{"a-01", "b-01"} {
+		consume(t, c, sink, tAgent{host: h, machineID: "m-" + h, addrs: []string{"172.17.0.1"}, time: now, segment: now.Add(-time.Hour),
+			edges: []tEdge{
+				{role: "client", proto: "tcp", local: "172.17.0.2", peer: "172.17.0.1", port: 5432, svc: h + "-app", comm: "app", opened: 1},
+				{role: "server", proto: "tcp", local: "172.17.0.1", peer: "172.17.0.2", port: 5432, svc: h + "-db", comm: "db", opened: 1},
+			}})
+	}
+	c.flush(ctx)
+	got := queryStrings(t, conn, `SELECT client_service, server_service, observed_by FROM shawk_v1.dependencies`)
+	want := []string{"a-01-app a-01-db both", "b-01-app b-01-db both"}
+	if !slices.Equal(got, want) {
+		t.Errorf("dependencies = %v, want %v", got, want)
+	}
+}

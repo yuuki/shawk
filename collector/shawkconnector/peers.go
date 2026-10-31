@@ -190,18 +190,24 @@ func (r *resolver) expire(t time.Time) {
 // and port. The peer of a server edge is the client service whose client
 // edge has the same addresses and port. A peer without a known service is
 // named after its address range.
+//
+// A loopback peer is on the host itself. So is a peer whose address several
+// live hosts hold at once, such as the address of a container bridge, when
+// the host holds it too; such an address is never resolved to another host.
 func (r *resolver) peer(host string, id *edgeID) peer {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	// A loopback peer is on the same host.
-	sameHost := id.peer.IsLoopback()
-	p := peer{agent: sameHost || r.isAgent(id.peer)}
+	hosts := r.hostsOf(id.peer)
+	shared := len(hosts) > 1
+	local := id.peer.IsLoopback() || (shared && hosts[host])
+	sameHostOnly := id.peer.IsLoopback() || shared
+	p := peer{agent: local || (!shared && len(hosts) > 0)}
 	if id.role == roleClient {
 		k := endpointKey{id.peer, id.port, id.proto}
-		p.name = best(host, r.localEndpoints[k], r.dbEndpoints[k], sameHost)
+		p.name = best(host, r.localEndpoints[k], r.dbEndpoints[k], sameHostOnly)
 	} else {
 		k := clientKey{id.peer, id.local, id.port, id.proto}
-		p.name = best(host, r.localClients[k], r.dbClients[k], sameHost)
+		p.name = best(host, r.localClients[k], r.dbClients[k], sameHostOnly)
 	}
 	if p.name == "" {
 		p.name = r.classify(id.peer)
@@ -238,8 +244,22 @@ func best(host string, local map[endpoint]time.Time, db []endpoint, sameHostOnly
 	return b.service
 }
 
-func (r *resolver) isAgent(a netip.Addr) bool {
-	return len(r.localAgents[a]) > 0 || len(r.dbAgents[a]) > 0
+// hostsOf returns the live hosts with agents that hold an address.
+func (r *resolver) hostsOf(a netip.Addr) map[string]bool {
+	var hosts map[string]bool
+	add := func(h string) {
+		if hosts == nil {
+			hosts = map[string]bool{}
+		}
+		hosts[h] = true
+	}
+	for h := range r.localAgents[a] {
+		add(h)
+	}
+	for _, h := range r.dbAgents[a] {
+		add(h)
+	}
+	return hosts
 }
 
 // classify names a peer without a known service from its address.

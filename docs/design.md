@@ -344,7 +344,10 @@ and adds what it learns from requests at once.
 agent is alive (or is loopback): the other side of the edge is then
 recorded too, which the counting convention of §7 relies on.
 
-Loopback peers are looked up on the same host only. Among several services
+Loopback peers are looked up on the same host only, and so are addresses
+that several live hosts hold at once, such as the gateway of a container
+bridge (172.17.0.1 on every Docker host); such a peer is on the host itself
+when the host holds the address too. Among several services
 on an endpoint, one on the same host, then the most recently seen, wins.
 Names are the best guess at the time of aggregation; PostgreSQL is the
 truth of attribution. A new server may show as `~unresolved` until its
@@ -415,7 +418,7 @@ names in PostgreSQL and Prometheus match.
 
 | view or function | |
 |---|---|
-| `dependencies` | one row per logical dependency: the client edge and the server edge matched by their addresses and port (loopback within a host and netns). `observed_by` is `both`, `client` or `server`; a one-sided row means no agent on the other side, or a NAT or load balancer between. `client_observed_until` and `server_observed_until` are the latest heartbeats of the hosts: an old `last_seen` with a recent `observed_until` means *no longer used*; both old means *no longer observed*. |
+| `dependencies` | one row per logical dependency: the client edge and the server edge matched by their addresses and port (loopback within a host and netns, addresses held by several hosts at once within a host). `observed_by` is `both`, `client` or `server`; a one-sided row means no agent on the other side, or a NAT or load balancer between. `client_observed_until` and `server_observed_until` are the latest heartbeats of the hosts: an old `last_seen` with a recent `observed_until` means *no longer used*; both old means *no longer observed*. |
 | `graph_nodes`, `graph_edges` | the dependency map between services in the format of the Grafana Node Graph; peers without a service are named by address |
 | `dependency_changes` | dependencies between services that appeared, or disappeared while a host that saw them kept observing for 15 minutes |
 | `service_endpoints` | addresses and ports services accept connections on (listeners, with unspecified addresses expanded to the addresses of the host, and server edges); used by the connector |
@@ -483,8 +486,10 @@ parses. shawk runs beside it instead:
 - **Relays that rewrite addresses** (NAT, IPVS, kube-proxy, cloud load
   balancers) hide the real peer, as discussed in §5.2 of the paper.
   Dependencies end at the relay address and are seen on one side only.
-- **Addresses shared by many hosts** (container bridges such as
-  172.17.0.1) can be attributed to the wrong host when naming peers.
+- **Addresses of container networks** are told apart only when several
+  hosts with agents hold them at once. A container address held by one
+  host with an agent may be attributed to that host for a peer on a host
+  without an agent.
 - **Same port shared by different services** with `SO_REUSEPORT` cannot be
   told apart (§5.3 of the paper); this is rare.
 - **UDP peer-to-peer protocols** where both sides send first are recorded

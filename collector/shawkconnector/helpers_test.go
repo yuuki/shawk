@@ -318,7 +318,7 @@ func flatten(md pmetric.Metrics) []series {
 func find(ss []series, metric, job, peer, role, dir string) []series {
 	var out []series
 	for _, s := range ss {
-		if s.metric == metric && s.job == job && (peer == "*" || s.peer == peer) && s.role == role && s.dir == dir {
+		if s.metric == metric && s.job == job && (peer == "*" || s.peer == peer) && (role == "*" || s.role == role) && s.dir == dir {
 			out = append(out, s)
 		}
 	}

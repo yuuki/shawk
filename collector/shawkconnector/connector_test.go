@@ -396,3 +396,39 @@ func TestPruneSchedule(t *testing.T) {
 		t.Error("pruned with retention 0")
 	}
 }
+
+// TestSharedAddresses checks that an address several hosts hold at once,
+// such as the gateway of a container bridge, is resolved on the host
+// itself only.
+func TestSharedAddresses(t *testing.T) {
+	c, _, sink, _ := testConnector(t, nil)
+	ts := t0.Add(15 * time.Second)
+	bridge := "172.17.0.1"
+	// db-01 serves postgres on its bridge address; app-01 has the same
+	// bridge address and a container that connects to its own bridge.
+	consume(t, c, sink, tAgent{host: "db-01", addrs: []string{"10.0.0.10", bridge}, time: ts,
+		listeners: []tListener{{proto: "tcp", addr: "0.0.0.0", port: 5432, svc: "postgres", comm: "postgres"}}})
+	out := consume(t, c, sink, tAgent{host: "app-01", addrs: []string{"10.0.0.11", bridge}, time: ts,
+		listeners: []tListener{{proto: "tcp", addr: bridge, port: 8080, svc: "proxy", comm: "proxy"}},
+		edges: []tEdge{
+			{role: "client", proto: "tcp", local: "172.17.0.2", peer: bridge, port: 5432, svc: "app", comm: "app", opened: 1},
+			{role: "client", proto: "tcp", local: "172.17.0.2", peer: bridge, port: 8080, svc: "app", comm: "app", opened: 1},
+			{role: "client", proto: "tcp", local: "10.0.0.11", peer: "10.0.0.10", port: 5432, svc: "app", comm: "app", opened: 1},
+			{role: "server", proto: "tcp", local: "10.0.0.11", peer: bridge, port: 9000, svc: "app", comm: "app", opened: 1},
+		}})
+	got := map[string]bool{}
+	for _, s := range find(out, metricConnOpened, "app", "*", "*", "") {
+		got[fmt.Sprintf("%s:%d %s/%v", s.role, s.port, s.peer, s.agent)] = true
+	}
+	want := map[string]bool{
+		// postgres on db-01's copy of the bridge address is not app-01's.
+		"client:5432 ~unresolved/true": true,
+		// The unique address of db-01 still resolves across hosts.
+		"client:5432 postgres/true":    true,
+		"client:8080 proxy/true":       true,
+		"server:9000 ~unresolved/true": true,
+	}
+	if !maps.Equal(got, want) {
+		t.Errorf("series = %v, want %v", got, want)
+	}
+}
