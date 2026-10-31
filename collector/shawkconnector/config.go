@@ -62,8 +62,9 @@ func (c *Config) Validate() error {
 	if c.WriteInterval <= 0 {
 		errs = append(errs, errors.New("write_interval must be positive"))
 	}
-	if c.IdleTTL < c.WriteInterval {
-		errs = append(errs, errors.New("idle_ttl must not be shorter than write_interval"))
+	if c.IdleTTL < c.WriteInterval || c.IdleTTL < 2*time.Minute {
+		// Inputs must outlive a few intervals of the agents (15s) and delays.
+		errs = append(errs, errors.New("idle_ttl must be at least 2m and not shorter than write_interval"))
 	}
 	if c.Retention != 0 && c.Retention < 24*time.Hour {
 		errs = append(errs, errors.New("retention must be zero (keep forever) or at least 24h"))
@@ -85,6 +86,7 @@ type namedPrefix struct {
 // parsePeerCIDRs parses peer_cidrs, narrowest prefixes first.
 func parsePeerCIDRs(m map[string]string) ([]namedPrefix, error) {
 	var out []namedPrefix
+	seen := map[netip.Prefix]string{}
 	for name, v := range m {
 		if name == "" || strings.HasPrefix(name, "~") {
 			return nil, fmt.Errorf("peer_cidrs: invalid name %q", name)
@@ -94,7 +96,12 @@ func parsePeerCIDRs(m map[string]string) ([]namedPrefix, error) {
 			if err != nil {
 				return nil, fmt.Errorf("peer_cidrs: %s: %w", name, err)
 			}
-			out = append(out, namedPrefix{name: name, prefix: p.Masked()})
+			p = p.Masked()
+			if other, dup := seen[p]; dup {
+				return nil, fmt.Errorf("peer_cidrs: %s is named both %s and %s", p, other, name)
+			}
+			seen[p] = name
+			out = append(out, namedPrefix{name: name, prefix: p})
 		}
 	}
 	sortPrefixes(out)

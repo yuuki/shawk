@@ -20,10 +20,13 @@ func (s *span) merge(o span) {
 	}
 }
 
-type procKey struct{ unit, comm string }
+// procKey identifies a process in PostgreSQL. The service name is part of
+// it, so that processes of one unit with the same comm but different
+// OTEL_SERVICE_NAME stay apart.
+type procKey struct{ unit, comm, service string }
 
 type procRow struct {
-	exe, service string
+	exe string
 	span
 }
 
@@ -106,14 +109,14 @@ func (h *hostChanges) addAddr(a netip.Addr, s span) {
 	h.addrs[a] = cur
 }
 
-func (h *hostChanges) addProcess(k procKey, exe, service string, s span) {
+func (h *hostChanges) addProcess(k procKey, exe string, s span) {
 	p := h.processes[k]
 	if p == nil {
 		p = &procRow{}
 		h.processes[k] = p
 	}
 	if !s.last.Before(p.last) {
-		p.exe, p.service = exe, service
+		p.exe = exe
 	}
 	p.span.merge(s)
 }
@@ -152,7 +155,7 @@ func (h *hostChanges) merge(o *hostChanges) {
 		h.addAddr(a, s)
 	}
 	for k, p := range o.processes {
-		h.addProcess(k, p.exe, p.service, p.span)
+		h.addProcess(k, p.exe, p.span)
 	}
 	for k, s := range o.edges {
 		h.addEdge(k, s)
@@ -232,7 +235,7 @@ func (c *changes) add(b *hostBatch, now time.Time) {
 		if s.first.IsZero() {
 			s.first = s.last
 		}
-		pk := procKey{e.id.unit, e.id.comm}
+		pk := procKey{e.id.unit, e.id.comm, e.id.job()}
 		k := edgeRowKey{role: e.id.role, proto: e.id.proto, local: e.id.local, peer: e.id.peer,
 			port: e.id.port, netns: e.id.netns, procKey: pk}
 		acc, ok := edges[k]
@@ -243,7 +246,7 @@ func (c *changes) add(b *hostBatch, now time.Time) {
 		if !changed {
 			continue
 		}
-		h.addProcess(pk, e.id.exe, e.id.job(), s)
+		h.addProcess(pk, e.id.exe, s)
 		h.addEdge(k, s)
 	}
 
@@ -273,8 +276,8 @@ func (c *changes) add(b *hostBatch, now time.Time) {
 		}
 		var pk procKey
 		if l.id.unit != "" || l.id.comm != "" {
-			pk = procKey{l.id.unit, l.id.comm}
-			h.addProcess(pk, l.id.exe, l.id.job(), s)
+			pk = procKey{l.id.unit, l.id.comm, l.id.job()}
+			h.addProcess(pk, l.id.exe, s)
 		}
 		h.addListener(k, pk, s)
 	}

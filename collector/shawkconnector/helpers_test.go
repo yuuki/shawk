@@ -41,6 +41,12 @@ type tAgent struct {
 	segment         time.Time
 	edges           []tEdge
 	listeners       []tListener
+	// partial omits the metrics of the agent: a request of an interval that
+	// is not its last.
+	partial bool
+	// noUDP reports that UDP is not traced; netnsScope defaults to "all".
+	noUDP      bool
+	netnsScope string
 }
 
 func putProcess(a pcommon.Map, svc, ns, unit, comm, exe string) {
@@ -168,10 +174,22 @@ func (ta tAgent) metrics() pmetric.Metrics {
 			dp.SetIntValue(t.Unix())
 		}
 	}
+	if ta.partial {
+		return md
+	}
 	up := metric(metricAgentUp, pmetric.MetricTypeGauge).Gauge().DataPoints().AppendEmpty()
-	up.Attributes().PutStr(attrNetNSScope, "all")
+	scope := ta.netnsScope
+	if scope == "" {
+		scope = "all"
+	}
+	up.Attributes().PutStr(attrNetNSScope, scope)
 	up.SetTimestamp(now)
 	up.SetIntValue(1)
+	udp := metric(metricAgentUDPTraced, pmetric.MetricTypeGauge).Gauge().DataPoints().AppendEmpty()
+	udp.SetTimestamp(now)
+	if !ta.noUDP {
+		udp.SetIntValue(1)
+	}
 	seg := ta.segment
 	if seg.IsZero() {
 		seg = t0
@@ -189,6 +207,7 @@ type fakeStore struct {
 	fail     bool
 	rows     peerRows
 	prunes   int
+	err      error
 	migrated int
 }
 
@@ -204,6 +223,9 @@ func (s *fakeStore) write(_ context.Context, h *hostChanges) error {
 	defer s.mu.Unlock()
 	if s.fail {
 		return errFake
+	}
+	if s.err != nil {
+		return s.err
 	}
 	s.writes = append(s.writes, h)
 	return nil

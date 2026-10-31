@@ -130,29 +130,29 @@ ON CONFLICT (host_id, addr) DO UPDATE SET
 			units = append(units, k.unit)
 			comms = append(comms, k.comm)
 			exes = append(exes, p.exe)
-			services = append(services, p.service)
+			services = append(services, k.service)
 			firsts = append(firsts, p.first)
 			lasts = append(lasts, p.last)
 		}
 		b.Queue(`
 INSERT INTO shawk.processes AS p (host_id, unit, comm, exe, service_name, first_seen, last_seen)
 SELECT $1, * FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::timestamptz[], $7::timestamptz[])
-ON CONFLICT (host_id, unit, comm) DO UPDATE SET
+ON CONFLICT (host_id, unit, comm, service_name) DO UPDATE SET
   exe          = CASE WHEN excluded.last_seen >= p.last_seen THEN excluded.exe ELSE p.exe END,
-  service_name = CASE WHEN excluded.last_seen >= p.last_seen THEN excluded.service_name ELSE p.service_name END,
   first_seen   = least(p.first_seen, excluded.first_seen),
   last_seen    = greatest(p.last_seen, excluded.last_seen)`,
 			h.key, units, comms, exes, services, firsts, lasts)
 	}
 
 	if len(h.edges) > 0 {
-		var units, comms, roles, protos, locals, peers []string
+		var units, comms, services, roles, protos, locals, peers []string
 		var ports []int32
 		var netns []int64
 		var firsts, lasts []time.Time
 		for k, s := range h.edges {
 			units = append(units, k.unit)
 			comms = append(comms, k.comm)
+			services = append(services, k.service)
 			roles = append(roles, k.role)
 			protos = append(protos, k.proto)
 			locals = append(locals, k.local.String())
@@ -165,23 +165,25 @@ ON CONFLICT (host_id, unit, comm) DO UPDATE SET
 		b.Queue(`
 INSERT INTO shawk.edges AS e (host_id, process_id, role, proto, local_addr, remote_addr, port, netns, first_seen, last_seen)
 SELECT $1, p.id, u.role, u.proto, u.local::inet, u.peer::inet, u.port, u.netns, u.f, u.l
-FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::integer[], $9::bigint[],
-            $10::timestamptz[], $11::timestamptz[]) AS u(unit, comm, role, proto, local, peer, port, netns, f, l)
-JOIN shawk.processes p ON p.host_id = $1 AND p.unit = u.unit AND p.comm = u.comm
+FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::text[], $9::integer[],
+            $10::bigint[], $11::timestamptz[], $12::timestamptz[])
+  AS u(unit, comm, service, role, proto, local, peer, port, netns, f, l)
+JOIN shawk.processes p ON p.host_id = $1 AND p.unit = u.unit AND p.comm = u.comm AND p.service_name = u.service
 ON CONFLICT (host_id, role, proto, local_addr, remote_addr, port, netns, process_id) DO UPDATE SET
   first_seen = least(e.first_seen, excluded.first_seen),
   last_seen  = greatest(e.last_seen, excluded.last_seen)`,
-			h.key, units, comms, roles, protos, locals, peers, ports, netns, firsts, lasts)
+			h.key, units, comms, services, roles, protos, locals, peers, ports, netns, firsts, lasts)
 	}
 
 	if len(h.listeners) > 0 {
-		var units, comms, protos, addrs []string
+		var units, comms, services, protos, addrs []string
 		var ports []int32
 		var netns []int64
 		var firsts, lasts []time.Time
 		for k, l := range h.listeners {
 			units = append(units, l.proc.unit)
 			comms = append(comms, l.proc.comm)
+			services = append(services, l.proc.service)
 			protos = append(protos, k.proto)
 			addrs = append(addrs, k.addr.String())
 			ports = append(ports, int32(k.port))
@@ -192,16 +194,16 @@ ON CONFLICT (host_id, role, proto, local_addr, remote_addr, port, netns, process
 		b.Queue(`
 INSERT INTO shawk.listeners AS l (host_id, process_id, proto, addr, port, netns, first_seen, last_seen)
 SELECT $1, p.id, u.proto, u.addr::inet, u.port, u.netns, u.f, u.l
-FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::integer[], $7::bigint[],
-            $8::timestamptz[], $9::timestamptz[]) AS u(unit, comm, proto, addr, port, netns, f, l)
+FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::integer[], $8::bigint[],
+            $9::timestamptz[], $10::timestamptz[]) AS u(unit, comm, service, proto, addr, port, netns, f, l)
 LEFT JOIN shawk.processes p ON p.host_id = $1 AND p.unit = u.unit AND p.comm = u.comm
-  AND (u.unit <> '' OR u.comm <> '')
+  AND p.service_name = u.service AND (u.unit <> '' OR u.comm <> '')
 ON CONFLICT (host_id, proto, addr, port, netns) DO UPDATE SET
   process_id = CASE WHEN excluded.last_seen >= l.last_seen THEN coalesce(excluded.process_id, l.process_id)
                     ELSE l.process_id END,
   first_seen = least(l.first_seen, excluded.first_seen),
   last_seen  = greatest(l.last_seen, excluded.last_seen)`,
-			h.key, units, comms, protos, addrs, ports, netns, firsts, lasts)
+			h.key, units, comms, services, protos, addrs, ports, netns, firsts, lasts)
 	}
 	return tx.SendBatch(ctx, b).Close()
 }
@@ -215,12 +217,12 @@ func (s *pgStore) prune(ctx context.Context, retention time.Duration, maxRows in
 
 func (s *pgStore) peers(ctx context.Context) (peerRows, error) {
 	var out peerRows
-	err := queryRows(ctx, s.pool, `SELECT host(addr), port, proto, host_id, service, last_seen FROM shawk_v1.service_endpoints`,
+	err := queryRows(ctx, s.pool, `SELECT host(addr), port, proto, host_id, service, last_seen, exact FROM shawk_v1.service_endpoints`,
 		func(rows pgx.Rows) error {
 			var addr string
 			var port int32
 			var e endpointRow
-			if err := rows.Scan(&addr, &port, &e.key.proto, &e.host, &e.service, &e.lastSeen); err != nil {
+			if err := rows.Scan(&addr, &port, &e.key.proto, &e.host, &e.service, &e.lastSeen, &e.exact); err != nil {
 				return err
 			}
 			if a, err := netip.ParseAddr(addr); err == nil {
@@ -245,6 +247,7 @@ FROM shawk_v1.client_endpoints`,
 			sa, err2 := netip.ParseAddr(server)
 			if err1 == nil && err2 == nil {
 				c.key.client, c.key.server, c.key.port = ca.Unmap(), sa.Unmap(), uint16(port)
+				c.exact = true
 				out.clients = append(out.clients, c)
 			}
 			return nil
@@ -252,11 +255,11 @@ FROM shawk_v1.client_endpoints`,
 	if err != nil {
 		return out, err
 	}
-	err = queryRows(ctx, s.pool, `SELECT host(addr), host_id FROM shawk_v1.agent_addrs`,
+	err = queryRows(ctx, s.pool, `SELECT host(addr), host_id, last_seen, udp_traced, netns_scope = 'all' FROM shawk_v1.agent_addrs`,
 		func(rows pgx.Rows) error {
 			var addr string
 			var r agentAddrRow
-			if err := rows.Scan(&addr, &r.host); err != nil {
+			if err := rows.Scan(&addr, &r.host, &r.seen, &r.udpTraced, &r.allNetNS); err != nil {
 				return err
 			}
 			if a, err := netip.ParseAddr(addr); err == nil {

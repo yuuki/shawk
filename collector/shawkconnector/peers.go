@@ -3,9 +3,20 @@ package shawkconnector
 import (
 	"net/netip"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 )
+
+// aliveWindow is how long an agent may be silent and still count as alive;
+// it matches shawk.alive_window() in PostgreSQL.
+const aliveWindow = 5 * time.Minute
+
+// shareWindow is how close in time two hosts must have reported an address
+// for the address to count as held by both at once. An address whose
+// former holder stopped reporting it earlier has moved, e.g. to a renamed
+// or rebuilt host.
+const shareWindow = 3 * time.Minute
 
 // endpointKey is a service endpoint: an address and port a server accepts
 // connections on.
@@ -26,22 +37,42 @@ type clientKey struct {
 // endpoint is a service seen on an endpoint, or a client service seen on
 // the client side of connections.
 type endpoint struct {
-	host     string // hosts.id
-	service  string
+	host    string // hosts.id
+	service string
+	// exact is true when the address was observed on a socket, and false
+	// when it is an address of the host that a listener on an unspecified
+	// address may serve.
+	exact    bool
 	lastSeen time.Time
+}
+
+// agentHost is what is known of the agent of a host.
+type agentHost struct {
+	seen time.Time // by the clock of the connector
+	// The agent records both sides of a dependency only if it traces every
+	// network namespace, and UDP only if it traces UDP.
+	udpTraced bool
+	allNetNS  bool
+}
+
+// covers tells whether the agent records the edges of a protocol on its
+// host. Loopback edges stay within one namespace, which the agent sees
+// whenever it sees the other side.
+func (h agentHost) covers(proto string, loopback bool) bool {
+	return (loopback || h.allNetNS) && (proto != "udp" || h.udpTraced)
 }
 
 // peer is the name of the peer of an edge.
 type peer struct {
 	name string // service.peer.name
-	// agent tells whether the peer runs on a host with an agent, which then
-	// records the other side of the edge (shawk.peer.agent).
+	// agent tells whether the peer runs on a host whose agent records the
+	// other side of the edge (shawk.peer.agent).
 	agent bool
 }
 
 // resolver names the peers of edges. It combines the endpoints, clients and
-// agent addresses read from PostgreSQL with those the connector has seen
-// itself since, which may not be written yet.
+// agents read from PostgreSQL with those the connector has seen itself
+// since, which may not be written yet.
 type resolver struct {
 	cidrs []namedPrefix
 
@@ -50,11 +81,13 @@ type resolver struct {
 	// shawk_v1.agent_addrs.
 	dbEndpoints map[endpointKey][]endpoint
 	dbClients   map[clientKey][]endpoint
-	dbAgents    map[netip.Addr][]string
+	dbAddrs     map[netip.Addr]map[string]time.Time // address -> host -> last seen
+	dbAgents    map[string]agentHost
 	// Seen by this connector, with the time they were last seen.
 	localEndpoints map[endpointKey]map[endpoint]time.Time
 	localClients   map[clientKey]map[endpoint]time.Time
-	localAgents    map[netip.Addr]map[string]time.Time
+	localAddrs     map[netip.Addr]map[string]time.Time
+	localAgents    map[string]agentHost
 }
 
 func newResolver(cidrs []namedPrefix) *resolver {
@@ -62,10 +95,12 @@ func newResolver(cidrs []namedPrefix) *resolver {
 		cidrs:          cidrs,
 		dbEndpoints:    map[endpointKey][]endpoint{},
 		dbClients:      map[clientKey][]endpoint{},
-		dbAgents:       map[netip.Addr][]string{},
+		dbAddrs:        map[netip.Addr]map[string]time.Time{},
+		dbAgents:       map[string]agentHost{},
 		localEndpoints: map[endpointKey]map[endpoint]time.Time{},
 		localClients:   map[clientKey]map[endpoint]time.Time{},
-		localAgents:    map[netip.Addr]map[string]time.Time{},
+		localAddrs:     map[netip.Addr]map[string]time.Time{},
+		localAgents:    map[string]agentHost{},
 	}
 }
 
@@ -85,6 +120,7 @@ type clientRow struct {
 type agentAddrRow struct {
 	addr netip.Addr
 	host string
+	agentHost
 }
 
 // peerRows are the rows the resolver loads from PostgreSQL.
@@ -104,17 +140,26 @@ func (r *resolver) load(rows peerRows) {
 	for _, c := range rows.clients {
 		cls[c.key] = append(cls[c.key], c.endpoint)
 	}
-	ags := make(map[netip.Addr][]string, len(rows.agents))
+	addrs := make(map[netip.Addr]map[string]time.Time, len(rows.agents))
+	agents := map[string]agentHost{}
 	for _, a := range rows.agents {
-		ags[a.addr] = append(ags[a.addr], a.host)
+		m := addrs[a.addr]
+		if m == nil {
+			m = map[string]time.Time{}
+			addrs[a.addr] = m
+		}
+		m[a.host] = a.seen
+		if cur, ok := agents[a.host]; !ok || a.seen.After(cur.seen) {
+			agents[a.host] = a.agentHost
+		}
 	}
 	r.mu.Lock()
-	r.dbEndpoints, r.dbClients, r.dbAgents = eps, cls, ags
+	r.dbEndpoints, r.dbClients, r.dbAddrs, r.dbAgents = eps, cls, addrs, agents
 	r.mu.Unlock()
 }
 
-func learnInto[K comparable](m map[K]map[endpoint]time.Time, k K, host, service string, now time.Time) {
-	if service == "" {
+func learnInto[K comparable](m map[K]map[endpoint]time.Time, k K, e endpoint, now time.Time) {
+	if e.service == "" {
 		return
 	}
 	es := m[k]
@@ -122,7 +167,7 @@ func learnInto[K comparable](m map[K]map[endpoint]time.Time, k K, host, service 
 		es = map[endpoint]time.Time{}
 		m[k] = es
 	}
-	es[endpoint{host: host, service: service}] = now
+	es[e] = now
 }
 
 // learn records the endpoints, clients and addresses of a host seen in a
@@ -134,31 +179,37 @@ func (r *resolver) learn(b *hostBatch, now time.Time) {
 	for _, l := range b.listeners {
 		svc := l.id.job()
 		if !l.id.addr.IsUnspecified() {
-			learnInto(r.localEndpoints, endpointKey{l.id.addr, l.id.port, l.id.proto}, b.key, svc, now)
+			learnInto(r.localEndpoints, endpointKey{l.id.addr, l.id.port, l.id.proto},
+				endpoint{host: b.key, service: svc, exact: true}, now)
 			continue
 		}
 		for _, a := range b.addrs {
 			if l.id.addr.Is4() && !a.Is4() {
 				continue
 			}
-			learnInto(r.localEndpoints, endpointKey{a, l.id.port, l.id.proto}, b.key, svc, now)
+			learnInto(r.localEndpoints, endpointKey{a, l.id.port, l.id.proto}, endpoint{host: b.key, service: svc}, now)
 		}
 	}
 	for _, e := range b.edges {
 		switch e.id.role {
 		case roleServer:
-			learnInto(r.localEndpoints, endpointKey{e.id.local, e.id.port, e.id.proto}, b.key, e.id.job(), now)
+			learnInto(r.localEndpoints, endpointKey{e.id.local, e.id.port, e.id.proto},
+				endpoint{host: b.key, service: e.id.job(), exact: true}, now)
 		case roleClient:
-			learnInto(r.localClients, clientKey{e.id.local, e.id.peer, e.id.port, e.id.proto}, b.key, e.id.job(), now)
+			learnInto(r.localClients, clientKey{e.id.local, e.id.peer, e.id.port, e.id.proto},
+				endpoint{host: b.key, service: e.id.job(), exact: true}, now)
 		}
 	}
 	for _, a := range b.addrs {
-		m := r.localAgents[a]
+		m := r.localAddrs[a]
 		if m == nil {
 			m = map[string]time.Time{}
-			r.localAgents[a] = m
+			r.localAddrs[a] = m
 		}
 		m[b.key] = now
+	}
+	if b.final {
+		r.localAgents[b.key] = agentHost{seen: now, udpTraced: b.udpTraced, allNetNS: b.netnsScope == "all"}
 	}
 }
 
@@ -175,16 +226,22 @@ func expireLearned[K comparable, V comparable](m map[K]map[V]time.Time, t time.T
 	}
 }
 
-// expire forgets what was learned before t.
-func (r *resolver) expire(t time.Time) {
+// expire forgets endpoints and clients learned before t, and addresses and
+// agents not seen within the alive window before now.
+func (r *resolver) expire(t, now time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	expireLearned(r.localEndpoints, t)
 	expireLearned(r.localClients, t)
-	expireLearned(r.localAgents, t)
+	expireLearned(r.localAddrs, now.Add(-aliveWindow))
+	for h, a := range r.localAgents {
+		if a.seen.Before(now.Add(-aliveWindow)) {
+			delete(r.localAgents, h)
+		}
+	}
 }
 
-// peer names the peer of an edge of host.
+// peer names the peer of an edge of host at now.
 //
 // The peer of a client edge is the service listening on the peer address
 // and port. The peer of a server edge is the client service whose client
@@ -194,14 +251,31 @@ func (r *resolver) expire(t time.Time) {
 // A loopback peer is on the host itself. So is a peer whose address several
 // live hosts hold at once, such as the address of a container bridge, when
 // the host holds it too; such an address is never resolved to another host.
-func (r *resolver) peer(host string, id *edgeID) peer {
+func (r *resolver) peer(host string, id *edgeID, now time.Time) peer {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	hosts := r.hostsOf(id.peer)
-	shared := len(hosts) > 1
-	local := id.peer.IsLoopback() || (shared && hosts[host])
-	sameHostOnly := id.peer.IsLoopback() || shared
-	p := peer{agent: local || (!shared && len(hosts) > 0)}
+	holders := r.holders(id.peer, now)
+	shared := len(holders) > 1
+	loopback := id.peer.IsLoopback()
+	local := loopback || (shared && holders[host])
+	sameHostOnly := loopback || shared
+
+	var p peer
+	switch {
+	case local:
+		// The host itself runs an agent; before its first complete interval
+		// what it traces is not known yet.
+		p.agent = true
+		if a, ok := r.agent(host, now); ok {
+			p.agent = a.covers(id.proto, loopback)
+		}
+	case len(holders) == 1:
+		for h := range holders {
+			if a, ok := r.agent(h, now); ok {
+				p.agent = a.covers(id.proto, false)
+			}
+		}
+	}
 	if id.role == roleClient {
 		k := endpointKey{id.peer, id.port, id.proto}
 		p.name = best(host, r.localEndpoints[k], r.dbEndpoints[k], sameHostOnly)
@@ -215,22 +289,78 @@ func (r *resolver) peer(host string, id *edgeID) peer {
 	return p
 }
 
+// holders returns the hosts with live agents that hold an address now. A
+// host that last reported the address well before another one did no
+// longer holds it.
+func (r *resolver) holders(a netip.Addr, now time.Time) map[string]bool {
+	seen := map[string]time.Time{}
+	var newest time.Time
+	add := func(h string, t time.Time) {
+		if t.Before(now.Add(-aliveWindow)) {
+			return
+		}
+		if t.After(seen[h]) {
+			seen[h] = t
+		}
+		if t.After(newest) {
+			newest = t
+		}
+	}
+	for h, t := range r.localAddrs[a] {
+		add(h, t)
+	}
+	for h, t := range r.dbAddrs[a] {
+		add(h, t)
+	}
+	var out map[string]bool
+	for h, t := range seen {
+		if t.Before(newest.Add(-shareWindow)) {
+			continue
+		}
+		if out == nil {
+			out = map[string]bool{}
+		}
+		out[h] = true
+	}
+	return out
+}
+
+// agent returns the latest known agent of a host, if it is alive.
+func (r *resolver) agent(host string, now time.Time) (agentHost, bool) {
+	a, ok := r.localAgents[host]
+	if d, dok := r.dbAgents[host]; dok && (!ok || d.seen.After(a.seen)) {
+		a, ok = d, true
+	}
+	if !ok || a.seen.Before(now.Add(-aliveWindow)) {
+		return agentHost{}, false
+	}
+	return a, true
+}
+
 // best returns the service of the best candidate: one on the host itself,
-// then the most recently seen one.
+// then one observed on a socket rather than inferred from a listener on an
+// unspecified address, then the most recently seen one, then the first by
+// name, so that the choice does not depend on the order of maps.
 func best(host string, local map[endpoint]time.Time, db []endpoint, sameHostOnly bool) string {
 	var b endpoint
+	better := func(e endpoint) bool {
+		switch {
+		case b.service == "":
+			return true
+		case (e.host == host) != (b.host == host):
+			return e.host == host
+		case e.exact != b.exact:
+			return e.exact
+		case !e.lastSeen.Equal(b.lastSeen):
+			return e.lastSeen.After(b.lastSeen)
+		}
+		return strings.Compare(e.service, b.service) < 0
+	}
 	consider := func(e endpoint) {
 		if sameHostOnly && e.host != host {
 			return
 		}
-		switch {
-		case b.service == "":
-			b = e
-		case (e.host == host) != (b.host == host):
-			if e.host == host {
-				b = e
-			}
-		case e.lastSeen.After(b.lastSeen):
+		if better(e) {
 			b = e
 		}
 	}
@@ -242,24 +372,6 @@ func best(host string, local map[endpoint]time.Time, db []endpoint, sameHostOnly
 		consider(e)
 	}
 	return b.service
-}
-
-// hostsOf returns the live hosts with agents that hold an address.
-func (r *resolver) hostsOf(a netip.Addr) map[string]bool {
-	var hosts map[string]bool
-	add := func(h string) {
-		if hosts == nil {
-			hosts = map[string]bool{}
-		}
-		hosts[h] = true
-	}
-	for h := range r.localAgents[a] {
-		add(h)
-	}
-	for _, h := range r.dbAgents[a] {
-		add(h)
-	}
-	return hosts
 }
 
 // classify names a peer without a known service from its address.

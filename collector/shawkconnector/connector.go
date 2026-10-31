@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/connector"
 	"go.opentelemetry.io/collector/consumer"
@@ -134,11 +135,15 @@ func (c *shawkConnector) loop(ctx context.Context) {
 			cancel()
 			return
 		case <-t.C:
+			// Writes and the reload of peers have their own deadlines, so
+			// that a slow write does not stop the names from being reloaded.
 			wctx, cancel := context.WithTimeout(ctx, c.cfg.WriteInterval)
 			if c.prepareSchemaOnly(wctx) {
 				c.flush(wctx)
 			}
-			c.prepare(wctx)
+			cancel()
+			rctx, cancel := context.WithTimeout(ctx, c.cfg.WriteInterval)
+			c.prepare(rctx)
 			cancel()
 			c.pruneIfDue(ctx)
 			now := c.now()
@@ -146,7 +151,7 @@ func (c *shawkConnector) loop(ctx context.Context) {
 			c.agg.expire(now)
 			c.changes.expire(now)
 			c.mu.Unlock()
-			c.resolver.expire(now.Add(-c.cfg.IdleTTL))
+			c.resolver.expire(now.Add(-c.cfg.IdleTTL), now)
 		}
 	}
 }
@@ -208,6 +213,13 @@ func (c *shawkConnector) flush(ctx context.Context) {
 	var lastErr error
 	for _, h := range pending {
 		if err := c.store.write(ctx, h); err != nil {
+			if isDataError(err) {
+				// Writing these changes again would fail again and block the
+				// host for good; drop them.
+				c.log.Error("dropping changes that PostgreSQL rejects", zap.String("host", h.hostname),
+					zap.Int("rows", h.size()), zap.Error(err))
+				continue
+			}
 			failed++
 			lastErr = err
 			c.mu.Lock()
@@ -258,7 +270,7 @@ func (c *shawkConnector) ConsumeMetrics(ctx context.Context, md pmetric.Metrics)
 		c.resolver.learn(b, now)
 		c.mu.Lock()
 		c.changes.add(b, now)
-		c.agg.add(b, func(id *edgeID) peer { return c.resolver.peer(b.key, id) }, now, out)
+		c.agg.add(b, func(id *edgeID) peer { return c.resolver.peer(b.key, id, now) }, now, out)
 		c.mu.Unlock()
 	}
 	if out.ResourceMetrics().Len() > 0 {
@@ -267,4 +279,16 @@ func (c *shawkConnector) ConsumeMetrics(ctx context.Context, md pmetric.Metrics)
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// isDataError tells whether PostgreSQL rejected the data itself (SQLSTATE
+// classes 22, data exception, and 23, integrity constraint violation),
+// rather than failing for a reason that may pass, such as a lost
+// connection.
+func isDataError(err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	return strings.HasPrefix(pgErr.Code, "22") || strings.HasPrefix(pgErr.Code, "23")
 }

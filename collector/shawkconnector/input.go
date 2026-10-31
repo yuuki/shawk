@@ -44,6 +44,7 @@ type valueKey struct {
 // point is a cumulative value of an input series.
 type point struct {
 	start pcommon.Timestamp
+	time  pcommon.Timestamp
 	value float64
 	count uint64 // of a histogram
 }
@@ -87,6 +88,10 @@ type hostBatch struct {
 
 	// agent holds the metrics of the agent itself to forward.
 	agent pmetric.MetricSlice
+	// final tells that the request closes an interval of the agent: it is
+	// the last of the requests of the interval, which carries the metrics
+	// of the agent.
+	final bool
 	// invalid counts the data points that could not be decoded.
 	invalid int
 }
@@ -115,7 +120,7 @@ func parseResource(rm pmetric.ResourceMetrics) (*hostBatch, error) {
 	if v, ok := res.Get(attrHostIP); ok && v.Type() == pcommon.ValueTypeSlice {
 		s := v.Slice()
 		for i := range s.Len() {
-			if a, err := netip.ParseAddr(s.At(i).AsString()); err == nil {
+			if a, err := parseAddr(s.At(i).AsString()); err == nil {
 				b.addrs = append(b.addrs, a.Unmap())
 			}
 		}
@@ -157,7 +162,7 @@ func (b *hostBatch) addMetric(m pmetric.Metric) {
 			if name == metricNetworkIO || name == metricUDPDatagrams {
 				k.dir = getString(dp.Attributes(), attrIODirection)
 			}
-			e.values[k] = point{start: dp.StartTimestamp(), value: numberValue(dp)}
+			e.values[k] = point{start: dp.StartTimestamp(), time: dp.Timestamp(), value: numberValue(dp)}
 		}
 	case metricRTT:
 		if m.Type() != pmetric.MetricTypeHistogram {
@@ -169,7 +174,8 @@ func (b *hostBatch) addMetric(m pmetric.Metric) {
 			dp := dps.At(i)
 			b.observe(dp.Timestamp())
 			if e := b.edge(dp.Attributes()); e != nil {
-				e.values[valueKey{metric: name}] = point{start: dp.StartTimestamp(), value: dp.Sum(), count: dp.Count()}
+				e.values[valueKey{metric: name}] = point{start: dp.StartTimestamp(), time: dp.Timestamp(),
+					value: dp.Sum(), count: dp.Count()}
 			}
 		}
 	case metricEdgeFirst, metricEdgeLast:
@@ -203,6 +209,7 @@ func (b *hostBatch) addMetric(m pmetric.Metric) {
 		case metricAgentUDPTraced:
 			forGauge(b, m, func(dp pmetric.NumberDataPoint, _ time.Time) { b.udpTraced = numberValue(dp) != 0 })
 		case metricAgentUp:
+			b.final = true
 			forGauge(b, m, func(dp pmetric.NumberDataPoint, _ time.Time) {
 				b.netnsScope = getString(dp.Attributes(), attrNetNSScope)
 			})
@@ -274,8 +281,8 @@ func parseProcess(a pcommon.Map) process {
 func (b *hostBatch) edge(a pcommon.Map) *edgeInput {
 	role := getString(a, attrRole)
 	proto := getString(a, attrTransport)
-	local, err1 := netip.ParseAddr(getString(a, attrLocalAddr))
-	peer, err2 := netip.ParseAddr(getString(a, attrPeerAddr))
+	local, err1 := parseAddr(getString(a, attrLocalAddr))
+	peer, err2 := parseAddr(getString(a, attrPeerAddr))
 	port, ok1 := getInt(a, attrServerPort)
 	netns, ok2 := getInt(a, attrNetNS)
 	if (role != roleClient && role != roleServer) || (proto != "tcp" && proto != "udp") ||
@@ -295,7 +302,7 @@ func (b *hostBatch) edge(a pcommon.Map) *edgeInput {
 
 func (b *hostBatch) listener(a pcommon.Map) *listenerInput {
 	proto := getString(a, attrTransport)
-	addr, err := netip.ParseAddr(getString(a, attrLocalAddr))
+	addr, err := parseAddr(getString(a, attrLocalAddr))
 	port, ok1 := getInt(a, attrServerPort)
 	netns, ok2 := getInt(a, attrNetNS)
 	if (proto != "tcp" && proto != "udp") || err != nil || !ok1 || !ok2 || port < 0 || port > 65535 {
@@ -309,4 +316,14 @@ func (b *hostBatch) listener(a pcommon.Map) *listenerInput {
 		b.listeners[id] = l
 	}
 	return l
+}
+
+// parseAddr parses an address without its IPv6 zone, which PostgreSQL's
+// inet does not accept and which does not identify a peer across hosts.
+func parseAddr(s string) (netip.Addr, error) {
+	a, err := netip.ParseAddr(s)
+	if err != nil {
+		return a, err
+	}
+	return a.WithZone("").Unmap(), nil
 }

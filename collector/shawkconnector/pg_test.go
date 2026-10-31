@@ -183,7 +183,7 @@ func TestPGPipeline(t *testing.T) {
 	}
 
 	agents := queryStrings(t, conn, `SELECT host, alive, udp_traced, netns_scope, started_at = $1 FROM shawk_v1.agents`, base.Add(-time.Hour))
-	if !slices.Equal(agents, []string{"app-01 true false all true", "db-01 true false all true"}) {
+	if !slices.Equal(agents, []string{"app-01 true true all true", "db-01 true true all true"}) {
 		t.Errorf("agents = %v", agents)
 	}
 
@@ -268,9 +268,9 @@ func TestPGPipeline(t *testing.T) {
 	conn.QueryRow(ctx, `SELECT max(last_seen) FROM shawk.edges`).Scan(&before)
 	old := newHostChanges(hostKey("m-app", "app-01"))
 	old.setHost("m-app", "app-01", "4.18", "old", base.Add(-48*time.Hour))
-	old.addProcess(procKey{"app.service", "puma"}, "/old", "old", span{base.Add(-48 * time.Hour), base.Add(-48 * time.Hour)})
+	old.addProcess(procKey{"app.service", "puma", "shop/app"}, "/old", span{base.Add(-48 * time.Hour), base.Add(-48 * time.Hour)})
 	old.addEdge(edgeRowKey{role: "client", proto: "tcp", local: addrOf("10.0.0.11"), peer: addrOf("10.0.0.10"), port: 5432,
-		netns: 4026531840, procKey: procKey{"app.service", "puma"}}, span{base.Add(-48 * time.Hour), base.Add(-48 * time.Hour)})
+		netns: 4026531840, procKey: procKey{"app.service", "puma", "shop/app"}}, span{base.Add(-48 * time.Hour), base.Add(-48 * time.Hour)})
 	if err := c.store.write(ctx, old); err != nil {
 		t.Fatal(err)
 	}
@@ -380,8 +380,8 @@ func TestPGPrune(t *testing.T) {
 		h.setHost("m", host, "5.14", "test", at)
 		h.addSession(at.Add(-time.Hour), sessionRow{lastHeartbeat: at, netnsScope: "all"})
 		h.addAddr(addrOf("10.0.0.1"), span{at, at})
-		pk := procKey{host + ".service", host}
-		h.addProcess(pk, "/usr/bin/"+host, host, span{at, at})
+		pk := procKey{host + ".service", host, host}
+		h.addProcess(pk, "/usr/bin/"+host, span{at, at})
 		for i := range 5 {
 			h.addEdge(edgeRowKey{role: "client", proto: "tcp", local: addrOf("10.0.0.1"), peer: addrOf("10.0.1.1"),
 				port: port + uint16(i), netns: 1, procKey: pk}, span{at, at})
@@ -426,13 +426,19 @@ func TestPGSharedAddresses(t *testing.T) {
 	c, sink, conn := pgConnector(t)
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Second)
+	// Both hosts hold the bridge address for 20 minutes; held together for
+	// less than 10 minutes it would not count as shared.
 	for _, h := range []string{"a-01", "b-01"} {
-		consume(t, c, sink, tAgent{host: h, machineID: "m-" + h, addrs: []string{"172.17.0.1"}, time: now, segment: now.Add(-time.Hour),
-			edges: []tEdge{
-				{role: "client", proto: "tcp", local: "172.17.0.2", peer: "172.17.0.1", port: 5432, svc: h + "-app", comm: "app", opened: 1},
-				{role: "server", proto: "tcp", local: "172.17.0.1", peer: "172.17.0.2", port: 5432, svc: h + "-db", comm: "db", opened: 1},
-			}})
+		for _, at := range []time.Time{now.Add(-20 * time.Minute), now} {
+			c.now = func() time.Time { return at }
+			consume(t, c, sink, tAgent{host: h, machineID: "m-" + h, addrs: []string{"172.17.0.1"}, time: at, segment: now.Add(-time.Hour),
+				edges: []tEdge{
+					{role: "client", proto: "tcp", local: "172.17.0.2", peer: "172.17.0.1", port: 5432, svc: h + "-app", comm: "app", opened: 1},
+					{role: "server", proto: "tcp", local: "172.17.0.1", peer: "172.17.0.2", port: 5432, svc: h + "-db", comm: "db", opened: 1},
+				}})
+		}
 	}
+	c.now = time.Now
 	c.flush(ctx)
 	got := queryStrings(t, conn, `SELECT client_service, server_service, observed_by FROM shawk_v1.dependencies`)
 	want := []string{"a-01-app a-01-db both", "b-01-app b-01-db both"}

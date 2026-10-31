@@ -39,22 +39,31 @@ type inputKey struct {
 	value valueKey
 }
 
+// inputState is the latest point of an input series.
 type inputState struct {
 	start pcommon.Timestamp
+	time  pcommon.Timestamp
 	value float64
 	count uint64
-	seen  time.Time
+	seen  time.Time // by the clock of the connector
 }
 
-// outResKey identifies an output resource: a local service on a host.
-type outResKey struct {
-	host           string
+// svcKey identifies the local service of an output resource on a host.
+type svcKey struct {
 	service, svcNS string
 }
 
-type outResource struct {
+// hostOutputs are the output resources of a host.
+type hostOutputs struct {
 	machineID, hostname string
-	series              map[outKey]*outSeries
+	resources           map[svcKey]*outResource
+	// emitted is the time of the latest request whose outputs were emitted,
+	// by the clock of the agent.
+	emitted time.Time
+}
+
+type outResource struct {
+	series map[outKey]*outSeries
 }
 
 // outKey identifies an output series within its resource.
@@ -70,10 +79,13 @@ type outKey struct {
 }
 
 type outSeries struct {
-	start time.Time
+	start time.Time // by the clock of the agent, like the points
 	value float64
 	count uint64
 	seen  time.Time
+	// gauge holds the current value of each input of a gauge since the
+	// outputs of the host were last emitted.
+	gauge map[inputKey]float64
 }
 
 type peerGroup struct {
@@ -81,9 +93,14 @@ type peerGroup struct {
 }
 
 // aggregator sums the cumulative input series of edges into output series
-// without addresses. It keeps the last value of every input series and
+// without addresses. It keeps the last point of every input series and
 // adds the difference to the output, so that an output series never
 // decreases when one of its inputs disappears.
+//
+// An agent may send an interval in several requests; the last one carries
+// the metrics of the agent. The outputs of a host are emitted when that
+// request arrives, once per interval, so that a series is never emitted
+// twice with the same timestamp.
 type aggregator struct {
 	ttl          time.Duration
 	maxPeers     int
@@ -93,8 +110,8 @@ type aggregator struct {
 	// baseline rather than an increase.
 	started time.Time
 
-	inputs  map[inputKey]*inputState
-	outputs map[outResKey]*outResource
+	inputs map[inputKey]*inputState
+	hosts  map[string]*hostOutputs
 	// peers are the values of service.peer.name in use per group, with
 	// when they were last used.
 	peers map[peerGroup]map[string]time.Time
@@ -107,7 +124,7 @@ func newAggregator(ttl time.Duration, maxPeers int, keepPeerAddr bool, started t
 		keepPeerAddr: keepPeerAddr,
 		started:      started,
 		inputs:       map[inputKey]*inputState{},
-		outputs:      map[outResKey]*outResource{},
+		hosts:        map[string]*hostOutputs{},
 		peers:        map[peerGroup]map[string]time.Time{},
 	}
 }
@@ -127,38 +144,41 @@ func (a *aggregator) peer(g peerGroup, name string, now time.Time) string {
 	return name
 }
 
-// add accounts the request of a host and appends the output of the host to
-// out: every live output series of the host, and the agent's own metrics.
+// add accounts a request of a host received at now. If the request closes
+// an interval, it appends to out every live output series of the host and
+// the metrics of the agent.
 func (a *aggregator) add(b *hostBatch, peerOf func(*edgeID) peer, now time.Time, out pmetric.Metrics) {
 	ts := b.time
 	if ts.IsZero() {
 		ts = now
 	}
-	// The open connections are those of this request only.
-	for k, r := range a.outputs {
-		if k.host != b.key {
-			continue
-		}
-		for ok, s := range r.series {
-			if outMetrics[ok.metric].gauge {
-				s.value = 0
-			}
-		}
+	// The start of the connector by the clock of the agent.
+	started := a.started.Add(-now.Sub(ts))
+
+	h := a.hosts[b.key]
+	if h == nil {
+		h = &hostOutputs{resources: map[svcKey]*outResource{}}
+		a.hosts[b.key] = h
 	}
+	h.machineID, h.hostname = b.machineID, b.hostname
 
 	for _, e := range b.edges {
-		rk := outResKey{host: b.key, service: e.id.service, svcNS: e.id.svcNS}
-		r := a.outputs[rk]
+		sk := svcKey{service: e.id.service, svcNS: e.id.svcNS}
+		r := h.resources[sk]
 		if r == nil {
 			r = &outResource{series: map[outKey]*outSeries{}}
-			a.outputs[rk] = r
+			h.resources[sk] = r
 		}
-		r.machineID, r.hostname = b.machineID, b.hostname
 		p := peerOf(&e.id)
 		name := a.peer(peerGroup{b.key, e.id.service, e.id.svcNS, e.id.role}, p.name, now)
 		for vk, pt := range e.values {
 			m, ok := outMetrics[vk.metric]
 			if !ok {
+				continue
+			}
+			ik := inputKey{b.key, e.id, vk}
+			dv, dc, fresh := a.delta(ik, pt, started, now)
+			if !fresh {
 				continue
 			}
 			key := outKey{metric: vk.metric, dir: vk.dir, peer: name, peerAgent: p.agent, role: e.id.role,
@@ -169,33 +189,37 @@ func (a *aggregator) add(b *hostBatch, peerOf func(*edgeID) peer, now time.Time,
 			s := r.series[key]
 			if s == nil {
 				start := pt.start.AsTime()
-				if start.Before(a.started) || start.After(ts) {
-					start = a.started
+				if start.Before(started) || start.After(ts) {
+					start = started
 				}
 				s = &outSeries{start: start}
 				r.series[key] = s
 			}
 			s.seen = now
 			if m.gauge {
-				s.value += pt.value
+				if s.gauge == nil {
+					s.gauge = map[inputKey]float64{}
+				}
+				s.gauge[ik] = pt.value
 				continue
 			}
-			dv, dc := a.delta(inputKey{b.key, e.id, vk}, pt, now)
 			s.value += dv
 			s.count += dc
 		}
 	}
 
-	for k, r := range a.outputs {
-		if k.host != b.key {
-			continue
-		}
+	// Emit once per interval, and never a request older than one emitted.
+	if !b.final || !ts.After(h.emitted) {
+		return
+	}
+	h.emitted = ts
+	for sk, r := range h.resources {
 		a.expireSeries(r, now)
 		if len(r.series) == 0 {
-			delete(a.outputs, k)
+			delete(h.resources, sk)
 			continue
 		}
-		r.appendTo(k, ts, out)
+		r.appendTo(sk, h, ts, out)
 	}
 	if b.agent.Len() > 0 {
 		rm := out.ResourceMetrics().AppendEmpty()
@@ -211,18 +235,26 @@ func (a *aggregator) add(b *hostBatch, peerOf func(*edgeID) peer, now time.Time,
 	}
 }
 
-// delta returns how much an input series increased since its last value.
-func (a *aggregator) delta(k inputKey, p point, now time.Time) (float64, uint64) {
+// delta returns how much an input series increased since its last point,
+// and whether the point is newer than that one. A point that is not newer
+// (a request that arrived late or twice) changes nothing. started is the
+// start of the connector by the clock of the agent.
+func (a *aggregator) delta(k inputKey, p point, started, now time.Time) (float64, uint64, bool) {
 	in := a.inputs[k]
 	if in == nil {
-		in = &inputState{start: p.start, value: p.value, count: p.count, seen: now}
-		a.inputs[k] = in
-		if p.start.AsTime().Before(a.started) {
-			return 0, 0
+		a.inputs[k] = &inputState{start: p.start, time: p.time, value: p.value, count: p.count, seen: now}
+		if p.start.AsTime().Before(started) {
+			return 0, 0, true
 		}
-		return p.value, p.count
+		return p.value, p.count, true
 	}
-	in.seen = now
+	switch {
+	case p.start < in.start:
+		// A late point of a series that has restarted since.
+		return 0, 0, false
+	case p.start == in.start && p.time <= in.time:
+		return 0, 0, false
+	}
 	var dv float64
 	var dc uint64
 	if p.start != in.start || p.value < in.value || p.count < in.count {
@@ -232,8 +264,8 @@ func (a *aggregator) delta(k inputKey, p point, now time.Time) (float64, uint64)
 	} else {
 		dv, dc = p.value-in.value, p.count-in.count
 	}
-	in.start, in.value, in.count = p.start, p.value, p.count
-	return dv, dc
+	in.start, in.time, in.value, in.count, in.seen = p.start, p.time, p.value, p.count, now
+	return dv, dc, true
 }
 
 func (a *aggregator) expireSeries(r *outResource, now time.Time) {
@@ -252,10 +284,15 @@ func (a *aggregator) expire(now time.Time) {
 			delete(a.inputs, k)
 		}
 	}
-	for k, r := range a.outputs {
-		a.expireSeries(r, now)
-		if len(r.series) == 0 {
-			delete(a.outputs, k)
+	for host, h := range a.hosts {
+		for sk, r := range h.resources {
+			a.expireSeries(r, now)
+			if len(r.series) == 0 {
+				delete(h.resources, sk)
+			}
+		}
+		if len(h.resources) == 0 {
+			delete(a.hosts, host)
 		}
 	}
 	for g, m := range a.peers {
@@ -278,8 +315,9 @@ func putHostAttrs(attrs pcommon.Map, machineID, hostname string) {
 	attrs.PutStr(attrHostName, hostname)
 }
 
-// appendTo appends the series of a resource at ts to out.
-func (r *outResource) appendTo(k outResKey, ts time.Time, out pmetric.Metrics) {
+// appendTo appends the series of a resource at ts to out. The value of a
+// gauge is the sum of its inputs since the last emission.
+func (r *outResource) appendTo(k svcKey, h *hostOutputs, ts time.Time, out pmetric.Metrics) {
 	rm := out.ResourceMetrics().AppendEmpty()
 	attrs := rm.Resource().Attributes()
 	// Prometheus makes the job label from service.namespace/service.name and
@@ -288,7 +326,7 @@ func (r *outResource) appendTo(k outResKey, ts time.Time, out pmetric.Metrics) {
 	if k.svcNS != "" {
 		attrs.PutStr(attrServiceNS, k.svcNS)
 	}
-	putHostAttrs(attrs, r.machineID, r.hostname)
+	putHostAttrs(attrs, h.machineID, h.hostname)
 	sm := rm.ScopeMetrics().AppendEmpty()
 	sm.Scope().SetName(scopeName)
 
@@ -300,6 +338,13 @@ func (r *outResource) appendTo(k outResKey, ts time.Time, out pmetric.Metrics) {
 				continue
 			}
 			desc := outMetrics[name]
+			if desc.gauge {
+				s.value = 0
+				for _, v := range s.gauge {
+					s.value += v
+				}
+				clear(s.gauge)
+			}
 			m, ok := metrics[name]
 			if !ok {
 				m = sm.Metrics().AppendEmpty()
