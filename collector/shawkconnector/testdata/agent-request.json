@@ -2253,7 +2253,6 @@
             },
             {
               "name":  "shawk.agent.up",
-              "unit":  "1",
               "gauge":  {
                 "dataPoints":  [
                   {
@@ -2285,7 +2284,6 @@
             },
             {
               "name":  "shawk.agent.udp.traced",
-              "unit":  "1",
               "gauge":  {
                 "dataPoints":  [
                   {

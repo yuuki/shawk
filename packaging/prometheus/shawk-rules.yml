@@ -1,0 +1,192 @@
+# Recording rules and alerts for the metrics of shawk in Prometheus.
+#
+# Both ends of a dependency may run an agent, so a dependency shows up on
+# the client side (shawk_role="client") and on the server side
+# (shawk_role="server"). The rules count each dependency once:
+#
+#   - connections, open connections, bytes, datagrams and RTT come from the
+#     client side, and from the server side only when the client has no
+#     agent (service_peer_name != "~agent");
+#   - connection failures exist on the client side only;
+#   - retransmissions come from both sides, since each side counts its own
+#     retransmitted segments; shawk_role tells the sender.
+#
+# The two sides of an `or` never share a label set because they differ in
+# shawk_role, so `or` is a union. The rules name the client src and the
+# server dst, whichever side observed the dependency.
+groups:
+  - name: shawk-dependencies
+    rules:
+      - record: shawk:dependency_connections:rate5m
+        expr: |
+          sum by (src, dst, server_port, network_transport) (
+              label_replace(label_replace(
+                rate(shawk_connection_opened_total{shawk_role="client"}[5m]),
+                "src", "$1", "job", "(.*)"), "dst", "$1", "service_peer_name", "(.*)")
+            or
+              label_replace(label_replace(
+                rate(shawk_connection_opened_total{shawk_role="server", service_peer_name!="~agent"}[5m]),
+                "dst", "$1", "job", "(.*)"), "src", "$1", "service_peer_name", "(.*)")
+          )
+
+      - record: shawk:dependency_connection_failures:rate5m
+        expr: |
+          sum by (src, dst, server_port, network_transport) (
+            label_replace(label_replace(
+              rate(shawk_connection_failed_total{shawk_role="client"}[5m]),
+              "src", "$1", "job", "(.*)"), "dst", "$1", "service_peer_name", "(.*)")
+          )
+
+      - record: shawk:dependency_open_connections
+        expr: |
+          sum by (src, dst, server_port, network_transport) (
+              label_replace(label_replace(
+                shawk_connection_count{shawk_role="client"},
+                "src", "$1", "job", "(.*)"), "dst", "$1", "service_peer_name", "(.*)")
+            or
+              label_replace(label_replace(
+                shawk_connection_count{shawk_role="server", service_peer_name!="~agent"},
+                "dst", "$1", "job", "(.*)"), "src", "$1", "service_peer_name", "(.*)")
+          )
+
+      # Bytes from the client to the server: transmitted by the client or
+      # received by the server.
+      - record: shawk:dependency_request_bytes:rate5m
+        expr: |
+          sum by (src, dst, server_port, network_transport) (
+              label_replace(label_replace(
+                rate(shawk_network_io_bytes_total{shawk_role="client", network_io_direction="transmit"}[5m]),
+                "src", "$1", "job", "(.*)"), "dst", "$1", "service_peer_name", "(.*)")
+            or
+              label_replace(label_replace(
+                rate(shawk_network_io_bytes_total{shawk_role="server", service_peer_name!="~agent", network_io_direction="receive"}[5m]),
+                "dst", "$1", "job", "(.*)"), "src", "$1", "service_peer_name", "(.*)")
+          )
+
+      # Bytes from the server to the client.
+      - record: shawk:dependency_response_bytes:rate5m
+        expr: |
+          sum by (src, dst, server_port, network_transport) (
+              label_replace(label_replace(
+                rate(shawk_network_io_bytes_total{shawk_role="client", network_io_direction="receive"}[5m]),
+                "src", "$1", "job", "(.*)"), "dst", "$1", "service_peer_name", "(.*)")
+            or
+              label_replace(label_replace(
+                rate(shawk_network_io_bytes_total{shawk_role="server", service_peer_name!="~agent", network_io_direction="transmit"}[5m]),
+                "dst", "$1", "job", "(.*)"), "src", "$1", "service_peer_name", "(.*)")
+          )
+
+      - record: shawk:dependency_request_datagrams:rate5m
+        expr: |
+          sum by (src, dst, server_port, network_transport) (
+              label_replace(label_replace(
+                rate(shawk_udp_datagrams_total{shawk_role="client", network_io_direction="transmit"}[5m]),
+                "src", "$1", "job", "(.*)"), "dst", "$1", "service_peer_name", "(.*)")
+            or
+              label_replace(label_replace(
+                rate(shawk_udp_datagrams_total{shawk_role="server", service_peer_name!="~agent", network_io_direction="receive"}[5m]),
+                "dst", "$1", "job", "(.*)"), "src", "$1", "service_peer_name", "(.*)")
+          )
+
+      - record: shawk:dependency_response_datagrams:rate5m
+        expr: |
+          sum by (src, dst, server_port, network_transport) (
+              label_replace(label_replace(
+                rate(shawk_udp_datagrams_total{shawk_role="client", network_io_direction="receive"}[5m]),
+                "src", "$1", "job", "(.*)"), "dst", "$1", "service_peer_name", "(.*)")
+            or
+              label_replace(label_replace(
+                rate(shawk_udp_datagrams_total{shawk_role="server", service_peer_name!="~agent", network_io_direction="transmit"}[5m]),
+                "dst", "$1", "job", "(.*)"), "src", "$1", "service_peer_name", "(.*)")
+          )
+
+      # The mean RTT is rtt_sum / rtt_count.
+      - record: shawk:dependency_rtt_seconds_sum:rate5m
+        expr: |
+          sum by (src, dst, server_port, network_transport) (
+              label_replace(label_replace(
+                rate(shawk_tcp_rtt_seconds_sum{shawk_role="client"}[5m]),
+                "src", "$1", "job", "(.*)"), "dst", "$1", "service_peer_name", "(.*)")
+            or
+              label_replace(label_replace(
+                rate(shawk_tcp_rtt_seconds_sum{shawk_role="server", service_peer_name!="~agent"}[5m]),
+                "dst", "$1", "job", "(.*)"), "src", "$1", "service_peer_name", "(.*)")
+          )
+      - record: shawk:dependency_rtt_seconds_count:rate5m
+        expr: |
+          sum by (src, dst, server_port, network_transport) (
+              label_replace(label_replace(
+                rate(shawk_tcp_rtt_seconds_count{shawk_role="client"}[5m]),
+                "src", "$1", "job", "(.*)"), "dst", "$1", "service_peer_name", "(.*)")
+            or
+              label_replace(label_replace(
+                rate(shawk_tcp_rtt_seconds_count{shawk_role="server", service_peer_name!="~agent"}[5m]),
+                "dst", "$1", "job", "(.*)"), "src", "$1", "service_peer_name", "(.*)")
+          )
+
+      # Retransmissions from both sides; shawk_role is the sender.
+      - record: shawk:dependency_retransmits:rate5m
+        expr: |
+          sum by (src, dst, server_port, network_transport, shawk_role) (
+              label_replace(label_replace(
+                rate(shawk_tcp_retransmits_total{shawk_role="client"}[5m]),
+                "src", "$1", "job", "(.*)"), "dst", "$1", "service_peer_name", "(.*)")
+            or
+              label_replace(label_replace(
+                rate(shawk_tcp_retransmits_total{shawk_role="server"}[5m]),
+                "dst", "$1", "job", "(.*)"), "src", "$1", "service_peer_name", "(.*)")
+          )
+
+  - name: shawk-alerts
+    rules:
+      # A push over OTLP has no scrape `up`. This finds hosts that sent in
+      # the last 24 hours but not now. Pushed series disappear 5 minutes
+      # after their last sample (there is no staleness marker), so the alert
+      # fires about 5 minutes after an agent stops and resolves by itself
+      # after 24 hours; the Grafana alert on shawk_v1.agents takes over then.
+      - alert: ShawkAgentDown
+        expr: |
+          group by (host_name) (max_over_time(shawk_agent_up[24h]))
+            unless group by (host_name) (shawk_agent_up)
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "shawk agent on {{ $labels.host_name }} stopped sending"
+          description: "No metrics from the shawk agent on {{ $labels.host_name }}; dependencies of the host are not observed."
+
+      - alert: ShawkFlowsDropped
+        expr: increase(shawk_agent_flows_dropped_total[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "shawk agent on {{ $labels.host_name }} drops flows"
+          description: "The in-kernel flow table is full; raise -max-flows of the agent."
+
+      - alert: ShawkUDPNotTraced
+        expr: shawk_agent_udp_traced == 0
+        for: 1h
+        labels:
+          severity: info
+        annotations:
+          summary: "shawk agent on {{ $labels.host_name }} does not trace UDP"
+          description: "The kernel lacks BPF trampolines (fentry); UDP dependencies of the host are not observed."
+
+      - alert: ShawkExportFailures
+        expr: increase(shawk_agent_export_failures_total[15m]) > 3
+        labels:
+          severity: warning
+        annotations:
+          summary: "shawk agent on {{ $labels.host_name }} fails to send"
+          description: "The agent could not reach the collector; dependencies that end while it cannot send may be lost."
+
+      - alert: ShawkConnectionFailureRate
+        expr: |
+          shawk:dependency_connection_failures:rate5m
+            / (shawk:dependency_connections:rate5m + shawk:dependency_connection_failures:rate5m) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.src }} fails to connect to {{ $labels.dst }}:{{ $labels.server_port }}"
+          description: "{{ $value | humanizePercentage }} of the connections of {{ $labels.src }} to {{ $labels.dst }} on port {{ $labels.server_port }} fail."

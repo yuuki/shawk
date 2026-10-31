@@ -1,0 +1,18 @@
+# Example notification policy for the shawk alerts. Provisioning a policy
+# replaces the whole policy tree of the organization, so merge this into
+# your own policies instead of copying it as is.
+#
+# A deployment often adds many dependencies at once; grouping by
+# client_service sends them in one notification per service.
+apiVersion: 1
+policies:
+  - orgId: 1
+    receiver: default
+    group_by: [grafana_folder, alertname]
+    routes:
+      - receiver: default
+        object_matchers:
+          - [grafana_folder, =, shawk]
+        group_by: [grafana_folder, alertname, client_service]
+        group_wait: 1m
+        group_interval: 5m

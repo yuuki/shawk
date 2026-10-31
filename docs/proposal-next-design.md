@@ -643,3 +643,22 @@ group by (src, dst) (
   - `graph_nodes` / `graph_edges` / `dependency_changes` はサービス単位にまとめる。サービス名のない相手はアドレスをノードの名前にする。`dependency_changes` の「消えた」は、その依存を見ていたホストが `last_seen` から 15 分以上観測を続けていることを条件にする。
   - `unobserved()` は `SECURITY DEFINER` にした（読み取りのロールが `shawk` スキーマの表を読めなくても使えるように）。
   - `agents` に `host_id`、`machine_id`、`kernel`、`agent_version` を加えた。
+
+### 9.3 packaging
+
+- 置き場所：`packaging/prometheus/`（`shawk-rules.yml`、`prometheus.yml`）、`packaging/grafana/`（`dashboards/` と `provisioning/`）、`packaging/collector/config.yaml`、`packaging/postgres/`（`setup.sql`、`grants.sql`）、`packaging/systemd/`（エージェントと Collector のユニット、`agent.env`）。
+- recording rule は §4.4 の二つに加えて、`shawk:dependency_open_connections`、`shawk:dependency_request_bytes:rate5m` / `shawk:dependency_response_bytes:rate5m`（クライアントからサーバ / サーバからクライアント。クライアント側の transmit とサーバ側の receive を同じ向きとして扱う）、UDP の `shawk:dependency_request_datagrams:rate5m` / `shawk:dependency_response_datagrams:rate5m`、`shawk:dependency_rtt_seconds_sum:rate5m` / `_count:rate5m`、`shawk:dependency_retransmits:rate5m`（`shawk_role` を残す）を作る。
+- Prometheus のアラートに `ShawkUDPNotTraced` と `ShawkExportFailures` を加えた。
+- Grafana の SQL のアラート「消えた依存」は、§6.2 の例と違い、(client_service, server_service, port) ごとに集計してから `HAVING max(last_seen)` で窓を判定する。行ごとに判定すると、レプリカの一つが入れ替わっただけで発火するため。観測を続けている側は、クライアント側に限らず両側の `observed_until` の大きい方で判定する（クライアントにエージェントがない依存も扱えるように）。
+- ダッシュボードは五つ（フリート、依存マップ、依存の詳細、変化、アプリ層（OBI））。データソースは uid `shawk-postgres` / `shawk-prometheus` で参照する。依存マップは変数 `service`（複数可）、`direction`（downstream / upstream / both）、`depth` を持ち、再帰 SQL に `CYCLE` 句と深さの上限を入れる。
+- エージェントの `shawk.agent.up` と `shawk.agent.udp.traced` は単位を空にした。単位 `1` の Gauge には Prometheus が `_ratio` を付けるため。
+- 見本のテスト：recording rule とアラートは `test/packaging`（独自の go.mod）で Prometheus の PromQL エンジンに合成した系列を読ませて値を確かめる。ダッシュボードの PromQL は構文と recording rule の名前を確かめる。ダッシュボードと SQL アラートの SQL は、`grants.sql` を当てたうえで `shawk_grafana` ロールで実際の PostgreSQL に流す（Grafana のマクロは置き換える）。Grafana そのものでの読み込みは確かめていない。
+
+## 10. 未決事項（実装中に見つけたもの）
+
+- **サーバ側の再送の `src`**：§4.4 の規約どおり再送は両側を使うが、相手にエージェントがあるサーバ側の系列は `service_peer_name="~agent"` なので、recording rule の `src` が `~agent` になり、どのクライアントへの再送かが Prometheus では分からない。PostgreSQL 側（`dependencies`）で突き合わせるか、connector がサーバ側の `~agent` の代わりにクライアントのサービス名を付けるか（その場合は二重計上の規約の作り直しが要る）を決める必要がある。
+- **共有されるプライベートアドレス**：docker0（172.17.0.1）のように多くのホストが同じアドレスを持つ場合、`service_endpoints` と `agent_addrs` の引き当てが誤る（同じホストのものを優先するだけ）。§8 の `host_addrs` のスコープの課題と同じ。
+- **`service_endpoints` の期間**：直近 7 日に見た待ち受けとサーバ側のエッジだけを使う。エージェントが 7 日以上止まっているホストのサービスは名前が引けなくなる。設定にするかどうかは未定。
+- **保持期間**：PostgreSQL の表を消す仕組みはまだない（`edges` は IP の入れ替わりで増え続ける）。現行の `-retention-*` に当たるものを connector の設定にするか、運用の SQL にするかを決める必要がある。
+- **`dependencies` ビューの重さ**：全期間のエッジを FULL JOIN するので、エッジが多いと遅い。期間で絞る関数版（`dependencies_between(since, until)` など）を足すかどうか。
+- **`unobserved()` の時刻の基準**：`last_heartbeat` はエージェントの時計、`now()` は PostgreSQL の時計。時計がずれたホストでは `alive` や空白の判定がずれる。

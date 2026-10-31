@@ -1,0 +1,65 @@
+# Configuration of the collector with the shawk connector (built from
+# collector/builder-config.yaml). Agents send to otlp/shawk; OBI and other
+# instrumentation send to otlp.
+receivers:
+  otlp/shawk:                 # shawk agents only
+    protocols:
+      grpc: { endpoint: 0.0.0.0:4327 }
+      http: { endpoint: 0.0.0.0:4328 }
+  otlp:                       # OBI and other instrumentation
+    protocols:
+      grpc: { endpoint: 0.0.0.0:4317 }
+      http: { endpoint: 0.0.0.0:4318 }
+
+connectors:
+  shawk:
+    postgres:
+      # A connection string of the role shawk_connector, e.g.
+      # postgres://shawk_connector:PASSWORD@db.example:5432/shawk?sslmode=require
+      dsn_file: /etc/shawk/postgres-dsn
+      migrate: false          # apply the schema with shawk-migrate
+    write_interval: 1m
+    idle_ttl: 15m
+    max_peers: 50
+    peer_cidrs:
+      office-lan: 192.168.10.0/24
+    keep_peer_address: false
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 20
+  batch: {}
+
+exporters:
+  otlphttp/prometheus:
+    # Prometheus started with --web.enable-otlp-receiver.
+    endpoint: http://prometheus.example:9090/api/v1/otlp
+    tls:
+      insecure: true
+  otlp/traces:                # Tempo or another trace store
+    endpoint: tempo.example:4317
+    tls:
+      insecure: true
+
+service:
+  pipelines:
+    # No batch processor before the connector: one request of an agent is
+    # one interval of its host.
+    metrics/shawk-in:
+      receivers: [otlp/shawk]
+      processors: [memory_limiter]
+      exporters: [shawk]
+    metrics/shawk-out:
+      receivers: [shawk]
+      processors: [batch]
+      exporters: [otlphttp/prometheus]
+    metrics/obi:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlphttp/prometheus]
+    traces/obi:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp/traces]

@@ -1,0 +1,174 @@
+{
+  "uid": "shawk-changes",
+  "title": "shawk / Changes",
+  "description": "Dependencies that appeared or disappeared.",
+  "tags": [
+    "shawk"
+  ],
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "version": 1,
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "refresh": "1m",
+  "timezone": "",
+  "templating": {
+    "list": []
+  },
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      },
+      {
+        "name": "Dependency changes",
+        "datasource": {
+          "type": "grafana-postgresql-datasource",
+          "uid": "shawk-postgres"
+        },
+        "enable": true,
+        "iconColor": "rgba(255, 152, 48, 1)",
+        "target": {
+          "refId": "Anno",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shawk-postgres"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT time, change || ': ' || client_service || ' -> ' || server_service || ':' || port AS text, change AS tags\nFROM shawk_v1.dependency_changes\nWHERE $__timeFilter(time)"
+        }
+      },
+      {
+        "name": "Unobserved",
+        "datasource": {
+          "type": "grafana-postgresql-datasource",
+          "uid": "shawk-postgres"
+        },
+        "enable": true,
+        "iconColor": "rgba(255, 96, 96, 0.4)",
+        "target": {
+          "refId": "Anno",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shawk-postgres"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT gap_start AS time, gap_end AS timeend, 'not observed: ' || host AS text, host AS tags\nFROM shawk_v1.unobserved($__timeFrom(), $__timeTo())"
+        }
+      }
+    ]
+  },
+  "links": [
+    {
+      "asDropdown": true,
+      "includeVars": false,
+      "keepTime": true,
+      "tags": [
+        "shawk"
+      ],
+      "title": "shawk",
+      "type": "dashboards"
+    }
+  ],
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Changes per hour",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "shawk-postgres"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shawk-postgres"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT $__timeGroupAlias(time, '1h'), change AS metric, count(*) AS value\nFROM shawk_v1.dependency_changes\nWHERE $__timeFilter(time)\nGROUP BY 1, 2\nORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 60
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 2,
+      "type": "table",
+      "title": "Changes",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "shawk-postgres"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 8,
+        "w": 24,
+        "h": 16
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shawk-postgres"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT time, change, client_service, server_service, port, proto\nFROM shawk_v1.dependency_changes\nWHERE $__timeFilter(time)\nORDER BY time DESC\nLIMIT 1000"
+        }
+      ],
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "description": "Dependencies between services that appeared, or disappeared while a host that saw them kept observing for 15 minutes."
+    }
+  ]
+}

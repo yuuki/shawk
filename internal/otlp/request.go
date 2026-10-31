@@ -89,13 +89,14 @@ func (s *State) Request(res Resource, st AgentStatus, now time.Time) *colmetrics
 		b.gauge(MetricListenerLast, "s", l.LastSeen.Unix(), attrs)
 	}
 
-	b.gauge(MetricAgentUp, "1", 1, []*commonpb.KeyValue{str(AttrNetNSScope, st.NetNSScope)})
+	// No unit "1": Prometheus would add the suffix _ratio to the names.
+	b.gauge(MetricAgentUp, "", 1, []*commonpb.KeyValue{str(AttrNetNSScope, st.NetNSScope)})
 	b.gauge(MetricAgentSegmentStart, "s", st.SegmentStart.Unix(), nil)
 	udp := int64(0)
 	if st.UDPTraced {
 		udp = 1
 	}
-	b.gauge(MetricAgentUDPTraced, "1", udp, nil)
+	b.gauge(MetricAgentUDPTraced, "", udp, nil)
 	b.sum(MetricAgentFlowsDropped, "{update}", true, st.Started, st.FlowsDropped, nil)
 	b.sum(MetricAgentExportFailures, "{request}", true, st.Started, st.ExportFailures, nil)
 	for _, p := range st.BPFPrograms {

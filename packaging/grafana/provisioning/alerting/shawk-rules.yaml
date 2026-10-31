@@ -1,0 +1,140 @@
+# Grafana alert rules on the PostgreSQL contract of shawk (shawk_v1).
+#
+# The PostgreSQL data source is used in the time series format: each query
+# returns a time column, string columns that become labels and one numeric
+# value column. When nothing happens a query returns no rows, which is No
+# Data; the rules treat No Data as Normal. A dependency that disappeared is
+# an explicit row (its last_seen falls in a window) rather than a row that
+# vanishes from the result, and a host that stopped observing is excluded,
+# so that a stopped agent does not look like a removed dependency.
+#
+# Dashboard variables cannot be used in alerts, so the time windows are
+# written in the queries.
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: shawk-dependencies
+    folder: shawk
+    interval: 1m
+    rules:
+      - uid: shawk-new-dependency
+        title: New dependency
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 900, to: 0 }
+            datasourceUid: shawk-postgres
+            model:
+              refId: A
+              editorMode: code
+              format: time_series
+              rawQuery: true
+              rawSql: |-
+                SELECT max(first_seen) AS time,
+                       client_service, server_service, port::text AS port,
+                       1 AS value
+                FROM shawk_v1.dependencies
+                WHERE first_seen > now() - interval '15 minutes'
+                GROUP BY client_service, server_service, port
+          - refId: B
+            datasourceUid: __expr__
+            model: { refId: B, type: reduce, expression: A, reducer: last }
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+        noDataState: OK
+        execErrState: Error
+        for: 0s
+        labels:
+          severity: info
+        annotations:
+          summary: "New dependency: {{ $labels.client_service }} -> {{ $labels.server_service }}:{{ $labels.port }}"
+
+      - uid: shawk-disappeared-dependency
+        title: Disappeared dependency
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 1800, to: 0 }
+            datasourceUid: shawk-postgres
+            model:
+              refId: A
+              editorMode: code
+              format: time_series
+              rawQuery: true
+              rawSql: |-
+                SELECT max(last_seen) AS time,
+                       client_service, server_service, port::text AS port,
+                       1 AS value
+                FROM shawk_v1.dependencies
+                GROUP BY client_service, server_service, port
+                -- Every edge of the dependency ended 15 to 30 minutes ago,
+                -- and a host that saw it is still observing.
+                HAVING max(last_seen) BETWEEN now() - interval '30 minutes' AND now() - interval '15 minutes'
+                   AND greatest(max(client_observed_until), max(server_observed_until)) > now() - interval '5 minutes'
+          - refId: B
+            datasourceUid: __expr__
+            model: { refId: B, type: reduce, expression: A, reducer: last }
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+        noDataState: OK
+        execErrState: Error
+        for: 0s
+        labels:
+          severity: warning
+        annotations:
+          summary: "Dependency disappeared: {{ $labels.client_service }} -> {{ $labels.server_service }}:{{ $labels.port }}"
+          description: "Last seen 15 to 30 minutes ago while a host that saw it is still observed."
+
+  - orgId: 1
+    name: shawk-agents
+    folder: shawk
+    interval: 5m
+    rules:
+      # Covers agents silent for longer than the TSDB keeps them, where the
+      # Prometheus alert ShawkAgentDown resolves.
+      - uid: shawk-agent-silent
+        title: shawk agent silent
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 3600, to: 0 }
+            datasourceUid: shawk-postgres
+            model:
+              refId: A
+              editorMode: code
+              format: time_series
+              rawQuery: true
+              rawSql: |-
+                SELECT last_heartbeat AS time, host, 1 AS value
+                FROM shawk_v1.agents
+                WHERE NOT alive AND last_heartbeat > now() - interval '30 days'
+          - refId: B
+            datasourceUid: __expr__
+            model: { refId: B, type: reduce, expression: A, reducer: last }
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+        noDataState: OK
+        execErrState: Error
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "shawk agent on {{ $labels.host }} has not reported since {{ $values.B }}"
