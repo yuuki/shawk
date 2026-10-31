@@ -71,6 +71,11 @@ type bpfShawkSockState struct {
 	Pad         uint32
 }
 
+type bpfShawkUdpState struct {
+	_   structs.HostLayout
+	Dir uint32
+}
+
 // Names of all BPF objects in the ELF.
 //
 // Used for safe lookups in a Collection or CollectionSpec.
@@ -80,6 +85,8 @@ const (
 	bpfMapFlows1                 = "flows_1"
 	bpfMapListenPorts            = "listen_ports"
 	bpfMapSockStates             = "sock_states"
+	bpfMapUdpListenPorts         = "udp_listen_ports"
+	bpfMapUdpStates              = "udp_states"
 	bpfProgShawkInetSockSetState = "shawk_inet_sock_set_state"
 	bpfProgShawkIp6SendSkb       = "shawk_ip6_send_skb"
 	bpfProgShawkIpSendSkb        = "shawk_ip_send_skb"
@@ -93,6 +100,7 @@ const (
 	bpfVarEphPortLow             = "eph_port_low"
 	bpfVarFlowDrops              = "flow_drops"
 	bpfVarLearnSelf              = "learn_self"
+	bpfVarMarkUdpServers         = "mark_udp_servers"
 	bpfVarSelfTgid               = "self_tgid"
 	bpfVarTargetNetns            = "target_netns"
 	bpfVarUnusedIterRec          = "unused_iter_rec"
@@ -153,11 +161,13 @@ type bpfProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type bpfMapSpecs struct {
-	Flows       *ebpf.MapSpec `ebpf:"flows"`
-	Flows0      *ebpf.MapSpec `ebpf:"flows_0"`
-	Flows1      *ebpf.MapSpec `ebpf:"flows_1"`
-	ListenPorts *ebpf.MapSpec `ebpf:"listen_ports"`
-	SockStates  *ebpf.MapSpec `ebpf:"sock_states"`
+	Flows          *ebpf.MapSpec `ebpf:"flows"`
+	Flows0         *ebpf.MapSpec `ebpf:"flows_0"`
+	Flows1         *ebpf.MapSpec `ebpf:"flows_1"`
+	ListenPorts    *ebpf.MapSpec `ebpf:"listen_ports"`
+	SockStates     *ebpf.MapSpec `ebpf:"sock_states"`
+	UdpListenPorts *ebpf.MapSpec `ebpf:"udp_listen_ports"`
+	UdpStates      *ebpf.MapSpec `ebpf:"udp_states"`
 }
 
 // bpfVariableSpecs contains global variables before they are loaded into the kernel.
@@ -170,6 +180,7 @@ type bpfVariableSpecs struct {
 	EphPortLow     *ebpf.VariableSpec `ebpf:"eph_port_low"`
 	FlowDrops      *ebpf.VariableSpec `ebpf:"flow_drops"`
 	LearnSelf      *ebpf.VariableSpec `ebpf:"learn_self"`
+	MarkUdpServers *ebpf.VariableSpec `ebpf:"mark_udp_servers"`
 	SelfTgid       *ebpf.VariableSpec `ebpf:"self_tgid"`
 	TargetNetns    *ebpf.VariableSpec `ebpf:"target_netns"`
 	UnusedIterRec  *ebpf.VariableSpec `ebpf:"unused_iter_rec"`
@@ -195,11 +206,13 @@ func (o *bpfObjects) Close() error {
 //
 // It can be passed to loadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type bpfMaps struct {
-	Flows       *ebpf.Map `ebpf:"flows"`
-	Flows0      *ebpf.Map `ebpf:"flows_0"`
-	Flows1      *ebpf.Map `ebpf:"flows_1"`
-	ListenPorts *ebpf.Map `ebpf:"listen_ports"`
-	SockStates  *ebpf.Map `ebpf:"sock_states"`
+	Flows          *ebpf.Map `ebpf:"flows"`
+	Flows0         *ebpf.Map `ebpf:"flows_0"`
+	Flows1         *ebpf.Map `ebpf:"flows_1"`
+	ListenPorts    *ebpf.Map `ebpf:"listen_ports"`
+	SockStates     *ebpf.Map `ebpf:"sock_states"`
+	UdpListenPorts *ebpf.Map `ebpf:"udp_listen_ports"`
+	UdpStates      *ebpf.Map `ebpf:"udp_states"`
 }
 
 func (m *bpfMaps) Close() error {
@@ -209,6 +222,8 @@ func (m *bpfMaps) Close() error {
 		m.Flows1,
 		m.ListenPorts,
 		m.SockStates,
+		m.UdpListenPorts,
+		m.UdpStates,
 	)
 }
 
@@ -222,6 +237,7 @@ type bpfVariables struct {
 	EphPortLow     *ebpf.Variable `ebpf:"eph_port_low"`
 	FlowDrops      *ebpf.Variable `ebpf:"flow_drops"`
 	LearnSelf      *ebpf.Variable `ebpf:"learn_self"`
+	MarkUdpServers *ebpf.Variable `ebpf:"mark_udp_servers"`
 	SelfTgid       *ebpf.Variable `ebpf:"self_tgid"`
 	TargetNetns    *ebpf.Variable `ebpf:"target_netns"`
 	UnusedIterRec  *ebpf.Variable `ebpf:"unused_iter_rec"`

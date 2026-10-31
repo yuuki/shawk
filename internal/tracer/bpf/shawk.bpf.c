@@ -127,6 +127,29 @@ struct {
 	__type(value, __u8);
 } listen_ports SEC(".maps");
 
+/* UDP server ports, rebuilt by iter/udp at every scan. */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 8192);
+	__type(key, struct shawk_listen_key);
+	__type(value, __u8);
+} udp_listen_ports SEC(".maps");
+
+/* Direction of a UDP socket, decided by its first datagram. */
+struct shawk_udp_state {
+	__u32 dir;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_SK_STORAGE);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__type(key, int);
+	__type(value, struct shawk_udp_state);
+} udp_states SEC(".maps");
+
+/* Set by user space while iter/udp marks the sockets that exist at startup. */
+volatile __u32 mark_udp_servers = 0;
+
 /* Make bpf2go emit Go types for the records read from iterators. */
 const struct shawk_iter_rec *unused_iter_rec __attribute__((unused));
 
@@ -546,26 +569,47 @@ static __always_inline bool port_bound(const struct sock *sk)
 }
 
 /*
- * A UDP socket is regarded as a server when the application bound its port
- * explicitly. Clients that bind a random port in the ephemeral range for
- * source port randomization (e.g. DNS resolvers) are excluded when the peer
- * uses a port outside the range.
+ * The direction of a UDP socket is decided by its first datagram: a socket
+ * that receives first is a server and one that sends first is a client.
+ * Ports cannot tell them apart: resolvers bind random source ports anywhere
+ * in 1024-65535 and servers may listen in the ephemeral range.
+ *
+ * A socket that sends first is still a server when it uses the port of a
+ * known server socket, e.g. the per-client connected sockets of a QUIC
+ * server. Server sockets that existed before the tracer started are marked
+ * by iter/udp at startup.
  */
-static __always_inline bool udp_server(const struct sock *sk, __u16 lport,
-				       __u16 rport)
+static __always_inline __u32 udp_direction(struct sock *sk, __u32 netns,
+					   __u16 lport, bool sending)
 {
-	if (!port_bound(sk))
-		return false;
-	if (ephemeral(lport) && !ephemeral(rport))
-		return false;
-	return true;
+	struct shawk_listen_key lk = {.netns = netns, .port = lport};
+	struct shawk_udp_state *us;
+	__u32 dir = DIR_IN;
+
+	us = bpf_sk_storage_get(&udp_states, sk, NULL, 0);
+	if (us)
+		return us->dir;
+	if (sending && !bpf_map_lookup_elem(&udp_listen_ports, &lk))
+		dir = DIR_OUT;
+	us = bpf_sk_storage_get(&udp_states, sk, NULL,
+				BPF_SK_STORAGE_GET_F_CREATE);
+	if (us)
+		us->dir = dir;
+	return dir;
 }
 
-/* Whether a UDP socket is a bound server socket worth listing. */
-static __always_inline bool udp_listener(const struct sock *sk, __u16 port)
+/* Whether a UDP socket is an unconnected server socket worth listing. */
+static __always_inline bool udp_listener(struct sock *sk, __u16 port)
 {
-	return port && !BPF_CORE_READ(sk, __sk_common.skc_dport) &&
-	       port_bound(sk) && !ephemeral(port);
+	struct shawk_udp_state *us;
+
+	if (!port || BPF_CORE_READ(sk, __sk_common.skc_dport))
+		return false;
+	us = bpf_sk_storage_get(&udp_states, sk, NULL, 0);
+	if (us)
+		return us->dir == DIR_IN;
+	/* Idle since the tracer started: trust an explicitly bound port. */
+	return port_bound(sk) && !ephemeral(port);
 }
 
 struct shawk_l3l4 {
@@ -628,7 +672,8 @@ static __always_inline int handle_udp_send(struct sk_buff *skb)
 
 	if (tgid == self_tgid)
 		return 0;
-	sk = BPF_CORE_READ(skb, sk);
+	/* A direct access keeps the pointer usable with socket storage. */
+	sk = skb->sk;
 	if (!sk || BPF_CORE_READ(sk, sk_protocol) != IPPROTO_UDP)
 		return 0;
 	key.netns = sock_netns(sk);
@@ -639,13 +684,8 @@ static __always_inline int handle_udp_send(struct sk_buff *skb)
 
 	__builtin_memcpy(key.laddr, h.saddr, 16);
 	__builtin_memcpy(key.raddr, h.daddr, 16);
-	if (udp_server(sk, h.sport, h.dport)) {
-		key.direction = DIR_IN;
-		key.port = h.sport;
-	} else {
-		key.direction = DIR_OUT;
-		key.port = h.dport;
-	}
+	key.direction = udp_direction(sk, key.netns, h.sport, true);
+	key.port = key.direction == DIR_IN ? h.sport : h.dport;
 	key.proto = IPPROTO_UDP;
 	set_current_owner(&key);
 
@@ -693,13 +733,8 @@ int BPF_PROG(shawk_skb_consume_udp, struct sock *sk, struct sk_buff *skb,
 
 	__builtin_memcpy(key.laddr, h.daddr, 16);
 	__builtin_memcpy(key.raddr, h.saddr, 16);
-	if (udp_server(sk, h.dport, h.sport)) {
-		key.direction = DIR_IN;
-		key.port = h.dport;
-	} else {
-		key.direction = DIR_OUT;
-		key.port = h.sport;
-	}
+	key.direction = udp_direction(sk, key.netns, h.dport, false);
+	key.port = key.direction == DIR_IN ? h.dport : h.sport;
 	key.proto = IPPROTO_UDP;
 	set_current_owner(&key);
 
@@ -712,15 +747,22 @@ int BPF_PROG(shawk_skb_consume_udp, struct sock *sk, struct sk_buff *skb,
 	return 0;
 }
 
-/* Emits bound UDP server sockets. */
+/*
+ * Emits UDP server sockets and records their ports. At startup it marks the
+ * bound, unconnected sockets as servers, since their first datagram after
+ * the tracer started may be a reply.
+ */
 SEC("iter/udp")
 int shawk_iter_udp(struct bpf_iter__udp *ctx)
 {
 	struct udp_sock *udp = ctx->udp_sk;
 	struct seq_file *seq = ctx->meta->seq;
+	struct shawk_listen_key lk = {};
+	struct shawk_udp_state *us;
 	struct sock *sk;
 	__u16 family, port;
 	__u32 netns;
+	__u8 one = 1;
 
 	learn_self_tgid();
 	if (!udp)
@@ -733,8 +775,18 @@ int shawk_iter_udp(struct bpf_iter__udp *ctx)
 	if (!netns_ok(netns))
 		return 0;
 	port = BPF_CORE_READ(sk, __sk_common.skc_num);
+	if (mark_udp_servers && port && port_bound(sk) &&
+	    !BPF_CORE_READ(sk, __sk_common.skc_dport)) {
+		us = bpf_sk_storage_get(&udp_states, udp, NULL,
+					BPF_SK_STORAGE_GET_F_CREATE);
+		if (us && !us->dir)
+			us->dir = DIR_IN;
+	}
 	if (!udp_listener(sk, port))
 		return 0;
+	lk.netns = netns;
+	lk.port = port;
+	bpf_map_update_elem(&udp_listen_ports, &lk, &one, BPF_ANY);
 	emit_listener(seq, sk, netns, port, IPPROTO_UDP);
 	return 0;
 }

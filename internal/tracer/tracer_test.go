@@ -406,3 +406,130 @@ func TestHelperDial(t *testing.T) {
 	roundTrip(t, c, 10)
 	c.Close()
 }
+
+// TestUDPDirection checks the direction of UDP sockets whose ports do not
+// tell it.
+func TestUDPDirection(t *testing.T) {
+	skipIfNoNetwork(t, "udp4")
+	findPort := func(flows []Flow, dir Direction, port uint16) *Flow {
+		for i := range flows {
+			if f := &flows[i]; f.Proto == ProtoUDP && f.Direction == dir && f.Port == port {
+				return f
+			}
+		}
+		return nil
+	}
+	echo := func(c net.PacketConn) {
+		buf := make([]byte, 2048)
+		for {
+			n, from, err := c.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			c.WriteTo(buf[:n], from)
+		}
+	}
+	exchange := func(t *testing.T, cli net.PacketConn, to net.Addr) {
+		t.Helper()
+		buf := make([]byte, 64)
+		if _, err := cli.WriteTo(buf, to); err != nil {
+			t.Fatal(err)
+		}
+		cli.SetReadDeadline(time.Now().Add(time.Second))
+		if _, _, err := cli.ReadFrom(buf); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("client bound to a random port", func(t *testing.T) {
+		tr := newTestTracer(t)
+		if !tr.UDPEnabled() {
+			t.Skip("UDP tracing is unavailable on this kernel")
+		}
+		srv := listenUDPFixedPort(t, "udp4", "127.0.0.1")
+		defer srv.Close()
+		go echo(srv)
+		// Like a DNS resolver randomizing its source port below 32768.
+		cli := listenUDPFixedPort(t, "udp4", "127.0.0.1")
+		defer cli.Close()
+		exchange(t, cli, srv.LocalAddr())
+
+		snap, err := tr.Collect()
+		if err != nil {
+			t.Fatal(err)
+		}
+		srvPort := uint16(srv.LocalAddr().(*net.UDPAddr).Port)
+		cliPort := uint16(cli.LocalAddr().(*net.UDPAddr).Port)
+		if f := findPort(snap.Flows, DirOut, srvPort); f == nil || f.MsgsSent != 1 || f.MsgsRecv != 1 {
+			t.Errorf("client flow = %+v", f)
+		}
+		if f := findPort(snap.Flows, DirIn, srvPort); f == nil || f.MsgsSent != 1 || f.MsgsRecv != 1 {
+			t.Errorf("server flow = %+v", f)
+		}
+		for _, f := range snap.Flows {
+			if f.Proto == ProtoUDP && f.Port == cliPort {
+				t.Errorf("the client's port became a service port: %+v", f)
+			}
+		}
+	})
+
+	t.Run("server in the ephemeral range", func(t *testing.T) {
+		tr := newTestTracer(t)
+		if !tr.UDPEnabled() {
+			t.Skip("UDP tracing is unavailable on this kernel")
+		}
+		srv, err := net.ListenPacket("udp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer srv.Close()
+		go echo(srv)
+		cli, err := net.ListenPacket("udp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cli.Close()
+		exchange(t, cli, srv.LocalAddr())
+
+		snap, err := tr.Collect()
+		if err != nil {
+			t.Fatal(err)
+		}
+		srvPort := uint16(srv.LocalAddr().(*net.UDPAddr).Port)
+		if f := findPort(snap.Flows, DirIn, srvPort); f == nil || f.MsgsRecv != 1 {
+			t.Errorf("server flow = %+v", f)
+		}
+		if f := findPort(snap.Flows, DirOut, srvPort); f == nil || f.MsgsSent != 1 {
+			t.Errorf("client flow = %+v", f)
+		}
+	})
+
+	t.Run("server bound before the tracer replies first", func(t *testing.T) {
+		if os.Geteuid() != 0 {
+			t.Skip("requires root")
+		}
+		srv := listenUDPFixedPort(t, "udp4", "127.0.0.1")
+		defer srv.Close()
+		peer, err := net.ListenPacket("udp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer peer.Close()
+		tr := newTestTracer(t)
+		if !tr.UDPEnabled() {
+			t.Skip("UDP tracing is unavailable on this kernel")
+		}
+		// A reply to a request received before the tracer started.
+		if _, err := srv.WriteTo([]byte("reply"), peer.LocalAddr()); err != nil {
+			t.Fatal(err)
+		}
+		snap, err := tr.Collect()
+		if err != nil {
+			t.Fatal(err)
+		}
+		srvPort := uint16(srv.LocalAddr().(*net.UDPAddr).Port)
+		if f := findPort(snap.Flows, DirIn, srvPort); f == nil || f.MsgsSent != 1 {
+			t.Errorf("server flow = %+v in %+v", f, snap.Flows)
+		}
+	})
+}

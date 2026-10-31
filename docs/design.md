@@ -143,13 +143,20 @@ which worker thread accepted the connection.
 
 UDP has no connection, so datagrams are bundled per message as in the paper:
 `fentry/ip_send_skb`, `fentry/ip6_send_skb` and `fentry/skb_consume_udp`,
-which run in process context. The direction is decided per socket in the
-kernel without tracking `bind(2)`:
+which run in process context. Ports cannot tell clients from servers:
+resolvers bind random source ports anywhere in 1024-65535, and servers may
+listen in the ephemeral range. The direction is therefore decided per socket
+by its first datagram and kept in the socket local storage:
 
-* a socket whose port was explicitly bound (`SOCK_BINDPORT_LOCK` in
-  `sk_userlocks`) is a server;
-* except when the bound port is in the ephemeral range and the peer's port is
-  not; resolvers that bind random source ports for randomization are clients.
+* a socket that receives first is a server, and one that sends first is a
+  client;
+* a socket that sends first on the port of a known server socket (e.g. the
+  per-client connected sockets of a QUIC server) is a server;
+* bound, unconnected sockets that exist when the agent starts are marked as
+  servers, since their first datagram afterwards may be a reply.
+
+A client socket that existed before the agent started and receives before it
+sends again is recorded as a server with its own port.
 
 UDP needs BPF trampolines. On kernels without them the agent keeps tracing
 TCP and reports that UDP is not traced.

@@ -55,12 +55,14 @@ type Tracer struct {
 	links []link.Link
 	udp   bool
 
-	flowMaps    [2]*ebpf.Map
-	listenPorts *ebpf.Map
-	activeIdx   *ebpf.Variable
-	flowDrops   *ebpf.Variable
-	adopted     *ebpf.Variable
-	selfTgid    *ebpf.Variable
+	flowMaps       [2]*ebpf.Map
+	listenPorts    *ebpf.Map
+	udpListenPorts *ebpf.Map
+	markUDPServers *ebpf.Variable
+	activeIdx      *ebpf.Variable
+	flowDrops      *ebpf.Variable
+	adopted        *ebpf.Variable
+	selfTgid       *ebpf.Variable
 
 	iterTCP      *link.Iter
 	iterUDP      *link.Iter
@@ -149,8 +151,16 @@ func New(opts Options) (*Tracer, error) {
 
 	// Adopt connections and listeners that existed before the tracer
 	// started, then resolve their owners. The first walk also tells the
-	// programs which process the tracer is.
+	// programs which process the tracer is, and marks the UDP server sockets.
+	if err := t.markUDPServers.Set(uint32(1)); err != nil {
+		t.Close()
+		return nil, err
+	}
 	if _, err := t.scanSockets(); err != nil {
+		t.Close()
+		return nil, err
+	}
+	if err := t.markUDPServers.Set(uint32(0)); err != nil {
 		t.Close()
 		return nil, err
 	}
@@ -200,6 +210,8 @@ func (t *Tracer) loadCore(spec *ebpf.CollectionSpec) error {
 	t.progs = maps.Clone(coll.Programs)
 	t.flowMaps = [2]*ebpf.Map{coll.Maps[bpfMapFlows0], coll.Maps[bpfMapFlows1]}
 	t.listenPorts = coll.Maps[bpfMapListenPorts]
+	t.udpListenPorts = coll.Maps[bpfMapUdpListenPorts]
+	t.markUDPServers = coll.Variables[bpfVarMarkUdpServers]
 	t.activeIdx = coll.Variables[bpfVarActiveIdx]
 	t.flowDrops = coll.Variables[bpfVarFlowDrops]
 	t.adopted = coll.Variables[bpfVarAdoptedUnowned]
@@ -447,8 +459,10 @@ func convertFlow(k *bpfShawkFlowKey, v *bpfShawkFlowStats) Flow {
 // The iterators are opened in every network namespace, since an iterator
 // only walks the namespace it was opened in.
 func (t *Tracer) scanSockets() ([]Listener, error) {
-	if err := clearMap(t.listenPorts); err != nil {
-		return nil, err
+	for _, m := range []*ebpf.Map{t.listenPorts, t.udpListenPorts} {
+		if err := clearMap(m); err != nil {
+			return nil, err
+		}
 	}
 	var readers []io.ReadCloser
 	for _, ns := range listNetNS(t.opts.NetNS) {
