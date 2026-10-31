@@ -311,8 +311,12 @@ edge whose `last_seen` alone advances is written once per interval, and an
 idle edge that agents keep sending until its TTL is not written again.
 
 The segment of the request is upserted into `agent_sessions` with
-`last_heartbeat` set to the time of the request: observations up to there
-are written. While the database is down, changes accumulate (in proportion
+`last_heartbeat` set to the time the connector received the request:
+observations up to there are written. Liveness is thus judged by the clock
+of the connector; the difference to the clock of the agent is kept as
+`clock_skew`, shown on the fleet dashboard and alerted on beyond a minute.
+Edges, listeners and processes keep the times of the agent that observed
+them. While the database is down, changes accumulate (in proportion
 to the number of edges, not to time) and are written when it returns. A
 crash of the connector loses at most one write interval, which agents send
 again while the edges are within their TTL.
@@ -493,5 +497,7 @@ parses. shawk runs beside it instead:
 - **Flow table capacity**: when more distinct flows than `-max-flows` occur
   in one interval, updates are dropped and `shawk.agent.flows.dropped`
   counts them.
-- **Clocks**: times come from the clock of each agent; heartbeats are
-  compared with the clock of PostgreSQL.
+- **Clocks**: first and last seen times of dependencies come from the clock
+  of each host, and the start of a segment too; heartbeats from the clock
+  of the connector, compared with the clock of PostgreSQL. Keep clocks
+  synchronized (chrony); `clock_skew` shows hosts that are not.

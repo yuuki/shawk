@@ -49,9 +49,12 @@ type listenerRow struct {
 
 type sessionRow struct {
 	lastHeartbeat time.Time
-	udpTraced     bool
-	netnsScope    string
-	dropped       int64
+	// clockSkew is how far the clock of the connector is ahead of the clock
+	// of the agent, from the latest request.
+	clockSkew  time.Duration
+	udpTraced  bool
+	netnsScope string
+	dropped    int64
 }
 
 // hostChanges are the changes of a host to write in one transaction.
@@ -195,18 +198,25 @@ func (c *changes) host(key string) *hostChanges {
 }
 
 // add records the changes of a request received at now.
+//
+// Whether a host is alive is judged by the clock of the connector: the
+// heartbeat and the last seen times of the host and its addresses are the
+// time of receipt, and the difference to the time of the request is kept
+// as the clock skew of the agent. Edges, listeners and processes keep the
+// times of the agent, which observed them.
 func (c *changes) add(b *hostBatch, now time.Time) {
-	t := b.time
-	if t.IsZero() {
-		t = now
+	var skew time.Duration
+	if !b.time.IsZero() {
+		skew = now.Sub(b.time)
 	}
 	h := c.host(b.key)
-	h.setHost(b.machineID, b.hostname, b.kernel, b.agentVersion, t)
+	h.setHost(b.machineID, b.hostname, b.kernel, b.agentVersion, now)
 	if !b.segmentStart.IsZero() {
-		h.addSession(b.segmentStart, sessionRow{lastHeartbeat: t, udpTraced: b.udpTraced, netnsScope: b.netnsScope, dropped: b.dropped})
+		h.addSession(b.segmentStart, sessionRow{lastHeartbeat: now, clockSkew: skew, udpTraced: b.udpTraced,
+			netnsScope: b.netnsScope, dropped: b.dropped})
 	}
 	for _, a := range b.addrs {
-		h.addAddr(a, span{t, t})
+		h.addAddr(a, span{now, now})
 	}
 
 	edges := c.acceptedEdges[b.key]

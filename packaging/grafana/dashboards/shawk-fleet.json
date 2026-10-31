@@ -321,7 +321,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT host, alive, agent_version, kernel, udp_traced, netns_scope, dropped_flows,\n       started_at AS observed_since, last_heartbeat\nFROM shawk_v1.agents\nORDER BY alive, host"
+          "rawSql": "SELECT host, alive, agent_version, kernel, udp_traced, netns_scope, dropped_flows,\n       started_at AS observed_since, last_heartbeat, clock_skew\nFROM shawk_v1.agents\nORDER BY alive, host"
         }
       ],
       "options": {
@@ -332,7 +332,7 @@
         "defaults": {},
         "overrides": []
       },
-      "description": "The latest observation segment of every host. observed_since is the start of the segment: dependencies before it are not known from this segment."
+      "description": "The latest observation segment of every host. observed_since is the start of the segment: dependencies before it are not known from this segment. clock_skew is how far the clock of the host is behind the collector; times of dependencies come from the clock of the host."
     },
     {
       "id": 6,

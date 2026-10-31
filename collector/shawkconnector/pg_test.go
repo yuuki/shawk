@@ -269,17 +269,28 @@ func TestPGUnobserved(t *testing.T) {
 		{now.Add(-2 * time.Hour), now.Add(-90 * time.Minute)},
 		{now.Add(-30 * time.Minute), now.Add(-time.Minute)},
 	} {
+		// The connector receives the requests at the times of the agent.
+		c.now = func() time.Time { return s.at }
 		consume(t, c, sink, tAgent{host: "h1", machineID: "m1", addrs: []string{"10.0.0.1"}, time: s.at, segment: s.start})
 	}
+	// An agent whose clock is ten minutes behind is alive by the clock of
+	// the connector, and its skew is kept.
+	c.now = time.Now
+	consume(t, c, sink, tAgent{host: "h2", machineID: "m2", addrs: []string{"10.0.0.2"}, time: now.Add(-10 * time.Minute),
+		segment: now.Add(-time.Hour)})
 	c.flush(ctx)
-	got := queryStrings(t, conn, `SELECT host, gap_start = $1, gap_end = $2 FROM shawk_v1.unobserved($3, $4)`,
+	agents := queryStrings(t, conn, `SELECT host, alive, round(extract(epoch FROM clock_skew) / 60)::int FROM shawk_v1.agents ORDER BY host`)
+	if !slices.Equal(agents, []string{"h1 true 0", "h2 true 10"}) {
+		t.Errorf("agents = %v", agents)
+	}
+	got := queryStrings(t, conn, `SELECT host, gap_start = $1, gap_end = $2 FROM shawk_v1.unobserved($3, $4) WHERE host = 'h1'`,
 		now.Add(-87*time.Minute), now.Add(-30*time.Minute), now.Add(-3*time.Hour), now)
 	// Before the first session and between them; the last heartbeat plus
 	// the tolerance reaches now.
 	if len(got) != 2 || !slices.Contains(got, "h1 true true") {
 		t.Errorf("unobserved = %v", got)
 	}
-	got = queryStrings(t, conn, `SELECT host FROM shawk_v1.unobserved($1, $2)`, now.Add(-20*time.Minute), now.Add(-5*time.Minute))
+	got = queryStrings(t, conn, `SELECT host FROM shawk_v1.unobserved($1, $2) WHERE host = 'h1'`, now.Add(-20*time.Minute), now.Add(-5*time.Minute))
 	if len(got) != 0 {
 		t.Errorf("unobserved within a session = %v", got)
 	}

@@ -287,8 +287,14 @@ func TestWrites(t *testing.T) {
 		len(h.processes) != 1 || len(h.addrs) != 1 || len(h.sessions) != 1 {
 		t.Fatalf("changes = %+v", h)
 	}
-	if s := h.sessions[t0.Add(-time.Hour)]; s == nil || !s.lastHeartbeat.Equal(ta.time) || s.netnsScope != "all" {
+	// The heartbeat is the time the connector received the request; the
+	// agent's clock is 15 seconds ahead.
+	if s := h.sessions[t0.Add(-time.Hour)]; s == nil || !s.lastHeartbeat.Equal(*now) || s.clockSkew != -15*time.Second ||
+		s.netnsScope != "all" {
 		t.Errorf("session = %+v", s)
+	}
+	if !h.last.Equal(*now) {
+		t.Errorf("host last seen %v, want the time of receipt", h.last)
 	}
 	for k, l := range h.listeners {
 		if k.port == 68 && l.proc != (procKey{}) {

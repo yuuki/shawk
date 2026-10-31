@@ -83,22 +83,27 @@ ON CONFLICT (id) DO UPDATE SET
 		var udp []bool
 		var scopes []string
 		var dropped []int64
+		var skews []float64
 		for t, s := range h.sessions {
 			starts = append(starts, t)
 			beats = append(beats, s.lastHeartbeat)
 			udp = append(udp, s.udpTraced)
 			scopes = append(scopes, s.netnsScope)
 			dropped = append(dropped, s.dropped)
+			skews = append(skews, s.clockSkew.Seconds())
 		}
 		b.Queue(`
-INSERT INTO shawk.agent_sessions AS s (host_id, started_at, last_heartbeat, udp_traced, netns_scope, dropped_flows)
-SELECT $1, * FROM unnest($2::timestamptz[], $3::timestamptz[], $4::boolean[], $5::text[], $6::bigint[])
+INSERT INTO shawk.agent_sessions AS s (host_id, started_at, last_heartbeat, udp_traced, netns_scope, dropped_flows, clock_skew)
+SELECT $1, u.started, u.beat, u.udp, u.scope, u.dropped, make_interval(secs => u.skew)
+FROM unnest($2::timestamptz[], $3::timestamptz[], $4::boolean[], $5::text[], $6::bigint[], $7::float8[])
+  AS u(started, beat, udp, scope, dropped, skew)
 ON CONFLICT (host_id, started_at) DO UPDATE SET
+  clock_skew     = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat THEN excluded.clock_skew ELSE s.clock_skew END,
   udp_traced     = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat THEN excluded.udp_traced ELSE s.udp_traced END,
   netns_scope    = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat THEN excluded.netns_scope ELSE s.netns_scope END,
   dropped_flows  = greatest(s.dropped_flows, excluded.dropped_flows),
   last_heartbeat = greatest(s.last_heartbeat, excluded.last_heartbeat)`,
-			h.key, starts, beats, udp, scopes, dropped)
+			h.key, starts, beats, udp, scopes, dropped, skews)
 	}
 
 	if len(h.addrs) > 0 {

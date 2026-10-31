@@ -138,3 +138,42 @@ groups:
           severity: warning
         annotations:
           summary: "shawk agent on {{ $labels.host }} has not reported since {{ $values.B }}"
+
+      # Times of dependencies come from the clock of each host, heartbeats
+      # from the clock of the collector; a wrong clock misplaces both.
+      - uid: shawk-agent-clock-skew
+        title: shawk agent clock skew
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: shawk-postgres
+            model:
+              refId: A
+              editorMode: code
+              format: time_series
+              rawQuery: true
+              rawSql: |-
+                SELECT last_heartbeat AS time, host,
+                       abs(extract(epoch FROM clock_skew))::float8 AS value
+                FROM shawk_v1.agents
+                WHERE alive AND abs(extract(epoch FROM clock_skew)) > 60
+          - refId: B
+            datasourceUid: __expr__
+            model: { refId: B, type: reduce, expression: A, reducer: last }
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [60] }
+        noDataState: OK
+        execErrState: Error
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The clock of {{ $labels.host }} is {{ $values.B }} seconds off the collector"
+          description: "Synchronize the clock of the host (chrony); first and last seen times of its dependencies are off by as much."

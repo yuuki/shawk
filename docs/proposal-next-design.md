@@ -653,6 +653,8 @@ group by (src, dst) (
 
 - 保持期間（§10 から解決）：connector の設定 `retention`（既定 3 年。0 なら消さない）より前に最後に見た行を、1 時間ごとに関数 `shawk.prune(cutoff, max_rows)`（マイグレーション 0003）で消す。一回の呼び出しで表ごとに最大 1 万行だけ消し、0 行になるまで短いトランザクションで繰り返す。プロセスとホストは参照がなくなってから消す。区間（`agent_sessions`）も消すので、`unobserved()` は保持期間より前を「観測していない」と返す。基準の時刻は PostgreSQL の `now()`。connector のロールには DELETE 権限が要る（`grants.sql`）。
 
+- 時計（§10 から解決）：`last_heartbeat` と、ホストとアドレスの `last_seen` は connector がリクエストを受け取った時刻にする。生死（`agents.alive`、`agent_addrs`）は connector と PostgreSQL の時計だけで判定される。リクエストのデータ点の時刻との差を `agent_sessions.clock_skew`（マイグレーション 0004）に残し、`agents` ビュー、フリートのダッシュボード、Grafana のアラート（1 分を超えて 15 分続いたら）で示す。エッジ・待ち受けポート・プロセスの時刻と区間の始まりはエージェントの時計のまま（区間の始まりは `agent_sessions` のキーなので、揺れる補正はかけない）。
+
 ### 9.3 packaging
 
 - 置き場所：`packaging/prometheus/`（`shawk-rules.yml`、`prometheus.yml`）、`packaging/grafana/`（`dashboards/` と `provisioning/`）、`packaging/collector/config.yaml`、`packaging/postgres/`（`setup.sql`、`grants.sql`）、`packaging/systemd/`（エージェントと Collector のユニット、`agent.env`）。
