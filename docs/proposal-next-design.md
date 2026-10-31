@@ -14,6 +14,7 @@
 | 名前 | ローカルの `service.name` は、環境変数がなければ実行ファイル名にする（OBI と同じ） | §3.3 |
 | 書き込み | PostgreSQL への書き込みと名前の付与を、エージェントから Collector の shawk connector に移す | §2, §4 |
 | OBI | OBI はアプリ層の計装として並べて動かす。shawk のトレーサを OBI に寄与する計画はない | §7 |
+| OBI との並走 | サービスを Prometheus の `job` で表して OBI とそろえ、OBI の設定・Collector・Grafana のつなぎ方を決める | §4.3, §5.1, §7.3, §7.4 |
 
 レビュー P0 の根拠は[類似ツール比較と設計レビュー](../reports/shawk%20類似ツール比較と設計レビュー.md)、OBI の調査は `research_notes/OBI土台化の検討/` にある。
 
@@ -77,7 +78,7 @@ resource 属性（送信ごとに一つ）：
 
 | 属性 | 値 |
 |---|---|
-| `host.id` | `/etc/machine-id`（OBI と同じ取り方） |
+| `host.id` | `/etc/machine-id`、なければ `/var/lib/dbus/machine-id`（OBI と同じ取り方） |
 | `host.name` | ホスト名 |
 | `host.ip` | ホストのアドレスの一覧（コンテナの名前空間のものを含む） |
 | `os.version` | カーネルのバージョン |
@@ -111,7 +112,7 @@ resource 属性（送信ごとに一つ）：
 
 注意点：
 
-- 同じホストで同じ実行ファイル（`ruby`、`python`、`java`、`php-fpm` など）を使う別々のサービスは、環境変数で名前を与えない限り、Prometheus の数値では同じ `service_name` に混ざる。PostgreSQL では `shawk.unit` で区別できる。
+- 同じホストで同じ実行ファイル（`ruby`、`python`、`java`、`php-fpm` など）を使う別々のサービスは、環境変数で名前を与えない限り、Prometheus の数値では同じ `job` に混ざる。PostgreSQL では `shawk.unit` で区別できる。
 - OBI は Java について Spring Boot の名前や JAR 名を使うが、shawk は実行ファイル名（`java`）になる。
 - 上の二つに当たるサービスには `OTEL_SERVICE_NAME` を設定することを勧める。systemd のドロップインの `Environment=` で足り、OBI とも名前が一致する。
 
@@ -171,16 +172,22 @@ connector は PostgreSQL の `shawk_v1.service_endpoints` と `shawk_v1.agent_ad
 
 connector は §3.1 の「集約して転送」のメトリクスを、次の属性だけに減らして合算する。エージェント自身のメトリクスはそのまま転送する。
 
+出力は **(ホスト, ローカルのサービス) ごとに一つの resource** にまとめ、その `service.name` をローカルのサービス名にする。Prometheus は resource の `service.name` を `job` ラベルにするので、shawk の数値と OBI の数値が同じサービスについて同じ `job` を持つ（OBI も計装したサービスを resource の `service.name` にしている）。
+
 | 属性 | Prometheus 上のラベル |
 |---|---|
+| resource の `service.name`（ローカルのサービス）と `service.namespace`（あれば） | `job`（namespace があれば `namespace/name`） |
+| resource の `service.instance.id`（= `host.name`） | `instance` |
 | resource の `host.id` / `host.name` | `host_id` / `host_name`（Prometheus の `promote_resource_attributes` で昇格させる） |
-| resource の `service.name`（`shawk-agent`） | `job` |
-| `service.name` | `service_name` |
 | `service.peer.name` | `service_peer_name` |
 | `shawk.role` | `shawk_role` |
 | `server.port` | `server_port` |
 | `network.transport` | `network_transport` |
 | `network.io.direction`（バイトと UDP のみ） | `network_io_direction` |
+
+エージェント自身のメトリクスは resource の `service.name` が `shawk-agent` なので、`job="shawk-agent"` になる。
+
+`service.namespace` は、エージェントがプロセスの `OTEL_RESOURCE_ATTRIBUTES` から読めたときだけ付ける。
 
 Prometheus 上の名前は `shawk_connection_opened_total`、`shawk_connection_failed_total`、`shawk_connection_count`、`shawk_network_io_bytes_total`、`shawk_udp_datagrams_total`、`shawk_tcp_retransmits_total`、`shawk_tcp_rtt_seconds_sum` / `_count`、`shawk_agent_*` になる。
 
@@ -220,18 +227,18 @@ groups:
           sum by (src, dst, server_port, network_transport) (
               label_replace(label_replace(
                 rate(shawk_connection_opened_total{shawk_role="client"}[5m]),
-                "src", "$1", "service_name", "(.*)"), "dst", "$1", "service_peer_name", "(.*)")
+                "src", "$1", "job", "(.*)"), "dst", "$1", "service_peer_name", "(.*)")
             or
               label_replace(label_replace(
                 rate(shawk_connection_opened_total{shawk_role="server", service_peer_name!="~agent"}[5m]),
-                "dst", "$1", "service_name", "(.*)"), "src", "$1", "service_peer_name", "(.*)")
+                "dst", "$1", "job", "(.*)"), "src", "$1", "service_peer_name", "(.*)")
           )
       - record: shawk:dependency_connection_failures:rate5m
         expr: |
           sum by (src, dst, server_port, network_transport) (
             label_replace(label_replace(
               rate(shawk_connection_failed_total{shawk_role="client"}[5m]),
-              "src", "$1", "service_name", "(.*)"), "dst", "$1", "service_peer_name", "(.*)"))
+              "src", "$1", "job", "(.*)"), "dst", "$1", "service_peer_name", "(.*)"))
       # バイト数・RTT の和と回数も接続数と同じ形で作る
 ```
 
@@ -278,6 +285,8 @@ processors:
 exporters:
   otlphttp/prometheus:
     endpoint: http://prometheus:9090/api/v1/otlp
+  otlp/traces:                # Tempo などトレースの送り先
+    endpoint: tempo:4317
 
 service:
   pipelines:
@@ -292,6 +301,10 @@ service:
       receivers: [otlp]
       processors: [batch]
       exporters: [otlphttp/prometheus]
+    traces/obi:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/traces]
 ```
 
 ## 5. PostgreSQL の契約
@@ -302,7 +315,8 @@ PostgreSQL 14 以上を前提とする（多重範囲型 `tstzmultirange` と再
 
 ```sql
 CREATE TABLE shawk.hosts (
-  id            text PRIMARY KEY,          -- host.id（machine-id）。名前は説明属性
+  id            text PRIMARY KEY,          -- machine-id とホスト名のハッシュ（現行の hostID と同じ）
+  machine_id    text NOT NULL,             -- resource の host.id。OBI のデータとの突き合わせに使う
   hostname      text NOT NULL,
   kernel        text NOT NULL,
   agent_version text NOT NULL,
@@ -506,10 +520,75 @@ OpenTelemetry eBPF Instrumentation（OBI）を土台にできるかを検討し�
 
 ### 7.3 名前のそろえ方
 
-- **ホスト**：`host.id` を両者の共通の鍵にする。OBI のネットワークと統計のメトリクスは `host.name` を持たず `host.id` だけを持つ。shawk も `/etc/machine-id` を `host.id` にし、Prometheus で昇格させる。
-- **サービス**：両者とも環境変数、次に実行ファイル名の順で決める（§3.3）。Java などで食い違う場合は `OTEL_SERVICE_NAME` でそろえる。
+- **サービス**：
+  - 両者とも、環境変数（`OTEL_SERVICE_NAME`、`OTEL_RESOURCE_ATTRIBUTES`）、次に実行ファイル名の順で決める（§3.3）。
+  - Prometheus では両者とも resource の `service.name` が `job` になるので、同じサービスは同じ `job` で引ける（§4.3）。
+  - Java などで食い違う場合は `OTEL_SERVICE_NAME` でそろえる。
+- **ホスト**：
+  - resource の `host.id`（machine-id）と `host.name` を、両者とも Prometheus で昇格させる。OBI のネットワークと統計のメトリクスは `host.name` を持たないが、アプリ層のメトリクスでは両方が使える。
+  - テンプレートから複製した VM は machine-id が同じことがある。PostgreSQL の `hosts.id` は、現行の実装と同じく machine-id とホスト名のハッシュにして区別し、`machine_id` 列を OBI との突き合わせに使う。OBI 側は `host.id` が衝突するので、複製した VM では machine-id を作り直すよう運用で勧める（`systemd-machine-id-setup`）。
 - **属性名**：semconv（`network.transport`, `server.port`, `service.peer.name` など）にそろえる。OBI のフローの属性名（`src.*`, `dst.*`）は改名予定なので、そろえない。
-- **将来**：OBI のサービスグラフ（`traces_service_graph_*`、`client`/`server` ラベル）と shawk の `service_name`/`service_peer_name` を PromQL で突き合わせれば、アプリ層の計装が届いていない依存を見つけられる。
+
+### 7.4 並走の構成
+
+**OBI の役割を絞る**
+
+- OBI にはアプリ層（`application` と `application_service_graph`）だけを任せる。
+- ネットワークフロー（`network`）と TCP 統計（`stats*`）は有効にしない。理由は二つある。
+  - shawk がプロセス単位で同じものを取っている。
+  - `stats_tcp_io` はすべての TCP の送受信を観測し、負荷が高いと OBI 自身が注意している。
+- OBI はアプリ層の計装を、対象の選び方（selector）を設定したときだけ有効にする。Config v1 の環境変数で対象を指定すれば、ネットワークと統計は既定で無効のままになる。
+- Config v2 を使う場合は、`capture.policy.default_action` を省略すると全プロセスが対象になるので、必ず明示する。
+
+**対象のプロセスの選び方**
+
+- OBI は systemd のユニットや cgroup では対象を選べない。待ち受けポート（`OTEL_EBPF_OPEN_PORT`）か実行ファイルのパス（`OTEL_EBPF_AUTO_TARGET_EXE`）で選ぶ。
+- 待ち受けポートで選ぶと、同じポートを開くヘルパーやポート転送のプロセスを拾うことがある。
+- shawk の `shawk_v1.service_endpoints` には、ホストごとの待ち受けポートとサービスの一覧がある。OBI の対象ポートはここから選べる（自動生成は P1 以降）。
+- OBI は既定で、自分で OTLP を送っているプロセスを計装しない（`exclude_otel_instrumented_services`）。SDK で計装済みのサービスとは重ならない。
+
+**各ホストでの動かし方**（Rocky Linux 9。OBI v1.0.0 は RPM がなく、tar 玉とコンテナイメージで配られている）
+
+- バイナリを `/usr/local/bin/obi` に置き、リポジトリの `contrib/obi@.service`（`EnvironmentFile=/etc/obi/%i.env` を読む systemd のテンプレート）で動かす。
+- このテンプレートは root で動き、権限を絞っていない。アプリ層の計装に要る権限は `CAP_BPF`, `CAP_DAC_READ_SEARCH`, `CAP_CHECKPOINT_RESTORE`, `CAP_PERFMON`, `CAP_NET_RAW`, `CAP_SYS_PTRACE` である。
+- SELinux（enforcing）での動作は OBI の文書にないので、shawk と合わせて検証する。
+
+```sh
+# /etc/obi/app.env（systemctl enable --now obi@app）
+OTEL_EBPF_OPEN_PORT=8080,8443
+OTEL_EBPF_METRICS_FEATURES=application,application_service_graph
+OTEL_EXPORTER_OTLP_ENDPOINT=http://collector.example:4318
+```
+
+**Collector**
+
+- OBI の OTLP は通常の受け口（`otlp`）に、shawk agent の OTLP は専用の受け口（`otlp/shawk`）に送る。
+- メトリクスは同じ Prometheus へ、トレースは Tempo などへ送る（§4.6）。
+
+**Grafana でのつなぎ方**
+
+- ダッシュボードの変数 `$service` を `job` から作れば、shawk の依存（`shawk:dependency_*` の `src`/`dst`、PostgreSQL の `client_service`/`server_service`）と OBI の RED を同じ値で絞り込める。
+- 依存マップのノード（PostgreSQL）から、そのサービスの OBI の RED とトレースへデータリンクで移る。
+
+**アプリ層の計装が届いていない依存を見つける**
+
+shawk が見ている依存のうち、OBI のサービスグラフに現れないもの：
+
+```promql
+group by (src, dst) (shawk:dependency_connections:rate5m > 0)
+unless on (src, dst)
+group by (src, dst) (
+  label_replace(label_replace(
+    rate(traces_service_graph_request_total[5m]),
+    "src", "$1", "client", "(.*)"), "dst", "$1", "server", "(.*)")
+)
+```
+
+注意点：
+
+- OBI は名前を解決できない相手を、既定で `outgoing`（クライアント側から見た相手）と `incoming`（サーバ側から見た相手）に畳む。そのため、計装していない相手への依存は、この式では「届いていない」側に出る。それは正しい結果である（その相手のアプリ層は見えていない）。
+- サービスグラフの `client`/`server` には namespace が付かない。`service.namespace` を使うと `job` は `namespace/name` になるので、突き合わせの前に namespace を外す。
+- OBI のサービスグラフと各メトリクスは development 扱いで、v1 の互換性の対象外である。OBI の版を上げるときはこの式とダッシュボードを確かめる。
 
 ## 8. この案に入れていないこと（P1 以降）
 
@@ -520,4 +599,5 @@ OpenTelemetry eBPF Instrumentation（OBI）を土台にできるかを検討し�
 - エージェント側の送信キューのディスクへの退避（任意）。
 - プロセスのバージョン履歴（`service.version` の切り替わりの注釈）。
 - Java などで OBI と同じ名前の決め方（Spring Boot の名前、JAR 名）を取り入れるか。
+- `service_endpoints` から OBI の対象ポート（`OTEL_EBPF_OPEN_PORT`）を生成する仕組み。
 - Rocky Linux 9 の実カーネル（SELinux enforcing）での CI。
