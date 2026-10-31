@@ -135,10 +135,17 @@ expect 'only network namespace'
 run graph ${ADDR[app]} -depth 3
 expect 'n[0-9]+ -->\|tcp/8080\| n[0-9]+'
 
-run graph ${ADDR[app]} -depth 3 -format dot
-expect '"10\.231\.0\.5/[^"]*/haproxy" -> "10\.231\.0\.11/[^"]*/puma" \[label="tcp/8080"\]'
-expect '"10\.231\.0\.11/[^"]*/puma" -> "10\.231\.0\.10/[^"]*/postgres" \[label="tcp/5432"\]'
-expect '"10\.231\.0\.50" -> "10\.231\.0\.5/[^"]*/haproxy" \[label="tcp/80"\]'
+run graph ${ADDR[app]} -depth 3 -format json
+python3 - "$WORK/out" <<'PY' || fail "unexpected graph"
+import json, sys
+g = json.load(open(sys.argv[1]))
+label = {n["id"]: n["host"] + (":" + n.get("comm", "") if n["agent"] else "") for n in g["nodes"]}
+edges = {(label[e["from"]], label[e["to"]], e["port"]) for e in g["edges"]}
+want = {("lb-01:haproxy", "app-01:puma", 8080), ("app-01:puma", "db-01:postgres", 5432),
+        ("app-01:puma", "app-01:redis-server", 6379), ("10.231.0.50", "lb-01:haproxy", 80)}
+if want - edges or len(label) != len(set(label.values())):
+    sys.exit(f"missing {want - edges} or duplicate nodes in {sorted(edges)}")
+PY
 
 run diff ${ADDR[app]} -since 1h
 expect '^\+ +puma'

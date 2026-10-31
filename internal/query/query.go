@@ -44,6 +44,9 @@ func New(src Source, since, until time.Time) *Querier {
 // Node is a process in a dependency tree. A node with a Port is a server
 // process serving on that port.
 type Node struct {
+	// ID identifies the host of the node across its addresses: the agent's
+	// host id, or the address when no agent answered.
+	ID        string    `json:"id"`
 	Host      string    `json:"host"`            // host name reported by the agent, or the address
 	Addr      string    `json:"addr"`            // address or name used to reach the host
 	Agent     bool      `json:"agent"`           // whether an agent answered for the host
@@ -79,7 +82,39 @@ func (n *Node) Process() string {
 	return n.Comm + " (" + n.Unit + ")"
 }
 
-func (n *Node) key() string { return n.Addr + "|" + n.Unit + "|" + n.Comm }
+func (n *Node) key() string { return n.ID + "|" + n.Unit + "|" + n.Comm }
+
+// processFilter narrows edges to the process of a node: by unit when known,
+// since the command names of a service's processes may differ (e.g. a
+// master and its renamed workers), otherwise by command name.
+func processFilter(unit, comm string) (string, string) {
+	if unit != "" {
+		return unit, ""
+	}
+	return "", comm
+}
+
+// identity returns the id of the host an agent runs on, or host itself.
+func (q *Querier) identity(ctx context.Context, host string) string {
+	if info, err := q.src.Info(ctx, host); err == nil && info.ID != "" {
+		return info.ID
+	}
+	return host
+}
+
+// matching keeps the edges whose local address is addr, unless none does,
+// e.g. when the peer is behind NAT.
+func matching(edges []api.Edge, addr string) []api.Edge {
+	if m := slices.DeleteFunc(slices.Clone(edges), func(e api.Edge) bool { return e.LocalAddr != addr }); len(m) > 0 {
+		return m
+	}
+	return edges
+}
+
+func isLoopback(addr string) bool {
+	a, err := netip.ParseAddr(addr)
+	return err == nil && a.IsLoopback()
+}
 
 func (q *Querier) window(e *api.EdgeQuery) {
 	e.Since, e.Until = q.Since, q.Until
@@ -154,19 +189,22 @@ func (q *Querier) whoUses(ctx context.Context, host string, port uint16, unit, c
 		k := serviceKey{e.Proto, e.Port, e.Unit, e.Comm}
 		svc, ok := services[k]
 		if !ok {
-			svc = &Node{Host: name, Addr: host, Agent: true, Unit: e.Unit, Comm: e.Comm, Proto: e.Proto, Port: e.Port}
+			svc = &Node{ID: q.identity(ctx, host), Host: name, Addr: host, Agent: true,
+				Unit: e.Unit, Comm: e.Comm, Proto: e.Proto, Port: e.Port}
 			services[k] = svc
 			order = append(order, k)
 		}
 		addStats(svc, e)
 		for _, c := range q.clientsOf(ctx, host, e) {
-			if depth > 1 && c.Agent {
+			// A client whose process is unknown would match every service on
+			// its host.
+			if depth > 1 && c.Agent && (c.Unit != "" || c.Comm != "") {
 				ck := c.key()
 				if path[ck] {
 					c.Cycle = true
 				} else {
-					next := maps2(path, svc.key(), ck)
-					c.Children, _ = q.whoUses(ctx, c.Addr, 0, c.Unit, c.Comm, depth-1, next)
+					unit, comm := processFilter(c.Unit, c.Comm)
+					c.Children, _ = q.whoUses(ctx, c.Addr, 0, unit, comm, depth-1, maps2(path, svc.key(), ck))
 				}
 			}
 			svc.Children = append(svc.Children, c)
@@ -188,27 +226,34 @@ func (q *Querier) clientsOf(ctx context.Context, host string, in *api.Edge) []*N
 	name, ok := q.displayHost(ctx, clientHost)
 	if !ok {
 		return []*Node{{
-			Host: in.RemoteAddr, Addr: in.RemoteAddr, Stats: in.Stats, FirstSeen: in.FirstSeen, LastSeen: in.LastSeen,
+			ID: in.RemoteAddr, Host: in.RemoteAddr, Addr: in.RemoteAddr,
+			Stats: in.Stats, FirstSeen: in.FirstSeen, LastSeen: in.LastSeen,
 			Unqueried: q.unqueried(ctx, clientHost),
 		}}
 	}
+	id := q.identity(ctx, clientHost)
 	eq := api.EdgeQuery{Direction: "out", Proto: in.Proto, Port: in.Port, RemoteAddr: in.LocalAddr}
+	if clientHost == host && isLoopback(in.RemoteAddr) {
+		// Loopback addresses are per network namespace.
+		eq.NetNS = in.NetNS
+	}
 	q.window(&eq)
 	outs, err := q.src.Edges(ctx, clientHost, eq)
-	if err == nil && clientHost == host {
-		// Both ends are on this host; keep the edges from the client address.
-		outs = slices.DeleteFunc(outs, func(e api.Edge) bool { return e.LocalAddr != in.RemoteAddr })
+	if err == nil {
+		// A host with several addresses has different clients on each.
+		outs = matching(outs, in.RemoteAddr)
 	}
 	if err != nil || len(outs) == 0 {
 		// The agent did not see the client side (e.g. behind NAT or before
 		// its ledger started).
-		return []*Node{{Host: name, Addr: clientHost, Agent: true, Stats: in.Stats, FirstSeen: in.FirstSeen, LastSeen: in.LastSeen}}
+		return []*Node{{ID: id, Host: name, Addr: clientHost, Agent: true,
+			Stats: in.Stats, FirstSeen: in.FirstSeen, LastSeen: in.LastSeen}}
 	}
 	nodes := make([]*Node, 0, len(outs))
 	for i := range outs {
 		o := &outs[i]
 		nodes = append(nodes, &Node{
-			Host: name, Addr: clientHost, Agent: true, Unit: o.Unit, Comm: o.Comm,
+			ID: id, Host: name, Addr: clientHost, Agent: true, Unit: o.Unit, Comm: o.Comm,
 			Stats: o.Stats, FirstSeen: o.FirstSeen, LastSeen: o.LastSeen,
 		})
 	}
@@ -243,16 +288,17 @@ func (q *Querier) deps(ctx context.Context, host, unit, comm string, depth int, 
 		k := procKey{e.Unit, e.Comm}
 		p, ok := procs[k]
 		if !ok {
-			p = &Node{Host: name, Addr: host, Agent: true, Unit: e.Unit, Comm: e.Comm}
+			p = &Node{ID: q.identity(ctx, host), Host: name, Addr: host, Agent: true, Unit: e.Unit, Comm: e.Comm}
 			procs[k] = p
 			order = append(order, k)
 		}
 		srv := q.serverOf(ctx, host, e)
 		if depth > 1 && srv.Agent && (srv.Unit != "" || srv.Comm != "") {
 			sk := srv.key()
+			unit, comm := processFilter(srv.Unit, srv.Comm)
 			if path[sk] || sk == p.key() {
 				srv.Cycle = true
-			} else if sub, err := q.deps(ctx, srv.Addr, srv.Unit, srv.Comm, depth-1, maps2(path, p.key(), sk)); err == nil {
+			} else if sub, err := q.deps(ctx, srv.Addr, unit, comm, depth-1, maps2(path, p.key(), sk)); err == nil {
 				for _, s := range sub {
 					srv.Children = append(srv.Children, s.Children...)
 				}
@@ -272,7 +318,7 @@ func (q *Querier) deps(ctx context.Context, host, unit, comm string, depth int, 
 func (q *Querier) serverOf(ctx context.Context, host string, out *api.Edge) *Node {
 	serverHost := q.peerHost(ctx, host, out.RemoteAddr)
 	n := &Node{
-		Host: out.RemoteAddr, Addr: serverHost, Proto: out.Proto, Port: out.Port,
+		ID: out.RemoteAddr, Host: out.RemoteAddr, Addr: serverHost, Proto: out.Proto, Port: out.Port,
 		Stats: out.Stats, FirstSeen: out.FirstSeen, LastSeen: out.LastSeen,
 	}
 	name, ok := q.displayHost(ctx, serverHost)
@@ -280,10 +326,16 @@ func (q *Querier) serverOf(ctx context.Context, host string, out *api.Edge) *Nod
 		n.Unqueried = q.unqueried(ctx, serverHost)
 		return n
 	}
-	n.Host, n.Agent = name, true
+	n.ID, n.Host, n.Agent = q.identity(ctx, serverHost), name, true
 	eq := api.EdgeQuery{Direction: "in", Proto: out.Proto, Port: out.Port, RemoteAddr: out.LocalAddr}
+	if serverHost == host && isLoopback(out.RemoteAddr) {
+		// Loopback addresses are per network namespace.
+		eq.NetNS = out.NetNS
+	}
 	q.window(&eq)
 	if ins, err := q.src.Edges(ctx, serverHost, eq); err == nil && len(ins) > 0 {
+		// Services on different addresses may share the port.
+		ins = matching(ins, out.RemoteAddr)
 		n.Unit, n.Comm = ins[0].Unit, ins[0].Comm
 		return n
 	}
@@ -552,14 +604,19 @@ func mergeSiblings(n *Node) {
 		seen = map[string]*Node{}
 	)
 	for _, c := range n.Children {
-		k := c.key() + "|" + c.Host
+		k := c.key()
 		if prev, ok := seen[k]; ok {
 			prev.Stats.Conns += c.Stats.Conns
 			prev.Stats.ConnFails += c.Stats.ConnFails
+			prev.Stats.MaxOpenConns += c.Stats.MaxOpenConns
 			prev.Stats.BytesSent += c.Stats.BytesSent
 			prev.Stats.BytesRecv += c.Stats.BytesRecv
 			prev.Stats.MsgsSent += c.Stats.MsgsSent
 			prev.Stats.MsgsRecv += c.Stats.MsgsRecv
+			prev.Stats.Retrans += c.Stats.Retrans
+			if c.FirstSeen.Before(prev.FirstSeen) {
+				prev.FirstSeen = c.FirstSeen
+			}
 			if c.LastSeen.After(prev.LastSeen) {
 				prev.LastSeen = c.LastSeen
 			}

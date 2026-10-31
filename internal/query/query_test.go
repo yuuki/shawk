@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -50,6 +51,7 @@ func (f *fakeSource) Edges(_ context.Context, host string, q api.EdgeQuery) ([]a
 		if (q.Direction != "" && e.Direction != q.Direction) || (q.Proto != "" && e.Proto != q.Proto) ||
 			(q.LocalAddr != "" && e.LocalAddr != q.LocalAddr) || (q.RemoteAddr != "" && e.RemoteAddr != q.RemoteAddr) ||
 			(q.Port != 0 && e.Port != q.Port) || (q.Unit != "" && e.Unit != q.Unit) || (q.Comm != "" && e.Comm != q.Comm) ||
+			(q.NetNS != 0 && e.NetNS != q.NetNS) ||
 			(!q.Since.IsZero() && e.LastSeen.Before(q.Since)) || (!q.Until.IsZero() && e.FirstSeen.After(q.Until)) {
 			continue
 		}
@@ -82,9 +84,9 @@ func edge(dir, laddr, raddr string, port uint16, unit, comm string, conns uint64
 func topology() *fakeSource {
 	f := &fakeSource{
 		infos: map[string]*api.Info{
-			"10.0.0.5":  {Hostname: "lb-01", Addrs: []string{"10.0.0.5", "127.0.0.1"}, NetNS: "all"},
-			"10.0.0.11": {Hostname: "app-01", Addrs: []string{"10.0.0.11", "127.0.0.1"}, NetNS: "all"},
-			"10.0.0.10": {Hostname: "db-01", Addrs: []string{"10.0.0.10", "127.0.0.1"}, NetNS: "all"},
+			"10.0.0.5":  {ID: "id-lb", Hostname: "lb-01", Addrs: []string{"10.0.0.5", "127.0.0.1"}, NetNS: "all"},
+			"10.0.0.11": {ID: "id-app", Hostname: "app-01", Addrs: []string{"10.0.0.11", "127.0.0.1"}, NetNS: "all"},
+			"10.0.0.10": {ID: "id-db", Hostname: "db-01", Addrs: []string{"10.0.0.10", "127.0.0.1"}, NetNS: "all"},
 		},
 		edges: map[string][]api.Edge{
 			"10.0.0.5": {
@@ -380,5 +382,170 @@ func TestUnqueriedPeer(t *testing.T) {
 	}
 	if strings.Join(got, ", ") != "192.168.1.50 (no agent), 8.8.8.8 (not queried)" {
 		t.Errorf("clients = %v", got)
+	}
+}
+
+// flatten returns the hosts and processes of a tree in depth-first order.
+func flatten(nodes []*Node) []string {
+	var out []string
+	var walk func(n *Node, depth int)
+	walk = func(n *Node, depth int) {
+		out = append(out, fmt.Sprintf("%d:%s:%s", depth, n.Host, n.Process()))
+		for _, c := range n.Children {
+			walk(c, depth+1)
+		}
+	}
+	for _, n := range nodes {
+		walk(n, 0)
+	}
+	return out
+}
+
+func TestWhoUsesUnknownClientIsNotExpanded(t *testing.T) {
+	src := topology()
+	// app-01 runs an agent but did not see its side of the connection to db.
+	src.edges["10.0.0.11"] = slices.DeleteFunc(src.edges["10.0.0.11"], func(e api.Edge) bool { return e.Port == 5432 })
+	roots, err := New(src, now.Add(-30*24*time.Hour), now).WhoUses(context.Background(), "10.0.0.10", 5432, "", "", 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := roots[0].Children[0]
+	if app.Host != "app-01" || app.Process() != "?" || len(app.Children) != 0 {
+		t.Errorf("unknown client = %+v, children %v", app, flatten(app.Children))
+	}
+}
+
+func TestMultiAddressClient(t *testing.T) {
+	src := topology()
+	src.infos["10.0.0.11"].Addrs = append(src.infos["10.0.0.11"].Addrs, "10.0.1.11")
+	src.infos["10.0.1.11"] = src.infos["10.0.0.11"]
+	ruby := edge("out", "10.0.1.11", "10.0.0.10", 5432, "batch.service", "ruby", 2)
+	src.edges["10.0.0.11"] = append(src.edges["10.0.0.11"], ruby)
+	src.edges["10.0.1.11"] = src.edges["10.0.0.11"]
+	src.edges["10.0.0.10"] = append(src.edges["10.0.0.10"], edge("in", "10.0.0.10", "10.0.1.11", 5432, "postgresql.service", "postgres", 2))
+
+	roots, err := New(src, now.Add(-30*24*time.Hour), now).WhoUses(context.Background(), "10.0.0.10", 5432, "", "", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := flatten(roots)
+	want := []string{
+		"0:db-01:postgres (postgresql.service)",
+		"1:app-01:puma (app.service)",
+		"1:10.0.0.99:(no agent)",
+		"1:app-01:ruby (batch.service)",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("tree =\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+func TestServerOnSamePortDifferentAddresses(t *testing.T) {
+	src := topology()
+	src.infos["10.0.0.10"].Addrs = append(src.infos["10.0.0.10"].Addrs, "10.0.0.20")
+	src.infos["10.0.0.20"] = src.infos["10.0.0.10"]
+	src.edges["10.0.0.10"] = append(src.edges["10.0.0.10"],
+		edge("in", "10.0.0.10", "10.0.0.11", 80, "nginx.service", "nginx", 1),
+		edge("in", "10.0.0.20", "10.0.0.11", 80, "httpd.service", "httpd", 1))
+	src.edges["10.0.0.20"] = src.edges["10.0.0.10"]
+	src.edges["10.0.0.11"] = append(src.edges["10.0.0.11"],
+		edge("out", "10.0.0.11", "10.0.0.10", 80, "app.service", "puma", 1),
+		edge("out", "10.0.0.11", "10.0.0.20", 80, "app.service", "puma", 1))
+
+	roots, err := New(src, now.Add(-30*24*time.Hour), now).Deps(context.Background(), "10.0.0.11", "app.service", "", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var comms []string
+	for _, c := range roots[0].Children {
+		if c.Port == 80 {
+			comms = append(comms, c.Comm)
+		}
+	}
+	slices.Sort(comms)
+	if strings.Join(comms, ",") != "httpd,nginx" {
+		t.Errorf("servers on port 80 = %v", comms)
+	}
+}
+
+func TestLoopbackAcrossNamespaces(t *testing.T) {
+	src := topology()
+	// Two containers on app-01, each with its own redis on 127.0.0.1:6379.
+	a := edge("out", "127.0.0.1", "127.0.0.1", 6379, "docker-aaa", "worker-a", 1)
+	a.NetNS = 1
+	b := edge("out", "127.0.0.1", "127.0.0.1", 6379, "docker-bbb", "worker-b", 1)
+	b.NetNS = 2
+	ra := edge("in", "127.0.0.1", "127.0.0.1", 6379, "docker-aaa", "redis-server", 1)
+	ra.NetNS = 1
+	rb := edge("in", "127.0.0.1", "127.0.0.1", 6379, "docker-bbb", "redis-server", 1)
+	rb.NetNS = 2
+	src.edges["10.0.0.11"] = []api.Edge{a, b, ra, rb}
+
+	roots, err := New(src, now.Add(-30*24*time.Hour), now).WhoUses(context.Background(), "10.0.0.11", 6379, "", "", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, svc := range roots {
+		if len(svc.Children) != 1 || svc.Children[0].Unit != svc.Unit {
+			t.Errorf("clients of redis in %s = %v", svc.Unit, flatten(svc.Children))
+		}
+	}
+}
+
+func TestWhoUsesWithRenamedWorkers(t *testing.T) {
+	src := topology()
+	// The master accepts (listener owner) but workers connect out.
+	for i, e := range src.edges["10.0.0.11"] {
+		if e.Direction == "in" && e.Port == 8080 {
+			src.edges["10.0.0.11"][i].Comm = "gunicorn: maste"
+		}
+		if e.Direction == "out" && e.Port == 5432 {
+			src.edges["10.0.0.11"][i].Comm = "gunicorn: worke"
+		}
+	}
+	roots, err := New(src, now.Add(-30*24*time.Hour), now).WhoUses(context.Background(), "10.0.0.10", 5432, "", "", 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(flatten(roots), "3:lb-01:haproxy (haproxy.service)") {
+		t.Errorf("the chain stopped at the worker:\n%s", strings.Join(flatten(roots), "\n"))
+	}
+}
+
+func TestGraphByHostName(t *testing.T) {
+	src := topology()
+	src.infos["app-01"] = src.infos["10.0.0.11"]
+	src.edges["app-01"] = src.edges["10.0.0.11"]
+	src.listeners["app-01"] = src.listeners["10.0.0.11"]
+	g, err := New(src, now.Add(-30*24*time.Hour), now).Graph(context.Background(), []string{"app-01"}, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	labels := map[string]int{}
+	for _, n := range g.Nodes {
+		labels[n.Label()]++
+	}
+	for l, n := range labels {
+		if n > 1 {
+			t.Errorf("node %q appears %d times", l, n)
+		}
+	}
+}
+
+func TestGraphKeepsClientsAtTheFrontier(t *testing.T) {
+	g, err := newTestQuerier().Graph(context.Background(), []string{"10.0.0.10"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	labels := map[string]string{}
+	for _, n := range g.Nodes {
+		labels[n.ID] = n.Label()
+	}
+	var edges []string
+	for _, e := range g.Edges {
+		edges = append(edges, labels[e.From]+" -> "+labels[e.To])
+	}
+	if !slices.Contains(edges, "app-01: puma (app.service) -> db-01: postgres (postgresql.service)") {
+		t.Errorf("edges = %v", edges)
 	}
 }

@@ -395,6 +395,9 @@ func (l *Ledger) Edges(ctx context.Context, q api.EdgeQuery) ([]api.Edge, error)
 	if q.Comm != "" {
 		add("e.comm = ?", q.Comm)
 	}
+	if q.NetNS != 0 {
+		add("e.netns = ?", q.NetNS)
+	}
 	query := `
 SELECT e.direction, e.proto, e.local_addr, e.remote_addr, e.port, e.netns, e.unit, e.comm, e.exe, e.cgroup, e.last_pid,
 	e.first_seen, e.last_seen,
@@ -434,6 +437,27 @@ ORDER BY e.direction, e.port, e.remote_addr, e.unit, e.comm`
 		edges = append(edges, e)
 	}
 	return edges, rows.Err()
+}
+
+// LocalAddrs returns the local addresses of the edges and listeners seen
+// since the given time, including those of containers.
+func (l *Ledger) LocalAddrs(ctx context.Context, since time.Time) ([]string, error) {
+	rows, err := l.db.QueryContext(ctx, `
+SELECT local_addr FROM edges WHERE last_seen >= ?
+UNION SELECT addr FROM listeners WHERE last_seen >= ?`, since.Unix(), since.Unix())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var a string
+		if err := rows.Scan(&a); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
 }
 
 // Listeners returns the listeners seen since the given time.

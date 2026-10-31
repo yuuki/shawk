@@ -3,13 +3,18 @@
 package agent
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -46,6 +51,7 @@ type Agent struct {
 	apiPort  uint16
 	started  time.Time
 	hostname string
+	hostID   string
 
 	// Owned by the collection loop.
 	lastWrite time.Time
@@ -111,6 +117,7 @@ func Run(ctx context.Context, cfg Config) error {
 		apiPort:  uint16(ln.Addr().(*net.TCPAddr).Port),
 		started:  time.Now(),
 		hostname: hostname,
+		hostID:   hostID(hostname),
 	}
 	// Flows are traced from here on.
 	a.lastWrite = a.started
@@ -312,11 +319,21 @@ func (a *Agent) info(ctx context.Context) (*api.Info, error) {
 	a.mu.Lock()
 	drops := a.drops
 	a.mu.Unlock()
+	addrs := hostAddrs()
+	// Addresses of containers appear only in the ledger.
+	if local, err := a.ledger.LocalAddrs(ctx, time.Now().Add(-24*time.Hour)); err == nil {
+		for _, l := range local {
+			if ip, err := netip.ParseAddr(l); err == nil && !ip.IsUnspecified() && !slices.Contains(addrs, l) {
+				addrs = append(addrs, l)
+			}
+		}
+	}
 	return &api.Info{
+		ID:          a.hostID,
 		Hostname:    a.hostname,
 		Version:     version.Version,
 		Kernel:      kernel,
-		Addrs:       hostAddrs(),
+		Addrs:       addrs,
 		StartedAt:   a.started,
 		LedgerSince: since,
 		Interval:    a.cfg.Interval.String(),
@@ -337,6 +354,17 @@ func (a *Agent) netnsMode() string {
 // from the scheduling of intervals.
 func (a *Agent) coverageTolerance() time.Duration {
 	return 2*a.cfg.Interval + time.Second
+}
+
+// hostID identifies the host from its machine id (or boot id) and its name;
+// the name tells apart hosts cloned with the same machine id.
+func hostID(hostname string) string {
+	id, err := os.ReadFile("/etc/machine-id")
+	if err != nil || len(bytes.TrimSpace(id)) == 0 {
+		id, _ = os.ReadFile("/proc/sys/kernel/random/boot_id")
+	}
+	sum := sha256.Sum256(append(bytes.TrimSpace(id), "\n"+hostname...))
+	return hex.EncodeToString(sum[:8])
 }
 
 // hostAddrs returns the addresses of the interfaces of the host.

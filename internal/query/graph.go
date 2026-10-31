@@ -54,15 +54,17 @@ type graphBuilder struct {
 // hops, following dependencies in both directions.
 func (q *Querier) Graph(ctx context.Context, hosts []string, depth int) (*Graph, error) {
 	b := &graphBuilder{q: q, nodes: map[string]*GraphNode{}, edges: map[string]*GraphEdge{}}
+	// Hosts are visited once whatever name or address they are reached by.
 	visited := map[string]bool{}
 	frontier := hosts
 	for level := 0; level < depth && len(frontier) > 0; level++ {
 		var next []string
 		for _, h := range frontier {
-			if visited[h] {
+			id := q.identity(ctx, h)
+			if visited[id] {
 				continue
 			}
-			visited[h] = true
+			visited[id] = true
 			peers, err := b.visit(ctx, h)
 			if err != nil {
 				if level == 0 {
@@ -90,10 +92,12 @@ func (q *Querier) Graph(ctx context.Context, hosts []string, depth int) (*Graph,
 	return g, nil
 }
 
-func (b *graphBuilder) node(host, addr string, agent bool, unit, comm string) *GraphNode {
+// node returns the graph node of a process. hostID identifies its host
+// across addresses; nodes without an agent are identified by the address.
+func (b *graphBuilder) node(hostID, host, addr string, agent bool, unit, comm string) *GraphNode {
 	id := addr
 	if agent {
-		id = addr + "/" + unit + "/" + comm
+		id = hostID + "/" + unit + "/" + comm
 	}
 	n, ok := b.nodes[id]
 	if !ok {
@@ -101,6 +105,10 @@ func (b *graphBuilder) node(host, addr string, agent bool, unit, comm string) *G
 		b.nodes[id] = n
 	}
 	return n
+}
+
+func (b *graphBuilder) nodeOf(n *Node) *GraphNode {
+	return b.node(n.ID, n.Host, n.Addr, n.Agent, n.Unit, n.Comm)
 }
 
 func (b *graphBuilder) edge(from, to *GraphNode, e *api.Edge) {
@@ -130,27 +138,23 @@ func (b *graphBuilder) visit(ctx context.Context, host string) ([]string, error)
 	if err != nil {
 		return nil, err
 	}
+	id := q.identity(ctx, host)
 	var peers []string
 	for i := range edges {
 		e := &edges[i]
-		local := b.node(name, host, true, e.Unit, e.Comm)
+		local := b.node(id, name, host, true, e.Unit, e.Comm)
 		peer := q.peerHost(ctx, host, e.RemoteAddr)
 		if peer != host {
 			peers = append(peers, peer)
 		}
 		if e.Direction == "out" {
-			srv := q.serverOf(ctx, host, e)
-			b.edge(local, b.node(srv.Host, srv.Addr, srv.Agent, srv.Unit, srv.Comm), e)
+			b.edge(local, b.nodeOf(q.serverOf(ctx, host, e)), e)
 			continue
 		}
-		// Incoming edges from hosts with an agent are added when visiting the
-		// client side, which knows the client process.
-		if peerName, ok := q.displayHost(ctx, peer); !ok {
-			b.edge(b.node(e.RemoteAddr, e.RemoteAddr, false, "", ""), local, e)
-		} else if peer == host {
-			for _, c := range q.clientsOf(ctx, host, e) {
-				b.edge(b.node(peerName, peer, true, c.Unit, c.Comm), local, e)
-			}
+		// The client side resolves the client process. The same edge is also
+		// added when visiting the client, unless it is beyond the depth.
+		for _, c := range q.clientsOf(ctx, host, e) {
+			b.edge(b.nodeOf(c), local, e)
 		}
 	}
 	return peers, nil

@@ -17,6 +17,8 @@ var ErrPeerNotAllowed = errors.New("not queried: outside the allowed peers")
 
 // Info describes an agent.
 type Info struct {
+	// ID identifies the host across its addresses and names.
+	ID       string   `json:"id"`
 	Hostname string   `json:"hostname"`
 	Version  string   `json:"version"`
 	Kernel   string   `json:"kernel"`
@@ -110,6 +112,7 @@ type EdgeQuery struct {
 	Port       uint16
 	Unit       string
 	Comm       string
+	NetNS      uint32
 	Since      time.Time
 	Until      time.Time
 }
@@ -128,6 +131,9 @@ func (q EdgeQuery) Values() url.Values {
 	set("remote", q.RemoteAddr)
 	set("unit", q.Unit)
 	set("comm", q.Comm)
+	if q.NetNS != 0 {
+		v.Set("netns", strconv.FormatUint(uint64(q.NetNS), 10))
+	}
 	if q.Port != 0 {
 		v.Set("port", strconv.Itoa(int(q.Port)))
 	}
@@ -149,6 +155,13 @@ func ParseEdgeQuery(v url.Values) (EdgeQuery, error) {
 		RemoteAddr: v.Get("remote"),
 		Unit:       v.Get("unit"),
 		Comm:       v.Get("comm"),
+	}
+	if s := v.Get("netns"); s != "" {
+		n, err := strconv.ParseUint(s, 10, 32)
+		if err != nil {
+			return q, err
+		}
+		q.NetNS = uint32(n)
 	}
 	if s := v.Get("port"); s != "" {
 		p, err := strconv.ParseUint(s, 10, 16)
