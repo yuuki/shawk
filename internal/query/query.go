@@ -365,17 +365,10 @@ func (q *Querier) CanIRemove(ctx context.Context, host string, port uint16) (*Re
 	return r, nil
 }
 
-func (q *Querier) until() time.Time {
-	if q.Until.IsZero() {
-		return time.Now()
-	}
-	return q.Until
-}
-
 // incomplete returns why the ledger of host may miss dependencies in
 // [since, Until]. A non-zero port limits the check of UDP to that service.
 func (q *Querier) incomplete(ctx context.Context, host string, info *api.Info, port uint16, since time.Time) ([]string, *api.Coverage, error) {
-	cov, err := q.src.Coverage(ctx, host, since, q.until())
+	cov, err := q.src.Coverage(ctx, host, since, q.Until)
 	if err != nil {
 		return nil, nil, fmt.Errorf("coverage of %s: %w", host, err)
 	}

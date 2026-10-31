@@ -118,7 +118,9 @@ type Tick struct {
 }
 
 // Write records the flows and listeners observed in an interval, and the
-// interval itself as covered.
+// interval itself as covered. The latest write sets last_seen and the
+// earliest first_seen, so that timestamps written while the clock was wrong
+// are corrected once it is right again.
 func (l *Ledger) Write(ctx context.Context, tick Tick, recs []Record, listeners []ListenerRecord) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -139,7 +141,8 @@ ON CONFLICT (direction, proto, local_addr, remote_addr, port, netns, unit, comm)
 	cgroup = CASE WHEN excluded.cgroup != '' THEN excluded.cgroup ELSE edges.cgroup END,
 	exe = CASE WHEN excluded.exe != '' THEN excluded.exe ELSE edges.exe END,
 	last_pid = CASE WHEN excluded.last_pid != 0 THEN excluded.last_pid ELSE edges.last_pid END,
-	last_seen = max(edges.last_seen, excluded.last_seen)
+	first_seen = min(edges.first_seen, excluded.first_seen),
+	last_seen = excluded.last_seen
 RETURNING id`)
 	if err != nil {
 		return err
@@ -190,7 +193,8 @@ ON CONFLICT (proto, addr, port, netns) DO UPDATE SET
 	cgroup = CASE WHEN excluded.comm != '' THEN excluded.cgroup ELSE listeners.cgroup END,
 	exe = CASE WHEN excluded.exe != '' THEN excluded.exe ELSE listeners.exe END,
 	pid = CASE WHEN excluded.pid != 0 THEN excluded.pid ELSE listeners.pid END,
-	last_seen = max(listeners.last_seen, excluded.last_seen)`)
+	first_seen = min(listeners.first_seen, excluded.first_seen),
+	last_seen = excluded.last_seen`)
 	if err != nil {
 		return err
 	}

@@ -108,11 +108,14 @@ func (c *Client) Listeners(ctx context.Context, host string, since time.Time) ([
 	return resp.Listeners, nil
 }
 
-// Coverage returns how much of [since, until] the agent on host recorded.
+// Coverage returns how much of [since, until] the agent on host recorded. A
+// zero until means the agent's current time.
 func (c *Client) Coverage(ctx context.Context, host string, since, until time.Time) (*api.Coverage, error) {
 	v := url.Values{}
 	v.Set("since", since.UTC().Format(time.RFC3339))
-	v.Set("until", until.UTC().Format(time.RFC3339))
+	if !until.IsZero() {
+		v.Set("until", until.UTC().Format(time.RFC3339))
+	}
 	var cov api.Coverage
 	if err := c.get(ctx, host, "/api/v1/coverage", v, &cov); err != nil {
 		return nil, err

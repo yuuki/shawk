@@ -149,8 +149,9 @@ func (f *queryFlags) querier() (*query.Querier, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: -since: %v", errUsage, err)
 	}
-	now := time.Now()
-	return query.New(c, now.Add(-d), now), nil
+	// The window ends at the agent's own "now", so that a clock skew between
+	// the client and the agents does not hide recent dependencies.
+	return query.New(c, time.Now().Add(-d), time.Time{}), nil
 }
 
 func readToken(path string) (string, error) {

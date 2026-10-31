@@ -122,7 +122,11 @@ func Run(ctx context.Context, cfg Config) error {
 
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()
-	lastPrune := time.Time{}
+	var (
+		lastPrune time.Time
+		prevTick  = time.Now()
+		clockJump time.Time // when the wall clock last jumped
+	)
 	for {
 		select {
 		case <-ctx.Done():
@@ -140,10 +144,17 @@ func Run(ctx context.Context, cfg Config) error {
 			}
 			return err
 		case <-ticker.C:
+			now := time.Now()
+			if d := clockSkew(prevTick, now); d > maxClockJump || d < -maxClockJump {
+				a.log.Warn("the wall clock jumped; pruning is suspended for a day", "jump", d)
+				clockJump = now
+			}
+			prevTick = now
 			if err := a.collect(ctx); err != nil {
 				a.log.Error("collecting flows", "error", err)
 			}
-			if time.Since(lastPrune) > time.Hour {
+			// A wrong clock would delete data as if it had expired.
+			if time.Since(lastPrune) > time.Hour && (clockJump.IsZero() || time.Since(clockJump) > 24*time.Hour) {
 				if err := lg.Prune(ctx, time.Now()); err != nil {
 					a.log.Error("pruning ledger", "error", err)
 				}
@@ -151,6 +162,17 @@ func Run(ctx context.Context, cfg Config) error {
 			}
 		}
 	}
+}
+
+// maxClockJump is how far the wall clock may move apart from the monotonic
+// clock between two ticks before it is considered to have jumped.
+const maxClockJump = 10 * time.Minute
+
+// clockSkew returns how much more the wall clock advanced than the
+// monotonic clock from prev to now. A suspended host also shows up as a
+// forward jump, since the monotonic clock stops while suspended.
+func clockSkew(prev, now time.Time) time.Duration {
+	return now.Round(0).Sub(prev.Round(0)) - now.Sub(prev)
 }
 
 type recordKey struct {

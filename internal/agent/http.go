@@ -3,7 +3,6 @@ package agent
 import (
 	"crypto/subtle"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -64,11 +63,17 @@ func (a *Agent) handler() http.Handler {
 		writeJSON(w, api.ListenersResponse{Listeners: ls})
 	})
 	mux.HandleFunc("GET /api/v1/coverage", func(w http.ResponseWriter, r *http.Request) {
-		since, err1 := time.Parse(time.RFC3339, r.URL.Query().Get("since"))
-		until, err2 := time.Parse(time.RFC3339, r.URL.Query().Get("until"))
-		if err := errors.Join(err1, err2); err != nil {
+		since, err := time.Parse(time.RFC3339, r.URL.Query().Get("since"))
+		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
+		}
+		until := time.Now()
+		if s := r.URL.Query().Get("until"); s != "" {
+			if until, err = time.Parse(time.RFC3339, s); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
 		}
 		c, err := a.ledger.Coverage(r.Context(), since, until, a.coverageTolerance())
 		if err != nil {

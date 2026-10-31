@@ -260,3 +260,24 @@ func TestPruneCoverage(t *testing.T) {
 		t.Errorf("coverage after pruning = %+v", c)
 	}
 }
+
+// TestClockCorrection checks that an edge first written while the clock was
+// ahead is found once the clock is right again.
+func TestClockCorrection(t *testing.T) {
+	ctx := context.Background()
+	l := openTest(t)
+	now := time.Now().Truncate(time.Second)
+	if err := l.Write(ctx, tick(now.Add(365*24*time.Hour)), []Record{clientRecord()}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Write(ctx, tick(now), []Record{clientRecord()}, nil); err != nil {
+		t.Fatal(err)
+	}
+	edges, err := l.Edges(ctx, api.EdgeQuery{Since: now.Add(-time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(edges) != 1 || !edges[0].FirstSeen.Equal(now) || !edges[0].LastSeen.Equal(now) {
+		t.Errorf("edges = %+v", edges)
+	}
+}
