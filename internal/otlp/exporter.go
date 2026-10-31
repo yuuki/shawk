@@ -30,13 +30,27 @@ const (
 
 // ExporterConfig configures an Exporter.
 type ExporterConfig struct {
-	// Endpoint is a URL. The scheme http disables TLS. With http/protobuf,
-	// /v1/metrics is appended to an endpoint without a path.
+	// Endpoint is a URL. The scheme http disables TLS. With http/protobuf it
+	// is a base URL to which /v1/metrics is appended, as with
+	// OTEL_EXPORTER_OTLP_ENDPOINT, unless the path already ends with it.
 	Endpoint string
 	Protocol string // ProtocolGRPC or ProtocolHTTP
 	// CAFile is a PEM file of the CAs that verify the collector, instead of
 	// the system roots.
 	CAFile string
+	// CertFile and KeyFile are a client certificate and its key, presented
+	// to a collector that requires them (mutual TLS).
+	CertFile string
+	KeyFile  string
+}
+
+// DefaultEndpoint returns the endpoint of a collector on the local host for
+// a protocol: the ports of the otlp/shawk receiver in the examples.
+func DefaultEndpoint(protocol string) string {
+	if protocol == ProtocolHTTP {
+		return "http://localhost:4328"
+	}
+	return "http://localhost:4327"
 }
 
 // Exporter sends requests to a collector.
@@ -52,9 +66,22 @@ func NewExporter(cfg ExporterConfig) (Exporter, error) {
 	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
 		return nil, fmt.Errorf("invalid OTLP endpoint %q: want http://HOST:PORT or https://HOST:PORT", cfg.Endpoint)
 	}
+	if u.Scheme == "http" && (cfg.CAFile != "" || cfg.CertFile != "") {
+		return nil, fmt.Errorf("a CA or client certificate is set but the OTLP endpoint %s does not use TLS; use https://", cfg.Endpoint)
+	}
+	if (cfg.CertFile == "") != (cfg.KeyFile == "") {
+		return nil, errors.New("set both or neither of the client certificate and its key")
+	}
 	var tlsConf *tls.Config
 	if u.Scheme == "https" {
 		tlsConf = &tls.Config{MinVersion: tls.VersionTLS12}
+		if cfg.CertFile != "" {
+			cert, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
+			if err != nil {
+				return nil, fmt.Errorf("loading the client certificate: %w", err)
+			}
+			tlsConf.Certificates = []tls.Certificate{cert}
+		}
 		if cfg.CAFile != "" {
 			pem, err := os.ReadFile(cfg.CAFile)
 			if err != nil {
@@ -80,8 +107,8 @@ func NewExporter(cfg ExporterConfig) (Exporter, error) {
 		}
 		return &grpcExporter{conn: conn, client: colmetricspb.NewMetricsServiceClient(conn)}, nil
 	case ProtocolHTTP:
-		if u.Path == "" || u.Path == "/" {
-			u.Path = "/v1/metrics"
+		if !strings.HasSuffix(u.Path, "/v1/metrics") {
+			u.Path = strings.TrimSuffix(u.Path, "/") + "/v1/metrics"
 		}
 		tr := http.DefaultTransport.(*http.Transport).Clone()
 		tr.TLSClientConfig = tlsConf

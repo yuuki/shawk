@@ -3,11 +3,14 @@ package procinfo
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
 
 // Fallback selects the name of a process that does not name its service in
@@ -58,33 +61,54 @@ func (s Service) Job() string {
 // maxEnviron bounds how much of the environment of a process is read.
 const maxEnviron = 1 << 20
 
+// environTimeout bounds a read of /proc/PID/environ, which takes the lock
+// of the memory map of the process and can block while the process is
+// stuck, e.g. on a hung network file system.
+const environTimeout = 200 * time.Millisecond
+
+// stuckEnviron are the PIDs whose environment is still being read after
+// the timeout; they are not read again until that read returns.
+var stuckEnviron sync.Map
+
 // OTelEnv returns the variables of the environment of a process whose names
 // start with OTEL_. Other variables, which may hold secrets, are discarded
-// as soon as they are read. It returns nil if the environment cannot be read.
-func OTelEnv(pid uint32) map[string]string {
+// as soon as they are read. ok is false if the environment could not be
+// read in time; env is nil if the process has none or cannot be read.
+func OTelEnv(pid uint32) (env map[string]string, ok bool) {
 	if pid == 0 {
-		return nil
+		return nil, true
 	}
+	if _, stuck := stuckEnviron.Load(pid); stuck {
+		return nil, false
+	}
+	done := make(chan map[string]string, 1)
+	go func() {
+		done <- readEnviron(pid)
+	}()
+	select {
+	case env := <-done:
+		return env, true
+	case <-time.After(environTimeout):
+		stuckEnviron.Store(pid, true)
+		go func() {
+			<-done
+			stuckEnviron.Delete(pid)
+		}()
+		return nil, false
+	}
+}
+
+// readEnviron reads the OTEL_ variables of a process; replaced in tests.
+var readEnviron = readOTelEnv
+
+func readOTelEnv(pid uint32) map[string]string {
 	f, err := os.Open("/proc/" + strconv.FormatUint(uint64(pid), 10) + "/environ")
 	if err != nil {
 		return nil
 	}
 	defer f.Close()
-	buf := make([]byte, maxEnviron)
-	n, _ := readFull(f, buf)
-	return parseOTelEnv(buf[:n])
-}
-
-func readFull(f *os.File, buf []byte) (int, error) {
-	n := 0
-	for n < len(buf) {
-		m, err := f.Read(buf[n:])
-		n += m
-		if err != nil || m == 0 {
-			return n, err
-		}
-	}
-	return n, nil
+	data, _ := io.ReadAll(io.LimitReader(f, maxEnviron))
+	return parseOTelEnv(data)
 }
 
 // parseOTelEnv extracts the OTEL_ variables from the contents of
@@ -132,7 +156,8 @@ func ResourceAttributes(s string) map[string]string {
 //  1. OTEL_SERVICE_NAME in the environment of the process,
 //  2. service.name in OTEL_RESOURCE_ATTRIBUTES,
 //  3. the base name of the executable, or the unit with FallbackUnit,
-//  4. comm.
+//  4. comm,
+//  5. the unit, then UnknownService, for sockets whose owner is unknown.
 //
 // service.namespace in OTEL_RESOURCE_ATTRIBUTES gives the namespace. The
 // order follows OBI, so that both name a service the same way.
@@ -153,8 +178,19 @@ func ServiceName(env map[string]string, exe, comm, unit string, fb Fallback) Ser
 	if s.Name == "" {
 		s.Name = comm
 	}
+	if s.Name == "" {
+		s.Name = unit
+	}
+	if s.Name == "" {
+		s.Name = UnknownService
+	}
 	return s
 }
+
+// UnknownService names the service of a socket whose process and unit are
+// unknown, e.g. a connection accepted on a listener closed within an
+// interval, or a socket owned by the kernel.
+const UnknownService = "~unknown"
 
 // machineIDPaths are where the machine id is looked up, in order.
 var machineIDPaths = []string{"/etc/machine-id", "/var/lib/dbus/machine-id"}

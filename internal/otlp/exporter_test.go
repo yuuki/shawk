@@ -68,9 +68,20 @@ func TestHTTPExporter(t *testing.T) {
 		t.Errorf("partial success: %v", err)
 	}
 
+	// The endpoint is a base URL, as OTEL_EXPORTER_OTLP_ENDPOINT.
 	bad, _ := NewExporter(ExporterConfig{Endpoint: srv.URL + "/wrong", Protocol: ProtocolHTTP})
 	if err := bad.Export(context.Background(), req); err == nil {
 		t.Error("an HTTP error was not reported")
+	}
+	for _, ep := range []string{srv.URL + "/", srv.URL + "/v1/metrics"} {
+		e, err := NewExporter(ExporterConfig{Endpoint: ep, Protocol: ProtocolHTTP})
+		if err != nil {
+			t.Fatal(err)
+		}
+		reject = false
+		if err := e.Export(context.Background(), req); err != nil {
+			t.Errorf("%s: %v", ep, err)
+		}
 	}
 }
 
@@ -117,9 +128,20 @@ func TestNewExporterErrors(t *testing.T) {
 		{Endpoint: "ftp://localhost:4317"},
 		{Endpoint: "http://localhost:4317", Protocol: "http/json"},
 		{Endpoint: "https://localhost:4317", CAFile: "/nonexistent"},
+		// TLS settings with a plaintext endpoint would be silently ignored.
+		{Endpoint: "http://localhost:4317", CAFile: "/etc/ssl/ca.pem"},
+		{Endpoint: "http://localhost:4317", CertFile: "/c.pem", KeyFile: "/k.pem"},
+		{Endpoint: "https://localhost:4317", CertFile: "/c.pem"},
+		{Endpoint: "https://localhost:4317", CertFile: "/nonexistent", KeyFile: "/nonexistent"},
 	} {
 		if _, err := NewExporter(cfg); err == nil {
 			t.Errorf("NewExporter(%+v) succeeded", cfg)
 		}
+	}
+}
+
+func TestDefaultEndpoint(t *testing.T) {
+	if DefaultEndpoint(ProtocolGRPC) != "http://localhost:4327" || DefaultEndpoint(ProtocolHTTP) != "http://localhost:4328" {
+		t.Error("default endpoints")
 	}
 }

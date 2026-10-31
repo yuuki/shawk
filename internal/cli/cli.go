@@ -95,11 +95,14 @@ func parseFlags(fs *flag.FlagSet, args []string) error {
 func runAgent(ctx context.Context, args []string, _ io.Writer) error {
 	fs := flag.NewFlagSet("agent", flag.ContinueOnError)
 	var (
-		endpoint = fs.String("otlp-endpoint", envOr("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4327"),
-			"URL of the OTLP receiver of the shawk connector; http:// disables TLS")
+		endpoint = fs.String("otlp-endpoint", os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
+			"URL of the otlp/shawk receiver of the collector; http:// disables TLS (default http://localhost:4327 for grpc, :4328 for http/protobuf)")
 		protocol = fs.String("otlp-protocol", envOr("OTEL_EXPORTER_OTLP_PROTOCOL", otlp.ProtocolGRPC),
 			"OTLP protocol: grpc or http/protobuf")
 		caFile   = fs.String("otlp-ca-file", "", "PEM file of the CAs that verify the collector (default: system roots)")
+		certFile = fs.String("otlp-cert-file", "", "PEM client certificate for a collector that requires one (mutual TLS)")
+		keyFile  = fs.String("otlp-key-file", "", "PEM key of -otlp-cert-file")
+		perReq   = fs.Int("max-series-per-request", 1000, "dependencies and listeners per OTLP request; more are sent in several requests")
 		interval = fs.Duration("interval", 15*time.Second, "collection and export interval")
 		idleTTL  = fs.Duration("idle-ttl", 15*time.Minute, "how long a dependency is sent after its last activity")
 		netns    = fs.String("netns", "all", `network namespaces to trace: "all", "self" or an inode number`)
@@ -125,15 +128,23 @@ func runAgent(ctx context.Context, args []string, _ io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("%w: %v", errUsage, err)
 	}
+	if *endpoint == "" {
+		*endpoint = otlp.DefaultEndpoint(*protocol)
+	}
+	if *perReq < 1 {
+		return fmt.Errorf("%w: -max-series-per-request must be positive", errUsage)
+	}
 	return agent.Run(ctx, agent.Config{
-		Exporter:        otlp.ExporterConfig{Endpoint: *endpoint, Protocol: *protocol, CAFile: *caFile},
-		Interval:        *interval,
-		IdleTTL:         *idleTTL,
-		NetNS:           ns,
-		MaxFlows:        uint32(*maxFlows),
-		ServiceFallback: fb,
-		BPFStats:        *bpfStats,
-		Logger:          logger,
+		Exporter: otlp.ExporterConfig{Endpoint: *endpoint, Protocol: *protocol, CAFile: *caFile,
+			CertFile: *certFile, KeyFile: *keyFile},
+		MaxSeriesPerRequest: *perReq,
+		Interval:            *interval,
+		IdleTTL:             *idleTTL,
+		NetNS:               ns,
+		MaxFlows:            uint32(*maxFlows),
+		ServiceFallback:     fb,
+		BPFStats:            *bpfStats,
+		Logger:              logger,
 	})
 }
 

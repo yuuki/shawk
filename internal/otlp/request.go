@@ -43,52 +43,93 @@ type BPFProgram struct {
 	RunTime  time.Duration
 }
 
-// Request builds the request that carries all live series at now.
+// Request builds one request that carries all live series at now.
 func (s *State) Request(res Resource, st AgentStatus, now time.Time) *colmetricspb.ExportMetricsServiceRequest {
-	b := newBuilder(now)
+	return s.Requests(res, st, now, 0)[0]
+}
 
+// Requests builds the requests that carry all live series at now, each with
+// at most maxSeries edges and listeners (0 means no limit), so that every
+// request stays below the size limits of the receiver. The metrics of the
+// agent itself are in the last request only: it closes the interval, and
+// the connector emits the aggregated metrics of the host when it arrives.
+func (s *State) Requests(res Resource, st AgentStatus, now time.Time, maxSeries int) []*colmetricspb.ExportMetricsServiceRequest {
 	edges := make([]EdgeKey, 0, len(s.edges))
 	for k := range s.edges {
 		edges = append(edges, k)
 	}
 	// A stable order makes requests easy to compare and compress.
 	slices.SortFunc(edges, compareEdgeKeys)
-	for _, k := range edges {
-		e := s.edges[k]
-		attrs := edgeAttrs(&k)
-		start := e.Start
-		t := &e.Total
-		switch k.Proto {
-		case "tcp":
-			b.sum(MetricConnOpened, "{connection}", true, start, t.Conns, attrs)
-			if k.Role == RoleClient {
-				b.sum(MetricConnFailed, "{connection}", true, start, t.ConnFails, attrs)
-			}
-			b.sum(MetricConnCount, "{connection}", false, start, t.OpenConns, attrs)
-			b.sum(MetricRetransmits, "{segment}", true, start, t.Retrans, attrs)
-			b.rtt(start, t.RTTSamples, float64(t.RTTSumUs)/1e6, attrs)
-		case "udp":
-			b.sum(MetricUDPDatagrams, "{datagram}", true, start, t.MsgsSent, with(attrs, AttrIODirection, DirTransmit))
-			b.sum(MetricUDPDatagrams, "{datagram}", true, start, t.MsgsRecv, with(attrs, AttrIODirection, DirReceive))
-		}
-		b.sum(MetricNetworkIO, "By", true, start, t.BytesSent, with(attrs, AttrIODirection, DirTransmit))
-		b.sum(MetricNetworkIO, "By", true, start, t.BytesRecv, with(attrs, AttrIODirection, DirReceive))
-		b.gauge(MetricEdgeFirst, "s", e.FirstSeen.Unix(), attrs)
-		b.gauge(MetricEdgeLast, "s", e.LastSeen.Unix(), attrs)
-	}
-
 	listeners := make([]ListenerKey, 0, len(s.listeners))
 	for k := range s.listeners {
 		listeners = append(listeners, k)
 	}
 	slices.SortFunc(listeners, compareListenerKeys)
-	for _, k := range listeners {
-		l := s.listeners[k]
-		attrs := listenerAttrs(&k)
-		b.gauge(MetricListenerFirst, "s", l.FirstSeen.Unix(), attrs)
-		b.gauge(MetricListenerLast, "s", l.LastSeen.Unix(), attrs)
-	}
 
+	total := len(edges) + len(listeners)
+	if maxSeries <= 0 || maxSeries > total {
+		maxSeries = max(total, 1)
+	}
+	resource := res.proto()
+	var reqs []*colmetricspb.ExportMetricsServiceRequest
+	for first := 0; first < total || len(reqs) == 0; first += maxSeries {
+		last := min(first+maxSeries, total)
+		b := newBuilder(now)
+		for i := first; i < last; i++ {
+			if i < len(edges) {
+				s.addEdge(b, &edges[i])
+			} else {
+				s.addListener(b, &listeners[i-len(edges)])
+			}
+		}
+		if last == total {
+			addAgent(b, &st)
+		}
+		reqs = append(reqs, &colmetricspb.ExportMetricsServiceRequest{
+			ResourceMetrics: []*metricspb.ResourceMetrics{{
+				Resource: resource,
+				ScopeMetrics: []*metricspb.ScopeMetrics{{
+					Scope:   &commonpb.InstrumentationScope{Name: ScopeName, Version: res.AgentVersion},
+					Metrics: b.metrics,
+				}},
+			}},
+		})
+	}
+	return reqs
+}
+
+func (s *State) addEdge(b *builder, k *EdgeKey) {
+	e := s.edges[*k]
+	attrs := edgeAttrs(k)
+	start := e.Start
+	t := &e.Total
+	switch k.Proto {
+	case "tcp":
+		b.sum(MetricConnOpened, "{connection}", true, start, t.Conns, attrs)
+		if k.Role == RoleClient {
+			b.sum(MetricConnFailed, "{connection}", true, start, t.ConnFails, attrs)
+		}
+		b.sum(MetricConnCount, "{connection}", false, start, t.OpenConns, attrs)
+		b.sum(MetricRetransmits, "{segment}", true, start, t.Retrans, attrs)
+		b.rtt(start, t.RTTSamples, float64(t.RTTSumUs)/1e6, attrs)
+	case "udp":
+		b.sum(MetricUDPDatagrams, "{datagram}", true, start, t.MsgsSent, with(attrs, AttrIODirection, DirTransmit))
+		b.sum(MetricUDPDatagrams, "{datagram}", true, start, t.MsgsRecv, with(attrs, AttrIODirection, DirReceive))
+	}
+	b.sum(MetricNetworkIO, "By", true, start, t.BytesSent, with(attrs, AttrIODirection, DirTransmit))
+	b.sum(MetricNetworkIO, "By", true, start, t.BytesRecv, with(attrs, AttrIODirection, DirReceive))
+	b.gauge(MetricEdgeFirst, "s", e.FirstSeen.Unix(), attrs)
+	b.gauge(MetricEdgeLast, "s", e.LastSeen.Unix(), attrs)
+}
+
+func (s *State) addListener(b *builder, k *ListenerKey) {
+	l := s.listeners[*k]
+	attrs := listenerAttrs(k)
+	b.gauge(MetricListenerFirst, "s", l.FirstSeen.Unix(), attrs)
+	b.gauge(MetricListenerLast, "s", l.LastSeen.Unix(), attrs)
+}
+
+func addAgent(b *builder, st *AgentStatus) {
 	// No unit "1": Prometheus would add the suffix _ratio to the names.
 	b.gauge(MetricAgentUp, "", 1, []*commonpb.KeyValue{str(AttrNetNSScope, st.NetNSScope)})
 	b.gauge(MetricAgentSegmentStart, "s", st.SegmentStart.Unix(), nil)
@@ -103,16 +144,6 @@ func (s *State) Request(res Resource, st AgentStatus, now time.Time) *colmetrics
 		attrs := []*commonpb.KeyValue{str(AttrBPFProgram, p.Name)}
 		b.sum(MetricAgentBPFRunCount, "{run}", true, st.Started, p.RunCount, attrs)
 		b.sumDouble(MetricAgentBPFRunTime, "s", st.Started, p.RunTime.Seconds(), attrs)
-	}
-
-	return &colmetricspb.ExportMetricsServiceRequest{
-		ResourceMetrics: []*metricspb.ResourceMetrics{{
-			Resource: res.proto(),
-			ScopeMetrics: []*metricspb.ScopeMetrics{{
-				Scope:   &commonpb.InstrumentationScope{Name: ScopeName, Version: res.AgentVersion},
-				Metrics: b.metrics,
-			}},
-		}},
 	}
 }
 

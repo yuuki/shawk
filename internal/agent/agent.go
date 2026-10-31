@@ -29,12 +29,15 @@ type Config struct {
 	Exporter otlp.ExporterConfig
 	Interval time.Duration
 	// IdleTTL is how long a series is sent after its last activity.
-	IdleTTL         time.Duration
-	NetNS           uint32 // 0 traces all network namespaces
-	MaxFlows        uint32
-	ServiceFallback procinfo.Fallback
-	BPFStats        bool // enable and send the run time statistics of the BPF programs
-	Logger          *slog.Logger
+	IdleTTL  time.Duration
+	NetNS    uint32 // 0 traces all network namespaces
+	MaxFlows uint32
+	// MaxSeriesPerRequest bounds the edges and listeners in one request;
+	// a host with more sends several requests per interval.
+	MaxSeriesPerRequest int
+	ServiceFallback     procinfo.Fallback
+	BPFStats            bool // enable and send the run time statistics of the BPF programs
+	Logger              *slog.Logger
 
 	traceSelf bool // trace the agent's own flows; for tests
 }
@@ -170,10 +173,15 @@ func (a *Agent) tick(ctx context.Context) error {
 	a.state.Expire(now)
 	a.idents.expire(now)
 
-	req, segStart := a.request(now)
-	if err := a.exporter.Export(ctx, req); err != nil {
-		a.failures++
-		return fmt.Errorf("sending to %s: %w", a.cfg.Exporter.Endpoint, err)
+	reqs, segStart := a.request(now)
+	// The last request carries the metrics of the agent and closes the
+	// interval; after a failure the rest is not sent, and the next interval
+	// makes up for it since the series are cumulative.
+	for i, req := range reqs {
+		if err := a.exporter.Export(ctx, req); err != nil {
+			a.failures++
+			return fmt.Errorf("sending request %d of %d to %s: %w", i+1, len(reqs), a.cfg.Exporter.Endpoint, err)
+		}
 	}
 	a.segment.Succeeded(segStart, now)
 	return nil
@@ -223,9 +231,9 @@ func (a *Agent) observe(snap *tracer.Snapshot, start, end time.Time) {
 	}
 }
 
-// request builds the request of the live series at now, and returns the
-// start of the observation segment it carries.
-func (a *Agent) request(now time.Time) (*colmetricspb.ExportMetricsServiceRequest, time.Time) {
+// request builds the requests of the live series at now, and returns the
+// start of the observation segment they carry.
+func (a *Agent) request(now time.Time) ([]*colmetricspb.ExportMetricsServiceRequest, time.Time) {
 	res := a.res
 	res.Addrs = hostAddrs()
 	// Addresses of containers in other network namespaces.
@@ -250,7 +258,7 @@ func (a *Agent) request(now time.Time) (*colmetricspb.ExportMetricsServiceReques
 			}
 		}
 	}
-	return a.state.Request(res, st, now), segStart
+	return a.state.Requests(res, st, now, a.cfg.MaxSeriesPerRequest), segStart
 }
 
 func (a *Agent) netnsScope() string {

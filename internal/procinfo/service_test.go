@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseOTelEnv(t *testing.T) {
@@ -31,8 +32,19 @@ func TestOTelEnvSelf(t *testing.T) {
 	t.Setenv("SHAWK_SECRET", "x")
 	// /proc/self/environ holds the environment at exec; check the parser on
 	// a process started with a known environment instead.
-	if env := OTelEnv(0); env != nil {
-		t.Errorf("OTelEnv(0) = %v", env)
+	if env, ok := OTelEnv(0); env != nil || !ok {
+		t.Errorf("OTelEnv(0) = %v, %v", env, ok)
+	}
+	// The environment of this process: at exec it had no OTEL_ variables
+	// beyond those the test runner passed; only OTEL_ ones come back.
+	env, ok := OTelEnv(uint32(os.Getpid()))
+	if !ok {
+		t.Error("reading the own environment timed out")
+	}
+	for k := range env {
+		if !strings.HasPrefix(k, "OTEL_") {
+			t.Errorf("non-OTEL variable %q kept", k)
+		}
 	}
 	b, err := os.ReadFile("/proc/self/environ")
 	if err != nil {
@@ -72,6 +84,8 @@ func TestServiceName(t *testing.T) {
 			"/usr/sbin/nginx", "nginx", "nginx.service", FallbackExe, Service{"nginx", ""}},
 		{"executable", nil, "/usr/lib/postgresql/16/bin/postgres", "postgres", "postgresql.service", FallbackExe, Service{"postgres", ""}},
 		{"comm without executable", nil, "", "kworker", "", FallbackExe, Service{"kworker", ""}},
+		{"unit without process", nil, "", "", "nfs-server.service", FallbackExe, Service{"nfs-server.service", ""}},
+		{"nothing known", nil, "", "", "", FallbackExe, Service{UnknownService, ""}},
 		{"unit", nil, "/usr/bin/ruby", "ruby", "billing.service", FallbackUnit, Service{"billing.service", ""}},
 		{"unit unknown", nil, "/usr/bin/ruby", "ruby", "", FallbackUnit, Service{"ruby", ""}},
 		{"environment wins over unit", map[string]string{"OTEL_SERVICE_NAME": "billing"},
@@ -125,5 +139,36 @@ func TestMachineID(t *testing.T) {
 	}
 	if got := machineID(missing); got != "" {
 		t.Errorf("machineID without files = %q", got)
+	}
+}
+
+func TestOTelEnvTimeout(t *testing.T) {
+	release := make(chan struct{})
+	readEnviron = func(uint32) map[string]string {
+		<-release
+		return map[string]string{"OTEL_SERVICE_NAME": "late"}
+	}
+	t.Cleanup(func() { readEnviron = readOTelEnv })
+	if env, ok := OTelEnv(4242); ok || env != nil {
+		t.Fatalf("a blocked read returned %v, %v", env, ok)
+	}
+	// While the read is blocked, the process is not read again.
+	start := time.Now()
+	if _, ok := OTelEnv(4242); ok || time.Since(start) > environTimeout/2 {
+		t.Errorf("a stuck process was read again")
+	}
+	close(release)
+	for i := 0; ; i++ {
+		if _, stuck := stuckEnviron.Load(uint32(4242)); !stuck {
+			break
+		}
+		if i > 100 {
+			t.Fatal("the process stays marked as stuck")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	readEnviron = func(uint32) map[string]string { return map[string]string{"OTEL_SERVICE_NAME": "ok"} }
+	if env, ok := OTelEnv(4242); !ok || env["OTEL_SERVICE_NAME"] != "ok" {
+		t.Errorf("after the read returned: %v, %v", env, ok)
 	}
 }

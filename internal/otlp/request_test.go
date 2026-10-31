@@ -1,6 +1,7 @@
 package otlp
 
 import (
+	"fmt"
 	"net/netip"
 	"testing"
 	"time"
@@ -173,5 +174,60 @@ func TestRequestWithoutMachineID(t *testing.T) {
 	req := NewState(time.Minute).Request(Resource{Hostname: "h"}, AgentStatus{}, t0)
 	if _, ok := attrMap(req.ResourceMetrics[0].Resource.Attributes)["host.id"]; ok {
 		t.Error("empty host.id sent")
+	}
+}
+
+func TestRequestsSplit(t *testing.T) {
+	s := NewState(15 * time.Minute)
+	for i := range 5 {
+		k := clientEdge()
+		k.Port = uint16(1000 + i)
+		s.AddEdge(k, EdgeStats{Conns: 1}, t0, t0)
+	}
+	for i := range 2 {
+		s.AddListener(ListenerKey{Proto: "tcp", Addr: netip.MustParseAddr("0.0.0.0"), Port: uint16(80 + i)}, t0)
+	}
+	st := AgentStatus{Started: t0, SegmentStart: t0, NetNSScope: "all"}
+	reqs := s.Requests(Resource{Hostname: "h"}, st, t0, 3)
+	if len(reqs) != 3 {
+		t.Fatalf("%d requests, want 3", len(reqs))
+	}
+	edges, listeners := 0, 0
+	for i, req := range reqs {
+		agent := false
+		series := map[string]bool{}
+		for _, m := range req.ResourceMetrics[0].ScopeMetrics[0].Metrics {
+			switch m.Name {
+			case MetricAgentUp:
+				agent = true
+			case MetricEdgeLast:
+				edges += len(m.GetGauge().DataPoints)
+				for _, p := range m.GetGauge().DataPoints {
+					series[fmt.Sprint(attrMap(p.Attributes)["server.port"])] = true
+				}
+			case MetricListenerLast:
+				listeners += len(m.GetGauge().DataPoints)
+				for _, p := range m.GetGauge().DataPoints {
+					series[fmt.Sprint(attrMap(p.Attributes)["server.port"])] = true
+				}
+			}
+		}
+		if len(series) > 3 {
+			t.Errorf("request %d has %d series", i, len(series))
+		}
+		// Only the last request carries the agent and closes the interval.
+		if agent != (i == len(reqs)-1) {
+			t.Errorf("request %d: agent metrics %v", i, agent)
+		}
+		if attrMap(req.ResourceMetrics[0].Resource.Attributes)["host.name"] != "h" {
+			t.Errorf("request %d lacks the resource", i)
+		}
+	}
+	if edges != 5 || listeners != 2 {
+		t.Errorf("%d edges and %d listeners sent", edges, listeners)
+	}
+	// Without series there is one request, with the agent.
+	if reqs := NewState(time.Minute).Requests(Resource{Hostname: "h"}, st, t0, 3); len(reqs) != 1 {
+		t.Errorf("%d requests without series", len(reqs))
 	}
 }

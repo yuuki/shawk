@@ -15,7 +15,8 @@ func TestIdentities(t *testing.T) {
 	reads := 0
 	r := newIdentities(procinfo.FallbackExe, 15*time.Minute)
 	r.exe = func(pid uint32) string { reads++; return exes[pid] }
-	r.env = func(pid uint32) map[string]string { return envs[pid] }
+	stuck := map[uint32]bool{}
+	r.env = func(pid uint32) (map[string]string, bool) { return envs[pid], !stuck[pid] }
 
 	r.beginInterval()
 	got := r.resolve(100, "ruby", "billing.service", now)
@@ -37,9 +38,24 @@ func TestIdentities(t *testing.T) {
 	if got := r.resolve(100, "ruby", "billing.service", now.Add(time.Minute)); got != want {
 		t.Errorf("resolve after exit = %+v, want %+v", got, want)
 	}
-	// Unknown processes are named after comm.
+	// Unknown processes are named after comm, then the unit.
 	if got := r.resolve(0, "kworker", "", now); got != (otlp.Process{Comm: "kworker", Service: "kworker"}) {
 		t.Errorf("resolve without a process = %+v", got)
+	}
+	if got := r.resolve(0, "", "nfs-server.service", now); got.Service != "nfs-server.service" {
+		t.Errorf("resolve without comm = %+v", got)
+	}
+	if got := r.resolve(0, "", "", now); got.Service != procinfo.UnknownService {
+		t.Errorf("resolve without anything = %+v", got)
+	}
+
+	// The environment of a stuck process cannot be read in time: its latest
+	// identity is used rather than a name without OTEL_SERVICE_NAME.
+	exes[100] = "/usr/bin/ruby"
+	stuck[100] = true
+	r.beginInterval()
+	if got := r.resolve(100, "ruby", "billing.service", now.Add(2*time.Minute)); got != want {
+		t.Errorf("resolve of a stuck process = %+v, want %+v", got, want)
 	}
 
 	r.expire(now.Add(16 * time.Minute))

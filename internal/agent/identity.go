@@ -19,12 +19,14 @@ type identities struct {
 	latest map[unitComm]latestIdentity
 	// Readers of /proc; replaced in tests.
 	exe func(pid uint32) string
-	env func(pid uint32) map[string]string
+	env func(pid uint32) (map[string]string, bool)
 }
 
 type procRead struct {
 	exe string
 	env map[string]string
+	// complete is false when the environment could not be read in time.
+	complete bool
 }
 
 type unitComm struct{ unit, comm string }
@@ -55,9 +57,9 @@ func (r *identities) read(pid uint32) procRead {
 	if p, ok := r.byPID[pid]; ok {
 		return p
 	}
-	p := procRead{exe: r.exe(pid)}
+	p := procRead{exe: r.exe(pid), complete: true}
 	if p.exe != "" {
-		p.env = r.env(pid)
+		p.env, p.complete = r.env(pid)
 	}
 	r.byPID[pid] = p
 	return p
@@ -67,7 +69,7 @@ func (r *identities) read(pid uint32) procRead {
 func (r *identities) resolve(pid uint32, comm, unit string, now time.Time) otlp.Process {
 	k := unitComm{unit, comm}
 	p := r.read(pid)
-	if p.exe == "" {
+	if p.exe == "" || !p.complete {
 		if l, ok := r.latest[k]; ok {
 			l.at = now
 			r.latest[k] = l
@@ -76,7 +78,7 @@ func (r *identities) resolve(pid uint32, comm, unit string, now time.Time) otlp.
 	}
 	svc := procinfo.ServiceName(p.env, p.exe, comm, unit, r.fallback)
 	proc := otlp.Process{Unit: unit, Comm: comm, Exe: p.exe, Service: svc.Name, ServiceNamespace: svc.Namespace}
-	if p.exe != "" {
+	if p.exe != "" && p.complete {
 		r.latest[k] = latestIdentity{proc: proc, at: now}
 	}
 	return proc
