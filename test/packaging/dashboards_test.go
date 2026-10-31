@@ -180,8 +180,23 @@ func TestAlertRules(t *testing.T) {
 				if d.DatasourceUID != "__expr__" && datasources[d.DatasourceUID] == "" {
 					t.Errorf("%s: unknown data source %s", r.Title, d.DatasourceUID)
 				}
-				if d.DatasourceUID == "shawk-postgres" && d.Model["format"] != "time_series" {
-					t.Errorf("%s: SQL alert queries must use the time series format", r.Title)
+				if d.DatasourceUID == "shawk-postgres" {
+					if d.Model["format"] != "time_series" {
+						t.Errorf("%s: SQL alert queries must use the time series format", r.Title)
+					}
+					// Grafana requires rows sorted by time, and a series
+					// without a value at the last time reduces to nothing:
+					// every row carries the same time, now().
+					sql, _ := d.Model["rawSql"].(string)
+					if !strings.Contains(sql, "SELECT now() AS time") || !strings.Contains(sql, "ORDER BY 1") {
+						t.Errorf("%s: an SQL alert query must select now() AS time and ORDER BY 1:\n%s", r.Title, sql)
+					}
+				}
+				if d.Model["type"] == "reduce" {
+					settings, _ := d.Model["settings"].(map[string]any)
+					if settings["mode"] != "dropNN" {
+						t.Errorf("%s: reduce %s does not drop nulls", r.Title, d.RefID)
+					}
 				}
 			}
 			if !refs[r.Condition] {

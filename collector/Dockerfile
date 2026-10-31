@@ -1,7 +1,7 @@
 # Image of the collector with the shawk connector, built by goreleaser from
 # the binaries of a release. Mount the configuration at
 # /etc/shawk/collector.yaml. shawk-migrate is included to apply the schema:
-#   docker run --rm IMAGE /shawk-migrate -dsn postgres://...
+#   docker run --rm --entrypoint /shawk-migrate IMAGE -dsn postgres://...
 FROM gcr.io/distroless/static-debian12:nonroot
 ARG TARGETPLATFORM
 COPY $TARGETPLATFORM/shawk-collector /shawk-collector

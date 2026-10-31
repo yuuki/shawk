@@ -2,10 +2,23 @@
 # collector/builder-config.yaml). Agents send to otlp/shawk; OBI and other
 # instrumentation send to otlp.
 receivers:
-  otlp/shawk:                 # shawk agents only
+  # shawk agents only. This receiver feeds the writes to PostgreSQL, so it
+  # requires TLS with client certificates (agents: -otlp-cert-file and
+  # -otlp-key-file). A request of an agent carries at most
+  # -max-series-per-request (1000) series, about 3 MB; the limits leave room.
+  otlp/shawk:
     protocols:
-      grpc: { endpoint: 0.0.0.0:4327 }
-      http: { endpoint: 0.0.0.0:4328 }
+      grpc:
+        endpoint: 0.0.0.0:4327
+        max_recv_msg_size_mib: 16
+        tls: &shawk_tls
+          cert_file: /etc/shawk/tls/collector.crt
+          key_file: /etc/shawk/tls/collector.key
+          client_ca_file: /etc/shawk/tls/agents-ca.crt
+      http:
+        endpoint: 0.0.0.0:4328
+        max_request_body_size: 16777216
+        tls: *shawk_tls
   otlp:                       # OBI and other instrumentation
     protocols:
       grpc: { endpoint: 0.0.0.0:4317 }
@@ -34,12 +47,12 @@ processors:
   batch: {}
 
 exporters:
-  otlphttp/prometheus:
+  otlp_http/prometheus:
     # Prometheus started with --web.enable-otlp-receiver.
     endpoint: http://prometheus.example:9090/api/v1/otlp
     tls:
       insecure: true
-  otlp/traces:                # Tempo or another trace store
+  otlp_grpc/traces:           # Tempo or another trace store
     endpoint: tempo.example:4317
     tls:
       insecure: true
@@ -55,12 +68,12 @@ service:
     metrics/shawk-out:
       receivers: [shawk]
       processors: [batch]
-      exporters: [otlphttp/prometheus]
+      exporters: [otlp_http/prometheus]
     metrics/obi:
       receivers: [otlp]
       processors: [memory_limiter, batch]
-      exporters: [otlphttp/prometheus]
+      exporters: [otlp_http/prometheus]
     traces/obi:
       receivers: [otlp]
       processors: [memory_limiter, batch]
-      exporters: [otlp/traces]
+      exporters: [otlp_grpc/traces]

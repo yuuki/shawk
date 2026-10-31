@@ -48,18 +48,15 @@ type endpoint struct {
 
 // agentHost is what is known of the agent of a host.
 type agentHost struct {
-	seen time.Time // by the clock of the connector
-	// The agent records both sides of a dependency only if it traces every
-	// network namespace, and UDP only if it traces UDP.
-	udpTraced bool
-	allNetNS  bool
+	seen      time.Time // by the clock of the connector
+	udpTraced bool      // UDP edges are recorded only if UDP is traced
 }
 
-// covers tells whether the agent records the edges of a protocol on its
-// host. Loopback edges stay within one namespace, which the agent sees
-// whenever it sees the other side.
-func (h agentHost) covers(proto string, loopback bool) bool {
-	return (loopback || h.allNetNS) && (proto != "udp" || h.udpTraced)
+// covers tells whether the agent records the edges of a protocol. An agent
+// that traces one network namespace reports the addresses of that
+// namespace only, so the peers at its addresses are traced.
+func (h agentHost) covers(proto string) bool {
+	return proto != "udp" || h.udpTraced
 }
 
 // peer is the name of the peer of an edge.
@@ -209,7 +206,7 @@ func (r *resolver) learn(b *hostBatch, now time.Time) {
 		m[b.key] = now
 	}
 	if b.final {
-		r.localAgents[b.key] = agentHost{seen: now, udpTraced: b.udpTraced, allNetNS: b.netnsScope == "all"}
+		r.localAgents[b.key] = agentHost{seen: now, udpTraced: b.udpTraced}
 	}
 }
 
@@ -267,12 +264,12 @@ func (r *resolver) peer(host string, id *edgeID, now time.Time) peer {
 		// what it traces is not known yet.
 		p.agent = true
 		if a, ok := r.agent(host, now); ok {
-			p.agent = a.covers(id.proto, loopback)
+			p.agent = a.covers(id.proto)
 		}
 	case len(holders) == 1:
 		for h := range holders {
 			if a, ok := r.agent(h, now); ok {
-				p.agent = a.covers(id.proto, false)
+				p.agent = a.covers(id.proto)
 			}
 		}
 	}

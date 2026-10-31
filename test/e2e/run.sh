@@ -104,8 +104,9 @@ PIDS+=($!)
 
 for h in lb app db; do
 	# A UTS namespace gives each simulated host its own host name. The hosts
-	# share the machine id, like cloned VMs.
-	ip netns exec "$PREFIX-$h" unshare --uts sh -c "hostname $h-01 && exec \"$SHAWK\" agent -netns self -interval 1s -otlp-endpoint http://$NET.1:4327" >"$WORK/$h-agent.log" 2>&1 &
+	# share the machine id, like cloned VMs. Three series per request make
+	# every interval span several requests.
+	ip netns exec "$PREFIX-$h" unshare --uts sh -c "hostname $h-01 && exec \"$SHAWK\" agent -netns self -interval 1s -max-series-per-request 3 -otlp-endpoint http://$NET.1:4327" >"$WORK/$h-agent.log" 2>&1 &
 	PIDS+=($!)
 done
 for _ in $(seq 60); do

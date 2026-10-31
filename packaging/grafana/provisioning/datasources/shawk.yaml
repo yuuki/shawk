@@ -15,7 +15,7 @@ datasources:
     type: grafana-postgresql-datasource
     url: postgres:5432
     # A role with SELECT on the schema shawk_v1 only; see
-    # packaging/postgres/roles.sql.
+    # packaging/postgres/setup.sql and grants.sql.
     user: shawk_grafana
     jsonData:
       database: shawk

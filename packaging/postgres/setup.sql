@@ -15,4 +15,9 @@ CREATE ROLE shawk_connector LOGIN PASSWORD 'change-me';
 -- Grafana: reads shawk_v1 only.
 CREATE ROLE shawk_grafana LOGIN PASSWORD 'change-me';
 
+-- Grafana reads only, with a time limit. Only a superuser (or a role with
+-- CREATEROLE and ADMIN on shawk_grafana) may set these, so they are here.
+ALTER ROLE shawk_grafana SET default_transaction_read_only = on;
+ALTER ROLE shawk_grafana SET statement_timeout = '30s';
+
 CREATE DATABASE shawk OWNER shawk_owner;

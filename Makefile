@@ -30,8 +30,7 @@ OCB_VERSION ?= v0.164.0
 
 .PHONY: collector
 collector: ## build the collector with the shawk connector (collector/_build/shawk-collector)
-	$(GO) install go.opentelemetry.io/collector/cmd/builder@$(OCB_VERSION)
-	cd collector && $$($(GO) env GOPATH)/bin/builder --config builder-config.yaml
+	cd collector && $(GO) run go.opentelemetry.io/collector/cmd/builder@$(OCB_VERSION) --config builder-config.yaml
 
 .PHONY: shawk-migrate
 shawk-migrate: ## build the command that applies the PostgreSQL schema

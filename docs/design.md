@@ -236,15 +236,25 @@ plain byte in recent kernels but a 4-bit bitfield at a different offset in
   same way: `OTEL_SERVICE_NAME`, then `service.name` in
   `OTEL_RESOURCE_ATTRIBUTES` of the process (only the `OTEL_` variables of
   `/proc/PID/environ` are read; the rest is discarded as soon as it is
-  read), then the base name of the executable, then comm.
+  read), then the base name of the executable, then comm, then the unit,
+  then `~unknown` (a socket whose owner is not known).
   `-service-name-fallback=unit` uses the unit instead of the executable.
   `service.namespace` is read from `OTEL_RESOURCE_ATTRIBUTES`.
 - Services that share an executable on a host (`ruby`, `python`, `java`,
   `php-fpm`) share a name unless they set `OTEL_SERVICE_NAME`, e.g. with
-  `Environment=` in a systemd drop-in. PostgreSQL still tells them apart by
+  `Environment=` in a systemd drop-in. PostgreSQL also tells them apart by
   unit.
-- When a process exits before `/proc` is read, the latest identity seen for
-  the same unit and comm is used.
+- The kernel bundles flows by cgroup and comm, not by process, and the
+  agent names a flow after the last process seen on it. Processes that
+  share a cgroup and a comm, e.g. two Python services under one supervisor
+  unit, are therefore not told apart even with different
+  `OTEL_SERVICE_NAME`; put them in different units (or containers) to tell
+  them apart.
+- When a process exits before `/proc` is read, or its environment cannot be
+  read within 200 ms (the read takes the lock of the memory map of the
+  process, which a stuck process may hold), the latest identity seen for
+  the same unit and comm is used, and a stuck process is not read again
+  until the read returns.
 - The host is identified by `host.id` (`/etc/machine-id`, else
   `/var/lib/dbus/machine-id`) and `host.name`. In PostgreSQL a host is the
   hash of both, so that VMs cloned with the same machine id stay apart.
@@ -282,8 +292,15 @@ the live series, including containers), `os.version`, and
 
 ### 4.3 How it is sent
 
-- **One request per interval.** Every 15 seconds the agent sends all live
-  series of the host in one OTLP request (gRPC or HTTP/protobuf, gzip).
+- **One interval at a time.** Every 15 seconds the agent sends all live
+  series of the host over OTLP (gRPC or HTTP/protobuf, gzip), in requests of
+  at most `-max-series-per-request` (1000) edges and listeners, about 3 MB,
+  below the 4 MiB default limit of a gRPC receiver. The last request
+  carries the metrics of the agent and closes the interval; after a failed
+  request the rest of the interval is not sent.
+- **TLS.** An `https://` endpoint verifies the collector (`-otlp-ca-file`)
+  and may present a client certificate (`-otlp-cert-file`,
+  `-otlp-key-file`) to a receiver that requires one.
 - **Cumulative.** Counters are totals since the series started, so a failed
   request is made up for by the next one. Requests are not retried.
 - **Idle TTL.** A series with no activity (connections, bytes, datagrams or
@@ -317,7 +334,9 @@ of the connector; the difference to the clock of the agent is kept as
 `clock_skew`, shown on the fleet dashboard and alerted on beyond a minute.
 Edges, listeners and processes keep the times of the agent that observed
 them. While the database is down, changes accumulate (in proportion
-to the number of edges, not to time) and are written when it returns. A
+to the number of edges, not to time) and are written when it returns. Rows that PostgreSQL rejects as invalid data are dropped rather than kept
+for the next write, which would fail again; IPv6 zones are stripped from
+addresses before. A
 crash of the connector loses at most one write interval, which agents send
 again while the edges are within their TTL.
 
@@ -341,14 +360,21 @@ and adds what it learns from requests at once.
 | either | unknown, public address | `~external` |
 
 `shawk.peer.agent` tells whether the peer address belongs to a host whose
-agent is alive (or is loopback): the other side of the edge is then
-recorded too, which the counting convention of §7 relies on.
+agent is alive (reported in the last 5 minutes, or the host itself for
+loopback) and records the other side of the edge, which for UDP requires
+that it traces UDP. An agent that traces one network namespace reports the
+addresses of that namespace only, so its peers are traced. The counting
+convention of §7 relies on it.
 
 Loopback peers are looked up on the same host only, and so are addresses
 that several live hosts hold at once, such as the gateway of a container
 bridge (172.17.0.1 on every Docker host); such a peer is on the host itself
-when the host holds the address too. Among several services
-on an endpoint, one on the same host, then the most recently seen, wins.
+when the host holds the address too. An address counts as held by several
+hosts when they reported it within 3 minutes of each other; one whose former
+holder stopped reporting it earlier has moved. Among several services on an
+endpoint, one on the same host wins, then one observed on a socket (a server
+edge or a listener on that address) over one inferred from a listener on an
+unspecified address, then the most recently seen, then the first by name.
 Names are the best guess at the time of aggregation; PostgreSQL is the
 truth of attribution. A new server may show as `~unresolved` until its
 listener is written (up to one write interval), and a new client on the
@@ -377,6 +403,13 @@ name, and `host.id` and `host.name` are promoted to labels by Prometheus.
   that started before the connector is taken as a baseline, so a restart of
   the connector does not add past totals at once. Open connections are the
   sum of the current inputs.
+- An agent may send an interval in several requests. The outputs of a
+  host are emitted once per interval, when the last request (the one with
+  the metrics of the agent) arrives, at the time of that request; an
+  interval whose last request is older than one already emitted emits
+  nothing. Every input point keeps its timestamp, and a point not newer
+  than the last one of its series (a late or retried request) changes
+  nothing.
 - An output series without input is sent until `idle_ttl` and then dropped.
 - This state requires the data of a host to reach the same connector. With
   several connectors, route by resource with the loadbalancing exporter of a
@@ -408,7 +441,7 @@ applied by `shawk-migrate` or by the connector with `postgres.migrate`.
 hosts(id, machine_id, hostname, kernel, agent_version, first_seen, last_seen)
 agent_sessions(host_id, started_at, last_heartbeat, udp_traced, netns_scope, dropped_flows)
 host_addrs(host_id, addr, first_seen, last_seen)
-processes(id, host_id, unit, comm, exe, service_name, first_seen, last_seen)
+processes(id, host_id, unit, comm, exe, service_name, first_seen, last_seen)  -- unique (host_id, unit, comm, service_name)
 edges(id, host_id, process_id, role, proto, local_addr, remote_addr, port, netns, first_seen, last_seen)
 listeners(host_id, process_id, proto, addr, port, netns, first_seen, last_seen)
 ```
@@ -457,8 +490,13 @@ dependency details, changes, application layer of OBI) and alert rules.
 
 The PostgreSQL data source is used for alerts in the **time series
 format**: a `time` column, string columns as labels and one numeric
-`value`. A query that finds nothing returns no rows, which is No Data, so
-the rules treat No Data as Normal. A disappeared dependency is an explicit
+`value`. Grafana turns the rows into one series per label set and requires
+them sorted by time; every row carries the same time, `now()`, so that each
+series has a value at the last time. A query that finds nothing returns no
+rows, which is No Data, so the rules treat No Data as Normal. New and
+disappeared dependencies are judged per service and port
+(`dependency_changes_between`), so a new replica of a known dependency is
+not new. A disappeared dependency is an explicit
 row — its `last_seen` falls in a window while a host that saw it is still
 observed — rather than a row that vanishes from the result, so a stopped
 agent does not look like a removed dependency. Agents that stopped are

@@ -255,11 +255,11 @@ FROM shawk_v1.client_endpoints`,
 	if err != nil {
 		return out, err
 	}
-	err = queryRows(ctx, s.pool, `SELECT host(addr), host_id, last_seen, udp_traced, netns_scope = 'all' FROM shawk_v1.agent_addrs`,
+	err = queryRows(ctx, s.pool, `SELECT host(addr), host_id, last_seen, udp_traced FROM shawk_v1.agent_addrs`,
 		func(rows pgx.Rows) error {
 			var addr string
 			var r agentAddrRow
-			if err := rows.Scan(&addr, &r.host, &r.seen, &r.udpTraced, &r.allNetNS); err != nil {
+			if err := rows.Scan(&addr, &r.host, &r.seen, &r.udpTraced); err != nil {
 				return err
 			}
 			if a, err := netip.ParseAddr(addr); err == nil {

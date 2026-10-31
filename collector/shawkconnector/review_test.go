@@ -131,8 +131,9 @@ func TestPeerAgentAliveWindow(t *testing.T) {
 	}
 }
 
-// TestPeerAgentCoverage: a peer whose agent traces no UDP, or one network
-// namespace only, does not record the other side of the edge.
+// TestPeerAgentCoverage: a peer whose agent traces no UDP does not record
+// the other side of a UDP edge. An agent tracing one network namespace
+// reports the addresses of that namespace only, which it records.
 func TestPeerAgentCoverage(t *testing.T) {
 	c, _, sink, now := testConnector(t, nil)
 	consume(t, c, sink, tAgent{host: "noudp-01", addrs: []string{"10.0.0.21"}, time: *now, noUDP: true})
@@ -144,7 +145,7 @@ func TestPeerAgentCoverage(t *testing.T) {
 	}{
 		{"10.0.0.21", "tcp", true},
 		{"10.0.0.21", "udp", false},
-		{"10.0.0.22", "tcp", false},
+		{"10.0.0.22", "tcp", true},
 		{"10.0.0.23", "udp", true},
 	} {
 		p := c.resolver.peer("dns-01", &edgeID{role: roleServer, proto: tc.proto, local: addrOf("10.0.0.53"),
@@ -153,11 +154,11 @@ func TestPeerAgentCoverage(t *testing.T) {
 			t.Errorf("%s %s: agent = %v, want %v", tc.peer, tc.proto, p.agent, tc.want)
 		}
 	}
-	// Loopback stays within a namespace the agent sees.
-	p := c.resolver.peer("onens-01", &edgeID{role: roleServer, proto: "tcp", local: addrOf("127.0.0.1"),
-		peer: addrOf("127.0.0.1"), port: 6379}, *now)
-	if !p.agent {
-		t.Error("loopback peer of an agent tracing one namespace")
+	// Loopback UDP on a host whose agent traces no UDP.
+	p := c.resolver.peer(hostKey("", "noudp-01"), &edgeID{role: roleServer, proto: "udp", local: addrOf("127.0.0.1"),
+		peer: addrOf("127.0.0.1"), port: 53}, *now)
+	if p.agent {
+		t.Error("loopback UDP peer of an agent that traces no UDP")
 	}
 }
 

@@ -7,8 +7,7 @@ set -eu
 version="${1:?usage: generate-collector.sh VERSION}"
 ocb_version="${OCB_VERSION:-v0.164.0}"
 cd "$(dirname "$0")/../collector"
-go install "go.opentelemetry.io/collector/cmd/builder@$ocb_version"
 manifest=_release-builder-config.yaml
 trap 'rm -f "$manifest"' EXIT
 sed "s/^  version: dev\$/  version: $version/" builder-config.yaml >"$manifest"
-"$(go env GOPATH)/bin/builder" --config "$manifest" --skip-compilation
+go run "go.opentelemetry.io/collector/cmd/builder@$ocb_version" --config "$manifest" --skip-compilation

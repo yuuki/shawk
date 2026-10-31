@@ -26,10 +26,10 @@
           "uid": "shawk-prometheus"
         },
         "query": {
-          "query": "label_values(shawk:dependency_connections:rate5m, src)",
+          "query": "label_values({__name__=~\"shawk_connection_opened_total|shawk_udp_datagrams_total\"}, job)",
           "refId": "service"
         },
-        "definition": "label_values(shawk:dependency_connections:rate5m, src)",
+        "definition": "label_values({__name__=~\"shawk_connection_opened_total|shawk_udp_datagrams_total\"}, job)",
         "refresh": 2,
         "multi": false,
         "includeAll": false,

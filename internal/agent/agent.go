@@ -235,8 +235,13 @@ func (a *Agent) observe(snap *tracer.Snapshot, start, end time.Time) {
 // start of the observation segment they carry.
 func (a *Agent) request(now time.Time) ([]*colmetricspb.ExportMetricsServiceRequest, time.Time) {
 	res := a.res
-	res.Addrs = hostAddrs()
-	// Addresses of containers in other network namespaces.
+	// host.ip tells the connector which peers this agent records the other
+	// side for, so it lists only addresses of traced namespaces: the
+	// interfaces of the agent's own namespace unless it traces another
+	// one, and the local addresses of the live series.
+	if a.cfg.NetNS == 0 || a.cfg.NetNS == procinfo.NetNS() {
+		res.Addrs = hostAddrs()
+	}
 	for _, addr := range a.state.LocalAddrs() {
 		if !slices.Contains(res.Addrs, addr) {
 			res.Addrs = append(res.Addrs, addr)

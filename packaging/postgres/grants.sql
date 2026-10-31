@@ -10,11 +10,12 @@ REVOKE ALL ON SCHEMA shawk, shawk_v1 FROM PUBLIC;
 -- and reads the views that name peers.
 GRANT USAGE ON SCHEMA shawk, shawk_v1 TO shawk_connector;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA shawk TO shawk_connector;
+-- The history of migrations belongs to shawk-migrate.
+REVOKE ALL ON shawk.schema_migrations FROM shawk_connector;
 GRANT USAGE ON ALL SEQUENCES IN SCHEMA shawk TO shawk_connector;
 GRANT SELECT ON ALL TABLES IN SCHEMA shawk_v1 TO shawk_connector;
 
--- Grafana reads the contract only, read-only and with a time limit.
+-- Grafana reads the contract only (setup.sql makes it read-only with a
+-- time limit).
 GRANT USAGE ON SCHEMA shawk_v1 TO shawk_grafana;
 GRANT SELECT ON ALL TABLES IN SCHEMA shawk_v1 TO shawk_grafana;
-ALTER ROLE shawk_grafana SET default_transaction_read_only = on;
-ALTER ROLE shawk_grafana SET statement_timeout = '30s';

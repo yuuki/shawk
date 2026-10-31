@@ -187,6 +187,9 @@ func TestPGPackaged(t *testing.T) {
 			// A dependency that ended 20 minutes ago.
 			{role: "client", proto: "tcp", local: "10.0.0.11", peer: "10.0.0.20", port: 6379, svc: "app", ns: "shop", comm: "puma", opened: 1,
 				first: now.Add(-time.Hour), last: now.Add(-20 * time.Minute)},
+			// A second new dependency: alerts must handle several rows.
+			{role: "client", proto: "tcp", local: "10.0.0.11", peer: "10.0.0.30", port: 11211, svc: "app", ns: "shop", comm: "puma", opened: 1,
+				first: now.Add(-3 * time.Minute)},
 		}})
 	c.flush(ctx)
 
@@ -255,14 +258,39 @@ func TestPGPackaged(t *testing.T) {
 			continue
 		}
 		n := 0
+		var times []any
+		labels := map[string]bool{}
 		for r.Next() {
 			n++
+			vals, err := r.Values()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.HasPrefix(name, "shawk-rules.yaml") {
+				// Grafana turns the rows into one series per label set and
+				// needs every series to have a value at the last time.
+				times = append(times, vals[0])
+				l := fmt.Sprint(vals[1 : len(vals)-1])
+				if labels[l] {
+					t.Errorf("%s: label set %s twice", name, l)
+				}
+				labels[l] = true
+			}
 		}
 		if err := r.Err(); err != nil {
 			t.Errorf("%s: %v\n%s", name, err, sql)
 		}
 		r.Close()
 		rows[name] = n
+		for _, tm := range times {
+			if tm != times[0] {
+				t.Errorf("%s: rows at different times %v", name, times)
+				break
+			}
+		}
+	}
+	if n := rows["shawk-rules.yaml/shawk-dependencies/New dependency/A/A#0"]; n < 2 {
+		t.Errorf("new dependency alert: %d rows, want several", n)
 	}
 	// Queries that must find the data above.
 	for _, want := range []string{
@@ -294,4 +322,63 @@ func keys(m map[string]int) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// TestPGGrantsAsOwner runs the documented setup: the schema applied and
+// grants.sql run by the owner of the database, not by a superuser.
+func TestPGGrantsAsOwner(t *testing.T) {
+	_, conn := testDB(t)
+	ctx := context.Background()
+	owner := fmt.Sprintf("shawk_owner_%d", time.Now().UnixNano())
+	var db string
+	conn.QueryRow(ctx, "SELECT current_database()").Scan(&db)
+	execAll(t, conn,
+		"CREATE ROLE "+owner+" NOLOGIN",
+		"GRANT CREATE ON DATABASE "+db+" TO "+owner,
+		`DO $$ BEGIN
+		   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'shawk_connector') THEN CREATE ROLE shawk_connector NOLOGIN; END IF;
+		   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'shawk_grafana') THEN CREATE ROLE shawk_grafana NOLOGIN; END IF;
+		 END $$`)
+	t.Cleanup(func() {
+		conn.Exec(ctx, "RESET ROLE")
+		conn.Exec(ctx, "DROP OWNED BY "+owner+" CASCADE")
+		conn.Exec(ctx, "DROP ROLE "+owner)
+	})
+	execAll(t, conn, "SET ROLE "+owner)
+	if _, err := Migrate(ctx, conn); err != nil {
+		t.Fatalf("migrating as the owner: %v", err)
+	}
+	grants, err := os.ReadFile(filepath.Join(packaging, "postgres/grants.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, string(grants)); err != nil {
+		t.Fatalf("grants.sql as the owner: %v", err)
+	}
+	execAll(t, conn, "RESET ROLE", "SET ROLE shawk_connector")
+	if _, err := conn.Exec(ctx, "INSERT INTO shawk.schema_migrations (version, name) VALUES (999, 'x')"); err == nil {
+		t.Error("the connector can write the history of migrations")
+	}
+	now := time.Now()
+	h := newHostChanges("h1")
+	h.setHost("m", "h1", "k", "v", now)
+	h.addSession(now.Add(-time.Hour), sessionRow{lastHeartbeat: now, netnsScope: "all"})
+	h.addProcess(procKey{"a.service", "a", "a"}, "/usr/bin/a", span{now, now})
+	h.addEdge(edgeRowKey{role: "client", proto: "tcp", local: addrOf("10.0.0.1"), peer: addrOf("10.0.0.2"), port: 80,
+		netns: 1, procKey: procKey{"a.service", "a", "a"}}, span{now, now})
+	if err := pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error { return writeHost(ctx, tx, h) }); err != nil {
+		t.Errorf("writing as the connector: %v", err)
+	}
+	var n int64
+	if err := conn.QueryRow(ctx, "SELECT shawk.prune(now() - interval '3 years')").Scan(&n); err != nil {
+		t.Errorf("pruning as the connector: %v", err)
+	}
+	execAll(t, conn, "RESET ROLE", "SET ROLE shawk_grafana")
+	if err := conn.QueryRow(ctx, "SELECT count(*) FROM shawk_v1.dependencies_between(now() - interval '1 hour', now())").Scan(&n); err != nil || n != 1 {
+		t.Errorf("reading as Grafana: %d, %v", n, err)
+	}
+	if _, err := conn.Exec(ctx, "SELECT count(*) FROM shawk.edges"); err == nil {
+		t.Error("Grafana can read the tables")
+	}
+	execAll(t, conn, "RESET ROLE")
 }

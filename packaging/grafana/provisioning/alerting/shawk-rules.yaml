@@ -2,11 +2,19 @@
 #
 # The PostgreSQL data source is used in the time series format: each query
 # returns a time column, string columns that become labels and one numeric
-# value column. When nothing happens a query returns no rows, which is No
-# Data; the rules treat No Data as Normal. A dependency that disappeared is
-# an explicit row (its last_seen falls in a window) rather than a row that
-# vanishes from the result, and a host that stopped observing is excluded,
-# so that a stopped agent does not look like a removed dependency.
+# value column. Grafana converts such rows into one series per label set and
+# requires them sorted by time; every row carries the same time, now(), so
+# that each series has a value at the last time, and rows are ordered. The
+# reducers drop nulls all the same.
+#
+# When nothing happens a query returns no rows, which is No Data; the rules
+# treat No Data as Normal. A dependency that disappeared is an explicit row
+# (its last activity falls in a window while a host that saw it kept
+# observing) rather than a row that vanishes from the result, so that a
+# stopped agent does not look like a removed dependency. New and disappeared
+# dependencies are judged per service and port, as in
+# shawk_v1.dependency_changes_between, not per edge: a new replica of a
+# known dependency is not new.
 #
 # Dashboard variables cannot be used in alerts, so the time windows are
 # written in the queries.
@@ -30,15 +38,15 @@ groups:
               format: time_series
               rawQuery: true
               rawSql: |-
-                SELECT max(first_seen) AS time,
-                       client_service, server_service, port::text AS port,
+                SELECT now() AS time,
+                       client_service, server_service, port::text AS port, proto,
                        1 AS value
-                FROM shawk_v1.dependencies_between(now() - interval '15 minutes', now())
-                WHERE first_seen > now() - interval '15 minutes'
-                GROUP BY client_service, server_service, port
+                FROM shawk_v1.dependency_changes_between(now() - interval '15 minutes', now())
+                WHERE change = 'appeared'
+                ORDER BY 1, 2, 3, 4, 5
           - refId: B
             datasourceUid: __expr__
-            model: { refId: B, type: reduce, expression: A, reducer: last }
+            model: { refId: B, type: reduce, expression: A, reducer: last, settings: { mode: dropNN } }
           - refId: C
             datasourceUid: __expr__
             model:
@@ -53,7 +61,7 @@ groups:
         labels:
           severity: info
         annotations:
-          summary: "New dependency: {{ $labels.client_service }} -> {{ $labels.server_service }}:{{ $labels.port }}"
+          summary: "New dependency: {{ $labels.client_service }} -> {{ $labels.server_service }}:{{ $labels.port }}/{{ $labels.proto }}"
 
       - uid: shawk-disappeared-dependency
         title: Disappeared dependency
@@ -68,19 +76,17 @@ groups:
               format: time_series
               rawQuery: true
               rawSql: |-
-                SELECT max(last_seen) AS time,
-                       client_service, server_service, port::text AS port,
+                -- Dependencies whose last activity was 15 to 30 minutes ago,
+                -- while a host that saw them kept observing for 15 minutes.
+                SELECT now() AS time,
+                       client_service, server_service, port::text AS port, proto,
                        1 AS value
-                -- Dependencies active in the last 30 minutes.
-                FROM shawk_v1.dependencies_between(now() - interval '30 minutes', now())
-                GROUP BY client_service, server_service, port
-                -- Every edge of the dependency ended 15 to 30 minutes ago,
-                -- and a host that saw it is still observing.
-                HAVING max(last_seen) BETWEEN now() - interval '30 minutes' AND now() - interval '15 minutes'
-                   AND greatest(max(client_observed_until), max(server_observed_until)) > now() - interval '5 minutes'
+                FROM shawk_v1.dependency_changes_between(now() - interval '30 minutes', now())
+                WHERE change = 'disappeared' AND time <= now() - interval '15 minutes'
+                ORDER BY 1, 2, 3, 4, 5
           - refId: B
             datasourceUid: __expr__
-            model: { refId: B, type: reduce, expression: A, reducer: last }
+            model: { refId: B, type: reduce, expression: A, reducer: last, settings: { mode: dropNN } }
           - refId: C
             datasourceUid: __expr__
             model:
@@ -95,8 +101,8 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "Dependency disappeared: {{ $labels.client_service }} -> {{ $labels.server_service }}:{{ $labels.port }}"
-          description: "Last seen 15 to 30 minutes ago while a host that saw it is still observed."
+          summary: "Dependency disappeared: {{ $labels.client_service }} -> {{ $labels.server_service }}:{{ $labels.port }}/{{ $labels.proto }}"
+          description: "Last active 15 to 30 minutes ago while a host that saw it is still observed."
 
   - orgId: 1
     name: shawk-agents
@@ -118,12 +124,14 @@ groups:
               format: time_series
               rawQuery: true
               rawSql: |-
-                SELECT last_heartbeat AS time, host, 1 AS value
+                SELECT now() AS time, host,
+                       round(extract(epoch FROM now() - last_heartbeat) / 60)::float8 AS value
                 FROM shawk_v1.agents
                 WHERE NOT alive AND last_heartbeat > now() - interval '30 days'
+                ORDER BY 1, 2
           - refId: B
             datasourceUid: __expr__
-            model: { refId: B, type: reduce, expression: A, reducer: last }
+            model: { refId: B, type: reduce, expression: A, reducer: last, settings: { mode: dropNN } }
           - refId: C
             datasourceUid: __expr__
             model:
@@ -138,7 +146,7 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "shawk agent on {{ $labels.host }} has not reported since {{ $values.B }}"
+          summary: "shawk agent on {{ $labels.host }} has not reported for {{ $values.B }} minutes"
 
       # Times of dependencies come from the clock of each host, heartbeats
       # from the clock of the collector; a wrong clock misplaces both.
@@ -155,13 +163,14 @@ groups:
               format: time_series
               rawQuery: true
               rawSql: |-
-                SELECT last_heartbeat AS time, host,
+                SELECT now() AS time, host,
                        abs(extract(epoch FROM clock_skew))::float8 AS value
                 FROM shawk_v1.agents
                 WHERE alive AND abs(extract(epoch FROM clock_skew)) > 60
+                ORDER BY 1, 2
           - refId: B
             datasourceUid: __expr__
-            model: { refId: B, type: reduce, expression: A, reducer: last }
+            model: { refId: B, type: reduce, expression: A, reducer: last, settings: { mode: dropNN } }
           - refId: C
             datasourceUid: __expr__
             model:
