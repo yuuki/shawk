@@ -377,7 +377,7 @@
           "sort": "desc"
         }
       },
-      "description": "Segments each side retransmitted. On the server side, a client with its own agent shows as ~agent."
+      "description": "Segments each side retransmitted; shawk_role is the sender."
     },
     {
       "id": 6,

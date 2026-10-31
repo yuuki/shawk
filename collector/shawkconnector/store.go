@@ -16,8 +16,9 @@ type store interface {
 	migrate(ctx context.Context) ([]string, error)
 	// write writes the changes of a host in one transaction.
 	write(ctx context.Context, h *hostChanges) error
-	// peers reads the endpoints of services and the addresses of agents.
-	peers(ctx context.Context) ([]endpointRow, []agentAddrRow, error)
+	// peers reads the endpoints of services, the client sides of
+	// connections and the addresses of agents.
+	peers(ctx context.Context) (peerRows, error)
 	close()
 }
 
@@ -196,47 +197,71 @@ ON CONFLICT (host_id, proto, addr, port, netns) DO UPDATE SET
 	return tx.SendBatch(ctx, b).Close()
 }
 
-func (s *pgStore) peers(ctx context.Context) ([]endpointRow, []agentAddrRow, error) {
-	rows, err := s.pool.Query(ctx, `SELECT host(addr), port, proto, host_id, service, last_seen FROM shawk_v1.service_endpoints`)
+func (s *pgStore) peers(ctx context.Context) (peerRows, error) {
+	var out peerRows
+	err := queryRows(ctx, s.pool, `SELECT host(addr), port, proto, host_id, service, last_seen FROM shawk_v1.service_endpoints`,
+		func(rows pgx.Rows) error {
+			var addr string
+			var port int32
+			var e endpointRow
+			if err := rows.Scan(&addr, &port, &e.key.proto, &e.host, &e.service, &e.lastSeen); err != nil {
+				return err
+			}
+			if a, err := netip.ParseAddr(addr); err == nil {
+				e.key.addr, e.key.port = a.Unmap(), uint16(port)
+				out.endpoints = append(out.endpoints, e)
+			}
+			return nil
+		})
 	if err != nil {
-		return nil, nil, err
+		return out, err
 	}
-	var eps []endpointRow
-	for rows.Next() {
-		var addr string
-		var port int32
-		var e endpointRow
-		if err := rows.Scan(&addr, &port, &e.key.proto, &e.host, &e.service, &e.lastSeen); err != nil {
-			rows.Close()
-			return nil, nil, err
-		}
-		a, err := netip.ParseAddr(addr)
-		if err != nil {
-			continue
-		}
-		e.key.addr, e.key.port = a.Unmap(), uint16(port)
-		eps = append(eps, e)
+	err = queryRows(ctx, s.pool, `SELECT host(client_addr), host(server_addr), port, proto, host_id, service, last_seen
+FROM shawk_v1.client_endpoints`,
+		func(rows pgx.Rows) error {
+			var client, server string
+			var port int32
+			var c clientRow
+			if err := rows.Scan(&client, &server, &port, &c.key.proto, &c.host, &c.service, &c.lastSeen); err != nil {
+				return err
+			}
+			ca, err1 := netip.ParseAddr(client)
+			sa, err2 := netip.ParseAddr(server)
+			if err1 == nil && err2 == nil {
+				c.key.client, c.key.server, c.key.port = ca.Unmap(), sa.Unmap(), uint16(port)
+				out.clients = append(out.clients, c)
+			}
+			return nil
+		})
+	if err != nil {
+		return out, err
 	}
-	if err := rows.Err(); err != nil {
-		return nil, nil, err
-	}
+	err = queryRows(ctx, s.pool, `SELECT host(addr), host_id FROM shawk_v1.agent_addrs`,
+		func(rows pgx.Rows) error {
+			var addr string
+			var r agentAddrRow
+			if err := rows.Scan(&addr, &r.host); err != nil {
+				return err
+			}
+			if a, err := netip.ParseAddr(addr); err == nil {
+				r.addr = a.Unmap()
+				out.agents = append(out.agents, r)
+			}
+			return nil
+		})
+	return out, err
+}
 
-	rows, err = s.pool.Query(ctx, `SELECT host(addr), host_id FROM shawk_v1.agent_addrs`)
+func queryRows(ctx context.Context, pool *pgxpool.Pool, sql string, scan func(pgx.Rows) error) error {
+	rows, err := pool.Query(ctx, sql)
 	if err != nil {
-		return nil, nil, err
+		return err
 	}
-	var agents []agentAddrRow
+	defer rows.Close()
 	for rows.Next() {
-		var addr string
-		var r agentAddrRow
-		if err := rows.Scan(&addr, &r.host); err != nil {
-			rows.Close()
-			return nil, nil, err
-		}
-		if a, err := netip.ParseAddr(addr); err == nil {
-			r.addr = a.Unmap()
-			agents = append(agents, r)
+		if err := scan(rows); err != nil {
+			return err
 		}
 	}
-	return eps, agents, rows.Err()
+	return rows.Err()
 }

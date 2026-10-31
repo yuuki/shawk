@@ -2,11 +2,13 @@
 #
 # Both ends of a dependency may run an agent, so a dependency shows up on
 # the client side (shawk_role="client") and on the server side
-# (shawk_role="server"). The rules count each dependency once:
+# (shawk_role="server"). shawk_peer_agent tells whether the peer runs on a
+# host with an agent, which then records the other side. The rules count
+# each dependency once:
 #
 #   - connections, open connections, bytes, datagrams and RTT come from the
 #     client side, and from the server side only when the client has no
-#     agent (service_peer_name != "~agent");
+#     agent (shawk_peer_agent="false");
 #   - connection failures exist on the client side only;
 #   - retransmissions come from both sides, since each side counts its own
 #     retransmitted segments; shawk_role tells the sender.
@@ -25,7 +27,7 @@ groups:
                 "src", "$1", "job", "(.*)"), "dst", "$1", "service_peer_name", "(.*)")
             or
               label_replace(label_replace(
-                rate(shawk_connection_opened_total{shawk_role="server", service_peer_name!="~agent"}[5m]),
+                rate(shawk_connection_opened_total{shawk_role="server", shawk_peer_agent="false"}[5m]),
                 "dst", "$1", "job", "(.*)"), "src", "$1", "service_peer_name", "(.*)")
           )
 
@@ -45,7 +47,7 @@ groups:
                 "src", "$1", "job", "(.*)"), "dst", "$1", "service_peer_name", "(.*)")
             or
               label_replace(label_replace(
-                shawk_connection_count{shawk_role="server", service_peer_name!="~agent"},
+                shawk_connection_count{shawk_role="server", shawk_peer_agent="false"},
                 "dst", "$1", "job", "(.*)"), "src", "$1", "service_peer_name", "(.*)")
           )
 
@@ -59,7 +61,7 @@ groups:
                 "src", "$1", "job", "(.*)"), "dst", "$1", "service_peer_name", "(.*)")
             or
               label_replace(label_replace(
-                rate(shawk_network_io_bytes_total{shawk_role="server", service_peer_name!="~agent", network_io_direction="receive"}[5m]),
+                rate(shawk_network_io_bytes_total{shawk_role="server", shawk_peer_agent="false", network_io_direction="receive"}[5m]),
                 "dst", "$1", "job", "(.*)"), "src", "$1", "service_peer_name", "(.*)")
           )
 
@@ -72,7 +74,7 @@ groups:
                 "src", "$1", "job", "(.*)"), "dst", "$1", "service_peer_name", "(.*)")
             or
               label_replace(label_replace(
-                rate(shawk_network_io_bytes_total{shawk_role="server", service_peer_name!="~agent", network_io_direction="transmit"}[5m]),
+                rate(shawk_network_io_bytes_total{shawk_role="server", shawk_peer_agent="false", network_io_direction="transmit"}[5m]),
                 "dst", "$1", "job", "(.*)"), "src", "$1", "service_peer_name", "(.*)")
           )
 
@@ -84,7 +86,7 @@ groups:
                 "src", "$1", "job", "(.*)"), "dst", "$1", "service_peer_name", "(.*)")
             or
               label_replace(label_replace(
-                rate(shawk_udp_datagrams_total{shawk_role="server", service_peer_name!="~agent", network_io_direction="receive"}[5m]),
+                rate(shawk_udp_datagrams_total{shawk_role="server", shawk_peer_agent="false", network_io_direction="receive"}[5m]),
                 "dst", "$1", "job", "(.*)"), "src", "$1", "service_peer_name", "(.*)")
           )
 
@@ -96,7 +98,7 @@ groups:
                 "src", "$1", "job", "(.*)"), "dst", "$1", "service_peer_name", "(.*)")
             or
               label_replace(label_replace(
-                rate(shawk_udp_datagrams_total{shawk_role="server", service_peer_name!="~agent", network_io_direction="transmit"}[5m]),
+                rate(shawk_udp_datagrams_total{shawk_role="server", shawk_peer_agent="false", network_io_direction="transmit"}[5m]),
                 "dst", "$1", "job", "(.*)"), "src", "$1", "service_peer_name", "(.*)")
           )
 
@@ -109,7 +111,7 @@ groups:
                 "src", "$1", "job", "(.*)"), "dst", "$1", "service_peer_name", "(.*)")
             or
               label_replace(label_replace(
-                rate(shawk_tcp_rtt_seconds_sum{shawk_role="server", service_peer_name!="~agent"}[5m]),
+                rate(shawk_tcp_rtt_seconds_sum{shawk_role="server", shawk_peer_agent="false"}[5m]),
                 "dst", "$1", "job", "(.*)"), "src", "$1", "service_peer_name", "(.*)")
           )
       - record: shawk:dependency_rtt_seconds_count:rate5m
@@ -120,7 +122,7 @@ groups:
                 "src", "$1", "job", "(.*)"), "dst", "$1", "service_peer_name", "(.*)")
             or
               label_replace(label_replace(
-                rate(shawk_tcp_rtt_seconds_count{shawk_role="server", service_peer_name!="~agent"}[5m]),
+                rate(shawk_tcp_rtt_seconds_count{shawk_role="server", shawk_peer_agent="false"}[5m]),
                 "dst", "$1", "job", "(.*)"), "src", "$1", "service_peer_name", "(.*)")
           )
 

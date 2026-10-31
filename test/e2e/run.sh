@@ -162,7 +162,8 @@ puma postgres"
 
 # The forwarded metrics name the peers and carry no addresses.
 grep -q 'service.peer.name: Str(postgres)' "$WORK/collector.log" || fail "no series of puma to postgres"
-grep -q 'service.peer.name: Str(~agent)' "$WORK/collector.log" || fail "no server side series of a client with an agent"
+grep -q 'service.peer.name: Str(haproxy)' "$WORK/collector.log" || fail "the server side does not name its client"
+grep -q 'shawk.peer.agent: Bool(true)' "$WORK/collector.log" || fail "no series of a peer with an agent"
 grep -q 'service.peer.name: Str(~unresolved)' "$WORK/collector.log" || fail "no series of the client without an agent"
 if grep -q 'network.peer.address' "$WORK/collector.log"; then fail "peer addresses forwarded"; fi
 

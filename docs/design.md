@@ -319,17 +319,21 @@ again while the edges are within their TTL.
 
 ### 5.2 Names of peers
 
-The connector loads `shawk_v1.service_endpoints` and `shawk_v1.agent_addrs`
-every write interval, and adds what it learns from requests at once.
+The connector loads `shawk_v1.service_endpoints`,
+`shawk_v1.client_endpoints` and `shawk_v1.agent_addrs` every write interval,
+and adds what it learns from requests at once.
 
 | role | peer | `service.peer.name` |
 |---|---|---|
 | client | a service listens on the peer address and port | the service (`[namespace/]name`) |
-| client | unknown, in a range of `peer_cidrs` | the name of the narrowest range |
-| client | unknown, private address | `~unresolved` |
-| client | unknown, public address | `~external` |
-| server | an address of a host whose agent is alive, or loopback | `~agent` |
-| server | otherwise | named range, `~unresolved`, `~external` |
+| server | a client edge has the same addresses and port | the client service |
+| either | unknown, in a range of `peer_cidrs` | the name of the narrowest range |
+| either | unknown, private address | `~unresolved` |
+| either | unknown, public address | `~external` |
+
+`shawk.peer.agent` tells whether the peer address belongs to a host whose
+agent is alive (or is loopback): the other side of the edge is then
+recorded too, which the counting convention of §7 relies on.
 
 Loopback peers are looked up on the same host only. Among several services
 on an endpoint, one on the same host, then the most recently seen, wins.
@@ -339,7 +343,7 @@ listener is written (up to one write interval).
 
 ### 5.3 Metrics to Prometheus
 
-Edge metrics are reduced to `service.peer.name`, `shawk.role`,
+Edge metrics are reduced to `service.peer.name`, `shawk.peer.agent`, `shawk.role`,
 `server.port`, `network.transport` and, for bytes and datagrams,
 `network.io.direction`, and summed into **one resource per host and local
 service**: `service.name` and `service.namespace` of the resource are those
@@ -406,6 +410,7 @@ names in PostgreSQL and Prometheus match.
 | `graph_nodes`, `graph_edges` | the dependency map between services in the format of the Grafana Node Graph; peers without a service are named by address |
 | `dependency_changes` | dependencies between services that appeared, or disappeared while a host that saw them kept observing for 15 minutes |
 | `service_endpoints` | addresses and ports services accept connections on (listeners, with unspecified addresses expanded to the addresses of the host, and server edges); used by the connector |
+| `client_endpoints` | the client sides of connections in the last hour (client address, server address, port, client service); used by the connector to name the peer of a server edge |
 | `agent_addrs` | addresses of hosts whose agent reported in the last 5 minutes; used by the connector |
 | `agents` | the latest segment of every host and whether its agent is alive |
 | `unobserved(since, until, tolerance)` | the periods in which each host was not observed; Grafana overlays them as annotations |
@@ -421,7 +426,7 @@ recording rules in `packaging/prometheus/shawk-rules.yml` count it once:
 
 | metric | per dependency |
 |---|---|
-| connections, open connections, bytes, datagrams, RTT | the client side; the server side only when the client has no agent (`service_peer_name != "~agent"`) |
+| connections, open connections, bytes, datagrams, RTT | the client side; the server side only when the client has no agent (`shawk_peer_agent="false"`) |
 | connection failures | the client side only (the server never sees them) |
 | retransmissions | both sides: each counts its own retransmitted segments; `shawk_role` is the sender |
 
@@ -486,5 +491,3 @@ parses. shawk runs beside it instead:
 - **Clocks**: times come from the clock of each agent; heartbeats are
   compared with the clock of PostgreSQL.
 - **Retention**: rows in PostgreSQL are not deleted yet.
-- **Retransmissions toward clients with an agent** are labeled `~agent` on
-  the server side in Prometheus.

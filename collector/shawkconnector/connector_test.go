@@ -2,6 +2,8 @@ package shawkconnector
 
 import (
 	"context"
+	"fmt"
+	"maps"
 	"os"
 	"strings"
 	"testing"
@@ -108,7 +110,7 @@ func TestPeerNames(t *testing.T) {
 			{role: "server", proto: "tcp", local: "10.0.0.10", peer: "10.9.9.9", port: 5432, svc: "postgres", comm: "postgres", opened: 1},
 			{role: "server", proto: "tcp", local: "127.0.0.1", peer: "127.0.0.1", port: 5432, svc: "postgres", comm: "postgres", opened: 1},
 		}})
-	out := consume(t, c, sink, tAgent{host: "app-01", addrs: []string{"127.0.0.1", "10.0.0.11"}, time: ts,
+	out2 := consume(t, c, sink, tAgent{host: "app-01", addrs: []string{"127.0.0.1", "10.0.0.11"}, time: ts,
 		edges: []tEdge{
 			{role: "client", proto: "tcp", local: "10.0.0.11", peer: "10.0.0.10", port: 5432, svc: "app", ns: "shop", comm: "puma", opened: 3},
 			{role: "client", proto: "tcp", local: "10.0.0.11", peer: "93.184.215.14", port: 443, svc: "app", ns: "shop", comm: "puma", opened: 1},
@@ -118,7 +120,7 @@ func TestPeerNames(t *testing.T) {
 			{role: "client", proto: "tcp", local: "127.0.0.1", peer: "127.0.0.1", port: 5432, svc: "app", ns: "shop", comm: "puma", opened: 1},
 		}})
 	peers := map[string]bool{}
-	for _, s := range find(out, metricConnOpened, "shop/app", "*", roleClient, "") {
+	for _, s := range find(out2, metricConnOpened, "shop/app", "*", roleClient, "") {
 		peers[s.peer] = true
 		if s.instance != "app-01" {
 			t.Errorf("instance = %q", s.instance)
@@ -134,7 +136,7 @@ func TestPeerNames(t *testing.T) {
 	}
 
 	// The server side, now that the app host is known as an agent.
-	out = consume(t, c, sink, tAgent{host: "db-01", addrs: []string{"127.0.0.1", "10.0.0.10"}, time: ts.Add(15 * time.Second),
+	out := consume(t, c, sink, tAgent{host: "db-01", addrs: []string{"127.0.0.1", "10.0.0.10"}, time: ts.Add(15 * time.Second),
 		edges: []tEdge{
 			{role: "server", proto: "tcp", local: "10.0.0.10", peer: "10.0.0.11", port: 5432, svc: "postgres", comm: "postgres", opened: 6},
 			{role: "server", proto: "tcp", local: "10.0.0.10", peer: "192.168.10.7", port: 5432, svc: "postgres", comm: "postgres", opened: 1},
@@ -143,13 +145,22 @@ func TestPeerNames(t *testing.T) {
 		}})
 	got := map[string]float64{}
 	for _, s := range find(out, metricConnOpened, "postgres", "*", roleServer, "") {
-		got[s.peer] = s.value
+		got[fmt.Sprintf("%s/%v", s.peer, s.agent)] = s.value
 	}
 	// The edge from 10.0.0.11 was named ~unresolved while app-01 was
-	// unknown; its increase since then goes to ~agent, as does the loopback
-	// edge.
-	if len(got) != 3 || got["office-lan"] != 1 || got["~unresolved"] != 6 || got["~agent"] != 2 {
-		t.Errorf("server peers = %v", got)
+	// unknown; its increase since then goes to the client service of
+	// app-01, which has an agent. The loopback client has no known client
+	// edge but is on the host itself.
+	want := map[string]float64{"office-lan/false": 1, "~unresolved/false": 6, "shop/app/true": 1, "~unresolved/true": 1}
+	if !maps.Equal(got, want) {
+		t.Errorf("server peers = %v, want %v", got, want)
+	}
+	// The client side of the app knows that postgres runs on a host with an
+	// agent, and the external peer does not.
+	for _, s := range find(out2, metricConnOpened, "shop/app", "*", roleClient, "") {
+		if wantAgent := s.peer == "postgres" || s.port == 5432; s.agent != wantAgent {
+			t.Errorf("client series %s:%d agent = %v", s.peer, s.port, s.agent)
+		}
 	}
 }
 
@@ -242,12 +253,12 @@ func TestMaxPeers(t *testing.T) {
 		edges = append(edges, tEdge{role: "client", proto: "tcp", local: "10.0.0.11", peer: peer, port: int64(443 + i),
 			svc: "app", comm: "app", opened: 1, start: t0})
 	}
-	c.resolver.load([]endpointRow{
+	c.resolver.load(peerRows{endpoints: []endpointRow{
 		{key: endpointKey{addrOf("1.1.1.1"), 443, "tcp"}, endpoint: endpoint{host: "x", service: "a"}},
 		{key: endpointKey{addrOf("2.2.2.2"), 444, "tcp"}, endpoint: endpoint{host: "x", service: "b"}},
 		{key: endpointKey{addrOf("3.3.3.3"), 445, "tcp"}, endpoint: endpoint{host: "x", service: "c"}},
 		{key: endpointKey{addrOf("4.4.4.4"), 446, "tcp"}, endpoint: endpoint{host: "x", service: "d"}},
-	}, nil)
+	}})
 	out := consume(t, c, sink, tAgent{host: "app-01", time: t0.Add(15 * time.Second), edges: edges})
 	peers := map[string]int{}
 	for _, s := range find(out, metricConnOpened, "app", "*", roleClient, "") {
@@ -335,7 +346,7 @@ func TestConfigValidate(t *testing.T) {
 		"short ttl":         func(c *Config) { c.IdleTTL = time.Second },
 		"no peers":          func(c *Config) { c.MaxPeers = 0 },
 		"bad cidr":          func(c *Config) { c.PeerCIDRs = map[string]string{"x": "10.0.0.0/33"} },
-		"reserved name":     func(c *Config) { c.PeerCIDRs = map[string]string{"~agent": "10.0.0.0/8"} },
+		"reserved name":     func(c *Config) { c.PeerCIDRs = map[string]string{"~other": "10.0.0.0/8"} },
 	} {
 		c := *ok
 		mod(&c)

@@ -53,26 +53,27 @@ func inline(expr string, records map[string]string) string {
 // serves an office PC without an agent.
 const series = `
 load 1m
-  shawk_connection_opened_total{job="shop/app", instance="app-01", shawk_role="client", service_peer_name="postgres", server_port="5432", network_transport="tcp"} 0+60x10
-  shawk_connection_opened_total{job="shop/app", instance="app-02", shawk_role="client", service_peer_name="postgres", server_port="5432", network_transport="tcp"} 0+60x10
-  shawk_connection_opened_total{job="postgres", instance="db-01", shawk_role="server", service_peer_name="~agent", server_port="5432", network_transport="tcp"} 0+120x10
-  shawk_connection_opened_total{job="postgres", instance="db-01", shawk_role="server", service_peer_name="office-lan", server_port="5432", network_transport="tcp"} 0+180x10
-  shawk_connection_failed_total{job="shop/app", instance="app-01", shawk_role="client", service_peer_name="postgres", server_port="5432", network_transport="tcp"} 0+30x10
-  shawk_connection_count{job="shop/app", instance="app-01", shawk_role="client", service_peer_name="postgres", server_port="5432", network_transport="tcp"} 4x10
-  shawk_connection_count{job="postgres", instance="db-01", shawk_role="server", service_peer_name="~agent", server_port="5432", network_transport="tcp"} 4x10
-  shawk_connection_count{job="postgres", instance="db-01", shawk_role="server", service_peer_name="office-lan", server_port="5432", network_transport="tcp"} 1x10
-  shawk_network_io_bytes_total{job="shop/app", instance="app-01", shawk_role="client", service_peer_name="postgres", server_port="5432", network_transport="tcp", network_io_direction="transmit"} 0+600x10
-  shawk_network_io_bytes_total{job="shop/app", instance="app-01", shawk_role="client", service_peer_name="postgres", server_port="5432", network_transport="tcp", network_io_direction="receive"} 0+6000x10
-  shawk_network_io_bytes_total{job="postgres", instance="db-01", shawk_role="server", service_peer_name="~agent", server_port="5432", network_transport="tcp", network_io_direction="receive"} 0+600x10
-  shawk_network_io_bytes_total{job="postgres", instance="db-01", shawk_role="server", service_peer_name="~agent", server_port="5432", network_transport="tcp", network_io_direction="transmit"} 0+6000x10
-  shawk_network_io_bytes_total{job="postgres", instance="db-01", shawk_role="server", service_peer_name="office-lan", server_port="5432", network_transport="tcp", network_io_direction="receive"} 0+300x10
-  shawk_network_io_bytes_total{job="postgres", instance="db-01", shawk_role="server", service_peer_name="office-lan", server_port="5432", network_transport="tcp", network_io_direction="transmit"} 0+3000x10
-  shawk_tcp_rtt_seconds_sum{job="shop/app", instance="app-01", shawk_role="client", service_peer_name="postgres", server_port="5432", network_transport="tcp"} 0+0.06x10
-  shawk_tcp_rtt_seconds_count{job="shop/app", instance="app-01", shawk_role="client", service_peer_name="postgres", server_port="5432", network_transport="tcp"} 0+60x10
-  shawk_tcp_retransmits_total{job="shop/app", instance="app-01", shawk_role="client", service_peer_name="postgres", server_port="5432", network_transport="tcp"} 0+60x10
-  shawk_tcp_retransmits_total{job="postgres", instance="db-01", shawk_role="server", service_peer_name="office-lan", server_port="5432", network_transport="tcp"} 0+120x10
-  shawk_udp_datagrams_total{job="shop/app", instance="app-01", shawk_role="client", service_peer_name="~external", server_port="53", network_transport="udp", network_io_direction="transmit"} 0+60x10
-  shawk_udp_datagrams_total{job="shop/app", instance="app-01", shawk_role="client", service_peer_name="~external", server_port="53", network_transport="udp", network_io_direction="receive"} 0+120x10
+  shawk_connection_opened_total{job="shop/app", instance="app-01", shawk_role="client", service_peer_name="postgres", shawk_peer_agent="true", server_port="5432", network_transport="tcp"} 0+60x10
+  shawk_connection_opened_total{job="shop/app", instance="app-02", shawk_role="client", service_peer_name="postgres", shawk_peer_agent="true", server_port="5432", network_transport="tcp"} 0+60x10
+  shawk_connection_opened_total{job="postgres", instance="db-01", shawk_role="server", service_peer_name="shop/app", shawk_peer_agent="true", server_port="5432", network_transport="tcp"} 0+120x10
+  shawk_connection_opened_total{job="postgres", instance="db-01", shawk_role="server", service_peer_name="office-lan", shawk_peer_agent="false", server_port="5432", network_transport="tcp"} 0+180x10
+  shawk_connection_failed_total{job="shop/app", instance="app-01", shawk_role="client", service_peer_name="postgres", shawk_peer_agent="true", server_port="5432", network_transport="tcp"} 0+30x10
+  shawk_connection_count{job="shop/app", instance="app-01", shawk_role="client", service_peer_name="postgres", shawk_peer_agent="true", server_port="5432", network_transport="tcp"} 4x10
+  shawk_connection_count{job="postgres", instance="db-01", shawk_role="server", service_peer_name="shop/app", shawk_peer_agent="true", server_port="5432", network_transport="tcp"} 4x10
+  shawk_connection_count{job="postgres", instance="db-01", shawk_role="server", service_peer_name="office-lan", shawk_peer_agent="false", server_port="5432", network_transport="tcp"} 1x10
+  shawk_network_io_bytes_total{job="shop/app", instance="app-01", shawk_role="client", service_peer_name="postgres", shawk_peer_agent="true", server_port="5432", network_transport="tcp", network_io_direction="transmit"} 0+600x10
+  shawk_network_io_bytes_total{job="shop/app", instance="app-01", shawk_role="client", service_peer_name="postgres", shawk_peer_agent="true", server_port="5432", network_transport="tcp", network_io_direction="receive"} 0+6000x10
+  shawk_network_io_bytes_total{job="postgres", instance="db-01", shawk_role="server", service_peer_name="shop/app", shawk_peer_agent="true", server_port="5432", network_transport="tcp", network_io_direction="receive"} 0+600x10
+  shawk_network_io_bytes_total{job="postgres", instance="db-01", shawk_role="server", service_peer_name="shop/app", shawk_peer_agent="true", server_port="5432", network_transport="tcp", network_io_direction="transmit"} 0+6000x10
+  shawk_network_io_bytes_total{job="postgres", instance="db-01", shawk_role="server", service_peer_name="office-lan", shawk_peer_agent="false", server_port="5432", network_transport="tcp", network_io_direction="receive"} 0+300x10
+  shawk_network_io_bytes_total{job="postgres", instance="db-01", shawk_role="server", service_peer_name="office-lan", shawk_peer_agent="false", server_port="5432", network_transport="tcp", network_io_direction="transmit"} 0+3000x10
+  shawk_tcp_rtt_seconds_sum{job="shop/app", instance="app-01", shawk_role="client", service_peer_name="postgres", shawk_peer_agent="true", server_port="5432", network_transport="tcp"} 0+0.06x10
+  shawk_tcp_rtt_seconds_count{job="shop/app", instance="app-01", shawk_role="client", service_peer_name="postgres", shawk_peer_agent="true", server_port="5432", network_transport="tcp"} 0+60x10
+  shawk_tcp_retransmits_total{job="shop/app", instance="app-01", shawk_role="client", service_peer_name="postgres", shawk_peer_agent="true", server_port="5432", network_transport="tcp"} 0+60x10
+  shawk_tcp_retransmits_total{job="postgres", instance="db-01", shawk_role="server", service_peer_name="office-lan", shawk_peer_agent="false", server_port="5432", network_transport="tcp"} 0+120x10
+  shawk_tcp_retransmits_total{job="postgres", instance="db-01", shawk_role="server", service_peer_name="shop/app", shawk_peer_agent="true", server_port="5432", network_transport="tcp"} 0+180x10
+  shawk_udp_datagrams_total{job="shop/app", instance="app-01", shawk_role="client", service_peer_name="~external", shawk_peer_agent="false", server_port="53", network_transport="udp", network_io_direction="transmit"} 0+60x10
+  shawk_udp_datagrams_total{job="shop/app", instance="app-01", shawk_role="client", service_peer_name="~external", shawk_peer_agent="false", server_port="53", network_transport="udp", network_io_direction="receive"} 0+120x10
   shawk_agent_up{job="shawk-agent", host_name="app-01"} 1x30
   shawk_agent_up{job="shawk-agent", host_name="app-02"} 1x10
   shawk_agent_flows_dropped_total{job="shawk-agent", host_name="app-01"} 0 0 0 0 0 5 5 5 5 5 5
@@ -90,7 +91,8 @@ func TestRecordingRules(t *testing.T) {
 	app := `src="shop/app", dst="postgres", server_port="5432", network_transport="tcp"`
 	office := `src="office-lan", dst="postgres", server_port="5432", network_transport="tcp"`
 	script := series + `
-# The server side of the app's connections (~agent) is not counted twice.
+# The server side of the app's connections (shawk_peer_agent="true") is not
+# counted twice.
 eval instant at 10m ` + r("shawk:dependency_connections:rate5m") + `
   {` + app + `} 2
   {` + office + `} 3
@@ -113,8 +115,10 @@ eval instant at 10m ` + r("shawk:dependency_response_bytes:rate5m") + `
 eval instant at 10m ` + r("shawk:dependency_rtt_seconds_sum:rate5m") + " / " + r("shawk:dependency_rtt_seconds_count:rate5m") + `
   {` + app + `} 0.001
 
+# Each side's own retransmissions; the server names the client service.
 eval instant at 10m ` + r("shawk:dependency_retransmits:rate5m") + `
   {` + app + `, shawk_role="client"} 1
+  {` + app + `, shawk_role="server"} 3
   {` + office + `, shawk_role="server"} 2
 
 eval instant at 10m ` + r("shawk:dependency_request_datagrams:rate5m") + `

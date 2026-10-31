@@ -222,16 +222,23 @@ func TestPGPipeline(t *testing.T) {
 		t.Cleanup(func() { c2.Shutdown(ctx) })
 		return c2, s, conn
 	}()
+	// The server side first: its client is named from client_endpoints.
+	db.time = base.Add(15 * time.Second)
+	out := consume(t, c2, sink2, db)
+	var server []series
+	for _, s := range find(out, metricConnOpened, "postgres", "*", roleServer, "") {
+		if s.port == 5432 && s.peer == "shop/app" && s.agent {
+			server = append(server, s)
+		}
+	}
+	if len(server) != 1 {
+		t.Errorf("client of a server edge not named from the database: %v", find(out, metricConnOpened, "postgres", "*", roleServer, ""))
+	}
 	app.time = base.Add(15 * time.Second)
 	app.listeners = nil
-	out := consume(t, c2, sink2, app)
-	if s := find(out, metricConnOpened, "shop/app", "postgres", roleClient, ""); len(s) != 1 {
+	out = consume(t, c2, sink2, app)
+	if s := find(out, metricConnOpened, "shop/app", "postgres", roleClient, ""); len(s) != 1 || !s[0].agent {
 		t.Errorf("peer not named from the database: %v", find(out, metricConnOpened, "shop/app", "*", roleClient, ""))
-	}
-	db.time = base.Add(15 * time.Second)
-	out = consume(t, c2, sink2, db)
-	if s := find(out, metricConnOpened, "postgres", "~agent", roleServer, ""); len(s) != 1 {
-		t.Errorf("agent peer not known from the database: %v", find(out, metricConnOpened, "postgres", "*", roleServer, ""))
 	}
 
 	// Replaying older data does not move times back.

@@ -15,25 +15,45 @@ type endpointKey struct {
 	proto string
 }
 
-// endpoint is a service that listened on an endpoint.
+// clientKey identifies the client side of connections as their server
+// sees it: the client address, the server address and the service port.
+type clientKey struct {
+	client, server netip.Addr
+	port           uint16
+	proto          string
+}
+
+// endpoint is a service seen on an endpoint, or a client service seen on
+// the client side of connections.
 type endpoint struct {
 	host     string // hosts.id
 	service  string
 	lastSeen time.Time
 }
 
-// resolver names the peers of edges (service.peer.name). It combines the
-// endpoints and agent addresses read from PostgreSQL with those the
-// connector has seen itself since, which may not be written yet.
+// peer is the name of the peer of an edge.
+type peer struct {
+	name string // service.peer.name
+	// agent tells whether the peer runs on a host with an agent, which then
+	// records the other side of the edge (shawk.peer.agent).
+	agent bool
+}
+
+// resolver names the peers of edges. It combines the endpoints, clients and
+// agent addresses read from PostgreSQL with those the connector has seen
+// itself since, which may not be written yet.
 type resolver struct {
 	cidrs []namedPrefix
 
 	mu sync.RWMutex
-	// From shawk_v1.service_endpoints and shawk_v1.agent_addrs.
+	// From shawk_v1.service_endpoints, shawk_v1.client_endpoints and
+	// shawk_v1.agent_addrs.
 	dbEndpoints map[endpointKey][]endpoint
+	dbClients   map[clientKey][]endpoint
 	dbAgents    map[netip.Addr][]string
 	// Seen by this connector, with the time they were last seen.
 	localEndpoints map[endpointKey]map[endpoint]time.Time
+	localClients   map[clientKey]map[endpoint]time.Time
 	localAgents    map[netip.Addr]map[string]time.Time
 }
 
@@ -41,8 +61,10 @@ func newResolver(cidrs []namedPrefix) *resolver {
 	return &resolver{
 		cidrs:          cidrs,
 		dbEndpoints:    map[endpointKey][]endpoint{},
+		dbClients:      map[clientKey][]endpoint{},
 		dbAgents:       map[netip.Addr][]string{},
 		localEndpoints: map[endpointKey]map[endpoint]time.Time{},
+		localClients:   map[clientKey]map[endpoint]time.Time{},
 		localAgents:    map[netip.Addr]map[string]time.Time{},
 	}
 }
@@ -53,60 +75,81 @@ type endpointRow struct {
 	endpoint
 }
 
+// clientRow is a row of shawk_v1.client_endpoints.
+type clientRow struct {
+	key clientKey
+	endpoint
+}
+
 // agentAddrRow is a row of shawk_v1.agent_addrs.
 type agentAddrRow struct {
 	addr netip.Addr
 	host string
 }
 
-// load replaces the endpoints and agent addresses read from PostgreSQL.
-func (r *resolver) load(endpoints []endpointRow, agents []agentAddrRow) {
-	eps := make(map[endpointKey][]endpoint, len(endpoints))
-	for _, e := range endpoints {
+// peerRows are the rows the resolver loads from PostgreSQL.
+type peerRows struct {
+	endpoints []endpointRow
+	clients   []clientRow
+	agents    []agentAddrRow
+}
+
+// load replaces what was read from PostgreSQL.
+func (r *resolver) load(rows peerRows) {
+	eps := make(map[endpointKey][]endpoint, len(rows.endpoints))
+	for _, e := range rows.endpoints {
 		eps[e.key] = append(eps[e.key], e.endpoint)
 	}
-	ags := make(map[netip.Addr][]string, len(agents))
-	for _, a := range agents {
+	cls := make(map[clientKey][]endpoint, len(rows.clients))
+	for _, c := range rows.clients {
+		cls[c.key] = append(cls[c.key], c.endpoint)
+	}
+	ags := make(map[netip.Addr][]string, len(rows.agents))
+	for _, a := range rows.agents {
 		ags[a.addr] = append(ags[a.addr], a.host)
 	}
 	r.mu.Lock()
-	r.dbEndpoints, r.dbAgents = eps, ags
+	r.dbEndpoints, r.dbClients, r.dbAgents = eps, cls, ags
 	r.mu.Unlock()
 }
 
-// learn records the endpoints and addresses of a host seen in a request at
-// now. Listeners on an unspecified address listen on every address of the
-// host.
+func learnInto[K comparable](m map[K]map[endpoint]time.Time, k K, host, service string, now time.Time) {
+	if service == "" {
+		return
+	}
+	es := m[k]
+	if es == nil {
+		es = map[endpoint]time.Time{}
+		m[k] = es
+	}
+	es[endpoint{host: host, service: service}] = now
+}
+
+// learn records the endpoints, clients and addresses of a host seen in a
+// request at now. Listeners on an unspecified address listen on every
+// address of the host.
 func (r *resolver) learn(b *hostBatch, now time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	addEndpoint := func(k endpointKey, service string, t time.Time) {
-		if service == "" {
-			return
-		}
-		m := r.localEndpoints[k]
-		if m == nil {
-			m = map[endpoint]time.Time{}
-			r.localEndpoints[k] = m
-		}
-		m[endpoint{host: b.key, service: service}] = t
-	}
 	for _, l := range b.listeners {
 		svc := l.id.job()
 		if !l.id.addr.IsUnspecified() {
-			addEndpoint(endpointKey{l.id.addr, l.id.port, l.id.proto}, svc, now)
+			learnInto(r.localEndpoints, endpointKey{l.id.addr, l.id.port, l.id.proto}, b.key, svc, now)
 			continue
 		}
 		for _, a := range b.addrs {
 			if l.id.addr.Is4() && !a.Is4() {
 				continue
 			}
-			addEndpoint(endpointKey{a, l.id.port, l.id.proto}, svc, now)
+			learnInto(r.localEndpoints, endpointKey{a, l.id.port, l.id.proto}, b.key, svc, now)
 		}
 	}
 	for _, e := range b.edges {
-		if e.id.role == roleServer {
-			addEndpoint(endpointKey{e.id.local, e.id.port, e.id.proto}, e.id.job(), now)
+		switch e.id.role {
+		case roleServer:
+			learnInto(r.localEndpoints, endpointKey{e.id.local, e.id.port, e.id.proto}, b.key, e.id.job(), now)
+		case roleClient:
+			learnInto(r.localClients, clientKey{e.id.local, e.id.peer, e.id.port, e.id.proto}, b.key, e.id.job(), now)
 		}
 	}
 	for _, a := range b.addrs {
@@ -119,76 +162,80 @@ func (r *resolver) learn(b *hostBatch, now time.Time) {
 	}
 }
 
+func expireLearned[K comparable, V comparable](m map[K]map[V]time.Time, t time.Time) {
+	for k, es := range m {
+		for e, at := range es {
+			if at.Before(t) {
+				delete(es, e)
+			}
+		}
+		if len(es) == 0 {
+			delete(m, k)
+		}
+	}
+}
+
 // expire forgets what was learned before t.
 func (r *resolver) expire(t time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for k, m := range r.localEndpoints {
-		for e, at := range m {
-			if at.Before(t) {
-				delete(m, e)
-			}
-		}
-		if len(m) == 0 {
-			delete(r.localEndpoints, k)
-		}
-	}
-	for a, m := range r.localAgents {
-		for h, at := range m {
-			if at.Before(t) {
-				delete(m, h)
-			}
-		}
-		if len(m) == 0 {
-			delete(r.localAgents, a)
-		}
-	}
+	expireLearned(r.localEndpoints, t)
+	expireLearned(r.localClients, t)
+	expireLearned(r.localAgents, t)
 }
 
-// peerName names the peer of an edge of host.
-func (r *resolver) peerName(host string, id *edgeID) string {
+// peer names the peer of an edge of host.
+//
+// The peer of a client edge is the service listening on the peer address
+// and port. The peer of a server edge is the client service whose client
+// edge has the same addresses and port. A peer without a known service is
+// named after its address range.
+func (r *resolver) peer(host string, id *edgeID) peer {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	// A loopback peer is on the same host.
 	sameHost := id.peer.IsLoopback()
+	p := peer{agent: sameHost || r.isAgent(id.peer)}
 	if id.role == roleClient {
-		if svc := r.service(host, endpointKey{id.peer, id.port, id.proto}, sameHost); svc != "" {
-			return svc
-		}
-	} else if sameHost || r.isAgent(id.peer) {
-		// The client side of the edge is recorded by its own agent.
-		return peerAgent
+		k := endpointKey{id.peer, id.port, id.proto}
+		p.name = best(host, r.localEndpoints[k], r.dbEndpoints[k], sameHost)
+	} else {
+		k := clientKey{id.peer, id.local, id.port, id.proto}
+		p.name = best(host, r.localClients[k], r.dbClients[k], sameHost)
 	}
-	return r.classify(id.peer)
+	if p.name == "" {
+		p.name = r.classify(id.peer)
+	}
+	return p
 }
 
-// service returns the service listening on an endpoint. An endpoint of the
-// host itself is preferred, then the most recently seen one.
-func (r *resolver) service(host string, k endpointKey, sameHostOnly bool) string {
-	var best endpoint
+// best returns the service of the best candidate: one on the host itself,
+// then the most recently seen one.
+func best(host string, local map[endpoint]time.Time, db []endpoint, sameHostOnly bool) string {
+	var b endpoint
 	consider := func(e endpoint) {
 		if sameHostOnly && e.host != host {
 			return
 		}
 		switch {
-		case best.service == "":
-			best = e
-		case (e.host == host) != (best.host == host):
+		case b.service == "":
+			b = e
+		case (e.host == host) != (b.host == host):
 			if e.host == host {
-				best = e
+				b = e
 			}
-		case e.lastSeen.After(best.lastSeen):
-			best = e
+		case e.lastSeen.After(b.lastSeen):
+			b = e
 		}
 	}
-	for e, at := range r.localEndpoints[k] {
+	for e, at := range local {
 		e.lastSeen = at
 		consider(e)
 	}
-	for _, e := range r.dbEndpoints[k] {
+	for _, e := range db {
 		consider(e)
 	}
-	return best.service
+	return b.service
 }
 
 func (r *resolver) isAgent(a netip.Addr) bool {

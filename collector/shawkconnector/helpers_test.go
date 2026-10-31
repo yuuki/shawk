@@ -187,8 +187,7 @@ type fakeStore struct {
 	mu       sync.Mutex
 	writes   []*hostChanges
 	fail     bool
-	eps      []endpointRow
-	agents   []agentAddrRow
+	rows     peerRows
 	migrated int
 }
 
@@ -209,10 +208,10 @@ func (s *fakeStore) write(_ context.Context, h *hostChanges) error {
 	return nil
 }
 
-func (s *fakeStore) peers(context.Context) ([]endpointRow, []agentAddrRow, error) {
+func (s *fakeStore) peers(context.Context) (peerRows, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.eps, s.agents, nil
+	return s.rows, nil
 }
 
 func (s *fakeStore) close() {}
@@ -256,6 +255,7 @@ func testConnector(t *testing.T, mod func(*Config)) (*shawkConnector, *fakeStore
 // series is an output data point flattened for comparisons.
 type series struct {
 	job, instance, metric, peer, role, dir string
+	agent                                  bool
 	port                                   int64
 	value                                  float64
 	count                                  uint64
@@ -278,8 +278,10 @@ func flatten(md pmetric.Metrics) []series {
 				m := ms.At(k)
 				add := func(a pcommon.Map, v float64, c uint64) {
 					port, _ := getInt(a, attrServerPort)
+					agent, _ := a.Get(attrPeerAgent)
 					out = append(out, series{job: job, instance: inst, metric: m.Name(), peer: getString(a, attrPeerService),
-						role: getString(a, attrRole), dir: getString(a, attrIODirection), port: port, value: v, count: c})
+						agent: agent.Bool(),
+						role:  getString(a, attrRole), dir: getString(a, attrIODirection), port: port, value: v, count: c})
 				}
 				switch m.Type() {
 				case pmetric.MetricTypeSum:

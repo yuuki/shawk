@@ -62,6 +62,7 @@ type outKey struct {
 	metric    string
 	dir       string
 	peer      string // service.peer.name
+	peerAgent bool   // shawk.peer.agent
 	role      string
 	transport string
 	port      uint16
@@ -128,7 +129,7 @@ func (a *aggregator) peer(g peerGroup, name string, now time.Time) string {
 
 // add accounts the request of a host and appends the output of the host to
 // out: every live output series of the host, and the agent's own metrics.
-func (a *aggregator) add(b *hostBatch, peerName func(*edgeID) string, now time.Time, out pmetric.Metrics) {
+func (a *aggregator) add(b *hostBatch, peerOf func(*edgeID) peer, now time.Time, out pmetric.Metrics) {
 	ts := b.time
 	if ts.IsZero() {
 		ts = now
@@ -153,19 +154,21 @@ func (a *aggregator) add(b *hostBatch, peerName func(*edgeID) string, now time.T
 			a.outputs[rk] = r
 		}
 		r.machineID, r.hostname = b.machineID, b.hostname
-		peer := a.peer(peerGroup{b.key, e.id.service, e.id.svcNS, e.id.role}, peerName(&e.id), now)
-		for vk, p := range e.values {
+		p := peerOf(&e.id)
+		name := a.peer(peerGroup{b.key, e.id.service, e.id.svcNS, e.id.role}, p.name, now)
+		for vk, pt := range e.values {
 			m, ok := outMetrics[vk.metric]
 			if !ok {
 				continue
 			}
-			key := outKey{metric: vk.metric, dir: vk.dir, peer: peer, role: e.id.role, transport: e.id.proto, port: e.id.port}
+			key := outKey{metric: vk.metric, dir: vk.dir, peer: name, peerAgent: p.agent, role: e.id.role,
+				transport: e.id.proto, port: e.id.port}
 			if a.keepPeerAddr {
 				key.peerAddr = e.id.peer.String()
 			}
 			s := r.series[key]
 			if s == nil {
-				start := p.start.AsTime()
+				start := pt.start.AsTime()
 				if start.Before(a.started) || start.After(ts) {
 					start = a.started
 				}
@@ -174,10 +177,10 @@ func (a *aggregator) add(b *hostBatch, peerName func(*edgeID) string, now time.T
 			}
 			s.seen = now
 			if m.gauge {
-				s.value += p.value
+				s.value += pt.value
 				continue
 			}
-			dv, dc := a.delta(inputKey{b.key, e.id, vk}, p, now)
+			dv, dc := a.delta(inputKey{b.key, e.id, vk}, pt, now)
 			s.value += dv
 			s.count += dc
 		}
@@ -330,6 +333,7 @@ func (r *outResource) appendTo(k outResKey, ts time.Time, out pmetric.Metrics) {
 				dpAttrs = dp.Attributes()
 			}
 			dpAttrs.PutStr(attrPeerService, key.peer)
+			dpAttrs.PutBool(attrPeerAgent, key.peerAgent)
 			dpAttrs.PutStr(attrRole, key.role)
 			dpAttrs.PutInt(attrServerPort, int64(key.port))
 			dpAttrs.PutStr(attrTransport, key.transport)

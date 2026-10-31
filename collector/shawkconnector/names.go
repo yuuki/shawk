@@ -39,6 +39,7 @@ const (
 	attrServiceVersion    = "service.version"
 	attrServiceInstanceID = "service.instance.id"
 	attrPeerService       = "service.peer.name"
+	attrPeerAgent         = "shawk.peer.agent"
 
 	attrExePath     = "process.executable.path"
 	attrCommand     = "process.command"
@@ -61,7 +62,6 @@ const (
 
 // Values of service.peer.name for peers without a known service.
 const (
-	peerAgent      = "~agent"      // server side of an edge whose client host runs an agent
 	peerUnresolved = "~unresolved" // a private address without a known service
 	peerExternal   = "~external"   // a public address
 	peerOther      = "~other"      // folded beyond max_peers

@@ -152,16 +152,19 @@ PostgreSQL の書き込み権限を持つのは connector だけで、エージ�
 
 ### 4.2 相手の名前
 
-connector は PostgreSQL の `shawk_v1.service_endpoints` と `shawk_v1.agent_addrs` を手元に保持する。1 分ごとに読み直し、自分が書いた変化もその場で反映する。`service.peer.name` は次のように決める。
+connector は PostgreSQL の `shawk_v1.service_endpoints`、`shawk_v1.client_endpoints`、`shawk_v1.agent_addrs` を手元に保持する。1 分ごとに読み直し、自分が書いた変化もその場で反映する。`service.peer.name` は次のように決める。
 
 | 役割 | 相手 | `service.peer.name` |
 |---|---|---|
 | client | 相手のアドレスとポートで待ち受けているサービスが `service_endpoints` で分かる | そのサービス名 |
-| client | 分からないが、設定した名前付き CIDR に入る | その名前（例 `office-lan`） |
-| client | 分からず、プライベート範囲 | `~unresolved` |
-| client | 分からず、それ以外 | `~external` |
-| server | 相手のアドレスがエージェントのいるホストのもの（`agent_addrs`） | `~agent`（クライアント側の系列が正。§4.4） |
-| server | それ以外 | 名前付き CIDR、`~unresolved`、`~external` の順 |
+| server | 同じアドレスの組とポートのクライアント側のエッジが `client_endpoints` で分かる | クライアントのサービス名 |
+| 両方 | 分からないが、設定した名前付き CIDR に入る | その名前（例 `office-lan`） |
+| 両方 | 分からず、プライベート範囲 | `~unresolved` |
+| 両方 | 分からず、それ以外 | `~external` |
+
+これとは別に、相手のアドレスがエージェントの生きているホストのもの（`agent_addrs`。ループバックを含む）かどうかを `shawk.peer.agent`（true / false）で付ける。true なら相手側の系列もあるので、§4.4 の規約はこれを使って二重計上を避ける。
+
+（改訂：当初はサーバ側でエージェントのいるクライアントを `~agent` という名前に畳んでいたが、再送の `src` が分からなくなるため、名前と「相手にエージェントがあるか」を分けた。§10 の未決事項を参照。）
 
 - 区分の値は `~` で始める。実在のサービス名と衝突させないため。
 - 名前付き CIDR は connector の設定 `peer_cidrs` で与える。最も狭い範囲が勝つ。
@@ -180,6 +183,7 @@ connector は §3.1 の「集約して転送」のメトリクスを、次の属
 | resource の `service.instance.id`（= `host.name`） | `instance` |
 | resource の `host.id` / `host.name` | `host_id` / `host_name`（Prometheus の `promote_resource_attributes` で昇格させる） |
 | `service.peer.name` | `service_peer_name` |
+| `shawk.peer.agent` | `shawk_peer_agent`（`true` / `false`） |
 | `shawk.role` | `shawk_role` |
 | `server.port` | `server_port` |
 | `network.transport` | `network_transport` |
@@ -212,11 +216,11 @@ Prometheus 側の設定：`--web.enable-otlp-receiver`、`promote_resource_attri
 
 | メトリクス | 依存単位の値の取り方 |
 |---|---|
-| 接続数、開いている接続、バイト数、UDP 数、RTT | クライアント側を正とする。サーバ側は相手にエージェントがない場合（`service_peer_name != "~agent"`）だけ使う |
+| 接続数、開いている接続、バイト数、UDP 数、RTT | クライアント側を正とする。サーバ側は相手にエージェントがない場合（`shawk_peer_agent="false"`）だけ使う |
 | 接続の失敗 | クライアント側だけ（サーバには届かないため） |
-| 再送 | 両側を使う。各ソケットが自分の送信を再送した数なので重複ではない。`shawk_role` で送信側を区別する |
+| 再送 | 両側を使う。各ソケットが自分の送信を再送した数なので重複ではない。`shawk_role` で送信側を区別する。サーバ側の系列もクライアントのサービス名を持つので、`src` が分かる |
 
-サーバ側の `~agent` 系列とクライアント側の系列は重ならないように作ってあるので、依存単位の値は和集合をとるだけで求まる。依存単位の系列は recording rule で作り、ダッシュボードとアラートはこれを使う。
+サーバ側の `shawk_peer_agent="true"` の系列とクライアント側の系列は重ならないように作ってあるので、依存単位の値は和集合をとるだけで求まる。依存単位の系列は recording rule で作り、ダッシュボードとアラートはこれを使う。
 
 ```yaml
 groups:
@@ -230,7 +234,7 @@ groups:
                 "src", "$1", "job", "(.*)"), "dst", "$1", "service_peer_name", "(.*)")
             or
               label_replace(label_replace(
-                rate(shawk_connection_opened_total{shawk_role="server", service_peer_name!="~agent"}[5m]),
+                rate(shawk_connection_opened_total{shawk_role="server", shawk_peer_agent="false"}[5m]),
                 "dst", "$1", "job", "(.*)"), "src", "$1", "service_peer_name", "(.*)")
           )
       - record: shawk:dependency_connection_failures:rate5m
@@ -414,7 +418,8 @@ $$;
 | `graph_nodes` / `graph_edges` | Node Graph が要求する列（`id`, `title`, `subtitle`, `mainstat` / `id`, `source`, `target`, `mainstat`） | 依存マップ |
 | `dependency_changes` | `time`, `change`（appeared / disappeared）, `client_service`, `server_service`, `port` | 変化の表と注釈 |
 | `service_endpoints` | `addr`, `port`, `proto`, `host`, `service` | connector が `service.peer.name` を決める |
-| `agent_addrs` | `addr`, `host` | connector がサーバ側の `~agent` を判定する |
+| `client_endpoints` | `client_addr`, `server_addr`, `port`, `proto`, `host`, `service` | connector がサーバ側の相手（クライアント）の名前を決める |
+| `agent_addrs` | `addr`, `host` | connector が `shawk.peer.agent` を判定する |
 | `agents` | `host`, `started_at`, `last_heartbeat`, `udp_traced`, `netns_scope`, `dropped_flows`, `alive` | エージェントの状態 |
 
 `dependencies` の組み立て（P0-3）：
@@ -627,7 +632,7 @@ group by (src, dst) (
 - スキーマは `collector/shawkconnector/migrations/` の SQL を埋め込み、`shawk-migrate` コマンド（`make shawk-migrate`）か connector の `postgres.migrate: true` で当てる。適用済みの版は `shawk.schema_migrations` に残す。接続文字列は `postgres.dsn` か `postgres.dsn_file`。
 - connector の起動時に DB に届かなくても Collector は起動する。変化は手元に溜め、名前は前回読んだもの（なければ区分）で付ける。
 - `service.peer.name` の決め方の細部：
-  - ループバックの相手は同じホストとみなす。クライアント側は同じホストの待ち受けだけで名前を引き、サーバ側は `~agent` にする。
+  - ループバックの相手は同じホストとみなす。名前は同じホストの待ち受け（クライアント側）か同じホストのクライアント側のエッジ（サーバ側）だけで引き、`shawk.peer.agent` は true にする。
   - 同じアドレスとポートに複数のサービスが見つかったら、同じホストのもの、次に最も新しく見たものを選ぶ。
   - `peer_cidrs` の値はカンマ区切りで複数の範囲を書ける。`~` で始まる名前は使えない。
   - 区分 `~unresolved` の「プライベート範囲」は、RFC 1918、ループバック、リンクローカル、CGNAT（100.64.0.0/10）、IPv6 ULA。
@@ -638,7 +643,8 @@ group by (src, dst) (
 - 出力のリソースには `service.name`、`service.namespace`（あれば）、`service.instance.id`（= `host.name`）、`host.id`、`host.name` を付ける。エージェント自身のメトリクスは `service.name=shawk-agent` のリソースで、`shawk.agent.segment.start` を除いて転送する。
 - `shawk_v1` のビューの細部：
   - `service_endpoints` は、待ち受けポート（`0.0.0.0` は同じホストの IPv4 アドレスに、`::` は全アドレスに展開する）とサーバ側のエッジの（ローカルアドレス, ポート）から作る。直近 7 日に見たものだけを返す。列 `host_id` と `last_seen` を加えた。§8 の「`0.0.0.0` の待ち受けポートの展開」のうち、ホストのアドレスへの単純な展開だけを先に入れた（これがないと、ほとんどのサーバの名前が引けないため）。
-  - `agent_addrs` は、直近 5 分以内に報告したホストのアドレスだけを返す。クライアント側のエージェントが止まると、サーバ側の系列は 5 分ほどで `~agent` から区分の名前に変わり、依存単位の値に数えられるようになる。
+  - `agent_addrs` は、直近 5 分以内に報告したホストのアドレスだけを返す。クライアント側のエージェントが止まると、サーバ側の系列は 5 分ほどで `shawk_peer_agent` が false に変わり、依存単位の値に数えられるようになる。
+  - `client_endpoints` は、直近 1 時間に見たクライアント側のエッジ（クライアントのアドレス、サーバのアドレス、ポート、クライアントのサービス）を返す。サーバ側のエッジはクライアント側のエッジが生きている間だけ送られるので、1 時間で足りる。
   - `dependencies` に `client_addr` と `server_unit` を加えた。ループバックのアドレスどうしは、同じホスト・同じ netns のエッジだけを突き合わせる。
   - `graph_nodes` / `graph_edges` / `dependency_changes` はサービス単位にまとめる。サービス名のない相手はアドレスをノードの名前にする。`dependency_changes` の「消えた」は、その依存を見ていたホストが `last_seen` から 15 分以上観測を続けていることを条件にする。
   - `unobserved()` は `SECURITY DEFINER` にした（読み取りのロールが `shawk` スキーマの表を読めなくても使えるように）。

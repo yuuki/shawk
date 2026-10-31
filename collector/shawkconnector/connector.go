@@ -108,12 +108,12 @@ func (c *shawkConnector) prepare(ctx context.Context) bool {
 		c.migrated = true
 		c.mu.Unlock()
 	}
-	eps, agents, err := c.store.peers(ctx)
+	rows, err := c.store.peers(ctx)
 	if err != nil {
 		c.log.Warn("reading the names of peers from PostgreSQL", zap.Error(err))
 		return true
 	}
-	c.resolver.load(eps, agents)
+	c.resolver.load(rows)
 	return true
 }
 
@@ -220,7 +220,7 @@ func (c *shawkConnector) ConsumeMetrics(ctx context.Context, md pmetric.Metrics)
 		c.resolver.learn(b, now)
 		c.mu.Lock()
 		c.changes.add(b, now)
-		c.agg.add(b, func(id *edgeID) string { return c.resolver.peerName(b.key, id) }, now, out)
+		c.agg.add(b, func(id *edgeID) peer { return c.resolver.peer(b.key, id) }, now, out)
 		c.mu.Unlock()
 	}
 	if out.ResourceMetrics().Len() > 0 {
