@@ -27,9 +27,6 @@ import (
 
 const (
 	defaultMaxFlows = 16384
-	// flipGrace is how long to wait after switching the active flow map so
-	// that BPF programs that read the old index finish their updates.
-	flipGrace = 20 * time.Millisecond
 )
 
 // Options configures a Tracer.
@@ -62,6 +59,7 @@ type Tracer struct {
 	udp   bool
 
 	flowMaps       [2]*ebpf.Map
+	flowsOuter     *ebpf.Map
 	listenPorts    *ebpf.Map
 	udpListenPorts *ebpf.Map
 	markUDPServers *ebpf.Variable
@@ -221,6 +219,7 @@ func (t *Tracer) loadCore(spec *ebpf.CollectionSpec) error {
 	t.colls = append(t.colls, coll)
 	t.progs = maps.Clone(coll.Programs)
 	t.flowMaps = [2]*ebpf.Map{coll.Maps[bpfMapFlows0], coll.Maps[bpfMapFlows1]}
+	t.flowsOuter = coll.Maps[bpfMapFlows]
 	t.listenPorts = coll.Maps[bpfMapListenPorts]
 	t.udpListenPorts = coll.Maps[bpfMapUdpListenPorts]
 	t.markUDPServers = coll.Variables[bpfVarMarkUdpServers]
@@ -422,7 +421,12 @@ func (t *Tracer) flip() ([]Flow, error) {
 		return nil, fmt.Errorf("switching flow map: %w", err)
 	}
 	t.idx = next
-	time.Sleep(flipGrace)
+	// Programs that read the old index may still be updating the old map.
+	// Updating an element of a map-in-map makes the kernel wait for an RCU
+	// grace period, after which they have all finished.
+	if err := t.flowsOuter.Update(old, t.flowMaps[old], ebpf.UpdateAny); err != nil {
+		return nil, fmt.Errorf("waiting for programs: %w", err)
+	}
 
 	m := t.flowMaps[old]
 	var (
