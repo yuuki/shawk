@@ -26,6 +26,10 @@ type Config struct {
 	// KeepPeerAddress keeps network.peer.address in the output. It raises
 	// the number of series with the number of peer addresses.
 	KeepPeerAddress bool `mapstructure:"keep_peer_address"`
+	// Retention is how long rows are kept in PostgreSQL after they were
+	// last seen; zero keeps them forever. The connector deletes older rows
+	// every hour.
+	Retention time.Duration `mapstructure:"retention"`
 }
 
 // PostgresConfig configures the connection to PostgreSQL.
@@ -45,6 +49,7 @@ func createDefaultConfig() *Config {
 		WriteInterval: time.Minute,
 		IdleTTL:       15 * time.Minute,
 		MaxPeers:      50,
+		Retention:     3 * 365 * 24 * time.Hour,
 	}
 }
 
@@ -59,6 +64,9 @@ func (c *Config) Validate() error {
 	}
 	if c.IdleTTL < c.WriteInterval {
 		errs = append(errs, errors.New("idle_ttl must not be shorter than write_interval"))
+	}
+	if c.Retention != 0 && c.Retention < 24*time.Hour {
+		errs = append(errs, errors.New("retention must be zero (keep forever) or at least 24h"))
 	}
 	if c.MaxPeers < 1 {
 		errs = append(errs, errors.New("max_peers must be at least 1"))

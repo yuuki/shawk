@@ -54,7 +54,7 @@ func TestPackagedCollectorConfig(t *testing.T) {
 		t.Error(err)
 	}
 	if cfg.Postgres.DSNFile == "" || cfg.WriteInterval != time.Minute || cfg.IdleTTL != 15*time.Minute ||
-		cfg.MaxPeers != 50 || cfg.PeerCIDRs["office-lan"] != "192.168.10.0/24" {
+		cfg.MaxPeers != 50 || cfg.PeerCIDRs["office-lan"] != "192.168.10.0/24" || cfg.Retention != 3*365*24*time.Hour {
 		t.Errorf("config = %+v", cfg)
 	}
 	for name, p := range doc.Service.Pipelines {
@@ -227,7 +227,8 @@ func TestPGPackaged(t *testing.T) {
 	if err := pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error { return writeHost(ctx, tx, h) }); err != nil {
 		t.Errorf("writing as shawk_connector: %v", err)
 	}
-	for _, q := range []string{`SELECT count(*) FROM shawk_v1.service_endpoints`, `SELECT count(*) FROM shawk_v1.agent_addrs`} {
+	for _, q := range []string{`SELECT count(*) FROM shawk_v1.service_endpoints`, `SELECT count(*) FROM shawk_v1.agent_addrs`,
+		`SELECT count(*) FROM shawk_v1.client_endpoints`, `SELECT shawk.prune(now() - interval '3 years')`} {
 		var n int
 		if err := conn.QueryRow(ctx, q).Scan(&n); err != nil {
 			t.Errorf("%s as shawk_connector: %v", q, err)

@@ -282,6 +282,7 @@ connectors:
     max_peers: 50
     peer_cidrs:
       office-lan: 192.168.10.0/24
+    retention: 26280h           # 3 年。0 なら消さない
 
 processors:
   batch: {}
@@ -649,6 +650,8 @@ group by (src, dst) (
   - `graph_nodes` / `graph_edges` / `dependency_changes` はサービス単位にまとめる。サービス名のない相手はアドレスをノードの名前にする。`dependency_changes` の「消えた」は、その依存を見ていたホストが `last_seen` から 15 分以上観測を続けていることを条件にする。
   - `unobserved()` は `SECURITY DEFINER` にした（読み取りのロールが `shawk` スキーマの表を読めなくても使えるように）。
   - `agents` に `host_id`、`machine_id`、`kernel`、`agent_version` を加えた。
+
+- 保持期間（§10 から解決）：connector の設定 `retention`（既定 3 年。0 なら消さない）より前に最後に見た行を、1 時間ごとに関数 `shawk.prune(cutoff, max_rows)`（マイグレーション 0003）で消す。一回の呼び出しで表ごとに最大 1 万行だけ消し、0 行になるまで短いトランザクションで繰り返す。プロセスとホストは参照がなくなってから消す。区間（`agent_sessions`）も消すので、`unobserved()` は保持期間より前を「観測していない」と返す。基準の時刻は PostgreSQL の `now()`。connector のロールには DELETE 権限が要る（`grants.sql`）。
 
 ### 9.3 packaging
 

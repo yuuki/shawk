@@ -188,6 +188,7 @@ type fakeStore struct {
 	writes   []*hostChanges
 	fail     bool
 	rows     peerRows
+	prunes   int
 	migrated int
 }
 
@@ -212,6 +213,13 @@ func (s *fakeStore) peers(context.Context) (peerRows, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.rows, nil
+}
+
+func (s *fakeStore) prune(context.Context, time.Duration, int) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.prunes++
+	return 0, nil
 }
 
 func (s *fakeStore) close() {}

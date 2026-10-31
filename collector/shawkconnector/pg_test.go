@@ -331,3 +331,53 @@ func TestPGReaderRole(t *testing.T) {
 		t.Error("the reader can read the tables")
 	}
 }
+
+func TestPGPrune(t *testing.T) {
+	c, _, conn := pgConnector(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	old := now.Add(-4 * 365 * 24 * time.Hour)
+	write := func(host string, at time.Time, port uint16) {
+		h := newHostChanges(hostKey("m", host))
+		h.setHost("m", host, "5.14", "test", at)
+		h.addSession(at.Add(-time.Hour), sessionRow{lastHeartbeat: at, netnsScope: "all"})
+		h.addAddr(addrOf("10.0.0.1"), span{at, at})
+		pk := procKey{host + ".service", host}
+		h.addProcess(pk, "/usr/bin/"+host, host, span{at, at})
+		for i := range 5 {
+			h.addEdge(edgeRowKey{role: "client", proto: "tcp", local: addrOf("10.0.0.1"), peer: addrOf("10.0.1.1"),
+				port: port + uint16(i), netns: 1, procKey: pk}, span{at, at})
+		}
+		h.addListener(listenerRowKey{proto: "tcp", addr: addrOf("0.0.0.0"), port: port, netns: 1}, pk, span{at, at})
+		if err := c.store.write(ctx, h); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("gone-01", old, 80)  // a host decommissioned four years ago
+	write("live-01", old, 80)  // a live host with old dependencies
+	write("live-01", now, 443) // and recent ones
+	var total int64
+	for i := 0; ; i++ {
+		n, err := c.store.prune(ctx, 3*365*24*time.Hour, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n == 0 {
+			break
+		}
+		if i > 20 {
+			t.Fatal("prune does not end")
+		}
+		total += n
+	}
+	got := queryStrings(t, conn, `
+SELECT 'hosts', string_agg(hostname, ',' ORDER BY hostname) FROM shawk.hosts
+UNION ALL SELECT 'edges', string_agg(DISTINCT port::text, ',') FROM shawk.edges
+UNION ALL SELECT 'listeners', string_agg(port::text, ',') FROM shawk.listeners
+UNION ALL SELECT 'processes', count(*)::text FROM shawk.processes
+UNION ALL SELECT 'sessions', count(*)::text FROM shawk.agent_sessions`)
+	want := []string{"edges 443,444,445,446,447", "hosts live-01", "listeners 443", "processes 1", "sessions 1"}
+	if !slices.Equal(got, want) {
+		t.Errorf("after pruning %d rows: %v, want %v", total, got, want)
+	}
+}

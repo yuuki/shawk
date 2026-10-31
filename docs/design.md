@@ -317,6 +317,11 @@ to the number of edges, not to time) and are written when it returns. A
 crash of the connector loses at most one write interval, which agents send
 again while the edges are within their TTL.
 
+Rows last seen longer ago than `retention` (3 years by default) are deleted
+every hour by `shawk.prune()`, in batches of short transactions; processes
+and hosts go once nothing refers to them. Sessions are deleted with them,
+so `unobserved()` reports the time before the retention as not observed.
+
 ### 5.2 Names of peers
 
 The connector loads `shawk_v1.service_endpoints`,
@@ -490,4 +495,3 @@ parses. shawk runs beside it instead:
   counts them.
 - **Clocks**: times come from the clock of each agent; heartbeats are
   compared with the clock of PostgreSQL.
-- **Retention**: rows in PostgreSQL are not deleted yet.

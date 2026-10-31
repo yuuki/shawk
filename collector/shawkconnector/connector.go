@@ -31,6 +31,8 @@ type shawkConnector struct {
 	changes  *changes
 	migrated bool
 
+	lastPrune time.Time
+
 	cancel context.CancelFunc
 	done   chan struct{}
 	now    func() time.Time
@@ -138,6 +140,7 @@ func (c *shawkConnector) loop(ctx context.Context) {
 			}
 			c.prepare(wctx)
 			cancel()
+			c.pruneIfDue(ctx)
 			now := c.now()
 			c.mu.Lock()
 			c.agg.expire(now)
@@ -145,6 +148,41 @@ func (c *shawkConnector) loop(ctx context.Context) {
 			c.mu.Unlock()
 			c.resolver.expire(now.Add(-c.cfg.IdleTTL))
 		}
+	}
+}
+
+// pruneBatch bounds the rows deleted per table in one transaction.
+const pruneBatch = 10000
+
+// pruneIfDue deletes the rows older than the retention, once an hour, in
+// batches so that no transaction holds locks for long.
+func (c *shawkConnector) pruneIfDue(ctx context.Context) {
+	if c.cfg.Retention == 0 || c.now().Sub(c.lastPrune) < time.Hour {
+		return
+	}
+	c.mu.Lock()
+	migrated := c.migrated
+	c.mu.Unlock()
+	if !migrated {
+		return
+	}
+	var total int64
+	for range 1000 {
+		pctx, cancel := context.WithTimeout(ctx, time.Minute)
+		n, err := c.store.prune(pctx, c.cfg.Retention, pruneBatch)
+		cancel()
+		if err != nil {
+			c.log.Error("deleting rows older than the retention", zap.Error(err))
+			return
+		}
+		total += n
+		if n == 0 {
+			break
+		}
+	}
+	c.lastPrune = c.now()
+	if total > 0 {
+		c.log.Info("deleted rows older than the retention", zap.Int64("rows", total), zap.Duration("retention", c.cfg.Retention))
 	}
 }
 

@@ -6,9 +6,10 @@
 
 REVOKE ALL ON SCHEMA shawk, shawk_v1 FROM PUBLIC;
 
--- The connector upserts the tables and reads the views that name peers.
+-- The connector upserts the tables, deletes rows older than its retention
+-- and reads the views that name peers.
 GRANT USAGE ON SCHEMA shawk, shawk_v1 TO shawk_connector;
-GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA shawk TO shawk_connector;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA shawk TO shawk_connector;
 GRANT USAGE ON ALL SEQUENCES IN SCHEMA shawk TO shawk_connector;
 GRANT SELECT ON ALL TABLES IN SCHEMA shawk_v1 TO shawk_connector;
 

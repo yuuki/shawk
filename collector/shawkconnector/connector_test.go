@@ -347,6 +347,7 @@ func TestConfigValidate(t *testing.T) {
 		"no peers":          func(c *Config) { c.MaxPeers = 0 },
 		"bad cidr":          func(c *Config) { c.PeerCIDRs = map[string]string{"x": "10.0.0.0/33"} },
 		"reserved name":     func(c *Config) { c.PeerCIDRs = map[string]string{"~other": "10.0.0.0/8"} },
+		"short retention":   func(c *Config) { c.Retention = time.Hour },
 	} {
 		c := *ok
 		mod(&c)
@@ -367,5 +368,25 @@ func TestNarrowestCIDRWins(t *testing.T) {
 		if got := r.classify(addrOf(addr)); got != want {
 			t.Errorf("classify(%s) = %s, want %s", addr, got, want)
 		}
+	}
+}
+
+func TestPruneSchedule(t *testing.T) {
+	c, st, _, now := testConnector(t, nil)
+	c.pruneIfDue(context.Background())
+	c.pruneIfDue(context.Background())
+	if st.prunes != 1 {
+		t.Errorf("pruned %d times at once", st.prunes)
+	}
+	*now = now.Add(time.Hour)
+	c.pruneIfDue(context.Background())
+	if st.prunes != 2 {
+		t.Errorf("pruned %d times after an hour", st.prunes)
+	}
+
+	c, st, _, _ = testConnector(t, func(cfg *Config) { cfg.Retention = 0 })
+	c.pruneIfDue(context.Background())
+	if st.prunes != 0 {
+		t.Error("pruned with retention 0")
 	}
 }

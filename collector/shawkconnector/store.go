@@ -16,6 +16,10 @@ type store interface {
 	migrate(ctx context.Context) ([]string, error)
 	// write writes the changes of a host in one transaction.
 	write(ctx context.Context, h *hostChanges) error
+	// prune deletes up to maxRows rows per table last seen more than
+	// retention ago, by the clock of the database, and returns how many it
+	// deleted.
+	prune(ctx context.Context, retention time.Duration, maxRows int) (int64, error)
 	// peers reads the endpoints of services, the client sides of
 	// connections and the addresses of agents.
 	peers(ctx context.Context) (peerRows, error)
@@ -195,6 +199,13 @@ ON CONFLICT (host_id, proto, addr, port, netns) DO UPDATE SET
 			h.key, units, comms, protos, addrs, ports, netns, firsts, lasts)
 	}
 	return tx.SendBatch(ctx, b).Close()
+}
+
+func (s *pgStore) prune(ctx context.Context, retention time.Duration, maxRows int) (int64, error) {
+	var n int64
+	err := s.pool.QueryRow(ctx, `SELECT shawk.prune(now() - make_interval(secs => $1), $2)`,
+		retention.Seconds(), maxRows).Scan(&n)
+	return n, err
 }
 
 func (s *pgStore) peers(ctx context.Context) (peerRows, error) {
