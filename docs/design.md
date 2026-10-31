@@ -243,7 +243,7 @@ per second in one transaction).
 |---|---|
 | `who-uses HOST[:PORT]` | Who uses this service? With `-depth N`, who is affected transitively (blast radius). |
 | `deps HOST[/UNIT]` | What does this process depend on, transitively? |
-| `can-i-remove HOST[:PORT]` | Did any remote process use it in the window? Exit status 1 if so. Warns when the ledger is younger than the window. |
+| `can-i-remove HOST[:PORT]` | Did any remote process use it in the window? Exits 0 if none did, 1 if some did, and 3 ("unknown") if none was seen but the record may be incomplete: the agent did not record part of the window (not running, failed writes, retention), the kernel dropped flows, UDP was not traced, the agent traces only one network namespace, or nothing listened on the port. |
 | `unused HOST` | Which listening services had no client in the window? |
 | `diff HOST -since 24h` | Which dependencies appeared or disappeared (e.g. after a deployment)? |
 | `graph HOST... -depth N` | Export the graph around hosts as Mermaid, Graphviz or JSON. |

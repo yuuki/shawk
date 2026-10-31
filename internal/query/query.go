@@ -22,6 +22,7 @@ type Source interface {
 	Info(ctx context.Context, host string) (*api.Info, error)
 	Edges(ctx context.Context, host string, q api.EdgeQuery) ([]api.Edge, error)
 	Listeners(ctx context.Context, host string, since time.Time) ([]api.Listener, error)
+	Coverage(ctx context.Context, host string, since, until time.Time) (*api.Coverage, error)
 }
 
 // Querier walks dependencies over agents.
@@ -308,21 +309,36 @@ func (q *Querier) listenerOn(ctx context.Context, host, proto, addr string, port
 	return wildcard
 }
 
+// Verdicts of CanIRemove.
+const (
+	VerdictSafe    = "safe"    // no remote process used the target
+	VerdictInUse   = "in-use"  // remote processes used the target
+	VerdictUnknown = "unknown" // none seen, but the record is incomplete
+)
+
 // Removal is the result of CanIRemove.
 type Removal struct {
 	Host string `json:"host"`
 	// Clients are the services on the host with their remote clients.
 	Clients []*Node `json:"clients"`
-	// Coverage is when the ledger of the host started. Dependencies before it
-	// are unknown.
-	Coverage time.Time `json:"coverage"`
+	// Reasons are why the record of the host may miss clients.
+	Reasons  []string      `json:"reasons,omitempty"`
+	Coverage *api.Coverage `json:"coverage"`
 }
 
-// Safe reports whether no remote process used the host in the window.
-func (r *Removal) Safe() bool { return len(r.Clients) == 0 }
+// Verdict tells whether the target can be removed.
+func (r *Removal) Verdict() string {
+	switch {
+	case len(r.Clients) > 0:
+		return VerdictInUse
+	case len(r.Reasons) > 0:
+		return VerdictUnknown
+	}
+	return VerdictSafe
+}
 
 // CanIRemove finds the remote processes that used services on host (on port
-// if not zero).
+// if not zero), and why the record of the host may be incomplete.
 func (q *Querier) CanIRemove(ctx context.Context, host string, port uint16) (*Removal, error) {
 	info, err := q.src.Info(ctx, host)
 	if err != nil {
@@ -332,28 +348,122 @@ func (q *Querier) CanIRemove(ctx context.Context, host string, port uint16) (*Re
 	if err != nil {
 		return nil, err
 	}
-	r := &Removal{Host: info.Hostname, Coverage: info.LedgerSince}
+	r := &Removal{Host: info.Hostname}
 	for _, svc := range services {
 		svc.Children = slices.DeleteFunc(svc.Children, func(c *Node) bool { return c.Addr == host })
 		if len(svc.Children) > 0 {
 			r.Clients = append(r.Clients, svc)
 		}
 	}
+	r.Reasons, r.Coverage, err = q.incomplete(ctx, host, info, port, q.Since)
+	if err != nil {
+		return nil, err
+	}
+	if port != 0 && len(services) == 0 && !q.listened(ctx, host, port) {
+		r.Reasons = append(r.Reasons, fmt.Sprintf("no service listened on port %d in the window", port))
+	}
 	return r, nil
 }
 
+func (q *Querier) until() time.Time {
+	if q.Until.IsZero() {
+		return time.Now()
+	}
+	return q.Until
+}
+
+// incomplete returns why the ledger of host may miss dependencies in
+// [since, Until]. A non-zero port limits the check of UDP to that service.
+func (q *Querier) incomplete(ctx context.Context, host string, info *api.Info, port uint16, since time.Time) ([]string, *api.Coverage, error) {
+	cov, err := q.src.Coverage(ctx, host, since, q.until())
+	if err != nil {
+		return nil, nil, fmt.Errorf("coverage of %s: %w", host, err)
+	}
+	var reasons []string
+	if len(cov.Gaps) > 0 {
+		var missing time.Duration
+		for _, g := range cov.Gaps {
+			missing += g.To.Sub(g.From)
+		}
+		reasons = append(reasons, fmt.Sprintf("the agent did not record %s of the window: %s",
+			humanDuration(missing), describeGaps(cov.Gaps)))
+	}
+	if cov.Drops > 0 {
+		reasons = append(reasons, fmt.Sprintf("%d flow updates were dropped because the flow table was full", cov.Drops))
+	}
+	if cov.Covered > 0 && !cov.UDP && q.udpMatters(ctx, host, port) {
+		reasons = append(reasons, "UDP was not traced in some or all of the window")
+	}
+	if info.NetNS != "" && info.NetNS != "all" {
+		reasons = append(reasons, fmt.Sprintf("the agent traces only network namespace %s", info.NetNS))
+	}
+	return reasons, cov, nil
+}
+
+func humanDuration(d time.Duration) string {
+	if d < 48*time.Hour {
+		return d.Round(time.Second).String()
+	}
+	return fmt.Sprintf("%.1f days", d.Hours()/24)
+}
+
+func describeGaps(gaps []api.Gap) string {
+	const max = 3
+	var parts []string
+	for i, g := range gaps {
+		if i == max {
+			parts = append(parts, fmt.Sprintf("and %d more", len(gaps)-max))
+			break
+		}
+		parts = append(parts, fmt.Sprintf("%s to %s", g.From.Format(time.DateTime), g.To.Format(time.DateTime)))
+	}
+	return strings.Join(parts, ", ")
+}
+
+// udpMatters reports whether UDP traffic can concern the service on port: any
+// service if port is zero, otherwise unless only TCP listened on it.
+func (q *Querier) udpMatters(ctx context.Context, host string, port uint16) bool {
+	if port == 0 {
+		return true
+	}
+	tcp := false
+	for _, l := range q.listenersOf(ctx, host) {
+		if l.Port != port {
+			continue
+		}
+		if l.Proto == "udp" {
+			return true
+		}
+		tcp = true
+	}
+	return !tcp
+}
+
+func (q *Querier) listened(ctx context.Context, host string, port uint16) bool {
+	return slices.ContainsFunc(q.listenersOf(ctx, host), func(l api.Listener) bool { return l.Port == port })
+}
+
 // Unused returns the listeners on host that no process used in the window,
-// excluding the agent itself.
-func (q *Querier) Unused(ctx context.Context, host string) ([]api.Listener, error) {
+// excluding the agent itself, and why the record may be incomplete. UDP
+// listeners are left out when UDP was not traced.
+func (q *Querier) Unused(ctx context.Context, host string) ([]api.Listener, []string, error) {
+	info, err := q.src.Info(ctx, host)
+	if err != nil {
+		return nil, nil, err
+	}
+	reasons, cov, err := q.incomplete(ctx, host, info, 0, q.Since)
+	if err != nil {
+		return nil, nil, err
+	}
 	ls, err := q.src.Listeners(ctx, host, q.Since)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	eq := api.EdgeQuery{Direction: "in"}
 	q.window(&eq)
 	edges, err := q.src.Edges(ctx, host, eq)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	used := map[string]bool{}
 	for _, e := range edges {
@@ -361,11 +471,14 @@ func (q *Querier) Unused(ctx context.Context, host string) ([]api.Listener, erro
 	}
 	var out []api.Listener
 	for _, l := range ls {
+		if l.Proto == "udp" && !cov.UDP {
+			continue
+		}
 		if !used[fmt.Sprintf("%s/%d/%d", l.Proto, l.NetNS, l.Port)] {
 			out = append(out, l)
 		}
 	}
-	return out, nil
+	return out, reasons, nil
 }
 
 // Change is a dependency that appeared or disappeared.
@@ -376,12 +489,21 @@ type Change struct {
 
 // Diff compares the dependencies of host in [Since, Until] with those in
 // [baseline, Since): edges first seen in the window are added and edges
-// last seen before the window are removed.
-func (q *Querier) Diff(ctx context.Context, host string, baseline time.Time) ([]Change, error) {
+// last seen before the window are removed. It also returns why the record
+// of [baseline, Until] may be incomplete.
+func (q *Querier) Diff(ctx context.Context, host string, baseline time.Time) ([]Change, []string, error) {
+	info, err := q.src.Info(ctx, host)
+	if err != nil {
+		return nil, nil, err
+	}
+	reasons, _, err := q.incomplete(ctx, host, info, 0, baseline)
+	if err != nil {
+		return nil, nil, err
+	}
 	eq := api.EdgeQuery{Since: baseline, Until: q.Until}
 	edges, err := q.src.Edges(ctx, host, eq)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	var out []Change
 	for _, e := range edges {
@@ -393,7 +515,7 @@ func (q *Querier) Diff(ctx context.Context, host string, baseline time.Time) ([]
 		}
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Added && !out[j].Added })
-	return out, nil
+	return out, reasons, nil
 }
 
 func addStats(n *Node, e *api.Edge) {

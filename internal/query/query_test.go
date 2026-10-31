@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +17,18 @@ type fakeSource struct {
 	infos     map[string]*api.Info
 	edges     map[string][]api.Edge
 	listeners map[string][]api.Listener
+	// coverage overrides the full coverage reported by default.
+	coverage map[string]*api.Coverage
+}
+
+func (f *fakeSource) Coverage(_ context.Context, host string, since, until time.Time) (*api.Coverage, error) {
+	if _, ok := f.infos[host]; !ok {
+		return nil, errors.New("connection refused")
+	}
+	if c, ok := f.coverage[host]; ok {
+		return c, nil
+	}
+	return &api.Coverage{Since: since, Until: until, Covered: until.Sub(since), UDP: true}, nil
 }
 
 func (f *fakeSource) Info(_ context.Context, host string) (*api.Info, error) {
@@ -66,9 +79,9 @@ func edge(dir, laddr, raddr string, port uint16, unit, comm string, conns uint64
 func topology() *fakeSource {
 	f := &fakeSource{
 		infos: map[string]*api.Info{
-			"10.0.0.5":  {Hostname: "lb-01", Addrs: []string{"10.0.0.5", "127.0.0.1"}, LedgerSince: now.Add(-100 * 24 * time.Hour)},
-			"10.0.0.11": {Hostname: "app-01", Addrs: []string{"10.0.0.11", "127.0.0.1"}, LedgerSince: now.Add(-100 * 24 * time.Hour)},
-			"10.0.0.10": {Hostname: "db-01", Addrs: []string{"10.0.0.10", "127.0.0.1"}, LedgerSince: now.Add(-10 * 24 * time.Hour)},
+			"10.0.0.5":  {Hostname: "lb-01", Addrs: []string{"10.0.0.5", "127.0.0.1"}, NetNS: "all"},
+			"10.0.0.11": {Hostname: "app-01", Addrs: []string{"10.0.0.11", "127.0.0.1"}, NetNS: "all"},
+			"10.0.0.10": {Hostname: "db-01", Addrs: []string{"10.0.0.10", "127.0.0.1"}, NetNS: "all"},
 		},
 		edges: map[string][]api.Edge{
 			"10.0.0.5": {
@@ -87,6 +100,10 @@ func topology() *fakeSource {
 			},
 		},
 		listeners: map[string][]api.Listener{
+			"10.0.0.11": {
+				{Proto: "tcp", Addr: "127.0.0.1", Port: 6379, Unit: "redis.service", Comm: "redis-server"},
+				{Proto: "tcp", Addr: "0.0.0.0", Port: 8080, Unit: "app.service", Comm: "puma"},
+			},
 			"10.0.0.10": {
 				{Proto: "tcp", Addr: "0.0.0.0", Port: 5432, Unit: "postgresql.service", Comm: "postgres"},
 				{Proto: "tcp", Addr: "0.0.0.0", Port: 9187, Unit: "postgres_exporter.service", Comm: "postgres_export"},
@@ -175,29 +192,86 @@ func TestDeps(t *testing.T) {
 }
 
 func TestCanIRemove(t *testing.T) {
+	ctx := context.Background()
 	q := newTestQuerier()
-	r, err := q.CanIRemove(context.Background(), "10.0.0.10", 0)
+	r, err := q.CanIRemove(ctx, "10.0.0.10", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.Safe() || len(r.Clients) != 1 || len(r.Clients[0].Children) != 2 {
+	if r.Verdict() != VerdictInUse || len(r.Clients) != 1 || len(r.Clients[0].Children) != 2 {
 		t.Errorf("removal = %+v", r)
 	}
 	// Only local clients use redis on app-01.
-	r, err = q.CanIRemove(context.Background(), "10.0.0.11", 6379)
+	r, err = q.CanIRemove(ctx, "10.0.0.11", 6379)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !r.Safe() {
-		t.Errorf("redis has remote clients: %+v", r.Clients)
+	if r.Verdict() != VerdictSafe {
+		t.Errorf("verdict for redis = %s: %+v %v", r.Verdict(), r.Clients, r.Reasons)
+	}
+}
+
+// TestCanIRemoveIncomplete checks that the absence of clients is not
+// reported as safe when the record may miss them.
+func TestCanIRemoveIncomplete(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name   string
+		modify func(*fakeSource)
+		port   uint16
+		reason string
+	}{
+		{"empty ledger", func(f *fakeSource) {
+			f.coverage["10.0.0.11"] = &api.Coverage{Gaps: []api.Gap{{From: now.Add(-30 * 24 * time.Hour), To: now}}}
+		}, 6379, "did not record"},
+		{"gap in the window", func(f *fakeSource) {
+			f.coverage["10.0.0.11"] = &api.Coverage{Covered: time.Hour, UDP: true,
+				Gaps: []api.Gap{{From: now.Add(-2 * time.Hour), To: now.Add(-time.Hour)}}}
+		}, 6379, "did not record 1h0m0s"},
+		{"dropped flows", func(f *fakeSource) {
+			f.coverage["10.0.0.11"] = &api.Coverage{Covered: 30 * 24 * time.Hour, UDP: true, Drops: 3}
+		}, 6379, "3 flow updates were dropped"},
+		{"UDP not traced", func(f *fakeSource) {
+			f.coverage["10.0.0.11"] = &api.Coverage{Covered: 30 * 24 * time.Hour}
+		}, 0, "UDP was not traced"},
+		{"restricted namespace", func(f *fakeSource) {
+			f.infos["10.0.0.11"].NetNS = "4026531840"
+		}, 6379, "only network namespace"},
+		{"no such service", func(*fakeSource) {}, 5433, "no service listened on port 5433"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := topology()
+			src.coverage = map[string]*api.Coverage{}
+			// Remove the remote clients of app-01 so that it would be safe.
+			src.edges["10.0.0.11"] = slices.DeleteFunc(src.edges["10.0.0.11"], func(e api.Edge) bool { return e.Port == 8080 })
+			tc.modify(src)
+			r, err := New(src, now.Add(-30*24*time.Hour), now).CanIRemove(ctx, "10.0.0.11", tc.port)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if r.Verdict() != VerdictUnknown || !strings.Contains(strings.Join(r.Reasons, "; "), tc.reason) {
+				t.Errorf("verdict = %s, reasons = %q; want unknown with %q", r.Verdict(), r.Reasons, tc.reason)
+			}
+		})
+	}
+
+	// A TCP-only service is not affected by UDP not being traced.
+	src := topology()
+	src.coverage = map[string]*api.Coverage{"10.0.0.11": {Covered: 30 * 24 * time.Hour}}
+	r, err := New(src, now.Add(-30*24*time.Hour), now).CanIRemove(ctx, "10.0.0.11", 6379)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Verdict() != VerdictSafe {
+		t.Errorf("verdict for a TCP service without UDP tracing = %s %v", r.Verdict(), r.Reasons)
 	}
 }
 
 func TestUnused(t *testing.T) {
 	q := newTestQuerier()
-	ls, err := q.Unused(context.Background(), "10.0.0.10")
-	if err != nil {
-		t.Fatal(err)
+	ls, reasons, err := q.Unused(context.Background(), "10.0.0.10")
+	if err != nil || len(reasons) != 0 {
+		t.Fatal(err, reasons)
 	}
 	if len(ls) != 1 || ls[0].Port != 9187 {
 		t.Errorf("unused = %+v", ls)
@@ -212,9 +286,9 @@ func TestDiff(t *testing.T) {
 	removed.LastSeen = now.Add(-3 * 24 * time.Hour)
 	src.edges["10.0.0.11"] = append(src.edges["10.0.0.11"], added, removed)
 	q := New(src, now.Add(-24*time.Hour), now)
-	changes, err := q.Diff(context.Background(), "10.0.0.11", now.Add(-7*24*time.Hour))
-	if err != nil {
-		t.Fatal(err)
+	changes, reasons, err := q.Diff(context.Background(), "10.0.0.11", now.Add(-7*24*time.Hour))
+	if err != nil || len(reasons) != 0 {
+		t.Fatal(err, reasons)
 	}
 	if len(changes) != 2 || !changes[0].Added || changes[0].Edge.Port != 6379 || changes[1].Added || changes[1].Edge.Port != 11211 {
 		t.Errorf("changes = %+v", changes)

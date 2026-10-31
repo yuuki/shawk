@@ -22,8 +22,11 @@ type Info struct {
 	// it are unknown.
 	LedgerSince time.Time `json:"ledger_since"`
 	Interval    string    `json:"interval"`
-	UDP         bool      `json:"udp"`   // whether UDP is traced
-	Drops       uint64    `json:"drops"` // flow updates dropped in the kernel
+	// NetNS is the network namespace the agent traces: "all" or an inode
+	// number.
+	NetNS string `json:"netns"`
+	UDP   bool   `json:"udp"`   // whether UDP is traced
+	Drops uint64 `json:"drops"` // flow updates dropped in the kernel
 }
 
 // Stats are the statistics of an edge aggregated over a time window.
@@ -164,6 +167,26 @@ func parseTime(s string) (time.Time, error) {
 		return time.Time{}, nil
 	}
 	return time.Parse(time.RFC3339, s)
+}
+
+// Coverage tells how much of a time window an agent recorded. Dependencies in
+// the gaps are unknown.
+type Coverage struct {
+	Since   time.Time     `json:"since"`
+	Until   time.Time     `json:"until"`
+	Covered time.Duration `json:"covered"`
+	Gaps    []Gap         `json:"gaps,omitempty"`
+	// Drops is the number of flow updates the kernel dropped because the
+	// flow table was full.
+	Drops uint64 `json:"drops"`
+	// UDP is whether UDP was traced in every recorded period.
+	UDP bool `json:"udp"`
+}
+
+// Gap is a period without recording.
+type Gap struct {
+	From time.Time `json:"from"`
+	To   time.Time `json:"to"`
 }
 
 // EdgesResponse is the response of GET /api/v1/edges.

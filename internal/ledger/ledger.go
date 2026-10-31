@@ -109,9 +109,17 @@ type ListenerRecord struct {
 	PID    uint32
 }
 
-// Write records the flows and listeners observed in the interval ending at
-// at.
-func (l *Ledger) Write(ctx context.Context, at time.Time, recs []Record, listeners []ListenerRecord) error {
+// Tick describes an interval of recording.
+type Tick struct {
+	At       time.Time     // end of the interval
+	Interval time.Duration // length of the interval
+	UDP      bool          // whether UDP was traced
+	Drops    uint64        // flow updates the kernel dropped in the interval
+}
+
+// Write records the flows and listeners observed in an interval, and the
+// interval itself as covered.
+func (l *Ledger) Write(ctx context.Context, tick Tick, recs []Record, listeners []ListenerRecord) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	tx, err := l.db.BeginTx(ctx, nil)
@@ -120,9 +128,9 @@ func (l *Ledger) Write(ctx context.Context, at time.Time, recs []Record, listene
 	}
 	defer tx.Rollback()
 
-	now := at.Unix()
-	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO meta(key, value) VALUES ('ledger_since', ?)`, now); err != nil {
-		return err
+	now := tick.At.Unix()
+	if err := recordCoverage(ctx, tx, tick); err != nil {
+		return fmt.Errorf("recording coverage: %w", err)
 	}
 	upsertEdge, err := tx.PrepareContext(ctx, `
 INSERT INTO edges (direction, proto, local_addr, remote_addr, port, netns, unit, comm, cgroup, exe, last_pid, first_seen, last_seen)
@@ -197,6 +205,91 @@ ON CONFLICT (proto, addr, port, netns) DO UPDATE SET
 	return tx.Commit()
 }
 
+// recordCoverage extends the latest covered period with the interval, or
+// starts a new period after a gap.
+func recordCoverage(ctx context.Context, tx *sql.Tx, tick Tick) error {
+	start, end := tick.At.Add(-tick.Interval).Unix(), tick.At.Unix()
+	udp := 0
+	if tick.UDP {
+		udp = 1
+	}
+	var (
+		rowid, lastEnd int64
+		lastUDP        int
+	)
+	err := tx.QueryRowContext(ctx, `SELECT rowid, end_ts, udp FROM coverage ORDER BY end_ts DESC LIMIT 1`).
+		Scan(&rowid, &lastEnd, &lastUDP)
+	if err != nil && err != sql.ErrNoRows {
+		return err
+	}
+	// Allow one interval of slack for the scheduling of ticks.
+	slack := int64(tick.Interval.Seconds())
+	if err == nil && lastUDP == udp && lastEnd >= start-slack && lastEnd <= end {
+		_, err = tx.ExecContext(ctx, `UPDATE coverage SET end_ts = ?, drops = drops + ? WHERE rowid = ?`, end, tick.Drops, rowid)
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO coverage (start_ts, end_ts, udp, drops) VALUES (?, ?, ?, ?)`,
+		start, end, udp, tick.Drops)
+	return err
+}
+
+// Coverage reports how much of [since, until] the ledger covers. Gaps
+// shorter than tolerance, such as the scheduling of intervals, are ignored.
+func (l *Ledger) Coverage(ctx context.Context, since, until time.Time, tolerance time.Duration) (api.Coverage, error) {
+	c := api.Coverage{Since: since, Until: until, UDP: true}
+	rows, err := l.db.QueryContext(ctx, `
+SELECT start_ts, end_ts, udp, drops FROM coverage
+WHERE end_ts >= ? AND start_ts <= ? ORDER BY start_ts`, since.Unix(), until.Unix())
+	if err != nil {
+		return c, err
+	}
+	defer rows.Close()
+	cursor := since
+	gap := func(to time.Time) {
+		if to.Sub(cursor) > tolerance {
+			c.Gaps = append(c.Gaps, api.Gap{From: cursor, To: to})
+		}
+	}
+	found := false
+	for rows.Next() {
+		var (
+			start, end int64
+			udp        int
+			drops      uint64
+		)
+		if err := rows.Scan(&start, &end, &udp, &drops); err != nil {
+			return c, err
+		}
+		found = true
+		s, e := time.Unix(start, 0), time.Unix(end, 0)
+		if s.After(cursor) {
+			gap(s)
+		}
+		if s.Before(cursor) {
+			s = cursor
+		}
+		if e.After(until) {
+			e = until
+		}
+		if e.After(s) {
+			c.Covered += e.Sub(s)
+		}
+		if e.After(cursor) {
+			cursor = e
+		}
+		c.Drops += drops
+		c.UDP = c.UDP && udp == 1
+	}
+	if err := rows.Err(); err != nil {
+		return c, err
+	}
+	if until.After(cursor) {
+		gap(until)
+	}
+	c.UDP = c.UDP && found
+	return c, nil
+}
+
 // Prune deletes activity, edges and listeners older than the retention.
 func (l *Ledger) Prune(ctx context.Context, now time.Time) error {
 	l.mu.Lock()
@@ -210,6 +303,7 @@ func (l *Ledger) Prune(ctx context.Context, now time.Time) error {
 		{`DELETE FROM activity WHERE res = 86400 AND ts < ?`, now.Add(-l.retention.Day).Unix()},
 		{`DELETE FROM edges WHERE last_seen < ?`, now.Add(-l.retention.Day).Unix()},
 		{`DELETE FROM listeners WHERE last_seen < ?`, now.Add(-l.retention.Day).Unix()},
+		{`DELETE FROM coverage WHERE end_ts < ?`, now.Add(-l.retention.Day).Unix()},
 	}
 	for _, s := range stmts {
 		if _, err := l.db.ExecContext(ctx, s.q, s.arg); err != nil {
@@ -219,16 +313,15 @@ func (l *Ledger) Prune(ctx context.Context, now time.Time) error {
 	return nil
 }
 
-// Since returns when the ledger started recording, or the zero time if it
-// has not recorded anything yet.
+// Since returns the start of the oldest retained recording, or the zero
+// time if the ledger has not recorded anything.
 func (l *Ledger) Since(ctx context.Context) (time.Time, error) {
 	var v sql.NullInt64
-	err := l.db.QueryRowContext(ctx, `SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'ledger_since'`).Scan(&v)
-	if err == sql.ErrNoRows || !v.Valid {
-		return time.Time{}, nil
-	}
-	if err != nil {
+	if err := l.db.QueryRowContext(ctx, `SELECT min(start_ts) FROM coverage`).Scan(&v); err != nil {
 		return time.Time{}, err
+	}
+	if !v.Valid {
+		return time.Time{}, nil
 	}
 	return time.Unix(v.Int64, 0), nil
 }

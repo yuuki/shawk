@@ -47,6 +47,10 @@ type Agent struct {
 	started  time.Time
 	hostname string
 
+	// Owned by the collection loop.
+	lastWrite time.Time
+	prevDrops uint64
+
 	mu       sync.Mutex
 	drops    uint64
 	lastErr  error
@@ -108,6 +112,8 @@ func Run(ctx context.Context, cfg Config) error {
 		started:  time.Now(),
 		hostname: hostname,
 	}
+	// Flows are traced from here on.
+	a.lastWrite = a.started
 
 	srv := &http.Server{Handler: a.handler(), ReadHeaderTimeout: 10 * time.Second}
 	errc := make(chan error, 1)
@@ -158,6 +164,9 @@ type recordKey struct {
 func (a *Agent) collect(ctx context.Context) error {
 	snap, err := a.tracer.Collect()
 	now := time.Now()
+	if err == nil {
+		err = a.record(ctx, now, snap)
+	}
 	a.mu.Lock()
 	a.lastErr = err
 	a.lastTick = now
@@ -165,9 +174,19 @@ func (a *Agent) collect(ctx context.Context) error {
 		a.drops = snap.Drops
 	}
 	a.mu.Unlock()
-	if err != nil {
-		return err
+	return err
+}
+
+// record writes the flows of the interval ending at now to the ledger. An
+// interval that fails to be written becomes a gap in the coverage.
+func (a *Agent) record(ctx context.Context, now time.Time, snap *tracer.Snapshot) error {
+	tick := ledger.Tick{
+		At:       now,
+		Interval: now.Sub(a.lastWrite),
+		UDP:      a.tracer.UDPEnabled(),
+		Drops:    snap.Drops - a.prevDrops,
 	}
+	a.lastWrite, a.prevDrops = now, snap.Drops
 
 	exes := map[uint32]string{}
 	exe := func(pid uint32) string {
@@ -239,7 +258,7 @@ func (a *Agent) collect(ctx context.Context) error {
 			PID:    l.PID,
 		})
 	}
-	return a.ledger.Write(ctx, now, recs, listeners)
+	return a.ledger.Write(ctx, tick, recs, listeners)
 }
 
 func mergeRecord(dst, src *ledger.Record) {
@@ -279,9 +298,23 @@ func (a *Agent) info(ctx context.Context) (*api.Info, error) {
 		StartedAt:   a.started,
 		LedgerSince: since,
 		Interval:    a.cfg.Interval.String(),
+		NetNS:       a.netnsMode(),
 		UDP:         a.tracer.UDPEnabled(),
 		Drops:       drops,
 	}, nil
+}
+
+func (a *Agent) netnsMode() string {
+	if a.cfg.NetNS == 0 {
+		return "all"
+	}
+	return strconv.FormatUint(uint64(a.cfg.NetNS), 10)
+}
+
+// coverageTolerance is the length of gaps in the coverage that are expected
+// from the scheduling of intervals.
+func (a *Agent) coverageTolerance() time.Duration {
+	return 2*a.cfg.Interval + time.Second
 }
 
 // hostAddrs returns the addresses of the interfaces of the host.

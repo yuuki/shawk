@@ -108,6 +108,18 @@ func (c *Client) Listeners(ctx context.Context, host string, since time.Time) ([
 	return resp.Listeners, nil
 }
 
+// Coverage returns how much of [since, until] the agent on host recorded.
+func (c *Client) Coverage(ctx context.Context, host string, since, until time.Time) (*api.Coverage, error) {
+	v := url.Values{}
+	v.Set("since", since.UTC().Format(time.RFC3339))
+	v.Set("until", until.UTC().Format(time.RFC3339))
+	var cov api.Coverage
+	if err := c.get(ctx, host, "/api/v1/coverage", v, &cov); err != nil {
+		return nil, err
+	}
+	return &cov, nil
+}
+
 // Programs returns the run time statistics of the BPF programs of an agent.
 func (c *Client) Programs(ctx context.Context, host string) ([]map[string]any, error) {
 	var out []map[string]any

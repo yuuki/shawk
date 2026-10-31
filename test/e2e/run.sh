@@ -121,8 +121,16 @@ set -e
 [[ $code == 1 ]] || fail "can-i-remove exited with $code, want 1"
 expect '^NO:'
 
+# Only local clients use redis, but each agent traces only its namespace and
+# a 30-day window is not covered by a ledger a few seconds old.
+set +e
 run can-i-remove ${ADDR[app]}:6379
-expect '^OK:'
+code=$?
+set -e
+[[ $code == 3 ]] || fail "can-i-remove exited with $code, want 3"
+expect '^UNKNOWN:'
+expect 'did not record'
+expect 'only network namespace'
 
 run graph ${ADDR[app]} -depth 3
 expect 'n[0-9]+ -->\|tcp/8080\| n[0-9]+'

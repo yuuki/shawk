@@ -19,7 +19,7 @@ func TestParseDuration(t *testing.T) {
 			t.Errorf("ParseDuration(%q) = %v, %v; want %v", in, got, err, want)
 		}
 	}
-	for _, in := range []string{"", "d", "-1d", "x"} {
+	for _, in := range []string{"", "d", "-1d", "x", "-1h", "0s", "0d", "NaNd", "Infd", "1e300d", "5e4w"} {
 		if _, err := ParseDuration(in); err == nil {
 			t.Errorf("ParseDuration(%q) succeeded", in)
 		}
@@ -44,6 +44,12 @@ func TestUsage(t *testing.T) {
 	}
 	if code := Main([]string{"who-uses"}, &out, &errOut); code != 2 {
 		t.Errorf("exit code without a target = %d", code)
+	}
+	if code := Main([]string{"can-i-remove", "db-01/nginx.service"}, &out, &errOut); code != 2 {
+		t.Errorf("exit code of can-i-remove with a process = %d", code)
+	}
+	if code := Main([]string{"can-i-remove", "db-01", "-since", "-1h"}, &out, &errOut); code != 2 {
+		t.Errorf("exit code of a negative window = %d", code)
 	}
 	if code := Main([]string{"version"}, &out, &errOut); code != 0 {
 		t.Errorf("exit code of version = %d", code)

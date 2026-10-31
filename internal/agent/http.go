@@ -3,6 +3,8 @@ package agent
 import (
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -15,6 +17,9 @@ func (a *Agent) handler() http.Handler {
 		a.mu.Lock()
 		err, last := a.lastErr, a.lastTick
 		a.mu.Unlock()
+		if err == nil && !last.IsZero() && time.Since(last) > 3*a.cfg.Interval {
+			err = fmt.Errorf("no collection since %s", last.Format(time.RFC3339))
+		}
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
@@ -57,6 +62,20 @@ func (a *Agent) handler() http.Handler {
 			return
 		}
 		writeJSON(w, api.ListenersResponse{Listeners: ls})
+	})
+	mux.HandleFunc("GET /api/v1/coverage", func(w http.ResponseWriter, r *http.Request) {
+		since, err1 := time.Parse(time.RFC3339, r.URL.Query().Get("since"))
+		until, err2 := time.Parse(time.RFC3339, r.URL.Query().Get("until"))
+		if err := errors.Join(err1, err2); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		c, err := a.ledger.Coverage(r.Context(), since, until, a.coverageTolerance())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, c)
 	})
 	mux.HandleFunc("GET /api/v1/programs", func(w http.ResponseWriter, r *http.Request) {
 		stats, err := a.programStats()

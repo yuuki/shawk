@@ -53,9 +53,14 @@ Other:
 Run 'shawk <command> -h' for the flags of a command.
 `
 
-// ErrFound is returned by can-i-remove when dependencies remain; the
-// command exits with status 1.
-var ErrFound = errors.New("dependencies found")
+// Exit statuses of can-i-remove besides 0 (safe to remove). Errors exit
+// with status 2.
+var (
+	// ErrFound means remote processes used the target (status 1).
+	ErrFound = errors.New("dependencies found")
+	// ErrUnknown means none were seen but the record is incomplete (status 3).
+	ErrUnknown = errors.New("dependencies unknown")
+)
 
 // Main runs the command line and returns the exit status.
 func Main(args []string, stdout, stderr io.Writer) int {
@@ -98,12 +103,14 @@ func Main(args []string, stdout, stderr io.Writer) int {
 		return 0
 	case errors.Is(err, ErrFound):
 		return 1
+	case errors.Is(err, ErrUnknown):
+		return 3
 	case errors.Is(err, errUsage):
 		fmt.Fprintf(stderr, "shawk %s: %v\n", name, err)
 		return 2
 	}
 	fmt.Fprintf(stderr, "shawk %s: %v\n", name, err)
-	return 1
+	return 2
 }
 
 var errUsage = errors.New("usage error")
@@ -206,25 +213,29 @@ func writeJSON(w io.Writer, v any) error {
 	return enc.Encode(v)
 }
 
-// ParseDuration parses a duration that may use the units d (days) and w
-// (weeks) in addition to those of time.ParseDuration.
+// ParseDuration parses a positive duration that may use the units d (days)
+// and w (weeks) in addition to those of time.ParseDuration.
 func ParseDuration(s string) (time.Duration, error) {
 	if s == "" {
 		return 0, errors.New("empty duration")
 	}
 	unit := s[len(s)-1]
-	if unit == 'd' || unit == 'w' {
-		n, err := strconv.ParseFloat(s[:len(s)-1], 64)
-		if err != nil || n < 0 {
-			return 0, fmt.Errorf("invalid duration %q", s)
+	if unit != 'd' && unit != 'w' {
+		d, err := time.ParseDuration(s)
+		if err == nil && d <= 0 {
+			err = fmt.Errorf("duration %q is not positive", s)
 		}
-		d := time.Duration(n * float64(24*time.Hour))
-		if unit == 'w' {
-			d *= 7
-		}
-		return d, nil
+		return d, err
 	}
-	return time.ParseDuration(s)
+	n, err := strconv.ParseFloat(s[:len(s)-1], 64)
+	if unit == 'w' {
+		n *= 7
+	}
+	// Up to 100 years; time.Duration overflows at about 292.
+	if err != nil || !(n > 0) || n > 100*365 {
+		return 0, fmt.Errorf("invalid duration %q", s)
+	}
+	return time.Duration(n * float64(24*time.Hour)), nil
 }
 
 func runAgent(ctx context.Context, args []string, _ io.Writer) error {

@@ -62,3 +62,13 @@ CREATE TABLE IF NOT EXISTS listeners (
 	last_seen  INTEGER NOT NULL,
 	UNIQUE (proto, addr, port, netns)
 );
+
+-- Periods in which the agent recorded flows. Dependencies in a gap between
+-- periods are unknown.
+CREATE TABLE IF NOT EXISTS coverage (
+	start_ts INTEGER NOT NULL, -- unix time
+	end_ts   INTEGER NOT NULL,
+	udp      INTEGER NOT NULL, -- 1 if UDP was traced
+	drops    INTEGER NOT NULL DEFAULT 0 -- flow updates dropped by the kernel
+);
+CREATE INDEX IF NOT EXISTS coverage_end ON coverage (end_ts);

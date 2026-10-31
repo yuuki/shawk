@@ -100,7 +100,7 @@ func runCanIRemove(ctx context.Context, args []string, w io.Writer) error {
 	if err != nil {
 		return err
 	}
-	t, err := target(rest[0])
+	t, err := hostTarget(rest[0])
 	if err != nil {
 		return err
 	}
@@ -112,28 +112,54 @@ func runCanIRemove(ctx context.Context, args []string, w io.Writer) error {
 	if err != nil {
 		return err
 	}
+	verdict := r.Verdict()
 	if f.json {
-		if err := writeJSON(w, map[string]any{"safe": r.Safe(), "result": r, "since": q.Since}); err != nil {
+		if err := writeJSON(w, map[string]any{"verdict": verdict, "result": r, "since": q.Since}); err != nil {
 			return err
 		}
 	} else {
-		if r.Coverage.After(q.Since) {
-			fmt.Fprintf(w, "warning: the ledger of %s starts at %s; dependencies before it are unknown.\n",
-				r.Host, r.Coverage.Format(time.DateTime))
+		since := q.Since.Format(time.DateTime)
+		switch verdict {
+		case query.VerdictSafe:
+			fmt.Fprintf(w, "OK: no remote process used %s since %s.\n", rest[0], since)
+		case query.VerdictUnknown:
+			fmt.Fprintf(w, "UNKNOWN: no remote process was seen using %s since %s, but the record may be incomplete:\n", rest[0], since)
+		case query.VerdictInUse:
+			fmt.Fprintf(w, "NO: %s is still used by remote processes since %s:\n", rest[0], since)
+			for _, svc := range r.Clients {
+				printTree(w, svc, "", "", true)
+			}
+			if len(r.Reasons) > 0 {
+				fmt.Fprintln(w, "Other clients may be missing:")
+			}
 		}
-		if r.Safe() {
-			fmt.Fprintf(w, "OK: no remote process used %s since %s.\n", rest[0], q.Since.Format(time.DateTime))
-			return nil
-		}
-		fmt.Fprintf(w, "NO: %s is still used by remote processes since %s:\n", rest[0], q.Since.Format(time.DateTime))
-		for _, svc := range r.Clients {
-			printTree(w, svc, "", "", true)
+		for _, reason := range r.Reasons {
+			fmt.Fprintf(w, "  - %s\n", reason)
 		}
 	}
-	if !r.Safe() {
+	switch verdict {
+	case query.VerdictInUse:
 		return ErrFound
+	case query.VerdictUnknown:
+		return ErrUnknown
 	}
 	return nil
+}
+
+// hostTarget parses a target for commands that work on a whole host or one
+// of its ports, rejecting a process.
+func hostTarget(s string) (query.Target, error) {
+	t, err := target(s)
+	if err == nil && (t.Unit != "" || t.Comm != "") {
+		err = fmt.Errorf("%w: this command does not take a process in %q", errUsage, s)
+	}
+	return t, err
+}
+
+func printWarnings(w io.Writer, reasons []string) {
+	for _, r := range reasons {
+		fmt.Fprintf(w, "warning: %s\n", r)
+	}
 }
 
 func runUnused(ctx context.Context, args []string, w io.Writer) error {
@@ -144,21 +170,25 @@ func runUnused(ctx context.Context, args []string, w io.Writer) error {
 	if err != nil {
 		return err
 	}
-	t, err := target(rest[0])
+	t, err := hostTarget(rest[0])
 	if err != nil {
 		return err
+	}
+	if t.Port != 0 {
+		return fmt.Errorf("%w: unused does not take a port", errUsage)
 	}
 	q, err := f.querier()
 	if err != nil {
 		return err
 	}
-	ls, err := q.Unused(ctx, t.Host)
+	ls, reasons, err := q.Unused(ctx, t.Host)
 	if err != nil {
 		return err
 	}
 	if f.json {
-		return writeJSON(w, ls)
+		return writeJSON(w, map[string]any{"listeners": ls, "warnings": reasons})
 	}
+	printWarnings(w, reasons)
 	if len(ls) == 0 {
 		fmt.Fprintf(w, "Every service on %s was used since %s.\n", t.Host, q.Since.Format(time.DateTime))
 		return nil
@@ -181,9 +211,12 @@ func runDiff(ctx context.Context, args []string, w io.Writer) error {
 	if err != nil {
 		return err
 	}
-	t, err := target(rest[0])
+	t, err := hostTarget(rest[0])
 	if err != nil {
 		return err
+	}
+	if t.Port != 0 {
+		return fmt.Errorf("%w: diff does not take a port", errUsage)
 	}
 	q, err := f.querier()
 	if err != nil {
@@ -193,13 +226,17 @@ func runDiff(ctx context.Context, args []string, w io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("%w: -baseline: %v", errUsage, err)
 	}
-	changes, err := q.Diff(ctx, t.Host, q.Until.Add(-bd))
+	if start := time.Now().Add(-bd); !start.Before(q.Since) {
+		return fmt.Errorf("%w: -baseline must be longer than -since", errUsage)
+	}
+	changes, reasons, err := q.Diff(ctx, t.Host, time.Now().Add(-bd))
 	if err != nil {
 		return err
 	}
 	if f.json {
-		return writeJSON(w, changes)
+		return writeJSON(w, map[string]any{"changes": changes, "warnings": reasons})
 	}
+	printWarnings(w, reasons)
 	if len(changes) == 0 {
 		fmt.Fprintf(w, "No changes in the dependencies of %s since %s.\n", t.Host, q.Since.Format(time.DateTime))
 		return nil

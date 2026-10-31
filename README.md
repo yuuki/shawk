@@ -74,14 +74,14 @@ host name or an address of a host running the agent.
 | `shawk flows` | show bundled flows on this host live, without an agent |
 | `shawk who-uses TARGET [-depth N]` | processes that use services on TARGET, transitively upstream |
 | `shawk deps TARGET [-depth N]` | services that processes on TARGET use, transitively downstream |
-| `shawk can-i-remove TARGET` | whether remote processes used TARGET; exits 1 if so |
+| `shawk can-i-remove TARGET` | whether remote processes used TARGET: exits 0 if none did, 1 if some did, 3 if none was seen but the record is incomplete (gaps, dropped flows, UDP not traced) |
 | `shawk unused TARGET` | listening services that nobody used |
 | `shawk diff TARGET -since 24h` | dependencies that appeared or disappeared |
 | `shawk graph TARGET... [-format mermaid\|dot\|json]` | export the dependency graph |
 | `shawk status TARGET` | agent status and BPF program statistics |
 
-Every query accepts `-since` (default `30d`; units `m`, `h`, `d`, `w`) and
-`-json`.
+Every query accepts `-since` (units `m`, `h`, `d`, `w`) and `-json`. Errors
+exit with status 2.
 
 ```console
 $ shawk deps lb-01 -depth 3
