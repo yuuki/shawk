@@ -235,7 +235,11 @@ All struct accesses use CO-RE. `TestKernelCompatibility` checks every
 attach target, helper and CO-RE relocation against the BTF of the Rocky Linux
 9.6 kernel (`scripts/fetch-kernel-btf.sh`); for example `sk_userlocks` is a
 plain byte in recent kernels but a 4-bit bitfield at a different offset in
-5.14.
+5.14. It also compares the parameters of the kernel functions and BTF
+tracepoints the programs attach to with those `BPF_PROG` declares in the
+source, which the verifier does not check for arguments read through
+`BPF_CORE_READ`; `TestProgramPrototypes` does the same against the running
+kernel and its modules.
 
 ## 4. The agent
 
