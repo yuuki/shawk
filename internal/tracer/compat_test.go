@@ -14,8 +14,9 @@ import (
 )
 
 // TestKernelCompatibility checks the BPF programs against the BTF of another
-// kernel without loading them: the attach targets must exist, the helpers
-// must be known and every CO-RE relocation must resolve.
+// kernel without loading them: the attach targets must exist with the
+// prototypes the programs assume, the helpers must be known and every CO-RE
+// relocation must resolve.
 //
 // Set SHAWK_TARGET_BTF to a raw BTF file or a vmlinux ELF, for example one
 // extracted by scripts/fetch-kernel-btf.sh for Rocky Linux 9.
@@ -96,6 +97,86 @@ func checkAttachTarget(t *testing.T, target *btf.Spec, prog *ebpf.ProgramSpec) {
 		t.Errorf("attach target %s is not available", prog.AttachTo)
 	} else if err != nil {
 		t.Errorf("looking up attach target %s: %v", prog.AttachTo, err)
+	}
+	if prog.AttachType == ebpf.AttachTraceFEntry || prog.AttachType == ebpf.AttachTraceFExit {
+		checkPrototype(t, target, prog.AttachTo)
+	}
+}
+
+// fentryPrototypes are the parameters that the programs attached to kernel
+// functions (BPF_PROG in shawk.bpf.c) assume. The verifier checks only how
+// many there are, so a function whose parameters changed would make a
+// program read the wrong arguments.
+var fentryPrototypes = map[string][]string{
+	"ip_send_skb":     {"*net", "*sk_buff"},
+	"ip6_send_skb":    {"*sk_buff"},
+	"skb_consume_udp": {"*sock", "*sk_buff", "int"},
+}
+
+func checkPrototype(t *testing.T, target *btf.Spec, name string) {
+	t.Helper()
+	want, ok := fentryPrototypes[name]
+	if !ok {
+		t.Errorf("the prototype of %s is not listed in fentryPrototypes", name)
+		return
+	}
+	var fn *btf.Func
+	if err := target.TypeByName(name, &fn); err != nil {
+		return // reported by checkAttachTarget
+	}
+	proto, ok := fn.Type.(*btf.FuncProto)
+	if !ok {
+		t.Errorf("%s has no prototype", name)
+		return
+	}
+	var got []string
+	for _, p := range proto.Params {
+		got = append(got, paramType(p.Type))
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("parameters of %s = %v, the program assumes %v", name, got, want)
+	}
+}
+
+// paramType names a parameter type: the name of an integer, or of the
+// struct a pointer points to, prefixed with *.
+func paramType(typ btf.Type) string {
+	typ = btf.UnderlyingType(typ)
+	if ptr, ok := typ.(*btf.Pointer); ok {
+		return "*" + paramType(ptr.Target)
+	}
+	if typ == nil {
+		return "void"
+	}
+	return typ.TypeName()
+}
+
+// TestFentryPrototypes checks the prototypes of the kernel functions the UDP
+// programs attach to in the running kernel. It needs no privileges.
+func TestFentryPrototypes(t *testing.T) {
+	kernel, err := btf.LoadKernelSpec()
+	if err != nil {
+		t.Skipf("no kernel BTF: %v", err)
+	}
+	spec, err := loadBpf()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	for _, prog := range spec.Programs {
+		if prog.AttachType != ebpf.AttachTraceFEntry && prog.AttachType != ebpf.AttachTraceFExit {
+			continue
+		}
+		n++
+		var fn *btf.Func
+		if err := kernel.TypeByName(prog.AttachTo, &fn); err != nil {
+			t.Errorf("attach target %s: %v", prog.AttachTo, err)
+			continue
+		}
+		checkPrototype(t, kernel, prog.AttachTo)
+	}
+	if n != len(fentryPrototypes) {
+		t.Errorf("%d programs attach to kernel functions, fentryPrototypes lists %d", n, len(fentryPrototypes))
 	}
 }
 
