@@ -99,8 +99,11 @@ type Tracer struct {
 	// ownerless are the listeners whose owner the last scan could not find,
 	// e.g. sockets of the kernel, and unheld the inodes of listening sockets
 	// that no process held then. They do not trigger another scan.
-	ownerless   map[sockAddrKey]bool
-	unheld      map[uint64]bool
+	ownerless map[sockAddrKey]bool
+	unheld    map[uint64]bool
+	// listening are the inodes of the listening sockets at the last owner
+	// scan.
+	listening   map[uint64]bool
 	lastOwnScan time.Time
 	lastAdopted uint64
 	// warnings rate-limits the warnings about kernel counters.
@@ -722,7 +725,9 @@ func (t *Tracer) refreshOwners(listeners []Listener, inos []uint64) error {
 		}
 	}
 	t.unheld = map[uint64]bool{}
+	t.listening = make(map[uint64]bool, len(inos))
 	for _, ino := range inos {
+		t.listening[ino] = true
 		if !t.held[ino] {
 			t.unheld[ino] = true
 		}
@@ -767,10 +772,12 @@ func preferOwner(pid, cur uint32) bool {
 	return pid != 1 && pid < cur
 }
 
-// hasNewListener reports whether a listener appeared whose owner is not
-// known yet: on a new address, or as a new socket on a known one, such as
-// that of a service restarted in the same cgroup, which the cgroup of the
-// connections it accepts does not tell from the former one.
+// hasNewListener reports whether the owners of listeners may have changed
+// since the last owner scan: a listener appeared on a new address, or a
+// socket appeared or went away on a known one. A service restarted in the
+// same cgroup, which the cgroup of the connections it accepts does not tell
+// from the former one, creates a new socket; with SO_REUSEPORT it may do so
+// before the former process closes its own.
 func (t *Tracer) hasNewListener(listeners []Listener, inos []uint64) bool {
 	for i := range listeners {
 		k := listenerKey(&listeners[i])
@@ -778,8 +785,15 @@ func (t *Tracer) hasNewListener(listeners []Listener, inos []uint64) bool {
 			return true
 		}
 	}
+	current := make(map[uint64]bool, len(inos))
 	for _, ino := range inos {
 		if !t.held[ino] && !t.unheld[ino] {
+			return true
+		}
+		current[ino] = true
+	}
+	for ino := range t.listening {
+		if !current[ino] {
 			return true
 		}
 	}

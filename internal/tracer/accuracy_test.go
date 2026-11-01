@@ -640,3 +640,109 @@ func tcpChecksum(src, dst [4]byte, seg []byte) uint16 {
 	}
 	return ^uint16(sum)
 }
+
+// TestTCPChildNotCreated checks a child of a listener that the kernel fails
+// to create when the handshake completes, here for want of a route to the
+// client: it goes from SYN_RECV to CLOSE, but was never a connection, and
+// must not be counted as one (it was, once every exit from SYN_RECV counted
+// as a passive open). The listener defers the child until data comes, and
+// the route goes away in between. It runs in a network namespace of its
+// own, whose routing rules it changes.
+func TestTCPChildNotCreated(t *testing.T) {
+	skipIfNoNetwork(t, "tcp4")
+	tr := newTestTracer(t)
+	run, _ := newNetNS(t)
+	var (
+		srv   netip.AddrPort
+		drops uint64
+	)
+	run(func() {
+		lc := net.ListenConfig{Control: setsockoptControl(unix.IPPROTO_TCP, unix.TCP_DEFER_ACCEPT, 5)}
+		lc.SetMultipathTCP(false)
+		ln, err := lc.Listen(t.Context(), "tcp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { ln.Close() })
+		srv = ln.Addr().(*net.TCPAddr).AddrPort()
+		d := net.Dialer{LocalAddr: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 2)}}
+		d.SetMultipathTCP(false)
+		c, err := d.Dial("tcp4", srv.String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { c.Close() })
+		// No route from the server to the client: the local table, which
+		// holds 127.0.0.0/8, is looked up after a rule that makes the
+		// client unreachable.
+		ipRule(t, unix.RTM_NEWRULE, unix.RT_TABLE_LOCAL, unix.FR_ACT_TO_TBL, 100, netip.Addr{})
+		ipRule(t, unix.RTM_DELRULE, unix.RT_TABLE_LOCAL, unix.FR_ACT_TO_TBL, 0, netip.Addr{})
+		ipRule(t, unix.RTM_NEWRULE, 0, unix.FR_ACT_UNREACHABLE, 10, netip.AddrFrom4([4]byte{127, 0, 0, 2}))
+		before := tcpExtCounter(t, "ListenDrops")
+		if _, err := c.Write([]byte("x")); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(200 * time.Millisecond)
+		drops = tcpExtCounter(t, "ListenDrops") - before
+	})
+	if drops == 0 {
+		skipUnavailable(t, "the child was not dropped")
+	}
+	snap, err := tr.Collect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if in := findFlow(snap.Flows, DirIn, ProtoTCP, srv.Port(), netip.AddrFrom4([4]byte{127, 0, 0, 2})); in != nil && in.Conns != 0 {
+		t.Errorf("%d children that failed to be created counted as connections: %+v", drops, in)
+	}
+}
+
+// ipRule adds (RTM_NEWRULE) or deletes (RTM_DELRULE) an IPv4 routing policy
+// rule in the network namespace of the thread, to dst if it is valid.
+func ipRule(t *testing.T, msgType uint16, table, action uint8, priority uint32, dst netip.Addr) {
+	t.Helper()
+	fd, err := unix.Socket(unix.AF_NETLINK, unix.SOCK_RAW|unix.SOCK_CLOEXEC, unix.NETLINK_ROUTE)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(fd)
+	// struct fib_rule_hdr: family, dst_len, src_len, tos, table, res1,
+	// res2, action, flags.
+	body := []byte{unix.AF_INET, 0, 0, 0, table, 0, 0, action, 0, 0, 0, 0}
+	attr := func(typ uint16, data []byte) {
+		a := make([]byte, (4+len(data)+3)&^3)
+		binary.NativeEndian.PutUint16(a, uint16(4+len(data)))
+		binary.NativeEndian.PutUint16(a[2:], typ)
+		copy(a[4:], data)
+		body = append(body, a...)
+	}
+	attr(unix.FRA_PRIORITY, binary.NativeEndian.AppendUint32(nil, priority))
+	if dst.IsValid() {
+		body[1] = 32
+		attr(unix.FRA_DST, dst.AsSlice())
+	}
+	flags := uint16(unix.NLM_F_REQUEST | unix.NLM_F_ACK)
+	if msgType == unix.RTM_NEWRULE {
+		flags |= unix.NLM_F_CREATE | unix.NLM_F_EXCL
+	}
+	msg := make([]byte, unix.SizeofNlMsghdr, unix.SizeofNlMsghdr+len(body))
+	binary.NativeEndian.PutUint32(msg, uint32(unix.SizeofNlMsghdr+len(body)))
+	binary.NativeEndian.PutUint16(msg[4:], msgType)
+	binary.NativeEndian.PutUint16(msg[6:], flags)
+	binary.NativeEndian.PutUint32(msg[8:], 1)
+	msg = append(msg, body...)
+	if err := unix.Sendto(fd, msg, 0, &unix.SockaddrNetlink{Family: unix.AF_NETLINK}); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 4096)
+	n, _, err := unix.Recvfrom(fd, buf, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n < unix.SizeofNlMsghdr+4 || binary.NativeEndian.Uint16(buf[4:]) != unix.NLMSG_ERROR {
+		t.Fatalf("unexpected netlink reply of %d bytes", n)
+	}
+	if errno := int32(binary.NativeEndian.Uint32(buf[unix.SizeofNlMsghdr:])); errno != 0 {
+		t.Fatalf("routing rule %d: %v", msgType, unix.Errno(-errno))
+	}
+}

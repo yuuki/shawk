@@ -110,7 +110,7 @@ retransmissions stand for errors, and open connections are added.
 |---|---|
 | `tp_btf/inet_sock_set_state` CLOSE→SYN_SENT | **active open**. Runs inside `connect(2)`, so the current task is the client. The flow key and the owner are stored in the socket local storage (`BPF_MAP_TYPE_SK_STORAGE`). |
 | SYN_SENT→ESTABLISHED / →CLOSE | count an established / failed outgoing connection |
-| SYN_RECV→* | **passive open**; counts an incoming connection. It usually goes to ESTABLISHED; a child created by a TCP Fast Open SYN, which carries data and is accepted at once, may also be closed or reset before the handshake completes. On a socket that went through SYN_SENT it ends a simultaneous open instead, e.g. of a socket connected to itself, which stays outgoing. |
+| SYN_RECV→* | **passive open**; counts an incoming connection. It usually goes to ESTABLISHED; a child created by a TCP Fast Open SYN, which carries data and is accepted at once, may also be closed or reset before the handshake completes. Other children that leave SYN_RECV for CLOSE failed to be created (e.g. without a route to the client) and are not counted. On a socket that went through SYN_SENT it ends a simultaneous open instead, e.g. of a socket connected to itself, which stays outgoing. |
 | *→CLOSE | account the remaining bytes of the connection, if any |
 | `iter/tcp` (every interval) | account byte deltas of long-lived connections, sample RTT, count open connections, list listening sockets, **adopt** connections established before the agent started |
 | `iter/task_file` | find the owners of adopted connections and of listening sockets |
@@ -177,8 +177,10 @@ listener, and the parent to forked workers. When no holder matches (the
 listener was closed or replaced since the last scan), the cgroup still names
 the service and another scan is requested. The walk also reports the inode
 of every listening socket, and a listening socket that the last scan did not
-see requests one, so that a listener replaced by another process of the
-same cgroup, e.g. a restarted service, is attributed to it at once.
+see, or that it saw and is gone, requests one, so that a listener replaced
+by another process of the same cgroup, e.g. a restarted service, is
+attributed to it at once, also when both listen for a while with
+`SO_REUSEPORT`.
 
 ### 3.3 UDP
 

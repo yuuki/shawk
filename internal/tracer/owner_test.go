@@ -254,17 +254,29 @@ func TestCgroupEvents(t *testing.T) {
 // another process in the same cgroup, like a restarted service, is
 // attributed to the new process at once rather than after the next periodic
 // owner scan (#98): the cgroup of the accepted connections cannot tell them
-// apart, the socket of the new listener can.
+// apart, the sockets of the listeners can. The new process may listen after
+// the former one stopped, or before, with SO_REUSEPORT.
 func TestListenerReplacedInCgroup(t *testing.T) {
 	requireRoot(t)
+	for _, overlap := range []bool{false, true} {
+		name := "stopped, then started"
+		if overlap {
+			name = "started before the former stops"
+		}
+		t.Run(name, func(t *testing.T) { testListenerReplaced(t, overlap) })
+	}
+}
+
+func testListenerReplaced(t *testing.T, overlap bool) {
 	l, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	port := l.Addr().(*net.TCPAddr).Port
 	l.Close()
-	// startHelper starts a process listening on the port, in the cgroup of
-	// the test, and returns it with a function that stops it.
+	// startHelper starts a process listening on the port with
+	// SO_REUSEPORT, in the cgroup of the test, and returns it with a
+	// function that stops it.
 	startHelper := func() (*exec.Cmd, func()) {
 		t.Helper()
 		helper := exec.Command(os.Args[0], "-test.run=^TestHelperReusePort$")
@@ -303,12 +315,23 @@ func TestListenerReplacedInCgroup(t *testing.T) {
 		t.Fatalf("listener owner = %d, want %d", pid, old.Process.Pid)
 	}
 
-	stopOld()
-	replacement, _ := startHelper()
+	var replacement *exec.Cmd
+	if overlap {
+		// Both hold the port at a scan, then the former stops.
+		replacement, _ = startHelper()
+		if _, err := tr.Collect(); err != nil {
+			t.Fatal(err)
+		}
+		stopOld()
+	} else {
+		stopOld()
+		replacement, _ = startHelper()
+	}
 	c, err := net.Dial("tcp4", "127.0.0.1:"+strconv.Itoa(port))
 	if err != nil {
 		t.Fatal(err)
 	}
+	c.SetReadDeadline(time.Now().Add(5 * time.Second))
 	c.Read(make([]byte, 1))
 	c.Close()
 	time.Sleep(100 * time.Millisecond)

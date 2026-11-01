@@ -67,8 +67,9 @@ struct shawk_iter_rec {
 	__u32 _pad;
 	/*
 	 * Inode of the socket, which tells apart a listener replaced by another
-	 * on the same address; 0 for sockets without a file (of the kernel, or
-	 * the subflows of MPTCP).
+	 * on the same address; 0 for sockets of the kernel, which have no file.
+	 * The first subflow of an MPTCP listener has the file of the MPTCP
+	 * socket.
 	 */
 	__u64 ino;
 };
