@@ -98,9 +98,7 @@ func TestTCPAdoptedWithoutListener(t *testing.T) {
 // 1024-65535, where ports tell nothing.
 func TestTCPAdoptedDirection(t *testing.T) {
 	skipIfNoNetwork(t, "tcp4")
-	if os.Geteuid() != 0 {
-		t.Skip("requires root")
-	}
+	requireRoot(t)
 	t.Run("default range", func(t *testing.T) {
 		testAdoptedDirection(t, func(f func()) { f() }, currentNetNS(t))
 	})
@@ -226,11 +224,11 @@ func newNetNS(t *testing.T) (func(f func()), uint32) {
 	t.Helper()
 	ip, err := exec.LookPath("ip")
 	if err != nil {
-		t.Skip("ip is not available")
+		skipUnavailable(t, "ip is not available")
 	}
 	name := fmt.Sprintf("shawkacc%d-%d", os.Getpid(), netnsSeq.Add(1))
 	if out, err := exec.Command(ip, "netns", "add", name).CombinedOutput(); err != nil {
-		t.Skipf("cannot create a network namespace: %v: %s", err, out)
+		skipUnavailable(t, "cannot create a network namespace: %v: %s", err, out)
 	}
 	t.Cleanup(func() { exec.Command(ip, "netns", "del", name).Run() })
 	if out, err := exec.Command(ip, "-n", name, "link", "set", "lo", "up").CombinedOutput(); err != nil {
@@ -286,7 +284,7 @@ func TestTCPSelfConnect(t *testing.T) {
 	d := net.Dialer{LocalAddr: ap}
 	c, err := d.Dial("tcp4", ap.String())
 	if err != nil {
-		t.Skipf("self-connect failed: %v", err)
+		skipUnavailable(t, "self-connect failed: %v", err)
 	}
 	roundTrip(t, c, 100)
 	c.Close()
@@ -417,9 +415,7 @@ func TestTCPExactBytes(t *testing.T) {
 // TestListenPortCapacity checks that the tables of listening ports are sized
 // by MaxFlows and that their overflow is reported (#98).
 func TestListenPortCapacity(t *testing.T) {
-	if os.Geteuid() != 0 {
-		t.Skip("requires root")
-	}
+	requireRoot(t)
 	for range 3 {
 		echoServer(t, "tcp4", "127.0.0.1:0")
 	}
@@ -524,10 +520,10 @@ func TestTCPFastOpen(t *testing.T) {
 		withData = tcpExtCounter(t, "TCPFastOpenActive") - before
 	})
 	if skipCause != "" {
-		t.Skip(skipCause)
+		skipUnavailable(t, "%s", skipCause)
 	}
 	if withData != conns {
-		t.Skipf("%d of %d connections carried data in their SYN", withData, conns)
+		skipUnavailable(t, "%d of %d connections carried data in their SYN", withData, conns)
 	}
 	time.Sleep(100 * time.Millisecond)
 
@@ -551,7 +547,7 @@ func tcpExtCounter(t *testing.T, name string) uint64 {
 	t.Helper()
 	b, err := os.ReadFile("/proc/thread-self/net/netstat")
 	if err != nil {
-		t.Skip(err)
+		skipUnavailable(t, "%v", err)
 	}
 	lines := strings.Split(string(b), "\n")
 	for i := 0; i+1 < len(lines); i += 2 {
@@ -566,6 +562,6 @@ func tcpExtCounter(t *testing.T, name string) uint64 {
 			}
 		}
 	}
-	t.Skipf("no counter %s", name)
+	skipUnavailable(t, "no counter %s", name)
 	return 0
 }
