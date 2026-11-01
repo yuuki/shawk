@@ -1,12 +1,17 @@
 package tracer
 
 import (
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
+	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -85,66 +90,184 @@ func TestTCPAdoptedWithoutListener(t *testing.T) {
 	}
 }
 
-// TestTCPAdoptedBoundClient checks a connection established before the
-// tracer started by a client that bound its port before connecting (#93): it
-// must stay outgoing, although its port was not allocated by connect(2).
-func TestTCPAdoptedBoundClient(t *testing.T) {
+// TestTCPAdoptedDirection checks the direction of connections established
+// before the tracer started, whatever their ports (#93): clients that let
+// connect(2) choose their port, bind port 0 or bind a privileged port, and
+// servers whose listener was closed since, with clients on any port. It runs
+// in the namespace of the test and in one whose ephemeral range is
+// 1024-65535, where ports tell nothing.
+func TestTCPAdoptedDirection(t *testing.T) {
 	skipIfNoNetwork(t, "tcp4")
-	ln := listenFixedPort(t)
-	go func() {
-		for {
-			c, err := ln.Accept()
-			if err != nil {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root")
+	}
+	t.Run("default range", func(t *testing.T) {
+		testAdoptedDirection(t, func(f func()) { f() }, currentNetNS(t))
+	})
+	t.Run("wide range", func(t *testing.T) {
+		run, inode := newNetNS(t)
+		run(func() {
+			if err := os.WriteFile("/proc/sys/net/ipv4/ip_local_port_range", []byte("1024 65535"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		})
+		testAdoptedDirection(t, run, inode)
+	})
+}
+
+func testAdoptedDirection(t *testing.T, inNetNS func(func()), netns uint32) {
+	type conn struct {
+		name string
+		srv  netip.AddrPort
+		c    net.Conn
+	}
+	var conns []conn
+	dial := func(name string, srv netip.AddrPort, laddr *net.TCPAddr) {
+		t.Helper()
+		d := net.Dialer{LocalAddr: laddr}
+		c, err := d.Dial("tcp4", srv.String())
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		t.Cleanup(func() { c.Close() })
+		conns = append(conns, conn{name, srv, c})
+	}
+	// dialPrivileged binds a free port below 1024 before connecting.
+	dialPrivileged := func(name string, srv netip.AddrPort) {
+		t.Helper()
+		for port := 900; port < 1024; port++ {
+			d := net.Dialer{LocalAddr: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port}}
+			if c, err := d.Dial("tcp4", srv.String()); err == nil {
+				t.Cleanup(func() { c.Close() })
+				conns = append(conns, conn{name, srv, c})
 				return
 			}
-			go echo(c)
 		}
-	}()
-	srv := ln.Addr().(*net.TCPAddr).AddrPort()
-	d := net.Dialer{LocalAddr: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)}}
-	cli, err := d.Dial("tcp4", srv.String())
-	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("%s: no free port below 1024", name)
 	}
-	defer cli.Close()
-	cliPort := cli.LocalAddr().(*net.TCPAddr).AddrPort().Port()
+	inNetNS(func() {
+		ln := echoServer(t, "tcp4", "127.0.0.1:0")
+		srv := ln.Addr().(*net.TCPAddr).AddrPort()
+		dial("client", srv, nil)
+		dial("client bound to port 0", srv, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		dialPrivileged("client bound to a privileged port", srv)
+		for _, bound := range []bool{false, true} {
+			name := "server draining its connections"
+			if bound {
+				name += ", client on a privileged port"
+			}
+			ln := echoServer(t, "tcp4", "127.0.0.1:0")
+			srv := ln.Addr().(*net.TCPAddr).AddrPort()
+			if bound {
+				dialPrivileged(name, srv)
+			} else {
+				dial(name, srv, nil)
+			}
+			roundTrip(t, conns[len(conns)-1].c, 1)
+			ln.Close()
+		}
+	})
 
 	tr := newTestTracer(t)
-	roundTrip(t, cli, 100)
+	for _, c := range conns {
+		roundTrip(t, c.c, 100)
+	}
 	time.Sleep(100 * time.Millisecond)
 	snap, err := tr.Collect()
 	if err != nil {
 		t.Fatal(err)
 	}
+	var flows []Flow
 	for _, f := range snap.Flows {
-		if f.Proto == ProtoTCP && f.Port == cliPort {
-			t.Errorf("the client's port became a service port: %+v", f)
+		if f.NetNS == netns && f.Proto == ProtoTCP {
+			flows = append(flows, f)
 		}
 	}
-	out := findFlow(snap.Flows, DirOut, ProtoTCP, srv.Port(), srv.Addr())
-	if out == nil || out.BytesSent != 100 || out.OpenConns != 1 || out.Comm != testComm {
-		t.Errorf("client flow = %+v", out)
+	want := map[uint16]uint64{}
+	for _, c := range conns {
+		want[c.srv.Port()]++
+		port := c.c.LocalAddr().(*net.TCPAddr).AddrPort().Port()
+		for _, f := range flows {
+			if f.Port == port {
+				t.Errorf("%s: its port %d became a service port: %+v", c.name, port, f)
+			}
+		}
 	}
-	in := findFlow(snap.Flows, DirIn, ProtoTCP, srv.Port(), srv.Addr())
-	if in == nil || in.BytesRecv != 100 || in.OpenConns != 1 {
-		t.Errorf("server flow = %+v", in)
+	for port, n := range want {
+		addr := netip.AddrFrom4([4]byte{127, 0, 0, 1})
+		out := findFlow(flows, DirOut, ProtoTCP, port, addr)
+		if out == nil || out.OpenConns != n || out.BytesSent != 100*n || out.BytesRecv != 100*n {
+			t.Errorf("port %d: client flow = %+v, want %d connections", port, out, n)
+		}
+		in := findFlow(flows, DirIn, ProtoTCP, port, addr)
+		if in == nil || in.OpenConns != n || in.BytesSent != 100*n || in.BytesRecv != 100*n || in.Comm != testComm {
+			t.Errorf("port %d: server flow = %+v, want %d connections", port, in, n)
+		}
 	}
 }
 
-// listenFixedPort listens on a TCP port below the ephemeral range, as
-// services do.
-func listenFixedPort(t *testing.T) net.Listener {
+func currentNetNS(t *testing.T) uint32 {
 	t.Helper()
-	low, _ := ephemeralPortRange()
-	for port := int(low) - 5000 + os.Getpid()%3000; port < int(low); port++ {
-		ln, err := net.Listen("tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
-		if err == nil {
-			t.Cleanup(func() { ln.Close() })
-			return ln
-		}
+	var st unix.Stat_t
+	if err := unix.Stat("/proc/thread-self/ns/net", &st); err != nil {
+		t.Fatal(err)
 	}
-	t.Fatal("no free TCP port")
-	return nil
+	return uint32(st.Ino)
+}
+
+var netnsSeq atomic.Uint32
+
+// newNetNS creates a named network namespace with its loopback up, whose
+// sockets the tracer walks like those of a container. It returns a function
+// running f on a thread that entered the namespace, and its inode. Sockets
+// created by f belong to the namespace; /proc/sys/net and
+// /proc/thread-self/net are those of the namespace while f runs.
+func newNetNS(t *testing.T) (func(f func()), uint32) {
+	t.Helper()
+	ip, err := exec.LookPath("ip")
+	if err != nil {
+		t.Skip("ip is not available")
+	}
+	name := fmt.Sprintf("shawkacc%d-%d", os.Getpid(), netnsSeq.Add(1))
+	if out, err := exec.Command(ip, "netns", "add", name).CombinedOutput(); err != nil {
+		t.Skipf("cannot create a network namespace: %v: %s", err, out)
+	}
+	t.Cleanup(func() { exec.Command(ip, "netns", "del", name).Run() })
+	if out, err := exec.Command(ip, "-n", name, "link", "set", "lo", "up").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	var st unix.Stat_t
+	if err := unix.Stat("/run/netns/"+name, &st); err != nil {
+		t.Fatal(err)
+	}
+	run := func(f func()) {
+		runtime.LockOSThread()
+		orig, err := os.Open("/proc/thread-self/ns/net")
+		if err != nil {
+			runtime.UnlockOSThread()
+			t.Fatal(err)
+		}
+		defer orig.Close()
+		ns, err := os.Open("/run/netns/" + name)
+		if err != nil {
+			runtime.UnlockOSThread()
+			t.Fatal(err)
+		}
+		defer ns.Close()
+		if err := unix.Setns(int(ns.Fd()), unix.CLONE_NEWNET); err != nil {
+			runtime.UnlockOSThread()
+			t.Fatal(err)
+		}
+		// A thread that cannot return to its namespace ends with its
+		// goroutine instead of being reused.
+		defer func() {
+			if unix.Setns(int(orig.Fd()), unix.CLONE_NEWNET) == nil {
+				runtime.UnlockOSThread()
+			}
+		}()
+		f()
+	}
+	return run, uint32(st.Ino)
 }
 
 // TestTCPSelfConnect checks a socket connected to itself, which goes through
@@ -192,19 +315,30 @@ func TestTCPSelfConnect(t *testing.T) {
 func TestTCPCloseWithoutTraffic(t *testing.T) {
 	skipIfNoNetwork(t, "tcp4")
 	tr := newTestTracer(t)
-	ln := echoServer(t, "tcp4", "127.0.0.1:0")
+	ln, accepted := acceptOne(t)
 	srv := ln.Addr().(*net.TCPAddr).AddrPort()
 	c, err := net.Dial("tcp4", srv.String())
 	if err != nil {
 		t.Fatal(err)
 	}
-	roundTrip(t, c, 100)
+	s := <-accepted
+	if _, err := c.Write(make([]byte, 100)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(s, make([]byte, 100)); err != nil {
+		t.Fatal(err)
+	}
 	time.Sleep(50 * time.Millisecond)
 	if _, err := tr.Collect(); err != nil {
 		t.Fatal(err)
 	}
 
 	c.Close()
+	s.SetReadDeadline(time.Now().Add(time.Second))
+	if n, err := s.Read(make([]byte, 1)); n != 0 || err != io.EOF {
+		t.Fatalf("read after the peer closed = %d, %v", n, err)
+	}
+	s.Close()
 	time.Sleep(100 * time.Millisecond)
 	snap, err := tr.Collect()
 	if err != nil {
@@ -289,6 +423,8 @@ func TestListenPortCapacity(t *testing.T) {
 	for range 3 {
 		echoServer(t, "tcp4", "127.0.0.1:0")
 	}
+	defer func(lo uint32) { minListenPorts = lo }(minListenPorts)
+	minListenPorts = 2
 	var logs strings.Builder
 	tr, err := New(Options{
 		TraceSelf:         true,
@@ -313,22 +449,12 @@ func TestListenPortCapacity(t *testing.T) {
 }
 
 // TestTCPFastOpen checks that data carried by the SYN of a TCP Fast Open
-// connection is counted on both sides (#97).
+// connection is counted on both sides (#97). It runs in a network namespace
+// of its own, whose sysctls it changes.
 func TestTCPFastOpen(t *testing.T) {
 	skipIfNoNetwork(t, "tcp4")
 	tr := newTestTracer(t)
-	const sysctl = "/proc/sys/net/ipv4/tcp_fastopen"
-	old, err := os.ReadFile(sysctl)
-	if err != nil {
-		t.Skip(err)
-	}
-	// Clients and servers, without cookies (0x1 | 0x2 | 0x4 | 0x200), so
-	// that every SYN carries data.
-	if err := os.WriteFile(sysctl, []byte("519"), 0o644); err != nil {
-		t.Skip(err)
-	}
-	t.Cleanup(func() { os.WriteFile(sysctl, old, 0o644) })
-
+	run, _ := newNetNS(t)
 	setsockopt := func(opt, value int) func(string, string, syscall.RawConn) error {
 		return func(_, _ string, c syscall.RawConn) error {
 			var serr error
@@ -340,51 +466,68 @@ func TestTCPFastOpen(t *testing.T) {
 			return serr
 		}
 	}
-	// The length of the queue of pending Fast Open requests.
-	lc := net.ListenConfig{Control: setsockopt(unix.TCP_FASTOPEN, 16)}
-	lc.SetMultipathTCP(false)
-	ln, err := lc.Listen(t.Context(), "tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	go func() {
-		for {
-			c, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go func() {
-				defer c.Close()
-				if _, err := io.ReadFull(c, make([]byte, 1000)); err != nil {
-					return
-				}
-				c.Write(make([]byte, 300))
-				io.Copy(io.Discard, c)
-			}()
-		}
-	}()
-	srv := ln.Addr().(*net.TCPAddr).AddrPort()
-
-	before := tcpExtCounter(t, "TCPFastOpenActive")
-	d := net.Dialer{Control: setsockopt(unix.TCP_FASTOPEN_CONNECT, 1)}
-	d.SetMultipathTCP(false)
 	const conns = 2
-	for range conns {
-		c, err := d.Dial("tcp4", srv.String())
+	var (
+		srv       netip.AddrPort
+		withData  uint64
+		skipCause string
+	)
+	run(func() {
+		// Clients and servers, without cookies (0x1 | 0x2 | 0x4 | 0x200), so
+		// that every SYN carries data.
+		if err := os.WriteFile("/proc/sys/net/ipv4/tcp_fastopen", []byte("519"), 0o644); err != nil {
+			skipCause = err.Error()
+			return
+		}
+		// The length of the queue of pending Fast Open requests.
+		lc := net.ListenConfig{Control: setsockopt(unix.TCP_FASTOPEN, 16)}
+		lc.SetMultipathTCP(false)
+		ln, err := lc.Listen(t.Context(), "tcp4", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := c.Write(make([]byte, 1000)); err != nil {
-			t.Fatal(err)
+		t.Cleanup(func() { ln.Close() })
+		go func() {
+			for {
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				go func() {
+					defer c.Close()
+					if _, err := io.ReadFull(c, make([]byte, 1000)); err != nil {
+						return
+					}
+					c.Write(make([]byte, 300))
+					io.Copy(io.Discard, c)
+				}()
+			}
+		}()
+		srv = ln.Addr().(*net.TCPAddr).AddrPort()
+
+		before := tcpExtCounter(t, "TCPFastOpenActive")
+		d := net.Dialer{Control: setsockopt(unix.TCP_FASTOPEN_CONNECT, 1)}
+		d.SetMultipathTCP(false)
+		for range conns {
+			c, err := d.Dial("tcp4", srv.String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := c.Write(make([]byte, 1000)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := io.ReadFull(c, make([]byte, 300)); err != nil {
+				t.Fatal(err)
+			}
+			c.Close()
 		}
-		if _, err := io.ReadFull(c, make([]byte, 300)); err != nil {
-			t.Fatal(err)
-		}
-		c.Close()
+		withData = tcpExtCounter(t, "TCPFastOpenActive") - before
+	})
+	if skipCause != "" {
+		t.Skip(skipCause)
 	}
-	if n := tcpExtCounter(t, "TCPFastOpenActive") - before; n != conns {
-		t.Skipf("%d of %d connections carried data in their SYN", n, conns)
+	if withData != conns {
+		t.Skipf("%d of %d connections carried data in their SYN", withData, conns)
 	}
 	time.Sleep(100 * time.Millisecond)
 
@@ -402,10 +545,11 @@ func TestTCPFastOpen(t *testing.T) {
 	}
 }
 
-// tcpExtCounter returns a counter of the TcpExt section of /proc/net/netstat.
+// tcpExtCounter returns a counter of the TcpExt section of netstat in the
+// network namespace of the current thread.
 func tcpExtCounter(t *testing.T, name string) uint64 {
 	t.Helper()
-	b, err := os.ReadFile("/proc/net/netstat")
+	b, err := os.ReadFile("/proc/thread-self/net/netstat")
 	if err != nil {
 		t.Skip(err)
 	}

@@ -137,8 +137,7 @@ type Snapshot struct {
 	Flows     []Flow
 	Listeners []Listener
 	// Drops is the cumulative number of flow updates dropped because the
-	// flow table was full, and of TCP connections lost because the kernel
-	// could not allocate socket storage for them.
+	// flow table was full.
 	Drops uint64
 }
 

@@ -91,11 +91,13 @@ volatile __u32 initial_scan = 0;
  * when the tracer runs in a PID namespace.
  */
 volatile __u32 self_tgid = 0xffffffff;
-/*
- * Flow updates dropped because the flow table was full, and TCP connections
- * lost because no socket storage could be allocated for them.
- */
+/* Flow updates dropped because the flow table was full. */
 __u64 flow_drops = 0;
+/*
+ * TCP connections opened without socket storage, which the next walk adopts:
+ * their connection and the traffic until then are not counted.
+ */
+__u64 storage_fails = 0;
 __u64 adopted_unowned = 0;
 /* Listening ports that did not fit in listen_ports or udp_listen_ports. */
 __u64 listen_port_drops = 0;
@@ -466,7 +468,7 @@ static __always_inline void on_active_open(struct sock *sk)
 	ss = bpf_sk_storage_get(&sock_states, sk, NULL,
 				BPF_SK_STORAGE_GET_F_CREATE);
 	if (!ss) {
-		__sync_fetch_and_add(&flow_drops, 1);
+		__sync_fetch_and_add(&storage_fails, 1);
 		return;
 	}
 	ss->key = key;
@@ -500,7 +502,7 @@ static __always_inline void on_passive_open(struct sock *sk)
 	ss = bpf_sk_storage_get(&sock_states, sk, NULL,
 				BPF_SK_STORAGE_GET_F_CREATE);
 	if (!ss) {
-		__sync_fetch_and_add(&flow_drops, 1);
+		__sync_fetch_and_add(&storage_fails, 1);
 		return;
 	}
 	ss->key = key;
@@ -575,8 +577,11 @@ int BPF_PROG(shawk_inet_sock_set_state, const struct sock *csk, int oldstate,
 	if (!take_tcp_delta(ss, sk, tp, oldstate, &d))
 		return 0;
 	fs = flow_get(&ss->key);
-	if (fs)
+	if (fs) {
 		add_tcp_delta(fs, &d);
+		if (ss->pid)
+			fs->pid = ss->pid;
+	}
 	return 0;
 }
 
@@ -596,49 +601,27 @@ static __always_inline void emit_listener(struct seq_file *seq,
 }
 
 /*
- * Whether the local port of a connection was allocated by connect(2). Such a
- * port gets a bind bucket of its own, marked as not reusable by bind(2)
- * (fastreuse -1). Ports bound by bind(2) or listen(2) do not: the connections
- * accepted by a listener share its bucket, and keep it after it is closed.
- */
-static __always_inline bool connect_bound(struct sock *sk)
-{
-	struct inet_connection_sock *icsk = (struct inet_connection_sock *)sk;
-	struct inet_bind_bucket *tb = BPF_CORE_READ(icsk, icsk_bind_hash);
-
-	if (!tb)
-		return true;
-	return BPF_CORE_READ(tb, fastreuse) < 0;
-}
-
-/*
  * Returns the direction of a connection established before the tracer
  * started, and whether its local port is listening.
+ *
+ * A connection whose port nothing listens on may still have been accepted:
+ * by a listener that is gone (a server draining its connections after a
+ * graceful restart, an FTP data connection) or, with TPROXY, on another port
+ * than the listener's. listen(2) sets sk_max_ack_backlog, and the
+ * connections a listener accepts are clones of it that keep it
+ * (sk_clone_lock() copies the socket and never resets it), while a socket
+ * that connects never listened. Ports and ranges cannot tell: a client may
+ * bind any port before connecting, and a server may listen anywhere.
  */
 static __always_inline __u8 adopted_direction(struct sock *sk, __u32 netns,
 					      __u16 lport, bool *listening)
 {
 	struct shawk_listen_key lk = {.netns = netns, .port = lport};
-	__u16 rport;
 
 	*listening = bpf_map_lookup_elem(&listen_ports, &lk) != NULL;
-	if (*listening)
+	if (*listening || BPF_CORE_READ(sk, sk_max_ack_backlog))
 		return DIR_IN;
-	if (connect_bound(sk))
-		return DIR_OUT;
-	/*
-	 * The port was bound by bind(2) or listen(2), but nothing listens on
-	 * it: mostly a connection accepted by a listener that is gone (a server
-	 * draining its connections, an FTP data connection) or, with TPROXY, on
-	 * another port than the listener's. A client may also bind its port
-	 * before connecting, e.g. to choose its source address; it then gets a
-	 * port of the ephemeral range, and talks to a service port, which is
-	 * usually below the range.
-	 */
-	rport = bpf_ntohs(BPF_CORE_READ(sk, __sk_common.skc_dport));
-	if (ephemeral(lport) && rport < eph_port_low)
-		return DIR_OUT;
-	return DIR_IN;
+	return DIR_OUT;
 }
 
 /* Starts tracking a connection established before the tracer started. */

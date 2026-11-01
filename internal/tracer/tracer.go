@@ -29,13 +29,18 @@ const (
 	defaultMaxFlows = 16384
 )
 
+// The tables of listening ports are sized by MaxFlows within these bounds:
+// they are preallocated, and hosts rarely listen on many ports.
+var minListenPorts, maxListenPorts uint32 = 8192, 65536
+
 // Options configures a Tracer.
 type Options struct {
 	// NetNS restricts tracing to the network namespace with this inode
 	// number. Zero traces all network namespaces.
 	NetNS uint32
-	// MaxFlows is the capacity of the in-kernel flow table per interval, and
-	// of the tables of listening TCP and UDP ports.
+	// MaxFlows is the capacity of the in-kernel flow table per interval. It
+	// also sizes the tables of listening TCP and UDP ports, between 8192 and
+	// 65536.
 	MaxFlows uint32
 	// OwnerScanInterval is how often the owners of listening sockets are
 	// resolved by walking the file descriptors of all processes.
@@ -67,6 +72,7 @@ type Tracer struct {
 	activeIdx      *ebpf.Variable
 	flowDrops      *ebpf.Variable
 	listenDrops    *ebpf.Variable
+	storageFails   *ebpf.Variable
 	adopted        *ebpf.Variable
 	selfTgid       *ebpf.Variable
 
@@ -91,11 +97,9 @@ type Tracer struct {
 	ownerless   map[sockAddrKey]bool
 	lastOwnScan time.Time
 	lastAdopted uint64
-	// listenDropped and listenWarned rate-limit the warning about
-	// listening ports that did not fit in the kernel's tables.
-	listenDropped uint64
-	listenWarned  time.Time
-	statsCloser   io.Closer
+	// warnings rate-limits the warnings about kernel counters.
+	warnings    map[string]counterWarning
+	statsCloser io.Closer
 }
 
 type sockAddrKey struct {
@@ -205,8 +209,11 @@ func (t *Tracer) configure(spec *ebpf.CollectionSpec) error {
 			return fmt.Errorf("setting %s: %w", name, err)
 		}
 	}
-	for _, name := range []string{bpfMapFlows0, bpfMapFlows1, bpfMapListenPorts, bpfMapUdpListenPorts} {
+	for _, name := range []string{bpfMapFlows0, bpfMapFlows1} {
 		spec.Maps[name].MaxEntries = t.opts.MaxFlows
+	}
+	for _, name := range []string{bpfMapListenPorts, bpfMapUdpListenPorts} {
+		spec.Maps[name].MaxEntries = min(max(t.opts.MaxFlows, minListenPorts), maxListenPorts)
 	}
 	spec.Maps[bpfMapFlows].InnerMap.MaxEntries = t.opts.MaxFlows
 	return nil
@@ -232,6 +239,7 @@ func (t *Tracer) loadCore(spec *ebpf.CollectionSpec) error {
 	t.activeIdx = coll.Variables[bpfVarActiveIdx]
 	t.flowDrops = coll.Variables[bpfVarFlowDrops]
 	t.listenDrops = coll.Variables[bpfVarListenPortDrops]
+	t.storageFails = coll.Variables[bpfVarStorageFails]
 	t.adopted = coll.Variables[bpfVarAdoptedUnowned]
 	t.selfTgid = coll.Variables[bpfVarSelfTgid]
 
@@ -382,7 +390,8 @@ func (t *Tracer) Collect() (*Snapshot, error) {
 	if err != nil {
 		return nil, err
 	}
-	t.checkListenDrops()
+	t.warnOnIncrease(t.listenDrops, "more listening ports than the in-kernel tables hold; connections that predate the agent and UDP sockets on the others may get the wrong direction", "capacity", t.listenPorts.MaxEntries())
+	t.warnOnIncrease(t.storageFails, "no socket storage for some TCP connections; they are counted from the next walk on, without their connection and earlier traffic")
 	var adopted uint64
 	if err := t.adopted.Get(&adopted); err != nil {
 		return nil, err
@@ -643,20 +652,31 @@ func (t *Tracer) scanSockets() ([]Listener, error) {
 	return listeners, nil
 }
 
-// checkListenDrops warns, at most once an hour, when listening ports did not
-// fit in the kernel's tables. Connections adopted at startup and UDP sockets
-// on those ports may then be given the wrong direction.
-func (t *Tracer) checkListenDrops() {
+type counterWarning struct {
+	last   uint64
+	warned time.Time
+}
+
+// warnOnIncrease warns, at most once an hour per message, when a cumulative
+// counter of the BPF programs increased.
+func (t *Tracer) warnOnIncrease(v *ebpf.Variable, msg string, args ...any) {
 	var n uint64
-	if err := t.listenDrops.Get(&n); err != nil || n == t.listenDropped {
+	if err := v.Get(&n); err != nil {
 		return
 	}
-	t.listenDropped = n
-	if time.Since(t.listenWarned) < time.Hour {
+	w := t.warnings[msg]
+	if n == w.last {
 		return
 	}
-	t.listenWarned = time.Now()
-	t.log.Warn("more listening ports than the in-kernel tables hold; raise -max-flows", "capacity", t.opts.MaxFlows)
+	w.last = n
+	if time.Since(w.warned) >= time.Hour {
+		w.warned = time.Now()
+		t.log.Warn(msg, append(args, "total", n)...)
+	}
+	if t.warnings == nil {
+		t.warnings = map[string]counterWarning{}
+	}
+	t.warnings[msg] = w
 }
 
 // scanOwners walks the file descriptors of all processes. It assigns owners

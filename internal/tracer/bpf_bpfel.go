@@ -112,6 +112,7 @@ const (
 	bpfVarLearnSelf              = "learn_self"
 	bpfVarListenPortDrops        = "listen_port_drops"
 	bpfVarSelfTgid               = "self_tgid"
+	bpfVarStorageFails           = "storage_fails"
 	bpfVarTargetNetns            = "target_netns"
 	bpfVarUnusedCgroupEvent      = "unused_cgroup_event"
 	bpfVarUnusedIterRec          = "unused_iter_rec"
@@ -197,6 +198,7 @@ type bpfVariableSpecs struct {
 	LearnSelf         *ebpf.VariableSpec `ebpf:"learn_self"`
 	ListenPortDrops   *ebpf.VariableSpec `ebpf:"listen_port_drops"`
 	SelfTgid          *ebpf.VariableSpec `ebpf:"self_tgid"`
+	StorageFails      *ebpf.VariableSpec `ebpf:"storage_fails"`
 	TargetNetns       *ebpf.VariableSpec `ebpf:"target_netns"`
 	UnusedCgroupEvent *ebpf.VariableSpec `ebpf:"unused_cgroup_event"`
 	UnusedIterRec     *ebpf.VariableSpec `ebpf:"unused_iter_rec"`
@@ -259,6 +261,7 @@ type bpfVariables struct {
 	LearnSelf         *ebpf.Variable `ebpf:"learn_self"`
 	ListenPortDrops   *ebpf.Variable `ebpf:"listen_port_drops"`
 	SelfTgid          *ebpf.Variable `ebpf:"self_tgid"`
+	StorageFails      *ebpf.Variable `ebpf:"storage_fails"`
 	TargetNetns       *ebpf.Variable `ebpf:"target_netns"`
 	UnusedCgroupEvent *ebpf.Variable `ebpf:"unused_cgroup_event"`
 	UnusedIterRec     *ebpf.Variable `ebpf:"unused_iter_rec"`

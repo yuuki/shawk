@@ -137,14 +137,14 @@ storage.
 A connection that existed before the agent started is adopted by the first
 walk. It is incoming when its local port is listening; it then belongs to
 the owner of the listener. Otherwise `iter/task_file` finds the process
-holding it, and the bind bucket of its local port tells its direction: a
-port allocated by `connect(2)` has a bucket of its own marked as not
-reusable by `bind(2)`, so the connection is outgoing. A port bound by
-`bind(2)` or `listen(2)` whose listener is gone (a server draining its
-connections after a graceful restart, an FTP data connection, TPROXY) is
-incoming, except when the port is in the ephemeral range and the peer's is
-below it: a client that bound its port before connecting. The traffic of an
-adopted connection before the adoption is not counted.
+holding it. It may still have been accepted: by a listener that is gone (a
+server draining its connections after a graceful restart, an FTP data
+connection) or, with TPROXY, on another port than the listener's. Ports
+cannot tell, since clients may bind any port and servers may listen
+anywhere; but `listen(2)` sets `sk_max_ack_backlog`, the connections a
+listener accepts are clones of it that keep it, and a socket that connects
+never listened. Such connections are incoming, the others outgoing. The
+traffic of an adopted connection before the adoption is not counted.
 
 Consequences compared with the original implementation (kprobes on
 `tcp_v4_connect`, `inet_csk_accept`, `tcp_sendmsg`, `tcp_cleanup_rbuf`):
@@ -623,15 +623,15 @@ parses. shawk runs beside it instead:
   opened by the kernel's path manager are attributed to a kernel worker.
 - **Flow table capacity**: when more distinct flows than `-max-flows` occur
   in one interval, updates are dropped and `shawk.agent.flows.dropped`
-  counts them, as well as TCP connections for which the kernel could not
-  allocate socket storage. The tables of listening TCP and UDP ports hold
-  `-max-flows` ports too; the agent warns when they overflow, since
-  connections that predate the agent and UDP sockets on the ports left out
-  may then be given the wrong direction.
+  counts them. The tables of listening TCP and UDP ports hold `-max-flows`
+  ports, at least 8192 and at most 65536; the agent warns when they
+  overflow, since connections that predate the agent and UDP sockets on the
+  ports left out may then be given the wrong direction. It also warns when
+  the kernel could not allocate socket storage for a TCP connection, which
+  is then counted from the next walk on.
 - **Connections that predate the agent** are counted from the adoption on.
-  A client that bound its port before connecting, to a service port in the
-  ephemeral range (e.g. 50051), and whose connection predates the agent, is
-  recorded as a server on its own port.
+  One accepted by a listener created with a backlog of 0 whose listener is
+  gone is recorded as outgoing.
 - **Clocks**: first and last seen times of dependencies come from the clock
   of each host, and the start of a segment too; heartbeats from the clock
   of the connector, compared with the clock of PostgreSQL. Keep clocks
