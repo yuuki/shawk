@@ -50,11 +50,11 @@ func TestReusePortOwners(t *testing.T) {
 	tr := newTestTracer(t)
 	root := cgroup2Root()
 	if root == "" {
-		t.Skip("cgroup v2 is not mounted")
+		skipUnavailable(t, "cgroup v2 is not mounted")
 	}
 	cg := filepath.Join(root, fmt.Sprintf("shawktest-%d", os.Getpid()))
 	if err := os.Mkdir(cg, 0o755); err != nil {
-		t.Skipf("cannot create a cgroup: %v", err)
+		skipUnavailable(t, "cannot create a cgroup: %v", err)
 	}
 	t.Cleanup(func() { os.Remove(cg) })
 
@@ -75,7 +75,7 @@ func TestReusePortOwners(t *testing.T) {
 	})
 	// Move the helper to the new cgroup before it creates its listener.
 	if err := os.WriteFile(filepath.Join(cg, "cgroup.procs"), []byte(strconv.Itoa(helper.Process.Pid)), 0o644); err != nil {
-		t.Skipf("cannot move a process to the cgroup: %v", err)
+		skipUnavailable(t, "cannot move a process to the cgroup: %v", err)
 	}
 	fmt.Fprintln(stdin, "listen")
 	if line, _ := bufio.NewReader(stdout).ReadString('\n'); !strings.HasPrefix(line, "READY") {
@@ -105,6 +105,16 @@ func TestReusePortOwners(t *testing.T) {
 	if self == 0 || other == 0 || self+other != 40 {
 		t.Errorf("accepted connections by pid = %v (self %d, helper %d), want both > 0 and 40 in total",
 			conns, os.Getpid(), helper.Process.Pid)
+	}
+	// The two sockets of the group are one listener.
+	var listeners int
+	for _, l := range snap.Listeners {
+		if l.Proto == ProtoTCP && l.Port == uint16(port) {
+			listeners++
+		}
+	}
+	if listeners != 1 {
+		t.Errorf("listeners on port %d = %d, want 1", port, listeners)
 	}
 }
 
@@ -177,12 +187,10 @@ func cgroup2Root() string {
 // with its path, and that flows of a process in it carry its id after the
 // cgroup is removed.
 func TestCgroupEvents(t *testing.T) {
-	if os.Geteuid() != 0 {
-		t.Skip("requires root")
-	}
+	requireRoot(t)
 	root := cgroup2Root()
 	if root == "" {
-		t.Skip("cgroup v2 is not mounted")
+		skipUnavailable(t, "cgroup v2 is not mounted")
 	}
 	events := make(chan [2]any, 100)
 	tr, err := New(Options{TraceSelf: true, OnCgroup: func(id uint64, path string) {
@@ -196,7 +204,7 @@ func TestCgroupEvents(t *testing.T) {
 	name := fmt.Sprintf("shawktest-job-%d", os.Getpid())
 	cg := filepath.Join(root, name)
 	if err := os.Mkdir(cg, 0o755); err != nil {
-		t.Skipf("cannot create a cgroup: %v", err)
+		skipUnavailable(t, "cannot create a cgroup: %v", err)
 	}
 	defer os.Remove(cg)
 	var st unix.Stat_t
@@ -222,7 +230,7 @@ func TestCgroupEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(cg, "cgroup.procs"), []byte(strconv.Itoa(helper.Process.Pid)), 0o644); err != nil {
-		t.Skipf("cannot move a process to the cgroup: %v", err)
+		skipUnavailable(t, "cannot move a process to the cgroup: %v", err)
 	}
 	stdin.Close()
 	if err := helper.Wait(); err != nil {

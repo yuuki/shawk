@@ -34,7 +34,11 @@ jobs:
         run: make test
       # The tests below use the committed BPF object, which the binary embeds
       # and releases ship.
+      # The runners support everything the tests need, e.g. IPv6 and BPF
+      # trampolines for UDP: fail rather than skip if that ever changes.
       - name: Tests loading BPF programs
+        env:
+          SHAWK_TEST_STRICT: "1"
         run: make test-root
       - name: End-to-end test
         run: |

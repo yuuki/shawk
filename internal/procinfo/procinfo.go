@@ -164,8 +164,15 @@ func unescapeMount(s string) string {
 var (
 	containerScope = regexp.MustCompile(`^(docker|libpod|cri-containerd|crio)-([0-9a-f]{12})[0-9a-f]*\.scope$`)
 	sessionScope   = regexp.MustCompile(`^session-[^.]+\.scope$`)
-	runScope       = regexp.MustCompile(`^run-[^.]+\.(scope|service)$`)
-	userService    = regexp.MustCompile(`^user@\d+\.service$`)
+	// Names systemd-run gives transient units without --unit:
+	//   run-<pid>                   systemd 228 and earlier
+	//   run-u<n>, run-u<n>-s<m>     after the D-Bus connection (229-256;
+	//                               -s<m> after soft reboots, 256)
+	//   run-p<pid>-i<pidfd id>      systemd 257 and later
+	//   run-r<random 128-bit id>    when none of the above is available
+	// Units named by the user, such as run-backup.service, are kept.
+	runScope    = regexp.MustCompile(`^run-([0-9]+|u[0-9]+(-s[0-9]+)?|r[0-9a-f]{32}|p[0-9]+-i[0-9]+)\.(scope|service)$`)
+	userService = regexp.MustCompile(`^user@\d+\.service$`)
 )
 
 // Unit derives a stable name of the service a process belongs to from its
@@ -178,7 +185,7 @@ var (
 //	/user.slice/user-1000.slice/session-3.scope      -> user-1000.slice/session.scope
 //	/user.slice/user-1000.slice/user@1000.service/app.slice/foo.service
 //	                                                 -> user@1000.service/foo.service
-//	/system.slice/run-r1234.scope                    -> run.scope
+//	/system.slice/run-u1234.scope                    -> run.scope
 func Unit(cgroupPath string) string {
 	parts := strings.FieldsFunc(cgroupPath, func(r rune) bool { return r == '/' })
 	if len(parts) == 0 {
