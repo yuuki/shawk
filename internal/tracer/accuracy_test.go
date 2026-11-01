@@ -1,6 +1,7 @@
 package tracer
 
 import (
+	"encoding/binary"
 	"io"
 	"log/slog"
 	"net"
@@ -486,14 +487,21 @@ func TestTCPFastOpen(t *testing.T) {
 // network namespace of the current thread.
 func tcpExtCounter(t *testing.T, name string) uint64 {
 	t.Helper()
-	b, err := os.ReadFile("/proc/thread-self/net/netstat")
+	return netCounter(t, "netstat", "TcpExt", name)
+}
+
+// netCounter returns a counter of a section of /proc/net/snmp or
+// /proc/net/netstat in the network namespace of the current thread.
+func netCounter(t *testing.T, file, section, name string) uint64 {
+	t.Helper()
+	b, err := os.ReadFile("/proc/thread-self/net/" + file)
 	if err != nil {
 		skipUnavailable(t, "%v", err)
 	}
 	lines := strings.Split(string(b), "\n")
 	for i := 0; i+1 < len(lines); i += 2 {
 		names, values := strings.Fields(lines[i]), strings.Fields(lines[i+1])
-		if len(names) == 0 || names[0] != "TcpExt:" || len(names) != len(values) {
+		if len(names) == 0 || names[0] != section+":" || len(names) != len(values) {
 			continue
 		}
 		for j := range names {
@@ -505,4 +513,236 @@ func tcpExtCounter(t *testing.T, name string) uint64 {
 	}
 	skipUnavailable(t, "no counter %s", name)
 	return 0
+}
+
+// TestTCPFastOpenChildClosed checks a child of a listener created by a TCP
+// Fast Open SYN that is reset before the handshake completes, so that it
+// never becomes established (#97): its connection and the data of its SYN
+// are counted. A raw socket sends the SYN; the kernel resets the connection
+// when the SYN-ACK reaches a port without a socket.
+//
+// A SYN that also carries a FIN must create no child at all: listeners drop
+// it (since Linux 3.5), so the FIN of the peer is always counted by
+// bytes_received, which tcp_fastopen_add_skb() would not do. The test runs in
+// a network namespace of its own, whose sysctls it changes.
+func TestTCPFastOpenChildClosed(t *testing.T) {
+	skipIfNoNetwork(t, "tcp4")
+	for _, tc := range []struct {
+		name  string
+		flags uint8
+		child bool
+	}{
+		{"reset", tcpSYN, true},
+		{"FIN in the SYN", tcpSYN | tcpFIN, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := newTestTracer(t)
+			run, netns := newNetNS(t)
+			var (
+				srv       netip.AddrPort
+				children  uint64
+				skipCause string
+			)
+			run(func() {
+				// Servers without cookies (0x2 | 0x200).
+				if err := os.WriteFile("/proc/sys/net/ipv4/tcp_fastopen", []byte("514"), 0o644); err != nil {
+					skipCause = err.Error()
+					return
+				}
+				lc := net.ListenConfig{Control: setsockoptControl(unix.IPPROTO_TCP, unix.TCP_FASTOPEN, 16)}
+				lc.SetMultipathTCP(false)
+				ln, err := lc.Listen(t.Context(), "tcp4", "127.0.0.1:0")
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { ln.Close() })
+				srv = ln.Addr().(*net.TCPAddr).AddrPort()
+				before := tcpExtCounter(t, "TCPFastOpenPassive")
+				segs := netCounter(t, "snmp", "Tcp", "InSegs")
+				csumErrs := netCounter(t, "snmp", "Tcp", "InCsumErrors")
+				sendRawSYN(t, srv, tc.flags, make([]byte, 100))
+				time.Sleep(100 * time.Millisecond)
+				children = tcpExtCounter(t, "TCPFastOpenPassive") - before
+				// The SYN reached TCP, so that a listener dropped it if it
+				// created no child.
+				if netCounter(t, "snmp", "Tcp", "InSegs") == segs || netCounter(t, "snmp", "Tcp", "InCsumErrors") != csumErrs {
+					t.Fatal("the SYN did not reach TCP")
+				}
+			})
+			if skipCause != "" {
+				skipUnavailable(t, "%s", skipCause)
+			}
+			snap, err := tr.Collect()
+			if err != nil {
+				t.Fatal(err)
+			}
+			in := findFlow(snap.Flows, DirIn, ProtoTCP, srv.Port(), srv.Addr())
+			if !tc.child {
+				if children != 0 || in != nil {
+					t.Errorf("the listener accepted a SYN with a FIN: %d children, flow %+v", children, in)
+				}
+				return
+			}
+			if children != 1 {
+				skipUnavailable(t, "the SYN created %d Fast Open children", children)
+			}
+			if in == nil || in.Conns != 1 || in.BytesRecv != 100 || in.BytesSent != 0 || in.NetNS != netns || in.LocalAddr != srv.Addr() {
+				t.Errorf("server flow = %+v", in)
+			}
+		})
+	}
+}
+
+const (
+	tcpFIN = 0x01
+	tcpSYN = 0x02
+)
+
+// sendRawSYN sends a SYN with data from 127.0.0.1 to dst through a raw socket,
+// with the flags given.
+func sendRawSYN(t *testing.T, dst netip.AddrPort, flags uint8, data []byte) {
+	t.Helper()
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_RAW|unix.SOCK_CLOEXEC, unix.IPPROTO_TCP)
+	if err != nil {
+		skipUnavailable(t, "raw socket: %v", err)
+	}
+	defer unix.Close(fd)
+	src := [4]byte{127, 0, 0, 1}
+	seg := make([]byte, 20+len(data))
+	// A port without a socket, which the kernel resets.
+	binary.BigEndian.PutUint16(seg[0:], uint16(61000+os.Getpid()%1000))
+	binary.BigEndian.PutUint16(seg[2:], dst.Port())
+	binary.BigEndian.PutUint32(seg[4:], 1000)
+	seg[12] = 5 << 4 // header of 20 bytes
+	seg[13] = flags
+	binary.BigEndian.PutUint16(seg[14:], 65535)
+	copy(seg[20:], data)
+	binary.BigEndian.PutUint16(seg[16:], tcpChecksum(src, dst.Addr().As4(), seg))
+	if err := unix.Sendto(fd, seg, 0, &unix.SockaddrInet4{Addr: dst.Addr().As4()}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func tcpChecksum(src, dst [4]byte, seg []byte) uint16 {
+	pseudo := append(append(append([]byte{}, src[:]...), dst[:]...), 0, unix.IPPROTO_TCP, byte(len(seg)>>8), byte(len(seg)))
+	var sum uint32
+	for _, b := range [][]byte{pseudo, seg} {
+		for i := 0; i < len(b); i += 2 {
+			v := uint32(b[i]) << 8
+			if i+1 < len(b) {
+				v |= uint32(b[i+1])
+			}
+			sum += v
+		}
+	}
+	for sum > 0xffff {
+		sum = sum>>16 + sum&0xffff
+	}
+	return ^uint16(sum)
+}
+
+// TestTCPChildNotCreated checks a child of a listener that the kernel fails
+// to create when the handshake completes, here for want of a route to the
+// client: it goes from SYN_RECV to CLOSE, but was never a connection, and
+// must not be counted as one (it was, once every exit from SYN_RECV counted
+// as a passive open). The listener defers the child until data comes, and
+// the route goes away in between. It runs in a network namespace of its
+// own, whose routing rules it changes.
+func TestTCPChildNotCreated(t *testing.T) {
+	skipIfNoNetwork(t, "tcp4")
+	tr := newTestTracer(t)
+	run, _ := newNetNS(t)
+	var (
+		srv   netip.AddrPort
+		drops uint64
+	)
+	run(func() {
+		lc := net.ListenConfig{Control: setsockoptControl(unix.IPPROTO_TCP, unix.TCP_DEFER_ACCEPT, 5)}
+		lc.SetMultipathTCP(false)
+		ln, err := lc.Listen(t.Context(), "tcp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { ln.Close() })
+		srv = ln.Addr().(*net.TCPAddr).AddrPort()
+		d := net.Dialer{LocalAddr: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 2)}}
+		d.SetMultipathTCP(false)
+		c, err := d.Dial("tcp4", srv.String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { c.Close() })
+		// No route from the server to the client: the local table, which
+		// holds 127.0.0.0/8, is looked up after a rule that makes the
+		// client unreachable.
+		ipRule(t, unix.RTM_NEWRULE, unix.RT_TABLE_LOCAL, unix.FR_ACT_TO_TBL, 100, netip.Addr{})
+		ipRule(t, unix.RTM_DELRULE, unix.RT_TABLE_LOCAL, unix.FR_ACT_TO_TBL, 0, netip.Addr{})
+		ipRule(t, unix.RTM_NEWRULE, 0, unix.FR_ACT_UNREACHABLE, 10, netip.AddrFrom4([4]byte{127, 0, 0, 2}))
+		before := tcpExtCounter(t, "ListenDrops")
+		if _, err := c.Write([]byte("x")); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(200 * time.Millisecond)
+		drops = tcpExtCounter(t, "ListenDrops") - before
+	})
+	if drops == 0 {
+		skipUnavailable(t, "the child was not dropped")
+	}
+	snap, err := tr.Collect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if in := findFlow(snap.Flows, DirIn, ProtoTCP, srv.Port(), netip.AddrFrom4([4]byte{127, 0, 0, 2})); in != nil && in.Conns != 0 {
+		t.Errorf("%d children that failed to be created counted as connections: %+v", drops, in)
+	}
+}
+
+// ipRule adds (RTM_NEWRULE) or deletes (RTM_DELRULE) an IPv4 routing policy
+// rule in the network namespace of the thread, to dst if it is valid.
+func ipRule(t *testing.T, msgType uint16, table, action uint8, priority uint32, dst netip.Addr) {
+	t.Helper()
+	fd, err := unix.Socket(unix.AF_NETLINK, unix.SOCK_RAW|unix.SOCK_CLOEXEC, unix.NETLINK_ROUTE)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(fd)
+	// struct fib_rule_hdr: family, dst_len, src_len, tos, table, res1,
+	// res2, action, flags.
+	body := []byte{unix.AF_INET, 0, 0, 0, table, 0, 0, action, 0, 0, 0, 0}
+	attr := func(typ uint16, data []byte) {
+		a := make([]byte, (4+len(data)+3)&^3)
+		binary.NativeEndian.PutUint16(a, uint16(4+len(data)))
+		binary.NativeEndian.PutUint16(a[2:], typ)
+		copy(a[4:], data)
+		body = append(body, a...)
+	}
+	attr(unix.FRA_PRIORITY, binary.NativeEndian.AppendUint32(nil, priority))
+	if dst.IsValid() {
+		body[1] = 32
+		attr(unix.FRA_DST, dst.AsSlice())
+	}
+	flags := uint16(unix.NLM_F_REQUEST | unix.NLM_F_ACK)
+	if msgType == unix.RTM_NEWRULE {
+		flags |= unix.NLM_F_CREATE | unix.NLM_F_EXCL
+	}
+	msg := make([]byte, unix.SizeofNlMsghdr, unix.SizeofNlMsghdr+len(body))
+	binary.NativeEndian.PutUint32(msg, uint32(unix.SizeofNlMsghdr+len(body)))
+	binary.NativeEndian.PutUint16(msg[4:], msgType)
+	binary.NativeEndian.PutUint16(msg[6:], flags)
+	binary.NativeEndian.PutUint32(msg[8:], 1)
+	msg = append(msg, body...)
+	if err := unix.Sendto(fd, msg, 0, &unix.SockaddrNetlink{Family: unix.AF_NETLINK}); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 4096)
+	n, _, err := unix.Recvfrom(fd, buf, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n < unix.SizeofNlMsghdr+4 || binary.NativeEndian.Uint16(buf[4:]) != unix.NLMSG_ERROR {
+		t.Fatalf("unexpected netlink reply of %d bytes", n)
+	}
+	if errno := int32(binary.NativeEndian.Uint32(buf[unix.SizeofNlMsghdr:])); errno != 0 {
+		t.Fatalf("routing rule %d: %v", msgType, unix.Errno(-errno))
+	}
 }

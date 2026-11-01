@@ -38,16 +38,14 @@ type edgeRowKey struct {
 	procKey
 }
 
+// listenerRowKey identifies a listener and its owner: a listener that
+// changes hands has a row per owner, which keeps its history.
 type listenerRowKey struct {
-	proto string
-	addr  netip.Addr
-	port  uint16
-	netns uint64
-}
-
-type listenerRow struct {
-	proc procKey // zero if the owner is unknown
-	span
+	proto   string
+	addr    netip.Addr
+	port    uint16
+	netns   uint64
+	procKey // zero if the owner is unknown
 }
 
 type sessionRow struct {
@@ -71,7 +69,7 @@ type hostChanges struct {
 	addrs     map[netip.Addr]span
 	processes map[procKey]*procRow
 	edges     map[edgeRowKey]span
-	listeners map[listenerRowKey]*listenerRow
+	listeners map[listenerRowKey]span
 }
 
 func newHostChanges(key string) *hostChanges {
@@ -81,7 +79,7 @@ func newHostChanges(key string) *hostChanges {
 		addrs:     map[netip.Addr]span{},
 		processes: map[procKey]*procRow{},
 		edges:     map[edgeRowKey]span{},
-		listeners: map[listenerRowKey]*listenerRow{},
+		listeners: map[listenerRowKey]span{},
 	}
 }
 
@@ -127,16 +125,10 @@ func (h *hostChanges) addEdge(k edgeRowKey, s span) {
 	h.edges[k] = cur
 }
 
-func (h *hostChanges) addListener(k listenerRowKey, proc procKey, s span) {
-	l := h.listeners[k]
-	if l == nil {
-		l = &listenerRow{}
-		h.listeners[k] = l
-	}
-	if !s.last.Before(l.last) {
-		l.proc = proc
-	}
-	l.span.merge(s)
+func (h *hostChanges) addListener(k listenerRowKey, s span) {
+	cur := h.listeners[k]
+	cur.merge(s)
+	h.listeners[k] = cur
 }
 
 // merge adds the changes of o, which are older, back into h after o failed
@@ -160,8 +152,8 @@ func (h *hostChanges) merge(o *hostChanges) {
 	for k, s := range o.edges {
 		h.addEdge(k, s)
 	}
-	for k, l := range o.listeners {
-		h.addListener(k, l.proc, l.span)
+	for k, s := range o.listeners {
+		h.addListener(k, s)
 	}
 }
 
@@ -303,6 +295,9 @@ func (c *changes) add(b *hostBatch, now time.Time) {
 			s.first = s.last
 		}
 		k := listenerRowKey{proto: l.id.proto, addr: l.id.addr, port: l.id.port, netns: l.id.netns}
+		if l.id.unit != "" || l.id.comm != "" {
+			k.procKey = procKey{l.id.unit, l.id.comm, l.id.job()}
+		}
 		acc, ok := listeners[k]
 		// A listener's last_seen advances at every request; write it once
 		// per interval like the edges.
@@ -313,12 +308,10 @@ func (c *changes) add(b *hostBatch, now time.Time) {
 		if !changed {
 			continue
 		}
-		var pk procKey
-		if l.id.unit != "" || l.id.comm != "" {
-			pk = procKey{l.id.unit, l.id.comm, l.id.job()}
-			h.addProcess(pk, l.id.exe, s)
+		if k.procKey != (procKey{}) {
+			h.addProcess(k.procKey, l.id.exe, s)
 		}
-		h.addListener(k, pk, s)
+		h.addListener(k, s)
 	}
 }
 

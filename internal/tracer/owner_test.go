@@ -249,3 +249,106 @@ func TestCgroupEvents(t *testing.T) {
 		t.Errorf("flow of the job = %+v, want cgroup %d", f, st.Ino)
 	}
 }
+
+// TestListenerReplacedInCgroup checks that a listener replaced by one of
+// another process in the same cgroup, like a restarted service, is
+// attributed to the new process at once rather than after the next periodic
+// owner scan (#98): the cgroup of the accepted connections cannot tell them
+// apart, the sockets of the listeners can. The new process may listen after
+// the former one stopped, or before, with SO_REUSEPORT.
+func TestListenerReplacedInCgroup(t *testing.T) {
+	requireRoot(t)
+	for _, overlap := range []bool{false, true} {
+		name := "stopped, then started"
+		if overlap {
+			name = "started before the former stops"
+		}
+		t.Run(name, func(t *testing.T) { testListenerReplaced(t, overlap) })
+	}
+}
+
+func testListenerReplaced(t *testing.T, overlap bool) {
+	l, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	l.Close()
+	// startHelper starts a process listening on the port with
+	// SO_REUSEPORT, in the cgroup of the test, and returns it with a
+	// function that stops it.
+	startHelper := func() (*exec.Cmd, func()) {
+		t.Helper()
+		helper := exec.Command(os.Args[0], "-test.run=^TestHelperReusePort$")
+		helper.Env = append(os.Environ(), "SHAWK_TEST_REUSEPORT="+strconv.Itoa(port))
+		stdin, _ := helper.StdinPipe()
+		stdout, _ := helper.StdoutPipe()
+		if err := helper.Start(); err != nil {
+			t.Fatal(err)
+		}
+		stop := func() {
+			stdin.Close()
+			helper.Wait()
+		}
+		t.Cleanup(stop)
+		fmt.Fprintln(stdin, "listen")
+		if line, _ := bufio.NewReader(stdout).ReadString('\n'); !strings.HasPrefix(line, "READY") {
+			t.Fatalf("helper did not listen: %q", line)
+		}
+		return helper, stop
+	}
+	old, stopOld := startHelper()
+	tr := newTestTracer(t)
+	listenerPID := func(snap *Snapshot) uint32 {
+		for _, l := range snap.Listeners {
+			if l.Proto == ProtoTCP && l.Port == uint16(port) {
+				return l.PID
+			}
+		}
+		return 0
+	}
+	snap, err := tr.Collect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pid := listenerPID(snap); pid != uint32(old.Process.Pid) {
+		t.Fatalf("listener owner = %d, want %d", pid, old.Process.Pid)
+	}
+
+	var replacement *exec.Cmd
+	if overlap {
+		// Both hold the port at a scan, then the former stops.
+		replacement, _ = startHelper()
+		if _, err := tr.Collect(); err != nil {
+			t.Fatal(err)
+		}
+		stopOld()
+	} else {
+		stopOld()
+		replacement, _ = startHelper()
+	}
+	c, err := net.Dial("tcp4", "127.0.0.1:"+strconv.Itoa(port))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	c.Read(make([]byte, 1))
+	c.Close()
+	time.Sleep(100 * time.Millisecond)
+	if snap, err = tr.Collect(); err != nil {
+		t.Fatal(err)
+	}
+	want := uint32(replacement.Process.Pid)
+	if pid := listenerPID(snap); pid != want {
+		t.Errorf("listener owner = %d, want %d", pid, want)
+	}
+	var in *Flow
+	for i := range snap.Flows {
+		if f := &snap.Flows[i]; f.Direction == DirIn && f.Port == uint16(port) {
+			in = f
+		}
+	}
+	if in == nil || in.Conns != 1 || in.PID != want {
+		t.Errorf("incoming flow = %+v, want the connection of %d", in, want)
+	}
+}

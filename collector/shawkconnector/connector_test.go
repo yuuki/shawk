@@ -300,9 +300,9 @@ func TestWrites(t *testing.T) {
 	if !h.last.Equal(*now) {
 		t.Errorf("host last seen %v, want the time of receipt", h.last)
 	}
-	for k, l := range h.listeners {
-		if k.port == 68 && l.proc != (procKey{}) {
-			t.Errorf("a listener without owner has a process: %+v", l)
+	for k := range h.listeners {
+		if k.port == 68 && k.procKey != (procKey{}) {
+			t.Errorf("a listener without owner has a process: %+v", k)
 		}
 	}
 

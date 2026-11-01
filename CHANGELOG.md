@@ -17,6 +17,19 @@
   aarch64) and upstream 5.14 and 5.15 in virtual machines (`make vm-test`),
   and on an arm64 runner. On Rocky Linux 9 on aarch64, which has no BPF
   trampolines, UDP is not traced.
+* Fixed: a UDP GSO send or GRO receive counted as one datagram, a peeked
+  empty datagram counted twice, and IPv6 datagrams with extension headers
+  were not counted.
+* Fixed: a child of a TCP Fast Open listener reset or closed before its
+  handshake completed was not counted, with the data of its SYN.
+* Fixed: a listener replaced by another process of the same cgroup was
+  attributed to the former process until the next periodic owner scan
+  (up to a minute).
+* The new table `shawk.listener_owners` keeps every known owner of a
+  listener, so its history is kept when it changes hands (migration 10, from
+  the migration on). `shawk.listeners` is unchanged, so connectors of the
+  previous version keep writing during an upgrade. Run `grants.sql` again
+  after the migration.
 * Fixed: when the main thread of the agent was in another network namespace
   than the thread walking the sockets, one namespace was walked twice and
   another not at all.
