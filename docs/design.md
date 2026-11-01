@@ -110,8 +110,8 @@ retransmissions stand for errors, and open connections are added.
 |---|---|
 | `tp_btf/inet_sock_set_state` CLOSE→SYN_SENT | **active open**. Runs inside `connect(2)`, so the current task is the client. The flow key and the owner are stored in the socket local storage (`BPF_MAP_TYPE_SK_STORAGE`). |
 | SYN_SENT→ESTABLISHED / →CLOSE | count an established / failed outgoing connection |
-| SYN_RECV→ESTABLISHED | **passive open**; counts an incoming connection |
-| *→CLOSE | account the remaining bytes of the connection |
+| SYN_RECV→ESTABLISHED | **passive open**; counts an incoming connection. On a socket that went through SYN_SENT it ends a simultaneous open instead, e.g. of a socket connected to itself, which stays outgoing. |
+| *→CLOSE | account the remaining bytes of the connection, if any |
 | `iter/tcp` (every interval) | account byte deltas of long-lived connections, sample RTT, count open connections, list listening sockets, **adopt** connections established before the agent started |
 | `iter/task_file` | find the owners of adopted connections and of listening sockets |
 
@@ -122,13 +122,29 @@ namespace of the host (found through `/proc/*/ns/net` and `/run/netns`).
 Bytes are not counted on the send/receive path. They are read from the
 cumulative counters of `struct tcp_sock` (`bytes_acked`, `bytes_received`,
 `total_retrans`) at close and at every scan, and the difference to the last
-accounted value is added to the flow. The iterator and the tracepoint do not
+accounted value is added to the flow. These counters count sequence
+numbers, so the SYN and the FIN of each side are subtracted: the counters
+are taken as the base when the connection is established, and a FIN is
+subtracted once it is acknowledged (the local one) or received (`SOCK_DONE`,
+the peer's). The iterator and the tracepoint do not
 interleave on a socket where the TCP iterator locks each socket (Linux 5.19+
 and RHEL 9 by backport); on older kernels, a connection closing during a scan
 may rarely be counted twice. Atomic exchange is avoided because the arm64 JIT
 supports it only since Linux 5.18. The direction of a
 connection is decided once, when it is opened, and kept in the socket local
 storage.
+
+A connection that existed before the agent started is adopted by the first
+walk. It is incoming when its local port is listening; it then belongs to
+the owner of the listener. Otherwise `iter/task_file` finds the process
+holding it, and the bind bucket of its local port tells its direction: a
+port allocated by `connect(2)` has a bucket of its own marked as not
+reusable by `bind(2)`, so the connection is outgoing. A port bound by
+`bind(2)` or `listen(2)` whose listener is gone (a server draining its
+connections after a graceful restart, an FTP data connection, TPROXY) is
+incoming, except when the port is in the ephemeral range and the peer's is
+below it: a client that bound its port before connecting. The traffic of an
+adopted connection before the adoption is not counted.
 
 Consequences compared with the original implementation (kprobes on
 `tcp_v4_connect`, `inet_csk_accept`, `tcp_sendmsg`, `tcp_cleanup_rbuf`):
@@ -608,6 +624,10 @@ parses. shawk runs beside it instead:
 - **Flow table capacity**: when more distinct flows than `-max-flows` occur
   in one interval, updates are dropped and `shawk.agent.flows.dropped`
   counts them.
+- **Connections that predate the agent** are counted from the adoption on.
+  A client that bound its port before connecting, to a service port in the
+  ephemeral range (e.g. 50051), and whose connection predates the agent, is
+  recorded as a server on its own port.
 - **Clocks**: first and last seen times of dependencies come from the clock
   of each host, and the start of a segment too; heartbeats from the clock
   of the connector, compared with the clock of PostgreSQL. Keep clocks

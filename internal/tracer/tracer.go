@@ -62,7 +62,7 @@ type Tracer struct {
 	flowsOuter     *ebpf.Map
 	listenPorts    *ebpf.Map
 	udpListenPorts *ebpf.Map
-	markUDPServers *ebpf.Variable
+	initialScan    *ebpf.Variable
 	activeIdx      *ebpf.Variable
 	flowDrops      *ebpf.Variable
 	adopted        *ebpf.Variable
@@ -162,7 +162,7 @@ func New(opts Options) (*Tracer, error) {
 	// Adopt connections and listeners that existed before the tracer
 	// started, then resolve their owners. The first walk also tells the
 	// programs which process the tracer is, and marks the UDP server sockets.
-	if err := t.markUDPServers.Set(uint32(1)); err != nil {
+	if err := t.initialScan.Set(uint32(1)); err != nil {
 		t.Close()
 		return nil, err
 	}
@@ -170,7 +170,7 @@ func New(opts Options) (*Tracer, error) {
 		t.Close()
 		return nil, err
 	}
-	if err := t.markUDPServers.Set(uint32(0)); err != nil {
+	if err := t.initialScan.Set(uint32(0)); err != nil {
 		t.Close()
 		return nil, err
 	}
@@ -222,7 +222,7 @@ func (t *Tracer) loadCore(spec *ebpf.CollectionSpec) error {
 	t.flowsOuter = coll.Maps[bpfMapFlows]
 	t.listenPorts = coll.Maps[bpfMapListenPorts]
 	t.udpListenPorts = coll.Maps[bpfMapUdpListenPorts]
-	t.markUDPServers = coll.Variables[bpfVarMarkUdpServers]
+	t.initialScan = coll.Variables[bpfVarInitialScan]
 	t.activeIdx = coll.Variables[bpfVarActiveIdx]
 	t.flowDrops = coll.Variables[bpfVarFlowDrops]
 	t.adopted = coll.Variables[bpfVarAdoptedUnowned]
@@ -458,7 +458,9 @@ func (t *Tracer) attribute(flows []Flow) []Flow {
 	merged := make(map[FlowKey]int, len(flows))
 	out := flows[:0]
 	for _, f := range flows {
-		if f.Direction == DirIn && f.Proto == ProtoTCP {
+		// Incoming connections that were adopted after their listener was
+		// closed already carry the process holding them.
+		if f.Direction == DirIn && f.Proto == ProtoTCP && f.PID == 0 {
 			cands := t.listenerOwners(f.Proto, f.NetNS, f.LocalAddr, f.Port)
 			if o, ok := chooseOwner(cands, f.CgroupID); ok {
 				f.Comm = o.comm
