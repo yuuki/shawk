@@ -45,11 +45,18 @@ type Config struct {
 // MaxInterval is the longest export interval.
 const MaxInterval = time.Minute
 
+// source is what the agent uses of the tracer.
+type source interface {
+	Collect() (*tracer.Snapshot, error)
+	UDPEnabled() bool
+	ProgramStats() ([]tracer.ProgramStat, error)
+}
+
 // Agent is a running agent.
 type Agent struct {
 	cfg      Config
 	log      *slog.Logger
-	tracer   *tracer.Tracer
+	tracer   source
 	exporter otlp.Exporter
 	cgroups  *procinfo.Resolver
 	state    *otlp.State
@@ -122,26 +129,12 @@ func Run(ctx context.Context, cfg Config) error {
 	if machineID == "" {
 		cfg.Logger.Warn("the host has no machine id (/etc/machine-id); it is identified by its name only")
 	}
-	now := time.Now()
-	a := &Agent{
-		cfg:      cfg,
-		log:      cfg.Logger,
-		tracer:   tr,
-		exporter: exp,
-		cgroups:  cgroups,
-		state:    otlp.NewState(cfg.IdleTTL),
-		segment:  otlp.NewSegment(now, cfg.IdleTTL),
-		idents:   newIdentities(cfg.ServiceFallback, cfg.IdleTTL),
-		started:  now,
-		res: otlp.Resource{
-			MachineID:    machineID,
-			Hostname:     hostname,
-			Kernel:       kernelRelease(),
-			AgentVersion: version.Version,
-		},
-		// Flows are traced from here on.
-		lastCollect: now,
-	}
+	a := newAgent(cfg, tr, exp, cgroups, otlp.Resource{
+		MachineID:    machineID,
+		Hostname:     hostname,
+		Kernel:       kernelRelease(),
+		AgentVersion: version.Version,
+	}, time.Now())
 	a.log.Info("agent started", "endpoint", cfg.Exporter.Endpoint, "protocol", cfg.Exporter.Protocol,
 		"interval", cfg.Interval, "idle_ttl", cfg.IdleTTL, "udp", tr.UDPEnabled())
 
@@ -164,6 +157,23 @@ func Run(ctx context.Context, cfg Config) error {
 			}
 			cancel()
 		}
+	}
+}
+
+// newAgent returns an agent whose flows are traced from now on.
+func newAgent(cfg Config, src source, exp otlp.Exporter, cgroups *procinfo.Resolver, res otlp.Resource, now time.Time) *Agent {
+	return &Agent{
+		cfg:         cfg,
+		log:         cfg.Logger,
+		tracer:      src,
+		exporter:    exp,
+		cgroups:     cgroups,
+		state:       otlp.NewState(cfg.IdleTTL),
+		segment:     otlp.NewSegment(now, cfg.IdleTTL),
+		idents:      newIdentities(cfg.ServiceFallback, cfg.IdleTTL),
+		started:     now,
+		res:         res,
+		lastCollect: now,
 	}
 }
 
