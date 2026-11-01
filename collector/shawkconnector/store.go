@@ -2,11 +2,13 @@ package shawkconnector
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/netip"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -23,6 +25,14 @@ type store interface {
 	// peers reads the endpoints of services, the client sides of
 	// connections and the addresses of agents.
 	peers(ctx context.Context) (peerRows, error)
+	// schemaVersion returns the version of the schema, 0 if it predates
+	// the function that tells it.
+	schemaVersion(ctx context.Context) (int, error)
+	// syncPeerCIDRs replaces the named address ranges of peers.
+	syncPeerCIDRs(ctx context.Context, cidrs []namedPrefix) error
+	// refreshDependencies brings the history of dependencies between
+	// services up to date.
+	refreshDependencies(ctx context.Context) (int64, error)
 	close()
 }
 
@@ -66,6 +76,9 @@ func (s *pgStore) write(ctx context.Context, h *hostChanges) error {
 
 func writeHost(ctx context.Context, tx pgx.Tx, h *hostChanges) error {
 	b := &pgx.Batch{}
+	// Writes wait for a migration in progress, which holds this lock, so
+	// that they do not deadlock with it.
+	b.Queue(`SELECT pg_advisory_xact_lock_shared($1)`, int64(migrationLock))
 	b.Queue(`
 INSERT INTO shawk.hosts AS h (id, machine_id, hostname, kernel, agent_version, first_seen, last_seen)
 VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -114,12 +127,30 @@ ON CONFLICT (host_id, started_at) DO UPDATE SET
 			firsts = append(firsts, s.first)
 			lasts = append(lasts, s.last)
 		}
+		// An address continues the latest period the host held it in, unless
+		// it was not seen for longer than the alive window, which starts a
+		// new period: an address that moved away and came back was not held
+		// in between.
 		b.Queue(`
+WITH u AS (
+  SELECT u.addr::inet AS addr, u.f, u.l FROM unnest($2::text[], $3::timestamptz[], $4::timestamptz[]) AS u(addr, f, l)
+),
+latest AS (
+  SELECT DISTINCT ON (a.addr) a.addr, a.first_seen, a.last_seen
+  FROM shawk.host_addrs a JOIN u ON u.addr = a.addr
+  WHERE a.host_id = $1
+  ORDER BY a.addr, a.first_seen DESC
+),
+continued AS (
+  UPDATE shawk.host_addrs a SET last_seen = greatest(a.last_seen, u.l)
+  FROM u JOIN latest ON latest.addr = u.addr
+  WHERE a.host_id = $1 AND a.addr = u.addr AND a.first_seen = latest.first_seen
+    AND u.f <= latest.last_seen + shawk.alive_window()
+  RETURNING a.addr
+)
 INSERT INTO shawk.host_addrs AS a (host_id, addr, first_seen, last_seen)
-SELECT $1, u.addr::inet, u.f, u.l FROM unnest($2::text[], $3::timestamptz[], $4::timestamptz[]) AS u(addr, f, l)
-ON CONFLICT (host_id, addr) DO UPDATE SET
-  first_seen = least(a.first_seen, excluded.first_seen),
-  last_seen  = greatest(a.last_seen, excluded.last_seen)`,
+SELECT $1, u.addr, u.f, u.l FROM u WHERE u.addr NOT IN (SELECT addr FROM continued)
+ON CONFLICT (host_id, addr, first_seen) DO UPDATE SET last_seen = greatest(a.last_seen, excluded.last_seen)`,
 			h.key, addrs, firsts, lasts)
 	}
 
@@ -208,6 +239,41 @@ ON CONFLICT (host_id, proto, addr, port, netns) DO UPDATE SET
 	return tx.SendBatch(ctx, b).Close()
 }
 
+func (s *pgStore) schemaVersion(ctx context.Context) (int, error) {
+	var v int
+	err := s.pool.QueryRow(ctx, `SELECT shawk.schema_version()`).Scan(&v)
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && (pgErr.Code == "42883" || pgErr.Code == "3F000") {
+		// No such function or schema: older than the check.
+		return 0, nil
+	}
+	return v, err
+}
+
+func (s *pgStore) syncPeerCIDRs(ctx context.Context, cidrs []namedPrefix) error {
+	prefixes := make([]string, 0, len(cidrs))
+	names := make([]string, 0, len(cidrs))
+	for _, c := range cidrs {
+		prefixes = append(prefixes, c.prefix.String())
+		names = append(names, c.name)
+	}
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		b := &pgx.Batch{}
+		b.Queue(`DELETE FROM shawk.peer_cidrs WHERE NOT (prefix = ANY ($1::cidr[]))`, prefixes)
+		b.Queue(`
+INSERT INTO shawk.peer_cidrs (prefix, name)
+SELECT * FROM unnest($1::cidr[], $2::text[])
+ON CONFLICT (prefix) DO UPDATE SET name = excluded.name`, prefixes, names)
+		return tx.SendBatch(ctx, b).Close()
+	})
+}
+
+func (s *pgStore) refreshDependencies(ctx context.Context) (int64, error) {
+	var n int64
+	err := s.pool.QueryRow(ctx, `SELECT shawk.refresh_known_dependencies()`).Scan(&n)
+	return n, err
+}
+
 func (s *pgStore) prune(ctx context.Context, retention time.Duration, maxRows int) (int64, error) {
 	var n int64
 	err := s.pool.QueryRow(ctx, `SELECT shawk.prune(now() - make_interval(secs => $1), $2)`,
@@ -255,11 +321,11 @@ FROM shawk_v1.client_endpoints`,
 	if err != nil {
 		return out, err
 	}
-	err = queryRows(ctx, s.pool, `SELECT host(addr), host_id, last_seen, udp_traced FROM shawk_v1.agent_addrs`,
+	err = queryRows(ctx, s.pool, `SELECT host(addr), host_id, last_seen, last_heartbeat, udp_traced FROM shawk_v1.agent_addrs`,
 		func(rows pgx.Rows) error {
 			var addr string
 			var r agentAddrRow
-			if err := rows.Scan(&addr, &r.host, &r.seen, &r.udpTraced); err != nil {
+			if err := rows.Scan(&addr, &r.host, &r.seen, &r.agent.seen, &r.agent.udpTraced); err != nil {
 				return err
 			}
 			if a, err := netip.ParseAddr(addr); err == nil {

@@ -75,7 +75,10 @@ type resolver struct {
 
 	mu sync.RWMutex
 	// From shawk_v1.service_endpoints, shawk_v1.client_endpoints and
-	// shawk_v1.agent_addrs.
+	// shawk_v1.agent_addrs, read at loaded. Their times are judged as of
+	// loaded: while the database cannot be read, the agents and addresses
+	// it knew keep the age they had then, rather than all expiring.
+	loaded      time.Time
 	dbEndpoints map[endpointKey][]endpoint
 	dbClients   map[clientKey][]endpoint
 	dbAddrs     map[netip.Addr]map[string]time.Time // address -> host -> last seen
@@ -113,11 +116,14 @@ type clientRow struct {
 	endpoint
 }
 
-// agentAddrRow is a row of shawk_v1.agent_addrs.
+// agentAddrRow is a row of shawk_v1.agent_addrs: an address of a host
+// last seen at seen, and its agent.
 type agentAddrRow struct {
 	addr netip.Addr
 	host string
-	agentHost
+	seen time.Time
+	// agent.seen is the last heartbeat of the agent.
+	agent agentHost
 }
 
 // peerRows are the rows the resolver loads from PostgreSQL.
@@ -127,8 +133,8 @@ type peerRows struct {
 	agents    []agentAddrRow
 }
 
-// load replaces what was read from PostgreSQL.
-func (r *resolver) load(rows peerRows) {
+// load replaces what was read from PostgreSQL at now.
+func (r *resolver) load(rows peerRows, now time.Time) {
 	eps := make(map[endpointKey][]endpoint, len(rows.endpoints))
 	for _, e := range rows.endpoints {
 		eps[e.key] = append(eps[e.key], e.endpoint)
@@ -146,17 +152,29 @@ func (r *resolver) load(rows peerRows) {
 			addrs[a.addr] = m
 		}
 		m[a.host] = a.seen
-		if cur, ok := agents[a.host]; !ok || a.seen.After(cur.seen) {
-			agents[a.host] = a.agentHost
+		if cur, ok := agents[a.host]; !ok || a.agent.seen.After(cur.seen) {
+			agents[a.host] = a.agent
 		}
 	}
 	r.mu.Lock()
+	r.loaded = now
 	r.dbEndpoints, r.dbClients, r.dbAddrs, r.dbAgents = eps, cls, addrs, agents
 	r.mu.Unlock()
 }
 
+// dbAge is how long ago what was read from PostgreSQL was read, which is
+// added to its times.
+func (r *resolver) dbAge(now time.Time) time.Duration {
+	if r.loaded.IsZero() || now.Before(r.loaded) {
+		return 0
+	}
+	return now.Sub(r.loaded)
+}
+
 func learnInto[K comparable](m map[K]map[endpoint]time.Time, k K, e endpoint, now time.Time) {
-	if e.service == "" {
+	// A socket without a known owner names no service; PostgreSQL does not
+	// keep it as an endpoint either.
+	if e.service == "" || e.service == unknownService {
 		return
 	}
 	es := m[k]
@@ -169,7 +187,9 @@ func learnInto[K comparable](m map[K]map[endpoint]time.Time, k K, e endpoint, no
 
 // learn records the endpoints, clients and addresses of a host seen in a
 // request at now. Listeners on an unspecified address listen on every
-// address of the host.
+// address of the host. The host holds its addresses, and its agent is
+// alive, only as of a request that closes an interval: an agent whose
+// last requests do not arrive emits nothing for its host.
 func (r *resolver) learn(b *hostBatch, now time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -197,6 +217,9 @@ func (r *resolver) learn(b *hostBatch, now time.Time) {
 				endpoint{host: b.key, service: e.id.job(), exact: true}, now)
 		}
 	}
+	if !b.final {
+		return
+	}
 	for _, a := range b.addrs {
 		m := r.localAddrs[a]
 		if m == nil {
@@ -205,9 +228,7 @@ func (r *resolver) learn(b *hostBatch, now time.Time) {
 		}
 		m[b.key] = now
 	}
-	if b.final {
-		r.localAgents[b.key] = agentHost{seen: now, udpTraced: b.udpTraced}
-	}
+	r.localAgents[b.key] = agentHost{seen: now, udpTraced: b.udpTraced}
 }
 
 func expireLearned[K comparable, V comparable](m map[K]map[V]time.Time, t time.Time) {
@@ -275,10 +296,10 @@ func (r *resolver) peer(host string, id *edgeID, now time.Time) peer {
 	}
 	if id.role == roleClient {
 		k := endpointKey{id.peer, id.port, id.proto}
-		p.name = best(host, r.localEndpoints[k], r.dbEndpoints[k], sameHostOnly)
+		p.name = best(host, r.localEndpoints[k], r.dbEndpoints[k], r.dbAge(now), sameHostOnly)
 	} else {
 		k := clientKey{id.peer, id.local, id.port, id.proto}
-		p.name = best(host, r.localClients[k], r.dbClients[k], sameHostOnly)
+		p.name = best(host, r.localClients[k], r.dbClients[k], r.dbAge(now), sameHostOnly)
 	}
 	if p.name == "" {
 		p.name = r.classify(id.peer)
@@ -306,8 +327,9 @@ func (r *resolver) holders(a netip.Addr, now time.Time) map[string]bool {
 	for h, t := range r.localAddrs[a] {
 		add(h, t)
 	}
+	age := r.dbAge(now)
 	for h, t := range r.dbAddrs[a] {
-		add(h, t)
+		add(h, t.Add(age))
 	}
 	var out map[string]bool
 	for h, t := range seen {
@@ -325,8 +347,11 @@ func (r *resolver) holders(a netip.Addr, now time.Time) map[string]bool {
 // agent returns the latest known agent of a host, if it is alive.
 func (r *resolver) agent(host string, now time.Time) (agentHost, bool) {
 	a, ok := r.localAgents[host]
-	if d, dok := r.dbAgents[host]; dok && (!ok || d.seen.After(a.seen)) {
-		a, ok = d, true
+	if d, dok := r.dbAgents[host]; dok {
+		d.seen = d.seen.Add(r.dbAge(now))
+		if !ok || d.seen.After(a.seen) {
+			a, ok = d, true
+		}
 	}
 	if !ok || a.seen.Before(now.Add(-aliveWindow)) {
 		return agentHost{}, false
@@ -338,7 +363,7 @@ func (r *resolver) agent(host string, now time.Time) (agentHost, bool) {
 // then one observed on a socket rather than inferred from a listener on an
 // unspecified address, then the most recently seen one, then the first by
 // name, so that the choice does not depend on the order of maps.
-func best(host string, local map[endpoint]time.Time, db []endpoint, sameHostOnly bool) string {
+func best(host string, local map[endpoint]time.Time, db []endpoint, dbAge time.Duration, sameHostOnly bool) string {
 	var b endpoint
 	better := func(e endpoint) bool {
 		switch {
@@ -366,6 +391,7 @@ func best(host string, local map[endpoint]time.Time, db []endpoint, sameHostOnly
 		consider(e)
 	}
 	for _, e := range db {
+		e.lastSeen = e.lastSeen.Add(dbAge)
 		consider(e)
 	}
 	return b.service

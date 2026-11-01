@@ -175,6 +175,26 @@ type changes struct {
 	// last reported.
 	acceptedEdges     map[string]map[edgeRowKey]acceptedSpan
 	acceptedListeners map[string]map[listenerRowKey]acceptedSpan
+	// floors bound the start of the sessions of hosts.
+	floors map[string]sessionFloor
+}
+
+// minAgentIdleTTL is the shortest idle TTL of an agent: an edge active that
+// long before a request is still sent in it.
+const minAgentIdleTTL = 2 * time.Minute
+
+// sessionFloor is the earliest start of a session of a host the connector
+// can vouch for, by the clock of the agent. An agent sends the edges active
+// within its idle TTL; older ones reached an earlier instance of the
+// connector, or were in changes it dropped, and may never have been
+// written. When the connector first sees a host, or drops changes of the
+// host, a session therefore starts no earlier than the idle TTL before;
+// the session written before then ends at its last heartbeat, and the time
+// in between shows as not observed.
+type sessionFloor struct {
+	start time.Time
+	skew  time.Duration // the latest clock skew of the agent
+	seen  time.Time
 }
 
 type acceptedSpan struct {
@@ -188,6 +208,7 @@ func newChanges(ttl time.Duration) *changes {
 		pending:           map[string]*hostChanges{},
 		acceptedEdges:     map[string]map[edgeRowKey]acceptedSpan{},
 		acceptedListeners: map[string]map[listenerRowKey]acceptedSpan{},
+		floors:            map[string]sessionFloor{},
 	}
 }
 
@@ -214,12 +235,30 @@ func (c *changes) add(b *hostBatch, now time.Time) {
 	}
 	h := c.host(b.key)
 	h.setHost(b.machineID, b.hostname, b.kernel, b.agentVersion, now)
+	f, ok := c.floors[b.key]
+	switch {
+	case !ok:
+		f.start = now.Add(-skew).Add(-minAgentIdleTTL).Truncate(time.Second)
+	case skew-f.skew > clockStepBack || f.skew-skew > clockStepBack:
+		// The clock of the agent stepped: keep the floor at the same time.
+		f.start = f.start.Add(f.skew - skew)
+	}
+	f.skew, f.seen = skew, now
+	c.floors[b.key] = f
 	if !b.segmentStart.IsZero() {
-		h.addSession(b.segmentStart, sessionRow{lastHeartbeat: now, clockSkew: skew, udpTraced: b.udpTraced,
+		start := b.segmentStart
+		if start.Before(f.start) {
+			start = f.start
+		}
+		h.addSession(start, sessionRow{lastHeartbeat: now, clockSkew: skew, udpTraced: b.udpTraced,
 			netnsScope: b.netnsScope, dropped: b.dropped})
 	}
-	for _, a := range b.addrs {
-		h.addAddr(a, span{now, now})
+	// The host holds its addresses as of the requests that close intervals,
+	// like its heartbeat.
+	if b.final {
+		for _, a := range b.addrs {
+			h.addAddr(a, span{now, now})
+		}
 	}
 
 	edges := c.acceptedEdges[b.key]
@@ -295,6 +334,19 @@ func (c *changes) restore(h *hostChanges) {
 	c.host(h.key).merge(h)
 }
 
+// forget is called when changes of a host were dropped at now. The spans
+// accepted for writing are forgotten, so that the edges and listeners the
+// agent still sends are written again, and the next session of the host
+// starts no earlier than the idle TTL of an agent before now.
+func (c *changes) forget(key string, now time.Time) {
+	delete(c.acceptedEdges, key)
+	delete(c.acceptedListeners, key)
+	if f, ok := c.floors[key]; ok {
+		f.start = now.Add(-f.skew).Add(-minAgentIdleTTL).Truncate(time.Second)
+		c.floors[key] = f
+	}
+}
+
 // expire forgets accepted spans not reported for the TTL.
 func (c *changes) expire(now time.Time) {
 	for host, m := range c.acceptedEdges {
@@ -315,6 +367,11 @@ func (c *changes) expire(now time.Time) {
 		}
 		if len(m) == 0 {
 			delete(c.acceptedListeners, host)
+		}
+	}
+	for host, f := range c.floors {
+		if now.Sub(f.seen) > c.ttl {
+			delete(c.floors, host)
 		}
 	}
 }

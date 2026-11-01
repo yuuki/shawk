@@ -155,11 +155,12 @@ lb-01 t t"
 check "host ids of hosts sharing a machine id" \
 "SELECT count(DISTINCT id), count(DISTINCT machine_id) FROM shawk.hosts" "3 1"
 
+# The client without an agent is named like in Prometheus.
 check "dependency map" \
 "SELECT source, target FROM shawk_v1.graph_edges WHERE mainstat ~ '^(80|8080|5432)/' ORDER BY 1, 2" \
-"10.231.0.50 haproxy
-haproxy puma
-puma postgres"
+"haproxy puma
+puma postgres
+~unresolved haproxy"
 
 # The forwarded metrics name the peers and carry no addresses.
 grep -q 'service.peer.name: Str(postgres)' "$WORK/collector.log" || fail "no series of puma to postgres"

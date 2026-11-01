@@ -67,6 +67,10 @@ const (
 	peerOther      = "~other"      // folded beyond max_peers
 )
 
+// unknownService is the service.name the agent gives a socket whose owner
+// is unknown.
+const unknownService = "~unknown"
+
 // hostKey identifies a host in PostgreSQL from its machine id and its name,
 // which tells apart hosts cloned with the same machine id. It is the host
 // id of shawk before the connector existed.

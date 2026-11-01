@@ -44,6 +44,9 @@ type PostgresConfig struct {
 	Migrate bool `mapstructure:"migrate"`
 }
 
+// maxWriteInterval is the longest write interval.
+const maxWriteInterval = time.Minute
+
 func createDefaultConfig() *Config {
 	return &Config{
 		WriteInterval: time.Minute,
@@ -59,8 +62,10 @@ func (c *Config) Validate() error {
 	if (c.Postgres.DSN == "") == (c.Postgres.DSNFile == "") {
 		errs = append(errs, errors.New("postgres: set exactly one of dsn and dsn_file"))
 	}
-	if c.WriteInterval <= 0 {
-		errs = append(errs, errors.New("write_interval must be positive"))
+	if c.WriteInterval <= 0 || c.WriteInterval > maxWriteInterval {
+		// Connectors learn the agents of the hosts they do not receive from
+		// PostgreSQL, which must be fresh within the alive window.
+		errs = append(errs, fmt.Errorf("write_interval must be positive and at most %s", maxWriteInterval))
 	}
 	if c.IdleTTL < c.WriteInterval || c.IdleTTL < 2*time.Minute {
 		// Inputs must outlive a few intervals of the agents (15s) and delays.

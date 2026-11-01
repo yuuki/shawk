@@ -91,7 +91,7 @@ func pgConnector(t *testing.T) (*shawkConnector, *consumertest.MetricsSink, *pgx
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { c.Shutdown(context.Background()) })
-	if !c.migrated {
+	if !c.ready {
 		t.Fatal("not migrated")
 	}
 	return c, sink, conn
@@ -182,7 +182,10 @@ func TestPGPipeline(t *testing.T) {
 		t.Errorf("service_endpoints:\n%s\nwant:\n%s", strings.Join(eps, "\n"), strings.Join(wantEps, "\n"))
 	}
 
-	agents := queryStrings(t, conn, `SELECT host, alive, udp_traced, netns_scope, started_at = $1 FROM shawk_v1.agents`, base.Add(-time.Hour))
+	// The agents started an hour ago, but this connector first sees them
+	// now: their sessions start no earlier than the shortest idle TTL of an
+	// agent before.
+	agents := queryStrings(t, conn, `SELECT host, alive, udp_traced, netns_scope, started_at = $1 FROM shawk_v1.agents`, base.Add(-minAgentIdleTTL))
 	if !slices.Equal(agents, []string{"app-01 true true all true", "db-01 true true all true"}) {
 		t.Errorf("agents = %v", agents)
 	}
@@ -193,16 +196,17 @@ func TestPGPipeline(t *testing.T) {
 	}
 
 	edges := queryStrings(t, conn, `SELECT source, target, mainstat FROM shawk_v1.graph_edges`)
-	if !slices.Contains(edges, "shop/app postgres 5432/tcp") || !slices.Contains(edges, "10.0.0.50 postgres 5432/tcp") {
+	// Peers without a known service are named like in Prometheus.
+	if !slices.Contains(edges, "shop/app postgres 5432/tcp") || !slices.Contains(edges, "~unresolved postgres 5432/tcp") {
 		t.Errorf("graph_edges = %v", edges)
 	}
 	nodes := queryStrings(t, conn, `SELECT id, subtitle, mainstat FROM shawk_v1.graph_nodes`)
-	if !slices.Contains(nodes, "postgres db-01 1") || !slices.Contains(nodes, "93.184.215.14  0") {
+	if !slices.Contains(nodes, "postgres db-01 1") || !slices.Contains(nodes, "~external  0") {
 		t.Errorf("graph_nodes = %v", nodes)
 	}
 
 	changes := queryStrings(t, conn, `SELECT change, client_service, server_service FROM shawk_v1.dependency_changes`)
-	if !slices.Contains(changes, "disappeared 10.0.0.50 postgres") || !slices.Contains(changes, "appeared shop/app postgres") ||
+	if !slices.Contains(changes, "disappeared ~unresolved postgres") || !slices.Contains(changes, "appeared shop/app postgres") ||
 		slices.Contains(changes, "disappeared shop/app postgres") {
 		t.Errorf("dependency_changes = %v", changes)
 	}

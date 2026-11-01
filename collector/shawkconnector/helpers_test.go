@@ -209,6 +209,32 @@ type fakeStore struct {
 	prunes   int
 	err      error
 	migrated int
+	version  int // of the schema; SchemaVersion() if zero
+	cidrs    []namedPrefix
+	refresh  int
+}
+
+func (s *fakeStore) schemaVersion(context.Context) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.version == 0 {
+		return SchemaVersion(), nil
+	}
+	return s.version, nil
+}
+
+func (s *fakeStore) syncPeerCIDRs(_ context.Context, cidrs []namedPrefix) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cidrs = cidrs
+	return nil
+}
+
+func (s *fakeStore) refreshDependencies(context.Context) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.refresh++
+	return 0, nil
 }
 
 func (s *fakeStore) migrate(context.Context) ([]string, error) {
@@ -258,13 +284,13 @@ func testConnector(t *testing.T, mod func(*Config)) (*shawkConnector, *fakeStore
 	t.Helper()
 	cfg := createDefaultConfig()
 	cfg.Postgres.DSN = "postgres://unused"
-	cfg.WriteInterval = 10 * time.Minute // flushes are driven by the test
 	if mod != nil {
 		mod(cfg)
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)
 	}
+	cfg.WriteInterval = time.Hour // flushes are driven by the test
 	sink := new(consumertest.MetricsSink)
 	c, err := newConnector(connectortest.NewNopSettings(Type), cfg, sink)
 	if err != nil {

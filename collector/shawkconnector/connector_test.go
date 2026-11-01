@@ -197,8 +197,10 @@ func TestCumulativeAggregation(t *testing.T) {
 	if v := gauge(out); v != 2 {
 		t.Errorf("open connections = %v", v)
 	}
-	// Two peer addresses fold into one series.
-	out = consume(t, c, sink, agent(edge("1.1.1.1", 103, 1, old), edge("2.2.2.2", 5, 1, t0)))
+	// Two peer addresses fold into one series. A series that started in
+	// the interval starts at the end of the previous one, and counts whole.
+	prev := *now
+	out = consume(t, c, sink, agent(edge("1.1.1.1", 103, 1, old), edge("2.2.2.2", 5, 1, prev)))
 	if v := opened(out); v != 8 {
 		t.Errorf("after two inputs = %v, want 8", v)
 	}
@@ -206,7 +208,7 @@ func TestCumulativeAggregation(t *testing.T) {
 		t.Errorf("open connections = %v", v)
 	}
 	// An input disappears: the output does not decrease.
-	out = consume(t, c, sink, agent(edge("2.2.2.2", 6, 0, t0)))
+	out = consume(t, c, sink, agent(edge("2.2.2.2", 6, 0, prev)))
 	if v := opened(out); v != 9 {
 		t.Errorf("after an input disappeared = %v, want 9", v)
 	}
@@ -258,7 +260,7 @@ func TestMaxPeers(t *testing.T) {
 		{key: endpointKey{addrOf("2.2.2.2"), 444, "tcp"}, endpoint: endpoint{host: "x", service: "b"}},
 		{key: endpointKey{addrOf("3.3.3.3"), 445, "tcp"}, endpoint: endpoint{host: "x", service: "c"}},
 		{key: endpointKey{addrOf("4.4.4.4"), 446, "tcp"}, endpoint: endpoint{host: "x", service: "d"}},
-	}})
+	}}, t0)
 	out := consume(t, c, sink, tAgent{host: "app-01", time: t0.Add(15 * time.Second), edges: edges})
 	peers := map[string]int{}
 	for _, s := range find(out, metricConnOpened, "app", "*", roleClient, "") {
@@ -288,10 +290,12 @@ func TestWrites(t *testing.T) {
 		t.Fatalf("changes = %+v", h)
 	}
 	// The heartbeat is the time the connector received the request; the
-	// agent's clock is 15 seconds ahead.
-	if s := h.sessions[t0.Add(-time.Hour)]; s == nil || !s.lastHeartbeat.Equal(*now) || s.clockSkew != -15*time.Second ||
+	// agent's clock is 15 seconds ahead. The connector has not seen the
+	// host before: the session starts no earlier than the shortest idle TTL
+	// of an agent before the request, whose edges it is sure to receive.
+	if s := h.sessions[ta.time.Add(-minAgentIdleTTL)]; s == nil || !s.lastHeartbeat.Equal(*now) || s.clockSkew != -15*time.Second ||
 		s.netnsScope != "all" {
-		t.Errorf("session = %+v", s)
+		t.Errorf("session = %+v (%v)", s, h.sessions)
 	}
 	if !h.last.Equal(*now) {
 		t.Errorf("host last seen %v, want the time of receipt", h.last)
@@ -333,7 +337,7 @@ func TestWrites(t *testing.T) {
 
 func TestMigrateOnStart(t *testing.T) {
 	c, st, _, _ := testConnector(t, func(cfg *Config) { cfg.Postgres.Migrate = true })
-	if st.migrated != 1 || !c.migrated {
+	if st.migrated != 1 || !c.ready {
 		t.Errorf("migrated %d times", st.migrated)
 	}
 }

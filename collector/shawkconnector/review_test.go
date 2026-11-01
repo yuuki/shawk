@@ -216,7 +216,7 @@ func TestRejectedRowsAreDropped(t *testing.T) {
 func TestBaselineWithClockSkew(t *testing.T) {
 	c, _, sink, now := testConnector(t, nil)
 	c.agg.started = t0
-	*now = t0.Add(5 * time.Minute)
+	*now = t0.Add(2 * time.Minute)
 	// The clock of the agent is 10 minutes behind: its series started a
 	// minute after the connector, at t0+1m by the connector's clock.
 	skew := -10 * time.Minute

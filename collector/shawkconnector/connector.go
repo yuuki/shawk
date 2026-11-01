@@ -27,12 +27,22 @@ type shawkConnector struct {
 	store    store
 	resolver *resolver
 
-	mu       sync.Mutex
-	agg      *aggregator
-	changes  *changes
-	migrated bool
+	mu      sync.Mutex
+	agg     *aggregator
+	changes *changes
+	// ready tells that the schema has been migrated, or checked to be
+	// recent enough, so that writes may proceed.
+	ready bool
+	// cidrsSynced tells that peer_cidrs has been written to PostgreSQL.
+	cidrsSynced bool
+	cidrs       []namedPrefix
 
-	lastPrune time.Time
+	lastPrune, lastRefresh time.Time
+
+	// Errors of the pipeline after the connector, logged at most once a
+	// minute.
+	downstreamErrs    int
+	lastDownstreamLog time.Time
 
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -53,7 +63,7 @@ func newConnector(set connector.Settings, cfg *Config, next consumer.Metrics) (*
 		resolver: newResolver(cidrs),
 		agg:      newAggregator(cfg.IdleTTL, cfg.MaxPeers, cfg.KeepPeerAddress, now),
 		changes:  newChanges(cfg.IdleTTL),
-		migrated: !cfg.Postgres.Migrate,
+		cidrs:    cidrs,
 		now:      time.Now,
 	}, nil
 }
@@ -92,13 +102,47 @@ func (c *shawkConnector) Start(ctx context.Context, _ component.Host) error {
 	return nil
 }
 
-// prepare migrates the schema if configured to and reloads the names of
-// peers. It reports whether the schema is ready.
+// prepare migrates the schema if configured to, or checks its version,
+// writes peer_cidrs and reloads the names of peers. It reports whether the
+// schema is ready.
 func (c *shawkConnector) prepare(ctx context.Context) bool {
+	if !c.prepareSchemaOnly(ctx) {
+		return false
+	}
 	c.mu.Lock()
-	migrated := c.migrated
+	synced := c.cidrsSynced
 	c.mu.Unlock()
-	if !migrated {
+	if !synced {
+		// PostgreSQL names peers without a service by peer_cidrs too.
+		if err := c.store.syncPeerCIDRs(ctx, c.cidrs); err != nil {
+			c.log.Warn("writing peer_cidrs to PostgreSQL", zap.Error(err))
+		} else {
+			c.mu.Lock()
+			c.cidrsSynced = true
+			c.mu.Unlock()
+		}
+	}
+	at := c.now()
+	rows, err := c.store.peers(ctx)
+	if err != nil {
+		c.log.Warn("reading the names of peers from PostgreSQL", zap.Error(err))
+		return true
+	}
+	c.resolver.load(rows, at)
+	return true
+}
+
+// prepareSchemaOnly migrates the schema if configured to, or checks that
+// it is not older than the connector, if that is still pending, and
+// reports whether writes may proceed.
+func (c *shawkConnector) prepareSchemaOnly(ctx context.Context) bool {
+	c.mu.Lock()
+	ready := c.ready
+	c.mu.Unlock()
+	if ready {
+		return true
+	}
+	if c.cfg.Postgres.Migrate {
 		applied, err := c.store.migrate(ctx)
 		if err != nil {
 			c.log.Error("migrating the PostgreSQL schema; writes wait until it succeeds", zap.Error(err))
@@ -107,16 +151,25 @@ func (c *shawkConnector) prepare(ctx context.Context) bool {
 		if len(applied) > 0 {
 			c.log.Info("migrated the PostgreSQL schema", zap.Strings("applied", applied))
 		}
-		c.mu.Lock()
-		c.migrated = true
-		c.mu.Unlock()
+	} else {
+		v, err := c.store.schemaVersion(ctx)
+		if err != nil {
+			c.log.Error("reading the version of the PostgreSQL schema; writes wait until it succeeds", zap.Error(err))
+			return false
+		}
+		switch want := SchemaVersion(); {
+		case v < want:
+			c.log.Error("the PostgreSQL schema is older than the connector; run shawk-migrate, writes wait until then",
+				zap.Int("version", v), zap.Int("required", want))
+			return false
+		case v > want:
+			c.log.Warn("the PostgreSQL schema is newer than the connector; upgrade the connector",
+				zap.Int("version", v), zap.Int("connector", want))
+		}
 	}
-	rows, err := c.store.peers(ctx)
-	if err != nil {
-		c.log.Warn("reading the names of peers from PostgreSQL", zap.Error(err))
-		return true
-	}
-	c.resolver.load(rows)
+	c.mu.Lock()
+	c.ready = true
+	c.mu.Unlock()
 	return true
 }
 
@@ -146,6 +199,7 @@ func (c *shawkConnector) loop(ctx context.Context) {
 			c.prepare(rctx)
 			cancel()
 			c.pruneIfDue(ctx)
+			c.refreshIfDue(ctx)
 			now := c.now()
 			c.mu.Lock()
 			c.agg.expire(now)
@@ -166,9 +220,9 @@ func (c *shawkConnector) pruneIfDue(ctx context.Context) {
 		return
 	}
 	c.mu.Lock()
-	migrated := c.migrated
+	ready := c.ready
 	c.mu.Unlock()
-	if !migrated {
+	if !ready {
 		return
 	}
 	var total int64
@@ -191,16 +245,29 @@ func (c *shawkConnector) pruneIfDue(ctx context.Context) {
 	}
 }
 
-// prepareSchemaOnly migrates the schema if that is still pending, without
-// reloading peers, and reports whether writes may proceed.
-func (c *shawkConnector) prepareSchemaOnly(ctx context.Context) bool {
-	c.mu.Lock()
-	migrated := c.migrated
-	c.mu.Unlock()
-	if migrated {
-		return true
+// refreshInterval is how often the history of dependencies between
+// services, which tells a dependency that comes back from one that is new,
+// is brought up to date.
+const refreshInterval = 5 * time.Minute
+
+// refreshIfDue brings the history of dependencies up to date.
+func (c *shawkConnector) refreshIfDue(ctx context.Context) {
+	if c.now().Sub(c.lastRefresh) < refreshInterval {
+		return
 	}
-	return c.prepare(ctx)
+	c.mu.Lock()
+	ready := c.ready
+	c.mu.Unlock()
+	if !ready {
+		return
+	}
+	rctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	if _, err := c.store.refreshDependencies(rctx); err != nil {
+		c.log.Error("updating the history of dependencies", zap.Error(err))
+		return
+	}
+	c.lastRefresh = c.now()
 }
 
 // flush writes the pending changes, one transaction per host. The changes
@@ -218,6 +285,9 @@ func (c *shawkConnector) flush(ctx context.Context) {
 				// host for good; drop them.
 				c.log.Error("dropping changes that PostgreSQL rejects", zap.String("host", h.hostname),
 					zap.Int("rows", h.size()), zap.Error(err))
+				c.mu.Lock()
+				c.changes.forget(h.key, c.now())
+				c.mu.Unlock()
 				continue
 			}
 			failed++
@@ -249,11 +319,15 @@ func (c *shawkConnector) Shutdown(context.Context) error {
 
 // ConsumeMetrics consumes the requests of agents. Every resource is the
 // request of one agent.
+//
+// An error of the pipeline after the connector, e.g. Prometheus being
+// down, is logged rather than returned: the request has been taken for
+// PostgreSQL, and an agent that sees an error counts a failed export and
+// eventually restarts its observation segment.
 func (c *shawkConnector) ConsumeMetrics(ctx context.Context, md pmetric.Metrics) error {
 	out := pmetric.NewMetrics()
 	now := c.now()
 	rms := md.ResourceMetrics()
-	var errs []error
 	for i := range rms.Len() {
 		b, err := parseResource(rms.At(i))
 		if err != nil {
@@ -275,10 +349,26 @@ func (c *shawkConnector) ConsumeMetrics(ctx context.Context, md pmetric.Metrics)
 	}
 	if out.ResourceMetrics().Len() > 0 {
 		if err := c.next.ConsumeMetrics(ctx, out); err != nil {
-			errs = append(errs, err)
+			c.downstreamError(err, now)
 		}
 	}
-	return errors.Join(errs...)
+	return nil
+}
+
+// downstreamError logs an error of the pipeline after the connector, at
+// most once a minute.
+func (c *shawkConnector) downstreamError(err error, now time.Time) {
+	c.mu.Lock()
+	c.downstreamErrs++
+	n := c.downstreamErrs
+	if !c.lastDownstreamLog.IsZero() && now.Sub(c.lastDownstreamLog) < time.Minute {
+		c.mu.Unlock()
+		return
+	}
+	c.lastDownstreamLog, c.downstreamErrs = now, 0
+	c.mu.Unlock()
+	c.log.Error("forwarding the aggregated metrics; they are sent again with the next interval of each host",
+		zap.Int("failures", n), zap.Error(err))
 }
 
 // isDataError tells whether PostgreSQL rejected the data itself (SQLSTATE
