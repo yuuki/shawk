@@ -1,0 +1,10 @@
+# Loads the shawk dashboards from packaging/grafana/dashboards, copied to
+# /var/lib/grafana/dashboards/shawk.
+apiVersion: 1
+providers:
+  - name: shawk
+    folder: shawk
+    type: file
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards/shawk

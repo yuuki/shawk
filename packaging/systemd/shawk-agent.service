@@ -1,19 +1,20 @@
 [Unit]
-Description=shawk agent: records network dependencies of this host
+Description=shawk agent: traces the network dependencies of this host
 Documentation=https://github.com/yuuki/shawk
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/shawk agent -db /var/lib/shawk/ledger.db
+# Set SHAWK_AGENT_OPTS, e.g. -otlp-endpoint https://collector.example:4327
+EnvironmentFile=-/etc/shawk/agent.env
+ExecStart=/usr/bin/shawk agent $SHAWK_AGENT_OPTS
 Restart=on-failure
 RestartSec=5s
-StateDirectory=shawk
-# Loading BPF programs needs root; restrict everything else.
+# Loading BPF programs and reading /proc of other processes needs root;
+# the agent keeps no state on disk.
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/var/lib/shawk
 PrivateTmp=yes
 NoNewPrivileges=yes
 LimitMEMLOCK=infinity

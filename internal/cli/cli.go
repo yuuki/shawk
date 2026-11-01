@@ -8,61 +8,36 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"net"
-	"net/netip"
+	"log/slog"
 	"os"
 	"os/signal"
 	"sort"
 	"strconv"
-	"strings"
 	"syscall"
 	"text/tabwriter"
 	"time"
 
 	"github.com/yuuki/shawk/internal/agent"
-	"github.com/yuuki/shawk/internal/api"
-	"github.com/yuuki/shawk/internal/client"
-	"github.com/yuuki/shawk/internal/ledger"
-	"github.com/yuuki/shawk/internal/query"
+	"github.com/yuuki/shawk/internal/otlp"
+	"github.com/yuuki/shawk/internal/procinfo"
 	"github.com/yuuki/shawk/internal/tracer"
 	"github.com/yuuki/shawk/internal/version"
-
-	"log/slog"
 )
 
-const usage = `shawk discovers network dependencies among processes with eBPF and keeps
-them in a ledger on every host, so that you can ask who depends on what.
+const usage = `shawk traces the network dependencies of the processes on a host with eBPF
+and sends them to the shawk connector of an OpenTelemetry Collector, which
+keeps them in PostgreSQL and Prometheus for Grafana.
 
 Usage:
-  shawk <command> [flags] [arguments]
+  shawk <command> [flags]
 
-Agent:
-  agent          run the agent that records dependencies on this host
-  flows          show bundled flows on this host live (no agent needed)
-
-Queries (ask the agents; TARGET is HOST[:PORT][/UNIT|/@COMM]):
-  who-uses       show the processes that use services on TARGET (upstream)
-  deps           show the services that processes on TARGET use (downstream)
-  can-i-remove   check whether remote processes still use TARGET
-  unused         show services on TARGET that nobody used
-  diff           show dependencies of TARGET that appeared or disappeared
-  graph          export the dependency graph around TARGETs (dot, mermaid, json)
-  status         show the status of the agent on TARGET
-
-Other:
+Commands:
+  agent          run the agent that traces dependencies on this host
+  flows          show bundled flows on this host live (no collector needed)
   version        print the version
 
 Run 'shawk <command> -h' for the flags of a command.
 `
-
-// Exit statuses of can-i-remove besides 0 (safe to remove). Errors exit
-// with status 2.
-var (
-	// ErrFound means remote processes used the target (status 1).
-	ErrFound = errors.New("dependencies found")
-	// ErrUnknown means none were seen but the record is incomplete (status 3).
-	ErrUnknown = errors.New("dependencies unknown")
-)
 
 // Main runs the command line and returns the exit status.
 func Main(args []string, stdout, stderr io.Writer) int {
@@ -71,15 +46,8 @@ func Main(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	cmds := map[string]func(context.Context, []string, io.Writer) error{
-		"agent":        runAgent,
-		"flows":        runFlows,
-		"who-uses":     runWhoUses,
-		"deps":         runDeps,
-		"can-i-remove": runCanIRemove,
-		"unused":       runUnused,
-		"diff":         runDiff,
-		"graph":        runGraph,
-		"status":       runStatus,
+		"agent": runAgent,
+		"flows": runFlows,
 		"version": func(context.Context, []string, io.Writer) error {
 			fmt.Fprintln(stdout, "shawk", version.Version)
 			return nil
@@ -103,10 +71,6 @@ func Main(args []string, stdout, stderr io.Writer) int {
 		return 0
 	case errors.Is(err, flag.ErrHelp):
 		return 0
-	case errors.Is(err, ErrFound):
-		return 1
-	case errors.Is(err, ErrUnknown):
-		return 3
 	case errors.Is(err, errUsage):
 		fmt.Fprintf(stderr, "shawk %s: %v\n", name, err)
 		return 2
@@ -117,167 +81,38 @@ func Main(args []string, stdout, stderr io.Writer) int {
 
 var errUsage = errors.New("usage error")
 
-// queryFlags are the flags common to the query commands.
-type queryFlags struct {
-	port      int
-	tokenFile string
-	timeout   time.Duration
-	json      bool
-	since     string
-	peers     string
-}
-
-func (f *queryFlags) register(fs *flag.FlagSet, since string) {
-	fs.IntVar(&f.port, "port", api.DefaultPort, "TCP port of the agent API")
-	fs.StringVar(&f.tokenFile, "token-file", os.Getenv("SHAWK_TOKEN_FILE"), "file containing the bearer token of the agent API")
-	fs.DurationVar(&f.timeout, "timeout", 5*time.Second, "timeout of each request to an agent")
-	fs.BoolVar(&f.json, "json", false, "output JSON")
-	fs.StringVar(&f.since, "since", since, "time window to look back, e.g. 30d, 12h")
-	peers := os.Getenv("SHAWK_PEERS")
-	if peers == "" {
-		peers = "private"
-	}
-	fs.StringVar(&f.peers, "peers", peers, `addresses of agents to query besides the targets: "private" (loopback, RFC 1918, CGNAT, IPv6 ULA), CIDR prefixes or "any", comma-separated`)
-}
-
-// client returns a client that may contact the given target hosts and the
-// allowed peers.
-func (f *queryFlags) client(hosts ...string) (*client.Client, error) {
-	token, err := readToken(f.tokenFile)
-	if err != nil {
-		return nil, err
-	}
-	peers, err := client.ParsePeers(f.peers)
-	if err != nil {
-		return nil, fmt.Errorf("%w: -peers: %v", errUsage, err)
-	}
-	for _, h := range hosts {
-		peers.AddHost(h)
-	}
-	return client.New(f.port, token, f.timeout, peers), nil
-}
-
-func (f *queryFlags) querier(hosts ...string) (*query.Querier, error) {
-	c, err := f.client(hosts...)
-	if err != nil {
-		return nil, err
-	}
-	d, err := ParseDuration(f.since)
-	if err != nil {
-		return nil, fmt.Errorf("%w: -since: %v", errUsage, err)
-	}
-	// The window ends at the agent's own "now", so that a clock skew between
-	// the client and the agents does not hide recent dependencies.
-	return query.New(c, time.Now().Add(-d), time.Time{}), nil
-}
-
-// readToken reads a bearer token. A file without a token is an error rather
-// than a silently disabled authentication.
-func readToken(path string) (string, error) {
-	if path == "" {
-		return "", nil
-	}
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return "", err
-	}
-	token := strings.TrimSpace(string(b))
-	if token == "" {
-		return "", fmt.Errorf("token file %s is empty", path)
-	}
-	return token, nil
-}
-
-func parseFlags(fs *flag.FlagSet, args []string, nargs string) ([]string, error) {
+func parseFlags(fs *flag.FlagSet, args []string) error {
 	fs.SetOutput(os.Stderr)
-	// Allow flags after positional arguments, e.g. "who-uses db-01 -depth 2".
-	var rest []string
-	for {
-		if err := fs.Parse(args); err != nil {
-			return nil, err
-		}
-		args = fs.Args()
-		if len(args) == 0 {
-			break
-		}
-		rest = append(rest, args[0])
-		args = args[1:]
+	if err := fs.Parse(args); err != nil {
+		return err
 	}
-	switch nargs {
-	case "1":
-		if len(rest) != 1 {
-			return nil, fmt.Errorf("%w: expected one TARGET", errUsage)
-		}
-	case "0..1":
-		if len(rest) > 1 {
-			return nil, fmt.Errorf("%w: expected at most one TARGET", errUsage)
-		}
-		if len(rest) == 0 {
-			rest = []string{"localhost"}
-		}
-	case "1..":
-		if len(rest) == 0 {
-			return nil, fmt.Errorf("%w: expected TARGETs", errUsage)
-		}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("%w: unexpected argument %q", errUsage, fs.Arg(0))
 	}
-	return rest, nil
-}
-
-func target(s string) (query.Target, error) {
-	t, err := query.ParseTarget(s)
-	if err != nil {
-		return t, fmt.Errorf("%w: %v", errUsage, err)
-	}
-	return t, nil
-}
-
-func writeJSON(w io.Writer, v any) error {
-	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
-	return enc.Encode(v)
-}
-
-// ParseDuration parses a positive duration that may use the units d (days)
-// and w (weeks) in addition to those of time.ParseDuration.
-func ParseDuration(s string) (time.Duration, error) {
-	if s == "" {
-		return 0, errors.New("empty duration")
-	}
-	unit := s[len(s)-1]
-	if unit != 'd' && unit != 'w' {
-		d, err := time.ParseDuration(s)
-		if err == nil && d <= 0 {
-			err = fmt.Errorf("duration %q is not positive", s)
-		}
-		return d, err
-	}
-	n, err := strconv.ParseFloat(s[:len(s)-1], 64)
-	if unit == 'w' {
-		n *= 7
-	}
-	// Up to 100 years; time.Duration overflows at about 292.
-	if err != nil || !(n > 0) || n > 100*365 {
-		return 0, fmt.Errorf("invalid duration %q", s)
-	}
-	return time.Duration(n * float64(24*time.Hour)), nil
+	return nil
 }
 
 func runAgent(ctx context.Context, args []string, _ io.Writer) error {
 	fs := flag.NewFlagSet("agent", flag.ContinueOnError)
 	var (
-		listen    = fs.String("listen", fmt.Sprintf(":%d", api.DefaultPort), "address of the API server")
-		db        = fs.String("db", "/var/lib/shawk/ledger.db", "path of the ledger database")
-		interval  = fs.Duration("interval", 15*time.Second, "collection interval")
-		netns     = fs.String("netns", "all", `network namespaces to trace: "all", "self" or an inode number`)
-		maxFlows  = fs.Uint("max-flows", 16384, "capacity of the in-kernel flow table per interval")
-		retMinute = fs.String("retention-minute", "2d", "retention of per-minute activity")
-		retHour   = fs.String("retention-hour", "90d", "retention of per-hour activity")
-		retDay    = fs.String("retention-day", "1095d", "retention of per-day activity and of dependencies")
-		tokenFile = fs.String("token-file", os.Getenv("SHAWK_TOKEN_FILE"), "file containing a bearer token required by the API")
-		bpfStats  = fs.Bool("bpf-stats", false, "enable run time statistics of the BPF programs (small overhead)")
-		logLevel  = fs.String("log-level", "info", "log level: debug, info, warn or error")
+		endpoint = fs.String("otlp-endpoint", os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
+			"URL of the otlp/shawk receiver of the collector; http:// disables TLS (default http://localhost:4327 for grpc, :4328 for http/protobuf)")
+		protocol = fs.String("otlp-protocol", envOr("OTEL_EXPORTER_OTLP_PROTOCOL", otlp.ProtocolGRPC),
+			"OTLP protocol: grpc or http/protobuf")
+		caFile   = fs.String("otlp-ca-file", "", "PEM file of the CAs that verify the collector (default: system roots)")
+		certFile = fs.String("otlp-cert-file", "", "PEM client certificate for a collector that requires one (mutual TLS)")
+		keyFile  = fs.String("otlp-key-file", "", "PEM key of -otlp-cert-file")
+		perReq   = fs.Int("max-series-per-request", 1000, "dependencies and listeners per OTLP request, which also stays below 3 MiB; more are sent in several requests")
+		interval = fs.Duration("interval", 15*time.Second, "collection and export interval, at most 1m")
+		idleTTL  = fs.Duration("idle-ttl", 15*time.Minute, "how long a dependency is sent after its last activity")
+		netns    = fs.String("netns", "all", `network namespaces to trace: "all", "self" or an inode number`)
+		maxFlows = fs.Uint("max-flows", 16384, "capacity of the in-kernel flow table per interval")
+		fallback = fs.String("service-name-fallback", "exe",
+			`name of a service without OTEL_SERVICE_NAME: "exe" (executable name) or "unit" (systemd unit)`)
+		bpfStats = fs.Bool("bpf-stats", false, "enable and send run time statistics of the BPF programs (small overhead)")
+		logLevel = fs.String("log-level", "info", "log level: debug, info, warn or error")
 	)
-	if _, err := parseFlags(fs, args, "0"); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	var lvl slog.Level
@@ -289,51 +124,35 @@ func runAgent(ctx context.Context, args []string, _ io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("%w: %v", errUsage, err)
 	}
-	var ret ledger.Retention
-	for _, r := range []struct {
-		s   string
-		dst *time.Duration
-	}{{*retMinute, &ret.Minute}, {*retHour, &ret.Hour}, {*retDay, &ret.Day}} {
-		if *r.dst, err = ParseDuration(r.s); err != nil {
-			return fmt.Errorf("%w: retention: %v", errUsage, err)
-		}
-	}
-	token, err := readToken(*tokenFile)
+	fb, err := procinfo.ParseFallback(*fallback)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %v", errUsage, err)
 	}
-	warnExposure(logger, *listen, *tokenFile, token)
-	if err := os.MkdirAll(dirOf(*db), 0o755); err != nil {
-		return err
+	if *endpoint == "" {
+		*endpoint = otlp.DefaultEndpoint(*protocol)
+	}
+	if *perReq < 1 {
+		return fmt.Errorf("%w: -max-series-per-request must be positive", errUsage)
 	}
 	return agent.Run(ctx, agent.Config{
-		Listen: *listen, DBPath: *db, Interval: *interval, NetNS: ns, MaxFlows: uint32(*maxFlows),
-		Retention: ret, Token: token, BPFStats: *bpfStats, Logger: logger,
+		Exporter: otlp.ExporterConfig{Endpoint: *endpoint, Protocol: *protocol, CAFile: *caFile,
+			CertFile: *certFile, KeyFile: *keyFile},
+		MaxSeriesPerRequest: *perReq,
+		Interval:            *interval,
+		IdleTTL:             *idleTTL,
+		NetNS:               ns,
+		MaxFlows:            uint32(*maxFlows),
+		ServiceFallback:     fb,
+		BPFStats:            *bpfStats,
+		Logger:              logger,
 	})
 }
 
-// warnExposure warns when the API, which reveals the processes and peers of
-// the host, is served to the network without a token, or when the token can
-// be read by other users.
-func warnExposure(logger *slog.Logger, listen, tokenFile, token string) {
-	if token == "" {
-		host, _, err := net.SplitHostPort(listen)
-		if a, perr := netip.ParseAddr(host); err != nil || perr != nil || !a.IsLoopback() {
-			logger.Warn("the agent API is served without authentication; set -token-file or listen on a management address",
-				"listen", listen)
-		}
-		return
+func envOr(name, def string) string {
+	if v := os.Getenv(name); v != "" {
+		return v
 	}
-	if st, err := os.Stat(tokenFile); err == nil && st.Mode().Perm()&0o077 != 0 {
-		logger.Warn("the token file can be read by other users", "file", tokenFile, "mode", st.Mode().Perm())
-	}
-}
-
-func dirOf(p string) string {
-	if i := strings.LastIndexByte(p, '/'); i > 0 {
-		return p[:i]
-	}
-	return "."
+	return def
 }
 
 func runFlows(ctx context.Context, args []string, w io.Writer) error {
@@ -344,7 +163,7 @@ func runFlows(ctx context.Context, args []string, w io.Writer) error {
 		netns    = fs.String("netns", "all", `network namespaces to trace: "all", "self" or an inode number`)
 		asJSON   = fs.Bool("json", false, "output JSON lines")
 	)
-	if _, err := parseFlags(fs, args, "0"); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	ns, err := agent.ParseNetNS(*netns)
@@ -410,4 +229,17 @@ func printFlows(w io.Writer, flows []tracer.Flow) {
 			f.PID, conns, f.OpenConns, humanBytes(f.BytesSent), humanBytes(f.BytesRecv))
 	}
 	tw.Flush()
+}
+
+func humanBytes(n uint64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%dB", n)
+	}
+	div, exp := uint64(unit), 0
+	for m := n / unit; m >= unit; m /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f%ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }

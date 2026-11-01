@@ -1,0 +1,566 @@
+{
+  "uid": "shawk-fleet",
+  "title": "shawk / Fleet",
+  "description": "Agents of shawk: liveness, observation gaps, drops and new dependencies.",
+  "tags": [
+    "shawk"
+  ],
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "version": 1,
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "refresh": "1m",
+  "timezone": "",
+  "templating": {
+    "list": []
+  },
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      },
+      {
+        "name": "Unobserved",
+        "datasource": {
+          "type": "grafana-postgresql-datasource",
+          "uid": "shawk-postgres"
+        },
+        "enable": true,
+        "iconColor": "rgba(255, 96, 96, 0.4)",
+        "target": {
+          "refId": "Anno",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shawk-postgres"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT gap_start AS time, gap_end AS timeend, 'not observed: ' || host AS text, host AS tags\nFROM shawk_v1.unobserved($__timeFrom(), $__timeTo())"
+        }
+      }
+    ]
+  },
+  "links": [
+    {
+      "asDropdown": true,
+      "includeVars": false,
+      "keepTime": true,
+      "tags": [
+        "shawk"
+      ],
+      "title": "shawk",
+      "type": "dashboards"
+    }
+  ],
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Agents alive",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "shawk-postgres"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shawk-postgres"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT count(*) FILTER (WHERE alive) AS alive FROM shawk_v1.agents"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false,
+          "fields": ""
+        },
+        "colorMode": "value"
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Agents silent",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "shawk-postgres"
+      },
+      "gridPos": {
+        "x": 6,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shawk-postgres"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT count(*) FILTER (WHERE NOT alive) AS silent FROM shawk_v1.agents"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false,
+          "fields": ""
+        },
+        "colorMode": "value"
+      },
+      "description": "Hosts whose agent reported before but not in the last 5 minutes."
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "UDP not traced",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "shawk-postgres"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shawk-postgres"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT count(*) FILTER (WHERE alive AND NOT udp_traced) AS hosts FROM shawk_v1.agents"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false,
+          "fields": ""
+        },
+        "colorMode": "value"
+      },
+      "description": "Hosts whose kernel lacks BPF trampolines (fentry): their UDP dependencies are not observed."
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "New dependencies today",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "shawk-postgres"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shawk-postgres"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT count(*) AS dependencies\nFROM shawk_v1.dependency_changes_between(date_trunc('day', now()), now())\nWHERE change = 'appeared'"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false,
+          "fields": ""
+        },
+        "colorMode": "value"
+      }
+    },
+    {
+      "id": 5,
+      "type": "table",
+      "title": "Agents",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "shawk-postgres"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 4,
+        "w": 24,
+        "h": 9
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shawk-postgres"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT host, alive, agent_version, kernel, udp_traced, netns_scope, dropped_flows,\n       started_at AS observed_since, last_heartbeat, clock_skew\nFROM shawk_v1.agents\nORDER BY alive, host"
+        }
+      ],
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "description": "The latest observation segment of every host. observed_since is the start of the segment: dependencies before it are not known from this segment. clock_skew is how far the clock of the host is behind the collector; times of dependencies come from the clock of the host."
+    },
+    {
+      "id": 6,
+      "type": "table",
+      "title": "Observation gaps in the time range",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "shawk-postgres"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 13,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shawk-postgres"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT host, gap_start, gap_end, gap_end - gap_start AS duration\nFROM shawk_v1.unobserved($__timeFrom(), $__timeTo())\nORDER BY gap_start DESC"
+        }
+      ],
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "description": "Periods in which a host was not observed: absence of a dependency in a gap does not mean it was unused."
+    },
+    {
+      "id": 7,
+      "type": "table",
+      "title": "Dependencies that appeared today",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "shawk-postgres"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 13,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shawk-postgres"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT time AS first_seen, client_service, server_service, port, proto\nFROM shawk_v1.dependency_changes_between(date_trunc('day', now()), now())\nWHERE change = 'appeared'\nORDER BY time DESC"
+        }
+      ],
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Agents sending",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "shawk-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 21,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "count(shawk_agent_up)",
+          "range": true,
+          "legendFormat": "agents"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Dropped flow updates",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "shawk-prometheus"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 21,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (host_name) (increase(shawk_agent_flows_dropped_total[$__rate_interval]))",
+          "range": true,
+          "legendFormat": "{{host_name}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Flow updates the kernel dropped because the flow table was full; raise -max-flows."
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Export failures",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "shawk-prometheus"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 21,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (host_name) (increase(shawk_agent_export_failures_total[$__rate_interval]))",
+          "range": true,
+          "legendFormat": "{{host_name}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Requests the agents failed to send to the collector."
+    }
+  ]
+}

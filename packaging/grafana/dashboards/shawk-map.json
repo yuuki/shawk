@@ -1,0 +1,207 @@
+{
+  "uid": "shawk-map",
+  "title": "shawk / Dependency map",
+  "description": "Dependency map from PostgreSQL around the selected services.",
+  "tags": [
+    "shawk"
+  ],
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "version": 1,
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "refresh": "1m",
+  "timezone": "",
+  "templating": {
+    "list": [
+      {
+        "name": "service",
+        "label": "Service",
+        "type": "query",
+        "datasource": {
+          "type": "grafana-postgresql-datasource",
+          "uid": "shawk-postgres"
+        },
+        "query": "SELECT id FROM shawk_v1.graph_nodes_between($__timeFrom(), $__timeTo()) ORDER BY id",
+        "definition": "SELECT id FROM shawk_v1.graph_nodes_between($__timeFrom(), $__timeTo()) ORDER BY id",
+        "refresh": 2,
+        "multi": true,
+        "includeAll": false,
+        "current": {},
+        "sort": 1
+      },
+      {
+        "name": "direction",
+        "label": "Direction",
+        "type": "custom",
+        "query": "downstream,upstream,both",
+        "current": {
+          "text": "both",
+          "value": "both"
+        },
+        "options": [
+          {
+            "text": "downstream",
+            "value": "downstream",
+            "selected": false
+          },
+          {
+            "text": "upstream",
+            "value": "upstream",
+            "selected": false
+          },
+          {
+            "text": "both",
+            "value": "both",
+            "selected": true
+          }
+        ]
+      },
+      {
+        "name": "depth",
+        "label": "Depth",
+        "type": "custom",
+        "query": "1,2,3,5",
+        "current": {
+          "text": "2",
+          "value": "2"
+        },
+        "options": [
+          {
+            "text": "1",
+            "value": "1",
+            "selected": false
+          },
+          {
+            "text": "2",
+            "value": "2",
+            "selected": true
+          },
+          {
+            "text": "3",
+            "value": "3",
+            "selected": false
+          },
+          {
+            "text": "5",
+            "value": "5",
+            "selected": false
+          }
+        ]
+      }
+    ]
+  },
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "links": [
+    {
+      "asDropdown": true,
+      "includeVars": false,
+      "keepTime": true,
+      "tags": [
+        "shawk"
+      ],
+      "title": "shawk",
+      "type": "dashboards"
+    }
+  ],
+  "panels": [
+    {
+      "id": 1,
+      "type": "nodeGraph",
+      "title": "Dependencies of $service",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "shawk-postgres"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 18
+      },
+      "targets": [
+        {
+          "refId": "nodes",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shawk-postgres"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "WITH RECURSIVE e AS (\n  SELECT id, source, target, mainstat, first_seen, last_seen\n  FROM shawk_v1.graph_edges_between($__timeFrom(), $__timeTo())\n),\n-- UNION keeps one row per service and depth, so that the walk visits\n-- services rather than every path between them.\nwalk (node, depth) AS (\n  SELECT unnest(ARRAY[${service:singlequote}]::text[]), 0\n  UNION\n  SELECT CASE WHEN e.source = w.node THEN e.target ELSE e.source END, w.depth + 1\n  FROM walk w\n  JOIN e ON ('$direction' IN ('downstream', 'both') AND e.source = w.node)\n         OR ('$direction' IN ('upstream', 'both') AND e.target = w.node)\n  WHERE w.depth < $depth\n),\nreached AS (SELECT DISTINCT node FROM walk)\n\nSELECT n.id, n.title, n.subtitle, n.mainstat || ' hosts' AS mainstat\nFROM shawk_v1.graph_nodes_between($__timeFrom(), $__timeTo()) n\nWHERE n.id IN (SELECT node FROM reached)"
+        },
+        {
+          "refId": "edges",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shawk-postgres"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "WITH RECURSIVE e AS (\n  SELECT id, source, target, mainstat, first_seen, last_seen\n  FROM shawk_v1.graph_edges_between($__timeFrom(), $__timeTo())\n),\n-- UNION keeps one row per service and depth, so that the walk visits\n-- services rather than every path between them.\nwalk (node, depth) AS (\n  SELECT unnest(ARRAY[${service:singlequote}]::text[]), 0\n  UNION\n  SELECT CASE WHEN e.source = w.node THEN e.target ELSE e.source END, w.depth + 1\n  FROM walk w\n  JOIN e ON ('$direction' IN ('downstream', 'both') AND e.source = w.node)\n         OR ('$direction' IN ('upstream', 'both') AND e.target = w.node)\n  WHERE w.depth < $depth\n),\nreached AS (SELECT DISTINCT node FROM walk)\n\nSELECT e.id, e.source, e.target, e.mainstat, e.last_seen AS secondarystat\nFROM e\nWHERE e.source IN (SELECT node FROM reached) AND e.target IN (SELECT node FROM reached)"
+        }
+      ],
+      "options": {
+        "nodes": {},
+        "edges": {}
+      },
+      "description": "Services reached from the selected services within the depth, in the time range. A peer without a known service is shown by the name Prometheus gives it: a name of peer_cidrs, ~unresolved or ~external."
+    },
+    {
+      "id": 2,
+      "type": "table",
+      "title": "Edges",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "shawk-postgres"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 18,
+        "w": 24,
+        "h": 10
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shawk-postgres"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "WITH RECURSIVE e AS (\n  SELECT id, source, target, mainstat, first_seen, last_seen\n  FROM shawk_v1.graph_edges_between($__timeFrom(), $__timeTo())\n),\n-- UNION keeps one row per service and depth, so that the walk visits\n-- services rather than every path between them.\nwalk (node, depth) AS (\n  SELECT unnest(ARRAY[${service:singlequote}]::text[]), 0\n  UNION\n  SELECT CASE WHEN e.source = w.node THEN e.target ELSE e.source END, w.depth + 1\n  FROM walk w\n  JOIN e ON ('$direction' IN ('downstream', 'both') AND e.source = w.node)\n         OR ('$direction' IN ('upstream', 'both') AND e.target = w.node)\n  WHERE w.depth < $depth\n),\nreached AS (SELECT DISTINCT node FROM walk)\n\n    SELECT e.source AS client, e.target AS server, e.mainstat AS ports, e.first_seen, e.last_seen\n    FROM e\n    WHERE e.source IN (SELECT node FROM reached) AND e.target IN (SELECT node FROM reached)\n    ORDER BY e.last_seen DESC"
+        }
+      ],
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      }
+    }
+  ]
+}

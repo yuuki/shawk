@@ -1,0 +1,14 @@
+# Settings of Prometheus for shawk (merge them into your prometheus.yml).
+# Start Prometheus with --web.enable-otlp-receiver so that the collector can
+# push to /api/v1/otlp/v1/metrics.
+otlp:
+  # Labels host_id and host_name on every series of shawk and OBI.
+  promote_resource_attributes:
+    - host.id
+    - host.name
+storage:
+  tsdb:
+    # Requests of agents may arrive late or out of order.
+    out_of_order_time_window: 30m
+rule_files:
+  - shawk-rules.yml

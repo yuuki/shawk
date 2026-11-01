@@ -9,6 +9,18 @@ jobs:
     # Hosted runners allow loading BPF programs with sudo, including fentry,
     # which the UDP tracing needs.
     runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      SHAWK_TEST_POSTGRES_DSN: postgres://postgres:postgres@localhost:5432/postgres
+      SHAWK_E2E_POSTGRES_DSN: postgres://postgres:postgres@localhost:5432/shawke2e
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -18,14 +30,20 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y clang llvm rpm2cpio cpio
       - name: Vet
         run: make vet
-      - name: Unit tests
-        run: go test ./...
+      - name: Unit tests (agent, connector with PostgreSQL, packaging examples)
+        run: make test
       # The tests below use the committed BPF object, which the binary embeds
       # and releases ship.
       - name: Tests loading BPF programs
         run: make test-root
       - name: End-to-end test
-        run: make e2e
+        run: |
+          psql "$SHAWK_TEST_POSTGRES_DSN" -c 'CREATE DATABASE shawke2e'
+          make e2e
+      # The collector built by make e2e checks the packaged configuration,
+      # including the names of the settings of its components.
+      - name: Validate the packaged collector configuration
+        run: collector/_build/shawk-collector validate --config packaging/collector/config.yaml
       - name: Compatibility with the Rocky Linux 9 kernel
         run: make compat
       - name: Check that the committed BPF object matches the source

@@ -1,0 +1,572 @@
+{
+  "uid": "shawk-dependency",
+  "title": "shawk / Dependency details",
+  "description": "Traffic of dependencies from Prometheus and their record in PostgreSQL.",
+  "tags": [
+    "shawk"
+  ],
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "version": 1,
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "refresh": "1m",
+  "timezone": "",
+  "templating": {
+    "list": [
+      {
+        "name": "src",
+        "label": "Client",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "shawk-prometheus"
+        },
+        "query": {
+          "query": "label_values({__name__=~\"shawk:dependency_connections:rate5m|shawk:dependency_request_datagrams:rate5m\"}, src)",
+          "refId": "src"
+        },
+        "definition": "label_values({__name__=~\"shawk:dependency_connections:rate5m|shawk:dependency_request_datagrams:rate5m\"}, src)",
+        "refresh": 2,
+        "multi": true,
+        "includeAll": true,
+        "current": {},
+        "sort": 1
+      },
+      {
+        "name": "dst",
+        "label": "Server",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "shawk-prometheus"
+        },
+        "query": {
+          "query": "label_values({__name__=~\"shawk:dependency_connections:rate5m|shawk:dependency_request_datagrams:rate5m\", src=~\"$src\"}, dst)",
+          "refId": "dst"
+        },
+        "definition": "label_values({__name__=~\"shawk:dependency_connections:rate5m|shawk:dependency_request_datagrams:rate5m\", src=~\"$src\"}, dst)",
+        "refresh": 2,
+        "multi": true,
+        "includeAll": true,
+        "current": {},
+        "sort": 1
+      }
+    ]
+  },
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      },
+      {
+        "name": "Unobserved",
+        "datasource": {
+          "type": "grafana-postgresql-datasource",
+          "uid": "shawk-postgres"
+        },
+        "enable": true,
+        "iconColor": "rgba(255, 96, 96, 0.4)",
+        "target": {
+          "refId": "Anno",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shawk-postgres"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT gap_start AS time, gap_end AS timeend, 'not observed: ' || host AS text, host AS tags\nFROM shawk_v1.unobserved($__timeFrom(), $__timeTo())"
+        }
+      }
+    ]
+  },
+  "links": [
+    {
+      "asDropdown": true,
+      "includeVars": false,
+      "keepTime": true,
+      "tags": [
+        "shawk"
+      ],
+      "title": "shawk",
+      "type": "dashboards"
+    }
+  ],
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Connections",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "shawk-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (src, dst, server_port) (shawk:dependency_connections:rate5m{src=~\"$src\", dst=~\"$dst\"})",
+          "range": true,
+          "legendFormat": "{{src}} → {{dst}}:{{server_port}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "unit": "cps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Connection failure ratio",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "shawk-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (src, dst, server_port) (shawk:dependency_connection_failures:rate5m{src=~\"$src\", dst=~\"$dst\"})\n  / (sum by (src, dst, server_port) (shawk:dependency_connections:rate5m{src=~\"$src\", dst=~\"$dst\"})\n     + sum by (src, dst, server_port) (shawk:dependency_connection_failures:rate5m{src=~\"$src\", dst=~\"$dst\"}))",
+          "range": true,
+          "legendFormat": "{{src}} → {{dst}}:{{server_port}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Failed connection attempts, observed on the client side only."
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Request and response bytes",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "shawk-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (src, dst, server_port) (shawk:dependency_request_bytes:rate5m{src=~\"$src\", dst=~\"$dst\"})",
+          "range": true,
+          "legendFormat": "request {{src}} → {{dst}}:{{server_port}}"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (src, dst, server_port) (shawk:dependency_response_bytes:rate5m{src=~\"$src\", dst=~\"$dst\"})",
+          "range": true,
+          "legendFormat": "response {{src}} → {{dst}}:{{server_port}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "unit": "Bps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Mean RTT",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "shawk-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (src, dst, server_port) (shawk:dependency_rtt_seconds_sum:rate5m{src=~\"$src\", dst=~\"$dst\"})\n  / sum by (src, dst, server_port) (shawk:dependency_rtt_seconds_count:rate5m{src=~\"$src\", dst=~\"$dst\"})",
+          "range": true,
+          "legendFormat": "{{src}} → {{dst}}:{{server_port}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Mean of the smoothed RTT samples of the connections."
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Retransmitted segments",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "shawk-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 16,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (src, dst, server_port, shawk_role) (shawk:dependency_retransmits:rate5m{src=~\"$src\", dst=~\"$dst\"})",
+          "range": true,
+          "legendFormat": "{{shawk_role}} sends: {{src}} → {{dst}}:{{server_port}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Segments each side retransmitted; shawk_role is the sender."
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Open connections",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "shawk-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 16,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (src, dst, server_port) (shawk:dependency_open_connections{src=~\"$src\", dst=~\"$dst\"})",
+          "range": true,
+          "legendFormat": "{{src}} → {{dst}}:{{server_port}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "UDP datagrams",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "shawk-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 24,
+        "w": 24,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (src, dst, server_port) (shawk:dependency_request_datagrams:rate5m{src=~\"$src\", dst=~\"$dst\"})",
+          "range": true,
+          "legendFormat": "request {{src}} → {{dst}}:{{server_port}}"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (src, dst, server_port) (shawk:dependency_response_datagrams:rate5m{src=~\"$src\", dst=~\"$dst\"})",
+          "range": true,
+          "legendFormat": "response {{src}} → {{dst}}:{{server_port}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "unit": "pps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 8,
+      "type": "table",
+      "title": "Dependencies in PostgreSQL",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "shawk-postgres"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 32,
+        "w": 24,
+        "h": 10
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shawk-postgres"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT client_host, client_service, client_unit, host(client_addr) AS client_addr,\n       server_host, server_service, host(server_addr) AS server_addr, port, proto,\n       observed_by, first_seen, last_seen, client_observed_until, server_observed_until\nFROM shawk_v1.dependencies_between($__timeFrom(), $__timeTo())\n-- A side without a service (a peer without an agent) is named like\n-- in Prometheus: a name of peer_cidrs, ~unresolved or ~external; and\n-- ~other, which folds peers beyond max_peers, matches any of them.\nWHERE (coalesce(client_service, shawk_v1.peer_class(client_addr)) IN (${src:singlequote})\n       OR (client_service IS NULL AND '~other' IN (${src:singlequote})))\n  AND (coalesce(server_service, shawk_v1.peer_class(server_addr)) IN (${dst:singlequote})\n       OR (server_service IS NULL AND '~other' IN (${dst:singlequote})))\nORDER BY last_seen DESC\nLIMIT 500"
+        }
+      ],
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "description": "Both ends, first and last seen, and how long each side has been observed. A dependency whose last_seen is old while its observer is still observed is no longer used; if both are close, the agent may have stopped."
+    },
+    {
+      "id": 9,
+      "type": "table",
+      "title": "Dependencies without application-layer instrumentation",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "shawk-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 42,
+        "w": 24,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "group by (src, dst) (\n  label_replace(label_replace(\n    shawk:dependency_connections:rate5m{src=~\"$src\", dst=~\"$dst\"} > 0,\n    \"src\", \"$1\", \"src\", \"(?:.*/)?(.*)\"), \"dst\", \"$1\", \"dst\", \"(?:.*/)?(.*)\"))\nunless on (src, dst)\ngroup by (src, dst) (\n  label_replace(label_replace(\n    rate(traces_service_graph_request_total[5m]),\n    \"src\", \"$1\", \"client\", \"(.*)\"), \"dst\", \"$1\", \"server\", \"(.*)\")\n)",
+          "range": false,
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "description": "Dependencies shawk sees that are absent from the service graph of OBI (or another tracer), compared without the service namespace, which the service graph does not carry. Peers that OBI cannot name show up here as well."
+    }
+  ]
+}

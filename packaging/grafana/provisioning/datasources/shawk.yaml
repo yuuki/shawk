@@ -1,0 +1,27 @@
+# Data sources of the shawk dashboards and alerts. The dashboards refer to
+# them by uid. Adjust the URLs, the database and the credentials.
+apiVersion: 1
+datasources:
+  - name: shawk Prometheus
+    uid: shawk-prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    jsonData:
+      timeInterval: 15s
+
+  - name: shawk PostgreSQL
+    uid: shawk-postgres
+    type: grafana-postgresql-datasource
+    url: postgres:5432
+    # A role with SELECT on the schema shawk_v1 only; see
+    # packaging/postgres/setup.sql and grants.sql.
+    user: shawk_grafana
+    jsonData:
+      database: shawk
+      sslmode: require
+      postgresVersion: 1400
+      timescaledb: false
+      maxOpenConns: 10
+    secureJsonData:
+      password: $SHAWK_GRAFANA_DB_PASSWORD

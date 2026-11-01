@@ -1,0 +1,200 @@
+# Grafana alert rules on the PostgreSQL contract of shawk (shawk_v1).
+#
+# The PostgreSQL data source is used in the time series format: each query
+# returns a time column, string columns that become labels and one numeric
+# value column. Grafana converts such rows into one series per label set and
+# requires them sorted by time; every row carries the same time, now(), so
+# that each series has a value at the last time, and rows are ordered. The
+# reducers drop nulls all the same.
+#
+# When nothing happens a query returns no rows, which is No Data; the rules
+# treat No Data as Normal. A dependency that disappeared is an explicit row
+# (its last activity falls in a window while a host that saw it kept
+# observing) rather than a row that vanishes from the result, so that a
+# stopped agent does not look like a removed dependency. New and disappeared
+# dependencies are judged per service and port, as in
+# shawk_v1.dependency_changes_between, not per edge: a dependency seen
+# before (a new replica, a job that runs every hour) is not new, and a peer
+# without a known service is named like in Prometheus (a name of
+# peer_cidrs, ~unresolved, ~external) rather than by its address.
+#
+# Dashboard variables cannot be used in alerts, so the time windows are
+# written in the queries.
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: shawk-dependencies
+    folder: shawk
+    interval: 1m
+    rules:
+      - uid: shawk-new-dependency
+        title: New dependency
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 1200, to: 0 }
+            datasourceUid: shawk-postgres
+            model:
+              refId: A
+              editorMode: code
+              format: time_series
+              rawQuery: true
+              rawSql: |-
+                -- The window ends a few minutes ago: both sides of a new
+                -- connection are written by then, so that it is not first
+                -- reported with one side named after its address.
+                SELECT now() AS time,
+                       client_service, server_service, port::text AS port, proto,
+                       1 AS value
+                FROM shawk_v1.dependency_changes_between(now() - interval '20 minutes', now() - interval '5 minutes')
+                WHERE change = 'appeared'
+                ORDER BY 1, 2, 3, 4, 5
+          - refId: B
+            datasourceUid: __expr__
+            model: { refId: B, type: reduce, expression: A, reducer: last, settings: { mode: dropNN } }
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+        noDataState: OK
+        execErrState: Error
+        for: 0s
+        labels:
+          severity: info
+        annotations:
+          summary: "New dependency: {{ $labels.client_service }} -> {{ $labels.server_service }}:{{ $labels.port }}/{{ $labels.proto }}"
+
+      - uid: shawk-disappeared-dependency
+        title: Disappeared dependency
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 1800, to: 0 }
+            datasourceUid: shawk-postgres
+            model:
+              refId: A
+              editorMode: code
+              format: time_series
+              rawQuery: true
+              rawSql: |-
+                -- Dependencies whose last activity was 15 to 30 minutes ago,
+                -- while a host that saw them kept observing for 15 minutes.
+                SELECT now() AS time,
+                       client_service, server_service, port::text AS port, proto,
+                       1 AS value
+                FROM shawk_v1.dependency_changes_between(now() - interval '30 minutes', now())
+                WHERE change = 'disappeared' AND time <= now() - interval '15 minutes'
+                ORDER BY 1, 2, 3, 4, 5
+          - refId: B
+            datasourceUid: __expr__
+            model: { refId: B, type: reduce, expression: A, reducer: last, settings: { mode: dropNN } }
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+        noDataState: OK
+        execErrState: Error
+        for: 0s
+        labels:
+          severity: warning
+        annotations:
+          summary: "Dependency disappeared: {{ $labels.client_service }} -> {{ $labels.server_service }}:{{ $labels.port }}/{{ $labels.proto }}"
+          description: "Last active 15 to 30 minutes ago while a host that saw it is still observed."
+
+  - orgId: 1
+    name: shawk-agents
+    folder: shawk
+    interval: 5m
+    rules:
+      # Agents silent for more than 24 hours, when the Prometheus alert
+      # ShawkAgentDown resolves, for 30 days. A host reinstalled under a new
+      # host id (a new machine id) with the same name is not silent; the
+      # host id tells hosts of the same name apart.
+      - uid: shawk-agent-silent
+        title: shawk agent silent
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 3600, to: 0 }
+            datasourceUid: shawk-postgres
+            model:
+              refId: A
+              editorMode: code
+              format: time_series
+              rawQuery: true
+              rawSql: |-
+                SELECT now() AS time, a.host, a.host_id,
+                       round(extract(epoch FROM now() - a.last_heartbeat) / 60)::float8 AS value
+                FROM shawk_v1.agents a
+                WHERE NOT a.alive
+                  AND a.last_heartbeat < now() - interval '24 hours'
+                  AND a.last_heartbeat > now() - interval '30 days'
+                  AND NOT EXISTS (SELECT FROM shawk_v1.agents b
+                                  WHERE b.host = a.host AND b.last_heartbeat > a.last_heartbeat)
+                ORDER BY 1, 2, 3
+          - refId: B
+            datasourceUid: __expr__
+            model: { refId: B, type: reduce, expression: A, reducer: last, settings: { mode: dropNN } }
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+        noDataState: OK
+        execErrState: Error
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "shawk agent on {{ $labels.host }} ({{ $labels.host_id }}) has not reported for {{ $values.B }} minutes"
+
+      # Times of dependencies come from the clock of each host, heartbeats
+      # from the clock of the collector; a wrong clock misplaces both.
+      - uid: shawk-agent-clock-skew
+        title: shawk agent clock skew
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: shawk-postgres
+            model:
+              refId: A
+              editorMode: code
+              format: time_series
+              rawQuery: true
+              rawSql: |-
+                SELECT now() AS time, host,
+                       abs(extract(epoch FROM clock_skew))::float8 AS value
+                FROM shawk_v1.agents
+                WHERE alive AND abs(extract(epoch FROM clock_skew)) > 60
+                ORDER BY 1, 2
+          - refId: B
+            datasourceUid: __expr__
+            model: { refId: B, type: reduce, expression: A, reducer: last, settings: { mode: dropNN } }
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [60] }
+        noDataState: OK
+        execErrState: Error
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The clock of {{ $labels.host }} is {{ $values.B }} seconds off the collector"
+          description: "Synchronize the clock of the host (chrony); first and last seen times of its dependencies are off by as much."

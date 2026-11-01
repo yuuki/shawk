@@ -16,11 +16,25 @@ build:
 .PHONY: vet
 vet:
 	$(GO) vet ./...
-	test -z "$$(gofmt -l .)"
+	cd collector && $(GO) vet ./...
+	cd test/packaging && $(GO) vet ./...
+	test -z "$$(gofmt -l cmd internal collector/shawkconnector collector/cmd test/packaging)"
 
 .PHONY: test
-test: ## unit tests; tests that load BPF programs are skipped without root
+test: ## unit tests; BPF tests need root, PostgreSQL tests need SHAWK_TEST_POSTGRES_DSN
 	$(GO) test ./...
+	cd collector && $(GO) test ./...
+	cd test/packaging && $(GO) test ./...
+
+OCB_VERSION ?= v0.164.0
+
+.PHONY: collector
+collector: ## build the collector with the shawk connector (collector/_build/shawk-collector)
+	cd collector && $(GO) run go.opentelemetry.io/collector/cmd/builder@$(OCB_VERSION) --config builder-config.yaml
+
+.PHONY: shawk-migrate
+shawk-migrate: ## build the command that applies the PostgreSQL schema
+	cd collector && CGO_ENABLED=0 $(GO) build -trimpath -o ../shawk-migrate ./cmd/shawk-migrate
 
 .PHONY: test-root
 test-root: ## tests that load the BPF programs into the running kernel
@@ -29,8 +43,8 @@ test-root: ## tests that load the BPF programs into the running kernel
 	rm -f tracer.test
 
 .PHONY: e2e
-e2e: build ## multi-host test with network namespaces
-	sudo test/e2e/run.sh ./shawk
+e2e: build collector ## multi-host test with network namespaces; needs SHAWK_E2E_POSTGRES_DSN
+	sudo --preserve-env=SHAWK_E2E_POSTGRES_DSN test/e2e/run.sh ./shawk collector/_build/shawk-collector
 
 .PHONY: check-object
 check-object: ## check that the committed BPF object matches the source
@@ -45,4 +59,4 @@ compat: rocky9.btf ## check the BPF programs against the Rocky Linux 9 kernel
 
 .PHONY: clean
 clean:
-	rm -f shawk tracer.test rocky9.btf
+	rm -rf shawk shawk-migrate tracer.test rocky9.btf collector/_build

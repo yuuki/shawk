@@ -1,0 +1,20 @@
+[Unit]
+Description=OpenTelemetry Collector with the shawk connector
+Documentation=https://github.com/yuuki/shawk
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=shawk-collector
+Group=shawk-collector
+ExecStart=/usr/bin/shawk-collector --config /etc/shawk/collector.yaml
+Restart=on-failure
+RestartSec=5s
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

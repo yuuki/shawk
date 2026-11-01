@@ -2,56 +2,69 @@
 
 <img alt="shawk-logo" src="docs/images/logo.png" width="160">
 
-**A dependency ledger for your servers.** shawk records which process talks
-to which network service on every host with eBPF, keeps the record for
-years, and answers the questions you ask before changing a system:
-
-```console
-$ shawk who-uses db-01:5432 -depth 2 -since 90d
-db-01:5432/tcp (10.0.0.10)  postgres (postgresql.service)  conns=1.2M bytes=12.4GiB/3.1GiB last=just now
-├── app-01 (10.0.0.11)  puma (app.service)  conns=1.2M open=40 bytes=3.1GiB/12.4GiB last=just now
-│   └── app-01:8080/tcp (10.0.0.11)  puma (app.service)  conns=8.1M last=just now
-│       └── lb-01 (10.0.0.5)  haproxy (haproxy.service)  conns=8.1M last=just now
-├── batch-03 (10.0.0.31)  ruby (monthly-report.service)  conns=12 last=2026-10-01
-└── 10.0.8.7  (no agent)  conns=3 last=2026-08-14
-
-$ shawk can-i-remove old-cache-02
-NO: old-cache-02 is still used by remote processes since 2026-09-30 12:00:00:
-old-cache-02:11211/tcp (10.0.0.42)  memcached (memcached.service)  conns=31 last=3d ago
-└── app-07 (10.0.0.17)  php-fpm (php-fpm.service)  conns=31 last=3d ago
-```
+**The record of network dependencies of your servers.** shawk traces which
+process talks to which network service on every host with eBPF, keeps the
+record in PostgreSQL with the periods each host was observed, sends the
+traffic of every dependency to Prometheus, and shows both in Grafana — so
+that you can answer the questions you ask before changing a system:
+*who still uses this database? what appeared after the deployment? did
+anything use this host in the last 90 days, and were we watching?*
 
 * **Zero instrumentation.** Dependencies are observed at TCP/UDP sockets in
   the kernel, so every process is covered — your code, middleware,
-  third-party software, cron jobs — whatever language it is written in.
+  third-party software, cron jobs — whatever language or protocol.
 * **Low overhead, always on.** Flows to the same service are bundled in the
   kernel; TCP is traced at connection state changes only, with no hook on the
   send/receive path. Rare dependencies such as monthly batch jobs are not
-  missed by sampling, and `can-i-remove` says when the record has gaps.
-* **History, not just a live map.** Each host keeps a ledger of its
-  dependencies with first/last seen times and per-minute/hour/day activity.
-* **No central database.** Each agent owns the ledger of its host; queries
-  walk dependencies across agents.
+  missed by sampling.
+* **History with known coverage.** Every dependency has its first and last
+  seen times, and every host its observation segments, so that "not used"
+  is told apart from "not observed".
+* **Standard building blocks.** Agents speak OTLP; a component of the
+  OpenTelemetry Collector writes PostgreSQL and forwards metrics to
+  Prometheus; Grafana dashboards and alerts are included. Services are
+  named like OBI (OpenTelemetry eBPF Instrumentation) names them, so the
+  network dependencies of shawk and the application metrics of OBI meet on
+  the same `job`.
 
 shawk implements the socket-based tracing with in-kernel flow bundling from
 [Low Overhead TCP/UDP Socket-based Tracing for Discovering Network Services
 Dependencies](https://yuuk.io/papers/transtracer_jip2022.pdf) (JIP, 2022).
 See [docs/design.md](docs/design.md) for the design.
 
+## How it fits together
+
+```
+ every host: eBPF ─ shawk agent ── OTLP ──→ collector with the shawk connector ─┬─→ PostgreSQL ─┐
+                                                                               └─→ Prometheus ─┴─→ Grafana
+```
+
+| component | what it does |
+|---|---|
+| `shawk agent` | traces the dependencies of its host and sends them every 15 s as OTLP metrics; no database, no open port |
+| shawk connector | writes dependencies, listeners and observation segments to PostgreSQL, names the peer of every dependency (`service.peer.name`), and forwards aggregated metrics without addresses to Prometheus |
+| PostgreSQL | whether a dependency exists, since when and until when: the views of the schema `shawk_v1` |
+| Prometheus | how much flows: connections, failures, bytes, RTT and retransmissions per dependency |
+| Grafana | dashboards (fleet, dependency map, dependency details, changes, application layer) and alerts |
+
 ## Requirements
 
-* Linux with BTF (`/sys/kernel/btf/vmlinux`): Rocky Linux / RHEL 9, or
-  upstream 5.14 or later (best 5.19 or later). The programs are tested by
+* Hosts: Linux with BTF (`/sys/kernel/btf/vmlinux`): Rocky Linux / RHEL 9,
+  or upstream 5.14 or later (best 5.19 or later). The programs are tested by
   loading them on Ubuntu kernels 6.8 to 7.0 and checked statically against
   the Rocky Linux 9.6 kernel; they have not yet run on a Rocky Linux kernel,
   on upstream 5.14 to 5.18, or on arm64. See [the design](docs/design.md#35-kernel-requirements-and-features-used).
-* The agent must run in the host PID namespace to resolve the owners of
-  sockets.
-* UDP tracing additionally needs BPF trampolines (fentry), available on
-  x86_64 and on arm64 since Linux 6.0. Without them only TCP is traced.
-* The agent runs as root.
+  The agent runs as root in the host PID namespace. UDP tracing
+  additionally needs BPF trampolines (fentry), available on x86_64 and on
+  arm64 since Linux 6.0; without them only TCP is traced.
+* PostgreSQL 14 or later.
+* Prometheus 3 with the OTLP receiver (`--web.enable-otlp-receiver`), or
+  another store that accepts OTLP metrics.
+* Grafana for the dashboards and alerts.
 
 ## Install
+
+### Agent
 
 shawk is a single static binary. The deb and rpm packages of a release
 install it as `/usr/bin/shawk` with the systemd unit `shawk-agent.service`.
@@ -62,74 +75,117 @@ make build                      # builds ./shawk (needs Go only)
 sudo install -m 0755 shawk /usr/local/bin/shawk
 sed 's|/usr/bin/shawk|/usr/local/bin/shawk|' packaging/systemd/shawk-agent.service |
   sudo tee /etc/systemd/system/shawk-agent.service >/dev/null
+sudo install -D -m 0644 packaging/systemd/agent.env /etc/shawk/agent.env   # set -otlp-endpoint
 sudo systemctl daemon-reload
 sudo systemctl enable --now shawk-agent
 ```
 
-Run the agent on every host you want to observe. It listens on TCP port
-7464; open it to the hosts you run queries from. The API reveals the
-processes and peers of the host, so require a token: write it to a file
-readable only by root and pass `-token-file` to the agent and the clients
-(or set `SHAWK_TOKEN_FILE`). The agent warns when it serves the network
-without one.
+Run the agent on every host you want to observe:
 
-## Usage
-
-Targets are `HOST[:PORT][/UNIT]` or `HOST[:PORT][/@COMM]`, where `HOST` is a
-host name or an address of a host running the agent.
-
-| command | |
+| flag | |
 |---|---|
-| `shawk agent` | run the agent (see `shawk agent -h` for retention and interval) |
-| `shawk flows` | show bundled flows on this host live, without an agent |
-| `shawk who-uses TARGET [-depth N]` | processes that use services on TARGET, transitively upstream |
-| `shawk deps TARGET [-depth N]` | services that processes on TARGET use, transitively downstream |
-| `shawk can-i-remove TARGET` | whether remote processes used TARGET: exits 0 if none did, 1 if some did, 3 if none was seen but the record is incomplete (gaps, dropped flows, UDP not traced) |
-| `shawk unused TARGET` | listening services that nobody used |
-| `shawk diff TARGET -since 24h` | dependencies that appeared or disappeared |
-| `shawk graph TARGET... [-format mermaid\|dot\|json]` | export the dependency graph |
-| `shawk status TARGET` | agent status, and BPF program statistics when the agent runs with `-bpf-stats` |
+| `-otlp-endpoint` | URL of the `otlp/shawk` receiver of the collector; `http://` disables TLS (default `$OTEL_EXPORTER_OTLP_ENDPOINT` or `http://localhost:4327`) |
+| `-otlp-protocol` | `grpc` (default) or `http/protobuf` |
+| `-otlp-ca-file` | CA bundle that verifies the collector |
+| `-otlp-cert-file`, `-otlp-key-file` | client certificate for a collector that requires one (the example configuration does) |
+| `-max-series-per-request` | dependencies and listeners per request (1000); a request also stays below 3 MiB, and a busy host sends several per interval |
+| `-service-name-fallback` | name of a service without `OTEL_SERVICE_NAME`: `exe` (executable name, as OBI) or `unit` (systemd unit) |
+| `-interval`, `-idle-ttl` | export interval (15 s, at most 1 min) and how long a dependency is sent after its last activity (15 min) |
+| `-netns`, `-max-flows`, `-bpf-stats` | network namespaces to trace, capacity of the in-kernel flow table, BPF run time statistics |
 
-Every query accepts `-since` (units `m`, `h`, `d`, `w`; `30d` by default,
-`24h` for `diff` and `7d` for `graph`) and `-json`. Errors exit with status
-2.
+Services that share an executable on a host (`ruby`, `python`, `java`,
+`php-fpm`) should set `OTEL_SERVICE_NAME`, e.g. with `Environment=` in a
+systemd drop-in; OBI uses the same name.
 
-Queries follow dependencies by asking the agents at the addresses recorded
-in ledgers. Since those include any client of a service, the CLI only
-contacts the targets you name and agents in private address ranges
-(loopback, RFC 1918, CGNAT, IPv6 ULA); other peers are shown as
-`(not queried)` and never receive the token. Use `-peers` (or
-`SHAWK_PEERS`) with CIDR prefixes, `private` or `any` to change it.
+### Collector
 
-```console
-$ shawk deps lb-01 -depth 3
-lb-01 (10.0.0.5)  haproxy (haproxy.service)
-└── app-01:8080/tcp (10.0.0.11)  puma (app.service)  conns=8.1M last=just now
-    ├── db-01:5432/tcp (10.0.0.10)  postgres (postgresql.service)  conns=1.2M open=40 last=just now
-    ├── app-01:6379/tcp (10.0.0.11)  redis-server (redis.service)  conns=8.1M last=just now
-    └── 10.0.0.2:53/udp  (no agent)  msgs=310.0k last=just now
+The shawk connector is a component of the OpenTelemetry Collector. A
+release ships a collector that includes it, of the same version as the
+agent:
 
-$ shawk diff app-01 -since 2h
-+  puma (app.service)  -> 10.0.0.20:6379/tcp        first seen 2026-10-30 10:12:41
--  puma (app.service)  -> 10.0.0.21:11211/tcp       last seen 2026-10-29 23:58:02
+* the deb and rpm packages `shawk-collector`: `/usr/bin/shawk-collector`,
+  `/usr/bin/shawk-migrate`, the systemd unit `shawk-collector.service`
+  (user `shawk-collector`), `/etc/shawk/collector.yaml` and the PostgreSQL
+  scripts in `/usr/share/shawk-collector/postgres`;
+* the container image `ghcr.io/yuuki/shawk-collector` (amd64 and arm64),
+  which also contains `/shawk-migrate`.
 
-$ shawk graph app-01 -depth 3 -format mermaid
-flowchart LR
-  ...
+To build it yourself with the OpenTelemetry Collector Builder:
+
+```bash
+make collector                  # collector/_build/shawk-collector
+make shawk-migrate              # ./shawk-migrate
 ```
+
+Then set up PostgreSQL, the collector and Prometheus with the examples in
+[packaging/](packaging/README.md):
+
+```bash
+psql -v ON_ERROR_STOP=1 -f packaging/postgres/setup.sql          # roles and database; edit the passwords
+./shawk-migrate -dsn 'postgres://shawk_owner:...@db/shawk'        # the schema
+psql -v ON_ERROR_STOP=1 -d shawk -U shawk_owner -f packaging/postgres/grants.sql
+```
+
+`packaging/collector/config.yaml` receives the agents on `otlp/shawk`
+(port 4327) and OBI on `otlp` (port 4317), both with TLS and client certificates, writes PostgreSQL with the role
+`shawk_connector` and pushes metrics to Prometheus;
+`packaging/prometheus/` has the Prometheus settings and the recording rules
+that count each dependency once; `packaging/grafana/` has data sources,
+dashboards and alert rules.
+
+## Using it
+
+In Grafana:
+
+* **shawk / Fleet**: agents alive, observation gaps, dropped flows, new
+  dependencies.
+* **shawk / Dependency map**: services reached from the selected ones,
+  upstream, downstream or both, to a depth.
+* **shawk / Dependency details**: connections, failure ratio, bytes, RTT and
+  retransmissions from Prometheus, with both ends, first and last seen
+  times and how long each side has been observed from PostgreSQL.
+* **shawk / Changes**: dependencies that appeared or disappeared.
+* **shawk / Application layer (OBI)**: OBI's RED metrics next to the
+  network dependencies of the same service.
+
+In SQL, against the contract views of `shawk_v1`:
+
+```sql
+-- Who used postgres on db-01 in the last 90 days, and were they watching?
+SELECT client_host, client_service, port, last_seen, client_observed_until, observed_by
+FROM shawk_v1.dependencies_between(now() - interval '90 days', now())
+WHERE server_host = 'db-01' AND server_service = 'postgres';
+
+-- When was db-01 not observed?
+SELECT * FROM shawk_v1.unobserved(now() - interval '90 days', now()) WHERE host = 'db-01';
+```
+
+In PromQL, with the recording rules:
+
+```promql
+shawk:dependency_connections:rate5m{dst="postgres"}
+```
+
+`shawk flows` shows the bundled flows of the local host live, without a
+collector, for debugging.
 
 ## Development
 
 ```bash
 make generate   # compile the BPF programs (needs clang and llvm-strip)
-make test       # unit tests
+make test       # unit tests of all modules; BPF tests run as root,
+                # PostgreSQL tests with SHAWK_TEST_POSTGRES_DSN=postgres://...
 make test-root  # load the BPF programs into the running kernel (sudo)
-make e2e        # multi-host test with network namespaces (sudo)
+make e2e        # multi-host test with network namespaces, a collector and
+                # PostgreSQL (sudo, SHAWK_E2E_POSTGRES_DSN)
 make compat     # check CO-RE relocations against the Rocky Linux 9 kernel
 make check-object  # check that the committed BPF object matches the source
 ```
 
-The generated BPF object (`internal/tracer/bpf_bpfel.o`) is committed, so
+The repository has three Go modules: the agent (`.`), the shawk connector
+(`collector/`, which keeps the dependencies of the collector out of the
+agent) and the tests of the packaging examples (`test/packaging/`). The
+generated BPF object (`internal/tracer/bpf_bpfel.o`) is committed, so
 building shawk needs only Go.
 
 ## History
