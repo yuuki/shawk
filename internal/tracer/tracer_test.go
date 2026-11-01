@@ -371,6 +371,9 @@ func listenUDPFixedPort(t *testing.T, network, host string) net.PacketConn {
 func TestExcludeSelf(t *testing.T) {
 	requireRoot(t)
 	if os.Getenv("SHAWK_TEST_IN_PIDNS") != "" {
+		if os.Getpid() != 1 {
+			t.Fatal("SHAWK_TEST_IN_PIDNS is set outside of the PID namespace of TestExcludeSelfInPIDNamespace")
+		}
 		// Like unshare --mount-proc: /proc shows the processes of the PID
 		// namespace that TestExcludeSelfInPIDNamespace created.
 		if err := unix.Mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, ""); err != nil {

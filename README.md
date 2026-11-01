@@ -50,9 +50,10 @@ See [docs/design.md](docs/design.md) for the design.
 ## Requirements
 
 * Hosts: Linux with BTF (`/sys/kernel/btf/vmlinux`): Rocky Linux / RHEL 9,
-  or upstream 5.14 or later (best 5.19 or later). The programs are tested on
-  the kernels of Rocky Linux 9.6 and upstream 5.14 and 5.15 in virtual
-  machines, and on Ubuntu kernels 6.8 to 7.0, on x86_64 and arm64. See
+  or upstream 5.14 or later (best 5.19 or later). The programs are tested in
+  virtual machines on the kernels of Rocky Linux 9.6 (x86_64, aarch64) and
+  upstream 5.14 (x86_64) and 5.15 (x86_64, aarch64), and on the kernels of
+  the Ubuntu CI runners (x86_64, arm64). See
   [the design](docs/design.md#35-kernel-requirements-and-features-used).
   The agent runs as root in the host PID namespace; its systemd unit
   sandboxes it and limits it to `CAP_BPF`, `CAP_PERFMON`, `CAP_SYS_ADMIN`
