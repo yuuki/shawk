@@ -57,6 +57,7 @@ type bpfShawkIterRec struct {
 	Proto    uint8
 	Comm     [16]int8
 	Pad      uint32
+	Ino      uint64
 }
 
 type bpfShawkListenKey struct {

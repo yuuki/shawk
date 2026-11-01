@@ -65,6 +65,12 @@ struct shawk_iter_rec {
 	__u8 proto;
 	char comm[TASK_COMM_LEN];
 	__u32 _pad;
+	/*
+	 * Inode of the socket, which tells apart a listener replaced by another
+	 * on the same address; 0 for sockets without a file (of the kernel, or
+	 * the subflows of MPTCP).
+	 */
+	__u64 ino;
 };
 
 #define CGROUP_PATH_LEN 512

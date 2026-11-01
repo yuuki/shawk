@@ -1,6 +1,7 @@
 package tracer
 
 import (
+	"encoding/binary"
 	"io"
 	"log/slog"
 	"net"
@@ -505,4 +506,123 @@ func tcpExtCounter(t *testing.T, name string) uint64 {
 	}
 	skipUnavailable(t, "no counter %s", name)
 	return 0
+}
+
+// TestTCPFastOpenChildClosed checks a child of a listener created by a TCP
+// Fast Open SYN that is reset before the handshake completes, so that it
+// never becomes established (#97): its connection and the data of its SYN
+// are counted. A raw socket sends the SYN; the kernel resets the connection
+// when the SYN-ACK reaches a port without a socket.
+//
+// A SYN that also carries a FIN must create no child at all: listeners drop
+// it (since Linux 3.5), so the FIN of the peer is always counted by
+// bytes_received, which tcp_fastopen_add_skb() would not do. The test runs in
+// a network namespace of its own, whose sysctls it changes.
+func TestTCPFastOpenChildClosed(t *testing.T) {
+	skipIfNoNetwork(t, "tcp4")
+	for _, tc := range []struct {
+		name  string
+		flags uint8
+		child bool
+	}{
+		{"reset", tcpSYN, true},
+		{"FIN in the SYN", tcpSYN | tcpFIN, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := newTestTracer(t)
+			run, _ := newNetNS(t)
+			var (
+				srv       netip.AddrPort
+				children  uint64
+				skipCause string
+			)
+			run(func() {
+				// Servers without cookies (0x2 | 0x200).
+				if err := os.WriteFile("/proc/sys/net/ipv4/tcp_fastopen", []byte("514"), 0o644); err != nil {
+					skipCause = err.Error()
+					return
+				}
+				lc := net.ListenConfig{Control: setsockoptControl(unix.IPPROTO_TCP, unix.TCP_FASTOPEN, 16)}
+				lc.SetMultipathTCP(false)
+				ln, err := lc.Listen(t.Context(), "tcp4", "127.0.0.1:0")
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { ln.Close() })
+				srv = ln.Addr().(*net.TCPAddr).AddrPort()
+				before := tcpExtCounter(t, "TCPFastOpenPassive")
+				sendRawSYN(t, srv, tc.flags, make([]byte, 100))
+				time.Sleep(100 * time.Millisecond)
+				children = tcpExtCounter(t, "TCPFastOpenPassive") - before
+			})
+			if skipCause != "" {
+				skipUnavailable(t, "%s", skipCause)
+			}
+			snap, err := tr.Collect()
+			if err != nil {
+				t.Fatal(err)
+			}
+			in := findFlow(snap.Flows, DirIn, ProtoTCP, srv.Port(), srv.Addr())
+			if !tc.child {
+				if children != 0 || in != nil {
+					t.Errorf("the listener accepted a SYN with a FIN: %d children, flow %+v", children, in)
+				}
+				return
+			}
+			if children != 1 {
+				skipUnavailable(t, "the SYN created %d Fast Open children", children)
+			}
+			if in == nil || in.Conns != 1 || in.BytesRecv != 100 || in.BytesSent != 0 {
+				t.Errorf("server flow = %+v", in)
+			}
+		})
+	}
+}
+
+const (
+	tcpFIN = 0x01
+	tcpSYN = 0x02
+)
+
+// sendRawSYN sends a SYN with data from 127.0.0.1 to dst through a raw socket,
+// with the flags given.
+func sendRawSYN(t *testing.T, dst netip.AddrPort, flags uint8, data []byte) {
+	t.Helper()
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_RAW|unix.SOCK_CLOEXEC, unix.IPPROTO_TCP)
+	if err != nil {
+		skipUnavailable(t, "raw socket: %v", err)
+	}
+	defer unix.Close(fd)
+	src := [4]byte{127, 0, 0, 1}
+	seg := make([]byte, 20+len(data))
+	// A port without a socket, which the kernel resets.
+	binary.BigEndian.PutUint16(seg[0:], uint16(61000+os.Getpid()%1000))
+	binary.BigEndian.PutUint16(seg[2:], dst.Port())
+	binary.BigEndian.PutUint32(seg[4:], 1000)
+	seg[12] = 5 << 4 // header of 20 bytes
+	seg[13] = flags
+	binary.BigEndian.PutUint16(seg[14:], 65535)
+	copy(seg[20:], data)
+	binary.BigEndian.PutUint16(seg[16:], tcpChecksum(src, dst.Addr().As4(), seg))
+	if err := unix.Sendto(fd, seg, 0, &unix.SockaddrInet4{Addr: dst.Addr().As4()}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func tcpChecksum(src, dst [4]byte, seg []byte) uint16 {
+	pseudo := append(append(append([]byte{}, src[:]...), dst[:]...), 0, unix.IPPROTO_TCP, byte(len(seg)>>8), byte(len(seg)))
+	var sum uint32
+	for _, b := range [][]byte{pseudo, seg} {
+		for i := 0; i < len(b); i += 2 {
+			v := uint32(b[i]) << 8
+			if i+1 < len(b) {
+				v |= uint32(b[i+1])
+			}
+			sum += v
+		}
+	}
+	for sum > 0xffff {
+		sum = sum>>16 + sum&0xffff
+	}
+	return ^uint16(sum)
 }
