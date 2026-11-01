@@ -1,4 +1,4 @@
-## Unreleased
+## [v0.8.0](https://github.com/yuuki/shawk/compare/v0.7.1...v0.8.0) (2026-11-01)
 
 Rewritten from scratch.
 
