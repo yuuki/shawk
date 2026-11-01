@@ -50,16 +50,18 @@ See [docs/design.md](docs/design.md) for the design.
 ## Requirements
 
 * Hosts: Linux with BTF (`/sys/kernel/btf/vmlinux`): Rocky Linux / RHEL 9,
-  or upstream 5.14 or later (best 5.19 or later). The programs are tested by
-  loading them on Ubuntu kernels 6.8 to 7.0 and checked statically against
-  the Rocky Linux 9.6 kernel; they have not yet run on a Rocky Linux kernel,
-  on upstream 5.14 to 5.18, or on arm64. See [the design](docs/design.md#35-kernel-requirements-and-features-used).
+  or upstream 5.14 or later (best 5.19 or later). The programs are tested in
+  virtual machines on the kernels of Rocky Linux 9.6 (x86_64, aarch64) and
+  upstream 5.14 (x86_64) and 5.15 (x86_64, aarch64), and on the kernels of
+  the Ubuntu CI runners (x86_64, arm64). See
+  [the design](docs/design.md#35-kernel-requirements-and-features-used).
   The agent runs as root in the host PID namespace; its systemd unit
   sandboxes it and limits it to `CAP_BPF`, `CAP_PERFMON`, `CAP_SYS_ADMIN`
   (to enter other network namespaces), `CAP_SYS_PTRACE` and
   `CAP_DAC_READ_SEARCH` (to read `/proc` of other processes). UDP tracing
   additionally needs BPF trampolines (fentry), available on x86_64 and on
-  arm64 since Linux 6.0; without them only TCP is traced.
+  arm64 since Linux 6.0 (not on Rocky Linux 9 on arm64); without them only
+  TCP is traced.
 * PostgreSQL 14 or later.
 * Prometheus 3 with the OTLP receiver (`--web.enable-otlp-receiver`), or
   another store that accepts OTLP metrics.

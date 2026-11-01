@@ -5,7 +5,8 @@
 #
 # The default is the Rocky Linux 9.6 kernel (5.14.0-570). The RPM is
 # downloaded once to build/kernel/ and checked against its SHA-256 before
-# every use: the one pinned below, or KERNEL_RPM_SHA256 for another URL.
+# every use (scripts/fetch-verified.sh): the one pinned below, or
+# KERNEL_RPM_SHA256 for another URL.
 # Requires curl, sha256sum, rpm2cpio, cpio, python3 and objcopy.
 set -euo pipefail
 
@@ -22,31 +23,9 @@ else
 	sha256="${KERNEL_RPM_SHA256:?set KERNEL_RPM_SHA256 to the SHA-256 of $url}"
 fi
 
-cache="$(cd "$(dirname "$0")/.." && pwd)/build/kernel"
-rpm="$cache/$(basename "$url")"
-verified() { echo "$sha256  $1" | sha256sum --check --status -; }
-
-if [[ -f "$rpm" ]] && ! verified "$rpm"; then
-	echo "$rpm does not match its SHA-256; downloading it again" >&2
-	rm -f "$rpm"
-fi
+rpm="$("$(dirname "$0")/fetch-verified.sh" "$url" "$sha256")"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
-
-if [[ ! -f "$rpm" ]]; then
-	mkdir -p "$cache"
-	# A download of its own, renamed into the cache once verified, so that
-	# concurrent runs neither clash nor see a partial file.
-	part="$(mktemp "$cache/.download.XXXXXX")"
-	trap 'rm -rf "$work" "$part"' EXIT
-	curl -fsSL -o "$part" "$url"
-	if ! verified "$part"; then
-		echo "$url does not match the SHA-256 $sha256" >&2
-		exit 1
-	fi
-	chmod 0644 "$part"
-	mv -f "$part" "$rpm"
-fi
 
 (cd "$work" && rpm2cpio "$rpm" | cpio -idm --quiet './lib/modules/*/vmlinuz')
 

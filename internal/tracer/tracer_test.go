@@ -10,8 +10,11 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // These tests load the BPF programs into the running kernel and need root.
@@ -61,6 +64,23 @@ func requireRoot(t *testing.T) {
 	t.Helper()
 	if os.Geteuid() != 0 {
 		skipUnavailable(t, "requires root")
+	}
+}
+
+// requireUDP skips a test of UDP tracing when the kernel cannot trace UDP,
+// which needs BPF trampolines. SHAWK_TEST_NO_UDP=1 declares a kernel without
+// them, such as Rocky Linux 9 on aarch64: UDP tracing must then be reported
+// unavailable, and the test is skipped even in strict mode.
+func requireUDP(t *testing.T, tr *Tracer) {
+	t.Helper()
+	noUDP, _ := strconv.ParseBool(os.Getenv("SHAWK_TEST_NO_UDP"))
+	switch {
+	case noUDP && tr.UDPEnabled():
+		t.Fatal("UDP tracing is available, but SHAWK_TEST_NO_UDP is set")
+	case noUDP:
+		t.Skip("UDP tracing is unavailable on this kernel, as SHAWK_TEST_NO_UDP declares")
+	case !tr.UDPEnabled():
+		skipUnavailable(t, "UDP tracing is unavailable on this kernel")
 	}
 }
 
@@ -275,9 +295,7 @@ func TestUDP(t *testing.T) {
 		t.Run(tc.network, func(t *testing.T) {
 			skipIfNoNetwork(t, tc.network)
 			tr := newTestTracer(t)
-			if !tr.UDPEnabled() {
-				skipUnavailable(t, "UDP tracing is unavailable on this kernel")
-			}
+			requireUDP(t, tr)
 			srv := listenUDPFixedPort(t, tc.network, tc.host)
 			defer srv.Close()
 			srvAddr := srv.LocalAddr().(*net.UDPAddr).AddrPort()
@@ -352,6 +370,19 @@ func listenUDPFixedPort(t *testing.T, network, host string) net.PacketConn {
 
 func TestExcludeSelf(t *testing.T) {
 	requireRoot(t)
+	if os.Getenv("SHAWK_TEST_IN_PIDNS") != "" {
+		if os.Getpid() != 1 {
+			t.Fatal("SHAWK_TEST_IN_PIDNS is set outside of the PID namespace of TestExcludeSelfInPIDNamespace")
+		}
+		// Like unshare --mount-proc: /proc shows the processes of the PID
+		// namespace that TestExcludeSelfInPIDNamespace created.
+		if err := unix.Mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, ""); err != nil {
+			t.Fatal(err)
+		}
+		if err := unix.Mount("proc", "/proc", "proc", unix.MS_NOSUID|unix.MS_NODEV|unix.MS_NOEXEC, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
 	tr, err := New(Options{})
 	if err != nil {
 		t.Fatal(err)
@@ -400,12 +431,9 @@ func TestExcludeSelfInPIDNamespace(t *testing.T) {
 	if os.Getenv("SHAWK_TEST_IN_PIDNS") != "" {
 		t.Skip("already in a PID namespace")
 	}
-	unshare, err := exec.LookPath("unshare")
-	if err != nil {
-		skipUnavailable(t, "unshare is not available")
-	}
-	cmd := exec.Command(unshare, "--pid", "--fork", "--mount-proc", os.Args[0], "-test.run=^TestExcludeSelf$", "-test.v")
+	cmd := exec.Command(os.Args[0], "-test.run=^TestExcludeSelf$", "-test.v")
 	cmd.Env = append(os.Environ(), "SHAWK_TEST_IN_PIDNS=1")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWNS}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("%v\n%s", err, out)
@@ -469,9 +497,7 @@ func TestUDPDirection(t *testing.T) {
 
 	t.Run("client bound to a random port", func(t *testing.T) {
 		tr := newTestTracer(t)
-		if !tr.UDPEnabled() {
-			skipUnavailable(t, "UDP tracing is unavailable on this kernel")
-		}
+		requireUDP(t, tr)
 		srv := listenUDPFixedPort(t, "udp4", "127.0.0.1")
 		defer srv.Close()
 		go echo(srv)
@@ -501,9 +527,7 @@ func TestUDPDirection(t *testing.T) {
 
 	t.Run("server in the ephemeral range", func(t *testing.T) {
 		tr := newTestTracer(t)
-		if !tr.UDPEnabled() {
-			skipUnavailable(t, "UDP tracing is unavailable on this kernel")
-		}
+		requireUDP(t, tr)
 		srv, err := net.ListenPacket("udp4", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
@@ -540,9 +564,7 @@ func TestUDPDirection(t *testing.T) {
 		}
 		defer peer.Close()
 		tr := newTestTracer(t)
-		if !tr.UDPEnabled() {
-			skipUnavailable(t, "UDP tracing is unavailable on this kernel")
-		}
+		requireUDP(t, tr)
 		// A reply to a request received before the tracer started.
 		if _, err := srv.WriteTo([]byte("reply"), peer.LocalAddr()); err != nil {
 			t.Fatal(err)

@@ -13,6 +13,13 @@
   (`THIRD_PARTY_NOTICES`).
 * `make build` and `make collector` set the version without the `v` of the
   tag (`0.8.0`), like the release.
+* The BPF programs are tested on the kernels of Rocky Linux 9.6 (x86_64 and
+  aarch64) and upstream 5.14 and 5.15 in virtual machines (`make vm-test`),
+  and on an arm64 runner. On Rocky Linux 9 on aarch64, which has no BPF
+  trampolines, UDP is not traced.
+* Fixed: when the main thread of the agent was in another network namespace
+  than the thread walking the sockets, one namespace was walked twice and
+  another not at all.
 
 ## [v0.8.0](https://github.com/yuuki/shawk/compare/v0.7.1...v0.8.0) (2026-11-01)
 
