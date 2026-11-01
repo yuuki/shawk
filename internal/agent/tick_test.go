@@ -56,21 +56,28 @@ func (e *fakeExporter) Export(_ context.Context, req *colmetricspb.ExportMetrics
 
 func (e *fakeExporter) Close() error { return nil }
 
-func newTestAgent(src source, exp otlp.Exporter, maxSeries int) *Agent {
+// newTestAgent returns an agent started at the time given.
+func newTestAgent(src source, exp otlp.Exporter, maxSeries int, started time.Time) *Agent {
 	cfg := Config{
 		Interval:            15 * time.Second,
 		IdleTTL:             15 * time.Minute,
 		MaxSeriesPerRequest: maxSeries,
 		Logger:              slog.New(slog.DiscardHandler),
 	}
-	return newAgent(cfg, src, exp, procinfo.NewResolver(), otlp.Resource{Hostname: "h"}, time.Now())
+	return newAgent(cfg, src, exp, procinfo.NewResolver(), otlp.Resource{Hostname: "h"}, started)
 }
 
-// sumOf returns the sum of the points of a counter in requests, for the
-// server port given, by role.
-func sumOf(reqs []*colmetricspb.ExportMetricsServiceRequest, metric string, port uint16) map[string]int64 {
+// Cgroup ids are inode numbers; these are no cgroup of the host running the
+// tests, whose paths would give the flows different units.
+const unknownCgroup = 1 << 62
+
+// lastSum returns the values of a counter for the server port given (all
+// ports for 0), by role, in the last request that carries each: the
+// counters are cumulative.
+func lastSum(reqs []*colmetricspb.ExportMetricsServiceRequest, metric string, port uint16) map[string]int64 {
 	out := map[string]int64{}
 	for _, req := range reqs {
+		got := map[string]int64{}
 		for _, rm := range req.ResourceMetrics {
 			for _, sm := range rm.ScopeMetrics {
 				for _, m := range sm.Metrics {
@@ -79,11 +86,14 @@ func sumOf(reqs []*colmetricspb.ExportMetricsServiceRequest, metric string, port
 					}
 					for _, p := range m.GetSum().GetDataPoints() {
 						if a := attrs(p.Attributes); a["server.port"] == strconv.Itoa(int(port)) || port == 0 {
-							out[a["shawk.role"]] += p.GetAsInt()
+							got[a["shawk.role"]] += p.GetAsInt()
 						}
 					}
 				}
 			}
+		}
+		for role, v := range got {
+			out[role] = v
 		}
 	}
 	return out
@@ -110,16 +120,16 @@ func flow(dir tracer.Direction, port uint16, cgroup uint64, conns uint64) tracer
 // resolve to the same process.
 func TestTickMergesFlows(t *testing.T) {
 	src := &fakeSource{snaps: []*tracer.Snapshot{{Flows: []tracer.Flow{
-		flow(tracer.DirOut, 5432, 101, 2),
-		flow(tracer.DirOut, 5432, 102, 3),
-		flow(tracer.DirIn, 5432, 101, 1),
+		flow(tracer.DirOut, 5432, unknownCgroup, 2),
+		flow(tracer.DirOut, 5432, unknownCgroup+1, 3),
+		flow(tracer.DirIn, 5432, unknownCgroup, 1),
 	}}}}
 	exp := &fakeExporter{}
-	a := newTestAgent(src, exp, 0)
+	a := newTestAgent(src, exp, 0, time.Now())
 	if err := a.tick(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if got := sumOf(exp.sent, otlp.MetricConnOpened, 5432); got["client"] != 5 || got["server"] != 1 {
+	if got := lastSum(exp.sent, otlp.MetricConnOpened, 5432); got["client"] != 5 || got["server"] != 1 {
 		t.Errorf("connections = %v", got)
 	}
 	var series int
@@ -134,17 +144,25 @@ func TestTickMergesFlows(t *testing.T) {
 }
 
 // TestTickAfterFailedExport checks that an interval whose request failed is
-// made up for by the next one: the counters are cumulative, the failures are
-// counted, and the observation segment keeps its start.
+// made up for by the next one: the counters are cumulative since the start,
+// not since the last request that succeeded, the failures are counted, and
+// the observation segment keeps its start.
 func TestTickAfterFailedExport(t *testing.T) {
 	src := &fakeSource{snaps: []*tracer.Snapshot{
-		{Flows: []tracer.Flow{flow(tracer.DirOut, 5432, 101, 2), flow(tracer.DirOut, 6379, 101, 1)}},
-		{Flows: []tracer.Flow{flow(tracer.DirOut, 5432, 101, 3)}},
+		{Flows: []tracer.Flow{flow(tracer.DirOut, 5432, unknownCgroup, 1)}},
+		{Flows: []tracer.Flow{flow(tracer.DirOut, 5432, unknownCgroup, 2), flow(tracer.DirOut, 6379, unknownCgroup, 1)}},
+		{Flows: []tracer.Flow{flow(tracer.DirOut, 5432, unknownCgroup, 3)}},
 	}}
+	exp := &fakeExporter{}
 	// One series per request: the interval spans several requests, and the
-	// rest of it is not sent after the first fails.
-	exp := &fakeExporter{fail: 1}
-	a := newTestAgent(src, exp, 1)
+	// rest of it is not sent after the first fails. The agent started a few
+	// minutes ago, so that a segment started anew would show.
+	started := time.Now().Add(-5 * time.Minute).Truncate(time.Second)
+	a := newTestAgent(src, exp, 1, started)
+	if err := a.tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	exp.fail, exp.calls = 1, 0
 	if err := a.tick(context.Background()); err == nil {
 		t.Fatal("tick succeeded with a failing exporter")
 	}
@@ -154,13 +172,13 @@ func TestTickAfterFailedExport(t *testing.T) {
 	if err := a.tick(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if got := sumOf(exp.sent, otlp.MetricConnOpened, 5432); got["client"] != 5 {
-		t.Errorf("connections to 5432 = %v, want the 2 of the failed interval and 3", got)
+	if got := lastSum(exp.sent, otlp.MetricConnOpened, 5432); got["client"] != 6 {
+		t.Errorf("connections to 5432 = %v, want 1+2+3", got)
 	}
-	if got := sumOf(exp.sent, otlp.MetricConnOpened, 6379); got["client"] != 1 {
+	if got := lastSum(exp.sent, otlp.MetricConnOpened, 6379); got["client"] != 1 {
 		t.Errorf("connections to 6379 = %v", got)
 	}
-	if got := sumOf(exp.sent, otlp.MetricAgentExportFailures, 0); got[""] != 1 {
+	if got := lastSum(exp.sent, otlp.MetricAgentExportFailures, 0); got[""] != 1 {
 		t.Errorf("export failures = %v", got)
 	}
 	var start int64
@@ -171,7 +189,9 @@ func TestTickAfterFailedExport(t *testing.T) {
 			}
 		}
 	}
-	if want := a.started.Unix(); start < want-1 || start > want+1 {
+	// The start is expressed by the current clock, within a second; a
+	// segment started anew would be minutes later.
+	if want := started.Unix(); start < want-1 || start > want+1 {
 		t.Errorf("segment start = %d, want the start of the agent %d", start, want)
 	}
 }
@@ -179,7 +199,7 @@ func TestTickAfterFailedExport(t *testing.T) {
 // TestTickCollectError checks that nothing is sent when the tracer fails.
 func TestTickCollectError(t *testing.T) {
 	exp := &fakeExporter{}
-	a := newTestAgent(&fakeSource{err: errors.New("iterator")}, exp, 0)
+	a := newTestAgent(&fakeSource{err: errors.New("iterator")}, exp, 0, time.Now())
 	if err := a.tick(context.Background()); err == nil {
 		t.Fatal("tick succeeded")
 	}

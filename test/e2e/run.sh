@@ -20,7 +20,7 @@
 # dependency, including that of ext, is then observed on both sides by it.
 #
 # Requires root, cgroup v2, iproute2 (ip, ss), python3, psql, nsenter and
-# unshare (util-linux). Every wait polls with a deadline.
+# unshare (util-linux). Every wait has a deadline.
 # SHAWK_E2E_POSTGRES_DSN is a database dedicated to the test: its schemas
 # shawk and shawk_v1 are dropped and recreated. The agents must trace UDP
 # (BPF trampolines): without them, the UDP dependency is not checked unless
@@ -31,9 +31,12 @@ set -euo pipefail
 SHAWK="$(realpath "${1:?usage: run.sh path/to/shawk path/to/shawk-collector}")"
 COLLECTOR="$(realpath "${2:?usage: run.sh path/to/shawk path/to/shawk-collector}")"
 DSN="${SHAWK_E2E_POSTGRES_DSN:?set SHAWK_E2E_POSTGRES_DSN to a database dedicated to the test}"
-STRICT="${SHAWK_TEST_STRICT:-0}"
+# The same values as strconv.ParseBool, which the Go tests use.
+case "${SHAWK_TEST_STRICT:-}" in
+1 | t | T | true | TRUE | True) STRICT=1 ;;
+*) STRICT=0 ;;
+esac
 HERE="$(cd "$(dirname "$0")" && pwd)"
-WORK="$(mktemp -d)"
 PREFIX="shawke2e"
 NET=10.231.0
 NET6=fd00:231:
@@ -51,10 +54,23 @@ CGROOT="$(awk '$0 ~ / - cgroup2 / { print $5; exit }' /proc/self/mountinfo)"
 }
 CGROUPS="$CGROOT/$PREFIX.slice"
 
+# stop PIDS...: stops processes, killing those that did not exit within 10
+# seconds of SIGTERM.
+stop() {
+	local pid deadline=$((SECONDS + 10))
+	(($# > 0)) || return 0
+	kill "$@" 2>/dev/null || true
+	for pid in "$@"; do
+		while kill -0 "$pid" 2>/dev/null && ((SECONDS < deadline)); do sleep 0.2; done
+		kill -KILL "$pid" 2>/dev/null || true
+		wait "$pid" 2>/dev/null || true
+	done
+}
+
+WORK="$(mktemp -d)"
 cleanup() {
 	set +e
-	for pid in "${PIDS[@]}" "${AGENTS[@]}"; do kill "$pid" 2>/dev/null; done
-	wait 2>/dev/null
+	stop "${PIDS[@]}" "${AGENTS[@]}"
 	for h in "${!ADDR[@]}"; do ip netns del "$PREFIX-$h" 2>/dev/null; done
 	ip link del "$PREFIX-br" 2>/dev/null
 	for cg in "$CGROUPS"/*/; do rmdir "$cg" 2>/dev/null; done
@@ -100,7 +116,6 @@ connected() { [[ -n "$(ip netns exec "$PREFIX-$1" ss -Htn state established "dst
 # IPv4 and IPv6 addresses.
 ip link add "$PREFIX-br" type bridge
 ip addr add $NET.1/24 dev "$PREFIX-br"
-ip -6 addr add ${NET6}:1/64 dev "$PREFIX-br" nodad
 ip link set "$PREFIX-br" up
 for h in "${!ADDR[@]}"; do
 	ns="$PREFIX-$h"
@@ -190,7 +205,8 @@ wait_for 30 "the agents to report" agents_alive 3
 # The agents must trace UDP, unless the kernel cannot and the run is not
 # strict.
 UDP=true
-if [[ "$(sql "SELECT bool_and(udp_traced) FROM shawk_v1.agents WHERE alive")" != t ]]; then
+udp_traced="$(sql "SELECT bool_and(udp_traced) FROM shawk_v1.agents WHERE alive")" || fail "reading the agents"
+if [[ "$udp_traced" != t ]]; then
 	[[ "$STRICT" == 1 ]] && fail "the agents do not trace UDP"
 	echo "WARNING: the agents do not trace UDP; the UDP dependency is not checked" >&2
 	UDP=false
@@ -208,14 +224,19 @@ check() { # description, SQL, expected output
 }
 
 # deps_sql CONDITION: the dependencies between the services of the test,
-# with the units of both sides and the family of the server address.
+# with the units of both sides and the family of the server address. They
+# are those to the addresses of the test (and to redis on the loopback),
+# whatever processes they are attributed to; other servers on these ports,
+# e.g. a PostgreSQL the collector writes to, are left out.
 deps_sql() {
 	echo "
 SELECT coalesce(client_host, host(client_addr)), coalesce(client_service, '-'), coalesce(client_unit, '-'),
        coalesce(server_host, '-'), coalesce(server_service, '-'), coalesce(server_unit, '-'),
        proto, port, family(server_addr), observed_by
 FROM shawk_v1.dependencies
-WHERE port IN (80, 5353, 5432, 5433, 5434, 6379, 8080) AND server_unit LIKE '$PREFIX-%' AND ($1)
+WHERE port IN (80, 5353, 5432, 5433, 5434, 6379, 8080)
+  AND (server_addr << '$NET.0/24' OR server_addr << '${NET6}:/64' OR (port = 6379 AND server_addr << '127.0.0.0/8'))
+  AND ($1)
 ORDER BY port, 1"
 }
 # want_deps EXT LB APP DB: the expected rows, with the hosts of the services;
@@ -287,8 +308,7 @@ if grep -q 'network.peer.address' "$WORK/collector.log"; then fail "peer address
 # dependencies, which are matched by address over all time, also pair
 # node-01 with them: only the dependencies node-01 observed on both sides
 # are checked.
-for pid in "${AGENTS[@]}"; do kill "$pid"; done
-wait "${AGENTS[@]}" 2>/dev/null || true
+stop "${AGENTS[@]}"
 AGENTS=()
 agent node-01 -
 node_alive() { [[ "$(sql "SELECT netns_scope FROM shawk_v1.agents WHERE host = 'node-01' AND alive" 2>/dev/null)" == all ]]; }
