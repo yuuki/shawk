@@ -176,8 +176,8 @@ socket-activated service is preferred to systemd, which created its
 listener, and the parent to forked workers. When no holder matches (the
 listener was closed or replaced since the last scan), the cgroup still names
 the service and another scan is requested. The walk also reports the inode
-of every listening socket, and a socket that no process held at the last
-scan requests one, so that a listener replaced by another process of the
+of every listening socket, and a listening socket that the last scan did not
+see requests one, so that a listener replaced by another process of the
 same cgroup, e.g. a restarted service, is attributed to it at once.
 
 ### 3.3 UDP
@@ -525,7 +525,8 @@ agent_sessions(host_id, started_at, last_heartbeat, udp_traced, netns_scope, dro
 host_addrs(host_id, addr, first_seen, last_seen)  -- one row per period
 processes(id, host_id, unit, comm, exe, service_name, first_seen, last_seen)  -- unique (host_id, unit, comm, service_name)
 edges(id, host_id, process_id, role, proto, local_addr, remote_addr, port, netns, first_seen, last_seen)
-listeners(host_id, process_id, proto, addr, port, netns, first_seen, last_seen)  -- one row per owner
+listeners(host_id, process_id, proto, addr, port, netns, first_seen, last_seen)  -- the latest owner
+listener_owners(host_id, process_id, proto, addr, port, netns, first_seen, last_seen)  -- every known owner
 peer_cidrs(prefix, name)  -- written by the connector from its peer_cidrs
 known_dependencies(client_service, server_service, port, proto, first_seen, last_seen)
 ```

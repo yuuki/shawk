@@ -75,10 +75,13 @@ func (s *pgStore) write(ctx context.Context, h *hostChanges) error {
 }
 
 func writeHost(ctx context.Context, tx pgx.Tx, h *hostChanges) error {
-	b := &pgx.Batch{}
 	// Writes wait for a migration in progress, which holds this lock, so
-	// that they do not deadlock with it.
-	b.Queue(`SELECT pg_advisory_xact_lock_shared($1)`, int64(migrationLock))
+	// that they do not deadlock with it. The lock is taken before the batch:
+	// preparing its statements already locks the tables they write.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared($1)`, int64(migrationLock)); err != nil {
+		return err
+	}
+	b := &pgx.Batch{}
 	b.Queue(`
 INSERT INTO shawk.hosts AS h (id, machine_id, hostname, kernel, agent_version, first_seen, last_seen)
 VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -207,34 +210,96 @@ ON CONFLICT (host_id, role, proto, local_addr, remote_addr, port, netns, process
 	}
 
 	if len(h.listeners) > 0 {
-		var units, comms, services, protos, addrs []string
-		var ports []int32
-		var netns []int64
-		var firsts, lasts []time.Time
-		for k, l := range h.listeners {
-			units = append(units, k.unit)
-			comms = append(comms, k.comm)
-			services = append(services, k.service)
-			protos = append(protos, k.proto)
-			addrs = append(addrs, k.addr.String())
-			ports = append(ports, int32(k.port))
-			netns = append(netns, int64(k.netns))
-			firsts = append(firsts, l.first)
-			lasts = append(lasts, l.last)
+		queueListeners(b, h)
+	}
+	return tx.SendBatch(ctx, b).Close()
+}
+
+// queueListeners writes the listeners of a host: a row per listener with
+// its latest owner, and a row per known owner of a listener, which keeps its
+// history when it changes hands.
+func queueListeners(b *pgx.Batch, h *hostChanges) {
+	type listener struct {
+		proto string
+		addr  netip.Addr
+		port  uint16
+		netns uint64
+	}
+	type latest struct {
+		proc procKey
+		span
+		known time.Time // last_seen of the latest known owner
+	}
+	// The latest owner of a listener in this write; one whose owner is
+	// unknown at the end keeps the latest known one.
+	rows := map[listener]*latest{}
+	var units, comms, services, protos, addrs []string
+	var ports []int32
+	var netns []int64
+	var firsts, lasts []time.Time
+	for k, s := range h.listeners {
+		l := listener{k.proto, k.addr, k.port, k.netns}
+		r := rows[l]
+		if r == nil {
+			r = &latest{span: s}
+			rows[l] = r
 		}
+		r.span.merge(s)
+		if k.procKey != (procKey{}) && !s.last.Before(r.known) {
+			r.proc, r.known = k.procKey, s.last
+		}
+		if k.procKey == (procKey{}) {
+			continue
+		}
+		units = append(units, k.unit)
+		comms = append(comms, k.comm)
+		services = append(services, k.service)
+		protos = append(protos, k.proto)
+		addrs = append(addrs, k.addr.String())
+		ports = append(ports, int32(k.port))
+		netns = append(netns, int64(k.netns))
+		firsts = append(firsts, s.first)
+		lasts = append(lasts, s.last)
+	}
+	if len(units) > 0 {
 		b.Queue(`
+INSERT INTO shawk.listener_owners AS o (host_id, process_id, proto, addr, port, netns, first_seen, last_seen)
+SELECT $1, p.id, u.proto, u.addr::inet, u.port, u.netns, u.f, u.l
+FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::integer[], $8::bigint[],
+            $9::timestamptz[], $10::timestamptz[]) AS u(unit, comm, service, proto, addr, port, netns, f, l)
+JOIN shawk.processes p ON p.host_id = $1 AND p.unit = u.unit AND p.comm = u.comm AND p.service_name = u.service
+ON CONFLICT (host_id, proto, addr, port, netns, process_id) DO UPDATE SET
+  first_seen = least(o.first_seen, excluded.first_seen),
+  last_seen  = greatest(o.last_seen, excluded.last_seen)`,
+			h.key, units, comms, services, protos, addrs, ports, netns, firsts, lasts)
+	}
+
+	units, comms, services, protos, addrs = nil, nil, nil, nil, nil
+	ports, netns, firsts, lasts = nil, nil, nil, nil
+	for l, r := range rows {
+		units = append(units, r.proc.unit)
+		comms = append(comms, r.proc.comm)
+		services = append(services, r.proc.service)
+		protos = append(protos, l.proto)
+		addrs = append(addrs, l.addr.String())
+		ports = append(ports, int32(l.port))
+		netns = append(netns, int64(l.netns))
+		firsts = append(firsts, r.first)
+		lasts = append(lasts, r.last)
+	}
+	b.Queue(`
 INSERT INTO shawk.listeners AS l (host_id, process_id, proto, addr, port, netns, first_seen, last_seen)
 SELECT $1, p.id, u.proto, u.addr::inet, u.port, u.netns, u.f, u.l
 FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::integer[], $8::bigint[],
             $9::timestamptz[], $10::timestamptz[]) AS u(unit, comm, service, proto, addr, port, netns, f, l)
 LEFT JOIN shawk.processes p ON p.host_id = $1 AND p.unit = u.unit AND p.comm = u.comm
   AND p.service_name = u.service AND (u.unit <> '' OR u.comm <> '')
-ON CONFLICT (host_id, proto, addr, port, netns, (coalesce(process_id, 0))) DO UPDATE SET
+ON CONFLICT (host_id, proto, addr, port, netns) DO UPDATE SET
+  process_id = CASE WHEN excluded.last_seen >= l.last_seen THEN coalesce(excluded.process_id, l.process_id)
+                    ELSE l.process_id END,
   first_seen = least(l.first_seen, excluded.first_seen),
   last_seen  = greatest(l.last_seen, excluded.last_seen)`,
-			h.key, units, comms, services, protos, addrs, ports, netns, firsts, lasts)
-	}
-	return tx.SendBatch(ctx, b).Close()
+		h.key, units, comms, services, protos, addrs, ports, netns, firsts, lasts)
 }
 
 func (s *pgStore) schemaVersion(ctx context.Context) (int, error) {

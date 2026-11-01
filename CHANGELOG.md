@@ -25,8 +25,11 @@
 * Fixed: a listener replaced by another process of the same cgroup was
   attributed to the former process until the next periodic owner scan
   (up to a minute).
-* The `listeners` table keeps a row per owner of a listener, so its history
-  is kept when it changes hands (migration 10).
+* The new table `shawk.listener_owners` keeps every known owner of a
+  listener, so its history is kept when it changes hands (migration 10, from
+  the migration on). `shawk.listeners` is unchanged, so connectors of the
+  previous version keep writing during an upgrade. Run `grants.sql` again
+  after the migration.
 * Fixed: when the main thread of the agent was in another network namespace
   than the thread walking the sockets, one namespace was walked twice and
   another not at all.
