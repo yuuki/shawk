@@ -487,14 +487,21 @@ func TestTCPFastOpen(t *testing.T) {
 // network namespace of the current thread.
 func tcpExtCounter(t *testing.T, name string) uint64 {
 	t.Helper()
-	b, err := os.ReadFile("/proc/thread-self/net/netstat")
+	return netCounter(t, "netstat", "TcpExt", name)
+}
+
+// netCounter returns a counter of a section of /proc/net/snmp or
+// /proc/net/netstat in the network namespace of the current thread.
+func netCounter(t *testing.T, file, section, name string) uint64 {
+	t.Helper()
+	b, err := os.ReadFile("/proc/thread-self/net/" + file)
 	if err != nil {
 		skipUnavailable(t, "%v", err)
 	}
 	lines := strings.Split(string(b), "\n")
 	for i := 0; i+1 < len(lines); i += 2 {
 		names, values := strings.Fields(lines[i]), strings.Fields(lines[i+1])
-		if len(names) == 0 || names[0] != "TcpExt:" || len(names) != len(values) {
+		if len(names) == 0 || names[0] != section+":" || len(names) != len(values) {
 			continue
 		}
 		for j := range names {
@@ -530,7 +537,7 @@ func TestTCPFastOpenChildClosed(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			tr := newTestTracer(t)
-			run, _ := newNetNS(t)
+			run, netns := newNetNS(t)
 			var (
 				srv       netip.AddrPort
 				children  uint64
@@ -551,9 +558,16 @@ func TestTCPFastOpenChildClosed(t *testing.T) {
 				t.Cleanup(func() { ln.Close() })
 				srv = ln.Addr().(*net.TCPAddr).AddrPort()
 				before := tcpExtCounter(t, "TCPFastOpenPassive")
+				segs := netCounter(t, "snmp", "Tcp", "InSegs")
+				csumErrs := netCounter(t, "snmp", "Tcp", "InCsumErrors")
 				sendRawSYN(t, srv, tc.flags, make([]byte, 100))
 				time.Sleep(100 * time.Millisecond)
 				children = tcpExtCounter(t, "TCPFastOpenPassive") - before
+				// The SYN reached TCP, so that a listener dropped it if it
+				// created no child.
+				if netCounter(t, "snmp", "Tcp", "InSegs") == segs || netCounter(t, "snmp", "Tcp", "InCsumErrors") != csumErrs {
+					t.Fatal("the SYN did not reach TCP")
+				}
 			})
 			if skipCause != "" {
 				skipUnavailable(t, "%s", skipCause)
@@ -572,7 +586,7 @@ func TestTCPFastOpenChildClosed(t *testing.T) {
 			if children != 1 {
 				skipUnavailable(t, "the SYN created %d Fast Open children", children)
 			}
-			if in == nil || in.Conns != 1 || in.BytesRecv != 100 || in.BytesSent != 0 {
+			if in == nil || in.Conns != 1 || in.BytesRecv != 100 || in.BytesSent != 0 || in.NetNS != netns || in.LocalAddr != srv.Addr() {
 				t.Errorf("server flow = %+v", in)
 			}
 		})
