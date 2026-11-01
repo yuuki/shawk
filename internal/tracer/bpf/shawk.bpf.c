@@ -400,8 +400,7 @@ static __always_inline void add_tcp_delta(struct shawk_flow_stats *fs,
 
 /*
  * Sets the current counters as the bases, so that only the traffic from now
- * on is accounted: when a connection is established, the sequence number
- * consumed by the SYN is not counted as data.
+ * on is accounted.
  */
 static __always_inline void reset_base(struct shawk_sock_state *ss,
 				       struct sock *sk, struct tcp_sock *tp,
@@ -413,6 +412,20 @@ static __always_inline void reset_base(struct shawk_sock_state *ss,
 	ss->sent_base = c.sent;
 	ss->recv_base = c.recv;
 	ss->retrans_base = c.retrans;
+}
+
+/*
+ * Sets the bases when a connection is established. bytes_received counts no
+ * SYN. bytes_acked counts the local SYN on an active open only: the child of
+ * a listener starts with its SYN-ACK acknowledged. What the counters hold
+ * beyond that is data, e.g. carried by the SYN with TCP Fast Open.
+ */
+static __always_inline void established_base(struct shawk_sock_state *ss,
+					     struct tcp_sock *tp, bool active)
+{
+	ss->sent_base = active && BPF_CORE_READ(tp, bytes_acked) ? 1 : 0;
+	ss->recv_base = 0;
+	ss->retrans_base = BPF_CORE_READ(tp, total_retrans);
 }
 
 static __always_inline bool ss_ready(const struct shawk_sock_state *ss)
@@ -491,7 +504,7 @@ static __always_inline void on_passive_open(struct sock *sk)
 		return;
 	}
 	ss->key = key;
-	reset_base(ss, sk, tp, TCP_ESTABLISHED);
+	established_base(ss, tp, false);
 	ss->pid = 0;
 	ss->flags = SS_READY;
 	count_conn(ss);
@@ -538,7 +551,7 @@ int BPF_PROG(shawk_inet_sock_set_state, const struct sock *csk, int oldstate,
 				return 0;
 			/* The local address is final once established. */
 			read_sock_addrs(sk, ss->key.laddr, ss->key.raddr);
-			reset_base(ss, sk, tp, TCP_ESTABLISHED);
+			established_base(ss, tp, true);
 			count_conn(ss);
 		} else if (newstate == TCP_CLOSE) {
 			fs = flow_get(&ss->key);

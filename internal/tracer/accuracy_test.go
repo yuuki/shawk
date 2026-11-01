@@ -7,8 +7,11 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // These tests load the BPF programs into the running kernel and need root.
@@ -307,4 +310,118 @@ func TestListenPortCapacity(t *testing.T) {
 	if !strings.Contains(logs.String(), "more listening ports than the in-kernel tables hold") {
 		t.Errorf("no warning about the overflow in %q", logs.String())
 	}
+}
+
+// TestTCPFastOpen checks that data carried by the SYN of a TCP Fast Open
+// connection is counted on both sides (#97).
+func TestTCPFastOpen(t *testing.T) {
+	skipIfNoNetwork(t, "tcp4")
+	tr := newTestTracer(t)
+	const sysctl = "/proc/sys/net/ipv4/tcp_fastopen"
+	old, err := os.ReadFile(sysctl)
+	if err != nil {
+		t.Skip(err)
+	}
+	// Clients and servers, without cookies (0x1 | 0x2 | 0x4 | 0x200), so
+	// that every SYN carries data.
+	if err := os.WriteFile(sysctl, []byte("519"), 0o644); err != nil {
+		t.Skip(err)
+	}
+	t.Cleanup(func() { os.WriteFile(sysctl, old, 0o644) })
+
+	setsockopt := func(opt, value int) func(string, string, syscall.RawConn) error {
+		return func(_, _ string, c syscall.RawConn) error {
+			var serr error
+			if err := c.Control(func(fd uintptr) {
+				serr = unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, opt, value)
+			}); err != nil {
+				return err
+			}
+			return serr
+		}
+	}
+	// The length of the queue of pending Fast Open requests.
+	lc := net.ListenConfig{Control: setsockopt(unix.TCP_FASTOPEN, 16)}
+	lc.SetMultipathTCP(false)
+	ln, err := lc.Listen(t.Context(), "tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				if _, err := io.ReadFull(c, make([]byte, 1000)); err != nil {
+					return
+				}
+				c.Write(make([]byte, 300))
+				io.Copy(io.Discard, c)
+			}()
+		}
+	}()
+	srv := ln.Addr().(*net.TCPAddr).AddrPort()
+
+	before := tcpExtCounter(t, "TCPFastOpenActive")
+	d := net.Dialer{Control: setsockopt(unix.TCP_FASTOPEN_CONNECT, 1)}
+	d.SetMultipathTCP(false)
+	const conns = 2
+	for range conns {
+		c, err := d.Dial("tcp4", srv.String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Write(make([]byte, 1000)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.ReadFull(c, make([]byte, 300)); err != nil {
+			t.Fatal(err)
+		}
+		c.Close()
+	}
+	if n := tcpExtCounter(t, "TCPFastOpenActive") - before; n != conns {
+		t.Skipf("%d of %d connections carried data in their SYN", n, conns)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	snap, err := tr.Collect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := findFlow(snap.Flows, DirOut, ProtoTCP, srv.Port(), srv.Addr())
+	if out == nil || out.Conns != conns || out.BytesSent != conns*1000 || out.BytesRecv != conns*300 {
+		t.Errorf("client flow = %+v", out)
+	}
+	in := findFlow(snap.Flows, DirIn, ProtoTCP, srv.Port(), srv.Addr())
+	if in == nil || in.Conns != conns || in.BytesRecv != conns*1000 || in.BytesSent != conns*300 {
+		t.Errorf("server flow = %+v", in)
+	}
+}
+
+// tcpExtCounter returns a counter of the TcpExt section of /proc/net/netstat.
+func tcpExtCounter(t *testing.T, name string) uint64 {
+	t.Helper()
+	b, err := os.ReadFile("/proc/net/netstat")
+	if err != nil {
+		t.Skip(err)
+	}
+	lines := strings.Split(string(b), "\n")
+	for i := 0; i+1 < len(lines); i += 2 {
+		names, values := strings.Fields(lines[i]), strings.Fields(lines[i+1])
+		if len(names) == 0 || names[0] != "TcpExt:" || len(names) != len(values) {
+			continue
+		}
+		for j := range names {
+			if names[j] == name {
+				v, _ := strconv.ParseUint(values[j], 10, 64)
+				return v
+			}
+		}
+	}
+	t.Skipf("no counter %s", name)
+	return 0
 }

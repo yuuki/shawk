@@ -123,10 +123,10 @@ Bytes are not counted on the send/receive path. They are read from the
 cumulative counters of `struct tcp_sock` (`bytes_acked`, `bytes_received`,
 `total_retrans`) at close and at every scan, and the difference to the last
 accounted value is added to the flow. These counters count sequence
-numbers, so the SYN and the FIN of each side are subtracted: the counters
-are taken as the base when the connection is established, and a FIN is
-subtracted once it is acknowledged (the local one) or received (`SOCK_DONE`,
-the peer's). The iterator and the tracepoint do not
+numbers, so the SYN and the FIN of each side are subtracted: the local SYN
+when an active open is established (data carried by a TCP Fast Open SYN is
+counted), and a FIN once it is acknowledged (the local one) or received
+(`SOCK_DONE`, the peer's). The iterator and the tracepoint do not
 interleave on a socket where the TCP iterator locks each socket (Linux 5.19+
 and RHEL 9 by backport); on older kernels, a connection closing during a scan
 may rarely be counted twice. Atomic exchange is avoided because the arm64 JIT
