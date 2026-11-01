@@ -3,11 +3,13 @@ package otlp
 import (
 	"fmt"
 	"net/netip"
+	"strings"
 	"testing"
 	"time"
 
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
+	"google.golang.org/protobuf/proto"
 )
 
 func attrMap(kvs []*commonpb.KeyValue) map[string]any {
@@ -229,5 +231,90 @@ func TestRequestsSplit(t *testing.T) {
 	// Without series there is one request, with the agent.
 	if reqs := NewState(time.Minute).Requests(Resource{Hostname: "h"}, st, t0, 3); len(reqs) != 1 {
 		t.Errorf("%d requests without series", len(reqs))
+	}
+}
+
+// Requests stay below the byte limit whatever the size of the attributes,
+// and are made of whole series.
+func TestRequestsByteLimit(t *testing.T) {
+	s := NewState(15 * time.Minute)
+	exe := "/" + strings.Repeat("venv/lib/python3.12/site-packages/", 30) + "bin/worker"
+	for i := range 1000 {
+		k := clientEdge()
+		k.LocalAddr = netip.MustParseAddr(fmt.Sprintf("2001:db8:aaaa:bbbb:cccc:dddd:%x:1", i))
+		k.PeerAddr = netip.MustParseAddr(fmt.Sprintf("2001:db8:aaaa:bbbb:cccc:eeee:%x:2", i))
+		k.Exe = exe
+		k.Service = "worker-with-a-long-service-name"
+		s.AddEdge(k, EdgeStats{Conns: 1, RTTSamples: 1, RTTSumUs: 100}, t0, t0)
+		u := k
+		u.Proto = "udp"
+		s.AddEdge(u, EdgeStats{MsgsSent: 1}, t0, t0)
+	}
+	st := AgentStatus{Started: t0, SegmentStart: t0, NetNSScope: "all"}
+	var addrs []netip.Addr
+	for i := range 300 {
+		addrs = append(addrs, netip.MustParseAddr(fmt.Sprintf("fd00::%x", i)))
+	}
+	reqs := s.Requests(Resource{Hostname: "h", Addrs: addrs}, st, t0, 1000)
+	if len(reqs) < 2 {
+		t.Fatalf("%d requests", len(reqs))
+	}
+	edges := 0
+	for i, req := range reqs {
+		if n := proto.Size(req); n > MaxRequestBytes {
+			t.Errorf("request %d has %d bytes, more than %d", i, n, MaxRequestBytes)
+		}
+		for _, m := range req.ResourceMetrics[0].ScopeMetrics[0].Metrics {
+			if m.Name == MetricEdgeLast {
+				edges += len(m.GetGauge().DataPoints)
+			}
+		}
+	}
+	if edges != 2000 {
+		t.Errorf("%d edges sent, want 2000", edges)
+	}
+}
+
+// Listeners come first and server edges before client edges, so that the
+// connector knows the services of the host when it names the peers of
+// client edges.
+func TestRequestsOrder(t *testing.T) {
+	s := NewState(15 * time.Minute)
+	c := clientEdge()
+	srv := clientEdge()
+	srv.Role = RoleServer
+	s.AddEdge(c, EdgeStats{Conns: 1}, t0, t0)
+	s.AddEdge(srv, EdgeStats{Conns: 1}, t0, t0)
+	s.AddListener(ListenerKey{Proto: "tcp", Addr: netip.MustParseAddr("127.0.0.1"), Port: 6379}, t0)
+	reqs := s.Requests(Resource{Hostname: "h"}, AgentStatus{}, t0, 1)
+	if len(reqs) != 3 {
+		t.Fatalf("%d requests", len(reqs))
+	}
+	kinds := []string{}
+	for _, req := range reqs {
+		for _, m := range req.ResourceMetrics[0].ScopeMetrics[0].Metrics {
+			switch m.Name {
+			case MetricListenerLast:
+				kinds = append(kinds, "listener")
+			case MetricEdgeLast:
+				kinds = append(kinds, fmt.Sprint(attrMap(m.GetGauge().DataPoints[0].Attributes)["shawk.role"]))
+			}
+		}
+	}
+	if fmt.Sprint(kinds) != "[listener server client]" {
+		t.Errorf("order = %v", kinds)
+	}
+}
+
+// A command name cut in the middle of a multibyte character is sent as
+// valid UTF-8; protobuf refuses to marshal it otherwise.
+func TestRequestInvalidUTF8(t *testing.T) {
+	s := NewState(15 * time.Minute)
+	k := clientEdge()
+	k.Comm = "サービスワ\xe3\x83"
+	s.AddEdge(k, EdgeStats{Conns: 1}, t0, t0)
+	req := s.Request(Resource{Hostname: "h"}, AgentStatus{}, t0)
+	if _, err := proto.Marshal(req); err != nil {
+		t.Fatalf("marshal: %v", err)
 	}
 }

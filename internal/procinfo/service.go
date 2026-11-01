@@ -66,9 +66,15 @@ const maxEnviron = 1 << 20
 // stuck, e.g. on a hung network file system.
 const environTimeout = 200 * time.Millisecond
 
-// stuckEnviron are the PIDs whose environment is still being read after
-// the timeout; they are not read again until that read returns.
-var stuckEnviron sync.Map
+// environBackoff is how long the environment of a process whose read timed
+// out is not read again after that read returned: a process slow to
+// answer once is likely slow again.
+const environBackoff = 5 * time.Minute
+
+// slowEnviron are the PIDs whose environment is not read: the zero time
+// while a read that timed out is still running, then the time until which
+// it backs off.
+var slowEnviron sync.Map
 
 // OTelEnv returns the variables of the environment of a process whose names
 // start with OTEL_. Other variables, which may hold secrets, are discarded
@@ -78,8 +84,11 @@ func OTelEnv(pid uint32) (env map[string]string, ok bool) {
 	if pid == 0 {
 		return nil, true
 	}
-	if _, stuck := stuckEnviron.Load(pid); stuck {
-		return nil, false
+	if v, slow := slowEnviron.Load(pid); slow {
+		if t := v.(time.Time); t.IsZero() || time.Now().Before(t) {
+			return nil, false
+		}
+		slowEnviron.Delete(pid)
 	}
 	done := make(chan map[string]string, 1)
 	go func() {
@@ -89,10 +98,18 @@ func OTelEnv(pid uint32) (env map[string]string, ok bool) {
 	case env := <-done:
 		return env, true
 	case <-time.After(environTimeout):
-		stuckEnviron.Store(pid, true)
+		slowEnviron.Store(pid, time.Time{})
 		go func() {
 			<-done
-			stuckEnviron.Delete(pid)
+			now := time.Now()
+			slowEnviron.Store(pid, now.Add(environBackoff))
+			// Forget the PIDs whose backoff ended, which may have exited.
+			slowEnviron.Range(func(k, v any) bool {
+				if t := v.(time.Time); !t.IsZero() && now.After(t) {
+					slowEnviron.Delete(k)
+				}
+				return true
+			})
 		}()
 		return nil, false
 	}

@@ -107,7 +107,7 @@ func TestLocalAddrs(t *testing.T) {
 	s.AddListener(ListenerKey{Proto: "tcp", Addr: netip.MustParseAddr("::"), Port: 80}, t0)
 	s.AddListener(ListenerKey{Proto: "tcp", Addr: netip.MustParseAddr("172.17.0.2"), Port: 80}, t0)
 	got := map[string]bool{}
-	for _, a := range s.LocalAddrs() {
+	for _, a := range s.LocalAddrs(t0) {
 		got[a.String()] = true
 	}
 	if len(got) != 2 || !got["10.0.0.11"] || !got["172.17.0.2"] {
@@ -149,5 +149,43 @@ func TestSegment(t *testing.T) {
 	s = NewSegment(t0, ttl)
 	if got := s.Start(t0.Add(ttl)); got != t0 {
 		t.Errorf("start = %v, want the agent start", got)
+	}
+}
+
+// An address of a series kept only for its idle TTL is not reported: it
+// may have moved to another host with its container.
+func TestLocalAddrsRecent(t *testing.T) {
+	s := NewState(15 * time.Minute)
+	old, recent := clientEdge(), clientEdge()
+	old.LocalAddr = netip.MustParseAddr("10.0.0.21")
+	s.AddEdge(old, EdgeStats{Conns: 1}, t0, t0)
+	later := t0.Add(10 * time.Minute)
+	s.AddEdge(recent, EdgeStats{Conns: 1}, later, later)
+	s.AddListener(ListenerKey{Proto: "tcp", Addr: netip.MustParseAddr("10.0.0.22"), Port: 80}, t0)
+	s.AddListener(ListenerKey{Proto: "tcp", Addr: netip.MustParseAddr("10.0.0.23"), Port: 80}, later)
+	got := map[string]bool{}
+	for _, a := range s.LocalAddrs(later.Add(-time.Minute)) {
+		got[a.String()] = true
+	}
+	if len(got) != 2 || !got["10.0.0.11"] || !got["10.0.0.23"] {
+		t.Errorf("LocalAddrs = %v", got)
+	}
+}
+
+// After the wall clock stepped, the start of the segment is sent by the new
+// clock, so that the connector converts it with the current skew.
+func TestSegmentClockStep(t *testing.T) {
+	ttl := 15 * time.Minute
+	step := -9 * time.Hour
+	s := NewSegment(t0, ttl)
+	now := t0.Add(time.Minute)
+	s.Succeeded(s.Start(now), now)
+	// The monotonic clock ignores the step; Sub of times without a
+	// monotonic reading does not, so the test adds it back.
+	elapsed = func(now, t time.Time) time.Duration { return now.Sub(t) - step }
+	t.Cleanup(func() { elapsed = func(now, t time.Time) time.Duration { return now.Sub(t) } })
+	stepped := t0.Add(2 * time.Minute).Add(step)
+	if got := s.Start(stepped); !got.Equal(t0.Add(step)) {
+		t.Errorf("start after the step = %v, want %v", got, t0.Add(step))
 	}
 }

@@ -161,9 +161,12 @@ func (s *State) Edges() map[EdgeKey]*Edge { return s.edges }
 // Listeners returns the live listener series. The map must not be modified.
 func (s *State) Listeners() map[ListenerKey]*Listener { return s.listeners }
 
-// LocalAddrs returns the specified local addresses of the live series, such
-// as the addresses of containers in other network namespaces.
-func (s *State) LocalAddrs() []netip.Addr {
+// LocalAddrs returns the specified local addresses of the series active
+// since a time, such as the addresses of containers in other network
+// namespaces, and those of the listeners still open then. An address of a
+// series that has only been kept for its idle TTL may have moved to
+// another host with its container.
+func (s *State) LocalAddrs(since time.Time) []netip.Addr {
 	seen := map[netip.Addr]bool{}
 	var out []netip.Addr
 	add := func(a netip.Addr) {
@@ -172,11 +175,15 @@ func (s *State) LocalAddrs() []netip.Addr {
 			out = append(out, a)
 		}
 	}
-	for k := range s.edges {
-		add(k.LocalAddr)
+	for k, e := range s.edges {
+		if !e.LastSeen.Before(since) {
+			add(k.LocalAddr)
+		}
 	}
-	for k := range s.listeners {
-		add(k.Addr)
+	for k, l := range s.listeners {
+		if !l.LastSeen.Before(since) {
+			add(k.Addr)
+		}
 	}
 	return out
 }
@@ -200,21 +207,34 @@ func NewSegment(start time.Time, idleTTL time.Duration) *Segment {
 // meantime may have been dropped before reaching the connector; the
 // segment then restarts at now minus the idle TTL, since the edges active
 // after that are still being sent.
+//
+// The start is expressed by the current wall clock, which differs from the
+// time it was taken at if the clock stepped since, e.g. when NTP corrected
+// it after the agent started: the connector converts it with the current
+// clock skew of the agent.
 func (s *Segment) Start(now time.Time) time.Time {
-	if now.Sub(s.lastSuccess) <= s.idleTTL-time.Minute {
-		return s.start
+	start := wall(s.start, now)
+	if elapsed(now, s.lastSuccess) <= s.idleTTL-time.Minute {
+		return start
 	}
-	if t := now.Add(-s.idleTTL); t.After(s.start) {
+	if t := now.Add(-s.idleTTL); t.After(start) {
 		return t
 	}
-	return s.start
+	return start
 }
 
 // Succeeded records that a request made at now with the segment start
 // start was delivered.
 func (s *Segment) Succeeded(start, now time.Time) {
 	s.start = start
-	if now.After(s.lastSuccess) {
-		s.lastSuccess = now
-	}
+	s.lastSuccess = now
 }
+
+// elapsed is the time that passed from t to now: by the monotonic clock
+// when both times have a reading of it, which a step of the wall clock does
+// not change; replaced in tests.
+var elapsed = func(now, t time.Time) time.Duration { return now.Sub(t) }
+
+// wall returns t by the wall clock of now. It keeps the monotonic reading
+// of t, and equals t unless the wall clock stepped in between.
+func wall(t, now time.Time) time.Time { return now.Add(-elapsed(now, t)) }

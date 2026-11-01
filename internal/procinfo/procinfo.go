@@ -216,6 +216,19 @@ func Unit(cgroupPath string) string {
 	return parts[len(parts)-1]
 }
 
+// Comm returns the command name of a process (of its main thread), or "" if
+// the process is gone.
+func Comm(pid uint32) string {
+	if pid == 0 {
+		return ""
+	}
+	b, err := os.ReadFile("/proc/" + strconv.FormatUint(uint64(pid), 10) + "/comm")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSuffix(string(b), "\n")
+}
+
 // Exe returns the path of the executable of a process, or "" if the process
 // is gone or not accessible.
 func Exe(pid uint32) string {
@@ -231,9 +244,17 @@ func Exe(pid uint32) string {
 
 // NetNS returns the inode number of the network namespace of the current
 // process.
-func NetNS() uint32 {
+func NetNS() uint32 { return netNS("/proc/self/ns/net") }
+
+// NetNSOf returns the inode of the network namespace of a process, or 0 if
+// it cannot be read.
+func NetNSOf(pid uint32) uint32 {
+	return netNS("/proc/" + strconv.FormatUint(uint64(pid), 10) + "/ns/net")
+}
+
+func netNS(path string) uint32 {
 	var st syscall.Stat_t
-	if err := syscall.Stat("/proc/self/ns/net", &st); err != nil {
+	if err := syscall.Stat(path, &st); err != nil {
 		return 0
 	}
 	return uint32(st.Ino)

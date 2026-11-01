@@ -42,6 +42,9 @@ type Config struct {
 	traceSelf bool // trace the agent's own flows; for tests
 }
 
+// MaxInterval is the longest export interval.
+const MaxInterval = time.Minute
+
 // Agent is a running agent.
 type Agent struct {
 	cfg      Config
@@ -70,6 +73,11 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	if cfg.IdleTTL <= 0 {
 		cfg.IdleTTL = 15 * time.Minute
+	}
+	if cfg.Interval > MaxInterval {
+		// The connector counts an agent alive, and an address held by two
+		// hosts at once, within windows of a few minutes.
+		return fmt.Errorf("the interval %s must be at most %s", cfg.Interval, MaxInterval)
 	}
 	if cfg.IdleTTL < 2*time.Minute || cfg.IdleTTL < 4*cfg.Interval {
 		return fmt.Errorf("the idle TTL %s must be at least 2m and 4 intervals", cfg.IdleTTL)
@@ -103,6 +111,10 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	if !tr.UDPEnabled() {
 		cfg.Logger.Warn("UDP is not traced; see the error above (UDP tracing needs BPF trampolines, fentry)")
+	}
+	if cfg.NetNS != 0 && cfg.NetNS == procinfo.NetNSOf(1) {
+		cfg.Logger.Warn("only the initial network namespace is traced: connections of containers in other namespaces are not, " +
+			"and those that leave with the addresses of the host look traced to their peers; use -netns all on hosts with containers")
 	}
 
 	hostname, _ := os.Hostname()
@@ -155,7 +167,8 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 }
 
-// exportTimeout keeps an export from delaying the next collection.
+// exportTimeout bounds a request, so that a collector that does not
+// answer does not delay the next collection for long.
 func (a *Agent) exportTimeout() time.Duration {
 	return max(a.cfg.Interval*2/3, time.Second)
 }
@@ -176,9 +189,14 @@ func (a *Agent) tick(ctx context.Context) error {
 	reqs, segStart := a.request(now)
 	// The last request carries the metrics of the agent and closes the
 	// interval; after a failure the rest is not sent, and the next interval
-	// makes up for it since the series are cumulative.
+	// makes up for it since the series are cumulative. Every request has its
+	// own deadline, which starts once the interval is collected, so that a
+	// host with many requests delivers them all.
 	for i, req := range reqs {
-		if err := a.exporter.Export(ctx, req); err != nil {
+		rctx, cancel := context.WithTimeout(ctx, a.exportTimeout())
+		err := a.exporter.Export(rctx, req)
+		cancel()
+		if err != nil {
 			a.failures++
 			return fmt.Errorf("sending request %d of %d to %s: %w", i+1, len(reqs), a.cfg.Exporter.Endpoint, err)
 		}
@@ -191,6 +209,14 @@ func (a *Agent) tick(ctx context.Context) error {
 func (a *Agent) observe(snap *tracer.Snapshot, start, end time.Time) {
 	a.drops = snap.Drops
 	a.idents.beginInterval()
+	pids := make([]uint32, 0, len(snap.Flows)+len(snap.Listeners))
+	for i := range snap.Flows {
+		pids = append(pids, snap.Flows[i].PID)
+	}
+	for i := range snap.Listeners {
+		pids = append(pids, snap.Listeners[i].PID)
+	}
+	a.idents.prefetch(pids)
 	a.state.BeginInterval()
 	for i := range snap.Flows {
 		f := &snap.Flows[i]
@@ -238,11 +264,11 @@ func (a *Agent) request(now time.Time) ([]*colmetricspb.ExportMetricsServiceRequ
 	// host.ip tells the connector which peers this agent records the other
 	// side for, so it lists only addresses of traced namespaces: the
 	// interfaces of the agent's own namespace unless it traces another
-	// one, and the local addresses of the live series.
+	// one, and the local addresses of the series active recently.
 	if a.cfg.NetNS == 0 || a.cfg.NetNS == procinfo.NetNS() {
 		res.Addrs = hostAddrs()
 	}
-	for _, addr := range a.state.LocalAddrs() {
+	for _, addr := range a.state.LocalAddrs(now.Add(-max(2*a.cfg.Interval, time.Minute))) {
 		if !slices.Contains(res.Addrs, addr) {
 			res.Addrs = append(res.Addrs, addr)
 		}

@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"os"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -128,5 +129,14 @@ func TestRun(t *testing.T) {
 				return
 			}
 		}
+	}
+}
+
+// The connector judges liveness and shared addresses within windows of a
+// few minutes, which a longer interval would exceed.
+func TestRunRejectsLongInterval(t *testing.T) {
+	err := Run(context.Background(), Config{Interval: 2 * time.Minute, IdleTTL: time.Hour})
+	if err == nil || !strings.Contains(err.Error(), "at most") {
+		t.Errorf("Run with a 2m interval: %v", err)
 	}
 }

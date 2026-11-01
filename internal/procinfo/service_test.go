@@ -158,17 +158,26 @@ func TestOTelEnvTimeout(t *testing.T) {
 		t.Errorf("a stuck process was read again")
 	}
 	close(release)
+	// Once the read returns, the process backs off for a while.
 	for i := 0; ; i++ {
-		if _, stuck := stuckEnviron.Load(uint32(4242)); !stuck {
+		if v, _ := slowEnviron.Load(uint32(4242)); v != nil && !v.(time.Time).IsZero() {
 			break
 		}
 		if i > 100 {
-			t.Fatal("the process stays marked as stuck")
+			t.Fatal("the process does not back off")
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	readEnviron = func(uint32) map[string]string { return map[string]string{"OTEL_SERVICE_NAME": "ok"} }
+	if _, ok := OTelEnv(4242); ok {
+		t.Error("a slow process was read again within its backoff")
+	}
+	// After the backoff it is read again.
+	slowEnviron.Store(uint32(4242), time.Now().Add(-time.Second))
 	if env, ok := OTelEnv(4242); !ok || env["OTEL_SERVICE_NAME"] != "ok" {
-		t.Errorf("after the read returned: %v, %v", env, ok)
+		t.Errorf("after the backoff: %v, %v", env, ok)
+	}
+	if _, slow := slowEnviron.Load(uint32(4242)); slow {
+		t.Error("the backoff is kept after it ended")
 	}
 }

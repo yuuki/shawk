@@ -8,11 +8,14 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	colmetricspb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
 	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
+	"google.golang.org/protobuf/encoding/protowire"
+	"google.golang.org/protobuf/proto"
 )
 
 // Resource describes the host and the agent.
@@ -48,41 +51,46 @@ func (s *State) Request(res Resource, st AgentStatus, now time.Time) *colmetrics
 	return s.Requests(res, st, now, 0)[0]
 }
 
+// MaxRequestBytes bounds the encoded size of a request, below the 4 MiB a
+// gRPC receiver accepts by default (after decompression).
+const MaxRequestBytes = 3 << 20
+
+// maxRequestBytes is MaxRequestBytes; replaced in tests.
+var maxRequestBytes = MaxRequestBytes
+
+// agentReserve is room left in every request for the metrics of the agent.
+const agentReserve = 16 << 10
+
 // Requests builds the requests that carry all live series at now, each with
-// at most maxSeries edges and listeners (0 means no limit), so that every
-// request stays below the size limits of the receiver. The metrics of the
-// agent itself are in the last request only: it closes the interval, and
-// the connector emits the aggregated metrics of the host when it arrives.
+// at most maxSeries edges and listeners (0 means no limit) and at most
+// MaxRequestBytes, so that every request stays below the size limits of
+// the receiver. The metrics of the agent itself are in the last request
+// only: it closes the interval, and the connector emits the aggregated
+// metrics of the host when it arrives.
+//
+// Listeners come first, then server edges, then client edges, so that the
+// connector has learned the services of the host before it names the peers
+// of client edges, such as a client of a service on the same host.
 func (s *State) Requests(res Resource, st AgentStatus, now time.Time, maxSeries int) []*colmetricspb.ExportMetricsServiceRequest {
-	edges := make([]EdgeKey, 0, len(s.edges))
-	for k := range s.edges {
-		edges = append(edges, k)
-	}
-	// A stable order makes requests easy to compare and compress.
-	slices.SortFunc(edges, compareEdgeKeys)
 	listeners := make([]ListenerKey, 0, len(s.listeners))
 	for k := range s.listeners {
 		listeners = append(listeners, k)
 	}
+	// A stable order makes requests easy to compare and compress.
 	slices.SortFunc(listeners, compareListenerKeys)
-
-	total := len(edges) + len(listeners)
-	if maxSeries <= 0 || maxSeries > total {
-		maxSeries = max(total, 1)
+	edges := make([]EdgeKey, 0, len(s.edges))
+	for k := range s.edges {
+		edges = append(edges, k)
 	}
+	slices.SortFunc(edges, compareEdgeKeys)
+
 	resource := res.proto()
+	budget := maxRequestBytes - proto.Size(resource) - agentReserve
 	var reqs []*colmetricspb.ExportMetricsServiceRequest
-	for first := 0; first < total || len(reqs) == 0; first += maxSeries {
-		last := min(first+maxSeries, total)
-		b := newBuilder(now)
-		for i := first; i < last; i++ {
-			if i < len(edges) {
-				s.addEdge(b, &edges[i])
-			} else {
-				s.addListener(b, &listeners[i-len(edges)])
-			}
-		}
-		if last == total {
+	b := newBuilder(now)
+	count, size := 0, 0
+	flush := func(last bool) {
+		if last {
 			addAgent(b, &st)
 		}
 		reqs = append(reqs, &colmetricspb.ExportMetricsServiceRequest{
@@ -94,13 +102,73 @@ func (s *State) Requests(res Resource, st AgentStatus, now time.Time, maxSeries 
 				}},
 			}},
 		})
+		b = newBuilder(now)
+		count, size = 0, 0
 	}
+	// add starts a new request if a series of n bytes would not fit.
+	add := func(n int) {
+		if count > 0 && ((maxSeries > 0 && count >= maxSeries) || size+n > budget) {
+			flush(false)
+		}
+		count++
+		size += n
+	}
+	for i := range listeners {
+		k := &listeners[i]
+		attrs := listenerAttrs(k)
+		add(listenerSize(attrs))
+		s.addListener(b, k, attrs)
+	}
+	for i := range edges {
+		k := &edges[i]
+		attrs := edgeAttrs(k)
+		add(edgeSize(k, attrs))
+		s.addEdge(b, k, attrs)
+	}
+	flush(true)
 	return reqs
 }
 
-func (s *State) addEdge(b *builder, k *EdgeKey) {
+// pointOverhead bounds the encoded size of a data point besides its
+// attributes: timestamps, value, count and sum, the bucket of a histogram,
+// and the tag and length of the point.
+const pointOverhead = 64
+
+// directionSize bounds the size of the attribute network.io.direction.
+var directionSize = attrsSize([]*commonpb.KeyValue{str(AttrIODirection, DirTransmit)})
+
+// edgeSize bounds the encoded size of the data points of an edge.
+func edgeSize(k *EdgeKey, attrs []*commonpb.KeyValue) int {
+	a := attrsSize(attrs)
+	// Two gauges, first and last seen, and two directions of bytes.
+	n := 2*(a+pointOverhead) + 2*(a+directionSize+pointOverhead)
+	switch k.Proto {
+	case "tcp":
+		// Opened, failed, open connections, retransmits and RTT.
+		n += 5 * (a + pointOverhead)
+	case "udp":
+		n += 2 * (a + directionSize + pointOverhead)
+	}
+	return n
+}
+
+// listenerSize bounds the encoded size of the data points of a listener.
+func listenerSize(attrs []*commonpb.KeyValue) int {
+	return 2 * (attrsSize(attrs) + pointOverhead)
+}
+
+// attrsSize is the encoded size of attributes as a repeated field.
+func attrsSize(attrs []*commonpb.KeyValue) int {
+	n := 0
+	for _, kv := range attrs {
+		s := proto.Size(kv)
+		n += 1 + protowire.SizeVarint(uint64(s)) + s
+	}
+	return n
+}
+
+func (s *State) addEdge(b *builder, k *EdgeKey, attrs []*commonpb.KeyValue) {
 	e := s.edges[*k]
-	attrs := edgeAttrs(k)
 	start := e.Start
 	t := &e.Total
 	switch k.Proto {
@@ -122,9 +190,8 @@ func (s *State) addEdge(b *builder, k *EdgeKey) {
 	b.gauge(MetricEdgeLast, "s", e.LastSeen.Unix(), attrs)
 }
 
-func (s *State) addListener(b *builder, k *ListenerKey) {
+func (s *State) addListener(b *builder, k *ListenerKey, attrs []*commonpb.KeyValue) {
 	l := s.listeners[*k]
-	attrs := listenerAttrs(k)
 	b.gauge(MetricListenerFirst, "s", l.FirstSeen.Unix(), attrs)
 	b.gauge(MetricListenerLast, "s", l.LastSeen.Unix(), attrs)
 }
@@ -198,7 +265,13 @@ func listenerAttrs(k *ListenerKey) []*commonpb.KeyValue {
 	)
 }
 
+// str returns a string attribute. A string field of protobuf must be valid
+// UTF-8, and Marshal fails otherwise; a command name cut at 15 bytes may
+// end in the middle of a character.
 func str(k, v string) *commonpb.KeyValue {
+	if !utf8.ValidString(v) {
+		v = strings.ToValidUTF8(v, "\uFFFD")
+	}
 	return &commonpb.KeyValue{Key: k, Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: v}}}
 }
 
@@ -307,9 +380,17 @@ func compareProcess(a, b *Process) int {
 	)
 }
 
+// roleOrder puts server edges before client edges.
+func roleOrder(role string) int {
+	if role == RoleServer {
+		return 0
+	}
+	return 1
+}
+
 func compareEdgeKeys(a, b EdgeKey) int {
 	return cmp.Or(
-		strings.Compare(a.Role, b.Role),
+		cmp.Compare(roleOrder(a.Role), roleOrder(b.Role)),
 		strings.Compare(a.Proto, b.Proto),
 		cmp.Compare(a.Port, b.Port),
 		a.PeerAddr.Compare(b.PeerAddr),

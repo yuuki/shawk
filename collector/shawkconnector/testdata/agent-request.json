@@ -58,9 +58,9 @@
           },
           "metrics":  [
             {
-              "name":  "shawk.connection.opened",
-              "unit":  "{connection}",
-              "sum":  {
+              "name":  "shawk.listener.first_seen",
+              "unit":  "s",
+              "gauge":  {
                 "dataPoints":  [
                   {
                     "attributes":  [
@@ -101,9 +101,125 @@
                         }
                       },
                       {
-                        "key":  "shawk.role",
+                        "key":  "network.transport",
                         "value":  {
-                          "stringValue":  "client"
+                          "stringValue":  "tcp"
+                        }
+                      },
+                      {
+                        "key":  "network.local.address",
+                        "value":  {
+                          "stringValue":  "0.0.0.0"
+                        }
+                      },
+                      {
+                        "key":  "server.port",
+                        "value":  {
+                          "intValue":  "8080"
+                        }
+                      },
+                      {
+                        "key":  "shawk.netns",
+                        "value":  {
+                          "stringValue":  "4026531840"
+                        }
+                      }
+                    ],
+                    "timeUnixNano":  "1793448015000000000",
+                    "asInt":  "1793448015"
+                  },
+                  {
+                    "attributes":  [
+                      {
+                        "key":  "service.name",
+                        "value":  {
+                          "stringValue":  ""
+                        }
+                      },
+                      {
+                        "key":  "process.command",
+                        "value":  {
+                          "stringValue":  ""
+                        }
+                      },
+                      {
+                        "key":  "shawk.unit",
+                        "value":  {
+                          "stringValue":  ""
+                        }
+                      },
+                      {
+                        "key":  "network.transport",
+                        "value":  {
+                          "stringValue":  "udp"
+                        }
+                      },
+                      {
+                        "key":  "network.local.address",
+                        "value":  {
+                          "stringValue":  "0.0.0.0"
+                        }
+                      },
+                      {
+                        "key":  "server.port",
+                        "value":  {
+                          "intValue":  "68"
+                        }
+                      },
+                      {
+                        "key":  "shawk.netns",
+                        "value":  {
+                          "stringValue":  "4026531840"
+                        }
+                      }
+                    ],
+                    "timeUnixNano":  "1793448015000000000",
+                    "asInt":  "1793448015"
+                  }
+                ]
+              }
+            },
+            {
+              "name":  "shawk.listener.last_seen",
+              "unit":  "s",
+              "gauge":  {
+                "dataPoints":  [
+                  {
+                    "attributes":  [
+                      {
+                        "key":  "service.name",
+                        "value":  {
+                          "stringValue":  "app"
+                        }
+                      },
+                      {
+                        "key":  "service.namespace",
+                        "value":  {
+                          "stringValue":  "shop"
+                        }
+                      },
+                      {
+                        "key":  "process.executable.name",
+                        "value":  {
+                          "stringValue":  "ruby"
+                        }
+                      },
+                      {
+                        "key":  "process.executable.path",
+                        "value":  {
+                          "stringValue":  "/usr/bin/ruby"
+                        }
+                      },
+                      {
+                        "key":  "process.command",
+                        "value":  {
+                          "stringValue":  "puma"
+                        }
+                      },
+                      {
+                        "key":  "shawk.unit",
+                        "value":  {
+                          "stringValue":  "app.service"
                         }
                       },
                       {
@@ -115,19 +231,13 @@
                       {
                         "key":  "network.local.address",
                         "value":  {
-                          "stringValue":  "10.0.0.11"
-                        }
-                      },
-                      {
-                        "key":  "network.peer.address",
-                        "value":  {
-                          "stringValue":  "10.0.0.10"
+                          "stringValue":  "0.0.0.0"
                         }
                       },
                       {
                         "key":  "server.port",
                         "value":  {
-                          "intValue":  "5432"
+                          "intValue":  "8080"
                         }
                       },
                       {
@@ -137,10 +247,65 @@
                         }
                       }
                     ],
-                    "startTimeUnixNano":  "1793448000000000000",
                     "timeUnixNano":  "1793448015000000000",
-                    "asInt":  "3"
+                    "asInt":  "1793448015"
                   },
+                  {
+                    "attributes":  [
+                      {
+                        "key":  "service.name",
+                        "value":  {
+                          "stringValue":  ""
+                        }
+                      },
+                      {
+                        "key":  "process.command",
+                        "value":  {
+                          "stringValue":  ""
+                        }
+                      },
+                      {
+                        "key":  "shawk.unit",
+                        "value":  {
+                          "stringValue":  ""
+                        }
+                      },
+                      {
+                        "key":  "network.transport",
+                        "value":  {
+                          "stringValue":  "udp"
+                        }
+                      },
+                      {
+                        "key":  "network.local.address",
+                        "value":  {
+                          "stringValue":  "0.0.0.0"
+                        }
+                      },
+                      {
+                        "key":  "server.port",
+                        "value":  {
+                          "intValue":  "68"
+                        }
+                      },
+                      {
+                        "key":  "shawk.netns",
+                        "value":  {
+                          "stringValue":  "4026531840"
+                        }
+                      }
+                    ],
+                    "timeUnixNano":  "1793448015000000000",
+                    "asInt":  "1793448015"
+                  }
+                ]
+              }
+            },
+            {
+              "name":  "shawk.connection.opened",
+              "unit":  "{connection}",
+              "sum":  {
+                "dataPoints":  [
                   {
                     "attributes":  [
                       {
@@ -219,17 +384,7 @@
                     "startTimeUnixNano":  "1793448000000000000",
                     "timeUnixNano":  "1793448015000000000",
                     "asInt":  "10"
-                  }
-                ],
-                "aggregationTemporality":  "AGGREGATION_TEMPORALITY_CUMULATIVE",
-                "isMonotonic":  true
-              }
-            },
-            {
-              "name":  "shawk.connection.failed",
-              "unit":  "{connection}",
-              "sum":  {
-                "dataPoints":  [
+                  },
                   {
                     "attributes":  [
                       {
@@ -307,7 +462,7 @@
                     ],
                     "startTimeUnixNano":  "1793448000000000000",
                     "timeUnixNano":  "1793448015000000000",
-                    "asInt":  "1"
+                    "asInt":  "3"
                   }
                 ],
                 "aggregationTemporality":  "AGGREGATION_TEMPORALITY_CUMULATIVE",
@@ -319,6 +474,85 @@
               "unit":  "{connection}",
               "sum":  {
                 "dataPoints":  [
+                  {
+                    "attributes":  [
+                      {
+                        "key":  "service.name",
+                        "value":  {
+                          "stringValue":  "app"
+                        }
+                      },
+                      {
+                        "key":  "service.namespace",
+                        "value":  {
+                          "stringValue":  "shop"
+                        }
+                      },
+                      {
+                        "key":  "process.executable.name",
+                        "value":  {
+                          "stringValue":  "ruby"
+                        }
+                      },
+                      {
+                        "key":  "process.executable.path",
+                        "value":  {
+                          "stringValue":  "/usr/bin/ruby"
+                        }
+                      },
+                      {
+                        "key":  "process.command",
+                        "value":  {
+                          "stringValue":  "puma"
+                        }
+                      },
+                      {
+                        "key":  "shawk.unit",
+                        "value":  {
+                          "stringValue":  "app.service"
+                        }
+                      },
+                      {
+                        "key":  "shawk.role",
+                        "value":  {
+                          "stringValue":  "server"
+                        }
+                      },
+                      {
+                        "key":  "network.transport",
+                        "value":  {
+                          "stringValue":  "tcp"
+                        }
+                      },
+                      {
+                        "key":  "network.local.address",
+                        "value":  {
+                          "stringValue":  "10.0.0.11"
+                        }
+                      },
+                      {
+                        "key":  "network.peer.address",
+                        "value":  {
+                          "stringValue":  "10.0.0.5"
+                        }
+                      },
+                      {
+                        "key":  "server.port",
+                        "value":  {
+                          "intValue":  "8080"
+                        }
+                      },
+                      {
+                        "key":  "shawk.netns",
+                        "value":  {
+                          "stringValue":  "4026531840"
+                        }
+                      }
+                    ],
+                    "startTimeUnixNano":  "1793448000000000000",
+                    "timeUnixNano":  "1793448015000000000",
+                    "asInt":  "0"
+                  },
                   {
                     "attributes":  [
                       {
@@ -397,7 +631,16 @@
                     "startTimeUnixNano":  "1793448000000000000",
                     "timeUnixNano":  "1793448015000000000",
                     "asInt":  "2"
-                  },
+                  }
+                ],
+                "aggregationTemporality":  "AGGREGATION_TEMPORALITY_CUMULATIVE"
+              }
+            },
+            {
+              "name":  "shawk.tcp.retransmits",
+              "unit":  "{segment}",
+              "sum":  {
+                "dataPoints":  [
                   {
                     "attributes":  [
                       {
@@ -476,16 +719,7 @@
                     "startTimeUnixNano":  "1793448000000000000",
                     "timeUnixNano":  "1793448015000000000",
                     "asInt":  "0"
-                  }
-                ],
-                "aggregationTemporality":  "AGGREGATION_TEMPORALITY_CUMULATIVE"
-              }
-            },
-            {
-              "name":  "shawk.tcp.retransmits",
-              "unit":  "{segment}",
-              "sum":  {
-                "dataPoints":  [
+                  },
                   {
                     "attributes":  [
                       {
@@ -564,7 +798,17 @@
                     "startTimeUnixNano":  "1793448000000000000",
                     "timeUnixNano":  "1793448015000000000",
                     "asInt":  "4"
-                  },
+                  }
+                ],
+                "aggregationTemporality":  "AGGREGATION_TEMPORALITY_CUMULATIVE",
+                "isMonotonic":  true
+              }
+            },
+            {
+              "name":  "shawk.tcp.rtt",
+              "unit":  "s",
+              "histogram":  {
+                "dataPoints":  [
                   {
                     "attributes":  [
                       {
@@ -642,18 +886,11 @@
                     ],
                     "startTimeUnixNano":  "1793448000000000000",
                     "timeUnixNano":  "1793448015000000000",
-                    "asInt":  "0"
-                  }
-                ],
-                "aggregationTemporality":  "AGGREGATION_TEMPORALITY_CUMULATIVE",
-                "isMonotonic":  true
-              }
-            },
-            {
-              "name":  "shawk.tcp.rtt",
-              "unit":  "s",
-              "histogram":  {
-                "dataPoints":  [
+                    "sum":  0,
+                    "bucketCounts":  [
+                      "0"
+                    ]
+                  },
                   {
                     "attributes":  [
                       {
@@ -736,6 +973,100 @@
                     "bucketCounts":  [
                       "3"
                     ]
+                  }
+                ],
+                "aggregationTemporality":  "AGGREGATION_TEMPORALITY_CUMULATIVE"
+              }
+            },
+            {
+              "name":  "shawk.network.io",
+              "unit":  "By",
+              "sum":  {
+                "dataPoints":  [
+                  {
+                    "attributes":  [
+                      {
+                        "key":  "service.name",
+                        "value":  {
+                          "stringValue":  "app"
+                        }
+                      },
+                      {
+                        "key":  "service.namespace",
+                        "value":  {
+                          "stringValue":  "shop"
+                        }
+                      },
+                      {
+                        "key":  "process.executable.name",
+                        "value":  {
+                          "stringValue":  "ruby"
+                        }
+                      },
+                      {
+                        "key":  "process.executable.path",
+                        "value":  {
+                          "stringValue":  "/usr/bin/ruby"
+                        }
+                      },
+                      {
+                        "key":  "process.command",
+                        "value":  {
+                          "stringValue":  "puma"
+                        }
+                      },
+                      {
+                        "key":  "shawk.unit",
+                        "value":  {
+                          "stringValue":  "app.service"
+                        }
+                      },
+                      {
+                        "key":  "shawk.role",
+                        "value":  {
+                          "stringValue":  "server"
+                        }
+                      },
+                      {
+                        "key":  "network.transport",
+                        "value":  {
+                          "stringValue":  "tcp"
+                        }
+                      },
+                      {
+                        "key":  "network.local.address",
+                        "value":  {
+                          "stringValue":  "10.0.0.11"
+                        }
+                      },
+                      {
+                        "key":  "network.peer.address",
+                        "value":  {
+                          "stringValue":  "10.0.0.5"
+                        }
+                      },
+                      {
+                        "key":  "server.port",
+                        "value":  {
+                          "intValue":  "8080"
+                        }
+                      },
+                      {
+                        "key":  "shawk.netns",
+                        "value":  {
+                          "stringValue":  "4026531840"
+                        }
+                      },
+                      {
+                        "key":  "network.io.direction",
+                        "value":  {
+                          "stringValue":  "transmit"
+                        }
+                      }
+                    ],
+                    "startTimeUnixNano":  "1793448000000000000",
+                    "timeUnixNano":  "1793448015000000000",
+                    "asInt":  "1000"
                   },
                   {
                     "attributes":  [
@@ -810,24 +1141,18 @@
                         "value":  {
                           "stringValue":  "4026531840"
                         }
+                      },
+                      {
+                        "key":  "network.io.direction",
+                        "value":  {
+                          "stringValue":  "receive"
+                        }
                       }
                     ],
                     "startTimeUnixNano":  "1793448000000000000",
                     "timeUnixNano":  "1793448015000000000",
-                    "sum":  0,
-                    "bucketCounts":  [
-                      "0"
-                    ]
-                  }
-                ],
-                "aggregationTemporality":  "AGGREGATION_TEMPORALITY_CUMULATIVE"
-              }
-            },
-            {
-              "name":  "shawk.network.io",
-              "unit":  "By",
-              "sum":  {
-                "dataPoints":  [
+                    "asInt":  "500"
+                  },
                   {
                     "attributes":  [
                       {
@@ -1167,176 +1492,6 @@
                     "startTimeUnixNano":  "1793448000000000000",
                     "timeUnixNano":  "1793448015000000000",
                     "asInt":  "160"
-                  },
-                  {
-                    "attributes":  [
-                      {
-                        "key":  "service.name",
-                        "value":  {
-                          "stringValue":  "app"
-                        }
-                      },
-                      {
-                        "key":  "service.namespace",
-                        "value":  {
-                          "stringValue":  "shop"
-                        }
-                      },
-                      {
-                        "key":  "process.executable.name",
-                        "value":  {
-                          "stringValue":  "ruby"
-                        }
-                      },
-                      {
-                        "key":  "process.executable.path",
-                        "value":  {
-                          "stringValue":  "/usr/bin/ruby"
-                        }
-                      },
-                      {
-                        "key":  "process.command",
-                        "value":  {
-                          "stringValue":  "puma"
-                        }
-                      },
-                      {
-                        "key":  "shawk.unit",
-                        "value":  {
-                          "stringValue":  "app.service"
-                        }
-                      },
-                      {
-                        "key":  "shawk.role",
-                        "value":  {
-                          "stringValue":  "server"
-                        }
-                      },
-                      {
-                        "key":  "network.transport",
-                        "value":  {
-                          "stringValue":  "tcp"
-                        }
-                      },
-                      {
-                        "key":  "network.local.address",
-                        "value":  {
-                          "stringValue":  "10.0.0.11"
-                        }
-                      },
-                      {
-                        "key":  "network.peer.address",
-                        "value":  {
-                          "stringValue":  "10.0.0.5"
-                        }
-                      },
-                      {
-                        "key":  "server.port",
-                        "value":  {
-                          "intValue":  "8080"
-                        }
-                      },
-                      {
-                        "key":  "shawk.netns",
-                        "value":  {
-                          "stringValue":  "4026531840"
-                        }
-                      },
-                      {
-                        "key":  "network.io.direction",
-                        "value":  {
-                          "stringValue":  "transmit"
-                        }
-                      }
-                    ],
-                    "startTimeUnixNano":  "1793448000000000000",
-                    "timeUnixNano":  "1793448015000000000",
-                    "asInt":  "1000"
-                  },
-                  {
-                    "attributes":  [
-                      {
-                        "key":  "service.name",
-                        "value":  {
-                          "stringValue":  "app"
-                        }
-                      },
-                      {
-                        "key":  "service.namespace",
-                        "value":  {
-                          "stringValue":  "shop"
-                        }
-                      },
-                      {
-                        "key":  "process.executable.name",
-                        "value":  {
-                          "stringValue":  "ruby"
-                        }
-                      },
-                      {
-                        "key":  "process.executable.path",
-                        "value":  {
-                          "stringValue":  "/usr/bin/ruby"
-                        }
-                      },
-                      {
-                        "key":  "process.command",
-                        "value":  {
-                          "stringValue":  "puma"
-                        }
-                      },
-                      {
-                        "key":  "shawk.unit",
-                        "value":  {
-                          "stringValue":  "app.service"
-                        }
-                      },
-                      {
-                        "key":  "shawk.role",
-                        "value":  {
-                          "stringValue":  "server"
-                        }
-                      },
-                      {
-                        "key":  "network.transport",
-                        "value":  {
-                          "stringValue":  "tcp"
-                        }
-                      },
-                      {
-                        "key":  "network.local.address",
-                        "value":  {
-                          "stringValue":  "10.0.0.11"
-                        }
-                      },
-                      {
-                        "key":  "network.peer.address",
-                        "value":  {
-                          "stringValue":  "10.0.0.5"
-                        }
-                      },
-                      {
-                        "key":  "server.port",
-                        "value":  {
-                          "intValue":  "8080"
-                        }
-                      },
-                      {
-                        "key":  "shawk.netns",
-                        "value":  {
-                          "stringValue":  "4026531840"
-                        }
-                      },
-                      {
-                        "key":  "network.io.direction",
-                        "value":  {
-                          "stringValue":  "receive"
-                        }
-                      }
-                    ],
-                    "startTimeUnixNano":  "1793448000000000000",
-                    "timeUnixNano":  "1793448015000000000",
-                    "asInt":  "500"
                   }
                 ],
                 "aggregationTemporality":  "AGGREGATION_TEMPORALITY_CUMULATIVE",
@@ -1348,6 +1503,84 @@
               "unit":  "s",
               "gauge":  {
                 "dataPoints":  [
+                  {
+                    "attributes":  [
+                      {
+                        "key":  "service.name",
+                        "value":  {
+                          "stringValue":  "app"
+                        }
+                      },
+                      {
+                        "key":  "service.namespace",
+                        "value":  {
+                          "stringValue":  "shop"
+                        }
+                      },
+                      {
+                        "key":  "process.executable.name",
+                        "value":  {
+                          "stringValue":  "ruby"
+                        }
+                      },
+                      {
+                        "key":  "process.executable.path",
+                        "value":  {
+                          "stringValue":  "/usr/bin/ruby"
+                        }
+                      },
+                      {
+                        "key":  "process.command",
+                        "value":  {
+                          "stringValue":  "puma"
+                        }
+                      },
+                      {
+                        "key":  "shawk.unit",
+                        "value":  {
+                          "stringValue":  "app.service"
+                        }
+                      },
+                      {
+                        "key":  "shawk.role",
+                        "value":  {
+                          "stringValue":  "server"
+                        }
+                      },
+                      {
+                        "key":  "network.transport",
+                        "value":  {
+                          "stringValue":  "tcp"
+                        }
+                      },
+                      {
+                        "key":  "network.local.address",
+                        "value":  {
+                          "stringValue":  "10.0.0.11"
+                        }
+                      },
+                      {
+                        "key":  "network.peer.address",
+                        "value":  {
+                          "stringValue":  "10.0.0.5"
+                        }
+                      },
+                      {
+                        "key":  "server.port",
+                        "value":  {
+                          "intValue":  "8080"
+                        }
+                      },
+                      {
+                        "key":  "shawk.netns",
+                        "value":  {
+                          "stringValue":  "4026531840"
+                        }
+                      }
+                    ],
+                    "timeUnixNano":  "1793448015000000000",
+                    "asInt":  "1793448015"
+                  },
                   {
                     "attributes":  [
                       {
@@ -1492,84 +1725,6 @@
                         "key":  "server.port",
                         "value":  {
                           "intValue":  "53"
-                        }
-                      },
-                      {
-                        "key":  "shawk.netns",
-                        "value":  {
-                          "stringValue":  "4026531840"
-                        }
-                      }
-                    ],
-                    "timeUnixNano":  "1793448015000000000",
-                    "asInt":  "1793448015"
-                  },
-                  {
-                    "attributes":  [
-                      {
-                        "key":  "service.name",
-                        "value":  {
-                          "stringValue":  "app"
-                        }
-                      },
-                      {
-                        "key":  "service.namespace",
-                        "value":  {
-                          "stringValue":  "shop"
-                        }
-                      },
-                      {
-                        "key":  "process.executable.name",
-                        "value":  {
-                          "stringValue":  "ruby"
-                        }
-                      },
-                      {
-                        "key":  "process.executable.path",
-                        "value":  {
-                          "stringValue":  "/usr/bin/ruby"
-                        }
-                      },
-                      {
-                        "key":  "process.command",
-                        "value":  {
-                          "stringValue":  "puma"
-                        }
-                      },
-                      {
-                        "key":  "shawk.unit",
-                        "value":  {
-                          "stringValue":  "app.service"
-                        }
-                      },
-                      {
-                        "key":  "shawk.role",
-                        "value":  {
-                          "stringValue":  "server"
-                        }
-                      },
-                      {
-                        "key":  "network.transport",
-                        "value":  {
-                          "stringValue":  "tcp"
-                        }
-                      },
-                      {
-                        "key":  "network.local.address",
-                        "value":  {
-                          "stringValue":  "10.0.0.11"
-                        }
-                      },
-                      {
-                        "key":  "network.peer.address",
-                        "value":  {
-                          "stringValue":  "10.0.0.5"
-                        }
-                      },
-                      {
-                        "key":  "server.port",
-                        "value":  {
-                          "intValue":  "8080"
                         }
                       },
                       {
@@ -1631,6 +1786,84 @@
                       {
                         "key":  "shawk.role",
                         "value":  {
+                          "stringValue":  "server"
+                        }
+                      },
+                      {
+                        "key":  "network.transport",
+                        "value":  {
+                          "stringValue":  "tcp"
+                        }
+                      },
+                      {
+                        "key":  "network.local.address",
+                        "value":  {
+                          "stringValue":  "10.0.0.11"
+                        }
+                      },
+                      {
+                        "key":  "network.peer.address",
+                        "value":  {
+                          "stringValue":  "10.0.0.5"
+                        }
+                      },
+                      {
+                        "key":  "server.port",
+                        "value":  {
+                          "intValue":  "8080"
+                        }
+                      },
+                      {
+                        "key":  "shawk.netns",
+                        "value":  {
+                          "stringValue":  "4026531840"
+                        }
+                      }
+                    ],
+                    "timeUnixNano":  "1793448015000000000",
+                    "asInt":  "1793448015"
+                  },
+                  {
+                    "attributes":  [
+                      {
+                        "key":  "service.name",
+                        "value":  {
+                          "stringValue":  "app"
+                        }
+                      },
+                      {
+                        "key":  "service.namespace",
+                        "value":  {
+                          "stringValue":  "shop"
+                        }
+                      },
+                      {
+                        "key":  "process.executable.name",
+                        "value":  {
+                          "stringValue":  "ruby"
+                        }
+                      },
+                      {
+                        "key":  "process.executable.path",
+                        "value":  {
+                          "stringValue":  "/usr/bin/ruby"
+                        }
+                      },
+                      {
+                        "key":  "process.command",
+                        "value":  {
+                          "stringValue":  "puma"
+                        }
+                      },
+                      {
+                        "key":  "shawk.unit",
+                        "value":  {
+                          "stringValue":  "app.service"
+                        }
+                      },
+                      {
+                        "key":  "shawk.role",
+                        "value":  {
                           "stringValue":  "client"
                         }
                       },
@@ -1745,7 +1978,15 @@
                     ],
                     "timeUnixNano":  "1793448015000000000",
                     "asInt":  "1793448015"
-                  },
+                  }
+                ]
+              }
+            },
+            {
+              "name":  "shawk.connection.failed",
+              "unit":  "{connection}",
+              "sum":  {
+                "dataPoints":  [
                   {
                     "attributes":  [
                       {
@@ -1787,7 +2028,7 @@
                       {
                         "key":  "shawk.role",
                         "value":  {
-                          "stringValue":  "server"
+                          "stringValue":  "client"
                         }
                       },
                       {
@@ -1805,13 +2046,13 @@
                       {
                         "key":  "network.peer.address",
                         "value":  {
-                          "stringValue":  "10.0.0.5"
+                          "stringValue":  "10.0.0.10"
                         }
                       },
                       {
                         "key":  "server.port",
                         "value":  {
-                          "intValue":  "8080"
+                          "intValue":  "5432"
                         }
                       },
                       {
@@ -1821,10 +2062,13 @@
                         }
                       }
                     ],
+                    "startTimeUnixNano":  "1793448000000000000",
                     "timeUnixNano":  "1793448015000000000",
-                    "asInt":  "1793448015"
+                    "asInt":  "1"
                   }
-                ]
+                ],
+                "aggregationTemporality":  "AGGREGATION_TEMPORALITY_CUMULATIVE",
+                "isMonotonic":  true
               }
             },
             {
@@ -2005,250 +2249,6 @@
                 ],
                 "aggregationTemporality":  "AGGREGATION_TEMPORALITY_CUMULATIVE",
                 "isMonotonic":  true
-              }
-            },
-            {
-              "name":  "shawk.listener.first_seen",
-              "unit":  "s",
-              "gauge":  {
-                "dataPoints":  [
-                  {
-                    "attributes":  [
-                      {
-                        "key":  "service.name",
-                        "value":  {
-                          "stringValue":  "app"
-                        }
-                      },
-                      {
-                        "key":  "service.namespace",
-                        "value":  {
-                          "stringValue":  "shop"
-                        }
-                      },
-                      {
-                        "key":  "process.executable.name",
-                        "value":  {
-                          "stringValue":  "ruby"
-                        }
-                      },
-                      {
-                        "key":  "process.executable.path",
-                        "value":  {
-                          "stringValue":  "/usr/bin/ruby"
-                        }
-                      },
-                      {
-                        "key":  "process.command",
-                        "value":  {
-                          "stringValue":  "puma"
-                        }
-                      },
-                      {
-                        "key":  "shawk.unit",
-                        "value":  {
-                          "stringValue":  "app.service"
-                        }
-                      },
-                      {
-                        "key":  "network.transport",
-                        "value":  {
-                          "stringValue":  "tcp"
-                        }
-                      },
-                      {
-                        "key":  "network.local.address",
-                        "value":  {
-                          "stringValue":  "0.0.0.0"
-                        }
-                      },
-                      {
-                        "key":  "server.port",
-                        "value":  {
-                          "intValue":  "8080"
-                        }
-                      },
-                      {
-                        "key":  "shawk.netns",
-                        "value":  {
-                          "stringValue":  "4026531840"
-                        }
-                      }
-                    ],
-                    "timeUnixNano":  "1793448015000000000",
-                    "asInt":  "1793448015"
-                  },
-                  {
-                    "attributes":  [
-                      {
-                        "key":  "service.name",
-                        "value":  {
-                          "stringValue":  ""
-                        }
-                      },
-                      {
-                        "key":  "process.command",
-                        "value":  {
-                          "stringValue":  ""
-                        }
-                      },
-                      {
-                        "key":  "shawk.unit",
-                        "value":  {
-                          "stringValue":  ""
-                        }
-                      },
-                      {
-                        "key":  "network.transport",
-                        "value":  {
-                          "stringValue":  "udp"
-                        }
-                      },
-                      {
-                        "key":  "network.local.address",
-                        "value":  {
-                          "stringValue":  "0.0.0.0"
-                        }
-                      },
-                      {
-                        "key":  "server.port",
-                        "value":  {
-                          "intValue":  "68"
-                        }
-                      },
-                      {
-                        "key":  "shawk.netns",
-                        "value":  {
-                          "stringValue":  "4026531840"
-                        }
-                      }
-                    ],
-                    "timeUnixNano":  "1793448015000000000",
-                    "asInt":  "1793448015"
-                  }
-                ]
-              }
-            },
-            {
-              "name":  "shawk.listener.last_seen",
-              "unit":  "s",
-              "gauge":  {
-                "dataPoints":  [
-                  {
-                    "attributes":  [
-                      {
-                        "key":  "service.name",
-                        "value":  {
-                          "stringValue":  "app"
-                        }
-                      },
-                      {
-                        "key":  "service.namespace",
-                        "value":  {
-                          "stringValue":  "shop"
-                        }
-                      },
-                      {
-                        "key":  "process.executable.name",
-                        "value":  {
-                          "stringValue":  "ruby"
-                        }
-                      },
-                      {
-                        "key":  "process.executable.path",
-                        "value":  {
-                          "stringValue":  "/usr/bin/ruby"
-                        }
-                      },
-                      {
-                        "key":  "process.command",
-                        "value":  {
-                          "stringValue":  "puma"
-                        }
-                      },
-                      {
-                        "key":  "shawk.unit",
-                        "value":  {
-                          "stringValue":  "app.service"
-                        }
-                      },
-                      {
-                        "key":  "network.transport",
-                        "value":  {
-                          "stringValue":  "tcp"
-                        }
-                      },
-                      {
-                        "key":  "network.local.address",
-                        "value":  {
-                          "stringValue":  "0.0.0.0"
-                        }
-                      },
-                      {
-                        "key":  "server.port",
-                        "value":  {
-                          "intValue":  "8080"
-                        }
-                      },
-                      {
-                        "key":  "shawk.netns",
-                        "value":  {
-                          "stringValue":  "4026531840"
-                        }
-                      }
-                    ],
-                    "timeUnixNano":  "1793448015000000000",
-                    "asInt":  "1793448015"
-                  },
-                  {
-                    "attributes":  [
-                      {
-                        "key":  "service.name",
-                        "value":  {
-                          "stringValue":  ""
-                        }
-                      },
-                      {
-                        "key":  "process.command",
-                        "value":  {
-                          "stringValue":  ""
-                        }
-                      },
-                      {
-                        "key":  "shawk.unit",
-                        "value":  {
-                          "stringValue":  ""
-                        }
-                      },
-                      {
-                        "key":  "network.transport",
-                        "value":  {
-                          "stringValue":  "udp"
-                        }
-                      },
-                      {
-                        "key":  "network.local.address",
-                        "value":  {
-                          "stringValue":  "0.0.0.0"
-                        }
-                      },
-                      {
-                        "key":  "server.port",
-                        "value":  {
-                          "intValue":  "68"
-                        }
-                      },
-                      {
-                        "key":  "shawk.netns",
-                        "value":  {
-                          "stringValue":  "4026531840"
-                        }
-                      }
-                    ],
-                    "timeUnixNano":  "1793448015000000000",
-                    "asInt":  "1793448015"
-                  }
-                ]
               }
             },
             {
