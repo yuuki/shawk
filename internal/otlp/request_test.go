@@ -49,7 +49,7 @@ func TestRequest(t *testing.T) {
 		Process: tcp.Process}, end)
 
 	res := Resource{
-		MachineID: "0123", Hostname: "app-01", Kernel: "5.14.0", AgentVersion: "v1.2.3",
+		MachineID: "0123", Hostname: "app-01", Kernel: "5.14.0", AgentVersion: "1.2.3",
 		Addrs: []netip.Addr{netip.MustParseAddr("10.0.0.11")},
 	}
 	started := t0.Add(-time.Hour)
@@ -64,7 +64,7 @@ func TestRequest(t *testing.T) {
 	rm := req.ResourceMetrics[0]
 	ra := attrMap(rm.Resource.Attributes)
 	for k, v := range map[string]string{"host.id": "0123", "host.name": "app-01", "os.version": "5.14.0",
-		"service.name": "shawk-agent", "service.version": "v1.2.3"} {
+		"service.name": "shawk-agent", "service.version": "1.2.3"} {
 		if ra[k] != v {
 			t.Errorf("resource %s = %v, want %v", k, ra[k], v)
 		}

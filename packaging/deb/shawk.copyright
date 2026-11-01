@@ -3,12 +3,26 @@ Upstream-Name: shawk
 Upstream-Contact: Yuuki TSUBOUCHI <yuki.tsubo@gmail.com>
 Source: https://github.com/yuuki/shawk
 Comment: /usr/bin/shawk embeds the compiled eBPF programs
- (internal/tracer/bpf_bpfel.o), which are built from the files of the
- second and third paragraphs. See also /usr/share/doc/shawk/NOTICE.
+ (internal/tracer/bpf_bpfel.o, see its paragraph). It also statically links
+ the Go standard library and third-party Go modules, which are not part of
+ this source and are under their own licenses (BSD-3-Clause, MIT,
+ Apache-2.0 and others); their texts are in
+ /usr/share/doc/shawk/THIRD_PARTY_NOTICES. See also
+ /usr/share/doc/shawk/NOTICE.
 
 Files: *
 Copyright: 2019-2026 Yuuki Tsubouchi
 License: Apache-2.0
+
+Files: internal/tracer/bpf_bpfel.o
+Copyright: 2026 Yuuki Tsubouchi
+ The libbpf authors (https://github.com/libbpf/libbpf)
+ The Linux kernel authors
+License: GPL-2 or BSD-2-clause
+Comment: The eBPF object embedded in /usr/bin/shawk, compiled from the eBPF
+ programs with the libbpf headers and the kernel types of vmlinux.h (see
+ their paragraphs); it carries BTF descriptions of the kernel types the
+ programs use, for CO-RE relocations.
 
 Files: internal/tracer/bpf/shawk.bpf.c
  internal/tracer/bpf/shawk.h

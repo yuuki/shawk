@@ -3,6 +3,7 @@ package packaging
 import (
 	"bufio"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -21,15 +22,33 @@ type nfpmContent struct {
 	Packager string `yaml:"packager"`
 }
 
+// archiveFile is a file of an archive: a glob, or a src with options.
+type archiveFile struct {
+	Src         string `yaml:"src"`
+	StripParent bool   `yaml:"strip_parent"`
+}
+
+func (f *archiveFile) UnmarshalYAML(n *yaml.Node) error {
+	if n.Kind == yaml.ScalarNode {
+		f.Src = n.Value
+		return nil
+	}
+	type plain archiveFile
+	return n.Decode((*plain)(f))
+}
+
 type releaseConfig struct {
+	Before struct {
+		Hooks []string `yaml:"hooks"`
+	} `yaml:"before"`
 	Builds []struct {
 		ID     string `yaml:"id"`
 		Binary string `yaml:"binary"`
 	} `yaml:"builds"`
 	Archives []struct {
-		ID    string   `yaml:"id"`
-		IDs   []string `yaml:"ids"`
-		Files []string `yaml:"files"`
+		ID    string        `yaml:"id"`
+		IDs   []string      `yaml:"ids"`
+		Files []archiveFile `yaml:"files"`
 	} `yaml:"archives"`
 	NFPMs []struct {
 		ID          string        `yaml:"id"`
@@ -54,6 +73,20 @@ func loadReleaseConfig(t *testing.T) releaseConfig {
 	return c
 }
 
+// generated reports whether a file is written by a before hook of the
+// release, which the test cannot run; it fails the test for a file under
+// build/ that no hook writes.
+func generated(t *testing.T, c releaseConfig, file string) bool {
+	t.Helper()
+	if !strings.HasPrefix(file, "build/") {
+		return false
+	}
+	if !slices.ContainsFunc(c.Before.Hooks, func(h string) bool { return strings.Contains(h, "-o "+file+" ") }) {
+		t.Errorf("no before hook writes %s", file)
+	}
+	return true
+}
+
 // TestReleasePackages checks the archives and packages of .goreleaser.yml
 // against the files they ship and the systemd units they install.
 func TestReleasePackages(t *testing.T) {
@@ -65,7 +98,15 @@ func TestReleasePackages(t *testing.T) {
 	archived := map[string][]string{} // files of the archive of each build
 	for _, a := range c.Archives {
 		var files []string
-		for _, glob := range a.Files {
+		for _, af := range a.Files {
+			glob := af.Src
+			if generated(t, c, glob) {
+				if !af.StripParent {
+					t.Errorf("archive %s: %s is not at the root of the archive", a.ID, glob)
+				}
+				files = append(files, glob)
+				continue
+			}
 			m, _ := filepath.Glob(filepath.Join(root, glob))
 			if len(m) == 0 {
 				t.Errorf("archive %s: %s matches no file", a.ID, glob)
@@ -87,8 +128,10 @@ func TestReleasePackages(t *testing.T) {
 			}
 		}
 		for _, ct := range p.Contents {
-			if _, err := os.Stat(filepath.Join(root, ct.Src)); err != nil {
-				t.Errorf("%s: %v", p.ID, err)
+			if !generated(t, c, ct.Src) {
+				if _, err := os.Stat(filepath.Join(root, ct.Src)); err != nil {
+					t.Errorf("%s: %v", p.ID, err)
+				}
 			}
 			for _, f := range []string{"deb", "rpm"} {
 				if ct.Packager == "" || ct.Packager == f {
@@ -104,11 +147,31 @@ func TestReleasePackages(t *testing.T) {
 				}
 			}
 		}
+		// rpm keeps the license texts in /usr/share/licenses, deb its
+		// copyright file and the notices in /usr/share/doc.
+		doc, licenses := "/usr/share/doc/"+p.PackageName+"/", "/usr/share/licenses/"+p.PackageName+"/"
+		want := map[string][]string{
+			"deb": {doc + "copyright", doc + "THIRD_PARTY_NOTICES"},
+			"rpm": {licenses + "LICENSE", licenses + "THIRD_PARTY_NOTICES"},
+		}
+		if p.PackageName == "shawk" {
+			want["deb"] = append(want["deb"], doc+"NOTICE")
+			want["rpm"] = append(want["rpm"], licenses+"NOTICE")
+			texts, _ := filepath.Glob(filepath.Join(root, "LICENSES/*"))
+			for _, f := range texts {
+				want["rpm"] = append(want["rpm"], licenses+filepath.Base(f))
+			}
+		}
 		for _, f := range p.Formats {
-			docCopyright := installed[f]["/usr/share/doc/"+p.PackageName+"/copyright"]
-			license := installed[f]["/usr/share/licenses/"+p.PackageName+"/LICENSE"]
-			if f == "deb" && (!docCopyright || license) || f == "rpm" && (docCopyright || !license) {
-				t.Errorf("%s %s: /usr/share/doc copyright %v, /usr/share/licenses %v", p.ID, f, docCopyright, license)
+			for _, dst := range want[f] {
+				if !installed[f][dst] {
+					t.Errorf("%s %s: %s is not installed", p.ID, f, dst)
+				}
+			}
+			for dst := range installed[f] {
+				if f == "deb" && strings.HasPrefix(dst, "/usr/share/licenses/") || f == "rpm" && dst == doc+"copyright" {
+					t.Errorf("%s %s: %s is installed", p.ID, f, dst)
+				}
 			}
 		}
 		// The units start an installed binary and read installed files.
@@ -175,6 +238,9 @@ func TestUnitsSandboxed(t *testing.T) {
 	}
 }
 
+// unitSettings returns the settings of a unit. The values of a key given
+// several times are joined with spaces, as systemd accumulates lists such as
+// SystemCallFilter=; the units do not reset a list with an empty value.
 func unitSettings(t *testing.T, file string) map[string]string {
 	t.Helper()
 	f, err := os.Open(file)
@@ -185,11 +251,41 @@ func unitSettings(t *testing.T, file string) map[string]string {
 	out := map[string]string{}
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
-		if k, v, ok := strings.Cut(sc.Text(), "="); ok && !strings.HasPrefix(k, "#") {
-			out[k] = v
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || line[0] == '#' || line[0] == ';' || line[0] == '[' {
+			continue
 		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			t.Fatalf("%s: malformed line %q", file, line)
+		}
+		k, v = strings.TrimSpace(k), strings.TrimSpace(v)
+		if prev, ok := out[k]; ok && prev != "" {
+			v = prev + " " + v
+		}
+		out[k] = v
 	}
 	return out
+}
+
+// TestUnitsVerify checks the units with systemd-analyze, which reports the
+// settings it does not know, e.g. misspelt ones, which systemd ignores.
+func TestUnitsVerify(t *testing.T) {
+	analyze, err := exec.LookPath("systemd-analyze")
+	if err != nil {
+		t.Skip("systemd-analyze is not available")
+	}
+	units, _ := filepath.Glob(filepath.Join(root, "packaging/systemd/*.service"))
+	for _, u := range units {
+		out, _ := exec.Command(analyze, "verify", u).CombinedOutput()
+		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+			// The binaries are not installed here.
+			if line == "" || strings.Contains(line, "is not executable") {
+				continue
+			}
+			t.Errorf("%s: %s", filepath.Base(u), line)
+		}
+	}
 }
 
 // dep5 parses a machine-readable debian/copyright file into paragraphs of
@@ -266,18 +362,28 @@ func TestDebianCopyright(t *testing.T) {
 				}
 			}
 		}
-		if filepath.Base(file) != "shawk.copyright" {
+		// The binaries link third-party modules, whose licenses the
+		// package ships next to the copyright file.
+		pkg := strings.TrimSuffix(filepath.Base(file), ".copyright")
+		if !strings.Contains(strings.Join(strings.Fields(paras[0]["Comment"]), " "), "/usr/share/doc/"+pkg+"/THIRD_PARTY_NOTICES") {
+			t.Errorf("%s: the header does not refer to /usr/share/doc/%s/THIRD_PARTY_NOTICES", file, pkg)
+		}
+		if pkg != "shawk" {
 			continue
 		}
+		bpf := []string{"internal/tracer/bpf_bpfel.o"}
 		filepath.WalkDir(filepath.Join(root, "internal/tracer/bpf"), func(f string, d os.DirEntry, err error) error {
 			if err != nil || d.IsDir() {
 				return err
 			}
 			rel, _ := filepath.Rel(root, f)
-			if !slices.ContainsFunc(patterns, func(re *regexp.Regexp) bool { return re.MatchString(filepath.ToSlash(rel)) }) {
-				t.Errorf("%s: %s is not covered by its own paragraph", file, rel)
-			}
+			bpf = append(bpf, filepath.ToSlash(rel))
 			return nil
 		})
+		for _, rel := range bpf {
+			if !slices.ContainsFunc(patterns, func(re *regexp.Regexp) bool { return re.MatchString(rel) }) {
+				t.Errorf("%s: %s is not covered by its own paragraph", file, rel)
+			}
+		}
 	}
 }

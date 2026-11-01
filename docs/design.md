@@ -222,7 +222,7 @@ plain byte in recent kernels but a 4-bit bitfield at a different offset in
 5.14.
 
 The kernel types come from `internal/tracer/bpf/include/vmlinux.h`, dumped
-by bpftool from the BTF of Linux 6.18.44 (x86_64). `scripts/gen-vmlinux.sh`
+by bpftool from the BTF of Linux 6.18.44 (x86_64, release `6.18.44-fc-v185`). `scripts/gen-vmlinux.sh`
 (`make vmlinux`) regenerates it from the running kernel or a BTF file and
 records the kernel in its first lines.
 

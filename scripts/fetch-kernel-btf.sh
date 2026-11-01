@@ -30,19 +30,23 @@ if [[ -f "$rpm" ]] && ! verified "$rpm"; then
 	echo "$rpm does not match its SHA-256; downloading it again" >&2
 	rm -f "$rpm"
 fi
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+
 if [[ ! -f "$rpm" ]]; then
 	mkdir -p "$cache"
-	curl -fsSL -o "$rpm.part" "$url"
-	if ! verified "$rpm.part"; then
-		rm -f "$rpm.part"
+	# A download of its own, renamed into the cache once verified, so that
+	# concurrent runs neither clash nor see a partial file.
+	part="$(mktemp "$cache/.download.XXXXXX")"
+	trap 'rm -rf "$work" "$part"' EXIT
+	curl -fsSL -o "$part" "$url"
+	if ! verified "$part"; then
 		echo "$url does not match the SHA-256 $sha256" >&2
 		exit 1
 	fi
-	mv "$rpm.part" "$rpm"
+	chmod 0644 "$part"
+	mv -f "$part" "$rpm"
 fi
-
-work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
 
 (cd "$work" && rpm2cpio "$rpm" | cpio -idm --quiet './lib/modules/*/vmlinuz')
 

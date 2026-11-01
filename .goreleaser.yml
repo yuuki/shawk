@@ -6,6 +6,10 @@ before:
     # Generate the sources of the collector with the shawk connector, with
     # the version of the release; goreleaser compiles them below.
     - sh scripts/generate-collector.sh {{ .Version }}
+    # The license texts of the Go modules linked into each binary, which
+    # the archives, packages and image ship with them.
+    - go run ./scripts/third-party-notices -o build/notices/shawk/THIRD_PARTY_NOTICES .=./cmd/shawk
+    - go run ./scripts/third-party-notices -o build/notices/shawk-collector/THIRD_PARTY_NOTICES collector/_build=. collector=./cmd/shawk-migrate
 
 builds:
   - id: shawk
@@ -66,6 +70,8 @@ archives:
       - LICENSE
       - NOTICE
       - LICENSES/*
+      - src: build/notices/shawk/THIRD_PARTY_NOTICES
+        strip_parent: true
       - packaging/systemd/shawk-agent.service
       - packaging/systemd/agent.env
   - id: shawk-collector
@@ -74,6 +80,8 @@ archives:
     files:
       - README.md
       - LICENSE
+      - src: build/notices/shawk-collector/THIRD_PARTY_NOTICES
+        strip_parent: true
       - packaging/collector/*
       - packaging/postgres/*
       - packaging/systemd/shawk-collector.service
@@ -120,11 +128,17 @@ nfpms:
       - src: LICENSES/BSD-2-Clause.txt
         dst: /usr/share/licenses/shawk/BSD-2-Clause.txt
         packager: rpm
+      - src: build/notices/shawk/THIRD_PARTY_NOTICES
+        dst: /usr/share/licenses/shawk/THIRD_PARTY_NOTICES
+        packager: rpm
       - src: packaging/deb/shawk.copyright
         dst: /usr/share/doc/shawk/copyright
         packager: deb
       - src: NOTICE
         dst: /usr/share/doc/shawk/NOTICE
+        packager: deb
+      - src: build/notices/shawk/THIRD_PARTY_NOTICES
+        dst: /usr/share/doc/shawk/THIRD_PARTY_NOTICES
         packager: deb
 
   - id: shawk-collector
@@ -155,8 +169,14 @@ nfpms:
       - src: LICENSE
         dst: /usr/share/licenses/shawk-collector/LICENSE
         packager: rpm
+      - src: build/notices/shawk-collector/THIRD_PARTY_NOTICES
+        dst: /usr/share/licenses/shawk-collector/THIRD_PARTY_NOTICES
+        packager: rpm
       - src: packaging/deb/shawk-collector.copyright
         dst: /usr/share/doc/shawk-collector/copyright
+        packager: deb
+      - src: build/notices/shawk-collector/THIRD_PARTY_NOTICES
+        dst: /usr/share/doc/shawk-collector/THIRD_PARTY_NOTICES
         packager: deb
     scripts:
       preinstall: packaging/collector/preinstall.sh
@@ -165,6 +185,9 @@ dockers_v2:
   - id: shawk-collector
     ids: [shawk-collector, shawk-migrate]
     dockerfile: collector/Dockerfile
+    extra_files:
+      - LICENSE
+      - build/notices/shawk-collector/THIRD_PARTY_NOTICES
     images:
       - ghcr.io/yuuki/shawk-collector
     tags:

@@ -3,7 +3,12 @@ Upstream-Name: shawk
 Upstream-Contact: Yuuki TSUBOUCHI <yuki.tsubo@gmail.com>
 Source: https://github.com/yuuki/shawk
 Comment: shawk-collector is the OpenTelemetry Collector built with the
- shawk connector (collector/); it contains no eBPF programs.
+ shawk connector (collector/); it contains no eBPF programs. It and
+ shawk-migrate statically link the Go standard library and third-party Go
+ modules, foremost the OpenTelemetry Collector (Copyright The OpenTelemetry
+ Authors, Apache-2.0), which are not part of this source and are under
+ their own licenses (Apache-2.0, BSD-3-Clause, MIT, ISC and others); their
+ texts are in /usr/share/doc/shawk-collector/THIRD_PARTY_NOTICES.
 
 Files: *
 Copyright: 2019-2026 Yuuki Tsubouchi

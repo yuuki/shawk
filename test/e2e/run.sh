@@ -130,7 +130,7 @@ service:
 EOF
 "$COLLECTOR" --config "$WORK/collector.yaml" >"$WORK/collector.log" 2>&1 &
 PIDS+=($!)
-wait_for 30 "the collector to listen" listening root 4327
+wait_for 30 "the collector to listen" sh -c "ss -Hltn 'src $NET.1:4327' | grep -q ."
 
 for h in lb app db; do
 	# A UTS namespace gives each simulated host its own host name. The hosts

@@ -1,6 +1,7 @@
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 # The version without the v of the tag (0.8.0), as in the release binaries,
-# packages and collector built by goreleaser.
-VERSION ?= $(patsubst v%,%,$(shell git describe --tags --always --dirty 2>/dev/null || echo dev))
+# packages and collector built by goreleaser, also when given as v0.8.0.
+override VERSION := $(patsubst v%,%,$(VERSION))
 LDFLAGS := -s -w -X github.com/yuuki/shawk/internal/version.Version=$(VERSION)
 GO ?= go
 
@@ -35,8 +36,9 @@ test: ## unit tests; BPF tests need root, PostgreSQL tests need SHAWK_TEST_POSTG
 OCB_VERSION ?= v0.164.0
 
 .PHONY: collector
-collector: ## build the collector with the shawk connector (collector/_build/shawk-collector)
-	cd collector && $(GO) run go.opentelemetry.io/collector/cmd/builder@$(OCB_VERSION) --config builder-config.yaml
+collector: ## build the collector with the shawk connector and VERSION (collector/_build/shawk-collector)
+	OCB_VERSION=$(OCB_VERSION) sh scripts/generate-collector.sh $(VERSION)
+	cd collector/_build && CGO_ENABLED=0 $(GO) build -trimpath -ldflags "-s -w" -o shawk-collector .
 
 .PHONY: shawk-migrate
 shawk-migrate: ## build the command that applies the PostgreSQL schema

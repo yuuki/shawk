@@ -1,3 +1,19 @@
+## Unreleased
+
+* The systemd units are sandboxed: the agent keeps only the capabilities it
+  needs (`CAP_BPF`, `CAP_PERFMON`, `CAP_SYS_ADMIN`, `CAP_SYS_PTRACE`,
+  `CAP_DAC_READ_SEARCH`) and both units filter system calls and address
+  families. `ProtectHome=yes` replaces `read-only`: the binary and the TLS
+  files of the agent must not be under `/home` or `/root`; override it with a
+  drop-in otherwise.
+* The release archive of the agent contains its systemd unit and
+  `agent.env`; deb packages have their copyright in
+  `/usr/share/doc/<package>/copyright`; archives, packages and the collector
+  image ship the licenses of the Go modules linked into the binaries
+  (`THIRD_PARTY_NOTICES`).
+* `make build` and `make collector` set the version without the `v` of the
+  tag (`0.8.0`), like the release.
+
 ## [v0.8.0](https://github.com/yuuki/shawk/compare/v0.7.1...v0.8.0) (2026-11-01)
 
 Rewritten from scratch.
