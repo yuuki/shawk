@@ -178,11 +178,15 @@ func TestOtherNetNS(t *testing.T) {
 	}
 
 	tr := newTestTracer(t)
-	time.Sleep(300 * time.Millisecond)
 	if _, err := tr.Collect(); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(300 * time.Millisecond)
+	// One round trip of 100 bytes in the interval.
+	fmt.Fprintln(stdin, "go")
+	if !sc.Scan() || sc.Text() != "DONE" {
+		t.Fatalf("helper did not exchange: %q", sc.Text())
+	}
+	time.Sleep(100 * time.Millisecond)
 	snap, err := tr.Collect()
 	if err != nil {
 		t.Fatal(err)
@@ -202,10 +206,10 @@ func TestOtherNetNS(t *testing.T) {
 			in = f
 		}
 	}
-	if out == nil || out.OpenConns != 1 || out.BytesSent == 0 || out.PID != pid {
+	if out == nil || out.OpenConns != 1 || out.BytesSent != 100 || out.BytesRecv != 100 || out.PID != pid {
 		t.Errorf("outgoing flow in the other namespace = %+v", out)
 	}
-	if in == nil || in.OpenConns != 1 || in.BytesRecv == 0 || in.PID != pid {
+	if in == nil || in.OpenConns != 1 || in.BytesSent != 100 || in.BytesRecv != 100 || in.PID != pid {
 		t.Errorf("incoming flow in the other namespace = %+v", in)
 	}
 	var listener *Listener
@@ -220,8 +224,8 @@ func TestOtherNetNS(t *testing.T) {
 }
 
 // TestHelperNetNSPair is run by TestOtherNetNS. In the network namespace
-// at SHAWK_TEST_NETNS_PAIR, it keeps a connection to its own listener busy
-// until stdin is closed.
+// at SHAWK_TEST_NETNS_PAIR, it connects to its own listener, and makes a
+// round trip of 100 bytes for every line of stdin until stdin is closed.
 func TestHelperNetNSPair(t *testing.T) {
 	path := os.Getenv("SHAWK_TEST_NETNS_PAIR")
 	if path == "" {
@@ -235,19 +239,12 @@ func TestHelperNetNSPair(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Close()
+	roundTrip(t, c, 100)
 	fmt.Printf("PORT %d\n", ln.Addr().(*net.TCPAddr).Port)
-	done := make(chan struct{})
-	go func() {
-		bufio.NewReader(os.Stdin).ReadString('\n')
-		close(done)
-	}()
-	for {
-		select {
-		case <-done:
-			return
-		case <-time.After(50 * time.Millisecond):
-			roundTrip(t, c, 100)
-		}
+	in := bufio.NewScanner(os.Stdin)
+	for in.Scan() {
+		roundTrip(t, c, 100)
+		fmt.Println("DONE")
 	}
 }
 
