@@ -9,7 +9,8 @@
 #                                        app puma ==persistent==> db:5433 postgres
 #                                                         db:9187 exporter (unused)
 #
-# Requires root, iproute2, python3, psql and unshare (util-linux).
+# Requires root, iproute2 (ip, ss), python3, psql and unshare (util-linux).
+# Every wait polls with a deadline.
 # SHAWK_E2E_POSTGRES_DSN is a database dedicated to the test: its schemas
 # shawk and shawk_v1 are dropped and recreated.
 # Usage: test/e2e/run.sh path/to/shawk path/to/shawk-collector
@@ -44,6 +45,31 @@ fail() {
 
 sql() { PGOPTIONS='-c client_min_messages=warning' psql "$DSN" -v ON_ERROR_STOP=1 -AXqt -F ' ' -c "$1"; }
 
+# poll SECONDS COMMAND...: runs COMMAND until it succeeds; returns 1 when
+# it has not after SECONDS.
+poll() {
+	local deadline=$((SECONDS + $1))
+	shift
+	until "$@"; do
+		((SECONDS < deadline)) || return 1
+		sleep 0.2
+	done
+}
+
+# wait_for SECONDS DESCRIPTION COMMAND...: polls COMMAND or fails.
+wait_for() { poll "$1" "${@:3}" || fail "timed out waiting for $2"; }
+
+# listening HOST PORT: whether a TCP socket listens on PORT in the namespace
+# of HOST, or in the root namespace for "root".
+listening() {
+	local in=()
+	[[ "$1" == root ]] || in=(ip netns exec "$PREFIX-$1")
+	[[ -n "$("${in[@]}" ss -Hltn "sport = :$2")" ]]
+}
+
+# connected HOST ADDR:PORT: whether HOST has a TCP connection to ADDR:PORT.
+connected() { [[ -n "$(ip netns exec "$PREFIX-$1" ss -Htn state established "dst $2")" ]]; }
+
 # Network: a bridge in the root namespace and one namespace per host.
 ip link add "$PREFIX-br" type bridge
 ip addr add $NET.1/24 dev "$PREFIX-br"
@@ -71,13 +97,16 @@ svc() { # host name args...
 }
 
 svc db postgres --listen 5432 --listen 5433
-svc db postgres --listen 9187 --bind ${ADDR[db]}
+svc db postgres --listen 9187 --bind "${ADDR[db]}"
 svc app redis-server --listen 6379 --bind 127.0.0.1
-sleep 1
+for p in 5432 5433 9187; do wait_for 10 "postgres to listen on $p" listening db $p; done
+wait_for 10 "redis-server to listen" listening app 6379
 # A long-lived connection established before any agent starts.
-svc app puma --listen 8080 --upstream ${ADDR[db]}:5432 --upstream 127.0.0.1:6379 --persist ${ADDR[db]}:5433
-svc lb haproxy --listen 80 --upstream ${ADDR[app]}:8080
-sleep 2
+svc app puma --listen 8080 --upstream "${ADDR[db]}:5432" --upstream 127.0.0.1:6379 --persist "${ADDR[db]}:5433"
+svc lb haproxy --listen 80 --upstream "${ADDR[app]}:8080"
+wait_for 10 "puma to listen" listening app 8080
+wait_for 10 "haproxy to listen" listening lb 80
+wait_for 10 "the persistent connection of puma" connected app "${ADDR[db]}:5433"
 
 # The collector listens on the bridge, where the agents reach it.
 sql "DROP SCHEMA IF EXISTS shawk_v1 CASCADE; DROP SCHEMA IF EXISTS shawk CASCADE" >/dev/null
@@ -101,6 +130,7 @@ service:
 EOF
 "$COLLECTOR" --config "$WORK/collector.yaml" >"$WORK/collector.log" 2>&1 &
 PIDS+=($!)
+wait_for 30 "the collector to listen" sh -c "ss -Hltn 'src $NET.1:4327' | grep -q ."
 
 for h in lb app db; do
 	# A UTS namespace gives each simulated host its own host name. The hosts
@@ -109,14 +139,33 @@ for h in lb app db; do
 	ip netns exec "$PREFIX-$h" unshare --uts sh -c "hostname $h-01 && exec \"$SHAWK\" agent -netns self -interval 1s -max-series-per-request 3 -otlp-endpoint http://$NET.1:4327" >"$WORK/$h-agent.log" 2>&1 &
 	PIDS+=($!)
 done
-for _ in $(seq 60); do
-	[[ "$(sql "SELECT count(*) FROM shawk_v1.agents WHERE alive" 2>/dev/null)" == 3 ]] && break
-	sleep 0.5
-done
-[[ "$(sql "SELECT count(*) FROM shawk_v1.agents WHERE alive")" == 3 ]] || fail "the agents did not report"
+agents_alive() { [[ "$(sql "SELECT count(*) FROM shawk_v1.agents WHERE alive" 2>/dev/null)" == 3 ]]; }
+wait_for 30 "the agents to report" agents_alive
 
-svc ext client --client ${ADDR[lb]}:80
-sleep 8
+svc ext client --client "${ADDR[lb]}:80"
+
+# Wait until the connector has written every dependency and forwarded the
+# metrics that name the peers; the checks below report what is missing.
+deps_sql="
+SELECT coalesce(client_host, host(client_addr)), coalesce(client_service, '-'), coalesce(server_host, '-'),
+       coalesce(server_service, '-'), port, observed_by
+FROM shawk_v1.dependencies
+WHERE port IN (80, 8080, 5432, 5433, 6379)
+ORDER BY port, 1"
+deps_want="10.231.0.50 - lb-01 haproxy 80 server
+app-01 puma db-01 postgres 5432 both
+app-01 puma db-01 postgres 5433 both
+app-01 puma app-01 redis-server 6379 both
+lb-01 haproxy app-01 puma 8080 both"
+deps_written() { [[ "$(sql "$deps_sql" 2>/dev/null)" == "$deps_want" ]]; }
+peers_named() {
+	local peer
+	for peer in postgres haproxy '~unresolved'; do
+		grep -qF "service.peer.name: Str($peer)" "$WORK/collector.log" || return 1
+	done
+}
+poll 60 deps_written || true
+poll 30 peers_named || true
 
 check() { # description, SQL, expected output
 	local got
@@ -127,17 +176,7 @@ check() { # description, SQL, expected output
 	[[ "$got" == "$3" ]] || fail "$1: got '$got', want '$3'"
 }
 
-check "dependencies" "
-SELECT coalesce(client_host, host(client_addr)), coalesce(client_service, '-'), coalesce(server_host, '-'),
-       coalesce(server_service, '-'), port, observed_by
-FROM shawk_v1.dependencies
-WHERE port IN (80, 8080, 5432, 5433, 6379)
-ORDER BY port, 1" \
-"10.231.0.50 - lb-01 haproxy 80 server
-app-01 puma db-01 postgres 5432 both
-app-01 puma db-01 postgres 5433 both
-app-01 puma app-01 redis-server 6379 both
-lb-01 haproxy app-01 puma 8080 both"
+check "dependencies" "$deps_sql" "$deps_want"
 
 check "unused listeners" "
 SELECT s.host, s.port, s.service

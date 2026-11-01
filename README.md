@@ -54,7 +54,10 @@ See [docs/design.md](docs/design.md) for the design.
   loading them on Ubuntu kernels 6.8 to 7.0 and checked statically against
   the Rocky Linux 9.6 kernel; they have not yet run on a Rocky Linux kernel,
   on upstream 5.14 to 5.18, or on arm64. See [the design](docs/design.md#35-kernel-requirements-and-features-used).
-  The agent runs as root in the host PID namespace. UDP tracing
+  The agent runs as root in the host PID namespace; its systemd unit
+  sandboxes it and limits it to `CAP_BPF`, `CAP_PERFMON`, `CAP_SYS_ADMIN`
+  (to enter other network namespaces), `CAP_SYS_PTRACE` and
+  `CAP_DAC_READ_SEARCH` (to read `/proc` of other processes). UDP tracing
   additionally needs BPF trampolines (fentry), available on x86_64 and on
   arm64 since Linux 6.0; without them only TCP is traced.
 * PostgreSQL 14 or later.
@@ -68,10 +71,11 @@ See [docs/design.md](docs/design.md) for the design.
 
 shawk is a single static binary. The deb and rpm packages of a release
 install it as `/usr/bin/shawk` with the systemd unit `shawk-agent.service`.
-To install a build by hand:
+To install a release tarball, which contains `shawk` and `packaging/systemd/`,
+or a build by hand:
 
 ```bash
-make build                      # builds ./shawk (needs Go only)
+make build                      # builds ./shawk (needs Go only); or extract the tarball
 sudo install -m 0755 shawk /usr/local/bin/shawk
 sed 's|/usr/bin/shawk|/usr/local/bin/shawk|' packaging/systemd/shawk-agent.service |
   sudo tee /etc/systemd/system/shawk-agent.service >/dev/null
@@ -178,8 +182,11 @@ make test       # unit tests of all modules; BPF tests run as root,
 make test-root  # load the BPF programs into the running kernel (sudo)
 make e2e        # multi-host test with network namespaces, a collector and
                 # PostgreSQL (sudo, SHAWK_E2E_POSTGRES_DSN)
-make compat     # check CO-RE relocations against the Rocky Linux 9 kernel
+make compat     # check CO-RE relocations against the Rocky Linux 9 kernel,
+                # whose RPM is downloaded once to build/ and checksummed
 make check-object  # check that the committed BPF object matches the source
+make vmlinux    # regenerate the kernel types (vmlinux.h) from the running
+                # kernel with bpftool
 ```
 
 The repository has three Go modules: the agent (`.`), the shawk connector

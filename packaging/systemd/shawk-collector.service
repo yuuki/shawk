@@ -11,10 +11,34 @@ Group=shawk-collector
 ExecStart=/usr/bin/shawk-collector --config /etc/shawk/collector.yaml
 Restart=on-failure
 RestartSec=5s
+
+# The collector listens on unprivileged ports, reads /etc/shawk and keeps
+# no state on disk.
+CapabilityBoundingSet=
+NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
-NoNewPrivileges=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+# TCP, and Unix sockets for a local PostgreSQL.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target

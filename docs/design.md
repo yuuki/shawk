@@ -241,6 +241,11 @@ source, which the verifier does not check for arguments read through
 `BPF_CORE_READ`; `TestProgramPrototypes` does the same against the running
 kernel and its modules.
 
+The kernel types come from `internal/tracer/bpf/include/vmlinux.h`, dumped
+by bpftool from the BTF of Linux 6.18.44 (x86_64, release `6.18.44-fc-v185`). `scripts/gen-vmlinux.sh`
+(`make vmlinux`) regenerates it from the running kernel or a BTF file and
+records the kernel in its first lines.
+
 ## 4. The agent
 
 ### 4.1 Identity of processes and services

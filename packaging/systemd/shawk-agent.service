@@ -11,13 +11,48 @@ EnvironmentFile=-/etc/shawk/agent.env
 ExecStart=/usr/bin/shawk agent $SHAWK_AGENT_OPTS
 Restart=on-failure
 RestartSec=5s
-# Loading BPF programs and reading /proc of other processes needs root;
-# the agent keeps no state on disk.
-ProtectSystem=strict
-ProtectHome=read-only
-PrivateTmp=yes
-NoNewPrivileges=yes
+
+# The agent runs as root with these capabilities only; it keeps no state
+# on disk, opens no port and only dials the collector.
+#   CAP_BPF, CAP_PERFMON  load and attach the BPF programs
+#   CAP_SYS_ADMIN         enter the other network namespaces (setns) to walk
+#                         their sockets; -bpf-stats
+#   CAP_SYS_PTRACE        read /proc/PID/exe, environ and ns/net of processes
+#                         of other users or with more capabilities
+#   CAP_DAC_READ_SEARCH   read /proc/PID/environ of other users (OTEL_SERVICE_NAME)
+# Kernels before 5.11 charge BPF memory to RLIMIT_MEMLOCK; with the limit
+# raised here the agent needs no CAP_SYS_RESOURCE.
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
 LimitMEMLOCK=infinity
+NoNewPrivileges=yes
+# The agent reads the kernel BTF, the cgroup hierarchy, ip_local_port_range,
+# the machine id and /proc, and resolves executables by reading
+# /proc/PID/exe, whose path does not depend on what this unit hides.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+# The agent reads the host name once at start, and the UTS namespace is a
+# copy of the host's made at every start.
+ProtectHostname=yes
+# OTLP over TCP, and netlink for the addresses of the interfaces.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=net
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+# bpf is not in @system-service. Other calls fail with EPERM rather than
+# killing the agent.
+SystemCallFilter=@system-service bpf setns
+SystemCallErrorNumber=EPERM
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target

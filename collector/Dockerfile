@@ -6,6 +6,7 @@ FROM gcr.io/distroless/static-debian12:nonroot
 ARG TARGETPLATFORM
 COPY $TARGETPLATFORM/shawk-collector /shawk-collector
 COPY $TARGETPLATFORM/shawk-migrate /shawk-migrate
+COPY LICENSE build/notices/shawk-collector/THIRD_PARTY_NOTICES /licenses/
 EXPOSE 4317 4318 4327 4328
 ENTRYPOINT ["/shawk-collector"]
 CMD ["--config", "/etc/shawk/collector.yaml"]

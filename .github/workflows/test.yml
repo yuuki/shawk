@@ -48,6 +48,16 @@ jobs:
       # including the names of the settings of its components.
       - name: Validate the packaged collector configuration
         run: collector/_build/shawk-collector validate --config packaging/collector/config.yaml
+      # The runners have systemd as PID 1: the agent runs under the packaged
+      # unit and its sandbox, with the binaries built by make e2e.
+      - name: Agent under the packaged systemd unit
+        run: sudo test/packaging/agent-unit.sh ./shawk collector/_build/shawk-collector
+      # The kernel RPM of make compat, whose SHA-256 the script pins.
+      - name: Cache the Rocky Linux 9 kernel
+        uses: actions/cache@v4
+        with:
+          path: build/kernel
+          key: kernel-rpm-${{ hashFiles('scripts/fetch-kernel-btf.sh') }}
       - name: Compatibility with the Rocky Linux 9 kernel
         run: make compat
       - name: Check that the committed BPF object matches the source
