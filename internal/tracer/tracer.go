@@ -34,7 +34,8 @@ type Options struct {
 	// NetNS restricts tracing to the network namespace with this inode
 	// number. Zero traces all network namespaces.
 	NetNS uint32
-	// MaxFlows is the capacity of the in-kernel flow table per interval.
+	// MaxFlows is the capacity of the in-kernel flow table per interval, and
+	// of the tables of listening TCP and UDP ports.
 	MaxFlows uint32
 	// OwnerScanInterval is how often the owners of listening sockets are
 	// resolved by walking the file descriptors of all processes.
@@ -65,6 +66,7 @@ type Tracer struct {
 	initialScan    *ebpf.Variable
 	activeIdx      *ebpf.Variable
 	flowDrops      *ebpf.Variable
+	listenDrops    *ebpf.Variable
 	adopted        *ebpf.Variable
 	selfTgid       *ebpf.Variable
 
@@ -89,7 +91,11 @@ type Tracer struct {
 	ownerless   map[sockAddrKey]bool
 	lastOwnScan time.Time
 	lastAdopted uint64
-	statsCloser io.Closer
+	// listenDropped and listenWarned rate-limit the warning about
+	// listening ports that did not fit in the kernel's tables.
+	listenDropped uint64
+	listenWarned  time.Time
+	statsCloser   io.Closer
 }
 
 type sockAddrKey struct {
@@ -199,7 +205,7 @@ func (t *Tracer) configure(spec *ebpf.CollectionSpec) error {
 			return fmt.Errorf("setting %s: %w", name, err)
 		}
 	}
-	for _, name := range []string{bpfMapFlows0, bpfMapFlows1} {
+	for _, name := range []string{bpfMapFlows0, bpfMapFlows1, bpfMapListenPorts, bpfMapUdpListenPorts} {
 		spec.Maps[name].MaxEntries = t.opts.MaxFlows
 	}
 	spec.Maps[bpfMapFlows].InnerMap.MaxEntries = t.opts.MaxFlows
@@ -225,6 +231,7 @@ func (t *Tracer) loadCore(spec *ebpf.CollectionSpec) error {
 	t.initialScan = coll.Variables[bpfVarInitialScan]
 	t.activeIdx = coll.Variables[bpfVarActiveIdx]
 	t.flowDrops = coll.Variables[bpfVarFlowDrops]
+	t.listenDrops = coll.Variables[bpfVarListenPortDrops]
 	t.adopted = coll.Variables[bpfVarAdoptedUnowned]
 	t.selfTgid = coll.Variables[bpfVarSelfTgid]
 
@@ -375,6 +382,7 @@ func (t *Tracer) Collect() (*Snapshot, error) {
 	if err != nil {
 		return nil, err
 	}
+	t.checkListenDrops()
 	var adopted uint64
 	if err := t.adopted.Get(&adopted); err != nil {
 		return nil, err
@@ -609,6 +617,8 @@ func (t *Tracer) scanSockets() ([]Listener, error) {
 	defer closeAll(readers)
 
 	var listeners []Listener
+	// The sockets of a SO_REUSEPORT group share an address and a port.
+	seen := map[sockAddrKey]bool{}
 	for _, rd := range readers {
 		recs, err := readRecords(rd)
 		if err != nil {
@@ -618,15 +628,35 @@ func (t *Tracer) scanSockets() ([]Listener, error) {
 			if recs[i].Type != recListener {
 				continue
 			}
-			listeners = append(listeners, Listener{
+			l := Listener{
 				Proto: Proto(recs[i].Proto),
 				Addr:  addrFrom16(recs[i].Addr),
 				Port:  recs[i].Port,
 				NetNS: recs[i].Netns,
-			})
+			}
+			if k := listenerKey(&l); !seen[k] {
+				seen[k] = true
+				listeners = append(listeners, l)
+			}
 		}
 	}
 	return listeners, nil
+}
+
+// checkListenDrops warns, at most once an hour, when listening ports did not
+// fit in the kernel's tables. Connections adopted at startup and UDP sockets
+// on those ports may then be given the wrong direction.
+func (t *Tracer) checkListenDrops() {
+	var n uint64
+	if err := t.listenDrops.Get(&n); err != nil || n == t.listenDropped {
+		return
+	}
+	t.listenDropped = n
+	if time.Since(t.listenWarned) < time.Hour {
+		return
+	}
+	t.listenWarned = time.Now()
+	t.log.Warn("more listening ports than the in-kernel tables hold; raise -max-flows", "capacity", t.opts.MaxFlows)
 }
 
 // scanOwners walks the file descriptors of all processes. It assigns owners

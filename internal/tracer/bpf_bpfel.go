@@ -110,6 +110,7 @@ const (
 	bpfVarFlowDrops              = "flow_drops"
 	bpfVarInitialScan            = "initial_scan"
 	bpfVarLearnSelf              = "learn_self"
+	bpfVarListenPortDrops        = "listen_port_drops"
 	bpfVarSelfTgid               = "self_tgid"
 	bpfVarTargetNetns            = "target_netns"
 	bpfVarUnusedCgroupEvent      = "unused_cgroup_event"
@@ -194,6 +195,7 @@ type bpfVariableSpecs struct {
 	FlowDrops         *ebpf.VariableSpec `ebpf:"flow_drops"`
 	InitialScan       *ebpf.VariableSpec `ebpf:"initial_scan"`
 	LearnSelf         *ebpf.VariableSpec `ebpf:"learn_self"`
+	ListenPortDrops   *ebpf.VariableSpec `ebpf:"listen_port_drops"`
 	SelfTgid          *ebpf.VariableSpec `ebpf:"self_tgid"`
 	TargetNetns       *ebpf.VariableSpec `ebpf:"target_netns"`
 	UnusedCgroupEvent *ebpf.VariableSpec `ebpf:"unused_cgroup_event"`
@@ -255,6 +257,7 @@ type bpfVariables struct {
 	FlowDrops         *ebpf.Variable `ebpf:"flow_drops"`
 	InitialScan       *ebpf.Variable `ebpf:"initial_scan"`
 	LearnSelf         *ebpf.Variable `ebpf:"learn_self"`
+	ListenPortDrops   *ebpf.Variable `ebpf:"listen_port_drops"`
 	SelfTgid          *ebpf.Variable `ebpf:"self_tgid"`
 	TargetNetns       *ebpf.Variable `ebpf:"target_netns"`
 	UnusedCgroupEvent *ebpf.Variable `ebpf:"unused_cgroup_event"`

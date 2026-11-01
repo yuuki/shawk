@@ -55,6 +55,7 @@ char LICENSE[] SEC("license") = "Dual BSD/GPL";
 #define AF_INET 2
 #define AF_INET6 10
 #define EEXIST 17
+#define SOCK_DGRAM 2
 #define SOCK_BINDPORT_LOCK 8
 
 /* TCP states in which the FIN of the local side is queued. */
@@ -90,8 +91,14 @@ volatile __u32 initial_scan = 0;
  * when the tracer runs in a PID namespace.
  */
 volatile __u32 self_tgid = 0xffffffff;
+/*
+ * Flow updates dropped because the flow table was full, and TCP connections
+ * lost because no socket storage could be allocated for them.
+ */
 __u64 flow_drops = 0;
 __u64 adopted_unowned = 0;
+/* Listening ports that did not fit in listen_ports or udp_listen_ports. */
+__u64 listen_port_drops = 0;
 
 /* Per-socket state attached to TCP sockets. */
 struct shawk_sock_state {
@@ -133,7 +140,10 @@ struct shawk_listen_key {
 	__u16 _pad;
 };
 
-/* Listening TCP ports, rebuilt by iter/tcp at every scan. */
+/*
+ * Listening TCP ports, rebuilt by iter/tcp at every scan. The capacity of
+ * both port maps is set by user space.
+ */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 8192);
@@ -442,8 +452,10 @@ static __always_inline void on_active_open(struct sock *sk)
 
 	ss = bpf_sk_storage_get(&sock_states, sk, NULL,
 				BPF_SK_STORAGE_GET_F_CREATE);
-	if (!ss)
+	if (!ss) {
+		__sync_fetch_and_add(&flow_drops, 1);
 		return;
+	}
 	ss->key = key;
 	ss->sent_base = 0;
 	ss->recv_base = 0;
@@ -474,8 +486,10 @@ static __always_inline void on_passive_open(struct sock *sk)
 		return;
 	ss = bpf_sk_storage_get(&sock_states, sk, NULL,
 				BPF_SK_STORAGE_GET_F_CREATE);
-	if (!ss)
+	if (!ss) {
+		__sync_fetch_and_add(&flow_drops, 1);
 		return;
+	}
 	ss->key = key;
 	reset_base(ss, sk, tp, TCP_ESTABLISHED);
 	ss->pid = 0;
@@ -684,7 +698,8 @@ int shawk_iter_tcp(struct bpf_iter__tcp *ctx)
 		struct shawk_listen_key lk = {.netns = netns, .port = lport};
 		__u8 one = 1;
 
-		bpf_map_update_elem(&listen_ports, &lk, &one, BPF_ANY);
+		if (bpf_map_update_elem(&listen_ports, &lk, &one, BPF_ANY))
+			__sync_fetch_and_add(&listen_port_drops, 1);
 		emit_listener(seq, sk, netns, lport, IPPROTO_TCP);
 		return 0;
 	}
@@ -774,6 +789,13 @@ static __always_inline bool udp_listener(struct sock *sk, __u16 port)
 	return port_bound(sk) && !ephemeral(port);
 }
 
+/* Raw sockets of protocol 17 also send through ip_send_skb(). */
+static __always_inline bool is_udp_sock(const struct sock *sk)
+{
+	return BPF_CORE_READ(sk, sk_protocol) == IPPROTO_UDP &&
+	       BPF_CORE_READ(sk, sk_type) == SOCK_DGRAM;
+}
+
 struct shawk_l3l4 {
 	__u8 saddr[16];
 	__u8 daddr[16];
@@ -836,7 +858,7 @@ static __always_inline int handle_udp_send(struct sk_buff *skb)
 		return 0;
 	/* A direct access keeps the pointer usable with socket storage. */
 	sk = skb->sk;
-	if (!sk || BPF_CORE_READ(sk, sk_protocol) != IPPROTO_UDP)
+	if (!sk || !is_udp_sock(sk))
 		return 0;
 	key.netns = sock_netns(sk);
 	if (!netns_ok(key.netns))
@@ -948,7 +970,8 @@ int shawk_iter_udp(struct bpf_iter__udp *ctx)
 		return 0;
 	lk.netns = netns;
 	lk.port = port;
-	bpf_map_update_elem(&udp_listen_ports, &lk, &one, BPF_ANY);
+	if (bpf_map_update_elem(&udp_listen_ports, &lk, &one, BPF_ANY))
+		__sync_fetch_and_add(&listen_port_drops, 1);
 	emit_listener(seq, sk, netns, port, IPPROTO_UDP);
 	return 0;
 }
@@ -1045,7 +1068,7 @@ int shawk_iter_task_file(struct bpf_iter__task_file *ctx)
 		proto = IPPROTO_TCP;
 		break;
 	case IPPROTO_UDP:
-		if (!udp_listener(sk, port))
+		if (!is_udp_sock(sk) || !udp_listener(sk, port))
 			return 0;
 		break;
 	default:

@@ -106,6 +106,16 @@ func TestReusePortOwners(t *testing.T) {
 		t.Errorf("accepted connections by pid = %v (self %d, helper %d), want both > 0 and 40 in total",
 			conns, os.Getpid(), helper.Process.Pid)
 	}
+	// The two sockets of the group are one listener.
+	var listeners int
+	for _, l := range snap.Listeners {
+		if l.Proto == ProtoTCP && l.Port == uint16(port) {
+			listeners++
+		}
+	}
+	if listeners != 1 {
+		t.Errorf("listeners on port %d = %d, want 1", port, listeners)
+	}
 }
 
 // TestHelperReusePort is run by TestReusePortOwners.

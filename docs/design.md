@@ -623,7 +623,11 @@ parses. shawk runs beside it instead:
   opened by the kernel's path manager are attributed to a kernel worker.
 - **Flow table capacity**: when more distinct flows than `-max-flows` occur
   in one interval, updates are dropped and `shawk.agent.flows.dropped`
-  counts them.
+  counts them, as well as TCP connections for which the kernel could not
+  allocate socket storage. The tables of listening TCP and UDP ports hold
+  `-max-flows` ports too; the agent warns when they overflow, since
+  connections that predate the agent and UDP sockets on the ports left out
+  may then be given the wrong direction.
 - **Connections that predate the agent** are counted from the adoption on.
   A client that bound its port before connecting, to a service port in the
   ephemeral range (e.g. 50051), and whose connection predates the agent, is

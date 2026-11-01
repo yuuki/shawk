@@ -106,7 +106,7 @@ func runAgent(ctx context.Context, args []string, _ io.Writer) error {
 		interval = fs.Duration("interval", 15*time.Second, "collection and export interval, at most 1m")
 		idleTTL  = fs.Duration("idle-ttl", 15*time.Minute, "how long a dependency is sent after its last activity")
 		netns    = fs.String("netns", "all", `network namespaces to trace: "all", "self" or an inode number`)
-		maxFlows = fs.Uint("max-flows", 16384, "capacity of the in-kernel flow table per interval")
+		maxFlows = fs.Uint("max-flows", 16384, "capacity of the in-kernel flow table per interval and of the tables of listening ports")
 		fallback = fs.String("service-name-fallback", "exe",
 			`name of a service without OTEL_SERVICE_NAME: "exe" (executable name) or "unit" (systemd unit)`)
 		bpfStats = fs.Bool("bpf-stats", false, "enable and send run time statistics of the BPF programs (small overhead)")

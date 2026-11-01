@@ -2,9 +2,11 @@ package tracer
 
 import (
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -272,5 +274,37 @@ func TestTCPExactBytes(t *testing.T) {
 			check(DirOut, 1000, 300)
 			check(DirIn, 300, 1000)
 		})
+	}
+}
+
+// TestListenPortCapacity checks that the tables of listening ports are sized
+// by MaxFlows and that their overflow is reported (#98).
+func TestListenPortCapacity(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root")
+	}
+	for range 3 {
+		echoServer(t, "tcp4", "127.0.0.1:0")
+	}
+	var logs strings.Builder
+	tr, err := New(Options{
+		TraceSelf:         true,
+		MaxFlows:          2,
+		OwnerScanInterval: time.Hour,
+		Logger:            slog.New(slog.NewTextHandler(&logs, nil)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+	snap, err := tr.Collect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.Listeners) < 3 {
+		t.Fatalf("listeners = %+v", snap.Listeners)
+	}
+	if !strings.Contains(logs.String(), "more listening ports than the in-kernel tables hold") {
+		t.Errorf("no warning about the overflow in %q", logs.String())
 	}
 }
