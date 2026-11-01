@@ -140,7 +140,7 @@ func TestPGAddressPeriods(t *testing.T) {
 		h.addAddr(addrOf("10.0.0.100"), span{first, last})
 		pk := procKey{"haproxy.service", "haproxy", "haproxy"}
 		h.addProcess(pk, "", span{first, last})
-		h.addListener(listenerRowKey{proto: "tcp", addr: addrOf("0.0.0.0"), port: 80, netns: 1}, pk, span{first, last})
+		h.addListener(listenerRowKey{proto: "tcp", addr: addrOf("0.0.0.0"), port: 80, netns: 1, procKey: pk}, span{first, last})
 		if err := st.write(ctx, h); err != nil {
 			t.Fatal(err)
 		}

@@ -212,9 +212,9 @@ ON CONFLICT (host_id, role, proto, local_addr, remote_addr, port, netns, process
 		var netns []int64
 		var firsts, lasts []time.Time
 		for k, l := range h.listeners {
-			units = append(units, l.proc.unit)
-			comms = append(comms, l.proc.comm)
-			services = append(services, l.proc.service)
+			units = append(units, k.unit)
+			comms = append(comms, k.comm)
+			services = append(services, k.service)
 			protos = append(protos, k.proto)
 			addrs = append(addrs, k.addr.String())
 			ports = append(ports, int32(k.port))
@@ -229,9 +229,7 @@ FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::inte
             $9::timestamptz[], $10::timestamptz[]) AS u(unit, comm, service, proto, addr, port, netns, f, l)
 LEFT JOIN shawk.processes p ON p.host_id = $1 AND p.unit = u.unit AND p.comm = u.comm
   AND p.service_name = u.service AND (u.unit <> '' OR u.comm <> '')
-ON CONFLICT (host_id, proto, addr, port, netns) DO UPDATE SET
-  process_id = CASE WHEN excluded.last_seen >= l.last_seen THEN coalesce(excluded.process_id, l.process_id)
-                    ELSE l.process_id END,
+ON CONFLICT (host_id, proto, addr, port, netns, (coalesce(process_id, 0))) DO UPDATE SET
   first_seen = least(l.first_seen, excluded.first_seen),
   last_seen  = greatest(l.last_seen, excluded.last_seen)`,
 			h.key, units, comms, services, protos, addrs, ports, netns, firsts, lasts)

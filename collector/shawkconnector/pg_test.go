@@ -390,7 +390,7 @@ func TestPGPrune(t *testing.T) {
 			h.addEdge(edgeRowKey{role: "client", proto: "tcp", local: addrOf("10.0.0.1"), peer: addrOf("10.0.1.1"),
 				port: port + uint16(i), netns: 1, procKey: pk}, span{at, at})
 		}
-		h.addListener(listenerRowKey{proto: "tcp", addr: addrOf("0.0.0.0"), port: port, netns: 1}, pk, span{at, at})
+		h.addListener(listenerRowKey{proto: "tcp", addr: addrOf("0.0.0.0"), port: port, netns: 1, procKey: pk}, span{at, at})
 		if err := c.store.write(ctx, h); err != nil {
 			t.Fatal(err)
 		}

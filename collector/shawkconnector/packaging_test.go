@@ -253,7 +253,7 @@ func TestPGPackaged(t *testing.T) {
 	h.addProcess(procKey{"x.service", "x", "x"}, "/usr/bin/x", span{now, now})
 	h.addEdge(edgeRowKey{role: "client", proto: "tcp", local: addrOf("10.0.0.30"), peer: addrOf("10.0.0.10"), port: 5432,
 		netns: 1, procKey: procKey{"x.service", "x", "x"}}, span{now, now})
-	h.addListener(listenerRowKey{proto: "tcp", addr: addrOf("0.0.0.0"), port: 9000, netns: 1}, procKey{"x.service", "x", "x"}, span{now, now})
+	h.addListener(listenerRowKey{proto: "tcp", addr: addrOf("0.0.0.0"), port: 9000, netns: 1, procKey: procKey{"x.service", "x", "x"}}, span{now, now})
 	if err := pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error { return writeHost(ctx, tx, h) }); err != nil {
 		t.Errorf("writing as shawk_connector: %v", err)
 	}
