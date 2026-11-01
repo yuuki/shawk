@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -111,7 +113,9 @@ func checkAttachTarget(t *testing.T, target *btf.Spec, prog *ebpf.ProgramSpec) {
 // type changed would make a program read the wrong argument.
 func sourcePrototypes(t *testing.T) map[string][]string {
 	t.Helper()
-	src, err := os.ReadFile("bpf/shawk.bpf.c")
+	// Next to this file: make test-root runs the compiled tests elsewhere.
+	_, self, _, _ := runtime.Caller(0)
+	src, err := os.ReadFile(filepath.Join(filepath.Dir(self), "bpf", "shawk.bpf.c"))
 	if err != nil {
 		t.Fatal(err)
 	}
