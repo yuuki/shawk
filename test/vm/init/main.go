@@ -8,7 +8,8 @@
 // It mounts the file systems the tests use, brings up the loopback, runs the
 // commands of /vm/commands one after the other, prints a line with the exit
 // status of the first that failed (or 0), and reboots, which ends QEMU
-// started with -no-reboot.
+// started with -no-reboot. A kernel tainted while the commands ran, e.g. by
+// a warning, fails the run and prints the kernel log.
 //
 // Each line of /vm/commands is a working directory followed by the program
 // and its arguments, separated by spaces.
@@ -31,6 +32,8 @@ const exitMarker = "SHAWK-VM-EXIT"
 func main() {
 	status := run()
 	fmt.Printf("\n%s %d\n", exitMarker, status)
+	// Wait until the console has sent the status before rebooting.
+	unix.IoctlSetInt(int(os.Stdout.Fd()), unix.TCSBRK, 1)
 	unix.Sync()
 	if err := unix.Reboot(unix.LINUX_REBOOT_CMD_RESTART); err != nil {
 		fmt.Fprintln(os.Stderr, "reboot:", err)
@@ -39,7 +42,7 @@ func main() {
 	time.Sleep(time.Hour)
 }
 
-func run() int {
+func run() (status int) {
 	if err := setup(); err != nil {
 		fmt.Fprintln(os.Stderr, "init:", err)
 		return 125
@@ -48,13 +51,23 @@ func run() int {
 	unix.Uname(&uts)
 	fmt.Printf("init: Linux %s %s\n", unix.ByteSliceToString(uts.Release[:]), unix.ByteSliceToString(uts.Machine[:]))
 
+	taint := tainted()
+	defer func() {
+		if t := tainted(); t != taint {
+			fmt.Printf("init: the kernel was tainted (%s -> %s) while the tests ran:\n", taint, t)
+			printKernelLog()
+			if status == 0 {
+				status = 1
+			}
+		}
+	}()
+
 	f, err := os.Open("/vm/commands")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "init:", err)
 		return 125
 	}
 	defer f.Close()
-	status := 0
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
 		fields := strings.Fields(sc.Text())
@@ -114,6 +127,28 @@ func setup() error {
 		}
 	}
 	return loopbackUp()
+}
+
+// tainted returns the taint flags of the kernel.
+func tainted() string {
+	b, err := os.ReadFile("/proc/sys/kernel/tainted")
+	if err != nil {
+		return err.Error()
+	}
+	return strings.TrimSpace(string(b))
+}
+
+// printKernelLog prints the end of the kernel log, which the quiet console
+// does not show.
+func printKernelLog() {
+	buf := make([]byte, 1<<20)
+	n, err := unix.Klogctl(3, buf) // SYSLOG_ACTION_READ_ALL
+	if err != nil {
+		fmt.Println("init: reading the kernel log:", err)
+		return
+	}
+	lines := strings.Split(strings.TrimSpace(string(buf[:n])), "\n")
+	fmt.Println(strings.Join(lines[max(0, len(lines)-100):], "\n"))
 }
 
 // loopbackUp brings up the loopback of the initial network namespace.
