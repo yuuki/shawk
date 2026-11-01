@@ -2,6 +2,7 @@
 /dist
 /tracer.test
 /rocky9.btf
+/build/
 *.db
 *.db-shm
 *.db-wal

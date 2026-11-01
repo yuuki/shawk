@@ -1,4 +1,6 @@
-VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+# The version without the v of the tag (0.8.0), as in the release binaries,
+# packages and collector built by goreleaser.
+VERSION ?= $(patsubst v%,%,$(shell git describe --tags --always --dirty 2>/dev/null || echo dev))
 LDFLAGS := -s -w -X github.com/yuuki/shawk/internal/version.Version=$(VERSION)
 GO ?= go
 
@@ -8,6 +10,10 @@ all: build
 .PHONY: generate
 generate: ## compile the BPF programs (needs clang)
 	$(GO) generate ./internal/tracer/
+
+.PHONY: vmlinux
+vmlinux: ## regenerate the kernel types the BPF programs include from the running kernel (needs bpftool)
+	scripts/gen-vmlinux.sh
 
 .PHONY: build
 build:
@@ -50,6 +56,7 @@ e2e: build collector ## multi-host test with network namespaces; needs SHAWK_E2E
 check-object: ## check that the committed BPF object matches the source
 	scripts/check-bpf-object.sh
 
+# The kernel RPM is cached in build/kernel and checked against its SHA-256.
 rocky9.btf:
 	scripts/fetch-kernel-btf.sh "" $@
 
@@ -59,4 +66,4 @@ compat: rocky9.btf ## check the BPF programs against the Rocky Linux 9 kernel
 
 .PHONY: clean
 clean:
-	rm -rf shawk shawk-migrate tracer.test rocky9.btf collector/_build
+	rm -rf shawk shawk-migrate tracer.test rocky9.btf build collector/_build

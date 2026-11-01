@@ -66,6 +66,8 @@ archives:
       - LICENSE
       - NOTICE
       - LICENSES/*
+      - packaging/systemd/shawk-agent.service
+      - packaging/systemd/agent.env
   - id: shawk-collector
     ids: [shawk-collector, shawk-migrate]
     name_template: "shawk-collector_v{{ .Version }}_{{ .Os }}_{{ .Arch }}"
@@ -103,14 +105,27 @@ nfpms:
       - src: packaging/systemd/agent.env
         dst: /etc/shawk/agent.env
         type: config|noreplace
+      # rpm keeps the license texts in /usr/share/licenses; deb has a
+      # machine-readable copyright file in /usr/share/doc, which refers to
+      # the licenses in /usr/share/common-licenses.
       - src: LICENSE
         dst: /usr/share/licenses/shawk/LICENSE
+        packager: rpm
       - src: NOTICE
         dst: /usr/share/licenses/shawk/NOTICE
+        packager: rpm
       - src: LICENSES/GPL-2.0-only.txt
         dst: /usr/share/licenses/shawk/GPL-2.0-only.txt
+        packager: rpm
       - src: LICENSES/BSD-2-Clause.txt
         dst: /usr/share/licenses/shawk/BSD-2-Clause.txt
+        packager: rpm
+      - src: packaging/deb/shawk.copyright
+        dst: /usr/share/doc/shawk/copyright
+        packager: deb
+      - src: NOTICE
+        dst: /usr/share/doc/shawk/NOTICE
+        packager: deb
 
   - id: shawk-collector
     ids: [shawk-collector, shawk-migrate]
@@ -139,6 +154,10 @@ nfpms:
         dst: /usr/share/shawk-collector/postgres/grants.sql
       - src: LICENSE
         dst: /usr/share/licenses/shawk-collector/LICENSE
+        packager: rpm
+      - src: packaging/deb/shawk-collector.copyright
+        dst: /usr/share/doc/shawk-collector/copyright
+        packager: deb
     scripts:
       preinstall: packaging/collector/preinstall.sh
 
