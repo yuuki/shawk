@@ -59,7 +59,7 @@ vm-test: ## the tests of test-root in a virtual machine with KERNEL (rocky9, 5.1
 
 .PHONY: e2e
 e2e: build collector ## multi-host test with network namespaces; needs SHAWK_E2E_POSTGRES_DSN
-	sudo --preserve-env=SHAWK_E2E_POSTGRES_DSN test/e2e/run.sh ./shawk collector/_build/shawk-collector
+	sudo --preserve-env=SHAWK_E2E_POSTGRES_DSN,SHAWK_TEST_STRICT test/e2e/run.sh ./shawk collector/_build/shawk-collector
 
 .PHONY: check-object
 check-object: ## check that the committed BPF object matches the source
