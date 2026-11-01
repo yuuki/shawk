@@ -36,13 +36,25 @@ var testComm = func() string {
 	return c
 }()
 
+// skipUnavailable skips a test when the environment lacks something it
+// needs, such as IPv6 or BPF trampolines. With SHAWK_TEST_STRICT set, as in
+// CI, it fails the test instead, so that a change of the environment cannot
+// turn tests into skips while the suite still passes.
+func skipUnavailable(t *testing.T, format string, args ...any) {
+	t.Helper()
+	if os.Getenv("SHAWK_TEST_STRICT") != "" {
+		t.Fatalf("SHAWK_TEST_STRICT is set: "+format, args...)
+	}
+	t.Skipf(format, args...)
+}
+
 // skipIfNoNetwork skips a test when the address family is unavailable,
 // e.g. IPv6 disabled by the kernel command line.
 func skipIfNoNetwork(t *testing.T, network string) {
 	t.Helper()
 	c, err := net.ListenPacket(map[string]string{"tcp4": "udp4", "tcp6": "udp6", "udp4": "udp4", "udp6": "udp6"}[network], map[string]string{"tcp4": "127.0.0.1:0", "tcp6": "[::1]:0", "udp4": "127.0.0.1:0", "udp6": "[::1]:0"}[network])
 	if err != nil {
-		t.Skipf("%s is unavailable: %v", network, err)
+		skipUnavailable(t, "%s is unavailable: %v", network, err)
 	}
 	c.Close()
 }
@@ -250,7 +262,7 @@ func TestUDP(t *testing.T) {
 			skipIfNoNetwork(t, tc.network)
 			tr := newTestTracer(t)
 			if !tr.UDPEnabled() {
-				t.Skip("UDP tracing is unavailable on this kernel")
+				skipUnavailable(t, "UDP tracing is unavailable on this kernel")
 			}
 			srv := listenUDPFixedPort(t, tc.network, tc.host)
 			defer srv.Close()
@@ -380,7 +392,7 @@ func TestExcludeSelfInPIDNamespace(t *testing.T) {
 	}
 	unshare, err := exec.LookPath("unshare")
 	if err != nil {
-		t.Skip("unshare is not available")
+		skipUnavailable(t, "unshare is not available")
 	}
 	cmd := exec.Command(unshare, "--pid", "--fork", "--mount-proc", os.Args[0], "-test.run=^TestExcludeSelf$", "-test.v")
 	cmd.Env = append(os.Environ(), "SHAWK_TEST_IN_PIDNS=1")
@@ -448,7 +460,7 @@ func TestUDPDirection(t *testing.T) {
 	t.Run("client bound to a random port", func(t *testing.T) {
 		tr := newTestTracer(t)
 		if !tr.UDPEnabled() {
-			t.Skip("UDP tracing is unavailable on this kernel")
+			skipUnavailable(t, "UDP tracing is unavailable on this kernel")
 		}
 		srv := listenUDPFixedPort(t, "udp4", "127.0.0.1")
 		defer srv.Close()
@@ -480,7 +492,7 @@ func TestUDPDirection(t *testing.T) {
 	t.Run("server in the ephemeral range", func(t *testing.T) {
 		tr := newTestTracer(t)
 		if !tr.UDPEnabled() {
-			t.Skip("UDP tracing is unavailable on this kernel")
+			skipUnavailable(t, "UDP tracing is unavailable on this kernel")
 		}
 		srv, err := net.ListenPacket("udp4", "127.0.0.1:0")
 		if err != nil {
@@ -521,7 +533,7 @@ func TestUDPDirection(t *testing.T) {
 		defer peer.Close()
 		tr := newTestTracer(t)
 		if !tr.UDPEnabled() {
-			t.Skip("UDP tracing is unavailable on this kernel")
+			skipUnavailable(t, "UDP tracing is unavailable on this kernel")
 		}
 		// A reply to a request received before the tracer started.
 		if _, err := srv.WriteTo([]byte("reply"), peer.LocalAddr()); err != nil {

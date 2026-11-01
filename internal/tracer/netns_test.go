@@ -19,11 +19,11 @@ func TestOtherNetNS(t *testing.T) {
 	}
 	ip, err := exec.LookPath("ip")
 	if err != nil {
-		t.Skip("ip is not available")
+		skipUnavailable(t, "ip is not available")
 	}
 	name := fmt.Sprintf("shawktest%d", os.Getpid())
 	if out, err := exec.Command(ip, "netns", "add", name).CombinedOutput(); err != nil {
-		t.Skipf("cannot create a network namespace: %v: %s", err, out)
+		skipUnavailable(t, "cannot create a network namespace: %v: %s", err, out)
 	}
 	t.Cleanup(func() { exec.Command(ip, "netns", "del", name).Run() })
 	if out, err := exec.Command(ip, "-n", name, "link", "set", "lo", "up").CombinedOutput(); err != nil {

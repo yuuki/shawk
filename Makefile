@@ -39,7 +39,7 @@ shawk-migrate: ## build the command that applies the PostgreSQL schema
 .PHONY: test-root
 test-root: ## tests that load the BPF programs into the running kernel
 	$(GO) test -c -o tracer.test ./internal/tracer/
-	sudo ./tracer.test -test.v -test.count=1
+	sudo --preserve-env=SHAWK_TEST_STRICT ./tracer.test -test.v -test.count=1
 	rm -f tracer.test
 
 .PHONY: e2e

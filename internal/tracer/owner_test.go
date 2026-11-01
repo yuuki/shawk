@@ -50,11 +50,11 @@ func TestReusePortOwners(t *testing.T) {
 	tr := newTestTracer(t)
 	root := cgroup2Root()
 	if root == "" {
-		t.Skip("cgroup v2 is not mounted")
+		skipUnavailable(t, "cgroup v2 is not mounted")
 	}
 	cg := filepath.Join(root, fmt.Sprintf("shawktest-%d", os.Getpid()))
 	if err := os.Mkdir(cg, 0o755); err != nil {
-		t.Skipf("cannot create a cgroup: %v", err)
+		skipUnavailable(t, "cannot create a cgroup: %v", err)
 	}
 	t.Cleanup(func() { os.Remove(cg) })
 
@@ -75,7 +75,7 @@ func TestReusePortOwners(t *testing.T) {
 	})
 	// Move the helper to the new cgroup before it creates its listener.
 	if err := os.WriteFile(filepath.Join(cg, "cgroup.procs"), []byte(strconv.Itoa(helper.Process.Pid)), 0o644); err != nil {
-		t.Skipf("cannot move a process to the cgroup: %v", err)
+		skipUnavailable(t, "cannot move a process to the cgroup: %v", err)
 	}
 	fmt.Fprintln(stdin, "listen")
 	if line, _ := bufio.NewReader(stdout).ReadString('\n'); !strings.HasPrefix(line, "READY") {
@@ -182,7 +182,7 @@ func TestCgroupEvents(t *testing.T) {
 	}
 	root := cgroup2Root()
 	if root == "" {
-		t.Skip("cgroup v2 is not mounted")
+		skipUnavailable(t, "cgroup v2 is not mounted")
 	}
 	events := make(chan [2]any, 100)
 	tr, err := New(Options{TraceSelf: true, OnCgroup: func(id uint64, path string) {
@@ -196,7 +196,7 @@ func TestCgroupEvents(t *testing.T) {
 	name := fmt.Sprintf("shawktest-job-%d", os.Getpid())
 	cg := filepath.Join(root, name)
 	if err := os.Mkdir(cg, 0o755); err != nil {
-		t.Skipf("cannot create a cgroup: %v", err)
+		skipUnavailable(t, "cannot create a cgroup: %v", err)
 	}
 	defer os.Remove(cg)
 	var st unix.Stat_t
@@ -222,7 +222,7 @@ func TestCgroupEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(cg, "cgroup.procs"), []byte(strconv.Itoa(helper.Process.Pid)), 0o644); err != nil {
-		t.Skipf("cannot move a process to the cgroup: %v", err)
+		skipUnavailable(t, "cannot move a process to the cgroup: %v", err)
 	}
 	stdin.Close()
 	if err := helper.Wait(); err != nil {
