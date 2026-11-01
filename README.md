@@ -54,7 +54,10 @@ See [docs/design.md](docs/design.md) for the design.
   loading them on Ubuntu kernels 6.8 to 7.0 and checked statically against
   the Rocky Linux 9.6 kernel; they have not yet run on a Rocky Linux kernel,
   on upstream 5.14 to 5.18, or on arm64. See [the design](docs/design.md#35-kernel-requirements-and-features-used).
-  The agent runs as root in the host PID namespace. UDP tracing
+  The agent runs as root in the host PID namespace; its systemd unit
+  sandboxes it and limits it to `CAP_BPF`, `CAP_PERFMON`, `CAP_SYS_ADMIN`
+  (to enter other network namespaces), `CAP_SYS_PTRACE` and
+  `CAP_DAC_READ_SEARCH` (to read `/proc` of other processes). UDP tracing
   additionally needs BPF trampolines (fentry), available on x86_64 and on
   arm64 since Linux 6.0; without them only TCP is traced.
 * PostgreSQL 14 or later.

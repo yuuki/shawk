@@ -134,6 +134,47 @@ func TestReleasePackages(t *testing.T) {
 	}
 }
 
+// TestUnitsSandboxed checks that the systemd units keep their sandbox, and
+// that the one of the agent still allows what the tracer needs.
+func TestUnitsSandboxed(t *testing.T) {
+	units, _ := filepath.Glob(filepath.Join(root, "packaging/systemd/*.service"))
+	if len(units) != 2 {
+		t.Fatalf("units = %v", units)
+	}
+	for _, u := range units {
+		s := unitSettings(t, u)
+		for k, want := range map[string]string{
+			"NoNewPrivileges": "yes", "ProtectSystem": "strict", "ProtectHome": "yes", "PrivateTmp": "yes",
+			"ProtectKernelTunables": "yes", "ProtectControlGroups": "yes", "SystemCallArchitectures": "native",
+			"SystemCallErrorNumber": "EPERM",
+		} {
+			if s[k] != want {
+				t.Errorf("%s: %s=%s, want %s", u, k, s[k], want)
+			}
+		}
+		for _, k := range []string{"CapabilityBoundingSet", "RestrictAddressFamilies", "RestrictNamespaces", "SystemCallFilter"} {
+			if _, ok := s[k]; !ok {
+				t.Errorf("%s: no %s", u, k)
+			}
+		}
+		if filepath.Base(u) != "shawk-agent.service" {
+			continue
+		}
+		for k, need := range map[string][]string{
+			"CapabilityBoundingSet":   {"CAP_BPF", "CAP_PERFMON", "CAP_SYS_ADMIN", "CAP_SYS_PTRACE", "CAP_DAC_READ_SEARCH"},
+			"SystemCallFilter":        {"@system-service", "bpf", "setns"},
+			"RestrictAddressFamilies": {"AF_INET", "AF_INET6", "AF_NETLINK"},
+			"RestrictNamespaces":      {"net"},
+		} {
+			for _, v := range need {
+				if !slices.Contains(strings.Fields(s[k]), v) {
+					t.Errorf("%s: %s does not have %s", u, k, v)
+				}
+			}
+		}
+	}
+}
+
 func unitSettings(t *testing.T, file string) map[string]string {
 	t.Helper()
 	f, err := os.Open(file)

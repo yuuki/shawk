@@ -6,8 +6,8 @@ tested (`make test`) but meant to be adapted.
 
 | Path | What |
 |---|---|
-| `systemd/shawk-agent.service`, `systemd/agent.env` | The agent on every host; options in `/etc/shawk/agent.env`. |
-| `systemd/shawk-collector.service` | The collector built with `make collector`. |
+| `systemd/shawk-agent.service`, `systemd/agent.env` | The agent on every host, as root with only the capabilities it needs and sandboxed; options in `/etc/shawk/agent.env`. |
+| `systemd/shawk-collector.service` | The collector built with `make collector`, as the user `shawk-collector`, sandboxed. |
 | `collector/config.yaml` | Collector configuration: the `otlp/shawk` receiver for agents, the shawk connector, Prometheus and OBI pipelines. |
 | `postgres/setup.sql`, `postgres/grants.sql` | Roles (`shawk_owner`, `shawk_connector`, `shawk_grafana`), database and privileges. |
 | `prometheus/prometheus.yml` | Settings Prometheus needs for the OTLP push of the collector. |
