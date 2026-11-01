@@ -250,11 +250,14 @@ plain byte in recent kernels but a 4-bit bitfield at a different offset in
   unit, are therefore not told apart even with different
   `OTEL_SERVICE_NAME`; put them in different units (or containers) to tell
   them apart.
-- When a process exits before `/proc` is read, or its environment cannot be
-  read within 200 ms (the read takes the lock of the memory map of the
-  process, which a stuck process may hold), the latest identity seen for
-  the same unit and comm is used, and a stuck process is not read again
-  until the read returns.
+- `/proc` is read for the processes of an interval several at once, within
+  one second per interval. A read of the environment takes the lock of the
+  memory map of the process, which a stuck process may hold; it gives up
+  after 200 ms, and a process whose read timed out is not read again for 5
+  minutes after the read returns. The command name in `/proc` must match
+  that of the flow, so that a PID reused by another process since is not
+  trusted. When a process exits before `/proc` is read, or is not read in
+  time, the latest identity seen for the same unit and comm is used.
 - The host is identified by `host.id` (`/etc/machine-id`, else
   `/var/lib/dbus/machine-id`) and `host.name`. In PostgreSQL a host is the
   hash of both, so that VMs cloned with the same machine id stay apart.
@@ -286,18 +289,26 @@ process attributes. The agent itself sends `shawk.agent.up` (with
 `shawk.netns.scope`), `shawk.agent.segment.start`, `shawk.agent.udp.traced`,
 `shawk.agent.flows.dropped`, `shawk.agent.export.failures`, and with
 `-bpf-stats` the run count and time of each BPF program. The resource
-carries `host.id`, `host.name`, `host.ip` (addresses of the interfaces and of
-the live series, including containers), `os.version`, and
-`service.name=shawk-agent` with `service.version`.
+carries `host.id`, `host.name`, `host.ip` (addresses of the interfaces of
+the traced namespaces, and the local addresses of the series active in the
+last two intervals, at least a minute, and of the open listeners, which
+include containers), `os.version`, and `service.name=shawk-agent` with
+`service.version`. Strings that are not valid UTF-8, such as a command name
+cut in the middle of a character, are sent with the invalid bytes
+replaced.
 
 ### 4.3 How it is sent
 
-- **One interval at a time.** Every 15 seconds the agent sends all live
-  series of the host over OTLP (gRPC or HTTP/protobuf, gzip), in requests of
-  at most `-max-series-per-request` (1000) edges and listeners, about 3 MB,
-  below the 4 MiB default limit of a gRPC receiver. The last request
-  carries the metrics of the agent and closes the interval; after a failed
-  request the rest of the interval is not sent.
+- **One interval at a time.** Every 15 seconds (`-interval`, at most a
+  minute) the agent sends all live series of the host over OTLP (gRPC or
+  HTTP/protobuf, gzip), in requests of at most `-max-series-per-request`
+  (1000) edges and listeners and at most 3 MiB, below the 4 MiB default
+  limit of a gRPC receiver. Listeners come first, then server edges, then
+  client edges, so that the connector knows the services of the host
+  before it names the peers of its clients. The last request carries the
+  metrics of the agent and closes the interval; after a failed request the
+  rest of the interval is not sent. Every request has its own timeout (two
+  thirds of the interval), which starts once the interval is collected.
 - **TLS.** An `https://` endpoint verifies the collector (`-otlp-ca-file`)
   and may present a client certificate (`-otlp-cert-file`,
   `-otlp-key-file`) to a receiver that requires one.
@@ -312,7 +323,10 @@ the live series, including containers), `os.version`, and
   is the start of the agent; when requests fail for longer than the idle TTL
   minus a minute, edges that ended meanwhile may have been dropped unsent,
   so the request that succeeds afterwards carries now minus the idle TTL:
-  edges active since then are still being sent.
+  edges active since then are still being sent. The start is expressed by
+  the current wall clock, so that it stays right after the clock steps
+  (e.g. when NTP corrects it after boot): the connector converts it with
+  the current clock skew of the agent.
 
 ## 5. The shawk connector
 
@@ -320,25 +334,43 @@ the live series, including containers), `os.version`, and
 
 For every request (one host), the connector accumulates the changes of
 hosts, segments, addresses, processes, edges and listeners. Every
-`write_interval` (1 minute) it writes the changes of each host in one
-transaction. Edges and listeners are upserted with
+`write_interval` (1 minute, at most a minute) it writes the changes of each
+host in one transaction. Edges and listeners are upserted with
 `first_seen = least(...)` and `last_seen = greatest(...)`, so replays and
 reordering give the same result and several connectors do not conflict. An
 edge whose `last_seen` alone advances is written once per interval, and an
 idle edge that agents keep sending until its TTL is not written again.
 
-The segment of the request is upserted into `agent_sessions` with
-`last_heartbeat` set to the time the connector received the request:
-observations up to there are written. Liveness is thus judged by the clock
+The segment of the request that closes an interval is upserted into
+`agent_sessions` with `last_heartbeat` set to the time the connector
+received the request: observations up to there are written. The addresses
+of the host are written from that request too, one row per period the
+host held an address in (a period ends when the address was not seen for
+5 minutes), so that an address that moves away and comes back is not held
+in between; an agent whose last requests never arrive emits nothing and
+does not count as alive. Liveness is thus judged by the clock
 of the connector; the difference to the clock of the agent is kept as
 `clock_skew`, shown on the fleet dashboard and alerted on beyond a minute.
 Edges, listeners and processes keep the times of the agent that observed
 them. While the database is down, changes accumulate (in proportion
-to the number of edges, not to time) and are written when it returns. Rows that PostgreSQL rejects as invalid data are dropped rather than kept
-for the next write, which would fail again; IPv6 zones are stripped from
-addresses before. A
-crash of the connector loses at most one write interval, which agents send
-again while the edges are within their TTL.
+to the number of edges, not to time) and are written when it returns, and
+the connector writes what is pending when it stops. Rows that PostgreSQL
+rejects as invalid data are dropped rather than kept for the next write,
+which would fail again (IPv6 zones are stripped from addresses before);
+the edges and listeners agents still send are then written again.
+
+Changes still pending are lost when the connector crashes, or stops while
+the database is down; agents send again only the edges active within their
+idle TTL. So a session written by a connector starts no earlier than 2
+minutes (the shortest idle TTL of an agent) before the first request it
+received from the host, and again after it dropped changes of the host:
+the session written before ends at its last heartbeat, and the time in
+between shows as not observed.
+
+A connector that does not migrate checks at start that the schema is not
+older than it (`shawk.schema_version()`), and waits until it is. Writes and
+`shawk.prune()` hold a shared advisory lock that migrations hold
+exclusively, so that a migration waits for them and they wait for it.
 
 Rows last seen longer ago than `retention` (3 years by default) are deleted
 every hour by `shawk.prune()`, in batches of short transactions; processes
@@ -349,7 +381,10 @@ so `unobserved()` reports the time before the retention as not observed.
 
 The connector loads `shawk_v1.service_endpoints`,
 `shawk_v1.client_endpoints` and `shawk_v1.agent_addrs` every write interval,
-and adds what it learns from requests at once.
+and adds what it learns from requests at once. The times of what it loaded
+are judged as of the load: while the database cannot be read, agents of
+hosts behind other connectors keep the age they had then rather than all
+expiring. A socket without a known owner (`~unknown`) names no service.
 
 | role | peer | `service.peer.name` |
 |---|---|---|
@@ -360,11 +395,13 @@ and adds what it learns from requests at once.
 | either | unknown, public address | `~external` |
 
 `shawk.peer.agent` tells whether the peer address belongs to a host whose
-agent is alive (reported in the last 5 minutes, or the host itself for
-loopback) and records the other side of the edge, which for UDP requires
-that it traces UDP. An agent that traces one network namespace reports the
-addresses of that namespace only, so its peers are traced. The counting
-convention of §7 relies on it.
+agent is alive (closed an interval in the last 5 minutes, or the host
+itself for loopback) and records the other side of the edge, which for UDP
+requires that it traces UDP. An agent that traces one network namespace
+reports the addresses of that namespace only, so its peers are traced
+(see §10 for the initial namespace). The counting convention of §7 relies
+on it. The connector writes `peer_cidrs` to PostgreSQL, so that the
+contract names peers without a service the same way.
 
 Loopback peers are looked up on the same host only, and so are addresses
 that several live hosts hold at once, such as the gateway of a container
@@ -400,16 +437,27 @@ name, and `host.id` and `host.name` are promoted to labels by Prometheus.
   The connector keeps the last value of every input series and adds the
   increase to the output, treating a decrease or a new start time as a
   reset, so an output never decreases when an input disappears. An input
-  that started before the connector is taken as a baseline, so a restart of
-  the connector does not add past totals at once. Open connections are the
-  sum of the current inputs.
+  seen for the first time counts in full only if it started after the
+  latest interval of its host closed at this connector, or, for a host that
+  has not closed one here yet, if it started after the connector and
+  within the last two minutes; otherwise its first value is a baseline. A
+  restart of the connector, or a host routed to another connector, thus
+  does not add past totals at once. Open connections are the sum of the
+  values the inputs had in the interval that closes.
 - An agent may send an interval in several requests. The outputs of a
   host are emitted once per interval, when the last request (the one with
-  the metrics of the agent) arrives, at the time of that request; an
-  interval whose last request is older than one already emitted emits
-  nothing. Every input point keeps its timestamp, and a point not newer
-  than the last one of its series (a late or retried request) changes
-  nothing.
+  the metrics of the agent) arrives; an interval whose last request is
+  older than one already emitted emits nothing. Every input point keeps its
+  timestamp, and a point not newer than the last one of its series (a late
+  or retried request) changes nothing. A request more than 2 minutes older
+  than the newest of its host means that the clock of the agent went back:
+  every input of the host takes its next point as a baseline, and the next
+  interval is emitted.
+- Outputs, and the metrics of the agents forwarded with them, carry the
+  time of the connector, so that one host with a wrong clock does not make
+  Prometheus reject a batch with the points of other hosts.
+- An error of the pipeline after the connector (Prometheus down) is logged
+  and not returned to the agent: the request was taken for PostgreSQL.
 - An output series without input is sent until `idle_ttl` and then dropped.
 - This state requires the data of a host to reach the same connector. With
   several connectors, route by resource with the loadbalancing exporter of a
@@ -431,20 +479,27 @@ out-of-order window of 30 minutes; counters stay cumulative.
 
 ## 6. PostgreSQL
 
-PostgreSQL 14 or later (multiranges and `CYCLE`). The schema is bundled
-with the connector as migrations (`collector/shawkconnector/migrations`),
-applied by `shawk-migrate` or by the connector with `postgres.migrate`.
+PostgreSQL 14 or later (multiranges). The schema is bundled with the
+connector as migrations (`collector/shawkconnector/migrations`), applied by
+`shawk-migrate` or by the connector with `postgres.migrate`; run
+`grants.sql` again after a migration that adds tables.
 
 ### 6.1 Tables (internal, schema `shawk`)
 
 ```
 hosts(id, machine_id, hostname, kernel, agent_version, first_seen, last_seen)
 agent_sessions(host_id, started_at, last_heartbeat, udp_traced, netns_scope, dropped_flows)
-host_addrs(host_id, addr, first_seen, last_seen)
+host_addrs(host_id, addr, first_seen, last_seen)  -- one row per period
 processes(id, host_id, unit, comm, exe, service_name, first_seen, last_seen)  -- unique (host_id, unit, comm, service_name)
 edges(id, host_id, process_id, role, proto, local_addr, remote_addr, port, netns, first_seen, last_seen)
 listeners(host_id, process_id, proto, addr, port, netns, first_seen, last_seen)
+peer_cidrs(prefix, name)  -- written by the connector from its peer_cidrs
+known_dependencies(client_service, server_service, port, proto, first_seen, last_seen)
 ```
+
+`known_dependencies` keeps every dependency between services ever seen; the
+connector brings it up to date every 5 minutes
+(`shawk.refresh_known_dependencies()`).
 
 `service_name` has the form of the `job` label (`namespace/name`), so that
 names in PostgreSQL and Prometheus match.
@@ -454,14 +509,15 @@ names in PostgreSQL and Prometheus match.
 | view or function | |
 |---|---|
 | `dependencies` | one row per logical dependency: the client edge and the server edge matched by their addresses and port (loopback within a host and netns, addresses held by several hosts at once within a host). `observed_by` is `both`, `client` or `server`; a one-sided row means no agent on the other side, or a NAT or load balancer between. `client_observed_until` and `server_observed_until` are the latest heartbeats of the hosts: an old `last_seen` with a recent `observed_until` means *no longer used*; both old means *no longer observed*. |
-| `graph_nodes`, `graph_edges` | the dependency map between services in the format of the Grafana Node Graph; peers without a service are named by address |
+| `graph_nodes`, `graph_edges` | the dependency map between services in the format of the Grafana Node Graph; a peer without a service is named by `peer_class` |
+| `peer_class(addr)` | the name of a peer without a known service, as in `service.peer.name`: the narrowest range of `peer_cidrs`, `~unresolved` for an address not routed on the Internet, `~external` otherwise |
 | `dependency_changes` | dependencies between services that appeared, or disappeared while a host that saw them kept observing for 15 minutes |
 | `service_endpoints` | addresses and ports services accept connections on: the last known listeners of each host (unspecified addresses expanded to the addresses of the host) and its server edges, for hosts that reported in the last 30 days, except addresses another host took over since; used by the connector |
 | `client_endpoints` | the client sides of connections in the last hour (client address, server address, port, client service); used by the connector to name the peer of a server edge |
-| `agent_addrs` | addresses of hosts whose agent reported in the last 5 minutes; used by the connector |
+| `agent_addrs` | addresses of hosts whose agent closed an interval in the last 5 minutes; used by the connector |
 | `agents` | the latest segment of every host and whether its agent is alive |
 | `unobserved(since, until, tolerance)` | the periods in which each host was not observed; Grafana overlays them as annotations |
-| `dependencies_between(since, until)`, `graph_edges_between`, `graph_nodes_between`, `dependency_changes_between` | the same for the dependencies active in a period. They filter edges before matching them, so a recent window does not scan the history (about 0.3 s instead of 3 s with a million edges); the dashboards and alerts use them |
+| `dependencies_between(since, until)`, `graph_edges_between`, `graph_nodes_between`, `dependency_changes_between` | the same for the dependencies active in a period. They take the edges active in the period with a margin of 15 minutes before matching them, so a recent window does not scan the history (about 0.3 s instead of 3 s with a million edges) and both sides of a connection are matched at the edges of the period; the dashboards and alerts use them. A dependency appeared in a period when it was first seen in it and is not in `known_dependencies` from before it: one that comes back on new edges (a new container, an hourly job) did not appear |
 
 The connector role writes `shawk` and reads `shawk_v1`; Grafana reads
 `shawk_v1` only (`packaging/postgres`).
@@ -495,13 +551,19 @@ them sorted by time; every row carries the same time, `now()`, so that each
 series has a value at the last time. A query that finds nothing returns no
 rows, which is No Data, so the rules treat No Data as Normal. New and
 disappeared dependencies are judged per service and port
-(`dependency_changes_between`), so a new replica of a known dependency is
-not new. A disappeared dependency is an explicit
+(`dependency_changes_between`), so a dependency seen before is not new, and
+peers without a service are named like in Prometheus rather than by
+address. The window of new dependencies ends 5 minutes ago, when both
+sides of a new connection are written. A disappeared dependency is an explicit
 row — its `last_seen` falls in a window while a host that saw it is still
 observed — rather than a row that vanishes from the result, so a stopped
 agent does not look like a removed dependency. Agents that stopped are
-alerted by Prometheus (`ShawkAgentDown`) while their series are in the TSDB,
-and by PostgreSQL (`shawk_v1.agents`) afterwards.
+alerted by Prometheus (`ShawkAgentDown`) for 24 hours, and by PostgreSQL
+(`shawk_v1.agents`) from then on for 30 days, labelled with the host id; a
+host reinstalled under the same name and alive is not alerted.
+
+The panels of OBI use a minimal interval of a minute: OBI exports every 60
+seconds by default, and a rate over a shorter range would hold one sample.
 
 ## 9. OBI
 
@@ -512,8 +574,11 @@ parses. shawk runs beside it instead:
 
 - OBI instruments the application layer (`application` and
   `application_service_graph` features) of selected services and sends to
-  the `otlp` receiver of the same collector; its network and statistics
-  features stay disabled, since shawk observes the same per process.
+  the `otlp` receiver of the same collector, with a client certificate
+  (`OTEL_EXPORTER_OTLP_CERTIFICATE`, `OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE`,
+  `OTEL_EXPORTER_OTLP_CLIENT_KEY`); its network and statistics features
+  stay disabled, since shawk observes the same per process. Its metrics
+  are not batched in the collector: they carry the clock of their host.
 - Both name services the same way and both set the resource `service.name`,
   so `job` matches; dashboards use one `$service` variable for both.
 - `host.id` is the machine id in both. Cloned VMs should regenerate it
@@ -547,3 +612,8 @@ parses. shawk runs beside it instead:
   of each host, and the start of a segment too; heartbeats from the clock
   of the connector, compared with the clock of PostgreSQL. Keep clocks
   synchronized (chrony); `clock_skew` shows hosts that are not.
+- **The initial network namespace only** (`-netns self` on a host): the
+  connections of containers in other namespaces are not traced, and those
+  that leave with the addresses of the host look traced to their peers,
+  whose server side is then not counted. The agent warns; use `-netns all`
+  on hosts with containers.

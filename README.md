@@ -88,9 +88,9 @@ Run the agent on every host you want to observe:
 | `-otlp-protocol` | `grpc` (default) or `http/protobuf` |
 | `-otlp-ca-file` | CA bundle that verifies the collector |
 | `-otlp-cert-file`, `-otlp-key-file` | client certificate for a collector that requires one (the example configuration does) |
-| `-max-series-per-request` | dependencies and listeners per request (1000, about 3 MB); a busy host sends several requests per interval |
+| `-max-series-per-request` | dependencies and listeners per request (1000); a request also stays below 3 MiB, and a busy host sends several per interval |
 | `-service-name-fallback` | name of a service without `OTEL_SERVICE_NAME`: `exe` (executable name, as OBI) or `unit` (systemd unit) |
-| `-interval`, `-idle-ttl` | export interval (15 s) and how long a dependency is sent after its last activity (15 min) |
+| `-interval`, `-idle-ttl` | export interval (15 s, at most 1 min) and how long a dependency is sent after its last activity (15 min) |
 | `-netns`, `-max-flows`, `-bpf-stats` | network namespaces to trace, capacity of the in-kernel flow table, BPF run time statistics |
 
 Services that share an executable on a host (`ruby`, `python`, `java`,
@@ -127,7 +127,7 @@ psql -v ON_ERROR_STOP=1 -d shawk -U shawk_owner -f packaging/postgres/grants.sql
 ```
 
 `packaging/collector/config.yaml` receives the agents on `otlp/shawk`
-(port 4327, TLS with client certificates) and OBI on `otlp` (port 4317), writes PostgreSQL with the role
+(port 4327) and OBI on `otlp` (port 4317), both with TLS and client certificates, writes PostgreSQL with the role
 `shawk_connector` and pushes metrics to Prometheus;
 `packaging/prometheus/` has the Prometheus settings and the recording rules
 that count each dependency once; `packaging/grafana/` has data sources,

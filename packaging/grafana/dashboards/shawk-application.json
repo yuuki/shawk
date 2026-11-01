@@ -91,7 +91,8 @@
           "editorMode": "code",
           "expr": "sum by (http_route, http_response_status_code) (rate(http_server_request_duration_seconds_count{job=\"$service\"}[$__rate_interval]))",
           "range": true,
-          "legendFormat": "{{http_route}} {{http_response_status_code}}"
+          "legendFormat": "{{http_route}} {{http_response_status_code}}",
+          "interval": "1m"
         }
       ],
       "fieldConfig": {
@@ -143,7 +144,8 @@
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by (le, http_route) (rate(http_server_request_duration_seconds_bucket{job=\"$service\"}[$__rate_interval])))",
           "range": true,
-          "legendFormat": "{{http_route}}"
+          "legendFormat": "{{http_route}}",
+          "interval": "1m"
         }
       ],
       "fieldConfig": {
@@ -195,7 +197,8 @@
           "editorMode": "code",
           "expr": "sum by (server_address, http_response_status_code) (rate(http_client_request_duration_seconds_count{job=\"$service\"}[$__rate_interval]))",
           "range": true,
-          "legendFormat": "{{server_address}} {{http_response_status_code}}"
+          "legendFormat": "{{server_address}} {{http_response_status_code}}",
+          "interval": "1m"
         }
       ],
       "fieldConfig": {

@@ -147,7 +147,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "WITH RECURSIVE e AS (\n  SELECT id, source, target, mainstat, first_seen, last_seen\n  FROM shawk_v1.graph_edges_between($__timeFrom(), $__timeTo())\n),\nwalk (node, depth) AS (\n  SELECT unnest(ARRAY[${service:singlequote}]::text[]), 0\n  UNION ALL\n  SELECT CASE WHEN e.source = w.node THEN e.target ELSE e.source END, w.depth + 1\n  FROM walk w\n  JOIN e ON ('$direction' IN ('downstream', 'both') AND e.source = w.node)\n         OR ('$direction' IN ('upstream', 'both') AND e.target = w.node)\n  WHERE w.depth < $depth\n) CYCLE node SET is_cycle USING path,\nreached AS (SELECT DISTINCT node FROM walk)\n\nSELECT n.id, n.title, n.subtitle, n.mainstat || ' hosts' AS mainstat\nFROM shawk_v1.graph_nodes_between($__timeFrom(), $__timeTo()) n\nWHERE n.id IN (SELECT node FROM reached)"
+          "rawSql": "WITH RECURSIVE e AS (\n  SELECT id, source, target, mainstat, first_seen, last_seen\n  FROM shawk_v1.graph_edges_between($__timeFrom(), $__timeTo())\n),\n-- UNION keeps one row per service and depth, so that the walk visits\n-- services rather than every path between them.\nwalk (node, depth) AS (\n  SELECT unnest(ARRAY[${service:singlequote}]::text[]), 0\n  UNION\n  SELECT CASE WHEN e.source = w.node THEN e.target ELSE e.source END, w.depth + 1\n  FROM walk w\n  JOIN e ON ('$direction' IN ('downstream', 'both') AND e.source = w.node)\n         OR ('$direction' IN ('upstream', 'both') AND e.target = w.node)\n  WHERE w.depth < $depth\n),\nreached AS (SELECT DISTINCT node FROM walk)\n\nSELECT n.id, n.title, n.subtitle, n.mainstat || ' hosts' AS mainstat\nFROM shawk_v1.graph_nodes_between($__timeFrom(), $__timeTo()) n\nWHERE n.id IN (SELECT node FROM reached)"
         },
         {
           "refId": "edges",
@@ -158,14 +158,14 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "WITH RECURSIVE e AS (\n  SELECT id, source, target, mainstat, first_seen, last_seen\n  FROM shawk_v1.graph_edges_between($__timeFrom(), $__timeTo())\n),\nwalk (node, depth) AS (\n  SELECT unnest(ARRAY[${service:singlequote}]::text[]), 0\n  UNION ALL\n  SELECT CASE WHEN e.source = w.node THEN e.target ELSE e.source END, w.depth + 1\n  FROM walk w\n  JOIN e ON ('$direction' IN ('downstream', 'both') AND e.source = w.node)\n         OR ('$direction' IN ('upstream', 'both') AND e.target = w.node)\n  WHERE w.depth < $depth\n) CYCLE node SET is_cycle USING path,\nreached AS (SELECT DISTINCT node FROM walk)\n\nSELECT e.id, e.source, e.target, e.mainstat, e.last_seen AS secondarystat\nFROM e\nWHERE e.source IN (SELECT node FROM reached) AND e.target IN (SELECT node FROM reached)"
+          "rawSql": "WITH RECURSIVE e AS (\n  SELECT id, source, target, mainstat, first_seen, last_seen\n  FROM shawk_v1.graph_edges_between($__timeFrom(), $__timeTo())\n),\n-- UNION keeps one row per service and depth, so that the walk visits\n-- services rather than every path between them.\nwalk (node, depth) AS (\n  SELECT unnest(ARRAY[${service:singlequote}]::text[]), 0\n  UNION\n  SELECT CASE WHEN e.source = w.node THEN e.target ELSE e.source END, w.depth + 1\n  FROM walk w\n  JOIN e ON ('$direction' IN ('downstream', 'both') AND e.source = w.node)\n         OR ('$direction' IN ('upstream', 'both') AND e.target = w.node)\n  WHERE w.depth < $depth\n),\nreached AS (SELECT DISTINCT node FROM walk)\n\nSELECT e.id, e.source, e.target, e.mainstat, e.last_seen AS secondarystat\nFROM e\nWHERE e.source IN (SELECT node FROM reached) AND e.target IN (SELECT node FROM reached)"
         }
       ],
       "options": {
         "nodes": {},
         "edges": {}
       },
-      "description": "Services reached from the selected services within the depth, in the time range. A peer without a known service is shown by its address."
+      "description": "Services reached from the selected services within the depth, in the time range. A peer without a known service is shown by the name Prometheus gives it: a name of peer_cidrs, ~unresolved or ~external."
     },
     {
       "id": 2,
@@ -191,7 +191,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "WITH RECURSIVE e AS (\n  SELECT id, source, target, mainstat, first_seen, last_seen\n  FROM shawk_v1.graph_edges_between($__timeFrom(), $__timeTo())\n),\nwalk (node, depth) AS (\n  SELECT unnest(ARRAY[${service:singlequote}]::text[]), 0\n  UNION ALL\n  SELECT CASE WHEN e.source = w.node THEN e.target ELSE e.source END, w.depth + 1\n  FROM walk w\n  JOIN e ON ('$direction' IN ('downstream', 'both') AND e.source = w.node)\n         OR ('$direction' IN ('upstream', 'both') AND e.target = w.node)\n  WHERE w.depth < $depth\n) CYCLE node SET is_cycle USING path,\nreached AS (SELECT DISTINCT node FROM walk)\n\n    SELECT e.source AS client, e.target AS server, e.mainstat AS ports, e.first_seen, e.last_seen\n    FROM e\n    WHERE e.source IN (SELECT node FROM reached) AND e.target IN (SELECT node FROM reached)\n    ORDER BY e.last_seen DESC"
+          "rawSql": "WITH RECURSIVE e AS (\n  SELECT id, source, target, mainstat, first_seen, last_seen\n  FROM shawk_v1.graph_edges_between($__timeFrom(), $__timeTo())\n),\n-- UNION keeps one row per service and depth, so that the walk visits\n-- services rather than every path between them.\nwalk (node, depth) AS (\n  SELECT unnest(ARRAY[${service:singlequote}]::text[]), 0\n  UNION\n  SELECT CASE WHEN e.source = w.node THEN e.target ELSE e.source END, w.depth + 1\n  FROM walk w\n  JOIN e ON ('$direction' IN ('downstream', 'both') AND e.source = w.node)\n         OR ('$direction' IN ('upstream', 'both') AND e.target = w.node)\n  WHERE w.depth < $depth\n),\nreached AS (SELECT DISTINCT node FROM walk)\n\n    SELECT e.source AS client, e.target AS server, e.mainstat AS ports, e.first_seen, e.last_seen\n    FROM e\n    WHERE e.source IN (SELECT node FROM reached) AND e.target IN (SELECT node FROM reached)\n    ORDER BY e.last_seen DESC"
         }
       ],
       "options": {

@@ -264,20 +264,34 @@ groups:
 
 ### 4.6 Collector の設定例
 
+実装の設定例は `packaging/collector/config.yaml` にある。ここはその要約で、二回の敵対的レビュー（§11, §12）で変わった点を反映している。
+
 ```yaml
 receivers:
-  otlp/shawk:                 # shawk agent 専用の受け口
+  otlp/shawk:                 # shawk agent 専用の受け口。TLS とクライアント証明書を必須にする
     protocols:
-      grpc: { endpoint: 0.0.0.0:4327 }
-  otlp:                       # OBI など
+      grpc:
+        endpoint: 0.0.0.0:4327
+        max_recv_msg_size_mib: 16
+        tls: &shawk_tls
+          cert_file: /etc/shawk/tls/collector.crt
+          key_file: /etc/shawk/tls/collector.key
+          client_ca_file: /etc/shawk/tls/agents-ca.crt
+      http:
+        endpoint: 0.0.0.0:4328
+        max_request_body_size: 16777216
+        tls: *shawk_tls
+  otlp:                       # OBI など。こちらもクライアント証明書を必須にする
     protocols:
-      grpc: { endpoint: 0.0.0.0:4317 }
+      grpc: { endpoint: 0.0.0.0:4317, tls: *shawk_tls }
+      http: { endpoint: 0.0.0.0:4318, tls: *shawk_tls }
 
 connectors:
   shawk:
     postgres:
       dsn_file: /etc/shawk/postgres-dsn
-    write_interval: 1m
+      migrate: false            # スキーマは shawk-migrate で当てる
+    write_interval: 1m          # 1 分以下
     idle_ttl: 15m
     max_peers: 50
     peer_cidrs:
@@ -285,31 +299,33 @@ connectors:
     retention: 26280h           # 3 年。0 なら消さない
 
 processors:
+  memory_limiter: { check_interval: 1s, limit_percentage: 80, spike_limit_percentage: 20 }
   batch: {}
 
 exporters:
-  otlphttp/prometheus:
+  otlp_http/prometheus:
     endpoint: http://prometheus:9090/api/v1/otlp
-  otlp/traces:                # Tempo などトレースの送り先
+  otlp_grpc/traces:           # Tempo などトレースの送り先
     endpoint: tempo:4317
 
 service:
   pipelines:
     metrics/shawk-in:         # connector の前に batch を置かない（一回の送信を一区間として扱うため）
       receivers: [otlp/shawk]
+      processors: [memory_limiter]
       exporters: [shawk]
-    metrics/shawk-out:
+    metrics/shawk-out:        # 出力は connector の時計の時刻なので batch してよい
       receivers: [shawk]
       processors: [batch]
-      exporters: [otlphttp/prometheus]
-    metrics/obi:
+      exporters: [otlp_http/prometheus]
+    metrics/obi:              # batch しない（ホストの時計の時刻のまま。§12）
       receivers: [otlp]
-      processors: [batch]
-      exporters: [otlphttp/prometheus]
+      processors: [memory_limiter]
+      exporters: [otlp_http/prometheus]
     traces/obi:
       receivers: [otlp]
-      processors: [batch]
-      exporters: [otlp/traces]
+      processors: [memory_limiter, batch]
+      exporters: [otlp_grpc/traces]
 ```
 
 ## 5. PostgreSQL の契約
@@ -340,12 +356,12 @@ CREATE TABLE shawk.agent_sessions (
   PRIMARY KEY (host_id, started_at)
 );
 
-CREATE TABLE shawk.host_addrs (
+CREATE TABLE shawk.host_addrs (    -- §12 で、アドレスを持っていた期間ごとの行にした
   host_id    text NOT NULL REFERENCES shawk.hosts,
   addr       inet NOT NULL,
   first_seen timestamptz NOT NULL,
   last_seen  timestamptz NOT NULL,
-  PRIMARY KEY (host_id, addr)
+  PRIMARY KEY (host_id, addr)        -- 0009 で (host_id, addr, first_seen)
 );
 
 CREATE TABLE shawk.processes (
@@ -442,10 +458,10 @@ $$;
 | ダッシュボード | 主なデータ源 |
 |---|---|
 | フリート概要（エージェントの稼働、観測の空白、ドロップ、UDP 未追跡、今日増えた依存） | Postgres（`agents`, `unobserved()`）、Prometheus（`shawk_agent_*`） |
-| 依存マップ（対象と深さを変数で選ぶ。再帰 SQL に `CYCLE` 句と深さの上限を入れる） | Postgres（`graph_nodes`, `graph_edges`） |
+| 依存マップ（対象と深さを変数で選ぶ。再帰 SQL は（サービス, 深さ）の `UNION` で辿り、深さの上限を入れる。§12） | Postgres（`graph_nodes_between`, `graph_edges_between`） |
 | 依存の詳細（接続数、失敗率、再送、RTT と、両端・初めて見た時刻・最後に見た時刻・観測区間） | Prometheus（recording rule）、Postgres（`dependencies`） |
 | 変化（現れた依存・消えた依存を表と注釈で） | Postgres（`dependency_changes`） |
-| アプリ層（HTTP・gRPC・DB の RED とトレース） | OBI のメトリクスとトレース |
+| アプリ層（HTTP・gRPC・DB の RED とトレース）。実装したのは HTTP の RED と shawk の依存だけで、gRPC・DB の RED とトレースは §8 に回した | OBI のメトリクスとトレース |
 
 ### 6.2 アラート（P0-5）
 
@@ -456,28 +472,35 @@ Grafana の PostgreSQL データソースは、アラートの条件に**時系�
 - ダッシュボードの変数はアラートでは使えないので、時間の範囲はクエリ内に直接書く。
 - 「消えた」は、行が結果から外れたこと（自動解決）では表さず、`last_seen` が一定の窓に入った行として明示的に選ぶ。エージェントが止まっただけの場合を除くため、相手側のホストが観測を続けていることを条件に入れる。
 
+実装は `packaging/grafana/provisioning/alerting/shawk-rules.yaml` にある。二回のレビュー（§11, §12）を受けて、次の形になった。
+
+- 全行の `time` を `now()` にそろえて `ORDER BY` する（Grafana は時刻順でない行を拒み、時刻のそろわない系列は最新の時刻にしか値を持たない）。reduce は null を落とす。
+- 新しい依存と消えた依存は、サービス単位の `dependency_changes_between` から作る。以前に見たことのある依存（`known_dependencies`）は「新しい」としない。サービス名のない相手は Prometheus と同じ名前（`peer_cidrs` の名前、`~unresolved`、`~external`）にまとめる。
+- 新しい依存の窓は 5 分前で終える。新しい接続の両側が書き込まれてからにするため。
+
 ```sql
--- 新しい依存（15 分以内に初めて見た依存）
-SELECT max(first_seen) AS time,
-       client_service, server_service, port::text AS port,
-       1 AS value
-FROM shawk_v1.dependencies
-WHERE first_seen > now() - interval '15 minutes'
-GROUP BY client_service, server_service, port;
+-- 新しい依存（20〜5 分前に初めて見た、以前に見たことのない依存）
+SELECT now() AS time, client_service, server_service, port::text AS port, proto, 1 AS value
+FROM shawk_v1.dependency_changes_between(now() - interval '20 minutes', now() - interval '5 minutes')
+WHERE change = 'appeared'
+ORDER BY 1, 2, 3, 4, 5;
 
--- 消えた依存（30〜15 分前を最後に見えなくなり、クライアント側は今も観測できている）
-SELECT max(last_seen) AS time,
-       client_service, server_service, port::text AS port,
-       1 AS value
-FROM shawk_v1.dependencies
-WHERE last_seen BETWEEN now() - interval '30 minutes' AND now() - interval '15 minutes'
-  AND client_observed_until > now() - interval '5 minutes'
-GROUP BY client_service, server_service, port;
+-- 消えた依存（30〜15 分前を最後に見えなくなり、それを見ていたホストは観測を続けている）
+SELECT now() AS time, client_service, server_service, port::text AS port, proto, 1 AS value
+FROM shawk_v1.dependency_changes_between(now() - interval '30 minutes', now())
+WHERE change = 'disappeared' AND time <= now() - interval '15 minutes'
+ORDER BY 1, 2, 3, 4, 5;
 
--- 長く報告が途絶えたエージェント（TSDB の保持期間を超えても効く）
-SELECT last_heartbeat AS time, host, 1 AS value
-FROM shawk_v1.agents
-WHERE NOT alive AND last_heartbeat > now() - interval '30 days';
+-- 24 時間を超えて報告が途絶えたエージェント（それまでは Prometheus の ShawkAgentDown が受け持つ）。
+-- 同じ名前で入れ直されて生きているホストは除き、host_id をラベルにする。
+SELECT now() AS time, a.host, a.host_id,
+       round(extract(epoch FROM now() - a.last_heartbeat) / 60)::float8 AS value
+FROM shawk_v1.agents a
+WHERE NOT a.alive
+  AND a.last_heartbeat < now() - interval '24 hours'
+  AND a.last_heartbeat > now() - interval '30 days'
+  AND NOT EXISTS (SELECT FROM shawk_v1.agents b WHERE b.host = a.host AND b.last_heartbeat > a.last_heartbeat)
+ORDER BY 1, 2, 3;
 ```
 
 Prometheus のアラート：
@@ -563,18 +586,24 @@ OpenTelemetry eBPF Instrumentation（OBI）を土台にできるかを検討し�
 # /etc/obi/app.env（systemctl enable --now obi@app）
 OTEL_EBPF_OPEN_PORT=8080,8443
 OTEL_EBPF_METRICS_FEATURES=application,application_service_graph
-OTEL_EXPORTER_OTLP_ENDPOINT=http://collector.example:4318
+# Collector の otlp はクライアント証明書を求める（§4.6）。OBI は OpenTelemetry SDK の変数で証明書を渡す
+OTEL_EXPORTER_OTLP_ENDPOINT=https://collector.example:4318
+OTEL_EXPORTER_OTLP_CERTIFICATE=/etc/obi/tls/collector-ca.crt
+OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE=/etc/obi/tls/obi.crt
+OTEL_EXPORTER_OTLP_CLIENT_KEY=/etc/obi/tls/obi.key
 ```
+
+OBI は既定で 60 秒ごとにメトリクスを送る。アプリ層のダッシュボードは OBI のクエリの最小間隔を 1 分にしている（`$__rate_interval` が 4 分になる）。短くしたいときは `OTEL_EBPF_METRICS_INTERVAL` を設定する。
 
 **Collector**
 
 - OBI の OTLP は通常の受け口（`otlp`）に、shawk agent の OTLP は専用の受け口（`otlp/shawk`）に送る。
-- メトリクスは同じ Prometheus へ、トレースは Tempo などへ送る（§4.6）。
+- メトリクスは同じ Prometheus へ、トレースは Tempo などへ送る（§4.6）。OBI のメトリクスは batch しない。点の時刻はホストの時計のままなので、時計の大きくずれたホストが一つあると、同じ batch の他のホストの点まで Prometheus に拒まれるため（§12）。
 
 **Grafana でのつなぎ方**
 
 - ダッシュボードの変数 `$service` を `job` から作れば、shawk の依存（`shawk:dependency_*` の `src`/`dst`、PostgreSQL の `client_service`/`server_service`）と OBI の RED を同じ値で絞り込める。
-- 依存マップのノード（PostgreSQL）から、そのサービスの OBI の RED とトレースへデータリンクで移る。
+- 依存マップのノード（PostgreSQL）から、そのサービスの OBI の RED とトレースへデータリンクで移る（未実装。§8）。
 
 **アプリ層の計装が届いていない依存を見つける**
 
@@ -607,6 +636,7 @@ group by (src, dst) (
 - Java などで OBI と同じ名前の決め方（Spring Boot の名前、JAR 名）を取り入れるか。
 - `service_endpoints` から OBI の対象ポート（`OTEL_EBPF_OPEN_PORT`）を生成する仕組み。
 - Rocky Linux 9 の実カーネル（SELinux enforcing）での CI。
+- アプリ層のダッシュボードの gRPC・DB の RED とトレース、依存マップのノードから OBI の RED とトレースへのデータリンク（§6.1, §7.4。今回の実装は HTTP の RED だけ）。
 
 ## 9. 実装で決めたこと
 
@@ -615,14 +645,14 @@ group by (src, dst) (
 ### 9.1 エージェント
 
 - OTLP の送り方は gRPC（既定）と HTTP/protobuf（`-otlp-protocol=http/protobuf`）の二つ。どちらも gzip で圧縮する。送り先は `-otlp-endpoint`（URL。`http://` は平文、`https://` は TLS。`-otlp-ca-file` で CA を指定できる）。既定値は環境変数 `OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_EXPORTER_OTLP_PROTOCOL`、なければ `http://localhost:4327` と gRPC。
-- 一回の送信の時間切れは送信間隔の 2/3。送信は再試行しない（次の送信が累積値で追いつく）。部分的な拒否（partial success）も失敗として数える。
+- 一回の送信の時間切れは送信間隔の 2/3（§12 で、リクエストごとに、収集の後から数えるようにした）。送信は再試行しない（次の送信が累積値で追いつく）。部分的な拒否（partial success）も失敗として数える。
 - エッジの系列は (役割, プロトコル, ローカルアドレス, 相手アドレス, ポート, netns, ユニット, comm, 実行ファイルのパス, `service.name`, `service.namespace`) で区別する。プロセスが `/proc` を読む前に終了した場合（短命なバッチなど）は、同じ (ユニット, comm) の直近の名前を使う。それもなければ comm を名前にする。
 - `first_seen` と `last_seen` は、活動があった区間の終わりの時刻にする。
 - TCP のエッジは `connection.opened`、`connection.count`、`network.io`、`tcp.retransmits`、`tcp.rtt` を、クライアント側だけ `connection.failed` も送る。UDP のエッジは `network.io` と `udp.datagrams` を送る。
 - `-idle-ttl` は 2 分以上かつ送信間隔の 4 倍以上でなければならない（区間の始まりの規則が「TTL − 1 分」を使うため）。
 - `-bpf-stats` は残し、BPF プログラムの実行回数と実行時間を `shawk.agent.bpf.run_count` / `shawk.agent.bpf.run_time`（属性 `shawk.bpf.program`）として送る。HTTP API がなくなったため。
 - エージェントの HTTP API（`internal/agent/http.go`）はこの段階で消した。
-- `host.ip` には、インタフェースのアドレスに加えて、生きている系列のローカルアドレス（コンテナの名前空間のもの）を入れる。
+- `host.ip` には、インタフェースのアドレスに加えて、生きている系列のローカルアドレス（コンテナの名前空間のもの）を入れる（§12 で、直近に活動した系列と開いている待ち受けのものだけにした）。
 - machine-id がないホストでは `host.id` を送らない（現行の boot_id への代替はやめた。再起動のたびに別のホストになるため）。
 
 ### 9.2 shawk connector
@@ -638,16 +668,16 @@ group by (src, dst) (
   - `peer_cidrs` の値はカンマ区切りで複数の範囲を書ける。`~` で始まる名前は使えない。
   - 区分 `~unresolved` の「プライベート範囲」は、RFC 1918、ループバック、リンクローカル、CGNAT（100.64.0.0/10）、IPv6 ULA。
 - 累積値の合算の細部：
-  - connector が起動する前に始まった入力系列は、最初の値を基準にして差分 0 とする（再起動直後に過去の累計が一度に足されて率が跳ねないように）。
-  - `shawk.connection.count`（開いている接続）は差分をとらず、そのリクエストに含まれる入力の現在値の和にする。入力がなくなった出力は 0 になる。
+  - connector が起動する前に始まった入力系列は、最初の値を基準にして差分 0 とする（再起動直後に過去の累計が一度に足されて率が跳ねないように）。§12 で、そのホストの直近の区間がこの connector で閉じた後に始まった系列だけを全量とする規則に変えた。
+  - `shawk.connection.count`（開いている接続）は差分をとらず、入力の現在値の和にする。入力がなくなった出力は 0 になる。§12 で、閉じる区間の値だけを足すようにした。
   - `max_peers` の枠は、出力の TTL の間使われなかった相手から空く。`~other` 自体は枠に数えない。
 - 出力のリソースには `service.name`、`service.namespace`（あれば）、`service.instance.id`（= `host.name`）、`host.id`、`host.name` を付ける。エージェント自身のメトリクスは `service.name=shawk-agent` のリソースで、`shawk.agent.segment.start` を除いて転送する。
 - `shawk_v1` のビューの細部：
   - `service_endpoints` は、待ち受けポート（`0.0.0.0` は同じホストの IPv4 アドレスに、`::` は全アドレスに展開する）とサーバ側のエッジの（ローカルアドレス, ポート）から作る。当初は直近 7 日に見たものだけを返していたが、§10 の未決事項を受けて、各ホストの「最後に分かっていた待ち受け」を返すように変えた（マイグレーション 0006）：そのホストの最新の待ち受けの報告から 1 時間以内の待ち受け（同じエージェントの時計どうしで比べる）、同じく 7 日以内のサーバ側のエッジ、直近 30 日に報告したホストに限る。アドレスを別のホストが後から持ち始めた場合（生存の窓 5 分より後。ループバックは除く）は、古いホストの名前を返さない。列 `host_id` と `last_seen` を加えた。§8 の「`0.0.0.0` の待ち受けポートの展開」のうち、ホストのアドレスへの単純な展開だけを先に入れた（これがないと、ほとんどのサーバの名前が引けないため）。
-  - `agent_addrs` は、直近 5 分以内に報告したホストのアドレスだけを返す。クライアント側のエージェントが止まると、サーバ側の系列は 5 分ほどで `shawk_peer_agent` が false に変わり、依存単位の値に数えられるようになる。
+  - `agent_addrs` は、直近 5 分以内に報告したホストのアドレスだけを返す（§12 で、区間を閉じたリクエストのハートビートでも判定するようにした）。クライアント側のエージェントが止まると、サーバ側の系列は 5 分ほどで `shawk_peer_agent` が false に変わり、依存単位の値に数えられるようになる。
   - `client_endpoints` は、直近 1 時間に見たクライアント側のエッジ（クライアントのアドレス、サーバのアドレス、ポート、クライアントのサービス）を返す。サーバ側のエッジはクライアント側のエッジが生きている間だけ送られるので、1 時間で足りる。
   - `dependencies` に `client_addr` と `server_unit` を加えた。ループバックのアドレスどうしは、同じホスト・同じ netns のエッジだけを突き合わせる。
-  - `graph_nodes` / `graph_edges` / `dependency_changes` はサービス単位にまとめる。サービス名のない相手はアドレスをノードの名前にする。`dependency_changes` の「消えた」は、その依存を見ていたホストが `last_seen` から 15 分以上観測を続けていることを条件にする。
+  - `graph_nodes` / `graph_edges` / `dependency_changes` はサービス単位にまとめる。サービス名のない相手はアドレスをノードの名前にする（§12 で、Prometheus と同じ `peer_class()` の名前に変えた）。`dependency_changes` の「消えた」は、その依存を見ていたホストが `last_seen` から 15 分以上観測を続けていることを条件にする。
   - `unobserved()` は `SECURITY DEFINER` にした（読み取りのロールが `shawk` スキーマの表を読めなくても使えるように）。
   - `agents` に `host_id`、`machine_id`、`kernel`、`agent_version` を加えた。
 
@@ -657,15 +687,15 @@ group by (src, dst) (
 
 - 共有されるアドレス（§10 から一部解決）：生きている複数のホストが同時に持つアドレス（docker0 の 172.17.0.1 など）は、ホストをまたいで引かない。connector は `agent_addrs` と受け取ったリクエストから、そのアドレスを持つホストが二つ以上あれば同じホストの待ち受けとクライアント側のエッジだけで名前を引き、自ホストも持っていれば相手は自ホスト（`shawk.peer.agent=true`）とみなす。`dependencies` ビューは、二つ以上のホストが重なる期間に持っていたアドレス（`shawk.shared_addrs`。期間は生存の窓 5 分だけ広げる）を含むエッジを同じホストの中だけで突き合わせる（マイグレーション 0005）。エージェントがアドレスのスコープ（bridge・veth・netns）を送る仕組みは §8 の P1 のまま残す。
 
-- 期間で絞る関数（§10 から解決）：`shawk_v1.dependencies_between(since, until)`、`graph_edges_between`、`graph_nodes_between`、`dependency_changes_between` を加えた（マイグレーション 0007。`SECURITY DEFINER`）。期間に活動したエッジだけを先に索引で絞ってから突き合わせる。100 万エッジ（うち直近 1 時間に活動 2 万）で、30 分の窓が 3.2 秒 → 0.27 秒、依存マップ（6 時間）が 3.3 秒 → 0.21 秒になった。同梱のダッシュボードと SQL のアラートはこれらを使う。ビューは互換のために残す。`dependency_changes_between` の「現れた」は、期間に活動したエッジの中での `first_seen` で判定する。
+- 期間で絞る関数（§10 から解決）：`shawk_v1.dependencies_between(since, until)`、`graph_edges_between`、`graph_nodes_between`、`dependency_changes_between` を加えた（マイグレーション 0007。`SECURITY DEFINER`）。期間に活動したエッジだけを先に索引で絞ってから突き合わせる。100 万エッジ（うち直近 1 時間に活動 2 万）で、30 分の窓が 3.2 秒 → 0.27 秒、依存マップ（6 時間）が 3.3 秒 → 0.21 秒になった。同梱のダッシュボードと SQL のアラートはこれらを使う。ビューは互換のために残す。`dependency_changes_between` の「現れた」は、期間に活動したエッジの中での `first_seen` で判定する（§12 で、`known_dependencies` に前からある依存を除くようにした）。
 
 ### 9.3 packaging
 
 - 置き場所：`packaging/prometheus/`（`shawk-rules.yml`、`prometheus.yml`）、`packaging/grafana/`（`dashboards/` と `provisioning/`）、`packaging/collector/config.yaml`、`packaging/postgres/`（`setup.sql`、`grants.sql`）、`packaging/systemd/`（エージェントと Collector のユニット、`agent.env`）。
 - recording rule は §4.4 の二つに加えて、`shawk:dependency_open_connections`、`shawk:dependency_request_bytes:rate5m` / `shawk:dependency_response_bytes:rate5m`（クライアントからサーバ / サーバからクライアント。クライアント側の transmit とサーバ側の receive を同じ向きとして扱う）、UDP の `shawk:dependency_request_datagrams:rate5m` / `shawk:dependency_response_datagrams:rate5m`、`shawk:dependency_rtt_seconds_sum:rate5m` / `_count:rate5m`、`shawk:dependency_retransmits:rate5m`（`shawk_role` を残す）を作る。
 - Prometheus のアラートに `ShawkUDPNotTraced` と `ShawkExportFailures` を加えた。
-- Grafana の SQL のアラート「消えた依存」は、§6.2 の例と違い、(client_service, server_service, port) ごとに集計してから `HAVING max(last_seen)` で窓を判定する。行ごとに判定すると、レプリカの一つが入れ替わっただけで発火するため。観測を続けている側は、クライアント側に限らず両側の `observed_until` の大きい方で判定する（クライアントにエージェントがない依存も扱えるように）。
-- ダッシュボードは五つ（フリート、依存マップ、依存の詳細、変化、アプリ層（OBI））。データソースは uid `shawk-postgres` / `shawk-prometheus` で参照する。依存マップは変数 `service`（複数可）、`direction`（downstream / upstream / both）、`depth` を持ち、再帰 SQL に `CYCLE` 句と深さの上限を入れる。
+- Grafana の SQL のアラート「新しい依存」「消えた依存」は、行ごとではなくサービス単位（`dependency_changes_between`）で判定する。行ごとに判定すると、レプリカの一つが入れ替わっただけで発火するため。観測を続けている側は、クライアント側に限らず両側の `observed_until` の大きい方で判定する（クライアントにエージェントがない依存も扱えるように）。現在の形は §6.2。
+- ダッシュボードは五つ（フリート、依存マップ、依存の詳細、変化、アプリ層（OBI））。データソースは uid `shawk-postgres` / `shawk-prometheus` で参照する。依存マップは変数 `service`（複数可）、`direction`（downstream / upstream / both）、`depth` を持ち、再帰 SQL は（サービス, 深さ）の `UNION` で辿り、深さの上限を入れる（§12）。
 - エージェントの `shawk.agent.up` と `shawk.agent.udp.traced` は単位を空にした。単位 `1` の Gauge には Prometheus が `_ratio` を付けるため。
 - 見本のテスト：recording rule とアラートは `test/packaging`（独自の go.mod）で Prometheus の PromQL エンジンに合成した系列を読ませて値を確かめる。ダッシュボードの PromQL は構文と recording rule の名前を確かめる。ダッシュボードと SQL アラートの SQL は、`grants.sql` を当てたうえで `shawk_grafana` ロールで実際の PostgreSQL に流す（Grafana のマクロは置き換える）。Grafana そのものでの読み込みは確かめていない。
 
@@ -733,3 +763,47 @@ group by (src, dst) (
 - `grants.sql` は、スキーマの持ち主のロールで流す。
 - ダッシュボードの変数とパネルの PromQL は、合成した系列で評価して、UDP の依存、サーバ専用のサービス、namespace 付きのサービスを確かめる。
 - 新しいテストは、古いファイルに対して失敗することを確かめた。
+
+## 12. 二回目の敵対的レビューとその対応（2026-11-01）
+
+§11 の対応の後、同じ四つの領域をもう一度、独立したサブエージェントにレビューさせた。指摘はコード・SQL・計測で確かめてから直し、直したものにはそれぞれ回帰テストを足した。新しいテストは、直す前の動き（直した箇所を一つずつ元に戻したもの）では失敗することを確かめた。
+
+| 指摘 | 妥当性 | 対応 |
+|---|---|---|
+| 一区間の一部のリクエストしか届かないと（最後のリクエストが届かない）、ハートビートも出力もないのに、`host_addrs` がリクエストごとに新しくなり、相手からは「エージェントあり」に見え続ける | 確認 | アドレスは区間を閉じるリクエストからだけ記録する（connector の手元と `host_addrs` の両方）。`agent_addrs` はハートビートでも判定し、列 `last_heartbeat` を加えた（マイグレーション 0009）。エージェントは、送信の期限を収集の後から、リクエストごとに数える |
+| リクエストを系列の数だけで分けているので、IPv6 と長い実行ファイルのパスでは 1000 系列で 4 MiB を超える | 確認（4.47 MB） | 系列ごとの大きさを見積もり、3 MiB も超えないように分ける |
+| 活動のない系列のアドレスが idle TTL の間 `host.ip` に残り、移ったアドレスが共有扱いになる | 妥当 | 直近 2 区間（1 分以上）に活動した系列と、開いている待ち受けのアドレスだけを送る |
+| 分割したとき、クライアント側のエッジが同じホストの待ち受けより先に届き、最初の区間の相手が `~unresolved` になる | 確認 | 待ち受け、サーバ側のエッジ、クライアント側のエッジの順に送る |
+| `/proc/PID/environ` の読み取りの期限が直列で、送信の期限を食う。遅いだけのプロセスは毎区間読み直す | 妥当 | 8 並列、区間あたり 1 秒の予算で読む。期限を過ぎたプロセスは、読み取りが戻ってから 5 分読まない |
+| 所有者不明の待ち受け（`~unknown`）を connector は名前として覚えるが、PostgreSQL は返さない | 妥当 | `~unknown` は名前として覚えない |
+| 再利用された PID のプロセスの名前を付けることがある | 妥当（頻度は未確認） | `/proc/PID/comm` がフローの comm と一致しなければ信用しない（tracer の comm はメインスレッドのもので、`/proc/PID/comm` と同じ） |
+| comm が 15 バイトで多バイト文字の途中で切れると、protobuf の Marshal が失敗し、その区間が毎回送れない | 確認 | 不正な UTF-8 を置き換えてから送る |
+| エージェントの時計が後ろに戻ると、そのホストの出力が止まり、その間に期限切れになった入力が後で二重に数えられる | 確認 | ホストの最新のリクエストより 2 分以上古いリクエストは時計が戻ったとみなし、入力の次の点を基準にし直して、次の区間を出力する |
+| 別の connector に振り分けられたホストの系列が、それまでの累計を一度に足す | 確認 | 初めて見る入力は、そのホストの直近の区間がこの connector で閉じた後に始まったものだけを全量とする。まだ閉じていないホストでは、connector の起動後かつ直近 2 分以内に始まったものだけ |
+| DB に読めない間、DB から読んだエージェントが時計とともに期限切れになり、`shawk_peer_agent` が false に変わって二重計上になる | 確認 | DB から読んだ時刻は、読んだ時点で判定する（読めない間は年齢を止める）。`write_interval` は 1 分以下、エージェントの `-interval` も 1 分以下に制限した |
+| データの誤りで捨てた変化の中のエッジが二度と書かれず、区間がその欠落を隠す。DB の停止中に connector が止まると、溜めた変化が失われるのを区間が隠す | 妥当 | 捨てたホストの受理済みの記録を忘れ、エージェントがまだ送っているものを書き直す。connector が初めて見たホストと、変化を捨てたホストの区間は、エージェントの idle TTL の最小値（2 分）より前には始めない。その間は観測の空白として残る |
+| 最後のリクエストが失われた区間の開いている接続数が、名前の変わった次の区間に重なって二重になる | 確認 | 閉じる区間の時刻の値だけを足す |
+| Prometheus へのエラーをエージェントに返し、DB には書けているのに送信の失敗として数えさせる | 妥当 | ログに出して（1 分に一度）エージェントには返さない |
+| 出力の時刻がエージェントの時計なので、時計の大きくずれたホストが一つあると、Prometheus が batch ごと拒み、他のホストの点も失われる | 確認（Prometheus の OTLP ハンドラで 400） | 出力（転送するエージェントのメトリクスも）は connector の時計の時刻にする。OBI のパイプラインからは batch を外した |
+| ルートの netns で `-netns self` を使うと、コンテナの通信を追跡しないのにホストのアドレスを報告し、相手からは追跡済みに見える | 妥当（推論のみ） | エージェントが起動時に警告し、限界として文書に書いた（ホストの通信の二重計上と、コンテナの通信の数え漏れのどちらかを選ぶことになるため、判定は変えていない） |
+| 「新しい依存」が、しばらく使われなかった既知の依存が新しいエッジ（新しいコンテナ、毎時のジョブ）で戻っただけで発火する | 確認 | これまでに見た依存を `known_dependencies` に残し（connector が 5 分ごとに `shawk.refresh_known_dependencies()` で更新。DB の停止や時計の遅れに備えて 1 時間の重なりを取る）、それに前からある依存は「現れた」としない |
+| サービス名のない相手をアドレスで名付けるので、アドレスの変わるクラウドの API などで、アドレスごとに「新しい」「消えた」が出る | 確認 | `shawk_v1.peer_class()` で Prometheus と同じ名前（`peer_cidrs` の名前、`~unresolved`、`~external`）にまとめる。connector は `peer_cidrs` を `shawk.peer_cidrs` に書く。依存マップのノードも同じ名前になる |
+| 期間の端で、片側のエッジだけが期間に入り、相手がアドレスで名付けられた片側だけの行が出る（幻の新しい依存、幻のノード） | 確認 | 15 分の余裕をとってエッジを取り出し、突き合わせてから期間で絞る。新しい依存のアラートの窓は 5 分前で終える |
+| `host_addrs` が最初と最後の時刻しか持たないので、A→B→A と移ったアドレスが保持期間の間ずっと共有扱いになり、B が「移った」とも判定されない | 確認 | `host_addrs` を期間ごとの行にした（5 分見えなければ新しい期間）。`service_endpoints` の「移った」はホストごとの最新の期間で判定する |
+| 依存マップの再帰が経路を数え上げ、ハブのあるグラフの深さ 5 で爆発する | 確認（300 サービス、ハブ 2 つで 8.2 秒） | （サービス, 深さ）の `UNION` で辿る（43 ms） |
+| `dependency_changes_between` が突き合わせを二度評価する | 妥当 | `MATERIALIZED` の CTE で一度にした |
+| 沈黙したエージェントのアラートが、同じ名前で入れ直されて生きているホストに出る。最初の 24 時間は Prometheus のアラートと二重に出る | 確認 | 新しい行のある同名のホストを除き、`host_id` をラベルにした。24 時間を超えたものだけにした |
+| 依存の詳細の SQL が `peer_cidrs` の名前の相手を拾えない | 確認 | `peer_class()` で名付けて絞る |
+| `unobserved()` が区間の始まりを最新のずれで換算する | 妥当 | 換算の側ではなく、エージェントが区間の始まりを現在の時計で送るようにした（時計が飛んでも、送る値は単調時計で測った経過時間から求める） |
+| connector がスキーマの版を確かめない。0008 のロックの順序が `prune` と逆でデッドロックする | 確認 | `migrate: false` の connector は `shawk.schema_version()` で版を確かめ、古ければ書き込みを待つ。書き込みと `prune` はマイグレーションの advisory lock を共有で取り、マイグレーションと互いに待つ |
+| OBI の既定の送信間隔（60 秒）だと、アプリ層のパネルの `rate` が空になる | 確認 | OBI のクエリの最小間隔を 1 分にした |
+| 認証のない `otlp` の受け口から `shawk_agent_up` を偽造して、アラートを黙らせられる | 妥当 | `otlp` にもクライアント証明書を求める。OBI は OpenTelemetry SDK の変数で証明書を渡す（OBI v1.0.0 のメトリクスの送信は SDK の設定を上書きしないことをソースで確かめた） |
+| 同梱の Collector 設定の mTLS と受信上限を確かめるテストがない。計装の抜けのパネルのテストが空の場合だけ。二つのアラートを評価していない | 確認 | テストを足し、CI で `shawk-collector validate` も流す |
+| 設計案（§4.6, §6.1, §6.2, §7.4, §9.3）が直す前の設定や SQL、実装していない機能を載せたまま | 確認 | 書き直し、実装していないものは §8 に移した |
+| TLS の鍵を Collector の利用者が読めなければならないことが書かれていない | 妥当 | `packaging/README.md` に書いた |
+
+残っているもの：
+
+- **ルートの netns だけを追跡するエージェント**：警告と文書だけ。コンテナのあるホストでは `-netns all` を使う。
+- **大きな表に索引を作るマイグレーション**：0008 は `edges` に `CONCURRENTLY` なしで索引を作る。リリース前なので既存の大きな表はないが、今後のマイグレーションでは索引の作成を分け、手順を文書にする。
+- **`known_dependencies` の最初の構築**：0009 は既存の全エッジから一度に作る。大きな既存のデータベースでは、マイグレーションに時間がかかる。

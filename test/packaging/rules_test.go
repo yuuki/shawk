@@ -152,6 +152,19 @@ eval instant at 10m ` + a("ShawkFlowsDropped") + `
 # 0.5 failures/s against 2 connections/s.
 eval instant at 10m ` + a("ShawkConnectionFailureRate") + `
   {src="shop/app", dst="postgres", server_port="5432", network_transport="tcp"} 0.2
+
+load 1m
+  shawk_agent_udp_traced{job="shawk-agent", host_name="app-01"} 1x30
+  shawk_agent_udp_traced{job="shawk-agent", host_name="app-03"} 0x30
+  shawk_agent_export_failures_total{job="shawk-agent", host_name="app-01"} 0x30
+  shawk_agent_export_failures_total{job="shawk-agent", host_name="app-03"} 0+1x30
+
+eval instant at 20m ` + a("ShawkUDPNotTraced") + `
+  shawk_agent_udp_traced{job="shawk-agent", host_name="app-03"} 0
+
+# One failure a minute.
+eval instant at 20m ` + a("ShawkExportFailures") + `
+  {job="shawk-agent", host_name="app-03"} 15
 `
 	promqltest.RunTest(t, script, promqltest.NewTestEngine(t, false, 0, promqltest.DefaultMaxSamplesPerQuery))
 	for name, e := range alerts {

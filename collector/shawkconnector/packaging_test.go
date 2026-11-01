@@ -57,7 +57,34 @@ func TestPackagedCollectorConfig(t *testing.T) {
 		cfg.MaxPeers != 50 || cfg.PeerCIDRs["office-lan"] != "192.168.10.0/24" || cfg.Retention != 3*365*24*time.Hour {
 		t.Errorf("config = %+v", cfg)
 	}
+	// Both receivers require client certificates; the receiver of agents
+	// accepts the largest requests of an agent.
+	for _, r := range []string{"otlp/shawk", "otlp"} {
+		protocols, _ := doc.Receivers[r].(map[string]any)["protocols"].(map[string]any)
+		for _, proto := range []string{"grpc", "http"} {
+			p, _ := protocols[proto].(map[string]any)
+			tls, _ := p["tls"].(map[string]any)
+			if tls["client_ca_file"] == nil || tls["cert_file"] == nil || tls["key_file"] == nil {
+				t.Errorf("%s %s: no TLS with client certificates: %v", r, proto, p)
+			}
+			if r != "otlp/shawk" {
+				continue
+			}
+			if proto == "grpc" && p["max_recv_msg_size_mib"] != 16 {
+				t.Errorf("%s: max_recv_msg_size_mib = %v", r, p["max_recv_msg_size_mib"])
+			}
+			if proto == "http" && p["max_request_body_size"] != 16<<20 {
+				t.Errorf("%s: max_request_body_size = %v", r, p["max_request_body_size"])
+			}
+		}
+	}
 	for name, p := range doc.Service.Pipelines {
+		// Points of other sources carry the clocks of their hosts; batched,
+		// one host with a wrong clock makes Prometheus drop the others.
+		if slicesContains(p.Receivers, "otlp") && slicesContains(p.Processors, "batch") &&
+			slicesContains(p.Exporters, "otlp_http/prometheus") {
+			t.Errorf("%s: batches points of several hosts for Prometheus", name)
+		}
 		for _, r := range p.Receivers {
 			if doc.Receivers[r] == nil && doc.Connectors[r] == nil {
 				t.Errorf("%s: undefined receiver %s", name, r)
@@ -183,13 +210,13 @@ func TestPGPackaged(t *testing.T) {
 		segment: now.Add(-2 * time.Hour),
 		edges: []tEdge{
 			{role: "client", proto: "tcp", local: "10.0.0.11", peer: "10.0.0.10", port: 5432, svc: "app", ns: "shop", comm: "puma", opened: 1,
-				first: now.Add(-5 * time.Minute)},
+				first: now.Add(-10 * time.Minute)},
 			// A dependency that ended 20 minutes ago.
 			{role: "client", proto: "tcp", local: "10.0.0.11", peer: "10.0.0.20", port: 6379, svc: "app", ns: "shop", comm: "puma", opened: 1,
 				first: now.Add(-time.Hour), last: now.Add(-20 * time.Minute)},
 			// A second new dependency: alerts must handle several rows.
 			{role: "client", proto: "tcp", local: "10.0.0.11", peer: "10.0.0.30", port: 11211, svc: "app", ns: "shop", comm: "puma", opened: 1,
-				first: now.Add(-3 * time.Minute)},
+				first: now.Add(-8 * time.Minute)},
 		}})
 	c.flush(ctx)
 
@@ -231,7 +258,8 @@ func TestPGPackaged(t *testing.T) {
 		t.Errorf("writing as shawk_connector: %v", err)
 	}
 	for _, q := range []string{`SELECT count(*) FROM shawk_v1.service_endpoints`, `SELECT count(*) FROM shawk_v1.agent_addrs`,
-		`SELECT count(*) FROM shawk_v1.client_endpoints`, `SELECT shawk.prune(now() - interval '3 years')`} {
+		`SELECT count(*) FROM shawk_v1.client_endpoints`, `SELECT shawk.prune(now() - interval '3 years')`,
+		`SELECT shawk.schema_version()`, `SELECT shawk.refresh_known_dependencies(interval '0')`} {
 		var n int
 		if err := conn.QueryRow(ctx, q).Scan(&n); err != nil {
 			t.Errorf("%s as shawk_connector: %v", q, err)

@@ -13,8 +13,10 @@
 # observing) rather than a row that vanishes from the result, so that a
 # stopped agent does not look like a removed dependency. New and disappeared
 # dependencies are judged per service and port, as in
-# shawk_v1.dependency_changes_between, not per edge: a new replica of a
-# known dependency is not new.
+# shawk_v1.dependency_changes_between, not per edge: a dependency seen
+# before (a new replica, a job that runs every hour) is not new, and a peer
+# without a known service is named like in Prometheus (a name of
+# peer_cidrs, ~unresolved, ~external) rather than by its address.
 #
 # Dashboard variables cannot be used in alerts, so the time windows are
 # written in the queries.
@@ -30,7 +32,7 @@ groups:
         condition: C
         data:
           - refId: A
-            relativeTimeRange: { from: 900, to: 0 }
+            relativeTimeRange: { from: 1200, to: 0 }
             datasourceUid: shawk-postgres
             model:
               refId: A
@@ -38,10 +40,13 @@ groups:
               format: time_series
               rawQuery: true
               rawSql: |-
+                -- The window ends a few minutes ago: both sides of a new
+                -- connection are written by then, so that it is not first
+                -- reported with one side named after its address.
                 SELECT now() AS time,
                        client_service, server_service, port::text AS port, proto,
                        1 AS value
-                FROM shawk_v1.dependency_changes_between(now() - interval '15 minutes', now())
+                FROM shawk_v1.dependency_changes_between(now() - interval '20 minutes', now() - interval '5 minutes')
                 WHERE change = 'appeared'
                 ORDER BY 1, 2, 3, 4, 5
           - refId: B
@@ -109,8 +114,10 @@ groups:
     folder: shawk
     interval: 5m
     rules:
-      # Covers agents silent for longer than the TSDB keeps them, where the
-      # Prometheus alert ShawkAgentDown resolves.
+      # Agents silent for more than 24 hours, when the Prometheus alert
+      # ShawkAgentDown resolves, for 30 days. A host reinstalled under a new
+      # host id (a new machine id) with the same name is not silent; the
+      # host id tells hosts of the same name apart.
       - uid: shawk-agent-silent
         title: shawk agent silent
         condition: C
@@ -124,11 +131,15 @@ groups:
               format: time_series
               rawQuery: true
               rawSql: |-
-                SELECT now() AS time, host,
-                       round(extract(epoch FROM now() - last_heartbeat) / 60)::float8 AS value
-                FROM shawk_v1.agents
-                WHERE NOT alive AND last_heartbeat > now() - interval '30 days'
-                ORDER BY 1, 2
+                SELECT now() AS time, a.host, a.host_id,
+                       round(extract(epoch FROM now() - a.last_heartbeat) / 60)::float8 AS value
+                FROM shawk_v1.agents a
+                WHERE NOT a.alive
+                  AND a.last_heartbeat < now() - interval '24 hours'
+                  AND a.last_heartbeat > now() - interval '30 days'
+                  AND NOT EXISTS (SELECT FROM shawk_v1.agents b
+                                  WHERE b.host = a.host AND b.last_heartbeat > a.last_heartbeat)
+                ORDER BY 1, 2, 3
           - refId: B
             datasourceUid: __expr__
             model: { refId: B, type: reduce, expression: A, reducer: last, settings: { mode: dropNN } }
@@ -146,7 +157,7 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "shawk agent on {{ $labels.host }} has not reported for {{ $values.B }} minutes"
+          summary: "shawk agent on {{ $labels.host }} ({{ $labels.host_id }}) has not reported for {{ $values.B }} minutes"
 
       # Times of dependencies come from the clock of each host, heartbeats
       # from the clock of the collector; a wrong clock misplaces both.

@@ -90,6 +90,13 @@ eval instant at 5m ` + asCount(t, variableQuery(t, "shawk-application.json", "se
 
 # shop/app is instrumented as app: the service graph has no namespace.
 eval instant at 5m ` + inline(gap, nil) + `
+
+# A dependency of app absent from the service graph is a gap.
+load 1m
+  shawk:dependency_connections:rate5m{src="shop/app", dst="redis", server_port="6379", network_transport="tcp"} 1x10
+
+eval instant at 5m ` + inline(gap, nil) + `
+  {src="app", dst="redis"} 1
 `
 	promqltest.RunTest(t, script, promqltest.NewTestEngine(t, false, 0, promqltest.DefaultMaxSamplesPerQuery))
 }

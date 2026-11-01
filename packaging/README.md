@@ -34,3 +34,24 @@ by that user only:
 ```sh
 sudo install -m 0640 -g shawk-collector /dev/stdin /etc/shawk/postgres-dsn <<<'postgres://shawk_connector:...@db/shawk?sslmode=require'
 ```
+
+Both receivers of the example configuration require TLS with client
+certificates. The certificate, key and CA of the collector in
+`/etc/shawk/tls/` must be readable by the user of the collector
+(`shawk-collector`; uid 65532 in the container image), e.g. the key with
+mode 0640 and group `shawk-collector`. Agents present theirs with
+`-otlp-cert-file` and `-otlp-key-file` (`systemd/agent.env`); OBI with the
+variables of the OpenTelemetry SDK:
+
+```sh
+# /etc/obi/app.env
+OTEL_EXPORTER_OTLP_ENDPOINT=https://collector.example:4318
+OTEL_EXPORTER_OTLP_CERTIFICATE=/etc/obi/tls/collector-ca.crt
+OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE=/etc/obi/tls/obi.crt
+OTEL_EXPORTER_OTLP_CLIENT_KEY=/etc/obi/tls/obi.key
+```
+
+A connector that does not migrate (`migrate: false`) waits until the schema
+is at least its own version: run `shawk-migrate`, then `grants.sql` again,
+before or while upgrading the collectors. The schema written by a newer
+connector may not suit an older one; upgrade them together.

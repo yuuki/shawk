@@ -1,11 +1,14 @@
 # Configuration of the collector with the shawk connector (built from
 # collector/builder-config.yaml). Agents send to otlp/shawk; OBI and other
 # instrumentation send to otlp.
+#
+# Both receivers require TLS with client certificates: what they receive is
+# written to PostgreSQL or Prometheus, where a forged shawk_agent_up would
+# silence alerts. The files must be readable by the user of the collector
+# (shawk-collector; 65532 in the container image).
 receivers:
-  # shawk agents only. This receiver feeds the writes to PostgreSQL, so it
-  # requires TLS with client certificates (agents: -otlp-cert-file and
-  # -otlp-key-file). A request of an agent carries at most
-  # -max-series-per-request (1000) series, about 3 MB; the limits leave room.
+  # shawk agents only (-otlp-cert-file and -otlp-key-file). A request of an
+  # agent stays below 3 MiB; the limits leave room.
   otlp/shawk:
     protocols:
       grpc:
@@ -19,10 +22,17 @@ receivers:
         endpoint: 0.0.0.0:4328
         max_request_body_size: 16777216
         tls: *shawk_tls
-  otlp:                       # OBI and other instrumentation
+  # OBI and other instrumentation, with the variables of the OpenTelemetry
+  # SDK: OTEL_EXPORTER_OTLP_ENDPOINT=https://..., OTEL_EXPORTER_OTLP_CERTIFICATE,
+  # OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE and OTEL_EXPORTER_OTLP_CLIENT_KEY.
+  otlp:
     protocols:
-      grpc: { endpoint: 0.0.0.0:4317 }
-      http: { endpoint: 0.0.0.0:4318 }
+      grpc:
+        endpoint: 0.0.0.0:4317
+        tls: *shawk_tls
+      http:
+        endpoint: 0.0.0.0:4318
+        tls: *shawk_tls
 
 connectors:
   shawk:
@@ -65,13 +75,18 @@ service:
       receivers: [otlp/shawk]
       processors: [memory_limiter]
       exporters: [shawk]
+    # The connector stamps its outputs with its own clock, so that they can
+    # be batched.
     metrics/shawk-out:
       receivers: [shawk]
       processors: [batch]
       exporters: [otlp_http/prometheus]
+    # No batch processor: points carry the clock of their host, and
+    # Prometheus rejects a whole request if one point is too far off, which
+    # would drop the metrics of every host batched with it.
     metrics/obi:
       receivers: [otlp]
-      processors: [memory_limiter, batch]
+      processors: [memory_limiter]
       exporters: [otlp_http/prometheus]
     traces/obi:
       receivers: [otlp]

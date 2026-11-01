@@ -40,6 +40,10 @@ jobs:
         run: |
           psql "$SHAWK_TEST_POSTGRES_DSN" -c 'CREATE DATABASE shawke2e'
           make e2e
+      # The collector built by make e2e checks the packaged configuration,
+      # including the names of the settings of its components.
+      - name: Validate the packaged collector configuration
+        run: collector/_build/shawk-collector validate --config packaging/collector/config.yaml
       - name: Compatibility with the Rocky Linux 9 kernel
         run: make compat
       - name: Check that the committed BPF object matches the source
