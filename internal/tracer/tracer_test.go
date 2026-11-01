@@ -155,7 +155,7 @@ func TestTCPShortLived(t *testing.T) {
 			if out == nil {
 				t.Fatalf("outgoing flow not found in %+v", snap.Flows)
 			}
-			if out.Conns != conns || out.BytesSent < conns*1000 || out.BytesRecv < conns*1000 {
+			if out.Conns != conns || out.BytesSent != conns*1000 || out.BytesRecv != conns*1000 {
 				t.Errorf("outgoing stats = %+v", out.FlowStats)
 			}
 			if out.Comm != testComm || out.PID != uint32(os.Getpid()) {
@@ -165,7 +165,7 @@ func TestTCPShortLived(t *testing.T) {
 			if in == nil {
 				t.Fatalf("incoming flow not found in %+v", snap.Flows)
 			}
-			if in.Conns != conns || in.BytesRecv < conns*1000 || in.BytesSent < conns*1000 {
+			if in.Conns != conns || in.BytesRecv != conns*1000 || in.BytesSent != conns*1000 {
 				t.Errorf("incoming stats = %+v", in.FlowStats)
 			}
 			if in.LocalAddr != addr {

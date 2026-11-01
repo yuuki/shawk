@@ -29,12 +29,18 @@ const (
 	defaultMaxFlows = 16384
 )
 
+// The tables of listening ports are sized by MaxFlows within these bounds:
+// they are preallocated, and hosts rarely listen on many ports.
+var minListenPorts, maxListenPorts uint32 = 8192, 65536
+
 // Options configures a Tracer.
 type Options struct {
 	// NetNS restricts tracing to the network namespace with this inode
 	// number. Zero traces all network namespaces.
 	NetNS uint32
-	// MaxFlows is the capacity of the in-kernel flow table per interval.
+	// MaxFlows is the capacity of the in-kernel flow table per interval. It
+	// also sizes the tables of listening TCP and UDP ports, between 8192 and
+	// 65536.
 	MaxFlows uint32
 	// OwnerScanInterval is how often the owners of listening sockets are
 	// resolved by walking the file descriptors of all processes.
@@ -62,9 +68,11 @@ type Tracer struct {
 	flowsOuter     *ebpf.Map
 	listenPorts    *ebpf.Map
 	udpListenPorts *ebpf.Map
-	markUDPServers *ebpf.Variable
+	initialScan    *ebpf.Variable
 	activeIdx      *ebpf.Variable
 	flowDrops      *ebpf.Variable
+	listenDrops    *ebpf.Variable
+	storageFails   *ebpf.Variable
 	adopted        *ebpf.Variable
 	selfTgid       *ebpf.Variable
 
@@ -89,6 +97,8 @@ type Tracer struct {
 	ownerless   map[sockAddrKey]bool
 	lastOwnScan time.Time
 	lastAdopted uint64
+	// warnings rate-limits the warnings about kernel counters.
+	warnings    map[string]counterWarning
 	statsCloser io.Closer
 }
 
@@ -162,7 +172,7 @@ func New(opts Options) (*Tracer, error) {
 	// Adopt connections and listeners that existed before the tracer
 	// started, then resolve their owners. The first walk also tells the
 	// programs which process the tracer is, and marks the UDP server sockets.
-	if err := t.markUDPServers.Set(uint32(1)); err != nil {
+	if err := t.initialScan.Set(uint32(1)); err != nil {
 		t.Close()
 		return nil, err
 	}
@@ -170,7 +180,7 @@ func New(opts Options) (*Tracer, error) {
 		t.Close()
 		return nil, err
 	}
-	if err := t.markUDPServers.Set(uint32(0)); err != nil {
+	if err := t.initialScan.Set(uint32(0)); err != nil {
 		t.Close()
 		return nil, err
 	}
@@ -202,6 +212,9 @@ func (t *Tracer) configure(spec *ebpf.CollectionSpec) error {
 	for _, name := range []string{bpfMapFlows0, bpfMapFlows1} {
 		spec.Maps[name].MaxEntries = t.opts.MaxFlows
 	}
+	for _, name := range []string{bpfMapListenPorts, bpfMapUdpListenPorts} {
+		spec.Maps[name].MaxEntries = min(max(t.opts.MaxFlows, minListenPorts), maxListenPorts)
+	}
 	spec.Maps[bpfMapFlows].InnerMap.MaxEntries = t.opts.MaxFlows
 	return nil
 }
@@ -222,9 +235,11 @@ func (t *Tracer) loadCore(spec *ebpf.CollectionSpec) error {
 	t.flowsOuter = coll.Maps[bpfMapFlows]
 	t.listenPorts = coll.Maps[bpfMapListenPorts]
 	t.udpListenPorts = coll.Maps[bpfMapUdpListenPorts]
-	t.markUDPServers = coll.Variables[bpfVarMarkUdpServers]
+	t.initialScan = coll.Variables[bpfVarInitialScan]
 	t.activeIdx = coll.Variables[bpfVarActiveIdx]
 	t.flowDrops = coll.Variables[bpfVarFlowDrops]
+	t.listenDrops = coll.Variables[bpfVarListenPortDrops]
+	t.storageFails = coll.Variables[bpfVarStorageFails]
 	t.adopted = coll.Variables[bpfVarAdoptedUnowned]
 	t.selfTgid = coll.Variables[bpfVarSelfTgid]
 
@@ -375,6 +390,8 @@ func (t *Tracer) Collect() (*Snapshot, error) {
 	if err != nil {
 		return nil, err
 	}
+	t.warnOnIncrease(t.listenDrops, "more listening ports than the in-kernel tables hold; connections that predate the agent and UDP sockets on the others may get the wrong direction", "capacity", t.listenPorts.MaxEntries())
+	t.warnOnIncrease(t.storageFails, "no socket storage for some TCP connections; they are counted from the next walk on, without their connection and earlier traffic")
 	var adopted uint64
 	if err := t.adopted.Get(&adopted); err != nil {
 		return nil, err
@@ -458,7 +475,9 @@ func (t *Tracer) attribute(flows []Flow) []Flow {
 	merged := make(map[FlowKey]int, len(flows))
 	out := flows[:0]
 	for _, f := range flows {
-		if f.Direction == DirIn && f.Proto == ProtoTCP {
+		// Incoming connections that were adopted after their listener was
+		// closed already carry the process holding them.
+		if f.Direction == DirIn && f.Proto == ProtoTCP && f.PID == 0 {
 			cands := t.listenerOwners(f.Proto, f.NetNS, f.LocalAddr, f.Port)
 			if o, ok := chooseOwner(cands, f.CgroupID); ok {
 				f.Comm = o.comm
@@ -607,6 +626,8 @@ func (t *Tracer) scanSockets() ([]Listener, error) {
 	defer closeAll(readers)
 
 	var listeners []Listener
+	// The sockets of a SO_REUSEPORT group share an address and a port.
+	seen := map[sockAddrKey]bool{}
 	for _, rd := range readers {
 		recs, err := readRecords(rd)
 		if err != nil {
@@ -616,15 +637,46 @@ func (t *Tracer) scanSockets() ([]Listener, error) {
 			if recs[i].Type != recListener {
 				continue
 			}
-			listeners = append(listeners, Listener{
+			l := Listener{
 				Proto: Proto(recs[i].Proto),
 				Addr:  addrFrom16(recs[i].Addr),
 				Port:  recs[i].Port,
 				NetNS: recs[i].Netns,
-			})
+			}
+			if k := listenerKey(&l); !seen[k] {
+				seen[k] = true
+				listeners = append(listeners, l)
+			}
 		}
 	}
 	return listeners, nil
+}
+
+type counterWarning struct {
+	last   uint64
+	warned time.Time
+}
+
+// warnOnIncrease warns, at most once an hour per message, when a cumulative
+// counter of the BPF programs increased.
+func (t *Tracer) warnOnIncrease(v *ebpf.Variable, msg string, args ...any) {
+	var n uint64
+	if err := v.Get(&n); err != nil {
+		return
+	}
+	w := t.warnings[msg]
+	if n == w.last {
+		return
+	}
+	w.last = n
+	if time.Since(w.warned) >= time.Hour {
+		w.warned = time.Now()
+		t.log.Warn(msg, append(args, "total", n)...)
+	}
+	if t.warnings == nil {
+		t.warnings = map[string]counterWarning{}
+	}
+	t.warnings[msg] = w
 }
 
 // scanOwners walks the file descriptors of all processes. It assigns owners

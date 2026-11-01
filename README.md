@@ -91,7 +91,7 @@ Run the agent on every host you want to observe:
 | `-max-series-per-request` | dependencies and listeners per request (1000); a request also stays below 3 MiB, and a busy host sends several per interval |
 | `-service-name-fallback` | name of a service without `OTEL_SERVICE_NAME`: `exe` (executable name, as OBI) or `unit` (systemd unit) |
 | `-interval`, `-idle-ttl` | export interval (15 s, at most 1 min) and how long a dependency is sent after its last activity (15 min) |
-| `-netns`, `-max-flows`, `-bpf-stats` | network namespaces to trace, capacity of the in-kernel flow table, BPF run time statistics |
+| `-netns`, `-max-flows`, `-bpf-stats` | network namespaces to trace, capacity of the in-kernel flow table (also sizing the tables of listening ports), BPF run time statistics |
 
 Services that share an executable on a host (`ruby`, `python`, `java`,
 `php-fpm`) should set `OTEL_SERVICE_NAME`, e.g. with `Environment=` in a

@@ -108,9 +108,11 @@ const (
 	bpfVarEphPortHigh            = "eph_port_high"
 	bpfVarEphPortLow             = "eph_port_low"
 	bpfVarFlowDrops              = "flow_drops"
+	bpfVarInitialScan            = "initial_scan"
 	bpfVarLearnSelf              = "learn_self"
-	bpfVarMarkUdpServers         = "mark_udp_servers"
+	bpfVarListenPortDrops        = "listen_port_drops"
 	bpfVarSelfTgid               = "self_tgid"
+	bpfVarStorageFails           = "storage_fails"
 	bpfVarTargetNetns            = "target_netns"
 	bpfVarUnusedCgroupEvent      = "unused_cgroup_event"
 	bpfVarUnusedIterRec          = "unused_iter_rec"
@@ -192,9 +194,11 @@ type bpfVariableSpecs struct {
 	EphPortHigh       *ebpf.VariableSpec `ebpf:"eph_port_high"`
 	EphPortLow        *ebpf.VariableSpec `ebpf:"eph_port_low"`
 	FlowDrops         *ebpf.VariableSpec `ebpf:"flow_drops"`
+	InitialScan       *ebpf.VariableSpec `ebpf:"initial_scan"`
 	LearnSelf         *ebpf.VariableSpec `ebpf:"learn_self"`
-	MarkUdpServers    *ebpf.VariableSpec `ebpf:"mark_udp_servers"`
+	ListenPortDrops   *ebpf.VariableSpec `ebpf:"listen_port_drops"`
 	SelfTgid          *ebpf.VariableSpec `ebpf:"self_tgid"`
+	StorageFails      *ebpf.VariableSpec `ebpf:"storage_fails"`
 	TargetNetns       *ebpf.VariableSpec `ebpf:"target_netns"`
 	UnusedCgroupEvent *ebpf.VariableSpec `ebpf:"unused_cgroup_event"`
 	UnusedIterRec     *ebpf.VariableSpec `ebpf:"unused_iter_rec"`
@@ -253,9 +257,11 @@ type bpfVariables struct {
 	EphPortHigh       *ebpf.Variable `ebpf:"eph_port_high"`
 	EphPortLow        *ebpf.Variable `ebpf:"eph_port_low"`
 	FlowDrops         *ebpf.Variable `ebpf:"flow_drops"`
+	InitialScan       *ebpf.Variable `ebpf:"initial_scan"`
 	LearnSelf         *ebpf.Variable `ebpf:"learn_self"`
-	MarkUdpServers    *ebpf.Variable `ebpf:"mark_udp_servers"`
+	ListenPortDrops   *ebpf.Variable `ebpf:"listen_port_drops"`
 	SelfTgid          *ebpf.Variable `ebpf:"self_tgid"`
+	StorageFails      *ebpf.Variable `ebpf:"storage_fails"`
 	TargetNetns       *ebpf.Variable `ebpf:"target_netns"`
 	UnusedCgroupEvent *ebpf.Variable `ebpf:"unused_cgroup_event"`
 	UnusedIterRec     *ebpf.Variable `ebpf:"unused_iter_rec"`

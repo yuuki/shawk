@@ -14,14 +14,17 @@
  *       SYN_SENT -> CLOSE       counts a failed outgoing connection.
  *       SYN_RECV -> ESTABLISHED passive open; counts an incoming connection.
  *                               Its owner is the owner of the listening
- *                               socket, which user space resolves.
+ *                               socket, which user space resolves. On a
+ *                               socket that went through SYN_SENT, it ends a
+ *                               simultaneous open instead, e.g. of a socket
+ *                               connected to itself.
  *       * -> CLOSE              accounts the remaining bytes.
  *   - iter/tcp periodically walks all TCP sockets. It accounts the byte
  *     deltas of long-lived connections from the cumulative counters kept in
  *     struct tcp_sock and adopts connections established before the tracer
  *     started.
- *   - iter/task_file resolves the owners of adopted outgoing connections and
- *     of listening sockets.
+ *   - iter/task_file resolves the owners of adopted connections and of
+ *     listening sockets.
  *
  * UDP
  *   - fentry/ip_send_skb, fentry/ip6_send_skb and fentry/skb_consume_udp
@@ -52,13 +55,18 @@ char LICENSE[] SEC("license") = "Dual BSD/GPL";
 #define AF_INET 2
 #define AF_INET6 10
 #define EEXIST 17
+#define SOCK_DGRAM 2
 #define SOCK_BINDPORT_LOCK 8
+
+/* TCP states in which the FIN of the local side is queued. */
+#define TCPF_FIN_QUEUED                                                    \
+	((1U << TCP_FIN_WAIT1) | (1U << TCP_FIN_WAIT2) | (1U << TCP_CLOSING) | \
+	 (1U << TCP_LAST_ACK))
 
 /* Flags of struct shawk_sock_state. */
 #define SS_READY (1U << 0)   /* the key is complete and traffic is accounted */
 #define SS_COUNTED (1U << 1) /* the connection has been counted in conns */
-#define SS_ADOPTED (1U << 2) /* established before the tracer started */
-#define SS_IGNORE (1U << 3)  /* owned by the tracer itself */
+#define SS_IGNORE (1U << 2)  /* owned by the tracer itself */
 
 #define MAX_FLOWS 16384 /* overridden by user space */
 
@@ -71,13 +79,28 @@ const volatile __u16 eph_port_high = 60999;
 /* Runtime state shared with user space. */
 volatile __u32 active_idx = 0;
 /*
+ * Set by user space during the walk of the sockets that exist at startup.
+ * That walk only adopts connections and marks UDP server sockets: the
+ * traffic of sockets the tracepoint already saw is accounted from the walk
+ * of the first interval, so that it is not counted twice.
+ */
+volatile __u32 initial_scan = 0;
+/*
  * The global thread group id of the tracer, learned by the iterators, which
  * run in the context of the process reading them. os.Getpid() would differ
  * when the tracer runs in a PID namespace.
  */
 volatile __u32 self_tgid = 0xffffffff;
+/* Flow updates dropped because the flow table was full. */
 __u64 flow_drops = 0;
+/*
+ * TCP connections opened without socket storage, which the next walk adopts:
+ * their connection and the traffic until then are not counted.
+ */
+__u64 storage_fails = 0;
 __u64 adopted_unowned = 0;
+/* Listening ports that did not fit in listen_ports or udp_listen_ports. */
+__u64 listen_port_drops = 0;
 
 /* Per-socket state attached to TCP sockets. */
 struct shawk_sock_state {
@@ -119,7 +142,10 @@ struct shawk_listen_key {
 	__u16 _pad;
 };
 
-/* Listening TCP ports, rebuilt by iter/tcp at every scan. */
+/*
+ * Listening TCP ports, rebuilt by iter/tcp at every scan. The capacity of
+ * both port maps is set by user space.
+ */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 8192);
@@ -147,9 +173,6 @@ struct {
 	__type(value, struct shawk_udp_state);
 } udp_states SEC(".maps");
 
-/* Set by user space while iter/udp marks the sockets that exist at startup. */
-volatile __u32 mark_udp_servers = 0;
-
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, 256 * 1024);
@@ -170,6 +193,11 @@ static __always_inline void learn_self_tgid(void)
 static __always_inline bool netns_ok(__u32 netns)
 {
 	return target_netns == 0 || target_netns == netns;
+}
+
+static __always_inline bool ephemeral(__u16 port)
+{
+	return port >= eph_port_low && port <= eph_port_high;
 }
 
 static __always_inline __u32 sock_netns(const struct sock *sk)
@@ -291,9 +319,42 @@ flow_get(const struct shawk_flow_key *k)
 	return bpf_map_lookup_elem(map, &key);
 }
 
+/* Cumulative counters of a TCP connection. */
+struct shawk_tcp_counters {
+	__u64 sent; /* bytes of data acknowledged by the peer */
+	__u64 recv; /* bytes of data received */
+	__u32 retrans;
+};
+
 /*
- * Accounts the bytes transferred on a TCP connection since the last call by
- * reading the cumulative counters of struct tcp_sock.
+ * Reads the cumulative counters of a TCP connection. bytes_acked and
+ * bytes_received count sequence numbers, which include the FIN of each side
+ * once it is acknowledged or received; it is not data and is subtracted.
+ * Each adjustment applies from the moment its FIN is counted on, so the
+ * counters never decrease. state is the state of the socket, which is still
+ * the old state in the state change tracepoint.
+ */
+static __always_inline void read_tcp_counters(struct sock *sk,
+					      struct tcp_sock *tp, int state,
+					      struct shawk_tcp_counters *c)
+{
+	c->sent = BPF_CORE_READ(tp, bytes_acked);
+	c->recv = BPF_CORE_READ(tp, bytes_received);
+	c->retrans = BPF_CORE_READ(tp, total_retrans);
+	/* tcp_fin() sets SOCK_DONE when it receives the FIN of the peer. */
+	if (c->recv &&
+	    (BPF_CORE_READ(sk, __sk_common.skc_flags) & (1UL << SOCK_DONE)))
+		c->recv--;
+	/* The local FIN is the last sequence number of the send queue. */
+	if (c->sent && ((1U << state) & TCPF_FIN_QUEUED) &&
+	    BPF_CORE_READ(tp, snd_una) == BPF_CORE_READ(tp, write_seq))
+		c->sent--;
+}
+
+/*
+ * Takes the traffic of a TCP connection since the last call, by comparing
+ * its cumulative counters with the bases kept in the socket storage, and
+ * advances the bases. Returns whether there was any.
  *
  * The bases are updated without atomic exchange, which the arm64 JIT only
  * supports since Linux 5.18; atomic adds are supported everywhere. The
@@ -302,41 +363,70 @@ flow_get(const struct shawk_flow_key *k)
  * backport). On older kernels, the bytes of a connection that closes during
  * a scan may rarely be counted twice.
  */
-static __always_inline void account_tcp(struct shawk_sock_state *ss,
-					struct tcp_sock *tp,
-					struct shawk_flow_stats *fs)
+static __always_inline bool take_tcp_delta(struct shawk_sock_state *ss,
+					   struct sock *sk, struct tcp_sock *tp,
+					   int state,
+					   struct shawk_tcp_counters *d)
 {
-	__u64 acked = BPF_CORE_READ(tp, bytes_acked);
-	__u64 rcvd = BPF_CORE_READ(tp, bytes_received);
-	__u32 retrans = BPF_CORE_READ(tp, total_retrans);
+	struct shawk_tcp_counters c;
 
-	if (acked > ss->sent_base) {
-		__sync_fetch_and_add(&fs->bytes_sent, acked - ss->sent_base);
-		ss->sent_base = acked;
+	read_tcp_counters(sk, tp, state, &c);
+	d->sent = 0;
+	d->recv = 0;
+	d->retrans = 0;
+	if (c.sent > ss->sent_base) {
+		d->sent = c.sent - ss->sent_base;
+		ss->sent_base = c.sent;
 	}
-	if (rcvd > ss->recv_base) {
-		__sync_fetch_and_add(&fs->bytes_recv, rcvd - ss->recv_base);
-		ss->recv_base = rcvd;
+	if (c.recv > ss->recv_base) {
+		d->recv = c.recv - ss->recv_base;
+		ss->recv_base = c.recv;
 	}
-	if (retrans > ss->retrans_base) {
-		__sync_fetch_and_add(&fs->retrans, retrans - ss->retrans_base);
-		ss->retrans_base = retrans;
+	if (c.retrans > ss->retrans_base) {
+		d->retrans = c.retrans - ss->retrans_base;
+		ss->retrans_base = c.retrans;
 	}
+	return d->sent || d->recv || d->retrans;
+}
+
+static __always_inline void add_tcp_delta(struct shawk_flow_stats *fs,
+					  const struct shawk_tcp_counters *d)
+{
+	if (d->sent)
+		__sync_fetch_and_add(&fs->bytes_sent, d->sent);
+	if (d->recv)
+		__sync_fetch_and_add(&fs->bytes_recv, d->recv);
+	if (d->retrans)
+		__sync_fetch_and_add(&fs->retrans, d->retrans);
 }
 
 /*
- * Sets the byte counters as the base when a connection is established, so
- * that the sequence number consumed by the SYN is not counted as data.
+ * Sets the current counters as the bases, so that only the traffic from now
+ * on is accounted.
  */
 static __always_inline void reset_base(struct shawk_sock_state *ss,
-				       struct sock *sk)
+				       struct sock *sk, struct tcp_sock *tp,
+				       int state)
 {
-	struct tcp_sock *tp = bpf_skc_to_tcp_sock(sk);
+	struct shawk_tcp_counters c;
 
-	if (!tp)
-		return;
-	ss->sent_base = BPF_CORE_READ(tp, bytes_acked);
-	ss->recv_base = BPF_CORE_READ(tp, bytes_received);
+	read_tcp_counters(sk, tp, state, &c);
+	ss->sent_base = c.sent;
+	ss->recv_base = c.recv;
+	ss->retrans_base = c.retrans;
+}
+
+/*
+ * Sets the bases when a connection is established. bytes_received counts no
+ * SYN. bytes_acked counts the local SYN on an active open only: the child of
+ * a listener starts with its SYN-ACK acknowledged. What the counters hold
+ * beyond that is data, e.g. carried by the SYN with TCP Fast Open.
+ */
+static __always_inline void established_base(struct shawk_sock_state *ss,
+					     struct tcp_sock *tp, bool active)
+{
+	ss->sent_base = active && BPF_CORE_READ(tp, bytes_acked) ? 1 : 0;
+	ss->recv_base = 0;
 	ss->retrans_base = BPF_CORE_READ(tp, total_retrans);
 }
 
@@ -377,8 +467,10 @@ static __always_inline void on_active_open(struct sock *sk)
 
 	ss = bpf_sk_storage_get(&sock_states, sk, NULL,
 				BPF_SK_STORAGE_GET_F_CREATE);
-	if (!ss)
+	if (!ss) {
+		__sync_fetch_and_add(&storage_fails, 1);
 		return;
+	}
 	ss->key = key;
 	ss->sent_base = 0;
 	ss->recv_base = 0;
@@ -392,6 +484,7 @@ static __always_inline void on_passive_open(struct sock *sk)
 {
 	struct shawk_flow_key key = {};
 	struct shawk_sock_state *ss;
+	struct tcp_sock *tp;
 
 	if (build_tcp_key(&key, sk, DIR_IN))
 		return;
@@ -403,12 +496,17 @@ static __always_inline void on_passive_open(struct sock *sk)
 	 */
 	key.cgroup_id = sock_cgroup_id(sk);
 
+	tp = bpf_skc_to_tcp_sock(sk);
+	if (!tp)
+		return;
 	ss = bpf_sk_storage_get(&sock_states, sk, NULL,
 				BPF_SK_STORAGE_GET_F_CREATE);
-	if (!ss)
+	if (!ss) {
+		__sync_fetch_and_add(&storage_fails, 1);
 		return;
+	}
 	ss->key = key;
-	reset_base(ss, sk);
+	established_base(ss, tp, false);
 	ss->pid = 0;
 	ss->flags = SS_READY;
 	count_conn(ss);
@@ -419,6 +517,7 @@ int BPF_PROG(shawk_inet_sock_set_state, const struct sock *csk, int oldstate,
 	     int newstate)
 {
 	struct sock *sk = (struct sock *)csk;
+	struct shawk_tcp_counters d;
 	struct shawk_sock_state *ss;
 	struct shawk_flow_stats *fs;
 	struct tcp_sock *tp;
@@ -430,20 +529,31 @@ int BPF_PROG(shawk_inet_sock_set_state, const struct sock *csk, int oldstate,
 		on_active_open(sk);
 		return 0;
 	}
-	if (oldstate == TCP_SYN_RECV && newstate == TCP_ESTABLISHED) {
+
+	ss = bpf_sk_storage_get(&sock_states, sk, NULL, 0);
+	/*
+	 * The children of a listener have no storage yet, since sock_states is
+	 * not cloned. A socket with an outgoing key went through SYN_SENT and
+	 * ends a simultaneous open, e.g. a socket connected to itself.
+	 */
+	if (oldstate == TCP_SYN_RECV && newstate == TCP_ESTABLISHED &&
+	    (!ss || ss->key.direction != DIR_OUT)) {
 		on_passive_open(sk);
 		return 0;
 	}
-
-	ss = bpf_sk_storage_get(&sock_states, sk, NULL, 0);
 	if (!ss || !ss_ready(ss))
 		return 0;
 
-	if (oldstate == TCP_SYN_SENT) {
+	if (oldstate == TCP_SYN_SENT || oldstate == TCP_SYN_RECV) {
+		if (ss->key.direction != DIR_OUT)
+			return 0;
 		if (newstate == TCP_ESTABLISHED) {
+			tp = bpf_skc_to_tcp_sock(sk);
+			if (!tp)
+				return 0;
 			/* The local address is final once established. */
 			read_sock_addrs(sk, ss->key.laddr, ss->key.raddr);
-			reset_base(ss, sk);
+			established_base(ss, tp, true);
 			count_conn(ss);
 		} else if (newstate == TCP_CLOSE) {
 			fs = flow_get(&ss->key);
@@ -460,9 +570,18 @@ int BPF_PROG(shawk_inet_sock_set_state, const struct sock *csk, int oldstate,
 	tp = bpf_skc_to_tcp_sock(sk);
 	if (!tp)
 		return 0;
+	/*
+	 * A connection whose traffic the last walk accounted, e.g. one reset
+	 * since, adds nothing: no empty flow is created.
+	 */
+	if (!take_tcp_delta(ss, sk, tp, oldstate, &d))
+		return 0;
 	fs = flow_get(&ss->key);
-	if (fs)
-		account_tcp(ss, tp, fs);
+	if (fs) {
+		add_tcp_delta(fs, &d);
+		if (ss->pid)
+			fs->pid = ss->pid;
+	}
 	return 0;
 }
 
@@ -481,16 +600,40 @@ static __always_inline void emit_listener(struct seq_file *seq,
 	bpf_seq_write(seq, &rec, sizeof(rec));
 }
 
-/* Starts tracking a connection established before the tracer started. */
-static __always_inline void adopt_tcp(struct tcp_sock *tp, struct sock *sk,
-				      __u32 netns, __u16 lport)
+/*
+ * Returns the direction of a connection established before the tracer
+ * started, and whether its local port is listening.
+ *
+ * A connection whose port nothing listens on may still have been accepted:
+ * by a listener that is gone (a server draining its connections after a
+ * graceful restart, an FTP data connection) or, with TPROXY, on another port
+ * than the listener's. listen(2) sets sk_max_ack_backlog, and the
+ * connections a listener accepts are clones of it that keep it
+ * (sk_clone_lock() copies the socket and never resets it), while a socket
+ * that connects never listened. Ports and ranges cannot tell: a client may
+ * bind any port before connecting, and a server may listen anywhere.
+ */
+static __always_inline __u8 adopted_direction(struct sock *sk, __u32 netns,
+					      __u16 lport, bool *listening)
 {
 	struct shawk_listen_key lk = {.netns = netns, .port = lport};
+
+	*listening = bpf_map_lookup_elem(&listen_ports, &lk) != NULL;
+	if (*listening || BPF_CORE_READ(sk, sk_max_ack_backlog))
+		return DIR_IN;
+	return DIR_OUT;
+}
+
+/* Starts tracking a connection established before the tracer started. */
+static __always_inline void adopt_tcp(struct tcp_sock *tp, struct sock *sk,
+				      __u32 netns, __u16 lport, int state)
+{
 	struct shawk_flow_key key = {};
 	struct shawk_sock_state *ss;
+	bool listening;
 	__u8 dir;
 
-	dir = bpf_map_lookup_elem(&listen_ports, &lk) ? DIR_IN : DIR_OUT;
+	dir = adopted_direction(sk, netns, lport, &listening);
 	if (build_tcp_key(&key, sk, dir))
 		return;
 	if (dir == DIR_IN)
@@ -501,18 +644,17 @@ static __always_inline void adopt_tcp(struct tcp_sock *tp, struct sock *sk,
 		return;
 	ss->key = key;
 	/* Only traffic after the adoption is accounted. */
-	ss->sent_base = BPF_CORE_READ(tp, bytes_acked);
-	ss->recv_base = BPF_CORE_READ(tp, bytes_received);
-	ss->retrans_base = BPF_CORE_READ(tp, total_retrans);
+	reset_base(ss, sk, tp, state);
 	ss->pid = 0;
 	/*
-	 * Incoming connections belong to the owner of the listener, which user
-	 * space resolves. Outgoing ones wait for iter/task_file.
+	 * Connections accepted by a listener belong to its owner, which user
+	 * space resolves. The others wait for iter/task_file to find the
+	 * process holding them.
 	 */
-	if (dir == DIR_IN) {
-		ss->flags = SS_ADOPTED | SS_COUNTED | SS_READY;
+	if (listening) {
+		ss->flags = SS_COUNTED | SS_READY;
 	} else {
-		ss->flags = SS_ADOPTED | SS_COUNTED;
+		ss->flags = SS_COUNTED;
 		__sync_fetch_and_add(&adopted_unowned, 1);
 	}
 }
@@ -528,6 +670,7 @@ int shawk_iter_tcp(struct bpf_iter__tcp *ctx)
 	struct seq_file *seq = ctx->meta->seq;
 	struct shawk_sock_state *ss;
 	struct shawk_flow_stats *fs;
+	struct shawk_tcp_counters d;
 	struct tcp_sock *tp;
 	struct sock *sk;
 	__u16 family, lport;
@@ -551,7 +694,8 @@ int shawk_iter_tcp(struct bpf_iter__tcp *ctx)
 		struct shawk_listen_key lk = {.netns = netns, .port = lport};
 		__u8 one = 1;
 
-		bpf_map_update_elem(&listen_ports, &lk, &one, BPF_ANY);
+		if (bpf_map_update_elem(&listen_ports, &lk, &one, BPF_ANY))
+			__sync_fetch_and_add(&listen_port_drops, 1);
 		emit_listener(seq, sk, netns, lport, IPPROTO_TCP);
 		return 0;
 	}
@@ -566,16 +710,17 @@ int shawk_iter_tcp(struct bpf_iter__tcp *ctx)
 
 	ss = bpf_sk_storage_get(&sock_states, tp, NULL, 0);
 	if (!ss) {
-		adopt_tcp(tp, sk, netns, lport);
+		adopt_tcp(tp, sk, netns, lport, state);
 		return 0;
 	}
-	if (!ss_ready(ss))
+	if (!ss_ready(ss) || initial_scan)
 		return 0;
 
 	fs = flow_get(&ss->key);
 	if (!fs)
 		return 0;
-	account_tcp(ss, tp, fs);
+	if (take_tcp_delta(ss, sk, tp, state, &d))
+		add_tcp_delta(fs, &d);
 	__sync_fetch_and_add(&fs->open_conns, 1);
 	srtt = BPF_CORE_READ(tp, srtt_us) >> 3;
 	if (srtt) {
@@ -588,11 +733,6 @@ int shawk_iter_tcp(struct bpf_iter__tcp *ctx)
 }
 
 /* ---------------------------------------------------------------- UDP --- */
-
-static __always_inline bool ephemeral(__u16 port)
-{
-	return port >= eph_port_low && port <= eph_port_high;
-}
 
 static __always_inline bool port_bound(const struct sock *sk)
 {
@@ -643,6 +783,13 @@ static __always_inline bool udp_listener(struct sock *sk, __u16 port)
 		return us->dir == DIR_IN;
 	/* Idle since the tracer started: trust an explicitly bound port. */
 	return port_bound(sk) && !ephemeral(port);
+}
+
+/* Raw sockets of protocol 17 also send through ip_send_skb(). */
+static __always_inline bool is_udp_sock(const struct sock *sk)
+{
+	return BPF_CORE_READ(sk, sk_protocol) == IPPROTO_UDP &&
+	       BPF_CORE_READ(sk, sk_type) == SOCK_DGRAM;
 }
 
 struct shawk_l3l4 {
@@ -707,7 +854,7 @@ static __always_inline int handle_udp_send(struct sk_buff *skb)
 		return 0;
 	/* A direct access keeps the pointer usable with socket storage. */
 	sk = skb->sk;
-	if (!sk || BPF_CORE_READ(sk, sk_protocol) != IPPROTO_UDP)
+	if (!sk || !is_udp_sock(sk))
 		return 0;
 	key.netns = sock_netns(sk);
 	if (!netns_ok(key.netns))
@@ -808,7 +955,7 @@ int shawk_iter_udp(struct bpf_iter__udp *ctx)
 	if (!netns_ok(netns))
 		return 0;
 	port = BPF_CORE_READ(sk, __sk_common.skc_num);
-	if (mark_udp_servers && port && port_bound(sk) &&
+	if (initial_scan && port && port_bound(sk) &&
 	    !BPF_CORE_READ(sk, __sk_common.skc_dport)) {
 		us = bpf_sk_storage_get(&udp_states, udp, NULL,
 					BPF_SK_STORAGE_GET_F_CREATE);
@@ -819,7 +966,8 @@ int shawk_iter_udp(struct bpf_iter__udp *ctx)
 		return 0;
 	lk.netns = netns;
 	lk.port = port;
-	bpf_map_update_elem(&udp_listen_ports, &lk, &one, BPF_ANY);
+	if (bpf_map_update_elem(&udp_listen_ports, &lk, &one, BPF_ANY))
+		__sync_fetch_and_add(&listen_port_drops, 1);
 	emit_listener(seq, sk, netns, port, IPPROTO_UDP);
 	return 0;
 }
@@ -916,7 +1064,7 @@ int shawk_iter_task_file(struct bpf_iter__task_file *ctx)
 		proto = IPPROTO_TCP;
 		break;
 	case IPPROTO_UDP:
-		if (!udp_listener(sk, port))
+		if (!is_udp_sock(sk) || !udp_listener(sk, port))
 			return 0;
 		break;
 	default:
