@@ -72,7 +72,14 @@ char LICENSE[] SEC("license") = "Dual BSD/GPL";
 #define SS_READY (1U << 0)   /* the key is complete and traffic is accounted */
 #define SS_COUNTED (1U << 1) /* the connection has been counted in conns */
 #define SS_IGNORE (1U << 2)  /* owned by the tracer itself */
+/*
+ * An additional subflow of an MPTCP connection (MP_JOIN). The connection is
+ * counted by its first subflow, so it counts no connection or failed
+ * attempt.
+ */
+#define SS_JOIN (1U << 3)
 
+#define IPPROTO_MPTCP_ 262
 
 #define MAX_FLOWS 16384 /* overridden by user space */
 
@@ -97,6 +104,8 @@ volatile __u32 initial_scan = 0;
  * when the tracer runs in a PID namespace.
  */
 volatile __u32 self_tgid = 0xffffffff;
+/* Incremented by user space before each walk of iter/task_file. */
+volatile __u32 owner_scan = 0;
 /* Flow updates dropped because the flow table was full. */
 __u64 flow_drops = 0;
 /*
@@ -104,6 +113,11 @@ __u64 flow_drops = 0;
  * their connection and the traffic until then are not counted.
  */
 __u64 storage_fails = 0;
+/*
+ * Connections waiting for iter/task_file to find their owner: connections
+ * adopted at startup, and subflows of MPTCP connections whose owner is not
+ * known yet. An increase makes user space walk the processes.
+ */
 __u64 adopted_unowned = 0;
 /* Listening ports that did not fit in listen_ports or udp_listen_ports. */
 __u64 listen_port_drops = 0;
@@ -178,6 +192,33 @@ struct {
 	__type(key, int);
 	__type(value, struct shawk_udp_state);
 } udp_states SEC(".maps");
+
+/* The process an MPTCP connection belongs to. */
+struct shawk_owner {
+	char comm[TASK_COMM_LEN];
+	__u64 cgroup_id;
+	__u32 pid;
+	__u32 scan; /* owner_scan when it was recorded */
+};
+
+/*
+ * Owners of MPTCP connections by the address of their MPTCP socket, which
+ * the TCP subflows point to. A subflow has no file, and on kernels before
+ * 5.19 (bpf_skc_to_mptcp_sock) a program cannot reach the MPTCP socket of a
+ * subflow as a socket, only read its address; so the owner is looked up by
+ * that address. It is recorded when the first subflow connects, in the
+ * process that called connect(2), and by iter/task_file for the MPTCP
+ * sockets that processes hold, once per walk: an entry left by a former
+ * socket at the same address is replaced by the next walk. Entries are
+ * removed when the MPTCP socket closes; the least recently used are
+ * evicted when the map is full. Its capacity is set by user space.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 8192);
+	__type(key, __u64);
+	__type(value, struct shawk_owner);
+} mptcp_owners SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -278,6 +319,141 @@ static __always_inline void set_current_owner(struct shawk_flow_key *key)
 
 	key->cgroup_id = bpf_get_current_cgroup_id();
 	BPF_CORE_READ_STR_INTO(&key->comm, task, group_leader, comm);
+}
+
+static __always_inline void set_kernel_owner(struct shawk_flow_key *key)
+{
+	key->cgroup_id = 0;
+	__builtin_memset(key->comm, 0, sizeof(key->comm));
+	__builtin_memcpy(key->comm, KERNEL_COMM, sizeof(KERNEL_COMM));
+}
+
+/*
+ * Gives a subflow the owner of its MPTCP connection. Returns the flags that
+ * make it ready.
+ */
+static __always_inline __u32 set_mptcp_owner(struct shawk_flow_key *key,
+					     __u32 *pid,
+					     const struct shawk_owner *o)
+{
+	key->cgroup_id = o->cgroup_id;
+	__builtin_memcpy(key->comm, o->comm, sizeof(key->comm));
+	*pid = o->pid;
+	return SS_READY | (o->pid == self_tgid ? SS_IGNORE : 0);
+}
+
+/*
+ * Returns the address of the MPTCP socket that a TCP socket is a subflow
+ * of, or zero for a plain TCP socket. join tells an additional subflow
+ * (MP_JOIN) from the first one: request_join is set before an additional
+ * subflow connects, and mp_join on both sides once it is established.
+ * Kernels without MPTCP have no is_mptcp. A child of an MPTCP listener for a
+ * client without MPTCP falls back to plain TCP, which clears is_mptcp.
+ */
+static __always_inline __u64 subflow_msk(struct sock *sk, bool *join)
+{
+	struct tcp_sock *tp = (struct tcp_sock *)sk;
+	struct mptcp_subflow_context *ctx;
+
+	*join = false;
+	if (!bpf_core_field_exists(tp->is_mptcp) || !BPF_CORE_READ(tp, is_mptcp))
+		return 0;
+	ctx = BPF_CORE_READ((struct inet_connection_sock *)sk, icsk_ulp_data);
+	if (!ctx)
+		return 0;
+	*join = BPF_CORE_READ_BITFIELD_PROBED(ctx, request_join) ||
+		BPF_CORE_READ_BITFIELD_PROBED(ctx, mp_join);
+	return (__u64)BPF_CORE_READ(ctx, conn);
+}
+
+/*
+ * Whether a subflow is the one that counts its MPTCP connection as open:
+ * the first of the subflows of the connection, usually the initial one,
+ * and another once the initial one closed while others carry on.
+ */
+static __always_inline bool subflow_counts_open(struct sock *sk, __u64 msk)
+{
+	struct mptcp_sock *m = (struct mptcp_sock *)msk;
+	struct mptcp_subflow_context *ctx;
+	struct list_head *head;
+
+	head = BPF_CORE_READ(m, conn_list.next);
+	if (!head || head == (void *)msk + bpf_core_field_offset(m->conn_list))
+		return false;
+	ctx = (void *)head -
+	      bpf_core_field_offset(((struct mptcp_subflow_context *)0)->node);
+	return BPF_CORE_READ(ctx, tcp_sock) == sk;
+}
+
+/* syn_smc of struct tcp_sock, with CONFIG_SMC only. */
+struct tcp_sock___smc {
+	bool syn_smc;
+} __attribute__((preserve_access_index));
+
+/*
+ * Whether a socket that connects, or sends a datagram, is opened and held
+ * by the kernel itself, e.g. by the clients of NFS, iSCSI, CIFS or Ceph,
+ * which connect in a kernel worker or in the process that happens to mount.
+ * No process holds such a socket, though it may have a file: the NFS client
+ * gives its sockets one. An orphan, closed by its process, has no struct
+ * socket.
+ *
+ * The kernel also creates TCP sockets on behalf of processes: the subflows
+ * of MPTCP, which the callers exclude, since they belong to the process
+ * holding their MPTCP socket, and the TCP socket of an SMC socket, which
+ * sends an SMC option in its SYN (syn_smc) and connects in connect(2) of
+ * the process. The callers also exclude the children of listeners, which
+ * inherit sk_kern_sock: the children of an MPTCP listener for clients
+ * without MPTCP are plain TCP sockets accepted by a process, which inherit
+ * it from the first subflow of the listener.
+ */
+static __always_inline bool kernel_owned(struct sock *sk)
+{
+	struct tcp_sock___smc *tp = (void *)sk;
+
+	if (!BPF_CORE_READ_BITFIELD_PROBED(sk, sk_kern_sock) ||
+	    !BPF_CORE_READ(sk, sk_socket))
+		return false;
+	if (BPF_CORE_READ(sk, sk_protocol) == IPPROTO_TCP &&
+	    bpf_core_field_exists(tp->syn_smc) &&
+	    BPF_CORE_READ_BITFIELD_PROBED(tp, syn_smc))
+		return false;
+	return true;
+}
+
+/*
+ * Whether a listening socket may be the kernel's: one the kernel created,
+ * other than the first subflow of an MPTCP listener, one without a file,
+ * which no process can hold, or one the kernel uses, such as a socket that
+ * rpc.nfsd created and passed to nfsd. User space takes it for the
+ * kernel's only if no process holds it either (see Tracer.listenerOwners).
+ */
+static __always_inline bool kernel_listener(struct sock *sk, __u8 proto,
+					    __u64 ino)
+{
+	bool join;
+
+	if (BPF_CORE_READ_BITFIELD_PROBED(sk, sk_kern_sock) &&
+	    (proto != IPPROTO_TCP || !subflow_msk(sk, &join)))
+		return true;
+	return !ino || BPF_CORE_READ(sk, sk_user_data);
+}
+
+/*
+ * Records the owner of an MPTCP connection, replacing that of a former
+ * socket at the same address.
+ */
+static __always_inline void record_mptcp_owner(__u64 msk,
+					       const struct shawk_flow_key *key,
+					       __u32 pid)
+{
+	struct shawk_owner o = {};
+
+	__builtin_memcpy(o.comm, key->comm, sizeof(o.comm));
+	o.cgroup_id = key->cgroup_id;
+	o.pid = pid;
+	o.scan = owner_scan;
+	bpf_map_update_elem(&mptcp_owners, &msk, &o, BPF_ANY);
 }
 
 /*
@@ -463,20 +639,68 @@ static __always_inline void count_conn(struct shawk_sock_state *ss)
 	}
 }
 
+/*
+ * Gives a subflow of the MPTCP socket msk that waits for its owner the
+ * owner of its connection, once iter/task_file recorded it. Returns whether
+ * it is ready.
+ */
+static __always_inline bool resolve_subflow(struct shawk_sock_state *ss,
+					    __u64 msk)
+{
+	struct shawk_owner *o;
+
+	if (msk && !(ss->flags & (SS_READY | SS_IGNORE))) {
+		o = bpf_map_lookup_elem(&mptcp_owners, &msk);
+		if (o)
+			ss->flags |= set_mptcp_owner(&ss->key, &ss->pid, o);
+	}
+	return ss_ready(ss);
+}
+
 /* ---------------------------------------------------------------- TCP --- */
 
-/* CLOSE -> SYN_SENT: called in connect(2) by the client process. */
+/*
+ * CLOSE -> SYN_SENT: called in connect(2) by the client process, except for
+ * sockets of the kernel, which may connect in a kernel worker or in any
+ * process, and for the additional subflows of MPTCP connections, which the
+ * path manager opens in a kernel worker. Both are given their owner
+ * instead of the current task.
+ */
 static __always_inline void on_active_open(struct sock *sk)
 {
 	__u32 tgid = bpf_get_current_pid_tgid() >> 32;
 	struct shawk_flow_key key = {};
 	struct shawk_sock_state *ss;
+	struct shawk_owner *o;
+	__u32 flags = SS_READY;
+	bool join;
+	__u64 msk;
 
 	if (build_tcp_key(&key, sk, DIR_OUT))
 		return;
 	if (!netns_ok(key.netns))
 		return;
-	set_current_owner(&key);
+	msk = subflow_msk(sk, &join);
+	if (msk && join) {
+		/*
+		 * Without a known owner, the subflow waits for iter/tcp to find
+		 * it in mptcp_owners once iter/task_file recorded it.
+		 */
+		flags = SS_COUNTED | SS_JOIN;
+		tgid = 0;
+		o = bpf_map_lookup_elem(&mptcp_owners, &msk);
+		if (o)
+			flags |= set_mptcp_owner(&key, &tgid, o);
+		else
+			__sync_fetch_and_add(&adopted_unowned, 1);
+	} else if (!msk && kernel_owned(sk)) {
+		set_kernel_owner(&key);
+		tgid = 0;
+	} else {
+		set_current_owner(&key);
+		if (msk)
+			record_mptcp_owner(msk, &key, tgid);
+	}
 
 	ss = bpf_sk_storage_get(&sock_states, sk, NULL,
 				BPF_SK_STORAGE_GET_F_CREATE);
@@ -489,7 +713,7 @@ static __always_inline void on_active_open(struct sock *sk)
 	ss->recv_base = 0;
 	ss->retrans_base = 0;
 	ss->pid = tgid;
-	ss->flags = SS_READY | (tgid == self_tgid ? SS_IGNORE : 0);
+	ss->flags = flags | (tgid == self_tgid ? SS_IGNORE : 0);
 }
 
 /*
@@ -522,6 +746,7 @@ static __always_inline struct shawk_sock_state *on_passive_open(struct sock *sk)
 	struct shawk_flow_key key = {};
 	struct shawk_sock_state *ss;
 	struct tcp_sock *tp;
+	bool join;
 
 	if (build_tcp_key(&key, sk, DIR_IN))
 		return NULL;
@@ -546,6 +771,9 @@ static __always_inline struct shawk_sock_state *on_passive_open(struct sock *sk)
 	established_base(ss, tp, false);
 	ss->pid = 0;
 	ss->flags = SS_READY;
+	/* An additional MPTCP subflow is not another connection. */
+	if (subflow_msk(sk, &join) && join)
+		ss->flags |= SS_COUNTED | SS_JOIN;
 	count_conn(ss);
 	return ss;
 }
@@ -559,8 +787,19 @@ int BPF_PROG(shawk_inet_sock_set_state, const struct sock *csk, int oldstate,
 	struct shawk_sock_state *ss;
 	struct shawk_flow_stats *fs;
 	struct tcp_sock *tp;
+	__u16 proto;
+	bool join;
+	__u64 msk;
 
-	if (BPF_CORE_READ(sk, sk_protocol) != IPPROTO_TCP)
+	proto = BPF_CORE_READ(sk, sk_protocol);
+	if (proto == IPPROTO_MPTCP_) {
+		if (newstate == TCP_CLOSE) {
+			msk = (__u64)sk;
+			bpf_map_delete_elem(&mptcp_owners, &msk);
+		}
+		return 0;
+	}
+	if (proto != IPPROTO_TCP)
 		return 0;
 
 	if (newstate == TCP_SYN_SENT) {
@@ -581,9 +820,15 @@ int BPF_PROG(shawk_inet_sock_set_state, const struct sock *csk, int oldstate,
 		ss = on_passive_open(sk);
 		if (!ss || newstate != TCP_CLOSE)
 			return 0;
-	} else if (!ss || !ss_ready(ss)) {
+	} else if (!ss || (ss->flags & SS_IGNORE) ||
+		   !(ss->flags & (SS_READY | SS_JOIN))) {
 		return 0;
 	} else if (oldstate == TCP_SYN_SENT || oldstate == TCP_SYN_RECV) {
+		/*
+		 * Also for an MPTCP subflow whose owner is not known yet, so that
+		 * its bases are set once its owner is found. Such a subflow is
+		 * SS_COUNTED and counts no connection.
+		 */
 		if (ss->key.direction != DIR_OUT)
 			return 0;
 		if (newstate == TCP_ESTABLISHED) {
@@ -594,7 +839,7 @@ int BPF_PROG(shawk_inet_sock_set_state, const struct sock *csk, int oldstate,
 			read_sock_addrs(sk, ss->key.laddr, ss->key.raddr);
 			established_base(ss, tp, true);
 			count_conn(ss);
-		} else if (newstate == TCP_CLOSE) {
+		} else if (newstate == TCP_CLOSE && !(ss->flags & SS_JOIN)) {
 			fs = flow_get(&ss->key);
 			if (fs) {
 				__sync_fetch_and_add(&fs->conn_fails, 1);
@@ -602,6 +847,11 @@ int BPF_PROG(shawk_inet_sock_set_state, const struct sock *csk, int oldstate,
 			}
 		}
 		return 0;
+	} else if (!ss_ready(ss)) {
+		/* A subflow closing before the next walk found its owner. */
+		if (newstate != TCP_CLOSE ||
+		    !resolve_subflow(ss, subflow_msk(sk, &join)))
+			return 0;
 	}
 
 	if (newstate != TCP_CLOSE)
@@ -638,6 +888,8 @@ static __always_inline void emit_listener(struct seq_file *seq,
 	rec.port = port;
 	/* Zero when the socket has no file. */
 	rec.ino = BPF_CORE_READ(sk, sk_socket, file, f_inode, i_ino);
+	if (kernel_listener((struct sock *)sk, proto, rec.ino))
+		__builtin_memcpy(rec.comm, KERNEL_COMM, sizeof(KERNEL_COMM));
 	bpf_seq_write(seq, &rec, sizeof(rec));
 }
 
@@ -671,7 +923,11 @@ static __always_inline void adopt_tcp(struct tcp_sock *tp, struct sock *sk,
 {
 	struct shawk_flow_key key = {};
 	struct shawk_sock_state *ss;
-	bool listening;
+	struct shawk_owner *o;
+	__u32 flags = SS_COUNTED;
+	bool listening, join;
+	__u32 pid = 0;
+	__u64 msk;
 	__u8 dir;
 
 	dir = adopted_direction(sk, netns, lport, &listening);
@@ -679,6 +935,26 @@ static __always_inline void adopt_tcp(struct tcp_sock *tp, struct sock *sk,
 		return;
 	if (dir == DIR_IN)
 		key.cgroup_id = sock_cgroup_id(sk);
+	msk = subflow_msk(sk, &join);
+	if (msk && join)
+		flags |= SS_JOIN;
+	/*
+	 * Connections accepted by a listener belong to its owner, which user
+	 * space resolves, and outgoing sockets of the kernel to the kernel.
+	 * The subflows of MPTCP connections belong to the owner of the
+	 * connection, and the others to the process holding them; both wait
+	 * for iter/task_file to find it.
+	 */
+	if (listening) {
+		flags |= SS_READY;
+	} else if (msk) {
+		o = bpf_map_lookup_elem(&mptcp_owners, &msk);
+		if (o)
+			flags |= set_mptcp_owner(&key, &pid, o);
+	} else if (dir == DIR_OUT && kernel_owned(sk)) {
+		set_kernel_owner(&key);
+		flags |= SS_READY;
+	}
 	ss = bpf_sk_storage_get(&sock_states, tp, NULL,
 				BPF_SK_STORAGE_GET_F_CREATE);
 	if (!ss)
@@ -686,18 +962,10 @@ static __always_inline void adopt_tcp(struct tcp_sock *tp, struct sock *sk,
 	ss->key = key;
 	/* Only traffic after the adoption is accounted. */
 	reset_base(ss, sk, tp, state);
-	ss->pid = 0;
-	/*
-	 * Connections accepted by a listener belong to its owner, which user
-	 * space resolves. The others wait for iter/task_file to find the
-	 * process holding them.
-	 */
-	if (listening) {
-		ss->flags = SS_COUNTED | SS_READY;
-	} else {
-		ss->flags = SS_COUNTED;
+	ss->pid = pid;
+	ss->flags = flags;
+	if (!(flags & SS_READY))
 		__sync_fetch_and_add(&adopted_unowned, 1);
-	}
 }
 
 /*
@@ -716,6 +984,8 @@ int shawk_iter_tcp(struct bpf_iter__tcp *ctx)
 	struct sock *sk;
 	__u16 family, lport;
 	__u32 netns, srtt;
+	bool join;
+	__u64 msk;
 	__u8 state;
 
 	learn_self_tgid();
@@ -754,7 +1024,8 @@ int shawk_iter_tcp(struct bpf_iter__tcp *ctx)
 		adopt_tcp(tp, sk, netns, lport, state);
 		return 0;
 	}
-	if (!ss_ready(ss) || initial_scan)
+	msk = subflow_msk(sk, &join);
+	if (!resolve_subflow(ss, msk) || initial_scan)
 		return 0;
 
 	fs = flow_get(&ss->key);
@@ -762,7 +1033,9 @@ int shawk_iter_tcp(struct bpf_iter__tcp *ctx)
 		return 0;
 	if (take_tcp_delta(ss, sk, tp, state, &d))
 		add_tcp_delta(fs, &d);
-	__sync_fetch_and_add(&fs->open_conns, 1);
+	/* An MPTCP connection is open once, whatever its subflows. */
+	if (!msk || subflow_counts_open(sk, msk))
+		__sync_fetch_and_add(&fs->open_conns, 1);
 	srtt = BPF_CORE_READ(tp, srtt_us) >> 3;
 	if (srtt) {
 		__sync_fetch_and_add(&fs->rtt_sum_us, srtt);
@@ -824,6 +1097,22 @@ static __always_inline bool udp_listener(struct sock *sk, __u16 port)
 		return us->dir == DIR_IN;
 	/* Idle since the tracer started: trust an explicitly bound port. */
 	return port_bound(sk) && !ephemeral(port);
+}
+
+/*
+ * Sets the owner of a UDP flow: the kernel for its own sockets, e.g. of the
+ * NFS client or lockd, which send from kernel threads, else the current
+ * process. Returns the process id, zero for the kernel.
+ */
+static __always_inline __u32 set_udp_owner(struct shawk_flow_key *key,
+					   struct sock *sk, __u32 tgid)
+{
+	if (kernel_owned(sk)) {
+		set_kernel_owner(key);
+		return 0;
+	}
+	set_current_owner(key);
+	return tgid;
 }
 
 /* Raw sockets of protocol 17 also send through ip_send_skb(). */
@@ -936,7 +1225,7 @@ static __always_inline int handle_udp_send(struct sk_buff *skb)
 	key.direction = udp_direction(sk, key.netns, h.sport, true);
 	key.port = key.direction == DIR_IN ? h.sport : h.dport;
 	key.proto = IPPROTO_UDP;
-	set_current_owner(&key);
+	tgid = set_udp_owner(&key, sk, tgid);
 
 	fs = flow_get(&key);
 	if (!fs)
@@ -946,7 +1235,8 @@ static __always_inline int handle_udp_send(struct sk_buff *skb)
 	if (h.ulen > sizeof(struct udphdr))
 		__sync_fetch_and_add(&fs->bytes_sent,
 				     h.ulen - sizeof(struct udphdr));
-	fs->pid = tgid;
+	if (tgid)
+		fs->pid = tgid;
 	return 0;
 }
 
@@ -993,14 +1283,15 @@ int BPF_PROG(shawk_skb_consume_udp, struct sock *sk, struct sk_buff *skb,
 	key.direction = udp_direction(sk, key.netns, h.dport, false);
 	key.port = key.direction == DIR_IN ? h.dport : h.sport;
 	key.proto = IPPROTO_UDP;
-	set_current_owner(&key);
+	tgid = set_udp_owner(&key, sk, tgid);
 
 	fs = flow_get(&key);
 	if (!fs)
 		return 0;
 	__sync_fetch_and_add(&fs->msgs_recv, udp_segments(skb, h.ulen));
 	__sync_fetch_and_add(&fs->bytes_recv, len);
-	fs->pid = tgid;
+	if (tgid)
+		fs->pid = tgid;
 	return 0;
 }
 
@@ -1078,15 +1369,16 @@ int BPF_PROG(shawk_cgroup_mkdir, struct cgroup *cgrp, const char *path)
 
 /* ------------------------------------------------------------- owners --- */
 
-#define IPPROTO_MPTCP_ 262
-
 /*
  * Walks the file descriptors of all processes to find the owners of
- * adopted outgoing TCP connections and of listening sockets.
+ * adopted outgoing TCP connections, of MPTCP connections and of listening
+ * sockets.
  *
- * Applications listening with MPTCP (the default of Go since 1.24) hold an
- * MPTCP socket whose TCP subflows carry the traffic. Such listeners are
- * reported as TCP since the subflows are what the TCP hooks observe.
+ * Applications using MPTCP (Go listens with it by default since 1.24) hold
+ * an MPTCP socket whose TCP subflows carry the traffic. Its listeners are
+ * reported as TCP since the subflows are what the TCP hooks observe. The
+ * owners of its connections are recorded in mptcp_owners, where iter/tcp
+ * finds them for the subflows.
  */
 SEC("iter/task_file")
 int shawk_iter_task_file(struct bpf_iter__task_file *ctx)
@@ -1096,10 +1388,12 @@ int shawk_iter_task_file(struct bpf_iter__task_file *ctx)
 	struct file *file = ctx->file;
 	struct shawk_iter_rec rec = {};
 	struct shawk_sock_state *ss;
+	struct shawk_owner o = {}, *e;
 	struct socket *sock;
 	struct sock *sk;
 	__u16 family, proto, port;
 	__u32 netns, tgid;
+	__u64 msk;
 	__u8 state;
 
 	learn_self_tgid();
@@ -1136,8 +1430,25 @@ int shawk_iter_task_file(struct bpf_iter__task_file *ctx)
 		ss->flags |= SS_READY | (tgid == self_tgid ? SS_IGNORE : 0);
 		return 0;
 	case IPPROTO_MPTCP_:
-		if (state != TCP_LISTEN)
+		if (state != TCP_LISTEN) {
+			/*
+			 * The first process found holding it in this walk, as for
+			 * TCP. A socket that never connected is freed without a
+			 * state change that would remove it.
+			 */
+			msk = (__u64)sk;
+			if (state == TCP_CLOSE)
+				return 0;
+			e = bpf_map_lookup_elem(&mptcp_owners, &msk);
+			if (e && e->scan == owner_scan)
+				return 0;
+			BPF_CORE_READ_STR_INTO(&o.comm, task, group_leader, comm);
+			o.cgroup_id = task_cgroup_id(task);
+			o.pid = tgid;
+			o.scan = owner_scan;
+			bpf_map_update_elem(&mptcp_owners, &msk, &o, BPF_ANY);
 			return 0;
+		}
 		proto = IPPROTO_TCP;
 		break;
 	case IPPROTO_UDP:

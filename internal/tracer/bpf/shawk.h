@@ -10,6 +10,13 @@
 
 #define TASK_COMM_LEN 16
 
+/*
+ * The command name given to sockets that the kernel itself opens and holds
+ * (NFS, iSCSI, CIFS, Ceph, ...), with a cgroup id of zero, which no process
+ * has. User space names their service after their port.
+ */
+#define KERNEL_COMM "~kernel"
+
 /* Direction of a flow seen from the local host. */
 enum shawk_flow_direction {
 	DIR_OUT = 1, /* active open: the local process is the client */

@@ -99,6 +99,26 @@ func TestServiceName(t *testing.T) {
 	}
 }
 
+func TestKernelServiceName(t *testing.T) {
+	for port, want := range map[uint16]string{
+		2049:  "~kernel:nfs",
+		445:   "~kernel:smb",
+		3260:  "~kernel:iscsi",
+		6789:  "~kernel:ceph",
+		6800:  "~kernel:ceph",
+		7300:  "~kernel:ceph",
+		7301:  "~kernel",
+		7788:  "~kernel:drbd",
+		111:   "~kernel:rpcbind",
+		0:     "~kernel",
+		40000: "~kernel",
+	} {
+		if got := KernelServiceName(port); got != want {
+			t.Errorf("KernelServiceName(%d) = %q, want %q", port, got, want)
+		}
+	}
+}
+
 func TestServiceJob(t *testing.T) {
 	if got := (Service{Name: "cart"}).Job(); got != "cart" {
 		t.Errorf("Job = %q", got)

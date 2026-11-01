@@ -113,7 +113,7 @@ retransmissions stand for errors, and open connections are added.
 | SYN_RECV→* | **passive open**; counts an incoming connection. It usually goes to ESTABLISHED; a child created by a TCP Fast Open SYN, which carries data and is accepted at once, may also be closed or reset before the handshake completes. Other children that leave SYN_RECV for CLOSE failed to be created (e.g. without a route to the client) and are not counted. On a socket that went through SYN_SENT it ends a simultaneous open instead, e.g. of a socket connected to itself, which stays outgoing. |
 | *→CLOSE | account the remaining bytes of the connection, if any |
 | `iter/tcp` (every interval) | account byte deltas of long-lived connections, sample RTT, count open connections, list listening sockets, **adopt** connections established before the agent started |
-| `iter/task_file` | find the owners of adopted connections and of listening sockets |
+| `iter/task_file` | find the owners of adopted connections, of MPTCP connections and of listening sockets |
 
 A socket iterator walks only the network namespace of the thread that opens
 it, so the agent opens the TCP and UDP iterators inside every network
@@ -162,10 +162,7 @@ Consequences compared with the original implementation (kprobes on
   restrict ftrace, or on arm64 before Linux 6.0.
 * **Connections that predate the agent are found** (DB connection pools,
   gRPC channels). The original streaming mode never saw them.
-* **IPv6** is handled, and so are **MPTCP listeners**: Go listens with MPTCP
-  by default since 1.24; its listening socket is an MPTCP socket whose TCP
-  subflows carry the traffic, so MPTCP listeners are reported as TCP
-  listeners. MPTCP *clients* are not fully handled (see limitations).
+* **IPv6** and **MPTCP** are handled (see below).
 
 The owner of an incoming connection is a holder of its listening socket.
 The passive open records the cgroup of the accepted socket, which it
@@ -181,6 +178,69 @@ see, or that it saw and is gone, requests one, so that a listener replaced
 by another process of the same cgroup, e.g. a restarted service, is
 attributed to it at once, also when both listen for a while with
 `SO_REUSEPORT`.
+
+**Sockets of the kernel.** The kernel opens and holds sockets of its own,
+without a file: the clients of NFS, iSCSI, CIFS and Ceph, nfsd, DRBD.
+They are what matters before a server is decommissioned (a mounted NFS
+export), but they have no stable process. A connection is opened in a
+kernel worker (NFS) or in whichever process triggers it (CIFS connects in
+`mount`), in the root cgroup or that of the process, so the command name
+(`kworker/u8:2`) changes from one reconnection to the next; and an adopted
+connection has no process for `iter/task_file` to find, so it would never
+be accounted. A socket that connects or sends a datagram is the kernel's
+when `sk_kern_sock` is set (a 1-bit bitfield in 5.14, read with
+`BPF_CORE_READ_BITFIELD_PROBED`) and it is not an orphan, closed by its
+process. Whether it has a file does not tell: the NFS client gives its
+sockets one, which no process holds. The kernel also creates sockets for
+processes: MPTCP subflows, which are checked first (below), and the TCP
+socket of an SMC socket, which sends an SMC option in its SYN (`syn_smc`,
+read only on kernels with `CONFIG_SMC`) and connects in `connect(2)` of
+the process; it keeps the current process. Such a socket gets the command name
+`~kernel` and cgroup id 0, which no process has, at its active open (TCP)
+or datagram (UDP), and an adopted outgoing one is ready at once. The
+children of a listener inherit `sk_kern_sock`, so it does not tell who owns
+an incoming connection: the plain TCP children of an MPTCP listener for
+clients without MPTCP, which a process accepts, inherit it from the first
+subflow of the listener. Incoming connections are attributed through their
+listener (above) instead. A listener is the kernel's when no process held
+it at the last owner scan and the walk found that the kernel may hold it:
+it was created by the kernel (`sk_kern_sock`, other than the first subflow
+of an MPTCP listener), it has no file, or the kernel uses it
+(`sk_user_data`), as nfsd uses the sockets that `rpc.nfsd` creates and
+passes to it (`/proc/fs/nfsd/portlist`), whose children are not kernel
+sockets. Neither alone is enough: an agent in a PID namespace does not see
+the processes outside it, and processes hold MPTCP listeners. Such
+listeners no longer request an owner scan for every connection they
+accept. How these flows are named is in
+§4.1.
+
+**MPTCP.** Go listens with MPTCP by default since 1.24, and dials with it
+with `GODEBUG=multipathtcp=1`. An MPTCP socket, which the application
+holds, carries its traffic over TCP subflows, which the kernel creates
+without a file; the TCP hooks see the subflows. MPTCP listeners are
+reported as TCP listeners. The first subflow of a connection is opened in
+`connect(2)`, so its owner is known as for TCP; additional subflows
+(MP_JOIN) are opened by the path manager in a kernel worker, and adopted
+subflows have no file for `iter/task_file` to find. Both get the owner of
+their MPTCP socket instead. On 5.14 a program cannot reach the MPTCP socket
+of a subflow as a socket (`bpf_skc_to_mptcp_sock` is 5.19), only read its
+address (`icsk_ulp_data` → `mptcp_subflow_context.conn`), so the owners are
+kept in an LRU hash map by that address, as large as the tables of
+listening ports: recorded when the first subflow connects and by
+`iter/task_file` for the MPTCP sockets processes hold, which replaces at
+every owner scan what an earlier one recorded (so that an entry left at a
+reused address does not last), and removed when the MPTCP socket closes. A
+subflow whose owner is not known yet waits for the next walk after an
+owner scan, like an adopted connection, or takes it when it closes. A connection counts once, by its first subflow: additional
+subflows (`request_join` or `mp_join` in the subflow context) count no
+connection or failed attempt, on either side, but their traffic, RTT and
+retransmissions are accounted to the flow of their own addresses. It is
+open once, on the subflow at the head of its list of subflows
+(`mptcp_sock.conn_list`): the initial one, or another once the initial one
+closed. Kernels without MPTCP have no `tcp_sock.is_mptcp`, which guards
+these reads. RHEL 9 turns MPTCP off by default (`net.mptcp.enabled=0`).
+Go's dialer retries with TCP after any MPTCP error, so a failed dial makes
+two attempts, and both are counted.
 
 ### 3.3 UDP
 
@@ -275,6 +335,23 @@ records the kernel in its first lines.
   then `~unknown` (a socket whose owner is not known).
   `-service-name-fallback=unit` uses the unit instead of the executable.
   `service.namespace` is read from `OTEL_RESOURCE_ATTRIBUTES`.
+- Sockets of the kernel (§3.2) are named after their service port, the
+  one thing that stays the same across reconnections: `~kernel:nfs` (2049),
+  `~kernel:rpcbind` (111), `~kernel:smb` (139, 445), `~kernel:iscsi`
+  (3260), `~kernel:ceph` (3300, 6789, 6800-7300), `~kernel:nvme-tcp` (4420,
+  8009), `~kernel:drbd` (7788-7799), `~kernel:ocfs2` (7777), `~kernel:rds`
+  (16385), `~kernel:dlm` (21064), and `~kernel` for other ports; client
+  and server sides alike (the NFS client and nfsd are both
+  `~kernel:nfs`). Only sockets of the kernel are named by port; an
+  application on these ports keeps its own name. The name starts with `~`
+  like the other names shawk makes up, which `peer_cidrs` cannot take, and
+  has no `/`, which would read as a namespace in the Prometheus `job`. The
+  process has comm `~kernel`, no unit and no executable, so PostgreSQL has
+  one row per host and name in `shawk.processes`, and each name is one
+  `job` in Prometheus. The socket itself could tell more than the port
+  (its `sk_data_ready` callback is `xs_data_ready` for the NFS client),
+  but mapping it to a name needs `/proc/kallsyms`, which shows addresses
+  only with `CAP_SYSLOG`, which the agent's unit does not grant.
 - Services that share an executable on a host (`ruby`, `python`, `java`,
   `php-fpm`) share a name unless they set `OTEL_SERVICE_NAME`, e.g. with
   `Environment=` in a systemd drop-in. PostgreSQL also tells them apart by
@@ -419,7 +496,8 @@ The connector loads `shawk_v1.service_endpoints`,
 and adds what it learns from requests at once. The times of what it loaded
 are judged as of the load: while the database cannot be read, agents of
 hosts behind other connectors keep the age they had then rather than all
-expiring. A socket without a known owner (`~unknown`) names no service.
+expiring. A socket without a known owner (`~unknown`) names no service;
+sockets of the kernel (`~kernel:nfs`, §4.1) do.
 
 | role | peer | `service.peer.name` |
 |---|---|---|
@@ -638,9 +716,23 @@ parses. shawk runs beside it instead:
   as clients of each other's port. A UDP client socket that existed before
   the agent started and receives before it sends again is recorded as a
   server.
-- **MPTCP clients**: an outgoing MPTCP connection that existed before the
-  agent started is not attributed to its process, and additional subflows
-  opened by the kernel's path manager are attributed to a kernel worker.
+- **MPTCP**: additional subflows opened by the server side (with a path
+  manager that does so, which the default does not) are recorded as
+  outgoing connections from the server. Data that MPTCP sends again on
+  another subflow is counted on both. On a host with more open MPTCP
+  connections than the owner map holds, the subflows that the path
+  manager adds to evicted connections make the agent walk the processes
+  at every interval.
+- **Sockets of the kernel** are named after their port (§4.1), so a
+  subsystem on a port of another is named after it, and one on a port of
+  none is `~kernel`; NFSv3 also talks to `lockd` and `mountd` on
+  ports that rpcbind assigns. A socket created by a process and then
+  held by the kernel alone (an `nbd` or iSCSI connection whose process
+  exited) is not the kernel's: an outgoing one adopted at startup is not
+  attributed, and a new one belongs to the process that connected it. A
+  listener that a process in another PID namespace than the agent's holds
+  and that has `sk_user_data` (e.g. in a BPF sockmap) is taken for the
+  kernel's; run the agent in the host PID namespace.
 - **Flow table capacity**: when more distinct flows than `-max-flows` occur
   in one interval, updates are dropped and `shawk.agent.flows.dropped`
   counts them. The tables of listening TCP and UDP ports hold `-max-flows`

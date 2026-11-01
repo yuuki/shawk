@@ -23,6 +23,25 @@ import (
 //
 // Set SHAWK_TARGET_BTF to a raw BTF file or a vmlinux ELF, for example one
 // extracted by scripts/fetch-kernel-btf.sh for Rocky Linux 9.
+//
+// optionalTypes are the local types, with a flavor suffix, of fields that
+// only some kernels have, which the programs read behind
+// bpf_core_field_exists: their relocations may not resolve.
+var optionalTypes = map[string]bool{
+	"tcp_sock___smc": true, // syn_smc, with CONFIG_SMC only (not in RHEL 9)
+}
+
+// optionalRelocation reports whether a relocation is of a field of
+// optionalTypes, which its string names: Struct:"name"[...].
+func optionalRelocation(r *btf.CORERelocation) bool {
+	for name := range optionalTypes {
+		if strings.Contains(r.String(), `"`+name+`"`) {
+			return true
+		}
+	}
+	return false
+}
+
 func TestKernelCompatibility(t *testing.T) {
 	path := os.Getenv("SHAWK_TARGET_BTF")
 	if path == "" {
@@ -72,7 +91,7 @@ func TestKernelCompatibility(t *testing.T) {
 				}
 			}
 			for i, fx := range fixups {
-				if strings.Contains(fx.String(), "poison") {
+				if strings.Contains(fx.String(), "poison") && !optionalRelocation(relos[i]) {
 					t.Errorf("unresolvable CO-RE relocation %v", relos[i])
 				}
 			}

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -40,6 +41,57 @@ func TestChooseOwner(t *testing.T) {
 		if got != tc.want || ok != tc.ok {
 			t.Errorf("%s: chooseOwner = %+v, %v; want %+v, %v", tc.name, got, ok, tc.want, tc.ok)
 		}
+	}
+}
+
+// TestAttributeKernel checks that incoming connections accepted by a
+// listener of the kernel that no process holds, e.g. that of nfsd, belong to
+// the kernel without requesting another owner scan, that those of another
+// listener that no process the agent sees holds keep the cgroup of the
+// socket, and that flows the BPF programs gave to the kernel keep it.
+func TestAttributeKernel(t *testing.T) {
+	addr := netip.MustParseAddr("10.0.0.1")
+	peer := netip.MustParseAddr("10.0.0.2")
+	key := func(a netip.Addr, port uint16) sockAddrKey {
+		return sockAddrKey{proto: ProtoTCP, netns: 1, addr: a.As16(), port: port}
+	}
+	tr := &Tracer{
+		self:      12345,
+		owners:    map[sockAddrKey][]owner{key(addr, 80): {{pid: 100, comm: "nginx", cgroupID: 20}}},
+		ownerless: map[sockAddrKey]bool{key(netip.IPv4Unspecified(), 2049): true, key(addr, 443): true},
+		kernel:    map[sockAddrKey]bool{key(netip.IPv4Unspecified(), 2049): true},
+	}
+	in := func(port uint16, comm string, cgroup uint64) Flow {
+		return Flow{FlowKey: FlowKey{Direction: DirIn, Proto: ProtoTCP, LocalAddr: addr, RemoteAddr: peer,
+			Port: port, NetNS: 1, CgroupID: cgroup, Comm: comm}, FlowStats: FlowStats{Conns: 1}}
+	}
+	flows := tr.attribute([]Flow{
+		in(2049, "", 30),       // accepted by nfsd on 0.0.0.0:2049
+		in(80, "", 20),         // accepted by nginx
+		in(111, KernelComm, 0), // adopted from a listener that is gone
+		in(8080, "", 40),       // a listener closed since the last scan
+		in(443, "", 50),        // held in another PID namespace
+	})
+	want := []struct {
+		comm   string
+		cgroup uint64
+		pid    uint32
+	}{{KernelComm, 0, 0}, {"nginx", 20, 100}, {KernelComm, 0, 0}, {"", 40, 0}, {"", 50, 0}}
+	if len(flows) != len(want) {
+		t.Fatalf("flows = %+v", flows)
+	}
+	for i, w := range want {
+		if f := flows[i]; f.Comm != w.comm || f.CgroupID != w.cgroup || f.PID != w.pid {
+			t.Errorf("flow to %d: owner %q/%d/%d, want %q/%d/%d", f.Port, f.Comm, f.CgroupID, f.PID, w.comm, w.cgroup, w.pid)
+		}
+	}
+	if !tr.ownerMissing {
+		t.Error("the closed listener requested no owner scan")
+	}
+	tr.ownerMissing = false
+	tr.attribute([]Flow{in(2049, "", 30), in(111, KernelComm, 0)})
+	if tr.ownerMissing {
+		t.Error("connections of the kernel requested an owner scan")
 	}
 }
 

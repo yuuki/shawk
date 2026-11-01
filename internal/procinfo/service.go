@@ -206,8 +206,51 @@ func ServiceName(env map[string]string, exe, comm, unit string, fb Fallback) Ser
 
 // UnknownService names the service of a socket whose process and unit are
 // unknown, e.g. a connection accepted on a listener closed within an
-// interval, or a socket owned by the kernel.
+// interval.
 const UnknownService = "~unknown"
+
+// KernelService is the service.name of sockets that belong to the kernel
+// rather than to a process (see KernelServiceName).
+const KernelService = "~kernel"
+
+// kernelPorts names the subsystems of the kernel that use sockets, by
+// their usual service port. Only sockets of the kernel are named by port:
+// an application on one of these ports keeps its own name.
+var kernelPorts = map[uint16]string{
+	111:   KernelService + ":rpcbind", // the portmapper, e.g. for NFSv3 and lockd
+	139:   KernelService + ":smb",
+	445:   KernelService + ":smb", // the CIFS/SMB client and ksmbd
+	2049:  KernelService + ":nfs", // the NFS client and nfsd
+	3260:  KernelService + ":iscsi",
+	3300:  KernelService + ":ceph", // monitors (msgr2)
+	4420:  KernelService + ":nvme-tcp",
+	6789:  KernelService + ":ceph", // monitors (msgr1)
+	7777:  KernelService + ":ocfs2",
+	8009:  KernelService + ":nvme-tcp", // discovery
+	16385: KernelService + ":rds",
+	21064: KernelService + ":dlm",
+}
+
+// KernelServiceName names the service of a socket of the kernel after its
+// service port: ~kernel:nfs for 2049, ~kernel for a port of no known
+// subsystem. The kernel opens a socket in a kernel worker or in whatever
+// process triggers it (e.g. mount), so neither the command name nor the
+// cgroup is stable; the port is. The name starts with ~, like the other
+// names shawk makes up (~unknown, ~unresolved), which peer_cidrs cannot
+// take, and has no /, which separates the namespace in the Prometheus job.
+// Ceph also uses 6800-7300 for its daemons, and DRBD usually 7788-7799.
+func KernelServiceName(port uint16) string {
+	if name, ok := kernelPorts[port]; ok {
+		return name
+	}
+	switch {
+	case port >= 6800 && port <= 7300:
+		return KernelService + ":ceph"
+	case port >= 7788 && port <= 7799:
+		return KernelService + ":drbd"
+	}
+	return KernelService
+}
 
 // machineIDPaths are where the machine id is looked up, in order.
 var machineIDPaths = []string{"/etc/machine-id", "/var/lib/dbus/machine-id"}

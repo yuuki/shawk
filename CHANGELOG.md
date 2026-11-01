@@ -33,6 +33,25 @@
 * Fixed: when the main thread of the agent was in another network namespace
   than the thread walking the sockets, one namespace was walked twice and
   another not at all.
+* Sockets of the kernel (the clients of NFS, iSCSI, CIFS and Ceph, nfsd)
+  belong to the kernel: their service is named after their port
+  (`~kernel:nfs`, `~kernel:iscsi`, `~kernel:smb`, `~kernel:ceph`, ...,
+  `~kernel` for other ports) on both the client and the server side.
+  Previously a connection opened before the agent started was never
+  accounted, and a new one was named after the kernel worker that opened it
+  (`kworker/u8:2`), which changes at every reconnection: a new row in
+  `shawk.processes`, another `service.name` and Prometheus `job`, and a
+  dependency that seemed to disappear and reappear in `dependency_changes`.
+  A listener that no process holds, such as that of nfsd, no longer makes
+  the agent walk the processes for every connection it accepts.
+* Fixed: MPTCP clients. An outgoing MPTCP connection opened before the
+  agent started was never accounted; the subflows that the path manager
+  adds (MP_JOIN) were attributed to a kernel worker and counted as further
+  connections, on both sides. Subflows now belong to the process holding
+  the MPTCP socket, and a connection counts once. A failed dial of Go with
+  MPTCP still counts two attempts, since Go tries again with TCP.
+* The virtual machine tests load the NFS client modules of Rocky Linux 9
+  (`kernel-modules-core`), and `test/vm/run.sh` needs `xz`.
 
 ## [v0.8.0](https://github.com/yuuki/shawk/compare/v0.7.1...v0.8.0) (2026-11-01)
 

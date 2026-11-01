@@ -81,6 +81,19 @@ type FlowKey struct {
 	Comm     string
 }
 
+// KernelComm is the Comm of flows and listeners whose socket belongs to the
+// kernel rather than to a process: sockets the kernel opens itself (the
+// clients of NFS, iSCSI, CIFS or Ceph, nfsd), and listeners that no process
+// holds. Such flows and listeners have no PID and a CgroupID of zero, which
+// no process has. It matches KERNEL_COMM of the BPF programs.
+const KernelComm = "~kernel"
+
+// KernelOwned reports whether the owner of a flow or a listener with comm
+// and cgroupID is the kernel.
+func KernelOwned(comm string, cgroupID uint64) bool {
+	return comm == KernelComm && cgroupID == 0
+}
+
 // FlowStats holds the statistics of a bundled flow in an interval.
 type FlowStats struct {
 	Conns      uint64 // TCP connections established
@@ -126,7 +139,7 @@ type Listener struct {
 	Port  uint16
 	NetNS uint32
 	// Owner of the socket. PID is zero when the socket is owned by the
-	// kernel or the owner could not be resolved.
+	// kernel (Comm is then KernelComm) or the owner could not be resolved.
 	PID      uint32
 	Comm     string
 	CgroupID uint64

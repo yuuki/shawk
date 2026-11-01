@@ -241,7 +241,7 @@ func (a *Agent) observe(snap *tracer.Snapshot, start, end time.Time) {
 			PeerAddr:  f.RemoteAddr,
 			Port:      f.Port,
 			NetNS:     f.NetNS,
-			Process:   a.idents.resolve(f.PID, f.Comm, procinfo.Unit(a.cgroups.CgroupPath(f.CgroupID)), end),
+			Process:   a.process(f.PID, f.Comm, f.CgroupID, f.Port, end),
 		}
 		a.state.AddEdge(k, otlp.EdgeStats{
 			Conns:      f.Conns,
@@ -262,9 +262,19 @@ func (a *Agent) observe(snap *tracer.Snapshot, start, end time.Time) {
 			Addr:    l.Addr,
 			Port:    l.Port,
 			NetNS:   l.NetNS,
-			Process: a.idents.resolve(l.PID, l.Comm, procinfo.Unit(a.cgroups.CgroupPath(l.CgroupID)), end),
+			Process: a.process(l.PID, l.Comm, l.CgroupID, l.Port, end),
 		}, end)
 	}
+}
+
+// process returns the identity of the owner of a flow or a listener whose
+// service port is port. Sockets of the kernel are named after the port
+// (procinfo.KernelServiceName); they have no unit or executable.
+func (a *Agent) process(pid uint32, comm string, cgroupID uint64, port uint16, now time.Time) otlp.Process {
+	if tracer.KernelOwned(comm, cgroupID) {
+		return otlp.Process{Comm: comm, Service: procinfo.KernelServiceName(port)}
+	}
+	return a.idents.resolve(pid, comm, procinfo.Unit(a.cgroups.CgroupPath(cgroupID)), now)
 }
 
 // request builds the requests of the live series at now, and returns the
