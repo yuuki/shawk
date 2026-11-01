@@ -1,73 +1,79 @@
--- One row per owner of a listener (#98). The listeners table kept only the
--- latest owner of a listener, so the processes that listened on a port
--- before it changed hands were lost. A listener whose owner is unknown has a
--- row of its own.
-ALTER TABLE shawk.listeners DROP CONSTRAINT listeners_pkey;
-CREATE UNIQUE INDEX listeners_owner
-  ON shawk.listeners (host_id, proto, addr, port, netns, (coalesce(process_id, 0)));
+-- The owners of every listener (#98). shawk.listeners keeps the latest
+-- owner of a listener only, so the processes that listened on a port before
+-- it changed hands were lost. It is kept as it is, so that connectors of the
+-- previous schema still write during an upgrade; the connector records here
+-- every known owner of a listener as well, from this migration on.
+CREATE TABLE shawk.listener_owners (
+  host_id    text NOT NULL REFERENCES shawk.hosts,
+  process_id bigint NOT NULL REFERENCES shawk.processes,
+  proto      text NOT NULL,
+  addr       inet NOT NULL,
+  port       integer NOT NULL,
+  netns      bigint NOT NULL,
+  first_seen timestamptz NOT NULL,
+  last_seen  timestamptz NOT NULL,
+  PRIMARY KEY (host_id, proto, addr, port, netns, process_id)
+);
+CREATE INDEX listener_owners_process ON shawk.listener_owners (process_id);
+CREATE INDEX listener_owners_last_seen ON shawk.listener_owners (last_seen);
 
--- service_endpoints: from the latest owner of each listener, as before.
-CREATE OR REPLACE VIEW shawk_v1.service_endpoints AS
-WITH latest AS (
-  SELECT host_id, max(last_seen) AS last_seen FROM shawk.listeners GROUP BY host_id
-),
--- The latest known owner of every listener.
-owned AS (
-  SELECT DISTINCT ON (l.host_id, l.proto, l.addr, l.port, l.netns) l.*
-  FROM shawk.listeners l
-  WHERE l.process_id IS NOT NULL
-  ORDER BY l.host_id, l.proto, l.addr, l.port, l.netns, l.last_seen DESC
-),
-current_addrs AS (
-  SELECT a.host_id, a.addr, a.last_seen
-  FROM shawk.host_addrs a
-  JOIN (SELECT host_id, max(last_seen) AS last_seen FROM shawk.host_addrs GROUP BY host_id) m
-    ON m.host_id = a.host_id
-  WHERE a.last_seen >= m.last_seen - shawk.alive_window()
-),
-s AS (
-  SELECT l.addr, l.port, l.proto, l.host_id, p.service_name AS service, l.last_seen, true AS exact
-  FROM owned l
-  JOIN shawk.processes p ON p.id = l.process_id
-  JOIN latest ON latest.host_id = l.host_id
-  WHERE l.addr NOT IN (inet '0.0.0.0', inet '::')
-    AND l.last_seen >= latest.last_seen - interval '1 hour'
-  UNION ALL
-  SELECT a.addr, l.port, l.proto, l.host_id, p.service_name, l.last_seen, false
-  FROM owned l
-  JOIN shawk.processes p ON p.id = l.process_id
-  JOIN latest ON latest.host_id = l.host_id
-  JOIN current_addrs a ON a.host_id = l.host_id
-   AND (l.addr = inet '::' OR family(a.addr) = 4)
-  WHERE l.addr IN (inet '0.0.0.0', inet '::')
-    AND l.last_seen >= latest.last_seen - interval '1 hour'
-  UNION ALL
-  SELECT e.local_addr, e.port, e.proto, e.host_id, p.service_name, e.last_seen, true
-  FROM latest
-  CROSS JOIN LATERAL (
-    SELECT DISTINCT ON (e.local_addr, e.port, e.proto, e.process_id) e.*
-    FROM shawk.edges e
-    WHERE e.role = 'server' AND e.host_id = latest.host_id
-      AND e.last_seen >= latest.last_seen - interval '7 days'
-    ORDER BY e.local_addr, e.port, e.proto, e.process_id, e.last_seen DESC
-  ) e
-  JOIN shawk.processes p ON p.id = e.process_id
-),
-newest AS (
-  SELECT addr, max(first_seen) AS first_seen FROM shawk.host_addrs GROUP BY addr
-),
-moved AS (
-  SELECT mine.host_id, mine.addr
-  FROM (SELECT host_id, addr, max(last_seen) AS last_seen FROM shawk.host_addrs GROUP BY host_id, addr) mine
-  JOIN newest ON newest.addr = mine.addr
-  WHERE newest.first_seen > mine.last_seen + shawk.alive_window()
-    AND NOT (mine.addr << inet '127.0.0.0/8' OR mine.addr = inet '::1')
-)
-SELECT s.addr, s.port, s.proto, h.hostname AS host, s.host_id, s.service, max(s.last_seen) AS last_seen,
-       bool_or(s.exact) AS exact
-FROM s
-JOIN shawk.hosts h ON h.id = s.host_id
-LEFT JOIN moved ON moved.host_id = s.host_id AND moved.addr = s.addr
-WHERE h.last_seen > now() - interval '30 days'
-  AND moved.host_id IS NULL
-GROUP BY s.addr, s.port, s.proto, h.hostname, s.host_id, s.service;
+-- prune: the owners go with the retention, and processes and hosts once
+-- nothing refers to them.
+CREATE OR REPLACE FUNCTION shawk.prune(cutoff timestamptz, max_rows integer DEFAULT 10000) RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE
+  n bigint;
+  total bigint := 0;
+BEGIN
+  PERFORM pg_advisory_xact_lock_shared(1936220535);  -- 0x73686177, see Migrate
+
+  DELETE FROM shawk.edges WHERE last_seen < cutoff AND id IN (
+    SELECT id FROM shawk.edges WHERE last_seen < cutoff LIMIT max_rows);
+  GET DIAGNOSTICS n = ROW_COUNT; total := total + n;
+
+  DELETE FROM shawk.listeners WHERE last_seen < cutoff AND ctid IN (
+    SELECT ctid FROM shawk.listeners WHERE last_seen < cutoff LIMIT max_rows);
+  GET DIAGNOSTICS n = ROW_COUNT; total := total + n;
+
+  DELETE FROM shawk.listener_owners WHERE last_seen < cutoff AND ctid IN (
+    SELECT ctid FROM shawk.listener_owners WHERE last_seen < cutoff LIMIT max_rows);
+  GET DIAGNOSTICS n = ROW_COUNT; total := total + n;
+
+  DELETE FROM shawk.host_addrs WHERE last_seen < cutoff AND ctid IN (
+    SELECT ctid FROM shawk.host_addrs WHERE last_seen < cutoff LIMIT max_rows);
+  GET DIAGNOSTICS n = ROW_COUNT; total := total + n;
+
+  DELETE FROM shawk.agent_sessions WHERE last_heartbeat < cutoff AND ctid IN (
+    SELECT ctid FROM shawk.agent_sessions WHERE last_heartbeat < cutoff LIMIT max_rows);
+  GET DIAGNOSTICS n = ROW_COUNT; total := total + n;
+
+  DELETE FROM shawk.known_dependencies WHERE last_seen < cutoff AND ctid IN (
+    SELECT ctid FROM shawk.known_dependencies WHERE last_seen < cutoff LIMIT max_rows);
+  GET DIAGNOSTICS n = ROW_COUNT; total := total + n;
+
+  DELETE FROM shawk.processes p WHERE p.last_seen < cutoff
+    AND NOT EXISTS (SELECT FROM shawk.edges e WHERE e.process_id = p.id)
+    AND NOT EXISTS (SELECT FROM shawk.listeners l WHERE l.process_id = p.id)
+    AND NOT EXISTS (SELECT FROM shawk.listener_owners o WHERE o.process_id = p.id)
+    AND p.id IN (
+      SELECT p2.id FROM shawk.processes p2
+      WHERE p2.last_seen < cutoff
+        AND NOT EXISTS (SELECT FROM shawk.edges e WHERE e.process_id = p2.id)
+        AND NOT EXISTS (SELECT FROM shawk.listeners l WHERE l.process_id = p2.id)
+        AND NOT EXISTS (SELECT FROM shawk.listener_owners o WHERE o.process_id = p2.id)
+      LIMIT max_rows);
+  GET DIAGNOSTICS n = ROW_COUNT; total := total + n;
+
+  DELETE FROM shawk.hosts h WHERE h.last_seen < cutoff
+    AND NOT EXISTS (SELECT FROM shawk.agent_sessions s WHERE s.host_id = h.id)
+    AND NOT EXISTS (SELECT FROM shawk.host_addrs a WHERE a.host_id = h.id)
+    AND NOT EXISTS (SELECT FROM shawk.processes p WHERE p.host_id = h.id)
+    AND NOT EXISTS (SELECT FROM shawk.edges e WHERE e.host_id = h.id)
+    AND NOT EXISTS (SELECT FROM shawk.listeners l WHERE l.host_id = h.id)
+    AND NOT EXISTS (SELECT FROM shawk.listener_owners o WHERE o.host_id = h.id)
+    AND h.id IN (SELECT h2.id FROM shawk.hosts h2 WHERE h2.last_seen < cutoff LIMIT max_rows);
+  GET DIAGNOSTICS n = ROW_COUNT; total := total + n;
+
+  RETURN total;
+END
+$$;

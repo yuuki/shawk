@@ -65,14 +65,20 @@ func TestUDPSegmentation(t *testing.T) {
 				skipUnavailable(t, "UDP GSO send: %v", err)
 			}
 			buf := make([]byte, 2048)
-			var got int
-			for got < 300 {
+			var reads []int
+			for got := 0; got < 300; {
 				srv.SetReadDeadline(time.Now().Add(time.Second))
 				n, _, err := srv.ReadFrom(buf)
 				if err != nil {
 					t.Fatalf("after %d bytes: %v", got, err)
 				}
 				got += n
+				reads = append(reads, n)
+			}
+			// A GRO socket receives the datagrams in one read, without which
+			// the test would not count the segments of a received skb.
+			if tc.gro && len(reads) != 1 {
+				skipUnavailable(t, "the datagrams were received in reads of %v bytes, not coalesced", reads)
 			}
 
 			snap, err := tr.Collect()
@@ -121,10 +127,11 @@ func TestUDPPeek(t *testing.T) {
 				n    int
 				rerr error
 			)
-			deadline := time.Now().Add(time.Second)
+			// The deadline ends a wait for readability too.
+			srv.SetReadDeadline(time.Now().Add(time.Second))
 			err := rc.Read(func(fd uintptr) bool {
 				n, _, rerr = unix.Recvfrom(int(fd), make([]byte, 100), flags|unix.MSG_DONTWAIT)
-				return rerr != unix.EAGAIN || time.Now().After(deadline)
+				return rerr != unix.EAGAIN
 			})
 			if err != nil || rerr != nil || n != size {
 				t.Fatalf("recvfrom(%#x) of %d bytes = %d, %v, %v", flags, size, n, err, rerr)

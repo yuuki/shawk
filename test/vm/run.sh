@@ -47,7 +47,9 @@ esac
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 fetch() { "$ROOT/scripts/fetch-verified.sh" "$@"; }
-no_udp=0
+# The environment may declare a kernel without BPF trampolines, e.g. one
+# given by its path.
+no_udp="${SHAWK_TEST_NO_UDP:-}"
 
 # Packages signed by the Rocky Linux 9 release key (rpmkeys --checksig, key id
 # 350d275d). The mainline builds are pinned by the SHA-256 they had when
@@ -61,7 +63,7 @@ rocky9/x86_64)
 rocky9/aarch64)
 	# arm64 has BPF trampolines since Linux 6.0, and RHEL 9 did not backport
 	# them: fentry programs load but do not attach.
-	no_udp=1
+	: "${no_udp:=1}"
 	pkg=$(fetch $rocky/aarch64/os/Packages/k/kernel-core-5.14.0-570.58.1.el9_6.aarch64.rpm \
 		f0eb542737285c1a7fd386a2cbb5f464228b847762d585d8bd47aa013512d7dd) ;;
 5.14/x86_64)
@@ -71,7 +73,7 @@ rocky9/aarch64)
 	pkg=$(fetch $mainline/v5.15.224/amd64/linux-image-unsigned-5.15.224-0515224-generic_5.15.224-0515224.202610301525_amd64.deb \
 		bce2733d9144d11e31f9680c69cd093a656e68b0fe50b315c364c2544cf5a29e) ;;
 5.15/aarch64)
-	no_udp=1
+	: "${no_udp:=1}"
 	pkg=$(fetch $mainline/v5.15.224/arm64/linux-image-unsigned-5.15.224-0515224-generic_5.15.224-0515224.202610301525_arm64.deb \
 		dee11976dee32b5e762a74fa027a17619b9c425135f84fae6be1d0c6bc1fb7bd) ;;
 *)
@@ -114,7 +116,7 @@ EOF
 
 # Unknown parameters of the kernel command line are passed to init as
 # environment variables.
-cmdline="console=$console panic=-1 quiet SHAWK_TEST_STRICT=${SHAWK_TEST_STRICT:-1} SHAWK_TEST_NO_UDP=$no_udp"
+cmdline="console=$console panic=-1 quiet SHAWK_TEST_STRICT=${SHAWK_TEST_STRICT:-1} SHAWK_TEST_NO_UDP=${no_udp:-0}"
 opts=(-m 2G -smp 2 -nographic -no-reboot -kernel "$image" -initrd "$WORK/initramfs.gz" -append "$cmdline")
 host="$(uname -m)"
 if [[ "$host" == "$ARCH" && -r /dev/kvm && -w /dev/kvm ]]; then
@@ -133,7 +135,7 @@ if ((status == 124)); then
 	echo "FAIL: the virtual machine did not finish within $TIMEOUT seconds" >&2
 	exit 1
 fi
-exit_line="$(grep -a '^SHAWK-VM-EXIT ' "$log" | tail -1 | tr -d '\r')"
+exit_line="$(grep -a '^SHAWK-VM-EXIT ' "$log" | tail -1 | tr -d '\r')" || true
 if [[ -z "$exit_line" ]]; then
 	echo "FAIL: the virtual machine stopped without the status of the tests" >&2
 	exit 1

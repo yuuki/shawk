@@ -57,6 +57,11 @@ char LICENSE[] SEC("license") = "Dual BSD/GPL";
 #define EEXIST 17
 #define SOCK_DGRAM 2
 #define SOCK_BINDPORT_LOCK 8
+/*
+ * SKB_GSO_UDP_L4 of the anonymous enum of GSO types, unchanged since Linux
+ * 4.18; an anonymous enum cannot be relocated.
+ */
+#define GSO_UDP_L4 (1U << 17)
 
 /* TCP states in which the FIN of the local side is queued. */
 #define TCPF_FIN_QUEUED                                                    \
@@ -488,11 +493,29 @@ static __always_inline void on_active_open(struct sock *sk)
 }
 
 /*
- * A child socket of a listener leaves SYN_RECV: usually for ESTABLISHED. A
- * child created by a TCP Fast Open SYN, which may carry data and is accepted
- * at once, may leave it otherwise: for FIN_WAIT1 when the server closed it
- * before the handshake completed, or for CLOSE when it was reset. Returns
- * the storage of the socket.
+ * Whether a child of a listener that leaves SYN_RECV for another state than
+ * ESTABLISHED was a connection: a child created by a TCP Fast Open SYN is
+ * accepted at once and may be closed by the server before the handshake
+ * completes (FIN_WAIT1), or reset or timed out (CLOSE). Other children leave
+ * SYN_RECV for CLOSE only when they fail to be created, e.g. without a route
+ * to the client or when two CPUs complete the same request, and were never
+ * established. A Fast Open child still has its request, except when reset,
+ * which removes it first; one that carried data has syn_data_acked.
+ */
+static __always_inline bool fastopen_child(struct sock *sk)
+{
+	struct tcp_sock *tp = bpf_skc_to_tcp_sock(sk);
+
+	if (!tp)
+		return false;
+	return BPF_CORE_READ(tp, fastopen_rsk) ||
+	       BPF_CORE_READ_BITFIELD_PROBED(tp, syn_data_acked);
+}
+
+/*
+ * A child socket of a listener leaves SYN_RECV: usually for ESTABLISHED, or
+ * for another state for a TCP Fast Open child (see fastopen_child()).
+ * Returns the storage of the socket.
  */
 static __always_inline struct shawk_sock_state *on_passive_open(struct sock *sk)
 {
@@ -553,6 +576,8 @@ int BPF_PROG(shawk_inet_sock_set_state, const struct sock *csk, int oldstate,
 	 * that is closed at once accounts its data below.
 	 */
 	if (oldstate == TCP_SYN_RECV && (!ss || ss->key.direction != DIR_OUT)) {
+		if (newstate != TCP_ESTABLISHED && !fastopen_child(sk))
+			return 0;
 		ss = on_passive_open(sk);
 		if (!ss || newstate != TCP_CLOSE)
 			return 0;
@@ -861,20 +886,29 @@ static __always_inline int read_udp_headers(struct sk_buff *skb,
 /*
  * Returns the number of datagrams an skb carries: one, or the segments of a
  * UDP GSO send (UDP_SEGMENT) or of a GRO receive delivered whole to a socket
- * with UDP_GRO.
+ * with UDP_GRO. Legacy UFO (SKB_GSO_UDP) carries one datagram. Packets of a
+ * guest's virtio device may leave gso_segs unset; the UDP header holds the
+ * length of all segments, which then counts them.
  */
-static __always_inline __u32 udp_segments(struct sk_buff *skb)
+static __always_inline __u32 udp_segments(struct sk_buff *skb, __u16 ulen)
 {
 	unsigned char *head = BPF_CORE_READ(skb, head);
 	/* An offset on 64-bit kernels (NET_SKBUFF_DATA_USES_OFFSET). */
 	__u32 end = BPF_CORE_READ(skb, end);
 	struct skb_shared_info *shinfo = (void *)(head + end);
+	__u32 size, data;
 	__u16 segs;
 
-	if (!BPF_CORE_READ(shinfo, gso_size))
+	size = BPF_CORE_READ(shinfo, gso_size);
+	if (!size || !(BPF_CORE_READ(shinfo, gso_type) & GSO_UDP_L4))
 		return 1;
 	segs = BPF_CORE_READ(shinfo, gso_segs);
-	return segs ? segs : 1;
+	if (segs)
+		return segs;
+	if (ulen <= sizeof(struct udphdr))
+		return 1;
+	data = ulen - sizeof(struct udphdr);
+	return (data + size - 1) / size;
 }
 
 static __always_inline int handle_udp_send(struct sk_buff *skb)
@@ -908,7 +942,7 @@ static __always_inline int handle_udp_send(struct sk_buff *skb)
 	if (!fs)
 		return 0;
 	/* The UDP header of a GSO skb holds the length of all segments. */
-	__sync_fetch_and_add(&fs->msgs_sent, udp_segments(skb));
+	__sync_fetch_and_add(&fs->msgs_sent, udp_segments(skb, h.ulen));
 	if (h.ulen > sizeof(struct udphdr))
 		__sync_fetch_and_add(&fs->bytes_sent,
 				     h.ulen - sizeof(struct udphdr));
@@ -964,7 +998,7 @@ int BPF_PROG(shawk_skb_consume_udp, struct sock *sk, struct sk_buff *skb,
 	fs = flow_get(&key);
 	if (!fs)
 		return 0;
-	__sync_fetch_and_add(&fs->msgs_recv, udp_segments(skb));
+	__sync_fetch_and_add(&fs->msgs_recv, udp_segments(skb, h.ulen));
 	__sync_fetch_and_add(&fs->bytes_recv, len);
 	fs->pid = tgid;
 	return 0;

@@ -110,7 +110,7 @@ retransmissions stand for errors, and open connections are added.
 |---|---|
 | `tp_btf/inet_sock_set_state` CLOSE→SYN_SENT | **active open**. Runs inside `connect(2)`, so the current task is the client. The flow key and the owner are stored in the socket local storage (`BPF_MAP_TYPE_SK_STORAGE`). |
 | SYN_SENT→ESTABLISHED / →CLOSE | count an established / failed outgoing connection |
-| SYN_RECV→* | **passive open**; counts an incoming connection. It usually goes to ESTABLISHED; a child created by a TCP Fast Open SYN, which carries data and is accepted at once, may also be closed or reset before the handshake completes. On a socket that went through SYN_SENT it ends a simultaneous open instead, e.g. of a socket connected to itself, which stays outgoing. |
+| SYN_RECV→* | **passive open**; counts an incoming connection. It usually goes to ESTABLISHED; a child created by a TCP Fast Open SYN, which carries data and is accepted at once, may also be closed or reset before the handshake completes. Other children that leave SYN_RECV for CLOSE failed to be created (e.g. without a route to the client) and are not counted. On a socket that went through SYN_SENT it ends a simultaneous open instead, e.g. of a socket connected to itself, which stays outgoing. |
 | *→CLOSE | account the remaining bytes of the connection, if any |
 | `iter/tcp` (every interval) | account byte deltas of long-lived connections, sample RTT, count open connections, list listening sockets, **adopt** connections established before the agent started |
 | `iter/task_file` | find the owners of adopted connections and of listening sockets |
@@ -176,9 +176,11 @@ socket-activated service is preferred to systemd, which created its
 listener, and the parent to forked workers. When no holder matches (the
 listener was closed or replaced since the last scan), the cgroup still names
 the service and another scan is requested. The walk also reports the inode
-of every listening socket, and a socket that no process held at the last
-scan requests one, so that a listener replaced by another process of the
-same cgroup, e.g. a restarted service, is attributed to it at once.
+of every listening socket, and a listening socket that the last scan did not
+see, or that it saw and is gone, requests one, so that a listener replaced
+by another process of the same cgroup, e.g. a restarted service, is
+attributed to it at once, also when both listen for a while with
+`SO_REUSEPORT`.
 
 ### 3.3 UDP
 
@@ -525,7 +527,8 @@ agent_sessions(host_id, started_at, last_heartbeat, udp_traced, netns_scope, dro
 host_addrs(host_id, addr, first_seen, last_seen)  -- one row per period
 processes(id, host_id, unit, comm, exe, service_name, first_seen, last_seen)  -- unique (host_id, unit, comm, service_name)
 edges(id, host_id, process_id, role, proto, local_addr, remote_addr, port, netns, first_seen, last_seen)
-listeners(host_id, process_id, proto, addr, port, netns, first_seen, last_seen)  -- one row per owner
+listeners(host_id, process_id, proto, addr, port, netns, first_seen, last_seen)  -- the latest owner
+listener_owners(host_id, process_id, proto, addr, port, netns, first_seen, last_seen)  -- every known owner
 peer_cidrs(prefix, name)  -- written by the connector from its peer_cidrs
 known_dependencies(client_service, server_service, port, proto, first_seen, last_seen)
 ```

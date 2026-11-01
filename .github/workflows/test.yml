@@ -9,6 +9,7 @@ jobs:
     # Hosted runners allow loading BPF programs with sudo, including fentry,
     # which the UDP tracing needs.
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:16
@@ -60,6 +61,7 @@ jobs:
         with:
           path: build/kernel
           key: kernel-rpm-${{ hashFiles('scripts/fetch-kernel-btf.sh') }}
+          restore-keys: kernel-rpm-
       - name: Compatibility with the Rocky Linux 9 kernel
         run: make compat
       - name: Check that the committed BPF object matches the source
@@ -71,6 +73,7 @@ jobs:
   kernels:
     name: kernel ${{ matrix.kernel }} ${{ matrix.arch }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -99,12 +102,15 @@ jobs:
         with:
           path: build/kernel
           key: kernel-${{ matrix.kernel }}-${{ matrix.arch }}-${{ hashFiles('test/vm/run.sh') }}
+          # The script checks the SHA-256 of what an older cache holds.
+          restore-keys: kernel-${{ matrix.kernel }}-${{ matrix.arch }}-
       - name: Tests in the virtual machine
         run: test/vm/run.sh ${{ matrix.kernel }} ${{ matrix.arch }}
 
   # The same tests on an arm64 host, with its own kernel and JIT.
   arm64:
     runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6

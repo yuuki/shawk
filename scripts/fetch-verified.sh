@@ -25,7 +25,8 @@ if [[ ! -f "$file" ]]; then
 	# concurrent runs neither clash nor see a partial file.
 	part="$(mktemp "$cache/.download.XXXXXX")"
 	trap 'rm -f "$part"' EXIT
-	curl -fsSL --retry 3 -o "$part" "$url"
+	# A stalled transfer fails rather than holding CI.
+	curl -fsSL --retry 3 --connect-timeout 30 --max-time 900 -o "$part" "$url"
 	if ! verified "$part"; then
 		echo "$url does not match the SHA-256 $sha256" >&2
 		exit 1
