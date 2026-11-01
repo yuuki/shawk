@@ -283,15 +283,17 @@ grep -q 'service.peer.name: Str(~unresolved)' "$WORK/collector.log" || fail "no 
 if grep -q 'network.peer.address' "$WORK/collector.log"; then fail "peer addresses forwarded"; fi
 
 # One agent traces every namespace, as on a host with containers. The
-# addresses of the namespaces were held by the hosts above a moment ago, so
-# dependencies are matched within the host, where both sides now are.
+# addresses of the namespaces move from the hosts above to node-01, and
+# dependencies, which are matched by address over all time, also pair
+# node-01 with them: only the dependencies node-01 observed on both sides
+# are checked.
 for pid in "${AGENTS[@]}"; do kill "$pid"; done
 wait "${AGENTS[@]}" 2>/dev/null || true
 AGENTS=()
 agent node-01 -
 node_alive() { [[ "$(sql "SELECT netns_scope FROM shawk_v1.agents WHERE host = 'node-01' AND alive" 2>/dev/null)" == all ]]; }
 wait_for 30 "the agent of all namespaces to report" node_alive
-node_sql="$(deps_sql "client_host = 'node-01' OR server_host = 'node-01'")"
+node_sql="$(deps_sql "client_host = 'node-01' AND server_host = 'node-01'")"
 node_want="$(want_deps node-01 node-01 node-01 node-01)"
 node_written() { [[ "$(sql "$node_sql" 2>/dev/null)" == "$node_want" ]]; }
 poll 60 node_written || true
