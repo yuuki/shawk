@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -15,7 +16,7 @@ import (
 
 // TestKernelCompatibility checks the BPF programs against the BTF of another
 // kernel without loading them: the attach targets must exist with the
-// prototypes the programs assume, the helpers must be known and every CO-RE
+// parameters the programs read, the helpers must be known and every CO-RE
 // relocation must resolve.
 //
 // Set SHAWK_TARGET_BTF to a raw BTF file or a vmlinux ELF, for example one
@@ -98,43 +99,115 @@ func checkAttachTarget(t *testing.T, target *btf.Spec, prog *ebpf.ProgramSpec) {
 	} else if err != nil {
 		t.Errorf("looking up attach target %s: %v", prog.AttachTo, err)
 	}
-	if prog.AttachType == ebpf.AttachTraceFEntry || prog.AttachType == ebpf.AttachTraceFExit {
-		checkPrototype(t, target, prog.AttachTo)
+	if prog.AttachType != ebpf.AttachTraceIter {
+		checkPrototype(t, target, prog)
 	}
 }
 
-// fentryPrototypes are the parameters that the programs attached to kernel
-// functions (BPF_PROG in shawk.bpf.c) assume. The verifier checks only how
-// many there are, so a function whose parameters changed would make a
-// program read the wrong arguments.
-var fentryPrototypes = map[string][]string{
-	"ip_send_skb":     {"*net", "*sk_buff"},
-	"ip6_send_skb":    {"*sk_buff"},
-	"skb_consume_udp": {"*sock", "*sk_buff", "int"},
+// sourcePrototypes returns the parameters that the programs attached to
+// kernel functions and BTF tracepoints read, as BPF_PROG declares them in the
+// BPF source, keyed by program name. The verifier checks only the number of
+// arguments of a function read through BPF_CORE_READ, so a parameter whose
+// type changed would make a program read the wrong argument.
+func sourcePrototypes(t *testing.T) map[string][]string {
+	t.Helper()
+	src, err := os.ReadFile("bpf/shawk.bpf.c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	re := regexp.MustCompile(`SEC\("(?:fentry|fexit|tp_btf)/\w+"\)\s*int\s+BPF_PROG\(\s*(\w+)([^)]*)\)`)
+	protos := map[string][]string{}
+	for _, m := range re.FindAllStringSubmatch(string(src), -1) {
+		params := []string{}
+		for _, p := range strings.Split(m[2], ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				params = append(params, p)
+			}
+		}
+		protos[m[1]] = params
+	}
+	return protos
 }
 
-func checkPrototype(t *testing.T, target *btf.Spec, name string) {
+// declType names the type of a C parameter declaration like paramType names
+// a BTF type, resolving typedefs in the kernel's BTF: "const struct sock *sk"
+// is "*sock".
+func declType(spec *btf.Spec, decl string) string {
+	fields := strings.Fields(strings.ReplaceAll(decl, "*", " * "))
+	fields = fields[:len(fields)-1] // the parameter name
+	var (
+		stars string
+		words []string
+	)
+	for _, f := range fields {
+		switch f {
+		case "*":
+			stars += "*"
+		case "const", "volatile", "struct", "union", "enum":
+		default:
+			words = append(words, f)
+		}
+	}
+	base := strings.Join(words, " ")
+	var td *btf.Typedef
+	if spec.TypeByName(base, &td) == nil {
+		base = paramType(td)
+	}
+	return stars + base
+}
+
+// kernelPrototype returns the parameters of the kernel function or BTF
+// tracepoint a program attaches to, without the context of a tracepoint.
+func kernelPrototype(spec *btf.Spec, prog *ebpf.ProgramSpec) ([]string, error) {
+	var proto *btf.FuncProto
+	switch prog.AttachType {
+	case ebpf.AttachTraceRawTp:
+		var td *btf.Typedef
+		if err := spec.TypeByName("btf_trace_"+prog.AttachTo, &td); err != nil {
+			return nil, err
+		}
+		ptr, ok := btf.UnderlyingType(td).(*btf.Pointer)
+		if !ok {
+			return nil, fmt.Errorf("btf_trace_%s is not a function pointer", prog.AttachTo)
+		}
+		if proto, ok = ptr.Target.(*btf.FuncProto); !ok || len(proto.Params) == 0 {
+			return nil, fmt.Errorf("btf_trace_%s is not a function pointer", prog.AttachTo)
+		}
+		proto = &btf.FuncProto{Return: proto.Return, Params: proto.Params[1:]}
+	default:
+		var fn *btf.Func
+		if err := spec.TypeByName(prog.AttachTo, &fn); err != nil {
+			return nil, err
+		}
+		var ok bool
+		if proto, ok = fn.Type.(*btf.FuncProto); !ok {
+			return nil, fmt.Errorf("%s has no prototype", prog.AttachTo)
+		}
+	}
+	params := make([]string, 0, len(proto.Params))
+	for _, p := range proto.Params {
+		params = append(params, paramType(p.Type))
+	}
+	return params, nil
+}
+
+func checkPrototype(t *testing.T, target *btf.Spec, prog *ebpf.ProgramSpec) {
 	t.Helper()
-	want, ok := fentryPrototypes[name]
+	decls, ok := sourcePrototypes(t)[prog.Name]
 	if !ok {
-		t.Errorf("the prototype of %s is not listed in fentryPrototypes", name)
+		t.Errorf("BPF_PROG of %s not found in the source", prog.Name)
 		return
 	}
-	var fn *btf.Func
-	if err := target.TypeByName(name, &fn); err != nil {
+	got, err := kernelPrototype(target, prog)
+	if err != nil {
 		return // reported by checkAttachTarget
 	}
-	proto, ok := fn.Type.(*btf.FuncProto)
-	if !ok {
-		t.Errorf("%s has no prototype", name)
-		return
-	}
-	var got []string
-	for _, p := range proto.Params {
-		got = append(got, paramType(p.Type))
+	want := make([]string, 0, len(decls))
+	for _, d := range decls {
+		want = append(want, declType(target, d))
 	}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
-		t.Errorf("parameters of %s = %v, the program assumes %v", name, got, want)
+		t.Errorf("parameters of %s = %v, %s reads %v", prog.AttachTo, got, prog.Name, want)
 	}
 }
 
@@ -151,9 +224,11 @@ func paramType(typ btf.Type) string {
 	return typ.TypeName()
 }
 
-// TestFentryPrototypes checks the prototypes of the kernel functions the UDP
-// programs attach to in the running kernel. It needs no privileges.
-func TestFentryPrototypes(t *testing.T) {
+// TestProgramPrototypes checks the prototypes of the kernel functions and
+// BTF tracepoints the programs attach to in the running kernel, including
+// those of modules (e.g. ip6_send_skb with IPv6 built as a module). It needs
+// no privileges.
+func TestProgramPrototypes(t *testing.T) {
 	kernel, err := btf.LoadKernelSpec()
 	if err != nil {
 		t.Skipf("no kernel BTF: %v", err)
@@ -164,20 +239,41 @@ func TestFentryPrototypes(t *testing.T) {
 	}
 	var n int
 	for _, prog := range spec.Programs {
-		if prog.AttachType != ebpf.AttachTraceFEntry && prog.AttachType != ebpf.AttachTraceFExit {
+		if prog.AttachType == ebpf.AttachTraceIter {
 			continue
 		}
 		n++
-		var fn *btf.Func
-		if err := kernel.TypeByName(prog.AttachTo, &fn); err != nil {
-			t.Errorf("attach target %s: %v", prog.AttachTo, err)
+		target := kernel
+		if _, err := kernelPrototype(kernel, prog); errors.Is(err, btf.ErrNotFound) {
+			if target = moduleSpecOf(prog); target == nil {
+				skipUnavailable(t, "attach target %s is not in the kernel's BTF", prog.AttachTo)
+				continue
+			}
+		}
+		checkPrototype(t, target, prog)
+	}
+	if want := len(sourcePrototypes(t)); n != want {
+		t.Errorf("%d programs attach to kernel functions or tracepoints, the source declares %d", n, want)
+	}
+}
+
+// moduleSpecOf returns the BTF of the kernel module that holds the attach
+// target of a program, or nil.
+func moduleSpecOf(prog *ebpf.ProgramSpec) *btf.Spec {
+	entries, _ := os.ReadDir("/sys/kernel/btf")
+	for _, e := range entries {
+		if e.Name() == "vmlinux" {
 			continue
 		}
-		checkPrototype(t, kernel, prog.AttachTo)
+		spec, err := btf.LoadKernelModuleSpec(e.Name())
+		if err != nil {
+			continue
+		}
+		if _, err := kernelPrototype(spec, prog); err == nil {
+			return spec
+		}
 	}
-	if n != len(fentryPrototypes) {
-		t.Errorf("%d programs attach to kernel functions, fentryPrototypes lists %d", n, len(fentryPrototypes))
-	}
+	return nil
 }
 
 func enumValues(t *testing.T, spec *btf.Spec, name string) map[uint64]bool {

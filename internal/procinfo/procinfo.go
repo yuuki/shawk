@@ -164,11 +164,14 @@ func unescapeMount(s string) string {
 var (
 	containerScope = regexp.MustCompile(`^(docker|libpod|cri-containerd|crio)-([0-9a-f]{12})[0-9a-f]*\.scope$`)
 	sessionScope   = regexp.MustCompile(`^session-[^.]+\.scope$`)
-	// Names systemd-run gives transient units without --unit: run-u<n>
-	// (after the D-Bus connection), run-r<random id> (on a direct
-	// connection) and run-p<pid>-i<n> (systemd 256 and later). Units named
-	// by the user, such as run-backup.service, are kept.
-	runScope    = regexp.MustCompile(`^run-(u[0-9]+|r[0-9a-f]{32}|p[0-9]+-i[0-9]+)\.(scope|service)$`)
+	// Names systemd-run gives transient units without --unit:
+	//   run-<pid>                   systemd 228 and earlier
+	//   run-u<n>, run-u<n>-s<m>     after the D-Bus connection (229-256;
+	//                               -s<m> after soft reboots, 256)
+	//   run-p<pid>-i<pidfd id>      systemd 257 and later
+	//   run-r<random 128-bit id>    when none of the above is available
+	// Units named by the user, such as run-backup.service, are kept.
+	runScope    = regexp.MustCompile(`^run-([0-9]+|u[0-9]+(-s[0-9]+)?|r[0-9a-f]{32}|p[0-9]+-i[0-9]+)\.(scope|service)$`)
 	userService = regexp.MustCompile(`^user@\d+\.service$`)
 )
 

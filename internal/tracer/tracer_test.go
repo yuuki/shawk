@@ -2,6 +2,7 @@ package tracer
 
 import (
 	"io"
+	"log/slog"
 	"net"
 	"net/netip"
 	"os"
@@ -17,10 +18,10 @@ import (
 
 func newTestTracer(t *testing.T) *Tracer {
 	t.Helper()
-	if os.Geteuid() != 0 {
-		t.Skip("requires root")
-	}
-	tr, err := New(Options{TraceSelf: true, OwnerScanInterval: time.Hour})
+	requireRoot(t)
+	// Warnings, e.g. why UDP tracing is unavailable, go to the test log.
+	log := slog.New(slog.NewTextHandler(testLogWriter{t}, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	tr, err := New(Options{TraceSelf: true, OwnerScanInterval: time.Hour, Logger: log})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -36,16 +37,31 @@ var testComm = func() string {
 	return c
 }()
 
+type testLogWriter struct{ t *testing.T }
+
+func (w testLogWriter) Write(p []byte) (int, error) {
+	w.t.Helper()
+	w.t.Log(strings.TrimSuffix(string(p), "\n"))
+	return len(p), nil
+}
+
 // skipUnavailable skips a test when the environment lacks something it
-// needs, such as IPv6 or BPF trampolines. With SHAWK_TEST_STRICT set, as in
-// CI, it fails the test instead, so that a change of the environment cannot
-// turn tests into skips while the suite still passes.
+// needs, such as root, IPv6 or BPF trampolines. With SHAWK_TEST_STRICT=1, as
+// in CI, it fails the test instead, so that a change of the environment
+// cannot turn tests into skips while the suite still passes.
 func skipUnavailable(t *testing.T, format string, args ...any) {
 	t.Helper()
-	if os.Getenv("SHAWK_TEST_STRICT") != "" {
+	if strict, _ := strconv.ParseBool(os.Getenv("SHAWK_TEST_STRICT")); strict {
 		t.Fatalf("SHAWK_TEST_STRICT is set: "+format, args...)
 	}
 	t.Skipf(format, args...)
+}
+
+func requireRoot(t *testing.T) {
+	t.Helper()
+	if os.Geteuid() != 0 {
+		skipUnavailable(t, "requires root")
+	}
 }
 
 // skipIfNoNetwork skips a test when the address family is unavailable,
@@ -174,9 +190,7 @@ func TestTCPShortLived(t *testing.T) {
 }
 
 func TestTCPLongLivedAndAdopted(t *testing.T) {
-	if os.Geteuid() != 0 {
-		t.Skip("requires root")
-	}
+	requireRoot(t)
 	ln := echoServer(t, "tcp4", "127.0.0.1:0")
 	srv := ln.Addr().(*net.TCPAddr).AddrPort()
 
@@ -337,9 +351,7 @@ func listenUDPFixedPort(t *testing.T, network, host string) net.PacketConn {
 }
 
 func TestExcludeSelf(t *testing.T) {
-	if os.Geteuid() != 0 {
-		t.Skip("requires root")
-	}
+	requireRoot(t)
 	tr, err := New(Options{})
 	if err != nil {
 		t.Fatal(err)
@@ -384,9 +396,7 @@ func TestExcludeSelf(t *testing.T) {
 // TestExcludeSelfInPIDNamespace runs TestExcludeSelf in a new PID namespace,
 // where os.Getpid() differs from the process id the kernel reports.
 func TestExcludeSelfInPIDNamespace(t *testing.T) {
-	if os.Geteuid() != 0 {
-		t.Skip("requires root")
-	}
+	requireRoot(t)
 	if os.Getenv("SHAWK_TEST_IN_PIDNS") != "" {
 		t.Skip("already in a PID namespace")
 	}
@@ -521,9 +531,7 @@ func TestUDPDirection(t *testing.T) {
 	})
 
 	t.Run("server bound before the tracer replies first", func(t *testing.T) {
-		if os.Geteuid() != 0 {
-			t.Skip("requires root")
-		}
+		requireRoot(t)
 		srv := listenUDPFixedPort(t, "udp4", "127.0.0.1")
 		defer srv.Close()
 		peer, err := net.ListenPacket("udp4", "127.0.0.1:0")

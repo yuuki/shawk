@@ -14,9 +14,7 @@ import (
 // namespace than the tracer's are accounted, including a connection that
 // existed before the tracer started.
 func TestOtherNetNS(t *testing.T) {
-	if os.Geteuid() != 0 {
-		t.Skip("requires root")
-	}
+	requireRoot(t)
 	ip, err := exec.LookPath("ip")
 	if err != nil {
 		skipUnavailable(t, "ip is not available")

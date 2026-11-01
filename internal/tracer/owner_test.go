@@ -177,9 +177,7 @@ func cgroup2Root() string {
 // with its path, and that flows of a process in it carry its id after the
 // cgroup is removed.
 func TestCgroupEvents(t *testing.T) {
-	if os.Geteuid() != 0 {
-		t.Skip("requires root")
-	}
+	requireRoot(t)
 	root := cgroup2Root()
 	if root == "" {
 		skipUnavailable(t, "cgroup v2 is not mounted")

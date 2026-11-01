@@ -23,6 +23,8 @@ func TestUnit(t *testing.T) {
 		{"/system.slice/run-r0a1b2c3d4e5f60718293a4b5c6d7e8f9.scope", "run.scope"},
 		{"/system.slice/run-u12.service", "run.service"},
 		{"/system.slice/run-p4242-i4243.service", "run.service"},
+		{"/system.slice/run-u12-s1.service", "run.service"},
+		{"/system.slice/run-4242.scope", "run.scope"},
 		{"/system.slice/run-backup.service", "run-backup.service"},
 		{"/system.slice/run-postgresql.service", "run-postgresql.service"},
 		{"/system.slice/run-r0a1b2.scope", "run-r0a1b2.scope"},
