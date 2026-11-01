@@ -62,3 +62,55 @@ jobs:
         run: make compat
       - name: Check that the committed BPF object matches the source
         run: make check-object
+
+  # The tests that load the BPF programs, on kernels booted in QEMU: Rocky
+  # Linux 9 and upstream releases older than the runner's, on x86_64 (with
+  # KVM) and on aarch64 (emulated).
+  kernels:
+    name: kernel ${{ matrix.kernel }} ${{ matrix.arch }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { kernel: rocky9, arch: x86_64, qemu: qemu-system-x86 }
+          - { kernel: rocky9, arch: aarch64, qemu: qemu-system-arm }
+          - { kernel: "5.14", arch: x86_64, qemu: qemu-system-x86 }
+          - { kernel: "5.15", arch: x86_64, qemu: qemu-system-x86 }
+          - { kernel: "5.15", arch: aarch64, qemu: qemu-system-arm }
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Install QEMU
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.qemu }} rpm2cpio cpio
+      # The runners have KVM, which only its group may open.
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      # The kernel packages, whose SHA-256 the script pins.
+      - name: Cache the kernel
+        uses: actions/cache@v4
+        with:
+          path: build/kernel
+          key: kernel-${{ matrix.kernel }}-${{ matrix.arch }}-${{ hashFiles('test/vm/run.sh') }}
+      - name: Tests in the virtual machine
+        run: test/vm/run.sh ${{ matrix.kernel }} ${{ matrix.arch }}
+
+  # The same tests on an arm64 host, with its own kernel and JIT.
+  arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Unit tests
+        run: go test ./...
+      - name: Tests loading BPF programs
+        env:
+          SHAWK_TEST_STRICT: "1"
+        run: make test-root

@@ -12,6 +12,7 @@ import (
 	"maps"
 	"net/netip"
 	"os"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -604,26 +605,11 @@ func (t *Tracer) scanSockets() ([]Listener, error) {
 			return nil, err
 		}
 	}
-	var readers []io.ReadCloser
-	for _, ns := range listNetNS(t.opts.NetNS) {
-		if ns.inode == t.netns {
-			rcs, err := openIters(t.iterTCP, t.iterUDP)
-			if err != nil {
-				closeAll(readers)
-				return nil, err
-			}
-			readers = append(readers, rcs...)
-			continue
-		}
-		rcs, err := openInNetNS(ns.path, t.iterTCP, t.iterUDP)
-		if err != nil {
-			// The namespace may have gone away since it was listed.
-			t.log.Debug("skipping network namespace", "netns", ns.inode, "error", err)
-			continue
-		}
-		readers = append(readers, rcs...)
-	}
+	readers, err := t.openAllNetNS()
 	defer closeAll(readers)
+	if err != nil {
+		return nil, err
+	}
 
 	var listeners []Listener
 	// The sockets of a SO_REUSEPORT group share an address and a port.
@@ -650,6 +636,43 @@ func (t *Tracer) scanSockets() ([]Listener, error) {
 		}
 	}
 	return listeners, nil
+}
+
+// openAllNetNS opens the socket iterators in every network namespace.
+//
+// The iterators walk the namespace of the thread that opens them, which is
+// not always that of the process: a thread may have entered another
+// namespace and stayed there, e.g. the main thread of the process, which Go
+// never terminates. The namespace of the thread is therefore compared, on a
+// thread locked for the walk.
+func (t *Tracer) openAllNetNS() ([]io.ReadCloser, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	var (
+		readers []io.ReadCloser
+		st      unix.Stat_t
+	)
+	if err := unix.Stat("/proc/thread-self/ns/net", &st); err != nil {
+		return nil, fmt.Errorf("finding the network namespace: %w", err)
+	}
+	for _, ns := range listNetNS(t.opts.NetNS) {
+		if ns.inode == uint32(st.Ino) {
+			rcs, err := openIters(t.iterTCP, t.iterUDP)
+			if err != nil {
+				return readers, err
+			}
+			readers = append(readers, rcs...)
+			continue
+		}
+		rcs, err := openInNetNS(ns.path, t.iterTCP, t.iterUDP)
+		if err != nil {
+			// The namespace may have gone away since it was listed.
+			t.log.Debug("skipping network namespace", "netns", ns.inode, "error", err)
+			continue
+		}
+		readers = append(readers, rcs...)
+	}
+	return readers, nil
 }
 
 type counterWarning struct {

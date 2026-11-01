@@ -224,12 +224,15 @@ require upstream 5.14 or later:
 | `bpf_sock_from_file`, `bpf_get_current_task_btf` | 5.11 |
 | cgroup pointer in `sock_cgroup_data` (else the owner of accepted connections is resolved in user space only) | 5.15, RHEL 9 |
 | TCP iterator that locks each socket (else rare double counting) | 5.19, RHEL 9 |
-| fentry (UDP only) | 5.5 on x86_64, 6.0 on arm64 |
+| fentry (UDP only) | 5.5 on x86_64, 6.0 on arm64 (not in RHEL 9 on arm64) |
 
-What is tested: the programs are loaded and exercised on Ubuntu kernels
-(6.8 to 7.0) in CI, and checked statically against the BTF of the Rocky
-Linux 9.6 kernel. They have not run on an actual Rocky Linux kernel, on
-upstream 5.14 to 5.18, or on arm64.
+What is tested in CI: the tests that load the programs run on the kernel of
+the Ubuntu runners (6.8 to 7.0) on x86_64 and arm64, and in virtual
+machines (`test/vm/run.sh`, `make vm-test`) on the kernel of Rocky Linux 9.6
+(x86_64 and aarch64) and on upstream 5.14 (x86_64) and 5.15 (x86_64 and
+aarch64). On aarch64 before 6.0, Rocky Linux 9 included, UDP is not traced:
+the fentry programs load but cannot attach, and the tests check that the
+tracer reports it and traces TCP.
 
 All struct accesses use CO-RE. `TestKernelCompatibility` checks every
 attach target, helper and CO-RE relocation against the BTF of the Rocky Linux

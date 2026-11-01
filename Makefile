@@ -25,7 +25,7 @@ vet:
 	$(GO) vet ./...
 	cd collector && $(GO) vet ./...
 	cd test/packaging && $(GO) vet ./...
-	test -z "$$(gofmt -l cmd internal collector/shawkconnector collector/cmd test/packaging)"
+	test -z "$$(gofmt -l cmd internal collector/shawkconnector collector/cmd test/packaging test/vm)"
 
 .PHONY: test
 test: ## unit tests; BPF tests need root, PostgreSQL tests need SHAWK_TEST_POSTGRES_DSN
@@ -49,6 +49,13 @@ test-root: ## tests that load the BPF programs into the running kernel
 	$(GO) test -c -o tracer.test ./internal/tracer/
 	sudo --preserve-env=SHAWK_TEST_STRICT ./tracer.test -test.v -test.count=1
 	rm -f tracer.test
+
+KERNEL ?= rocky9
+ARCH ?= $(shell uname -m)
+
+.PHONY: vm-test
+vm-test: ## the tests of test-root in a virtual machine with KERNEL (rocky9, 5.14, 5.15) for ARCH (x86_64, aarch64)
+	test/vm/run.sh $(KERNEL) $(ARCH)
 
 .PHONY: e2e
 e2e: build collector ## multi-host test with network namespaces; needs SHAWK_E2E_POSTGRES_DSN

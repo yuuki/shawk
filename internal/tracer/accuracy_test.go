@@ -1,17 +1,13 @@
 package tracer
 
 import (
-	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/netip"
 	"os"
-	"os/exec"
-	"runtime"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -211,61 +207,6 @@ func currentNetNS(t *testing.T) uint32 {
 		t.Fatal(err)
 	}
 	return uint32(st.Ino)
-}
-
-var netnsSeq atomic.Uint32
-
-// newNetNS creates a named network namespace with its loopback up, whose
-// sockets the tracer walks like those of a container. It returns a function
-// running f on a thread that entered the namespace, and its inode. Sockets
-// created by f belong to the namespace; /proc/sys/net and
-// /proc/thread-self/net are those of the namespace while f runs.
-func newNetNS(t *testing.T) (func(f func()), uint32) {
-	t.Helper()
-	ip, err := exec.LookPath("ip")
-	if err != nil {
-		skipUnavailable(t, "ip is not available")
-	}
-	name := fmt.Sprintf("shawkacc%d-%d", os.Getpid(), netnsSeq.Add(1))
-	if out, err := exec.Command(ip, "netns", "add", name).CombinedOutput(); err != nil {
-		skipUnavailable(t, "cannot create a network namespace: %v: %s", err, out)
-	}
-	t.Cleanup(func() { exec.Command(ip, "netns", "del", name).Run() })
-	if out, err := exec.Command(ip, "-n", name, "link", "set", "lo", "up").CombinedOutput(); err != nil {
-		t.Fatalf("%v: %s", err, out)
-	}
-	var st unix.Stat_t
-	if err := unix.Stat("/run/netns/"+name, &st); err != nil {
-		t.Fatal(err)
-	}
-	run := func(f func()) {
-		runtime.LockOSThread()
-		orig, err := os.Open("/proc/thread-self/ns/net")
-		if err != nil {
-			runtime.UnlockOSThread()
-			t.Fatal(err)
-		}
-		defer orig.Close()
-		ns, err := os.Open("/run/netns/" + name)
-		if err != nil {
-			runtime.UnlockOSThread()
-			t.Fatal(err)
-		}
-		defer ns.Close()
-		if err := unix.Setns(int(ns.Fd()), unix.CLONE_NEWNET); err != nil {
-			runtime.UnlockOSThread()
-			t.Fatal(err)
-		}
-		// A thread that cannot return to its namespace ends with its
-		// goroutine instead of being reused.
-		defer func() {
-			if unix.Setns(int(orig.Fd()), unix.CLONE_NEWNET) == nil {
-				runtime.UnlockOSThread()
-			}
-		}()
-		f()
-	}
-	return run, uint32(st.Ino)
 }
 
 // TestTCPSelfConnect checks a socket connected to itself, which goes through
