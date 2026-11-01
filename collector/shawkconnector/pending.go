@@ -41,10 +41,10 @@ type edgeRowKey struct {
 // listenerRowKey identifies a listener and its owner: a listener that
 // changes hands has a row per owner, which keeps its history.
 type listenerRowKey struct {
-	proto string
-	addr  netip.Addr
-	port  uint16
-	netns uint64
+	proto   string
+	addr    netip.Addr
+	port    uint16
+	netns   uint64
 	procKey // zero if the owner is unknown
 }
 
