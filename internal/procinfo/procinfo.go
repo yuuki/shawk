@@ -66,10 +66,8 @@ func (r *Resolver) Learn(id uint64, path string) {
 	}
 	r.learned[id] = learnedPath{path: path, at: time.Now()}
 	r.mu.Unlock()
-	if r.containers != nil {
-		if _, ok := cgroupContainer(path); ok {
-			r.unit(path)
-		}
+	if r.containers != nil && len(cgroupContainers(path)) > 0 {
+		r.unit(path)
 	}
 }
 
@@ -80,12 +78,23 @@ func (r *Resolver) Unit(id uint64) (string, *Container) {
 	return r.unit(r.CgroupPath(id))
 }
 
+// unit names the innermost container of a cgroup path whose state the
+// runtime has. A container in a container, e.g. with Docker in Docker,
+// keeps its state in the outer one, out of reach, and is named after the
+// outer container. Without any state, the outermost container names it by
+// id, as Unit does.
 func (r *Resolver) unit(path string) (string, *Container) {
-	ref, ok := cgroupContainer(path)
-	if !ok || r.containers == nil {
+	refs := cgroupContainers(path)
+	if len(refs) == 0 || r.containers == nil {
 		return Unit(path), nil
 	}
-	ctr := r.containers.Lookup(ref.runtime, ref.id)
+	var ctr *Container
+	for _, ref := range refs {
+		var found bool
+		if ctr, found = r.containers.Lookup(ref.runtime, ref.id); found {
+			break
+		}
+	}
 	return ctr.Unit(), ctr
 }
 
@@ -212,6 +221,7 @@ var (
 //	/system.slice/nginx.service                      -> nginx.service
 //	/system.slice/docker-0123456789ab....scope       -> docker-0123456789ab
 //	/kubepods/burstable/pod<uid>/0123456789ab...     -> container-0123456789ab
+//	/system.slice/docker-<outer>.scope/docker/<inner> -> docker-<outer 12 hex>
 //	/user.slice/user-1000.slice/session-3.scope      -> user-1000.slice/session.scope
 //	/user.slice/user-1000.slice/user@1000.service/app.slice/foo.service
 //	                                                 -> user@1000.service/foo.service
@@ -221,11 +231,12 @@ func Unit(cgroupPath string) string {
 	if len(parts) == 0 {
 		return ""
 	}
+	if refs := cgroupContainers(cgroupPath); len(refs) > 0 {
+		outer := refs[len(refs)-1]
+		return (&Container{Runtime: runtimeOrAny(outer.runtime), ID: outer.id}).Unit()
+	}
 	for i := len(parts) - 1; i >= 0; i-- {
 		p := parts[i]
-		if runtime, id, ok := containerOf(parts, i); ok {
-			return (&Container{Runtime: runtimeOrAny(runtime), ID: id}).Unit()
-		}
 		if runScope.MatchString(p) {
 			return "run." + p[strings.LastIndexByte(p, '.')+1:]
 		}
@@ -253,21 +264,26 @@ func Unit(cgroupPath string) string {
 // it; runtime is "" when the cgroup does not tell it.
 type containerRef struct{ runtime, id string }
 
-// cgroupContainer finds the container of a cgroup path: the innermost
-// cgroup of a container, unless a unit of systemd in the container is
-// deeper, as Unit does.
-func cgroupContainer(cgroupPath string) (containerRef, bool) {
+// cgroupContainers finds the containers of a cgroup path, innermost first:
+// several when containers run in a container. It finds none when a unit of
+// systemd is deeper than the innermost container, e.g. a service of
+// systemd in a container, which then names the process, as in Unit; it
+// stops at a unit above the containers, such as user@1000.service above
+// the containers of a rootless runtime.
+func cgroupContainers(cgroupPath string) []containerRef {
 	parts := strings.FieldsFunc(cgroupPath, func(r rune) bool { return r == '/' })
+	var refs []containerRef
 	for i := len(parts) - 1; i >= 0; i-- {
 		if runtime, id, ok := containerOf(parts, i); ok {
-			return containerRef{runtime, id}, true
+			refs = append(refs, containerRef{runtime, id})
+			continue
 		}
 		p := parts[i]
 		if runScope.MatchString(p) || sessionScope.MatchString(p) || strings.HasSuffix(p, ".service") {
-			return containerRef{}, false
+			break
 		}
 	}
-	return containerRef{}, false
+	return refs
 }
 
 func runtimeOrAny(runtime string) string {

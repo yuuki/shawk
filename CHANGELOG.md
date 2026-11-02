@@ -8,17 +8,30 @@
   `docker/<project>/<service>` for Docker Compose, and `docker/<name>`,
   `podman/<name>` or `containerd/<name>` otherwise, read from the state
   the runtime keeps on disk when the cgroup is created; the id is the new
-  attribute `container.id`. The cgroupfs drivers of Docker and kubelet
+  attribute `container.id`, which the connector reads to keep the series
+  of the replicas of a unit apart. Upgrade the connectors before the
+  agents: a connector of the previous version takes the series of the
+  containers of one unit for one series, and counts the connections of
+  only one of them. The cgroupfs drivers of Docker and kubelet
   (`/docker/<id>`, `/kubepods/.../pod<uid>/<id>`) are recognized; their
   processes were named after the raw id. A container whose state cannot
   be read, such as a rootless one, is named `<runtime>-<12 hex digits>`
-  (`containerd-` rather than `cri-containerd-`). The processes of a pod of
+  (`containerd-` rather than `cri-containerd-`), or `container-<12 hex
+  digits>` when the cgroup does not tell the runtime; a container in a
+  container is named after the outer one. The labels of a pod or of
+  Compose that Docker copies from the image name a container only with
+  the name cri-dockerd or Compose gives it. The processes of a pod of
   Kubernetes are named after the workload of the pod (the name of the pod
-  without the suffixes Kubernetes generates) with the namespace of the
-  pod as `service.namespace`, unless they set `OTEL_SERVICE_NAME`, as OBI
-  does with the metadata of Kubernetes: their Prometheus `job` changes
-  from the executable to `<namespace>/<workload>`. The existing rows of
-  `shawk.processes` of containers keep their old units.
+  without the suffixes Kubernetes generates) unless they set
+  `OTEL_SERVICE_NAME`, and get the namespace of the pod as
+  `service.namespace` unless `OTEL_RESOURCE_ATTRIBUTES` sets one, also
+  when they set `OTEL_SERVICE_NAME`: the Prometheus `job` of a pod changes
+  from the executable (or `billing`) to `<namespace>/<workload>` (or
+  `<namespace>/billing`), as OBI names them. OBI prefers the labels
+  `app.kubernetes.io/instance` and `app.kubernetes.io/name` of the pod,
+  which the agent cannot see, so the `job` of pods with these labels may
+  differ from that of OBI. The existing rows of `shawk.processes` of
+  containers keep their old units.
 * The kernel folds the peers outside the internal ranges of the host into
   one dependency per local endpoint (#96). On an internet-facing host, the
   clients of a local server on the Internet no longer make one flow, one

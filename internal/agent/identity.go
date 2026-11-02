@@ -166,7 +166,15 @@ func (r *identities) resolve(pid uint32, comm, unit string, ctr *procinfo.Contai
 		if l, ok := r.latest[k]; ok {
 			l.at = now
 			r.latest[k] = l
-			return l.proc
+			// The unit is shared by the replicas of a container and by the
+			// containers that replace it; the container is that of the
+			// cgroup of the flow.
+			proc := l.proc
+			proc.ContainerID = ""
+			if ctr != nil {
+				proc.ContainerID = ctr.ID
+			}
+			return proc
 		}
 	}
 	svc := procinfo.ServiceName(p.env, p.exe, comm, unit, ctr.Workload(), r.fallback)

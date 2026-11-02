@@ -15,6 +15,11 @@ import (
 type process struct {
 	unit, comm, exe string
 	service, svcNS  string
+	// containerID is the container of the process (container.id). The
+	// series of the containers of one unit, such as the replicas of a
+	// service or a container and the one that replaced it, are separate
+	// inputs; they make the same rows and output series.
+	containerID string
 }
 
 // job is the name of the local service as Prometheus shows it in the job
@@ -311,6 +316,7 @@ func parseProcess(a pcommon.Map) process {
 		service: getString(a, attrServiceName),
 	}
 	p.svcNS = getString(a, attrServiceNS)
+	p.containerID = getString(a, attrContainerID)
 	return p
 }
 

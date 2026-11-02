@@ -131,3 +131,29 @@ func TestReusedPID(t *testing.T) {
 		t.Errorf("resolve of a reused PID = %+v", got)
 	}
 }
+
+// The latest identity of a unit shared by containers, such as replicas or a
+// container and the one that replaced it, keeps the container of the flow
+// (#104).
+func TestLatestIdentityOfContainers(t *testing.T) {
+	now := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
+	r := newIdentities(procinfo.FallbackExe, 15*time.Minute)
+	exes := map[uint32]string{100: "/usr/bin/node"}
+	r.exe = func(pid uint32) string { return exes[pid] }
+	r.comm = func(uint32) string { return "" }
+	r.env = func(uint32) (map[string]string, bool) { return nil, true }
+	a := &procinfo.Container{Runtime: procinfo.RuntimeDocker, ID: "aaaa", Name: "web"}
+	b := &procinfo.Container{Runtime: procinfo.RuntimeDocker, ID: "bbbb", Name: "web"}
+	r.beginInterval()
+	if got := r.resolve(100, "node", "docker/web", a, now); got.ContainerID != "aaaa" || got.Exe != "/usr/bin/node" {
+		t.Errorf("resolve of a = %+v", got)
+	}
+	// A short-lived process of b exited before /proc was read.
+	got := r.resolve(200, "node", "docker/web", b, now)
+	if got.ContainerID != "bbbb" || got.Exe != "/usr/bin/node" || got.Service != "node" {
+		t.Errorf("resolve of b from the latest identity = %+v", got)
+	}
+	if got := r.resolve(300, "node", "docker/web", nil, now); got.ContainerID != "" {
+		t.Errorf("resolve without a container = %+v", got)
+	}
+}

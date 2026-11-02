@@ -3,11 +3,13 @@ package procinfo
 import (
 	"encoding/json"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -47,25 +49,25 @@ const shortID = 12
 //	docker/shop/db              the service db of the Compose project shop
 //	podman/redis                a container named redis
 //	docker-0123456789ab         a container whose state could not be read
+//
+// The parts of the name come from the state of the container, which its
+// owner or the author of its image may set, so each is limited to the
+// characters of the names of containers and pods (see namePart).
 func (c *Container) Unit() string {
 	switch {
 	case c.PodName != "":
-		ns := c.PodNamespace
-		if ns == "" {
-			ns = "default"
-		}
-		u := "k8s/" + ns + "/" + PodWorkload(c.PodName)
+		u := "k8s/" + namePart(c.podNamespace()) + "/" + namePart(PodWorkload(c.PodName))
 		if c.ContainerName != "" {
-			u += "/" + c.ContainerName
+			u += "/" + namePart(c.ContainerName)
 		}
 		return u
 	case c.ComposeService != "":
 		if c.ComposeProject == "" {
-			return c.Runtime + "/" + c.ComposeService
+			return c.Runtime + "/" + namePart(c.ComposeService)
 		}
-		return c.Runtime + "/" + c.ComposeProject + "/" + c.ComposeService
+		return c.Runtime + "/" + namePart(c.ComposeProject) + "/" + namePart(c.ComposeService)
 	case c.Name != "":
-		return c.Runtime + "/" + c.Name
+		return c.Runtime + "/" + namePart(c.Name)
 	}
 	id := c.ID
 	if len(id) > shortID {
@@ -74,15 +76,48 @@ func (c *Container) Unit() string {
 	return c.Runtime + "-" + id
 }
 
+func (c *Container) podNamespace() string {
+	if c.PodNamespace == "" {
+		return "default"
+	}
+	return c.PodNamespace
+}
+
 // Workload returns the service of a container of Kubernetes, named as OBI
-// names it from the metadata of the pod: the workload that owns the pod in
-// the namespace of the pod. It is zero for other containers, which OBI
-// names after their executable.
+// names it from the metadata of the pod when the pod has no annotation or
+// label that names its service: the workload that owns the pod in the
+// namespace of the pod. It is zero for other containers, which OBI names
+// after their executable.
 func (c *Container) Workload() Service {
 	if c == nil || c.PodName == "" {
 		return Service{}
 	}
-	return Service{Name: PodWorkload(c.PodName), Namespace: c.PodNamespace}
+	return Service{Name: namePart(PodWorkload(c.PodName)), Namespace: namePart(c.podNamespace())}
+}
+
+// maxNamePart bounds the length of a part of the name of a container: the
+// names of pods and containers of Kubernetes have at most 63 characters,
+// except the names of pods, which have at most 253.
+const maxNamePart = 253
+
+// namePart makes a part of a name taken from the state of a container safe
+// to join with / into a unit or a Prometheus job: the characters the names
+// of containers (Docker, Podman) and of objects of Kubernetes may have are
+// kept, any other is replaced with _, and . and .. become _.
+func namePart(s string) string {
+	if len(s) > maxNamePart {
+		s = s[:maxNamePart]
+	}
+	b := []byte(s)
+	for i, ch := range b {
+		if !(ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' || ch == '_' || ch == '.' || ch == '-') {
+			b[i] = '_'
+		}
+	}
+	if s = string(b); s == "" || s == "." || s == ".." {
+		return "_"
+	}
+	return s
 }
 
 // The suffixes Kubernetes appends to the names of the pods it creates, made
@@ -96,8 +131,18 @@ func (c *Container) Workload() Service {
 var (
 	podSuffix      = regexp.MustCompile(`-[bcdfghjklmnpqrstvwxz2456789]{5}$`)
 	templateHash   = regexp.MustCompile(`-([bcdfghjklmnpqrstvwxz2456789]{6,10}|[0-9]{8,10})$`)
+	generatedPart  = regexp.MustCompile(`^[0-9bcdfghjklmnpqrstvwxz]*$`)
 	podOrdinal     = regexp.MustCompile(`-[0-9]+$`)
 	containerIDHex = regexp.MustCompile(`^[0-9a-f]{64}$`)
+)
+
+// The API server truncates the prefix of a generated name to
+// maxGeneratedPrefix characters before it appends the 5 random ones
+// (k8s.io/apiserver/pkg/storage/names), so a generated name has at most
+// maxGeneratedName.
+const (
+	maxGeneratedPrefix = 58
+	maxGeneratedName   = maxGeneratedPrefix + 5
 )
 
 // PodWorkload guesses the name of the workload that owns a pod from the
@@ -107,7 +152,20 @@ var (
 // The owner itself is known only to the API server, which the agent does
 // not ask; a pod named by hand that ends like a generated one loses its
 // end too.
+//
+// A generated name whose prefix was truncated has no - before its random
+// characters: its prefix is cut at its last -, after which there is a part
+// of the hash or of the minutes of the Job, or the end of a long name of a
+// workload. The name is the same for every pod of the workload, though it
+// may lack the end of the name of the workload.
 func PodWorkload(pod string) string {
+	if len(pod) == maxGeneratedName && pod[maxGeneratedPrefix-1] != '-' {
+		prefix := pod[:maxGeneratedPrefix]
+		if i := strings.LastIndexByte(prefix, '-'); i > 0 && generatedPart.MatchString(prefix[i+1:]) {
+			prefix = prefix[:i]
+		}
+		return prefix
+	}
 	if loc := podSuffix.FindStringIndex(pod); loc != nil && loc[0] > 0 {
 		base := pod[:loc[0]]
 		if loc := templateHash.FindStringIndex(base); loc != nil && loc[0] > 0 {
@@ -199,12 +257,20 @@ type containerEntry struct {
 	used  time.Time // when the container was last looked up
 }
 
-// podmanIndex is the list of containers of containers/storage, read again
-// when it changes.
+// podmanIndex holds the names of the containers of containers/storage,
+// read again when one of its lists changes.
 type podmanIndex struct {
-	mtime time.Time
-	size  int64
+	files map[string]fileStamp
 	names map[string]string // id -> name
+}
+
+// fileStamp tells whether a file changed: a list is replaced by a new file
+// (another inode), possibly of the same size within the resolution of the
+// time of modification.
+type fileStamp struct {
+	mtime int64 // in nanoseconds
+	size  int64
+	ino   uint64
 }
 
 // NewContainers returns a reader of the state of the runtimes of the host.
@@ -215,18 +281,18 @@ func newContainers(root string) *Containers {
 }
 
 // Lookup returns the container of a runtime with an id. runtime is "" when
-// the cgroup does not tell it; every runtime is tried then. The container
-// has only its id when its state cannot be read.
-func (c *Containers) Lookup(runtime, id string) *Container {
+// the cgroup does not tell it; every runtime is tried then. found is false
+// when its state cannot be read; the container then has only its id.
+func (c *Containers) Lookup(runtime, id string) (ctr *Container, found bool) {
 	now := time.Now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if e, ok := c.cache[id]; ok && (e.found || now.Sub(e.read) < missTTL) {
 		e.used = now
 		c.cache[id] = e
-		return e.c
+		return e.c, e.found
 	}
-	ctr, found := c.read(runtime, id)
+	ctr, found = c.read(runtime, id)
 	if len(c.cache) >= maxContainers {
 		for k, e := range c.cache {
 			if now.Sub(e.used) > containerTTL || !e.found {
@@ -238,7 +304,7 @@ func (c *Containers) Lookup(runtime, id string) *Container {
 		}
 	}
 	c.cache[id] = containerEntry{c: ctr, found: found, read: now, used: now}
-	return ctr
+	return ctr, found
 }
 
 // expire forgets the containers not looked up for containerTTL.
@@ -271,6 +337,15 @@ func (c *Containers) read(runtime, id string) (*Container, bool) {
 		}
 	}
 	return &Container{Runtime: runtimeOrAny(""), ID: id}, false
+}
+
+// glob returns the paths that match a pattern, without root.
+func (c *Containers) glob(pattern string) []string {
+	m, _ := filepath.Glob(filepath.Join(c.root, pattern))
+	for i := range m {
+		m[i] = strings.TrimPrefix(m[i], c.root)
+	}
+	return m
 }
 
 func (c *Containers) readFile(path string) []byte {
@@ -319,47 +394,95 @@ func (c *Containers) readDocker(id string) *Container {
 		return nil
 	}
 	ctr := &Container{Runtime: RuntimeDocker, ID: id, Name: strings.TrimPrefix(cfg.Name, "/")}
-	labels := cfg.Config.Labels
-	ctr.ComposeProject = labels["com.docker.compose.project"]
-	ctr.ComposeService = labels["com.docker.compose.service"]
-	// cri-dockerd labels the containers of pods as dockershim did.
-	ctr.PodNamespace = labels["io.kubernetes.pod.namespace"]
-	ctr.PodName = labels["io.kubernetes.pod.name"]
-	ctr.ContainerName = labels["io.kubernetes.container.name"]
+	dockerLabels(ctr, cfg.Config.Labels)
 	return ctr
 }
 
-// storageRoots are the graph roots of containers/storage used by Podman
-// and CRI-O as root, then the run root, where CRI-O keeps the bundles.
+// composeIndex is the end of the name Docker Compose gives a container
+// after its project and service: its number, or run-<id> for one-off
+// containers of docker compose run.
+var composeIndex = regexp.MustCompile(`^([0-9]+|run-[0-9a-f]+)$`)
+
+// dockerLabels sets the pod or the Compose service of a container of Docker
+// from its labels. Docker merges the labels of the image into those of the
+// container, so an image could claim to be any pod or service; the labels
+// are believed only when the name of the container, which whoever creates
+// it chooses, is the one cri-dockerd or Compose gives it:
+//
+//	k8s_<container>_<pod>_<namespace>_<pod uid>_<attempt>   cri-dockerd
+//	<project>-<service>-<number>, <project>_<service>_<number>  Compose
+//
+// A Compose service with container_name keeps its name, which is as stable.
+func dockerLabels(ctr *Container, labels map[string]string) {
+	if f := strings.Split(ctr.Name, "_"); len(f) >= 5 && f[0] == "k8s" &&
+		f[2] == labels["io.kubernetes.pod.name"] && f[3] == labels["io.kubernetes.pod.namespace"] {
+		ctr.PodName, ctr.PodNamespace, ctr.ContainerName = f[2], f[3], f[1]
+		return
+	}
+	project, service := labels["com.docker.compose.project"], labels["com.docker.compose.service"]
+	if project == "" || service == "" {
+		return
+	}
+	for _, sep := range []string{"-", "_"} {
+		if rest, ok := strings.CutPrefix(ctr.Name, project+sep+service+sep); ok && composeIndex.MatchString(rest) {
+			ctr.ComposeProject, ctr.ComposeService = project, service
+			return
+		}
+	}
+}
+
+// storageRoots are the graph root of containers/storage used by Podman and
+// CRI-O as root, then the run root, where CRI-O keeps the bundles and a
+// transient store keeps its lists. The directories of the containers are
+// named after the storage driver: overlay-containers, vfs-containers...
 var storageRoots = []string{"/var/lib/containers/storage", "/run/containers/storage"}
 
-// readPodman reads the name of a container from containers.json of
-// containers/storage, which also lists the containers of CRI-O.
-func (c *Containers) readPodman(id string) *Container {
-	p := filepath.Join(storageRoots[0], "overlay-containers", "containers.json")
-	st, err := os.Stat(filepath.Join(c.root, p))
-	if err != nil {
-		return nil
-	}
+// podmanNames returns the names of the containers of containers/storage
+// by id: containers.json lists the containers, volatile-containers.json
+// those removed when they stop (podman run --rm).
+func (c *Containers) podmanNames() map[string]string {
 	ix := &c.podman
-	if ix.names == nil || !st.ModTime().Equal(ix.mtime) || st.Size() != ix.size {
+	stamps := map[string]fileStamp{}
+	for _, root := range storageRoots {
+		for _, list := range []string{"containers.json", "volatile-containers.json"} {
+			for _, p := range c.glob(filepath.Join(root, "*-containers", list)) {
+				st, err := os.Stat(filepath.Join(c.root, p))
+				if err != nil {
+					continue
+				}
+				fs := fileStamp{mtime: st.ModTime().UnixNano(), size: st.Size()}
+				if sys, ok := st.Sys().(*syscall.Stat_t); ok {
+					fs.ino = sys.Ino
+				}
+				stamps[p] = fs
+			}
+		}
+	}
+	if ix.names != nil && maps.Equal(stamps, ix.files) {
+		return ix.names
+	}
+	names := map[string]string{}
+	for p := range stamps {
 		var list []struct {
 			ID    string   `json:"id"`
 			Names []string `json:"names"`
 		}
-		b := c.readFile(p)
-		if b == nil || json.Unmarshal(b, &list) != nil {
-			return nil
-		}
-		ix.names = make(map[string]string, len(list))
-		for _, e := range list {
-			if len(e.Names) > 0 {
-				ix.names[e.ID] = e.Names[0]
+		if b := c.readFile(p); b != nil && json.Unmarshal(b, &list) == nil {
+			for _, e := range list {
+				if len(e.Names) > 0 {
+					names[e.ID] = e.Names[0]
+				}
 			}
 		}
-		ix.mtime, ix.size = st.ModTime(), st.Size()
 	}
-	name, ok := ix.names[id]
+	ix.files, ix.names = stamps, names
+	return names
+}
+
+// readPodman reads the name of a container from the lists of
+// containers/storage, which also list the containers of CRI-O.
+func (c *Containers) readPodman(id string) *Container {
+	name, ok := c.podmanNames()[id]
 	if !ok {
 		return nil
 	}
@@ -375,22 +498,30 @@ func (c *Containers) readPodman(id string) *Container {
 // readCRIO reads the annotations of the OCI bundle of a container of CRI-O.
 func (c *Containers) readCRIO(id string) *Container {
 	for _, root := range []string{storageRoots[1], storageRoots[0]} {
-		a := c.readBundle(filepath.Join(root, "overlay-containers", id, "userdata", "config.json"))
-		if a == nil {
-			continue
-		}
-		if a["io.kubernetes.pod.name"] == "" {
-			return nil
-		}
-		return &Container{
-			Runtime:       RuntimeCRIO,
-			ID:            id,
-			PodNamespace:  a["io.kubernetes.pod.namespace"],
-			PodName:       a["io.kubernetes.pod.name"],
-			ContainerName: a["io.kubernetes.container.name"],
+		for _, p := range c.glob(filepath.Join(root, "*-containers", id, "userdata", "config.json")) {
+			if ctr := c.crioBundle(id, p); ctr != nil {
+				return ctr
+			}
 		}
 	}
 	return nil
+}
+
+// crioBundle reads the pod of a container from the annotations of its
+// bundle, or returns nil if it is not the container of a pod, e.g. one of
+// Podman, whose bundle is in the same directories.
+func (c *Containers) crioBundle(id, path string) *Container {
+	a := c.readBundle(path)
+	if a["io.kubernetes.pod.name"] == "" {
+		return nil
+	}
+	return &Container{
+		Runtime:       RuntimeCRIO,
+		ID:            id,
+		PodNamespace:  a["io.kubernetes.pod.namespace"],
+		PodName:       a["io.kubernetes.pod.name"],
+		ContainerName: a["io.kubernetes.container.name"],
+	}
 }
 
 // containerdTasks is where containerd keeps the OCI bundles of the running
@@ -399,7 +530,9 @@ const containerdTasks = "/run/containerd/io.containerd.runtime.v2.task"
 
 // readContainerd reads the annotations of the OCI bundle of a container of
 // containerd: those of the CRI plugin for Kubernetes, nerdctl/name for
-// nerdctl.
+// nerdctl. A bundle without them is not a container of containerd that has
+// a name, such as a container of Docker (namespace moby), which Docker
+// names.
 func (c *Containers) readContainerd(id string) *Container {
 	nss, err := os.ReadDir(filepath.Join(c.root, containerdTasks))
 	if err != nil {
@@ -420,6 +553,9 @@ func (c *Containers) readContainerd(id string) *Container {
 		}
 		if ctr.ContainerName == "" && a["io.kubernetes.cri.container-type"] == "sandbox" {
 			ctr.ContainerName = "POD"
+		}
+		if ctr.Name == "" && ctr.PodName == "" {
+			continue
 		}
 		return ctr
 	}

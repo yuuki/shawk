@@ -272,6 +272,47 @@ func TestCumulativeAggregation(t *testing.T) {
 	}
 }
 
+// The series of containers of one unit that differ in container.id only,
+// such as replicas on the network of the host or a container and the one
+// that replaced it, are separate inputs of one output (#104).
+func TestContainersOfOneUnit(t *testing.T) {
+	c, _, sink, now := testConnector(t, nil)
+	edge := func(id string, opened, count int64, start time.Time) tEdge {
+		return tEdge{role: "client", proto: "tcp", local: "10.0.0.11", peer: "1.1.1.1", port: 443, svc: "web",
+			unit: "docker/shop/web", comm: "node", containerID: id, opened: opened, count: count, start: start}
+	}
+	value := func(out []series, metric string) float64 {
+		s := find(out, metric, "web", "~external", roleClient, "")
+		if len(s) != 1 {
+			t.Fatalf("%s = %v", metric, s)
+		}
+		return s[0].value
+	}
+	agent := func(edges ...tEdge) tAgent {
+		*now = now.Add(15 * time.Second)
+		return tAgent{host: "app-01", addrs: []string{"10.0.0.11"}, time: *now, edges: edges}
+	}
+	start := *now
+	consume(t, c, sink, agent(edge("bbbb", 10, 2, start), edge("aaaa", 10, 2, start)))
+	out := consume(t, c, sink, agent(edge("bbbb", 20, 2, start), edge("aaaa", 20, 3, start)))
+	if v := value(out, metricConnOpened); v != 40 {
+		t.Errorf("connection.opened of two replicas = %v, want 40", v)
+	}
+	if v := value(out, metricConnCount); v != 5 {
+		t.Errorf("connection.count of two replicas = %v, want 5", v)
+	}
+	// bbbb stopped; its idle series is still sent, frozen, and sorts after
+	// the series of its replacement cccc.
+	next := *now
+	out = consume(t, c, sink, agent(edge("bbbb", 20, 0, start), edge("aaaa", 20, 0, start), edge("cccc", 5, 4, next)))
+	if v := value(out, metricConnOpened); v != 45 {
+		t.Errorf("connection.opened after a replacement = %v, want 45", v)
+	}
+	if v := value(out, metricConnCount); v != 4 {
+		t.Errorf("connection.count after a replacement = %v, want 4", v)
+	}
+}
+
 func TestMaxPeers(t *testing.T) {
 	c, _, sink, _ := testConnector(t, func(cfg *Config) { cfg.MaxPeers = 2 })
 	var edges []tEdge
