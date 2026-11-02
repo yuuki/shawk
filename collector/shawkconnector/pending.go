@@ -33,6 +33,7 @@ type procRow struct {
 type edgeRowKey struct {
 	role, proto string
 	local, peer netip.Addr
+	folded      bool // the peer is the network of peer, as in edgeID
 	port        uint16
 	netns       uint64
 	procKey
@@ -56,6 +57,15 @@ type sessionRow struct {
 	udpTraced  bool
 	netnsScope string
 	dropped    int64
+	// droppedSince is when the counter of dropped flows started (the agent
+	// started), by the clock of the connector; zero if unknown. It tells
+	// whether the drops counted in an earlier session of the host are part
+	// of dropped.
+	droppedSince time.Time
+	// peerFold and peerInternal are what the agent folds and the ranges it
+	// keeps exact; peerFold is empty if unknown.
+	peerFold     string
+	peerInternal []netip.Prefix
 }
 
 // hostChanges are the changes of a host to write in one transaction.
@@ -242,8 +252,12 @@ func (c *changes) add(b *hostBatch, now time.Time) {
 		if start.Before(f.start) {
 			start = f.start
 		}
-		h.addSession(start, sessionRow{lastHeartbeat: now, clockSkew: skew, udpTraced: b.udpTraced,
-			netnsScope: b.netnsScope, dropped: b.dropped})
+		s := sessionRow{lastHeartbeat: now, clockSkew: skew, udpTraced: b.udpTraced,
+			netnsScope: b.netnsScope, dropped: b.dropped, peerFold: b.peerFold, peerInternal: b.peerInternal}
+		if !b.droppedSince.IsZero() {
+			s.droppedSince = b.droppedSince.Add(skew)
+		}
+		h.addSession(start, s)
 	}
 	// The host holds its addresses as of the requests that close intervals,
 	// like its heartbeat.
@@ -267,7 +281,7 @@ func (c *changes) add(b *hostBatch, now time.Time) {
 			s.first = s.last
 		}
 		pk := procKey{e.id.unit, e.id.comm, e.id.job()}
-		k := edgeRowKey{role: e.id.role, proto: e.id.proto, local: e.id.local, peer: e.id.peer,
+		k := edgeRowKey{role: e.id.role, proto: e.id.proto, local: e.id.local, peer: e.id.peer, folded: e.id.folded,
 			port: e.id.port, netns: e.id.netns, procKey: pk}
 		acc, ok := edges[k]
 		changed := !ok || s.first.Before(acc.first) || s.last.After(acc.last)

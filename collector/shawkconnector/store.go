@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -95,31 +96,7 @@ ON CONFLICT (id) DO UPDATE SET
 		h.key, h.machineID, h.hostname, h.kernel, h.version, h.first, h.last)
 
 	if len(h.sessions) > 0 {
-		var starts, beats []time.Time
-		var udp []bool
-		var scopes []string
-		var dropped []int64
-		var skews []float64
-		for t, s := range h.sessions {
-			starts = append(starts, t)
-			beats = append(beats, s.lastHeartbeat)
-			udp = append(udp, s.udpTraced)
-			scopes = append(scopes, s.netnsScope)
-			dropped = append(dropped, s.dropped)
-			skews = append(skews, s.clockSkew.Seconds())
-		}
-		b.Queue(`
-INSERT INTO shawk.agent_sessions AS s (host_id, started_at, last_heartbeat, udp_traced, netns_scope, dropped_flows, clock_skew)
-SELECT $1, u.started, u.beat, u.udp, u.scope, u.dropped, make_interval(secs => u.skew)
-FROM unnest($2::timestamptz[], $3::timestamptz[], $4::boolean[], $5::text[], $6::bigint[], $7::float8[])
-  AS u(started, beat, udp, scope, dropped, skew)
-ON CONFLICT (host_id, started_at) DO UPDATE SET
-  clock_skew     = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat THEN excluded.clock_skew ELSE s.clock_skew END,
-  udp_traced     = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat THEN excluded.udp_traced ELSE s.udp_traced END,
-  netns_scope    = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat THEN excluded.netns_scope ELSE s.netns_scope END,
-  dropped_flows  = greatest(s.dropped_flows, excluded.dropped_flows),
-  last_heartbeat = greatest(s.last_heartbeat, excluded.last_heartbeat)`,
-			h.key, starts, beats, udp, scopes, dropped, skews)
+		queueSessions(b, h)
 	}
 
 	if len(h.addrs) > 0 {
@@ -190,7 +167,7 @@ ON CONFLICT (host_id, unit, comm, service_name) DO UPDATE SET
 			roles = append(roles, k.role)
 			protos = append(protos, k.proto)
 			locals = append(locals, k.local.String())
-			peers = append(peers, k.peer.String())
+			peers = append(peers, peerString(k.peer, k.folded))
 			ports = append(ports, int32(k.port))
 			netns = append(netns, int64(k.netns))
 			firsts = append(firsts, s.first)
@@ -213,6 +190,134 @@ ON CONFLICT (host_id, role, proto, local_addr, remote_addr, port, netns, process
 		queueListeners(b, h)
 	}
 	return tx.SendBatch(ctx, b).Close()
+}
+
+// queueSessions writes the sessions of a host, and the periods in which its
+// agent dropped flows.
+//
+// The dropped flows of a session are compared with what PostgreSQL holds,
+// so that a restart of the connector, or several connectors, record the same
+// periods: an increase since the heartbeat written before is recorded as a
+// period from that heartbeat to the new one, which extends the latest period
+// of the session when they meet. A session written for the first time
+// continues the latest session of the host if the counter of the agent ran
+// then (the agent did not restart: a new segment, or a new connector, starts
+// a new session) and did not decrease; its drops since that session are
+// recorded from the start of the session, or the end of that session if it
+// ends later. Otherwise every drop it counts is recorded from its start.
+// Times are by the clock of the connector, like heartbeats.
+//
+// The upsert of the host before has locked its row, so that the writes of a
+// host wait for each other and each compares with the one before.
+func queueSessions(b *pgx.Batch, h *hostChanges) {
+	var starts, beats []time.Time
+	var counters []*time.Time // nil if unknown
+	var udp []bool
+	var scopes, folds []string
+	var internals []*string
+	var dropped []int64
+	var skews []float64
+	var anyDropped bool
+	for t, s := range h.sessions {
+		starts = append(starts, t)
+		beats = append(beats, s.lastHeartbeat)
+		udp = append(udp, s.udpTraced)
+		scopes = append(scopes, s.netnsScope)
+		dropped = append(dropped, s.dropped)
+		skews = append(skews, s.clockSkew.Seconds())
+		var counter *time.Time
+		if !s.droppedSince.IsZero() {
+			counter = &s.droppedSince
+		}
+		counters = append(counters, counter)
+		folds = append(folds, s.peerFold)
+		var internal *string
+		if s.peerInternal != nil {
+			ps := make([]string, len(s.peerInternal))
+			for i, p := range s.peerInternal {
+				ps[i] = p.String()
+			}
+			v := strings.Join(ps, ",")
+			internal = &v
+		}
+		internals = append(internals, internal)
+		anyDropped = anyDropped || s.dropped > 0
+	}
+	if anyDropped {
+		b.Queue(`
+WITH u AS (
+  SELECT * FROM unnest($2::timestamptz[], $3::timestamptz[], $4::bigint[], $5::float8[], $6::timestamptz[])
+    AS u(started, beat, dropped, skew, counter_start)
+),
+d AS (
+  SELECT u.started, u.beat, u.dropped,
+         least(u.started + make_interval(secs => u.skew), u.beat) AS start,
+         cur.last_heartbeat AS cur_beat, cur.dropped_flows AS cur_dropped,
+         prev.last_heartbeat AS prev_beat, prev.dropped_flows AS prev_dropped,
+         prev.last_heartbeat IS NOT NULL AND prev.dropped_flows <= u.dropped
+           AND coalesce(u.counter_start <= prev.last_heartbeat, true) AS same_run
+  FROM u
+  LEFT JOIN shawk.agent_sessions cur ON cur.host_id = $1 AND cur.started_at = u.started
+  LEFT JOIN LATERAL (
+    SELECT p.last_heartbeat, p.dropped_flows FROM shawk.agent_sessions p
+    WHERE p.host_id = $1 AND p.last_heartbeat <= u.beat
+    ORDER BY p.last_heartbeat DESC LIMIT 1
+  ) prev ON cur.started_at IS NULL
+),
+inc AS (
+  SELECT started, beat,
+         CASE WHEN cur_beat IS NOT NULL THEN cur_beat
+              WHEN same_run THEN greatest(start, prev_beat)
+              ELSE start END AS since,
+         dropped - CASE WHEN cur_beat IS NOT NULL THEN cur_dropped
+                        WHEN same_run THEN prev_dropped
+                        ELSE 0 END AS n
+  FROM d
+),
+p AS (SELECT * FROM inc WHERE n > 0 AND beat > since),
+latest AS (
+  SELECT DISTINCT ON (o.started_at) o.started_at, o.period_start, o.period_end
+  FROM shawk.partial_observations o JOIN p ON p.started = o.started_at
+  WHERE o.host_id = $1
+  ORDER BY o.started_at, o.period_start DESC
+),
+extended AS (
+  UPDATE shawk.partial_observations o
+  SET period_end = greatest(o.period_end, p.beat), dropped_flows = o.dropped_flows + p.n
+  FROM p JOIN latest ON latest.started_at = p.started
+  WHERE o.host_id = $1 AND o.started_at = p.started AND o.period_start = latest.period_start
+    AND p.since <= latest.period_end
+  RETURNING o.started_at
+)
+INSERT INTO shawk.partial_observations AS o (host_id, started_at, period_start, period_end, dropped_flows)
+SELECT $1, p.started, p.since, p.beat, p.n FROM p
+WHERE p.started NOT IN (SELECT started_at FROM extended)
+ON CONFLICT (host_id, started_at, period_start) DO UPDATE SET
+  period_end    = greatest(o.period_end, excluded.period_end),
+  dropped_flows = o.dropped_flows + excluded.dropped_flows`,
+			h.key, starts, beats, dropped, skews, counters)
+	}
+	// What the agent folds is kept as of the latest heartbeat, unless the
+	// session row does not tell it.
+	b.Queue(`
+INSERT INTO shawk.agent_sessions AS s (host_id, started_at, last_heartbeat, udp_traced, netns_scope, dropped_flows, clock_skew,
+                                       peer_fold, peer_internal)
+SELECT $1, u.started, u.beat, u.udp, u.scope, u.dropped, make_interval(secs => u.skew),
+       nullif(u.fold, ''), CASE WHEN u.fold <> '' THEN string_to_array(u.internal, ',')::cidr[] END
+FROM unnest($2::timestamptz[], $3::timestamptz[], $4::boolean[], $5::text[], $6::bigint[], $7::float8[],
+            $8::text[], $9::text[])
+  AS u(started, beat, udp, scope, dropped, skew, fold, internal)
+ON CONFLICT (host_id, started_at) DO UPDATE SET
+  clock_skew     = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat THEN excluded.clock_skew ELSE s.clock_skew END,
+  udp_traced     = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat THEN excluded.udp_traced ELSE s.udp_traced END,
+  netns_scope    = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat THEN excluded.netns_scope ELSE s.netns_scope END,
+  peer_fold      = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat AND excluded.peer_fold IS NOT NULL
+                        THEN excluded.peer_fold ELSE s.peer_fold END,
+  peer_internal  = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat AND excluded.peer_fold IS NOT NULL
+                        THEN excluded.peer_internal ELSE s.peer_internal END,
+  dropped_flows  = greatest(s.dropped_flows, excluded.dropped_flows),
+  last_heartbeat = greatest(s.last_heartbeat, excluded.last_heartbeat)`,
+		h.key, starts, beats, udp, scopes, dropped, skews, folds, internals)
 }
 
 // queueListeners writes the listeners of a host: a row per listener with
@@ -363,8 +468,10 @@ func (s *pgStore) peers(ctx context.Context) (peerRows, error) {
 	if err != nil {
 		return out, err
 	}
+	// A folded server address, a network, is no server.
 	err = queryRows(ctx, s.pool, `SELECT host(client_addr), host(server_addr), port, proto, host_id, service, last_seen
-FROM shawk_v1.client_endpoints`,
+FROM shawk_v1.client_endpoints
+WHERE masklen(server_addr) = CASE family(server_addr) WHEN 4 THEN 32 ELSE 128 END`,
 		func(rows pgx.Rows) error {
 			var client, server string
 			var port int32
@@ -384,12 +491,19 @@ FROM shawk_v1.client_endpoints`,
 	if err != nil {
 		return out, err
 	}
-	err = queryRows(ctx, s.pool, `SELECT host(addr), host_id, last_seen, last_heartbeat, udp_traced FROM shawk_v1.agent_addrs`,
+	err = queryRows(ctx, s.pool, `SELECT host(addr), host_id, last_seen, last_heartbeat, udp_traced, host,
+  coalesce(peer_fold, ''), peer_internal::text[]
+FROM shawk_v1.agent_addrs`,
 		func(rows pgx.Rows) error {
 			var addr string
+			var internal []string
 			var r agentAddrRow
-			if err := rows.Scan(&addr, &r.host, &r.seen, &r.agent.seen, &r.agent.udpTraced); err != nil {
+			if err := rows.Scan(&addr, &r.host, &r.seen, &r.agent.seen, &r.agent.udpTraced, &r.agent.name,
+				&r.agent.fold, &internal); err != nil {
 				return err
+			}
+			if internal != nil {
+				r.agent.internal = parsePrefixes(internal)
 			}
 			if a, err := netip.ParseAddr(addr); err == nil {
 				r.addr = a.Unmap()
@@ -398,6 +512,17 @@ FROM shawk_v1.client_endpoints`,
 			return nil
 		})
 	return out, err
+}
+
+// parsePrefixes parses address ranges, leaving out those that are invalid.
+func parsePrefixes(ss []string) []netip.Prefix {
+	out := make([]netip.Prefix, 0, len(ss))
+	for _, s := range ss {
+		if p, err := parsePrefix(s); err == nil {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func queryRows(ctx context.Context, pool *pgxpool.Pool, sql string, scan func(pgx.Rows) error) error {

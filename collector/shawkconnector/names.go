@@ -52,12 +52,28 @@ const (
 	attrNetNS       = "shawk.netns"
 	attrIODirection = "network.io.direction"
 	attrNetNSScope  = "shawk.netns.scope"
+	// attrPeerFolded marks an edge whose peer is folded: every peer outside
+	// the internal ranges of the agent, sent as the address 0.0.0.0 or ::.
+	attrPeerFolded = "shawk.peer.folded"
+	// attrPeerFold and attrPeerInternal are resource attributes of the
+	// agent: which edges it folds, and the ranges it keeps exact.
+	attrPeerFold     = "shawk.peer.fold"
+	attrPeerInternal = "shawk.peer.internal"
 
 	agentServiceName = "shawk-agent"
 	scopeName        = "github.com/yuuki/shawk/collector/shawkconnector"
 
 	roleClient = "client"
 	roleServer = "server"
+)
+
+// Values of shawk.peer.fold: an agent folds no peers, the peers of its
+// servers (in), or the peers of its servers and clients (all). An agent
+// that does not send the attribute folds none.
+const (
+	foldNone = "none"
+	foldIn   = "in"
+	foldAll  = "all"
 )
 
 // Values of service.peer.name for peers without a known service.

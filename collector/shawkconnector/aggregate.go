@@ -216,7 +216,7 @@ func (a *aggregator) add(b *hostBatch, peerOf func(*edgeID) peer, now time.Time,
 			key := outKey{metric: vk.metric, dir: vk.dir, peer: name, peerAgent: p.agent, role: e.id.role,
 				transport: e.id.proto, port: e.id.port}
 			if a.keepPeerAddr {
-				key.peerAddr = e.id.peer.String()
+				key.peerAddr = e.id.peerString()
 			}
 			s := r.series[key]
 			if s == nil {

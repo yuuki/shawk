@@ -44,6 +44,10 @@ type shawkConnector struct {
 	downstreamErrs    int
 	lastDownstreamLog time.Time
 
+	// foldWarned is when a client host and a server host whose agent folds
+	// the client into its external peers were last logged.
+	foldWarned map[[2]string]time.Time
+
 	cancel context.CancelFunc
 	done   chan struct{}
 	now    func() time.Time
@@ -65,6 +69,8 @@ func newConnector(set connector.Settings, cfg *Config, next consumer.Metrics) (*
 		changes:  newChanges(cfg.IdleTTL),
 		cidrs:    cidrs,
 		now:      time.Now,
+
+		foldWarned: map[[2]string]time.Time{},
 	}, nil
 }
 
@@ -204,6 +210,11 @@ func (c *shawkConnector) loop(ctx context.Context) {
 			c.mu.Lock()
 			c.agg.expire(now)
 			c.changes.expire(now)
+			for k, t := range c.foldWarned {
+				if now.Sub(t) >= foldWarnInterval {
+					delete(c.foldWarned, k)
+				}
+			}
 			c.mu.Unlock()
 			c.resolver.expire(now.Add(-c.cfg.IdleTTL), now)
 		}
@@ -344,7 +355,13 @@ func (c *shawkConnector) ConsumeMetrics(ctx context.Context, md pmetric.Metrics)
 		c.resolver.learn(b, now)
 		c.mu.Lock()
 		c.changes.add(b, now)
-		c.agg.add(b, func(id *edgeID) peer { return c.resolver.peer(b.key, id, now) }, now, out)
+		c.agg.add(b, func(id *edgeID) peer {
+			p := c.resolver.peer(b.key, id, now)
+			if p.foldedBy != "" {
+				c.foldedAgentPeer(b, id, p, now)
+			}
+			return p
+		}, now, out)
 		c.mu.Unlock()
 	}
 	if out.ResourceMetrics().Len() > 0 {
@@ -353,6 +370,33 @@ func (c *shawkConnector) ConsumeMetrics(ctx context.Context, md pmetric.Metrics)
 		}
 	}
 	return nil
+}
+
+// foldWarnInterval is how often a pair of hosts is logged by
+// foldedAgentPeer.
+const foldWarnInterval = time.Hour
+
+// foldedAgentPeer logs a client edge whose server runs an agent that folds
+// the client into its external peers although the client runs an agent: the
+// address of the client is outside the internal ranges of the server's
+// agent, as happens to hosts that talk over public addresses. The two sides
+// of their connections do not match in PostgreSQL, and both are counted
+// (§7). It logs each pair of hosts at most once an hour. c.mu is held.
+func (c *shawkConnector) foldedAgentPeer(b *hostBatch, id *edgeID, p peer, now time.Time) {
+	k := [2]string{b.key, p.foldedBy}
+	if t, ok := c.foldWarned[k]; ok && now.Sub(t) < foldWarnInterval {
+		return
+	}
+	c.foldWarned[k] = now
+	server := p.foldedByName
+	if server == "" {
+		server = p.foldedBy
+	}
+	c.log.Warn("the agent of a server folds a client that runs an agent into its external peers; "+
+		"add the address of the client to the internal peers of the server's agent (-internal-peers)",
+		zap.String("client_host", b.hostname), zap.String("client_address", id.local.String()),
+		zap.String("server_host", server), zap.String("server_address", id.peer.String()),
+		zap.Uint16("port", id.port), zap.String("transport", id.proto))
 }
 
 // downstreamError logs an error of the pipeline after the connector, at
