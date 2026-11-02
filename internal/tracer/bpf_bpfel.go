@@ -126,6 +126,7 @@ const (
 	bpfVarCgroupEventDrops       = "cgroup_event_drops"
 	bpfVarEphPortHigh            = "eph_port_high"
 	bpfVarEphPortLow             = "eph_port_low"
+	bpfVarFlowBusy               = "flow_busy"
 	bpfVarFlowDrops              = "flow_drops"
 	bpfVarFoldMode               = "fold_mode"
 	bpfVarInitialScan            = "initial_scan"
@@ -216,6 +217,7 @@ type bpfVariableSpecs struct {
 	CgroupEventDrops  *ebpf.VariableSpec `ebpf:"cgroup_event_drops"`
 	EphPortHigh       *ebpf.VariableSpec `ebpf:"eph_port_high"`
 	EphPortLow        *ebpf.VariableSpec `ebpf:"eph_port_low"`
+	FlowBusy          *ebpf.VariableSpec `ebpf:"flow_busy"`
 	FlowDrops         *ebpf.VariableSpec `ebpf:"flow_drops"`
 	FoldMode          *ebpf.VariableSpec `ebpf:"fold_mode"`
 	InitialScan       *ebpf.VariableSpec `ebpf:"initial_scan"`
@@ -285,6 +287,7 @@ type bpfVariables struct {
 	CgroupEventDrops  *ebpf.Variable `ebpf:"cgroup_event_drops"`
 	EphPortHigh       *ebpf.Variable `ebpf:"eph_port_high"`
 	EphPortLow        *ebpf.Variable `ebpf:"eph_port_low"`
+	FlowBusy          *ebpf.Variable `ebpf:"flow_busy"`
 	FlowDrops         *ebpf.Variable `ebpf:"flow_drops"`
 	FoldMode          *ebpf.Variable `ebpf:"fold_mode"`
 	InitialScan       *ebpf.Variable `ebpf:"initial_scan"`

@@ -55,6 +55,7 @@ char LICENSE[] SEC("license") = "Dual BSD/GPL";
 #define AF_INET 2
 #define AF_INET6 10
 #define EEXIST 17
+#define EBUSY 16
 #define SOCK_DGRAM 2
 #define SOCK_BINDPORT_LOCK 8
 /*
@@ -78,6 +79,11 @@ char LICENSE[] SEC("license") = "Dual BSD/GPL";
  * attempt.
  */
 #define SS_JOIN (1U << 3)
+/*
+ * The connection was established, but the flow could not be updated to
+ * count it: its next walk or its close counts it.
+ */
+#define SS_RECOUNT (1U << 4)
 
 #define IPPROTO_MPTCP_ 262
 
@@ -107,8 +113,17 @@ volatile __u32 initial_scan = 0;
 volatile __u32 self_tgid = 0xffffffff;
 /* Incremented by user space before each walk of iter/task_file. */
 volatile __u32 owner_scan = 0;
-/* Flow updates dropped because the flow table was full. */
+/* Flow updates dropped because the flow table could not be updated. */
 __u64 flow_drops = 0;
+/*
+ * Of flow_drops, the insertions that the kernel refused with -EBUSY, which
+ * a hash map returns when a program updates it while another update of a
+ * key of the same lock slot is in progress on the same CPU: an update
+ * nested in an interrupted one, or, on kernels that take the slot without
+ * disabling preemption (upstream 5.14), in a preempting task. The table is
+ * not full then.
+ */
+__u64 flow_busy = 0;
 /*
  * TCP connections opened without socket storage, which the next walk adopts:
  * their connection and the traffic until then are not counted.
@@ -536,7 +551,14 @@ flow_get(const struct shawk_flow_key *k)
 	struct shawk_flow_stats *fs;
 	__u32 idx = active_idx & 1;
 	void *map;
-	long err;
+	/*
+	 * Before Linux 6.4 the map operations that the JIT calls directly
+	 * return an int, and the upper half of the result is not
+	 * sign-extended: -EEXIST reads as 0xffffffef in 64 bits. Only the lower
+	 * half is compared, or losing a race to insert the same key on another
+	 * CPU would be taken for a drop and lose the update (#119).
+	 */
+	int err;
 
 	__builtin_memcpy(&key, k, sizeof(key));
 	map = bpf_map_lookup_elem(&flows, &idx);
@@ -547,6 +569,12 @@ flow_get(const struct shawk_flow_key *k)
 		return fs;
 	err = bpf_map_update_elem(map, &key, &zero, BPF_NOEXIST);
 	if (err && err != -EEXIST) {
+		/*
+		 * Retrying -EBUSY would fail again: the update holding the lock
+		 * cannot go on while this program runs on its CPU.
+		 */
+		if (err == -EBUSY)
+			__sync_fetch_and_add(&flow_busy, 1);
 		__sync_fetch_and_add(&flow_drops, 1);
 		return NULL;
 	}
@@ -672,19 +700,26 @@ static __always_inline bool ss_ready(const struct shawk_sock_state *ss)
 	return (ss->flags & (SS_READY | SS_IGNORE)) == SS_READY;
 }
 
+/*
+ * Counts an established connection once. When the flow cannot be updated,
+ * the connection stays uncounted and its next event (a walk or its close)
+ * counts it.
+ */
 static __always_inline void count_conn(struct shawk_sock_state *ss)
 {
 	struct shawk_flow_stats *fs;
 
 	if (ss->flags & SS_COUNTED)
 		return;
-	ss->flags |= SS_COUNTED;
 	fs = flow_get(&ss->key);
-	if (fs) {
-		__sync_fetch_and_add(&fs->conns, 1);
-		if (ss->pid)
-			fs->pid = ss->pid;
+	if (!fs) {
+		ss->flags |= SS_RECOUNT;
+		return;
 	}
+	ss->flags = (ss->flags | SS_COUNTED) & ~SS_RECOUNT;
+	__sync_fetch_and_add(&fs->conns, 1);
+	if (ss->pid)
+		fs->pid = ss->pid;
 }
 
 /*
@@ -910,6 +945,9 @@ int BPF_PROG(shawk_inet_sock_set_state, const struct sock *csk, int oldstate,
 	tp = bpf_skc_to_tcp_sock(sk);
 	if (!tp)
 		return 0;
+	/* A connection whose count failed when it was established. */
+	if (ss->flags & SS_RECOUNT)
+		count_conn(ss);
 	/*
 	 * A connection whose traffic the last walk accounted, e.g. one reset
 	 * since, adds nothing: no empty flow is created.
@@ -1083,6 +1121,13 @@ int shawk_iter_tcp(struct bpf_iter__tcp *ctx)
 	fs = flow_get(&ss->key);
 	if (!fs)
 		return 0;
+	/*
+	 * A connection whose count failed when it was established. On kernels
+	 * whose TCP iterator does not lock sockets (before 5.19), one that
+	 * closes during the walk may rarely be counted twice.
+	 */
+	if (ss->flags & SS_RECOUNT)
+		count_conn(ss);
 	if (take_tcp_delta(ss, sk, tp, state, &d))
 		add_tcp_delta(fs, &d);
 	/* An MPTCP connection is open once, whatever its subflows. */
@@ -1116,20 +1161,40 @@ static __always_inline bool port_bound(const struct sock *sk)
  * A socket that sends first is still a server when it uses the port of a
  * known server socket, e.g. the per-client connected sockets of a QUIC
  * server. Server sockets that existed before the tracer started are marked
- * by iter/udp at startup.
+ * by iter/udp at startup, and a socket bound to its port that receives
+ * first records the port at once, so that the connected sockets a new
+ * server opens next on its port are servers too, before the next walk.
+ *
+ * A connected socket that receives first is a client when the kernel chose
+ * its port, which no client could have known: a client that sent its
+ * datagrams before the tracer started (#99). A connected socket on a bound
+ * port may be a server, e.g. socat or a DTLS server connected to its
+ * client.
  */
 static __always_inline __u32 udp_direction(struct sock *sk, __u32 netns,
 					   __u16 lport, bool sending)
 {
 	struct shawk_listen_key lk = {.netns = netns, .port = lport};
 	struct shawk_udp_state *us;
+	bool listening, bound;
 	__u32 dir = DIR_IN;
+	__u8 one = 1;
 
 	us = bpf_sk_storage_get(&udp_states, sk, NULL, 0);
 	if (us)
 		return us->dir;
-	if (sending && !bpf_map_lookup_elem(&udp_listen_ports, &lk))
-		dir = DIR_OUT;
+	listening = bpf_map_lookup_elem(&udp_listen_ports, &lk) != NULL;
+	bound = port_bound(sk);
+	if (sending) {
+		if (!listening)
+			dir = DIR_OUT;
+	} else if (BPF_CORE_READ(sk, __sk_common.skc_dport)) {
+		if (!bound && !listening)
+			dir = DIR_OUT;
+	} else if (bound && !listening) {
+		if (bpf_map_update_elem(&udp_listen_ports, &lk, &one, BPF_ANY))
+			__sync_fetch_and_add(&listen_port_drops, 1);
+	}
 	us = bpf_sk_storage_get(&udp_states, sk, NULL,
 				BPF_SK_STORAGE_GET_F_CREATE);
 	if (us)

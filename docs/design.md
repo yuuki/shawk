@@ -257,12 +257,23 @@ by its first datagram and kept in the socket local storage:
 * a socket that receives first is a server, and one that sends first is a
   client;
 * a socket that sends first on the port of a known server socket (e.g. the
-  per-client connected sockets of a QUIC server) is a server;
+  per-client connected sockets of a QUIC server) is a server. The server
+  sockets found by the last walk are known, and an unconnected socket
+  bound to its port that receives first adds the port at once, so that the
+  connected sockets a server started since opens on its port are servers
+  too;
 * bound, unconnected sockets that exist when the agent starts are marked as
-  servers, since their first datagram afterwards may be a reply.
+  servers, since their first datagram afterwards may be a reply;
+* a connected socket whose port the kernel chose is a client when it
+  receives first, since no client could have known its port: it sent its
+  request before the agent started.
 
 A client socket that existed before the agent started and receives before it
-sends again is recorded as a server with its own port.
+sends again is recorded as a server with its own port, unless it is
+connected and the kernel chose its port. A connected socket on a bound port
+cannot be told from a server connected to its client (socat, DTLS). A
+socket that both queries servers and answers clients on its port, like
+ntpd, has the direction of its first datagram for all its peers.
 
 UDP needs BPF trampolines. On kernels without them the agent keeps tracing
 TCP and reports that UDP is not traced.
@@ -861,7 +872,9 @@ parses. shawk runs beside it instead:
 - **UDP peer-to-peer protocols** where both sides send first are recorded
   as clients of each other's port. A UDP client socket that existed before
   the agent started and receives before it sends again is recorded as a
-  server.
+  server, unless it is connected on a port the kernel chose (§3.3). A
+  socket that is both client and server on its port, like ntpd, is
+  recorded with the direction of its first datagram for all its peers.
 - **MPTCP**: additional subflows opened by the server side (with a path
   manager that does so, which the default does not) are recorded as
   outgoing connections from the server. Data that MPTCP sends again on
@@ -883,7 +896,12 @@ parses. shawk runs beside it instead:
   in one interval, updates are dropped and `shawk.agent.flows.dropped`
   counts them; the periods with drops are kept as partly observed
   (`partly_observed()`, §6), and a dependency not seen in them may still
-  have been used.
+  have been used. An insertion that the kernel refuses because an update
+  of the same bucket is in progress on the same CPU (`-EBUSY`, an update
+  nested in an interrupted one, or on upstream 5.14 also in a preempting
+  task) is counted as a drop too, and the agent warns that the table was
+  not full. A connection whose count failed is counted by its next walk or
+  its close.
   External peers are folded (§3.6), so the flows grow with the internal
   peers and the local services, not with the clients on the Internet; a
   host with very many internal clients, or with `-fold-external=none`, may
