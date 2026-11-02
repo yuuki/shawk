@@ -336,8 +336,10 @@ host into one flow per local endpoint:
   default, `private`, stands for the ranges not routed on the Internet
   (RFC 1918, CGNAT, loopback, link-local and IPv6 ULA), which
   `peer_class()` names `~unresolved`. Loopback and the addresses of the
-  interfaces of the host, refreshed at every interval, are always kept, so
-  that a host connecting to its own public address keeps both sides. A
+  interfaces of the host are always kept, from the start and refreshed at
+  every interval, so that a host connecting to its own public address
+  keeps both sides; a connection opened before an address appears on the
+  host keeps the key it was given. A
   fleet that uses public addresses internally adds them, e.g.
   `-internal-peers=private,203.0.113.0/24`.
 - `-fold-external` tells which flows fold their external peers: `in` (the
@@ -646,9 +648,12 @@ runs an agent when the address of the server is outside its internal
 ranges: its client edge names no service, so the server edge tells that
 its peer has no agent (`shawk.peer.agent` false), to be counted, and the
 connector warns. Each host whose agent folds is logged at most once an
-hour, with the number of hosts it folded since. An agent that folds the
-peers in a range of `peer_cidrs`, which are then named `~external`, is
-logged too, at most once an hour. What an agent folds comes from its
+hour, with the number of hosts it folded since. When both agents fold the
+other side, both edges are folded and neither tells the other host, so
+nothing is logged. Agents that fold the peers in a range of `peer_cidrs`,
+which are then named `~external`, are logged too, at most once an hour per
+configuration of the agents (a range of a whole network, which names the
+folded peers, is left out). What an agent folds comes from its
 requests, or for hosts behind other connectors from
 `shawk_v1.agent_addrs`. The connector has no metrics of its own, so the
 warnings are only logged.
@@ -891,8 +896,9 @@ parses. shawk runs beside it instead:
   is then counted from the next walk on.
 - **Folded peers** (§3.6): the address of each external peer is not kept,
   only that the endpoint had external peers. A fleet that uses public
-  addresses internally must list them in `-internal-peers`, or the
-  connections between its hosts are seen on the client side only.
+  addresses internally must list them in `-internal-peers`, or the two
+  sides of the connections between its hosts do not match; the connector
+  warns about it, except when both agents fold the other side.
 - **Connections that predate the agent** are counted from the adoption on.
   One accepted by a listener created with a backlog of 0 whose listener is
   gone is recorded as outgoing.

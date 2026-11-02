@@ -20,8 +20,9 @@
   public ranges, whose peers are otherwise named `~external`. The connector
   logs a warning, at most once an hour per host, when an agent folds a
   client (or, with `all`, a server) that runs an agent, whose connections
-  then do not match, and when an agent folds the peers of a range of
-  `peer_cidrs`. An IPv6 range of `-internal-peers` that overlaps
+  then do not match (not when both agents fold the other side), and, at
+  most once an hour per configuration, when agents fold the peers of a
+  range of `peer_cidrs`. An IPv6 range of `-internal-peers` that overlaps
   `::ffff:0:0/96`, such as `::/0`, is refused. Upgrade the connectors
   before the agents: a connector of the previous version keeps a folded
   peer as the address 0.0.0.0 or ::, which it names `~unresolved`.

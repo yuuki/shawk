@@ -206,9 +206,12 @@ ON CONFLICT (host_id, role, proto, local_addr, remote_addr, port, netns, process
 // requests) to the new heartbeat. A heartbeat written by another connector
 // may be ahead by the clock of that connector; the two ends are then
 // ordered rather than the drops skipped. The drops of a run not seen before
-// are recorded from the start of the session. Without the start of the
-// counters, as from an agent that does not send it, the session itself
-// stands for the run. A period that meets the
+// are recorded from the start of the session, unless a session written
+// without the start of the counters (by a connector of the previous
+// version) ran since the run started and counted no more: its drops are
+// those of the run so far, as after an upgrade of the connector. Without
+// the start of the counters, as from an agent that does not send it, the
+// session itself stands for the run. A period that meets the
 // latest period of the host extends it. Times are by the clock of the
 // connector, like heartbeats.
 //
@@ -261,7 +264,8 @@ WITH u AS (
 d AS (
   SELECT u.started, u.beat, u.dropped,
          least(u.started + make_interval(secs => u.skew), u.beat) AS start,
-         base.dropped AS base_dropped, base.beat AS base_beat
+         coalesce(base.dropped, legacy.dropped_flows) AS base_dropped,
+         coalesce(base.beat, legacy.last_heartbeat) AS base_beat
   FROM u
   CROSS JOIN LATERAL (
     SELECT max(s.dropped_flows) AS dropped, max(s.last_heartbeat) AS beat
@@ -269,6 +273,13 @@ d AS (
     WHERE s.host_id = $1
       AND CASE WHEN u.run IS NULL THEN s.started_at = u.started ELSE s.counters_started = u.run END
   ) base
+  LEFT JOIN LATERAL (
+    SELECT s.dropped_flows, s.last_heartbeat
+    FROM shawk.agent_sessions s
+    WHERE s.host_id = $1 AND s.counters_started IS NULL
+      AND s.last_heartbeat >= u.run + make_interval(secs => u.skew) AND s.dropped_flows <= u.dropped
+    ORDER BY s.last_heartbeat DESC LIMIT 1
+  ) legacy ON base.dropped IS NULL AND u.run IS NOT NULL
 ),
 e AS (
   SELECT started, beat, dropped - coalesce(base_dropped, 0) AS n,

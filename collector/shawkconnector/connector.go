@@ -45,10 +45,11 @@ type shawkConnector struct {
 	lastDownstreamLog time.Time
 
 	// foldWarned holds, by host whose agent folds the edges of hosts that run
-	// an agent, when it was last logged and the hosts it folded since.
-	foldWarned map[string]*foldWarning
-	// cidrWarned is when a host whose agent folds peers in ranges of
-	// peer_cidrs was last logged.
+	// an agent and by side it folds, when it was last logged and the hosts
+	// it folded since.
+	foldWarned map[foldWarnKey]*foldWarning
+	// cidrWarned is when what agents fold, and the ranges of peer_cidrs they
+	// fold, were last logged.
 	cidrWarned map[string]time.Time
 
 	cancel context.CancelFunc
@@ -73,7 +74,7 @@ func newConnector(set connector.Settings, cfg *Config, next consumer.Metrics) (*
 		cidrs:    cidrs,
 		now:      time.Now,
 
-		foldWarned: map[string]*foldWarning{},
+		foldWarned: map[foldWarnKey]*foldWarning{},
 		cidrWarned: map[string]time.Time{},
 	}, nil
 }
@@ -214,8 +215,10 @@ func (c *shawkConnector) loop(ctx context.Context) {
 			c.mu.Lock()
 			c.agg.expire(now)
 			c.changes.expire(now)
+			// A host that folded hosts since it was logged is kept, so that
+			// the next warning counts them.
 			for k, w := range c.foldWarned {
-				if now.Sub(w.logged) >= foldWarnInterval {
+				if len(w.hosts) == 0 && now.Sub(w.logged) >= foldWarnInterval {
 					delete(c.foldWarned, k)
 				}
 			}
@@ -386,6 +389,13 @@ func (c *shawkConnector) ConsumeMetrics(ctx context.Context, md pmetric.Metrics)
 // foldedCIDRs.
 const foldWarnInterval = time.Hour
 
+// foldWarnKey is a host whose agent folds, and whether it folds servers
+// (the clients otherwise).
+type foldWarnKey struct {
+	host    string
+	servers bool
+}
+
 // foldWarning is what foldedAgentPeer logged of a host whose agent folds.
 type foldWarning struct {
 	logged time.Time
@@ -399,12 +409,14 @@ type foldWarning struct {
 // -fold-external=all a server outside them. The two sides of their
 // connections do not match in PostgreSQL. It logs each host whose agent
 // folds at most once an hour, with the number of hosts it folded since.
-// c.mu is held.
+// When both agents fold the other side, both edges are folded and neither
+// tells the other host, so nothing is logged. c.mu is held.
 func (c *shawkConnector) foldedAgentPeer(b *hostBatch, id *edgeID, p peer, now time.Time) {
-	w := c.foldWarned[p.foldedBy]
+	k := foldWarnKey{host: p.foldedBy, servers: p.foldsServer}
+	w := c.foldWarned[k]
 	if w == nil {
 		w = &foldWarning{hosts: map[string]bool{}}
-		c.foldWarned[p.foldedBy] = w
+		c.foldWarned[k] = w
 	}
 	w.hosts[b.key] = true
 	if !w.logged.IsZero() && now.Sub(w.logged) < foldWarnInterval {
@@ -430,30 +442,38 @@ func (c *shawkConnector) foldedAgentPeer(b *hostBatch, id *edgeID, p peer, now t
 		zap.String("transport", id.proto), zap.Int("hosts_folded", n))
 }
 
-// foldedCIDRs logs, at most once an hour per host, an agent that folds the
-// peers in ranges of peer_cidrs: a folded peer has lost its address, so it
-// is named ~external rather than after its range. c.mu is held.
+// foldedCIDRs logs agents that fold peers in ranges of peer_cidrs: a
+// folded peer has lost its address, so it is named ~external rather than
+// after its range. A range of a whole network names the folded peers
+// themselves, and is left out. Agents usually share their configuration,
+// so each configuration (what is folded and the ranges kept exact) is
+// logged at most once an hour, with a host that has it. c.mu is held.
 func (c *shawkConnector) foldedCIDRs(b *hostBatch, now time.Time) {
 	if !b.final || (b.peerFold != foldIn && b.peerFold != foldAll) {
-		return
-	}
-	if t, ok := c.cidrWarned[b.key]; ok && now.Sub(t) < foldWarnInterval {
 		return
 	}
 	a := agentHost{fold: b.peerFold, internal: b.peerInternal}
 	var folded []string
 	for _, r := range c.cidrs {
-		if !a.keepsRange(r.prefix) {
+		if r.prefix.Bits() > 0 && !a.keepsRange(r.prefix) {
 			folded = append(folded, r.name+"="+r.prefix.String())
 		}
 	}
 	if len(folded) == 0 {
 		return
 	}
-	c.cidrWarned[b.key] = now
-	c.log.Warn("the agent of a host folds the peers in ranges of peer_cidrs, which are then named ~external; "+
-		"add the ranges to its internal peers (-internal-peers)",
-		zap.String("host", b.hostname), zap.Strings("peer_cidrs", folded))
+	k := fmt.Sprint(b.peerFold, b.peerInternal)
+	if t, ok := c.cidrWarned[k]; ok && now.Sub(t) < foldWarnInterval {
+		return
+	}
+	c.cidrWarned[k] = now
+	msg := "agents fold the clients in ranges of peer_cidrs, which their servers then name ~external; " +
+		"add the ranges to their internal peers (-internal-peers)"
+	if b.peerFold == foldAll {
+		msg = "agents fold the peers in ranges of peer_cidrs, which are then named ~external; " +
+			"add the ranges to their internal peers (-internal-peers)"
+	}
+	c.log.Warn(msg, zap.String("host", b.hostname), zap.String("fold", b.peerFold), zap.Strings("peer_cidrs", folded))
 }
 
 // downstreamError logs an error of the pipeline after the connector, at

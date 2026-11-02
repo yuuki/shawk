@@ -419,3 +419,29 @@ func TestPGPartialObservationsRuns(t *testing.T) {
 		}
 	})
 }
+
+// TestPGPartialObservationsUpgrade: a session written by a connector of the
+// previous version has no start of the counters. A run that continues it
+// after an upgrade of the connector compares with it, rather than recording
+// every drop it counted since it started.
+func TestPGPartialObservationsUpgrade(t *testing.T) {
+	dsn, conn := migratedDB(t)
+	base := time.Now().UTC().Truncate(time.Minute)
+	_, write := partialStore(t, dsn, base)
+	execAll(t, conn, `INSERT INTO shawk.hosts VALUES ('h1', 'm', 'h1', 'k', 'v', now(), now())`)
+	if _, err := conn.Exec(context.Background(), `INSERT INTO shawk.agent_sessions
+	  (host_id, started_at, last_heartbeat, udp_traced, netns_scope, dropped_flows, clock_skew)
+	  VALUES ('h1', $1, $2, true, 'all', 100000, '0')`, base.Add(-48*time.Hour), base.Add(-3*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	m := func(n int) time.Duration { return time.Duration(n) * time.Minute }
+	// The upgraded connector writes the same run under its floor.
+	write("h1", m(-4), m(-1), 100000, -48*time.Hour, 0)
+	if got := periods(t, conn, base); len(got) != 0 {
+		t.Errorf("periods after the upgrade = %q, want none", got)
+	}
+	write("h1", m(-4), m(0), 100005, -48*time.Hour, 0)
+	if got := periods(t, conn, base); !slices.Equal(got, []string{"h1 -4 -1 0 5"}) {
+		t.Errorf("periods = %q, want the 5 drops since the upgrade", got)
+	}
+}

@@ -5,9 +5,12 @@ import (
 	"fmt"
 	"net/netip"
 	"slices"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/collector/connector/connectortest"
 	"go.opentelemetry.io/collector/consumer/consumertest"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.uber.org/zap"
@@ -321,11 +324,13 @@ func TestFoldAllAgentServer(t *testing.T) {
 }
 
 // TestFoldedCIDRsWarning: an agent that folds the peers in a range of
-// peer_cidrs makes them ~external; the connector warns, once an hour per
-// host.
+// peer_cidrs makes them ~external; the connector warns once an hour per
+// configuration of the agents, and not about a range of a whole network,
+// which names folded peers.
 func TestFoldedCIDRsWarning(t *testing.T) {
 	c, _, sink, now := testConnector(t, func(cfg *Config) {
-		cfg.PeerCIDRs = map[string]string{"office": "203.0.113.0/24", "dc": "10.20.0.0/16"}
+		cfg.PeerCIDRs = map[string]string{"office": "203.0.113.0/24", "dc": "10.20.0.0/16",
+			"internet": "0.0.0.0/0", "internet6": "::/0"}
 	})
 	logs := observe(c)
 	host := func(name string, fold string, internal ...string) tAgent {
@@ -334,16 +339,71 @@ func TestFoldedCIDRsWarning(t *testing.T) {
 	consume(t, c, sink, host("edge-01", foldIn, "10.0.0.0/8"))
 	consume(t, c, sink, host("edge-02", foldIn, "10.0.0.0/8", "203.0.113.0/24"))
 	consume(t, c, sink, host("edge-03", foldNone))
+	// More hosts with the same configuration.
+	for i := range 5 {
+		consume(t, c, sink, host(fmt.Sprintf("app-%02d", i), foldIn, "10.0.0.0/8"))
+	}
 	got := logs.TakeAll()
-	if len(got) != 1 || got[0].ContextMap()["host"] != "edge-01" {
-		t.Fatalf("warnings = %v, want one for edge-01", got)
+	if len(got) != 1 || got[0].ContextMap()["host"] != "edge-01" || !strings.Contains(got[0].Message, "clients") {
+		t.Fatalf("warnings = %v, want one about the clients of edge-01", got)
 	}
 	if r := got[0].ContextMap()["peer_cidrs"]; fmt.Sprint(r) != "[office=203.0.113.0/24]" {
 		t.Errorf("ranges = %v", r)
 	}
-	consume(t, c, sink, host("edge-01", foldIn, "10.0.0.0/8"))
-	if got := logs.TakeAll(); len(got) != 0 {
-		t.Errorf("warned again within the hour: %v", got)
+	consume(t, c, sink, host("edge-04", foldAll, "10.0.0.0/8"))
+	if got := logs.TakeAll(); len(got) != 1 || strings.Contains(got[0].Message, "clients") {
+		t.Errorf("warnings for another configuration = %v, want one about all peers", got)
+	}
+}
+
+// TestFoldWarningCount: a host whose agent folds is logged once an hour with
+// the hosts it folded since, also when the loop of the connector expires
+// its warnings meanwhile.
+func TestFoldWarningCount(t *testing.T) {
+	cfg := createDefaultConfig()
+	cfg.Postgres.DSN = "postgres://unused"
+	cfg.WriteInterval = 10 * time.Millisecond
+	sink := new(consumertest.MetricsSink)
+	c, err := newConnector(connectortest.NewNopSettings(Type), cfg, sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.newStore = func(context.Context, string) (store, error) { return &fakeStore{}, nil }
+	var mu sync.Mutex
+	now := t0
+	c.now = func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	c.agg.started = t0.Add(-time.Hour)
+	if err := c.Start(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Shutdown(context.Background()) })
+	logs := observe(c)
+	at := func(minutes int, host, addr string) {
+		ts := t0.Add(time.Duration(minutes) * time.Minute)
+		mu.Lock()
+		now = ts
+		mu.Unlock()
+		consume(t, c, sink, tAgent{host: "edge-01", addrs: []string{"203.0.113.10"}, time: ts, fold: foldIn,
+			internal:  []string{"10.0.0.0/8"},
+			listeners: []tListener{{proto: "tcp", addr: "0.0.0.0", port: 443, svc: "nginx", comm: "nginx"}}})
+		consume(t, c, sink, tAgent{host: host, addrs: []string{addr}, time: ts,
+			edges: []tEdge{{role: "client", proto: "tcp", local: addr, peer: "203.0.113.10", port: 443, svc: "app", comm: "app", opened: 1}}})
+	}
+	at(0, "app-01", "198.51.100.1")
+	for i := 2; i <= 4; i++ {
+		at(10, fmt.Sprintf("app-%02d", i), fmt.Sprintf("198.51.100.%d", i))
+	}
+	mu.Lock()
+	now = t0.Add(61 * time.Minute)
+	mu.Unlock()
+	time.Sleep(100 * time.Millisecond) // the loop expires its warnings
+	at(61, "app-05", "198.51.100.5")
+	var counts []any
+	for _, e := range logs.TakeAll() {
+		counts = append(counts, e.ContextMap()["hosts_folded"])
+	}
+	if fmt.Sprint(counts) != "[1 4]" {
+		t.Errorf("hosts_folded of the warnings = %v, want [1 4]", counts)
 	}
 }
 
