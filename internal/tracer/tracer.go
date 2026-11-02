@@ -40,8 +40,8 @@ type Options struct {
 	// number. Zero traces all network namespaces.
 	NetNS uint32
 	// MaxFlows is the capacity of the in-kernel flow table per interval. It
-	// also sizes the tables of listening TCP and UDP ports, between 8192 and
-	// 65536.
+	// also sizes the tables of listening TCP and UDP ports and of the owners
+	// of MPTCP connections, between 8192 and 65536.
 	MaxFlows uint32
 	// OwnerScanInterval is how often the owners of listening sockets are
 	// resolved by walking the file descriptors of all processes.
@@ -76,6 +76,8 @@ type Tracer struct {
 	storageFails   *ebpf.Variable
 	adopted        *ebpf.Variable
 	selfTgid       *ebpf.Variable
+	ownerScan      *ebpf.Variable
+	ownerScans     uint32
 
 	cgroupEvents *ringbuf.Reader
 	cgroupDone   chan struct{}
@@ -97,10 +99,12 @@ type Tracer struct {
 	// matched no holder of its listener.
 	ownerMissing bool
 	// ownerless are the listeners whose owner the last scan could not find,
-	// e.g. sockets of the kernel, and unheld the inodes of listening sockets
-	// that no process held then. They do not trigger another scan.
+	// and unheld the inodes of listening sockets that no process held then.
+	// They do not trigger another scan. kernel are those of the ownerless
+	// listeners that the kernel may hold (see listenerOwners).
 	ownerless map[sockAddrKey]bool
 	unheld    map[uint64]bool
+	kernel    map[sockAddrKey]bool
 	// listening are the inodes of the listening sockets at the last owner
 	// scan.
 	listening   map[uint64]bool
@@ -222,7 +226,7 @@ func (t *Tracer) configure(spec *ebpf.CollectionSpec) error {
 	for _, name := range []string{bpfMapFlows0, bpfMapFlows1} {
 		spec.Maps[name].MaxEntries = t.opts.MaxFlows
 	}
-	for _, name := range []string{bpfMapListenPorts, bpfMapUdpListenPorts} {
+	for _, name := range []string{bpfMapListenPorts, bpfMapUdpListenPorts, bpfMapMptcpOwners} {
 		spec.Maps[name].MaxEntries = min(max(t.opts.MaxFlows, minListenPorts), maxListenPorts)
 	}
 	spec.Maps[bpfMapFlows].InnerMap.MaxEntries = t.opts.MaxFlows
@@ -252,6 +256,7 @@ func (t *Tracer) loadCore(spec *ebpf.CollectionSpec) error {
 	t.storageFails = coll.Variables[bpfVarStorageFails]
 	t.adopted = coll.Variables[bpfVarAdoptedUnowned]
 	t.selfTgid = coll.Variables[bpfVarSelfTgid]
+	t.ownerScan = coll.Variables[bpfVarOwnerScan]
 
 	l, err := link.AttachTracing(link.TracingOptions{Program: coll.Programs[bpfProgShawkInetSockSetState]})
 	if err != nil {
@@ -415,10 +420,14 @@ func (t *Tracer) Collect() (*Snapshot, error) {
 		t.ownerMissing = false
 	}
 	for i := range listeners {
-		if o, ok := preferredOwner(t.owners[listenerKey(&listeners[i])]); ok {
+		k := listenerKey(&listeners[i])
+		if o, ok := preferredOwner(t.owners[k]); ok {
 			listeners[i].PID = o.pid
 			listeners[i].Comm = o.comm
 			listeners[i].CgroupID = o.cgroupID
+		} else if !t.kernel[k] {
+			// The kernel may hold it, but a process did at the last scan.
+			listeners[i].Comm = ""
 		}
 	}
 
@@ -480,13 +489,16 @@ func (t *Tracer) attribute(flows []Flow) []Flow {
 	out := flows[:0]
 	for _, f := range flows {
 		// Incoming connections that were adopted after their listener was
-		// closed already carry the process holding them.
-		if f.Direction == DirIn && f.Proto == ProtoTCP && f.PID == 0 {
-			cands := t.listenerOwners(f.Proto, f.NetNS, f.LocalAddr, f.Port)
+		// closed already carry the process holding them, or the kernel.
+		if f.Direction == DirIn && f.Proto == ProtoTCP && f.PID == 0 && !KernelOwned(f.Comm, f.CgroupID) {
+			cands, kernel := t.listenerOwners(f.Proto, f.NetNS, f.LocalAddr, f.Port)
 			if o, ok := chooseOwner(cands, f.CgroupID); ok {
 				f.Comm = o.comm
 				f.CgroupID = o.cgroupID
 				f.PID = o.pid
+			} else if kernel {
+				f.Comm = KernelComm
+				f.CgroupID = 0
 			} else {
 				// The listener is gone or changed hands since the last scan.
 				// The cgroup taken from the socket still names the service.
@@ -509,17 +521,29 @@ func (t *Tracer) attribute(flows []Flow) []Flow {
 // listenerOwners returns the processes holding the socket listening on
 // addr:port, falling back to wildcard listeners of the address family. An
 // IPv4 connection may also be accepted by a dual-stack IPv6 listener.
-func (t *Tracer) listenerOwners(proto Proto, netns uint32, addr netip.Addr, port uint16) []owner {
+//
+// kernel reports a listener of the kernel: one that the BPF programs found
+// the kernel may hold (created by the kernel, e.g. by nfsd, without a file,
+// or used by the kernel, as a socket that rpc.nfsd creates and passes to
+// nfsd), and that no process held at the last owner scan. Either alone is
+// not enough: processes the agent cannot see, in another PID namespace,
+// hold listeners too, and the first subflow of an MPTCP listener is a socket
+// of the kernel that a process holds.
+func (t *Tracer) listenerOwners(proto Proto, netns uint32, addr netip.Addr, port uint16) (holders []owner, kernel bool) {
 	candidates := []netip.Addr{addr, netip.IPv6Unspecified()}
 	if addr.Is4() {
 		candidates = []netip.Addr{addr, netip.IPv4Unspecified(), netip.IPv6Unspecified()}
 	}
 	for _, a := range candidates {
-		if holders := t.owners[sockAddrKey{proto: proto, netns: netns, addr: a.As16(), port: port}]; len(holders) > 0 {
-			return holders
+		k := sockAddrKey{proto: proto, netns: netns, addr: a.As16(), port: port}
+		if holders := t.owners[k]; len(holders) > 0 {
+			return holders, false
+		}
+		if t.kernel[k] {
+			return nil, true
 		}
 	}
-	return nil
+	return nil, false
 }
 
 // chooseOwner picks the process an accepted connection belongs to among the
@@ -599,7 +623,8 @@ func convertFlow(k *bpfShawkFlowKey, v *bpfShawkFlowStats) Flow {
 }
 
 // scanSockets walks TCP and UDP sockets and returns the listeners and the
-// inodes of their sockets, where known.
+// inodes of their sockets, where known. The Comm of a listener that the
+// kernel may hold is KernelComm, until its owner is resolved.
 //
 // The iterators are opened in every network namespace, since an iterator
 // only walks the namespace it was opened in.
@@ -620,7 +645,7 @@ func (t *Tracer) scanSockets() ([]Listener, []uint64, error) {
 		inos      []uint64
 	)
 	// The sockets of a SO_REUSEPORT group share an address and a port.
-	seen := map[sockAddrKey]bool{}
+	seen := map[sockAddrKey]int{}
 	for _, rd := range readers {
 		recs, err := readRecords(rd)
 		if err != nil {
@@ -639,10 +664,18 @@ func (t *Tracer) scanSockets() ([]Listener, []uint64, error) {
 				Port:  recs[i].Port,
 				NetNS: recs[i].Netns,
 			}
-			if k := listenerKey(&l); !seen[k] {
-				seen[k] = true
-				listeners = append(listeners, l)
+			if commString(recs[i].Comm) == KernelComm {
+				l.Comm = KernelComm
 			}
+			k := listenerKey(&l)
+			if j, ok := seen[k]; ok {
+				if l.Comm != "" {
+					listeners[j].Comm = l.Comm
+				}
+				continue
+			}
+			seen[k] = len(listeners)
+			listeners = append(listeners, l)
 		}
 	}
 	return listeners, inos, nil
@@ -719,9 +752,13 @@ func (t *Tracer) refreshOwners(listeners []Listener, inos []uint64) error {
 		return err
 	}
 	t.ownerless = map[sockAddrKey]bool{}
+	t.kernel = map[sockAddrKey]bool{}
 	for i := range listeners {
 		if k := listenerKey(&listeners[i]); !t.hasOwner(k) {
 			t.ownerless[k] = true
+			if listeners[i].Comm == KernelComm {
+				t.kernel[k] = true
+			}
 		}
 	}
 	t.unheld = map[uint64]bool{}
@@ -739,6 +776,12 @@ func (t *Tracer) refreshOwners(listeners []Listener, inos []uint64) error {
 // to adopted connections in the kernel and caches the owners of listening
 // sockets.
 func (t *Tracer) scanOwners() error {
+	// Each walk records the owner of an MPTCP connection once, replacing
+	// what an earlier walk recorded.
+	t.ownerScans++
+	if err := t.ownerScan.Set(t.ownerScans); err != nil {
+		return err
+	}
 	recs, err := readIter(t.iterTaskFile)
 	if err != nil {
 		return err

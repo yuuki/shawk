@@ -5,8 +5,9 @@
 // initramfs holds nothing else than this program, the test binaries and
 // their inputs, so it runs on any distribution's kernel and architecture.
 //
-// It mounts the file systems the tests use, brings up the loopback, runs the
-// commands of /vm/commands one after the other, prints a line with the exit
+// It mounts the file systems the tests use, brings up the loopback, loads
+// the kernel modules of /vm/modules, runs the commands of /vm/commands one
+// after the other, prints a line with the exit
 // status of the first that failed (or 0), and reboots, which ends QEMU
 // started with -no-reboot. A kernel tainted while the commands ran, e.g. by
 // a warning, fails the run and prints the kernel log.
@@ -50,6 +51,7 @@ func run() (status int) {
 	var uts unix.Utsname
 	unix.Uname(&uts)
 	fmt.Printf("init: Linux %s %s\n", unix.ByteSliceToString(uts.Release[:]), unix.ByteSliceToString(uts.Machine[:]))
+	loadModules("/vm/modules")
 
 	taint := tainted()
 	defer func() {
@@ -127,6 +129,48 @@ func setup() error {
 		}
 	}
 	return loopbackUp()
+}
+
+// loadModules loads the kernel modules in dir. Their dependencies are not
+// known, so the modules that fail to load are tried again as long as others
+// load. A module that cannot be loaded is reported, and the tests that need
+// it fail.
+func loadModules(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	pending := map[string]error{}
+	for _, e := range entries {
+		pending[e.Name()] = nil
+	}
+	for progress := true; progress && len(pending) > 0; {
+		progress = false
+		for name := range pending {
+			if err := loadModule(dir + "/" + name); err != nil {
+				pending[name] = err
+				continue
+			}
+			delete(pending, name)
+			progress = true
+		}
+	}
+	for name, err := range pending {
+		fmt.Printf("init: loading %s: %v\n", name, err)
+	}
+	fmt.Printf("init: loaded %d of %d modules\n", len(entries)-len(pending), len(entries))
+}
+
+func loadModule(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if err := unix.FinitModule(int(f.Fd()), "", 0); err != nil && err != unix.EEXIST {
+		return err
+	}
+	return nil
 }
 
 // tainted returns the taint flags of the kernel.

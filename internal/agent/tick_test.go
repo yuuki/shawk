@@ -143,6 +143,50 @@ func TestTickMergesFlows(t *testing.T) {
 	}
 }
 
+// TestTickKernelSockets checks that flows and listeners of the kernel are
+// named after their port and side, whatever process the kernel used.
+func TestTickKernelSockets(t *testing.T) {
+	kernel := func(dir tracer.Direction, port uint16) tracer.Flow {
+		f := flow(dir, port, 0, 1)
+		f.Comm = tracer.KernelComm
+		return f
+	}
+	src := &fakeSource{snaps: []*tracer.Snapshot{{
+		Flows: []tracer.Flow{kernel(tracer.DirOut, 2049), kernel(tracer.DirIn, 2049), kernel(tracer.DirOut, 40000)},
+		Listeners: []tracer.Listener{{Proto: tracer.ProtoTCP, Addr: netip.IPv4Unspecified(), Port: 2049, NetNS: 1,
+			Comm: tracer.KernelComm}},
+	}}}
+	a := newTestAgent(src, &fakeExporter{}, 0, time.Now())
+	if err := a.tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// The service of each side of each port.
+	services := map[string]string{}
+	for k := range a.state.Edges() {
+		services[k.Role+"/"+strconv.Itoa(int(k.Port))] = k.Service
+		if k.Unit != "" || k.Exe != "" || k.Comm != tracer.KernelComm {
+			t.Errorf("edge to %d: process %+v", k.Port, k.Process)
+		}
+	}
+	for k := range a.state.Listeners() {
+		services["listener/"+strconv.Itoa(int(k.Port))] = k.Service
+	}
+	want := map[string]string{
+		"client/2049":   "~kernel:nfs",
+		"server/2049":   "~kernel:nfsd",
+		"listener/2049": "~kernel:nfsd",
+		"client/40000":  "~kernel",
+	}
+	if len(services) != len(want) {
+		t.Errorf("services = %v, want %v", services, want)
+	}
+	for side, w := range want {
+		if got := services[side]; got != w {
+			t.Errorf("service of %s = %q, want %q", side, got, w)
+		}
+	}
+}
+
 // TestTickAfterFailedExport checks that an interval whose request failed is
 // made up for by the next one: the counters are cumulative since the start,
 // not since the last request that succeeded, the failures are counted, and

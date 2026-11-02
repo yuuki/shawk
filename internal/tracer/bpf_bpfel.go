@@ -67,6 +67,14 @@ type bpfShawkListenKey struct {
 	Pad   uint16
 }
 
+type bpfShawkOwner struct {
+	_        structs.HostLayout
+	Comm     [16]int8
+	CgroupId uint64
+	Pid      uint32
+	Scan     uint32
+}
+
 type bpfShawkSockState struct {
 	_           structs.HostLayout
 	Key         bpfShawkFlowKey
@@ -92,6 +100,7 @@ const (
 	bpfMapFlows0                 = "flows_0"
 	bpfMapFlows1                 = "flows_1"
 	bpfMapListenPorts            = "listen_ports"
+	bpfMapMptcpOwners            = "mptcp_owners"
 	bpfMapSockStates             = "sock_states"
 	bpfMapUdpListenPorts         = "udp_listen_ports"
 	bpfMapUdpStates              = "udp_states"
@@ -112,6 +121,7 @@ const (
 	bpfVarInitialScan            = "initial_scan"
 	bpfVarLearnSelf              = "learn_self"
 	bpfVarListenPortDrops        = "listen_port_drops"
+	bpfVarOwnerScan              = "owner_scan"
 	bpfVarSelfTgid               = "self_tgid"
 	bpfVarStorageFails           = "storage_fails"
 	bpfVarTargetNetns            = "target_netns"
@@ -180,6 +190,7 @@ type bpfMapSpecs struct {
 	Flows0         *ebpf.MapSpec `ebpf:"flows_0"`
 	Flows1         *ebpf.MapSpec `ebpf:"flows_1"`
 	ListenPorts    *ebpf.MapSpec `ebpf:"listen_ports"`
+	MptcpOwners    *ebpf.MapSpec `ebpf:"mptcp_owners"`
 	SockStates     *ebpf.MapSpec `ebpf:"sock_states"`
 	UdpListenPorts *ebpf.MapSpec `ebpf:"udp_listen_ports"`
 	UdpStates      *ebpf.MapSpec `ebpf:"udp_states"`
@@ -198,6 +209,7 @@ type bpfVariableSpecs struct {
 	InitialScan       *ebpf.VariableSpec `ebpf:"initial_scan"`
 	LearnSelf         *ebpf.VariableSpec `ebpf:"learn_self"`
 	ListenPortDrops   *ebpf.VariableSpec `ebpf:"listen_port_drops"`
+	OwnerScan         *ebpf.VariableSpec `ebpf:"owner_scan"`
 	SelfTgid          *ebpf.VariableSpec `ebpf:"self_tgid"`
 	StorageFails      *ebpf.VariableSpec `ebpf:"storage_fails"`
 	TargetNetns       *ebpf.VariableSpec `ebpf:"target_netns"`
@@ -230,6 +242,7 @@ type bpfMaps struct {
 	Flows0         *ebpf.Map `ebpf:"flows_0"`
 	Flows1         *ebpf.Map `ebpf:"flows_1"`
 	ListenPorts    *ebpf.Map `ebpf:"listen_ports"`
+	MptcpOwners    *ebpf.Map `ebpf:"mptcp_owners"`
 	SockStates     *ebpf.Map `ebpf:"sock_states"`
 	UdpListenPorts *ebpf.Map `ebpf:"udp_listen_ports"`
 	UdpStates      *ebpf.Map `ebpf:"udp_states"`
@@ -242,6 +255,7 @@ func (m *bpfMaps) Close() error {
 		m.Flows0,
 		m.Flows1,
 		m.ListenPorts,
+		m.MptcpOwners,
 		m.SockStates,
 		m.UdpListenPorts,
 		m.UdpStates,
@@ -261,6 +275,7 @@ type bpfVariables struct {
 	InitialScan       *ebpf.Variable `ebpf:"initial_scan"`
 	LearnSelf         *ebpf.Variable `ebpf:"learn_self"`
 	ListenPortDrops   *ebpf.Variable `ebpf:"listen_port_drops"`
+	OwnerScan         *ebpf.Variable `ebpf:"owner_scan"`
 	SelfTgid          *ebpf.Variable `ebpf:"self_tgid"`
 	StorageFails      *ebpf.Variable `ebpf:"storage_fails"`
 	TargetNetns       *ebpf.Variable `ebpf:"target_netns"`
