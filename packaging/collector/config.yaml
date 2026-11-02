@@ -46,6 +46,19 @@ connectors:
     max_peers: 50
     peer_cidrs:
       office-lan: 192.168.10.0/24
+    # Relays without an agent that rewrite addresses: load balancers,
+    # keepalived/LVS virtual addresses, TCP proxies. The client edges to
+    # their virtual addresses are matched with the server edges of their
+    # backends (docs/design.md, section 5.4).
+    # translations:
+    #   postgres-vip:
+    #     virtual: [10.0.100.1:5432]
+    #     backends: [10.0.1.10, 10.0.1.11]   # without a port: the port of the client
+    #     transport: tcp
+    #   web-lb:
+    #     virtual: ["10.0.100.2:80", "[2001:db8::2]:80"]
+    #     backends: [10.0.1.0/24:8080]
+    #     sources: [10.0.100.250]            # what the backends see the clients at
     keep_peer_address: false
     retention: 26280h         # 3 years; 0 keeps rows forever
 

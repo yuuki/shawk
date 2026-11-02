@@ -141,6 +141,12 @@ psql -v ON_ERROR_STOP=1 -d shawk -U shawk_owner -f packaging/postgres/grants.sql
 that count each dependency once; `packaging/grafana/` has data sources,
 dashboards and alert rules.
 
+Connections through a load balancer, a virtual address or a proxy without an
+agent end at its address, on one side only, unless `translations` in the
+configuration of the connector describes it: its virtual addresses, its
+backends and, if it replaces the addresses of the clients, the addresses the
+backends see them at ([design §5.4](docs/design.md#54-translations-of-addresses)).
+
 ## Using it
 
 In Grafana:

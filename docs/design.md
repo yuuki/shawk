@@ -677,6 +677,8 @@ sockets of the kernel (`~kernel:nfs`, §4.1) do.
 |---|---|---|
 | client | a service listens on the peer address and port | the service (`[namespace/]name`) |
 | server | a client edge has the same addresses and port | the client service |
+| client | a virtual address of a translation, without a service of its own | the service at a backend, with its port (§5.4) |
+| server | a backend of a translation without sources, and a client edge to its virtual address from the peer | the client service (§5.4) |
 | either | unknown, in a range of `peer_cidrs` | the name of the narrowest range |
 | either | unknown, private address | `~unresolved` |
 | either | unknown, public address | `~external` |
@@ -800,6 +802,68 @@ Prometheus needs `--web.enable-otlp-receiver`,
 `otlp.promote_resource_attributes: [host.id, host.name]` and an
 out-of-order window of 30 minutes; counters stay cumulative.
 
+### 5.4 Translations of addresses
+
+A relay without an agent may rewrite the addresses of the connections it
+forwards: a load balancer, a keepalived or LVS virtual address, a TCP proxy.
+The client connects to a *virtual address*; the server sees its own
+address, and as the client either the address of the client (DNAT) or an
+address of the relay (SNAT, a proxy). The two sides of such connections do
+not match by address. `translations` in the configuration of the connector
+describes the relays:
+
+```yaml
+translations:
+  postgres-vip:
+    virtual: [10.0.100.1:5432]         # addresses clients connect to, with a port or for every port
+    backends: [10.0.1.10, 10.0.1.11]   # addresses or ranges of the servers, with their port or the client's
+    transport: tcp                     # tcp, udp, or empty for both
+  web-lb:
+    virtual: ["10.0.100.2:80", "[2001:db8::2]:80"]
+    backends: [10.0.1.0/24:8080]
+    sources: [10.0.100.250]            # what the servers see the clients at, when the relay replaces them
+```
+
+A virtual address and port belongs to one translation at most, and a
+backend with a port needs virtual addresses with a port. The connector
+writes the translations to PostgreSQL when it writes `peer_cidrs`; every
+connector should have the same.
+
+- **In PostgreSQL**, a client edge to a virtual address that matches no
+  server edge by address is matched with the server edges at the
+  backends: on the port of the backend, or that of the client edge; with
+  the address of the client (in the same scope, §6.2) through a
+  translation without sources, or from a source; and when their periods
+  overlap, within 2 minutes. The row has the period both edges were active
+  in, the address and port of the server, and in `virtual_addr`,
+  `virtual_port` and `translation` what the client connected to: a client
+  edge to a virtual address bundles its connections to every backend, and a
+  server edge from a source those of every client of the relay. Such a
+  server edge also keeps a row of its own, since clients without an agent
+  may be behind the relay; the range of the sources can be named in
+  `peer_cidrs`. A client edge that a server edge matches by address, such
+  as that of a relay that runs an agent, is not matched through a
+  translation. The services, the dependency map and
+  `known_dependencies` follow.
+- **In the names of peers**, a client edge to a virtual address whose
+  address and port have no known service is named after the service at a
+  backend, chosen as in §5.2, with the `server.port` of the backend and
+  `shawk.peer.agent` of its host; the services in a range of backends are
+  looked up among the endpoints once per write interval. A server edge at
+  a backend of a translation without sources is named after the client
+  service whose client edge to a virtual address has the address of its
+  peer. Behind sources, the server sees the relay, which is named after its
+  address.
+- Translations apply to the whole history: a former backend kept in its
+  translation is matched over the period it served. The backends of
+  Kubernetes services and Docker published ports change all the time and
+  cannot be written down; learning the translations on the hosts that make
+  them, from conntrack, is proposed in `docs/proposal-translation.md`.
+- An agent of a backend that folds its clients (§3.6) must keep the
+  sources, or the clients of a translation without sources, in its
+  internal ranges (`-internal-peers`); a folded server edge has no address
+  to match.
+
 ## 6. PostgreSQL
 
 PostgreSQL 14 or later (multiranges). The schema is bundled with the
@@ -821,6 +885,7 @@ edges(id, host_id, process_id, role, proto, local_addr, remote_addr, port, netns
 listeners(host_id, process_id, proto, addr, port, netns, first_seen, last_seen)  -- the latest owner
 listener_owners(host_id, process_id, proto, addr, port, netns, first_seen, last_seen)  -- every known owner
 peer_cidrs(prefix, name)  -- written by the connector from its peer_cidrs
+translations(name, side, proto, addr, port)  -- written by the connector from its translations (§5.4)
 known_dependencies(client_service, server_service, port, proto, first_seen, last_seen)
 ```
 
@@ -841,7 +906,7 @@ names in PostgreSQL and Prometheus match.
 
 | view or function | |
 |---|---|
-| `dependencies` | one row per logical dependency: the client edge and the server edge matched by their addresses and port (loopback within a host and netns, addresses held by several hosts at once within a host). `observed_by` is `both`, `client` or `server`; a one-sided row means no agent on the other side, or a NAT or load balancer between. Edges are matched by address over all time: when an address moves to another host, the edges of each host that held it are matched with those of the peer. `client_observed_until` and `server_observed_until` are the latest heartbeats of the hosts: an old `last_seen` with a recent `observed_until` means *no longer used*; both old means *no longer observed*. A `client_addr` (or `server_addr`) that is the network `0.0.0.0/0` or `::/0` stands for the peers an agent folded (§5.2): such a row is one-sided, and its peer is named `~external`. |
+| `dependencies` | one row per logical dependency: the client edge and the server edge matched by their addresses and port (loopback within a host and netns, addresses held by several hosts at once within a host), or through a translation (§5.4), when the last columns `virtual_addr`, `virtual_port` and `translation` tell the virtual address and port the client connected to and the name of the translation; `server_addr` and `port` are then those of the server, and `first_seen` and `last_seen` the period both edges were active in. `observed_by` is `both`, `client` or `server`; a one-sided row means no agent on the other side, or a NAT or load balancer between that no translation describes, or the server side of a translation with sources, which keeps its own row. Edges are matched by address over all time: when an address moves to another host, the edges of each host that held it are matched with those of the peer. `client_observed_until` and `server_observed_until` are the latest heartbeats of the hosts: an old `last_seen` with a recent `observed_until` means *no longer used*; both old means *no longer observed*. A `client_addr` (or `server_addr`) that is the network `0.0.0.0/0` or `::/0` stands for the peers an agent folded (§5.2): such a row is one-sided, and its peer is named `~external`. |
 | `graph_nodes`, `graph_edges` | the dependency map between services in the format of the Grafana Node Graph; a peer without a service is named by `peer_class` |
 | `peer_class(addr)` | the name of a peer without a known service, as in `service.peer.name`: the narrowest range of `peer_cidrs`, `~unresolved` for an address not routed on the Internet, `~external` otherwise, including the networks of folded peers |
 | `dependency_changes` | dependencies between services that appeared, or disappeared while a host that saw them kept observing for 15 minutes |
@@ -868,7 +933,13 @@ recording rules in `packaging/prometheus/shawk-rules.yml` count it once:
 | connection failures | the client side only (the server never sees them) |
 | retransmissions | both sides: each counts its own retransmitted segments; `shawk_role` is the sender |
 
-The two sides differ in `shawk_role`, so their `or` is a union. The rules
+The two sides differ in `shawk_role`, so their `or` is a union.
+
+Behind a translation with sources (§5.4), the server sees the relay
+(`shawk_peer_agent="false"`) and counts the connections of every client of
+the relay, while the clients that run an agent count theirs: each
+dependency is counted right, but the sum of the dependencies into the
+server counts those clients twice. The server cannot tell its clients apart. The rules
 label the client `src` and the server `dst` whichever side observed the
 dependency, e.g. `shawk:dependency_connections:rate5m{src, dst,
 server_port, network_transport}`.
@@ -933,7 +1004,15 @@ parses. shawk runs beside it instead:
 
 - **Relays that rewrite addresses** (NAT, IPVS, kube-proxy, cloud load
   balancers) hide the real peer, as discussed in §5.2 of the paper.
-  Dependencies end at the relay address and are seen on one side only.
+  Dependencies end at the relay address and are seen on one side only,
+  unless `translations` describes the relay (§5.4). Translations are
+  static: the backends of Kubernetes services and Docker published ports
+  change too often to be written down, and the connections to a published
+  port on loopback go through `docker-proxy`, a service of its own. Behind
+  a relay that replaces the addresses of the clients, the server cannot
+  tell its clients apart: every client of the relay is matched with every
+  server edge from it, and the server side is counted besides the clients
+  (§7).
 - **Addresses of container networks** are told apart only when several
   hosts with agents hold them at once. A container address held by one
   host with an agent may be attributed to that host for a peer on a host
