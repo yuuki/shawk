@@ -701,48 +701,19 @@ func TestTCPChildNotCreated(t *testing.T) {
 // rule in the network namespace of the thread, to dst if it is valid.
 func ipRule(t *testing.T, msgType uint16, table, action uint8, priority uint32, dst netip.Addr) {
 	t.Helper()
-	fd, err := unix.Socket(unix.AF_NETLINK, unix.SOCK_RAW|unix.SOCK_CLOEXEC, unix.NETLINK_ROUTE)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer unix.Close(fd)
 	// struct fib_rule_hdr: family, dst_len, src_len, tos, table, res1,
 	// res2, action, flags.
 	body := []byte{unix.AF_INET, 0, 0, 0, table, 0, 0, action, 0, 0, 0, 0}
-	attr := func(typ uint16, data []byte) {
-		a := make([]byte, (4+len(data)+3)&^3)
-		binary.NativeEndian.PutUint16(a, uint16(4+len(data)))
-		binary.NativeEndian.PutUint16(a[2:], typ)
-		copy(a[4:], data)
-		body = append(body, a...)
-	}
-	attr(unix.FRA_PRIORITY, binary.NativeEndian.AppendUint32(nil, priority))
+	body = append(body, rtAttr(unix.FRA_PRIORITY, binary.NativeEndian.AppendUint32(nil, priority))...)
 	if dst.IsValid() {
 		body[1] = 32
-		attr(unix.FRA_DST, dst.AsSlice())
+		body = append(body, rtAttr(unix.FRA_DST, dst.AsSlice())...)
 	}
-	flags := uint16(unix.NLM_F_REQUEST | unix.NLM_F_ACK)
+	var flags uint16
 	if msgType == unix.RTM_NEWRULE {
-		flags |= unix.NLM_F_CREATE | unix.NLM_F_EXCL
+		flags = unix.NLM_F_CREATE | unix.NLM_F_EXCL
 	}
-	msg := make([]byte, unix.SizeofNlMsghdr, unix.SizeofNlMsghdr+len(body))
-	binary.NativeEndian.PutUint32(msg, uint32(unix.SizeofNlMsghdr+len(body)))
-	binary.NativeEndian.PutUint16(msg[4:], msgType)
-	binary.NativeEndian.PutUint16(msg[6:], flags)
-	binary.NativeEndian.PutUint32(msg[8:], 1)
-	msg = append(msg, body...)
-	if err := unix.Sendto(fd, msg, 0, &unix.SockaddrNetlink{Family: unix.AF_NETLINK}); err != nil {
-		t.Fatal(err)
-	}
-	buf := make([]byte, 4096)
-	n, _, err := unix.Recvfrom(fd, buf, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if n < unix.SizeofNlMsghdr+4 || binary.NativeEndian.Uint16(buf[4:]) != unix.NLMSG_ERROR {
-		t.Fatalf("unexpected netlink reply of %d bytes", n)
-	}
-	if errno := int32(binary.NativeEndian.Uint32(buf[unix.SizeofNlMsghdr:])); errno != 0 {
-		t.Fatalf("routing rule %d: %v", msgType, unix.Errno(-errno))
+	if err := rtnetlink(msgType, flags, body); err != nil {
+		t.Fatalf("routing rule %d: %v", msgType, err)
 	}
 }

@@ -53,8 +53,28 @@ type Options struct {
 	// the host, so that the paths of short-lived cgroups can be resolved
 	// after they are removed. It is called from a separate goroutine.
 	OnCgroup func(id uint64, path string)
-	Logger   *slog.Logger
+	// Fold tells which flows fold their peers outside InternalPeers into
+	// one flow per local endpoint (see FoldMode). The default keeps every
+	// peer.
+	Fold FoldMode
+	// InternalPeers are the address ranges whose peers are kept exact when
+	// Fold folds peers. Loopback and the addresses given to SetLocalAddrs
+	// are always kept.
+	InternalPeers []netip.Prefix
+	Logger        *slog.Logger
 }
+
+// keyFolded is KEY_FOLDED of struct shawk_flow_key.
+const keyFolded = 1 << 0
+
+// alwaysInternal are the ranges whose peers are never folded.
+var alwaysInternal = []netip.Prefix{
+	netip.MustParsePrefix("127.0.0.0/8"),
+	netip.MustParsePrefix("::1/128"),
+}
+
+// maxLocalPeers bounds the addresses of the host given to SetLocalAddrs.
+const maxLocalPeers = 4096
 
 // Tracer loads the BPF programs and collects bundled flows.
 type Tracer struct {
@@ -78,6 +98,11 @@ type Tracer struct {
 	selfTgid       *ebpf.Variable
 	ownerScan      *ebpf.Variable
 	ownerScans     uint32
+	internalPeers  *ebpf.Map
+	// configuredPeers are the keys of internalPeers from the options, and
+	// localPeers those of the addresses of the host (SetLocalAddrs).
+	configuredPeers map[bpfShawkPeerPrefix]bool
+	localPeers      map[bpfShawkPeerPrefix]bool
 
 	cgroupEvents *ringbuf.Reader
 	cgroupDone   chan struct{}
@@ -217,12 +242,14 @@ func (t *Tracer) configure(spec *ebpf.CollectionSpec) error {
 		bpfVarTargetNetns: t.opts.NetNS,
 		bpfVarEphPortLow:  low,
 		bpfVarEphPortHigh: high,
+		bpfVarFoldMode:    uint8(t.opts.Fold),
 	}
 	for name, v := range vars {
 		if err := spec.Variables[name].Set(v); err != nil {
 			return fmt.Errorf("setting %s: %w", name, err)
 		}
 	}
+	spec.Maps[bpfMapInternalPeers].MaxEntries = uint32(len(alwaysInternal)+len(t.opts.InternalPeers)) + maxLocalPeers
 	for _, name := range []string{bpfMapFlows0, bpfMapFlows1} {
 		spec.Maps[name].MaxEntries = t.opts.MaxFlows
 	}
@@ -257,6 +284,17 @@ func (t *Tracer) loadCore(spec *ebpf.CollectionSpec) error {
 	t.adopted = coll.Variables[bpfVarAdoptedUnowned]
 	t.selfTgid = coll.Variables[bpfVarSelfTgid]
 	t.ownerScan = coll.Variables[bpfVarOwnerScan]
+	t.internalPeers = coll.Maps[bpfMapInternalPeers]
+	// The ranges are in place before the programs see the first flow.
+	t.configuredPeers = map[bpfShawkPeerPrefix]bool{}
+	t.localPeers = map[bpfShawkPeerPrefix]bool{}
+	for _, p := range append(slices.Clone(alwaysInternal), t.opts.InternalPeers...) {
+		k := peerPrefixKey(p)
+		if err := t.internalPeers.Update(&k, uint8(1), ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("adding the internal range %s: %w", p, err)
+		}
+		t.configuredPeers[k] = true
+	}
 
 	l, err := link.AttachTracing(link.TracingOptions{Program: coll.Programs[bpfProgShawkInetSockSetState]})
 	if err != nil {
@@ -361,6 +399,59 @@ func verifierError(err error) error {
 		return fmt.Errorf("%+v", verr)
 	}
 	return err
+}
+
+// peerPrefixKey returns the key of internal_peers for a prefix: IPv4
+// prefixes are IPv4-mapped, as the addresses of the flows are.
+func peerPrefixKey(p netip.Prefix) bpfShawkPeerPrefix {
+	p = p.Masked()
+	bits := p.Bits()
+	if p.Addr().Is4() {
+		bits += 96
+	}
+	return bpfShawkPeerPrefix{Prefixlen: uint32(bits), Addr: p.Addr().As16()}
+}
+
+// SetLocalAddrs sets the addresses of the host, whose peers are never
+// folded, e.g. a host that connects to its own public address. It replaces
+// the addresses of the previous call; only the first maxLocalPeers are
+// kept.
+func (t *Tracer) SetLocalAddrs(addrs []netip.Addr) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.opts.Fold == FoldNone {
+		return nil
+	}
+	want := make(map[bpfShawkPeerPrefix]bool, len(addrs))
+	for _, a := range addrs {
+		if len(want) == maxLocalPeers {
+			break
+		}
+		a = a.WithZone("")
+		if !a.IsValid() {
+			continue
+		}
+		want[peerPrefixKey(netip.PrefixFrom(a, a.BitLen()))] = true
+	}
+	for k := range want {
+		if t.localPeers[k] || t.configuredPeers[k] {
+			continue
+		}
+		if err := t.internalPeers.Update(&k, uint8(1), ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("adding a local address to the internal ranges: %w", err)
+		}
+		t.localPeers[k] = true
+	}
+	for k := range t.localPeers {
+		if want[k] {
+			continue
+		}
+		if err := t.internalPeers.Delete(&k); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			return fmt.Errorf("removing a local address from the internal ranges: %w", err)
+		}
+		delete(t.localPeers, k)
+	}
+	return nil
 }
 
 // SelfPID returns the process id of the tracer as the kernel sees it. It
@@ -605,6 +696,7 @@ func convertFlow(k *bpfShawkFlowKey, v *bpfShawkFlowStats) Flow {
 			NetNS:      k.Netns,
 			CgroupID:   k.CgroupId,
 			Comm:       commString(k.Comm),
+			Folded:     k.Flags&keyFolded != 0,
 		},
 		FlowStats: FlowStats{
 			Conns:      uint64(v.Conns),

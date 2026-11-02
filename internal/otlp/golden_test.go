@@ -29,6 +29,10 @@ func goldenRequest() *colmetricspb.ExportMetricsServiceRequest {
 	s.AddEdge(EdgeKey{Role: RoleServer, Proto: "tcp", LocalAddr: netip.MustParseAddr("10.0.0.11"),
 		PeerAddr: netip.MustParseAddr("10.0.0.5"), Port: 8080, NetNS: 4026531840, Process: app},
 		EdgeStats{Conns: 10, BytesSent: 1000, BytesRecv: 500}, t0, t0.Add(15*time.Second))
+	// The clients outside the internal ranges, folded into one edge.
+	s.AddEdge(EdgeKey{Role: RoleServer, Proto: "tcp", LocalAddr: netip.MustParseAddr("10.0.0.11"),
+		PeerAddr: netip.MustParseAddr("0.0.0.0"), PeerFolded: true, Port: 443, NetNS: 4026531840, Process: app},
+		EdgeStats{Conns: 250, OpenConns: 40, BytesSent: 90000, BytesRecv: 12000}, t0, t0.Add(15*time.Second))
 	s.AddEdge(EdgeKey{Role: RoleClient, Proto: "udp", LocalAddr: netip.MustParseAddr("10.0.0.11"),
 		PeerAddr: netip.MustParseAddr("8.8.8.8"), Port: 53, NetNS: 4026531840,
 		Process: Process{Unit: "app.service", Comm: "puma", Exe: "/usr/bin/ruby", Service: "app", ServiceNamespace: "shop"}},
@@ -39,6 +43,12 @@ func goldenRequest() *colmetricspb.ExportMetricsServiceRequest {
 	return s.Request(Resource{
 		MachineID: "4c4c4544003910528036b4c04f4d3732", Hostname: "app-01", Kernel: "5.14.0-503.el9.x86_64",
 		AgentVersion: "v0.9.0", Addrs: []netip.Addr{netip.MustParseAddr("127.0.0.1"), netip.MustParseAddr("10.0.0.11")},
+		PeerFold: "in", InternalPeers: []netip.Prefix{
+			netip.MustParsePrefix("10.0.0.0/8"), netip.MustParsePrefix("172.16.0.0/12"),
+			netip.MustParsePrefix("192.168.0.0/16"), netip.MustParsePrefix("100.64.0.0/10"),
+			netip.MustParsePrefix("127.0.0.0/8"), netip.MustParsePrefix("169.254.0.0/16"),
+			netip.MustParsePrefix("fc00::/7"), netip.MustParsePrefix("fe80::/10"), netip.MustParsePrefix("::1/128"),
+		},
 	}, AgentStatus{
 		Started: t0.Add(-time.Hour), SegmentStart: t0.Add(-time.Hour), NetNSScope: "all", UDPTraced: true,
 		FlowsDropped: 7, ExportFailures: 1,

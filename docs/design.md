@@ -94,7 +94,8 @@ records transferred to user space is proportional to the number of
 *dependencies*, not of connections or messages (the key idea of the paper).
 Unlike the original implementation, the process identity is part of the key;
 the paper notes that without it, different clients on one host cannot be
-distinguished (§5.3).
+distinguished (§5.3). A key can also bundle all the peers outside the
+internal ranges of the host, whose remote address is then zero (§3.6).
 
 Per flow and interval the kernel accumulates: established connections,
 failed connection attempts, connections open at the end of the interval,
@@ -288,6 +289,7 @@ require upstream 5.14 or later:
 | ring buffer (cgroup events) | 5.8 |
 | BPF iterators `tcp`, `udp`, `task_file` | 5.8 / 5.9 |
 | socket local storage in tracing programs | 5.11 |
+| LPM trie (internal ranges, §3.6) | 4.11 |
 | `bpf_sock_from_file`, `bpf_get_current_task_btf` | 5.11 |
 | cgroup pointer in `sock_cgroup_data` (else the owner of accepted connections is resolved in user space only) | 5.15, RHEL 9 |
 | TCP iterator that locks each socket (else rare double counting) | 5.19, RHEL 9 |
@@ -315,6 +317,58 @@ The kernel types come from `internal/tracer/bpf/include/vmlinux.h`, dumped
 by bpftool from the BTF of Linux 6.18.44 (x86_64, release `6.18.44-fc-v185`). `scripts/gen-vmlinux.sh`
 (`make vmlinux`) regenerates it from the running kernel or a BTF file and
 records the kernel in its first lines.
+
+### 3.6 Folding external peers
+
+The remote address is part of the key, so on an internet-facing host (a
+load balancer, a web server, a public DNS or QUIC server) every client
+address would be a flow of its own: in the flow table, which drops the
+updates that do not fit (§10), in the series of the agent, which sends
+every live series at every interval for the idle TTL (§4.3), and in the
+edges of PostgreSQL, which keep them for the retention (§6). None of the
+names needs them: a peer without a service is named after its address
+range (§5.2), so every client on the Internet is `~external` anyway.
+
+The kernel therefore folds the peers outside the internal ranges of the
+host into one flow per local endpoint:
+
+- `-internal-peers` lists the ranges whose peers are kept exact. The
+  default, `private`, stands for the ranges not routed on the Internet
+  (RFC 1918, CGNAT, loopback, link-local and IPv6 ULA), which
+  `peer_class()` names `~unresolved`. Loopback and the addresses of the
+  interfaces of the host, refreshed at every interval, are always kept, so
+  that a host connecting to its own public address keeps both sides. A
+  fleet that uses public addresses internally adds them, e.g.
+  `-internal-peers=private,203.0.113.0/24`.
+- `-fold-external` tells which flows fold their external peers: `in` (the
+  default) the incoming flows, i.e. the clients of local servers; `all`
+  also the outgoing ones, for hosts that contact many external servers
+  (crawlers, mail relays, forward proxies, recursive DNS resolvers);
+  `none` keeps every address. Outgoing flows keep the address of their
+  server by default, since it tells which external service a host uses.
+- The ranges are kept in an LPM trie (`internal_peers`), which user space
+  fills before the programs attach. A key is folded when it is built: when
+  a TCP connection is accepted, adopted or opened (and again once it is
+  established, when its addresses are read again), and for every UDP
+  datagram once the direction of its socket is known. Its remote address
+  becomes 0.0.0.0 (IPv4-mapped) or ::, and `KEY_FOLDED` is set in the key,
+  so that it never merges with an exact one. A TCP connection costs one
+  lookup in the trie, and so does a datagram of a UDP server.
+- A folded flow is sent with `network.peer.address` 0.0.0.0 or :: and
+  `shawk.peer.folded=true`; the resource of the agent carries
+  `shawk.peer.fold` and `shawk.peer.internal` (§4.2). PostgreSQL keeps its
+  peer as the network 0.0.0.0/0 or ::/0 (§6), which `peer_class()` names
+  `~external`: the names of the services and the dependencies between them
+  are those without folding. What is lost is the address of each external
+  client in `shawk_v1.dependencies`; set `-fold-external=none` where it is
+  needed.
+- `shawk flows` does not fold, so that it shows every address.
+
+The flow table then holds about one flow per internal peer and local
+service, plus one per local endpoint for all external peers. A peer on an
+internal range of the fleet that is missing from `-internal-peers` is
+folded, so its connections are seen on the client side only; the
+connector warns about agents whose peers are folded that way (§5.2).
 
 ## 4. The agent
 
@@ -385,7 +439,9 @@ attributes `service.name`, `service.namespace`, `process.executable.name`,
 `process.executable.path`, `process.command`, `shawk.unit`, `shawk.role`
 (`client` or `server`), `network.transport`, `network.local.address`,
 `network.peer.address`, `server.port` (the service port, whatever the role)
-and `shawk.netns`. The PID is not an attribute, so a restarted process
+and `shawk.netns`, and `shawk.peer.folded=true` when the edge bundles the
+peers outside the internal ranges, whose `network.peer.address` is then
+0.0.0.0 or :: (§3.6). The PID is not an attribute, so a restarted process
 continues the same series.
 
 | metric | type, unit | |
@@ -408,8 +464,10 @@ process attributes. The agent itself sends `shawk.agent.up` (with
 carries `host.id`, `host.name`, `host.ip` (addresses of the interfaces of
 the traced namespaces, and the local addresses of the series active in the
 last two intervals, at least a minute, and of the open listeners, which
-include containers), `os.version`, and `service.name=shawk-agent` with
-`service.version`. Strings that are not valid UTF-8, such as a command name
+include containers), `os.version`, `service.name=shawk-agent` with
+`service.version`, `shawk.peer.fold` (`none`, `in` or `all`) and
+`shawk.peer.internal` (the ranges of `-internal-peers`, as an array of
+prefixes). Strings that are not valid UTF-8, such as a command name
 cut in the middle of a character, are sent with the invalid bytes
 replaced.
 
@@ -739,12 +797,21 @@ parses. shawk runs beside it instead:
   kernel's; run the agent in the host PID namespace.
 - **Flow table capacity**: when more distinct flows than `-max-flows` occur
   in one interval, updates are dropped and `shawk.agent.flows.dropped`
-  counts them. The tables of listening TCP and UDP ports hold `-max-flows`
-  ports, at least 8192 and at most 65536; the agent warns when they
+  counts them; the intervals with drops are kept as partly observed (§6).
+  External peers are folded (§3.6), so the flows grow with the internal
+  peers and the local services, not with the clients on the Internet; a
+  host with very many internal clients, or with `-fold-external=none`, may
+  still need a larger `-max-flows`. The tables of listening TCP and UDP
+  ports hold `-max-flows` ports, at least 8192 and at most 65536; the agent
+  warns when they
   overflow, since connections that predate the agent and UDP sockets on the
   ports left out may then be given the wrong direction. It also warns when
   the kernel could not allocate socket storage for a TCP connection, which
   is then counted from the next walk on.
+- **Folded peers** (§3.6): the address of each external peer is not kept,
+  only that the endpoint had external peers. A fleet that uses public
+  addresses internally must list them in `-internal-peers`, or the
+  connections between its hosts are seen on the client side only.
 - **Connections that predate the agent** are counted from the adoption on.
   One accepted by a listener created with a backlog of 0 whose listener is
   gone is recorded as outgoing.

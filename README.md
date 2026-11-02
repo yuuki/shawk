@@ -98,6 +98,7 @@ Run the agent on every host you want to observe:
 | `-service-name-fallback` | name of a service without `OTEL_SERVICE_NAME`: `exe` (executable name, as OBI) or `unit` (systemd unit) |
 | `-interval`, `-idle-ttl` | export interval (15 s, at most 1 min) and how long a dependency is sent after its last activity (15 min) |
 | `-netns`, `-max-flows`, `-bpf-stats` | network namespaces to trace, capacity of the in-kernel flow table (also sizing the tables of listening ports), BPF run time statistics |
+| `-internal-peers`, `-fold-external` | address ranges whose peers are kept exact (`private`: the ranges not routed on the Internet), and which flows fold the other peers into one dependency per local endpoint: `in` (the clients of local servers, default), `all` or `none`; see [the design](docs/design.md#36-folding-external-peers) |
 
 Services that share an executable on a host (`ruby`, `python`, `java`,
 `php-fpm`) should set `OTEL_SERVICE_NAME`, e.g. with `Environment=` in a

@@ -29,6 +29,8 @@ type bpfShawkFlowKey struct {
 	Direction uint8
 	Proto     uint8
 	Comm      [16]int8
+	Flags     uint8
+	Pad       [7]uint8
 }
 
 type bpfShawkFlowStats struct {
@@ -75,6 +77,12 @@ type bpfShawkOwner struct {
 	Scan     uint32
 }
 
+type bpfShawkPeerPrefix struct {
+	_         structs.HostLayout
+	Prefixlen uint32
+	Addr      [16]uint8
+}
+
 type bpfShawkSockState struct {
 	_           structs.HostLayout
 	Key         bpfShawkFlowKey
@@ -99,6 +107,7 @@ const (
 	bpfMapFlows                  = "flows"
 	bpfMapFlows0                 = "flows_0"
 	bpfMapFlows1                 = "flows_1"
+	bpfMapInternalPeers          = "internal_peers"
 	bpfMapListenPorts            = "listen_ports"
 	bpfMapMptcpOwners            = "mptcp_owners"
 	bpfMapSockStates             = "sock_states"
@@ -118,6 +127,7 @@ const (
 	bpfVarEphPortHigh            = "eph_port_high"
 	bpfVarEphPortLow             = "eph_port_low"
 	bpfVarFlowDrops              = "flow_drops"
+	bpfVarFoldMode               = "fold_mode"
 	bpfVarInitialScan            = "initial_scan"
 	bpfVarLearnSelf              = "learn_self"
 	bpfVarListenPortDrops        = "listen_port_drops"
@@ -189,6 +199,7 @@ type bpfMapSpecs struct {
 	Flows          *ebpf.MapSpec `ebpf:"flows"`
 	Flows0         *ebpf.MapSpec `ebpf:"flows_0"`
 	Flows1         *ebpf.MapSpec `ebpf:"flows_1"`
+	InternalPeers  *ebpf.MapSpec `ebpf:"internal_peers"`
 	ListenPorts    *ebpf.MapSpec `ebpf:"listen_ports"`
 	MptcpOwners    *ebpf.MapSpec `ebpf:"mptcp_owners"`
 	SockStates     *ebpf.MapSpec `ebpf:"sock_states"`
@@ -206,6 +217,7 @@ type bpfVariableSpecs struct {
 	EphPortHigh       *ebpf.VariableSpec `ebpf:"eph_port_high"`
 	EphPortLow        *ebpf.VariableSpec `ebpf:"eph_port_low"`
 	FlowDrops         *ebpf.VariableSpec `ebpf:"flow_drops"`
+	FoldMode          *ebpf.VariableSpec `ebpf:"fold_mode"`
 	InitialScan       *ebpf.VariableSpec `ebpf:"initial_scan"`
 	LearnSelf         *ebpf.VariableSpec `ebpf:"learn_self"`
 	ListenPortDrops   *ebpf.VariableSpec `ebpf:"listen_port_drops"`
@@ -241,6 +253,7 @@ type bpfMaps struct {
 	Flows          *ebpf.Map `ebpf:"flows"`
 	Flows0         *ebpf.Map `ebpf:"flows_0"`
 	Flows1         *ebpf.Map `ebpf:"flows_1"`
+	InternalPeers  *ebpf.Map `ebpf:"internal_peers"`
 	ListenPorts    *ebpf.Map `ebpf:"listen_ports"`
 	MptcpOwners    *ebpf.Map `ebpf:"mptcp_owners"`
 	SockStates     *ebpf.Map `ebpf:"sock_states"`
@@ -254,6 +267,7 @@ func (m *bpfMaps) Close() error {
 		m.Flows,
 		m.Flows0,
 		m.Flows1,
+		m.InternalPeers,
 		m.ListenPorts,
 		m.MptcpOwners,
 		m.SockStates,
@@ -272,6 +286,7 @@ type bpfVariables struct {
 	EphPortHigh       *ebpf.Variable `ebpf:"eph_port_high"`
 	EphPortLow        *ebpf.Variable `ebpf:"eph_port_low"`
 	FlowDrops         *ebpf.Variable `ebpf:"flow_drops"`
+	FoldMode          *ebpf.Variable `ebpf:"fold_mode"`
 	InitialScan       *ebpf.Variable `ebpf:"initial_scan"`
 	LearnSelf         *ebpf.Variable `ebpf:"learn_self"`
 	ListenPortDrops   *ebpf.Variable `ebpf:"listen_port_drops"`

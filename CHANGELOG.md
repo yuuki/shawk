@@ -1,5 +1,23 @@
 ## Unreleased
 
+* The kernel folds the peers outside the internal ranges of the host into
+  one dependency per local endpoint (#96). On an internet-facing host, the
+  clients of a local server on the Internet no longer make one flow, one
+  series and one edge in PostgreSQL per address, which filled the flow
+  table (and dropped the flows of other dependencies), the requests of the
+  agent and `shawk.edges`. `-internal-peers` lists the ranges whose peers
+  are kept exact (default `private`: RFC 1918, CGNAT, loopback, link-local
+  and IPv6 ULA; loopback and the addresses of the host are always kept);
+  `-fold-external` folds the external peers of incoming flows (`in`, the
+  default), of all flows (`all`) or of none (`none`). A folded edge carries
+  `shawk.peer.folded=true` with `network.peer.address` 0.0.0.0 or ::, and
+  PostgreSQL keeps its peer as the network 0.0.0.0/0 or ::/0, named
+  `~external` as before. The address of each external client is no longer
+  recorded; set `-fold-external=none` where it is needed. A fleet that uses
+  public addresses internally must add them to `-internal-peers`. Upgrade
+  the connectors before the agents: a connector of the previous version
+  keeps a folded peer as the address 0.0.0.0 or ::, which it names
+  `~unresolved`.
 * The systemd units are sandboxed: the agent keeps only the capabilities it
   needs (`CAP_BPF`, `CAP_PERFMON`, `CAP_SYS_ADMIN`, `CAP_SYS_PTRACE`,
   `CAP_DAC_READ_SEARCH`) and both units filter system calls and address

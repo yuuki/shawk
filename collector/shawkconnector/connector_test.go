@@ -50,7 +50,7 @@ func TestGoldenRequest(t *testing.T) {
 	if !hb.time.Equal(t0.Add(15 * time.Second)) {
 		t.Errorf("time = %v", hb.time)
 	}
-	if len(hb.edges) != 3 || len(hb.listeners) != 2 {
+	if len(hb.edges) != 4 || len(hb.listeners) != 2 {
 		t.Fatalf("%d edges, %d listeners", len(hb.edges), len(hb.listeners))
 	}
 	var client *edgeInput

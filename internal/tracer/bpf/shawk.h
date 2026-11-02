@@ -24,12 +24,26 @@ enum shawk_flow_direction {
 };
 
 /*
+ * Which peers outside the internal ranges are folded (see fold_peer()):
+ * none, those of incoming flows, or those of all flows.
+ */
+enum shawk_fold_mode {
+	FOLD_NONE = 0,
+	FOLD_IN = 1,
+	FOLD_ALL = 2,
+};
+
+/* Flags of struct shawk_flow_key. */
+#define KEY_FOLDED (1U << 0) /* raddr stands for all peers outside the internal ranges */
+
+/*
  * flow_key identifies a bundled flow. Following the in-kernel flow
  * bundling method, the client's ephemeral port is dropped and all
  * connections/datagrams between the same pair of addresses to the same
  * service port are bundled into a single entry. The process identity
  * (cgroup and comm) is part of the key so that different clients on the
- * same host remain distinguishable.
+ * same host remain distinguishable. A folded key bundles the peers outside
+ * the internal ranges too: its remote address is zero.
  */
 struct shawk_flow_key {
 	__u8 laddr[16];               /* local address (IPv4-mapped IPv6 for IPv4) */
@@ -40,6 +54,18 @@ struct shawk_flow_key {
 	__u8 direction;               /* enum shawk_flow_direction */
 	__u8 proto;                   /* IPPROTO_TCP or IPPROTO_UDP */
 	char comm[TASK_COMM_LEN];     /* command name of the local process */
+	__u8 flags;                   /* KEY_* */
+	__u8 _pad[7];
+};
+
+/*
+ * A prefix of internal_peers: an address range whose peers are kept
+ * exact. IPv4 ranges are IPv4-mapped, so an IPv4 /n is a prefix of length
+ * 96+n.
+ */
+struct shawk_peer_prefix {
+	__u32 prefixlen;
+	__u8 addr[16];
 };
 
 struct shawk_flow_stats {

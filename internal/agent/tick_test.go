@@ -251,3 +251,77 @@ func TestTickCollectError(t *testing.T) {
 		t.Errorf("%d requests sent", exp.calls)
 	}
 }
+
+// localSource is a fakeSource that folds peers and records the addresses of
+// the host it is given.
+type localSource struct {
+	fakeSource
+	local [][]netip.Addr
+}
+
+func (s *localSource) SetLocalAddrs(addrs []netip.Addr) error {
+	s.local = append(s.local, addrs)
+	return nil
+}
+
+// TestTickFolded checks that a folded flow is sent as an edge with
+// shawk.peer.folded and the unspecified address, apart from an edge to the
+// same port with an exact peer, and that the addresses of the host are
+// given to a source that folds peers.
+func TestTickFolded(t *testing.T) {
+	folded := flow(tracer.DirIn, 443, unknownCgroup, 5)
+	folded.RemoteAddr = netip.IPv4Unspecified()
+	folded.Folded = true
+	src := &localSource{fakeSource: fakeSource{snaps: []*tracer.Snapshot{{
+		Flows: []tracer.Flow{folded, flow(tracer.DirIn, 443, unknownCgroup, 1)},
+	}}}}
+	exp := &fakeExporter{}
+	a := newTestAgent(src, exp, 0, time.Now())
+	a.cfg.Fold = tracer.FoldIn
+	if err := a.tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(src.local) != 1 {
+		t.Errorf("the addresses of the host were given %d times, want once", len(src.local))
+	}
+	var foldedEdges, exactEdges int
+	for k := range a.state.Edges() {
+		switch {
+		case k.PeerFolded && k.PeerAddr == netip.IPv4Unspecified():
+			foldedEdges++
+		case !k.PeerFolded:
+			exactEdges++
+		}
+	}
+	if foldedEdges != 1 || exactEdges != 1 {
+		t.Errorf("%d folded and %d exact edges, want 1 and 1", foldedEdges, exactEdges)
+	}
+	var marked int
+	for _, req := range exp.sent {
+		for _, m := range req.ResourceMetrics[0].ScopeMetrics[0].Metrics {
+			if m.Name != otlp.MetricConnOpened {
+				continue
+			}
+			for _, dp := range m.GetSum().DataPoints {
+				for _, kv := range dp.Attributes {
+					if kv.Key == otlp.AttrPeerFolded && kv.Value.GetBoolValue() {
+						marked++
+					}
+				}
+			}
+		}
+	}
+	if marked != 1 {
+		t.Errorf("%d data points of %s marked %s, want 1", marked, otlp.MetricConnOpened, otlp.AttrPeerFolded)
+	}
+
+	// Without folding, the addresses of the host are not needed.
+	src.local = nil
+	a.cfg.Fold = tracer.FoldNone
+	if err := a.tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(src.local) != 0 {
+		t.Errorf("the addresses of the host were given without folding")
+	}
+}

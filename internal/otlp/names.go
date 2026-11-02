@@ -52,6 +52,9 @@ const (
 	AttrTransport    = "network.transport"
 	AttrLocalAddr    = "network.local.address"
 	AttrPeerAddr     = "network.peer.address"
+	AttrPeerFolded   = "shawk.peer.folded"   // the edge bundles the peers outside the internal ranges
+	AttrPeerFold     = "shawk.peer.fold"     // resource: which edges fold their peers: none, in or all
+	AttrPeerInternal = "shawk.peer.internal" // resource: the internal ranges, whose peers are kept
 	AttrServerPort   = "server.port"
 	AttrNetNS        = "shawk.netns"
 	AttrIODirection  = "network.io.direction"

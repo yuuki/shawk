@@ -79,6 +79,57 @@ type FlowKey struct {
 	NetNS    uint32
 	CgroupID uint64
 	Comm     string
+	// Folded tells that the flow bundles the peers outside the internal
+	// ranges (see FoldMode): RemoteAddr is then 0.0.0.0 or ::, which stands
+	// for the network 0.0.0.0/0 or ::/0.
+	Folded bool
+}
+
+// RemotePrefix returns the remote address of a flow as a prefix: the
+// network 0.0.0.0/0 or ::/0 for a folded flow, a single address otherwise.
+func (k *FlowKey) RemotePrefix() netip.Prefix {
+	if k.Folded {
+		return netip.PrefixFrom(k.RemoteAddr, 0)
+	}
+	return netip.PrefixFrom(k.RemoteAddr, k.RemoteAddr.BitLen())
+}
+
+// FoldMode tells which flows fold their peers outside the internal ranges
+// into one flow per local endpoint, so that an internet-facing host does
+// not keep a flow per client address. It matches enum shawk_fold_mode of
+// the BPF programs.
+type FoldMode uint8
+
+const (
+	// FoldNone keeps the address of every peer.
+	FoldNone FoldMode = 0
+	// FoldIn folds the external peers of incoming flows (the clients of a
+	// local server); outgoing flows keep the address of their server.
+	FoldIn FoldMode = 1
+	// FoldAll folds the external peers of all flows.
+	FoldAll FoldMode = 2
+)
+
+func (m FoldMode) String() string {
+	switch m {
+	case FoldNone:
+		return "none"
+	case FoldIn:
+		return "in"
+	case FoldAll:
+		return "all"
+	}
+	return fmt.Sprintf("fold(%d)", uint8(m))
+}
+
+// ParseFoldMode parses the string form of a FoldMode.
+func ParseFoldMode(s string) (FoldMode, error) {
+	for _, m := range []FoldMode{FoldNone, FoldIn, FoldAll} {
+		if s == m.String() {
+			return m, nil
+		}
+	}
+	return 0, fmt.Errorf("invalid fold mode %q (none, in or all)", s)
 }
 
 // KernelComm is the Comm of flows and listeners whose socket belongs to the

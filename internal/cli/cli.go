@@ -107,6 +107,10 @@ func runAgent(ctx context.Context, args []string, _ io.Writer) error {
 		idleTTL  = fs.Duration("idle-ttl", 15*time.Minute, "how long a dependency is sent after its last activity")
 		netns    = fs.String("netns", "all", `network namespaces to trace: "all", "self" or an inode number`)
 		maxFlows = fs.Uint("max-flows", 16384, "capacity of the in-kernel flow table per interval; also sizes the tables of listening ports (8192 to 65536)")
+		fold     = fs.String("fold-external", "in",
+			`fold the peers outside -internal-peers into one dependency per local endpoint: "in" (the clients of local servers), "all" (also the servers of local clients) or "none"`)
+		internal = fs.String("internal-peers", "private",
+			`comma-separated address ranges whose peers are kept exact; "private" stands for the ranges not routed on the Internet (RFC 1918, CGNAT, loopback, link-local, ULA)`)
 		fallback = fs.String("service-name-fallback", "exe",
 			`name of a service without OTEL_SERVICE_NAME: "exe" (executable name) or "unit" (systemd unit)`)
 		bpfStats = fs.Bool("bpf-stats", false, "enable and send run time statistics of the BPF programs (small overhead)")
@@ -128,6 +132,14 @@ func runAgent(ctx context.Context, args []string, _ io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("%w: %v", errUsage, err)
 	}
+	foldMode, err := tracer.ParseFoldMode(*fold)
+	if err != nil {
+		return fmt.Errorf("%w: -fold-external: %v", errUsage, err)
+	}
+	internalPeers, err := agent.ParseInternalPeers(*internal)
+	if err != nil {
+		return fmt.Errorf("%w: -internal-peers: %v", errUsage, err)
+	}
 	if *endpoint == "" {
 		*endpoint = otlp.DefaultEndpoint(*protocol)
 	}
@@ -142,6 +154,8 @@ func runAgent(ctx context.Context, args []string, _ io.Writer) error {
 		IdleTTL:             *idleTTL,
 		NetNS:               ns,
 		MaxFlows:            uint32(*maxFlows),
+		Fold:                foldMode,
+		InternalPeers:       internalPeers,
 		ServiceFallback:     fb,
 		BPFStats:            *bpfStats,
 		Logger:              logger,
@@ -217,6 +231,9 @@ func printFlows(w io.Writer, flows []tracer.Flow) {
 	fmt.Fprintln(tw, "DIR\tPROTO\tLOCAL\tREMOTE\tPORT\tPROCESS\tPID\tCONNS\tOPEN\tSENT\tRECV")
 	for _, f := range flows {
 		local, remote := f.LocalAddr.String(), f.RemoteAddr.String()
+		if f.Folded {
+			remote = f.RemotePrefix().String()
+		}
 		arrow := "-->"
 		if f.Direction == tracer.DirIn {
 			arrow = "<--"
