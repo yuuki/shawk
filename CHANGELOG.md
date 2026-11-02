@@ -11,13 +11,26 @@
   `-fold-external` folds the external peers of incoming flows (`in`, the
   default), of all flows (`all`) or of none (`none`). A folded edge carries
   `shawk.peer.folded=true` with `network.peer.address` 0.0.0.0 or ::, and
-  PostgreSQL keeps its peer as the network 0.0.0.0/0 or ::/0, named
-  `~external` as before. The address of each external client is no longer
-  recorded; set `-fold-external=none` where it is needed. A fleet that uses
-  public addresses internally must add them to `-internal-peers`. Upgrade
-  the connectors before the agents: a connector of the previous version
-  keeps a folded peer as the address 0.0.0.0 or ::, which it names
-  `~unresolved`.
+  the connector writes its peer to PostgreSQL as the network 0.0.0.0/0 or
+  ::/0 and names it `~external` as before (or after a range of
+  `peer_cidrs` holding the whole network); `keep_peer_address` outputs the
+  network. The address of each external client is no longer recorded; set
+  `-fold-external=none` where it is needed. A fleet that uses public
+  addresses internally must add them to `-internal-peers`: the connector
+  logs a warning, at most once an hour per pair of hosts, when an agent
+  folds a client that runs an agent, whose connections then match on one
+  side only and are counted on both. Upgrade the connectors before the
+  agents: a connector of the previous version keeps a folded peer as the
+  address 0.0.0.0 or ::, which it names `~unresolved`.
+* The periods in which an agent dropped flows are recorded (migration 11):
+  the new table `shawk.partial_observations` and the function
+  `shawk_v1.partly_observed(since, until)`, so that the absence of a
+  dependency over them is not taken for disuse. The fleet, dependency
+  details and changes dashboards annotate them, and the fleet dashboard
+  lists them. `shawk_v1.agents` and `shawk_v1.agent_addrs` gain the columns
+  `peer_fold` and `peer_internal` at their end. Connectors of the previous
+  version keep writing during an upgrade, but do not record these periods.
+  Run `grants.sql` again after the migration.
 * The systemd units are sandboxed: the agent keeps only the capabilities it
   needs (`CAP_BPF`, `CAP_PERFMON`, `CAP_SYS_ADMIN`, `CAP_SYS_PTRACE`,
   `CAP_DAC_READ_SEARCH`) and both units filter system calls and address

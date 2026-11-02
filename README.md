@@ -18,8 +18,9 @@ anything use this host in the last 90 days, and were we watching?*
   send/receive path. Rare dependencies such as monthly batch jobs are not
   missed by sampling.
 * **History with known coverage.** Every dependency has its first and last
-  seen times, and every host its observation segments, so that "not used"
-  is told apart from "not observed".
+  seen times, and every host its observation segments and the periods in
+  which its agent dropped flows, so that "not used" is told apart from "not
+  observed" and "partly observed".
 * **Standard building blocks.** Agents speak OTLP; a component of the
   OpenTelemetry Collector writes PostgreSQL and forwards metrics to
   Prometheus; Grafana dashboards and alerts are included. Services are
@@ -144,8 +145,8 @@ dashboards and alert rules.
 
 In Grafana:
 
-* **shawk / Fleet**: agents alive, observation gaps, dropped flows, new
-  dependencies.
+* **shawk / Fleet**: agents alive, observation gaps, partly observed
+  periods, dropped flows, new dependencies.
 * **shawk / Dependency map**: services reached from the selected ones,
   upstream, downstream or both, to a depth.
 * **shawk / Dependency details**: connections, failure ratio, bytes, RTT and
@@ -165,6 +166,9 @@ WHERE server_host = 'db-01' AND server_service = 'postgres';
 
 -- When was db-01 not observed?
 SELECT * FROM shawk_v1.unobserved(now() - interval '90 days', now()) WHERE host = 'db-01';
+
+-- When did the agent of db-01 drop flows?
+SELECT * FROM shawk_v1.partly_observed(now() - interval '90 days', now()) WHERE host = 'db-01';
 ```
 
 In PromQL, with the recording rules:

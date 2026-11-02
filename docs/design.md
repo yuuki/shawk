@@ -26,8 +26,8 @@ sampling-based tracing misses. Answering those needs
 - **always-on tracing** with low overhead, so that rare dependencies are
   observed;
 - **long retention with known coverage**, so that "nobody used it in the
-  last 90 days" is a statement backed by data, and "not observed" is not
-  mistaken for "not used".
+  last 90 days" is a statement backed by data, and "not observed" (or
+  observed with dropped flows) is not mistaken for "not used".
 
 Existing eBPF service maps focus on the present state and on Kubernetes,
 and application-layer instrumentation such as OBI (OpenTelemetry eBPF
@@ -856,7 +856,9 @@ parses. shawk runs beside it instead:
   kernel's; run the agent in the host PID namespace.
 - **Flow table capacity**: when more distinct flows than `-max-flows` occur
   in one interval, updates are dropped and `shawk.agent.flows.dropped`
-  counts them; the intervals with drops are kept as partly observed (§6).
+  counts them; the periods with drops are kept as partly observed
+  (`partly_observed()`, §6), and a dependency not seen in them may still
+  have been used.
   External peers are folded (§3.6), so the flows grow with the internal
   peers and the local services, not with the clients on the Internet; a
   host with very many internal clients, or with `-fold-external=none`, may
