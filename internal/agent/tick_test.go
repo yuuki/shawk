@@ -144,7 +144,7 @@ func TestTickMergesFlows(t *testing.T) {
 }
 
 // TestTickKernelSockets checks that flows and listeners of the kernel are
-// named after their port, whatever process the kernel used.
+// named after their port and side, whatever process the kernel used.
 func TestTickKernelSockets(t *testing.T) {
 	kernel := func(dir tracer.Direction, port uint16) tracer.Flow {
 		f := flow(dir, port, 0, 1)
@@ -160,19 +160,29 @@ func TestTickKernelSockets(t *testing.T) {
 	if err := a.tick(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	services := map[uint16][]string{}
+	// The service of each side of each port.
+	services := map[string]string{}
 	for k := range a.state.Edges() {
-		services[k.Port] = append(services[k.Port], k.Service)
+		services[k.Role+"/"+strconv.Itoa(int(k.Port))] = k.Service
 		if k.Unit != "" || k.Exe != "" || k.Comm != tracer.KernelComm {
 			t.Errorf("edge to %d: process %+v", k.Port, k.Process)
 		}
 	}
 	for k := range a.state.Listeners() {
-		services[k.Port] = append(services[k.Port], k.Service)
+		services["listener/"+strconv.Itoa(int(k.Port))] = k.Service
 	}
-	for port, want := range map[uint16][]string{2049: {"~kernel:nfs", "~kernel:nfs", "~kernel:nfs"}, 40000: {"~kernel"}} {
-		if got := services[port]; len(got) != len(want) || got[0] != want[0] || got[len(got)-1] != want[0] {
-			t.Errorf("services on %d = %v, want %v", port, got, want)
+	want := map[string]string{
+		"client/2049":   "~kernel:nfs",
+		"server/2049":   "~kernel:nfsd",
+		"listener/2049": "~kernel:nfsd",
+		"client/40000":  "~kernel",
+	}
+	if len(services) != len(want) {
+		t.Errorf("services = %v, want %v", services, want)
+	}
+	for side, w := range want {
+		if got := services[side]; got != w {
+			t.Errorf("service of %s = %q, want %q", side, got, w)
 		}
 	}
 }

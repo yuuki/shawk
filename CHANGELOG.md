@@ -36,7 +36,9 @@
 * Sockets of the kernel (the clients of NFS, iSCSI, CIFS and Ceph, nfsd)
   belong to the kernel: their service is named after their port
   (`~kernel:nfs`, `~kernel:iscsi`, `~kernel:smb`, `~kernel:ceph`, ...,
-  `~kernel` for other ports) on both the client and the server side.
+  `~kernel` for other ports), and the servers of the kernel apart from its
+  clients (`~kernel:nfsd`, `~kernel:ksmbd`, `~kernel:iscsi-target`,
+  `~kernel:nvmet-tcp`).
   Previously a connection opened before the agent started was never
   accounted, and a new one was named after the kernel worker that opened it
   (`kworker/u8:2`), which changes at every reconnection: a new row in

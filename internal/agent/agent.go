@@ -241,7 +241,7 @@ func (a *Agent) observe(snap *tracer.Snapshot, start, end time.Time) {
 			PeerAddr:  f.RemoteAddr,
 			Port:      f.Port,
 			NetNS:     f.NetNS,
-			Process:   a.process(f.PID, f.Comm, f.CgroupID, f.Port, end),
+			Process:   a.process(f.PID, f.Comm, f.CgroupID, f.Port, f.Direction == tracer.DirIn, end),
 		}
 		a.state.AddEdge(k, otlp.EdgeStats{
 			Conns:      f.Conns,
@@ -262,17 +262,18 @@ func (a *Agent) observe(snap *tracer.Snapshot, start, end time.Time) {
 			Addr:    l.Addr,
 			Port:    l.Port,
 			NetNS:   l.NetNS,
-			Process: a.process(l.PID, l.Comm, l.CgroupID, l.Port, end),
+			Process: a.process(l.PID, l.Comm, l.CgroupID, l.Port, true, end),
 		}, end)
 	}
 }
 
 // process returns the identity of the owner of a flow or a listener whose
-// service port is port. Sockets of the kernel are named after the port
+// service port is port; server tells the server side, which a listener
+// always is. Sockets of the kernel are named after the port and the side
 // (procinfo.KernelServiceName); they have no unit or executable.
-func (a *Agent) process(pid uint32, comm string, cgroupID uint64, port uint16, now time.Time) otlp.Process {
+func (a *Agent) process(pid uint32, comm string, cgroupID uint64, port uint16, server bool, now time.Time) otlp.Process {
 	if tracer.KernelOwned(comm, cgroupID) {
-		return otlp.Process{Comm: comm, Service: procinfo.KernelServiceName(port)}
+		return otlp.Process{Comm: comm, Service: procinfo.KernelServiceName(port, server)}
 	}
 	return a.idents.resolve(pid, comm, procinfo.Unit(a.cgroups.CgroupPath(cgroupID)), now)
 }

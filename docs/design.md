@@ -340,11 +340,15 @@ records the kernel in its first lines.
   `~kernel:rpcbind` (111), `~kernel:smb` (139, 445), `~kernel:iscsi`
   (3260), `~kernel:ceph` (3300, 6789, 6800-7300), `~kernel:nvme-tcp` (4420,
   8009), `~kernel:drbd` (7788-7799), `~kernel:ocfs2` (7777), `~kernel:rds`
-  (16385), `~kernel:dlm` (21064), and `~kernel` for other ports; client
-  and server sides alike (the NFS client and nfsd are both
-  `~kernel:nfs`). Only sockets of the kernel are named by port; an
-  application on these ports keeps its own name. The name starts with `~`
-  like the other names shawk makes up, which `peer_cidrs` cannot take, and
+  (16385), `~kernel:dlm` (21064), and `~kernel` for other ports. The
+  servers of the kernel are named apart from its clients, so that a
+  dependency on them has two ends: `~kernel:nfsd` (2049), `~kernel:ksmbd`
+  (445), `~kernel:iscsi-target` (3260, LIO) and `~kernel:nvmet-tcp` (4420,
+  8009) on the server side; the other subsystems are clients only or peers
+  of one another and have one name. Only sockets of the kernel are named
+  by port; an application on these ports keeps its own name. The name
+  starts with `~` like the other names shawk makes up, which `peer_cidrs`
+  cannot take, and
   has no `/`, which would read as a namespace in the Prometheus `job`. The
   process has comm `~kernel`, no unit and no executable, so PostgreSQL has
   one row per host and name in `shawk.processes`, and each name is one

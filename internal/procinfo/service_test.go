@@ -100,21 +100,26 @@ func TestServiceName(t *testing.T) {
 }
 
 func TestKernelServiceName(t *testing.T) {
-	for port, want := range map[uint16]string{
-		2049:  "~kernel:nfs",
-		445:   "~kernel:smb",
-		3260:  "~kernel:iscsi",
-		6789:  "~kernel:ceph",
-		6800:  "~kernel:ceph",
-		7300:  "~kernel:ceph",
-		7301:  "~kernel",
-		7788:  "~kernel:drbd",
-		111:   "~kernel:rpcbind",
-		0:     "~kernel",
-		40000: "~kernel",
+	// The client and the server side; one name when they are the same.
+	for port, want := range map[uint16][2]string{
+		2049:  {"~kernel:nfs", "~kernel:nfsd"},
+		445:   {"~kernel:smb", "~kernel:ksmbd"},
+		139:   {"~kernel:smb", "~kernel:smb"},
+		3260:  {"~kernel:iscsi", "~kernel:iscsi-target"},
+		4420:  {"~kernel:nvme-tcp", "~kernel:nvmet-tcp"},
+		6789:  {"~kernel:ceph", "~kernel:ceph"},
+		6800:  {"~kernel:ceph", "~kernel:ceph"},
+		7300:  {"~kernel:ceph", "~kernel:ceph"},
+		7301:  {"~kernel", "~kernel"},
+		7788:  {"~kernel:drbd", "~kernel:drbd"},
+		111:   {"~kernel:rpcbind", "~kernel:rpcbind"},
+		0:     {"~kernel", "~kernel"},
+		40000: {"~kernel", "~kernel"},
 	} {
-		if got := KernelServiceName(port); got != want {
-			t.Errorf("KernelServiceName(%d) = %q, want %q", port, got, want)
+		for i, server := range []bool{false, true} {
+			if got := KernelServiceName(port, server); got != want[i] {
+				t.Errorf("KernelServiceName(%d, server=%t) = %q, want %q", port, server, got, want[i])
+			}
 		}
 	}
 }
