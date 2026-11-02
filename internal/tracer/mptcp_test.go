@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -275,11 +276,12 @@ func TestMPTCPJoin(t *testing.T) {
 	roundTrip(t, c, 1)
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		n, err := mptcpSubflows(c)
+		var joins uint64
+		run(func() { joins, err = mptcpJoins() })
 		if err != nil {
-			skipUnavailable(t, "reading MPTCP_INFO: %v", err)
+			skipUnavailable(t, "reading the MPTCP counters: %v", err)
 		}
-		if n > 0 {
+		if joins > 0 {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -323,30 +325,37 @@ func TestMPTCPJoin(t *testing.T) {
 	}
 }
 
-// mptcpSubflows returns the number of additional subflows of an MPTCP
-// connection (mptcpi_subflows of struct mptcp_info).
-func mptcpSubflows(c *net.TCPConn) (int, error) {
-	const solMPTCP, mptcpInfo = 284, 1
-	rc, err := c.SyscallConn()
+// mptcpJoins returns the number of additional subflows (MP_JOIN) completed
+// in the network namespace of the thread: MPJoinAckRx of the MPTCP MIB,
+// which the server side counts when the last ACK of a join arrives. The
+// MIB exists since Linux 5.6, unlike MPTCP_INFO (5.16, and RHEL 9 by
+// backport). /proc/thread-self is read, since /proc/self/net shows the
+// namespace of the main thread.
+func mptcpJoins() (uint64, error) {
+	b, err := os.ReadFile("/proc/thread-self/net/netstat")
 	if err != nil {
 		return 0, err
 	}
-	var (
-		n    int
-		serr error
-	)
-	err = rc.Control(func(fd uintptr) {
-		// The value is cut at its first zero byte, after the count.
-		var info string
-		info, serr = unix.GetsockoptString(int(fd), solMPTCP, mptcpInfo)
-		if len(info) > 0 {
-			n = int(info[0])
+	// Each group of counters is a line of names and a line of values, both
+	// starting with the name of the group.
+	var names []string
+	for line := range strings.Lines(string(b)) {
+		fields := strings.Fields(line)
+		if len(fields) == 0 || fields[0] != "MPTcpExt:" {
+			continue
 		}
-	})
-	if err != nil {
-		return 0, err
+		if names == nil {
+			names = fields[1:]
+			continue
+		}
+		for i, name := range names {
+			if name == "MPJoinAckRx" && i+1 < len(fields) {
+				return strconv.ParseUint(fields[i+1], 10, 64)
+			}
+		}
+		break
 	}
-	return n, serr
+	return 0, errors.New("no MPJoinAckRx in /proc/thread-self/net/netstat")
 }
 
 // Generic netlink of the MPTCP path manager (include/uapi/linux/mptcp.h).
