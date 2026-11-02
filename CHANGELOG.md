@@ -1,5 +1,24 @@
 ## Unreleased
 
+* A container keeps its name when it is recreated (#104). `shawk.unit` of a
+  process in a container was `docker-<id>`, `podman-<id>`,
+  `cri-containerd-<id>` or `crio-<id>`, so every redeploy added rows to
+  `shawk.processes` and split the history of a container. It is now
+  `k8s/<namespace>/<workload>/<container>` for a pod of Kubernetes,
+  `docker/<project>/<service>` for Docker Compose, and `docker/<name>`,
+  `podman/<name>` or `containerd/<name>` otherwise, read from the state
+  the runtime keeps on disk when the cgroup is created; the id is the new
+  attribute `container.id`. The cgroupfs drivers of Docker and kubelet
+  (`/docker/<id>`, `/kubepods/.../pod<uid>/<id>`) are recognized; their
+  processes were named after the raw id. A container whose state cannot
+  be read, such as a rootless one, is named `<runtime>-<12 hex digits>`
+  (`containerd-` rather than `cri-containerd-`). The processes of a pod of
+  Kubernetes are named after the workload of the pod (the name of the pod
+  without the suffixes Kubernetes generates) with the namespace of the
+  pod as `service.namespace`, unless they set `OTEL_SERVICE_NAME`, as OBI
+  does with the metadata of Kubernetes: their Prometheus `job` changes
+  from the executable to `<namespace>/<workload>`. The existing rows of
+  `shawk.processes` of containers keep their old units.
 * The kernel folds the peers outside the internal ranges of the host into
   one dependency per local endpoint (#96). On an internet-facing host, the
   clients of a local server on the Internet no longer make one flow, one

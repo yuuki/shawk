@@ -13,6 +13,10 @@ type Process struct {
 	Exe              string // path of the executable
 	Service          string // service.name
 	ServiceNamespace string // service.namespace
+	// ContainerID is the full id of the container of the process
+	// (container.id), which changes when the container is recreated; the
+	// unit names the container by what stays.
+	ContainerID string
 }
 
 // EdgeKey identifies an edge series.

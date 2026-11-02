@@ -20,33 +20,33 @@ func TestIdentities(t *testing.T) {
 	r.env = func(pid uint32) (map[string]string, bool) { return envs[pid], !stuck[pid] }
 
 	r.beginInterval()
-	got := r.resolve(100, "ruby", "billing.service", now)
+	got := r.resolve(100, "ruby", "billing.service", nil, now)
 	want := otlp.Process{Unit: "billing.service", Comm: "ruby", Exe: "/usr/bin/ruby", Service: "billing"}
 	if got != want {
 		t.Errorf("resolve = %+v, want %+v", got, want)
 	}
-	r.resolve(100, "ruby", "billing.service", now)
+	r.resolve(100, "ruby", "billing.service", nil, now)
 	if reads != 1 {
 		t.Errorf("/proc read %d times in an interval", reads)
 	}
-	if got := r.resolve(200, "nginx", "nginx.service", now); got.Service != "nginx" || got.Exe != "/usr/sbin/nginx" {
+	if got := r.resolve(200, "nginx", "nginx.service", nil, now); got.Service != "nginx" || got.Exe != "/usr/sbin/nginx" {
 		t.Errorf("resolve nginx = %+v", got)
 	}
 
 	// The process exited: the latest identity of the unit and comm is used.
 	delete(exes, 100)
 	r.beginInterval()
-	if got := r.resolve(100, "ruby", "billing.service", now.Add(time.Minute)); got != want {
+	if got := r.resolve(100, "ruby", "billing.service", nil, now.Add(time.Minute)); got != want {
 		t.Errorf("resolve after exit = %+v, want %+v", got, want)
 	}
 	// Unknown processes are named after comm, then the unit.
-	if got := r.resolve(0, "kworker", "", now); got != (otlp.Process{Comm: "kworker", Service: "kworker"}) {
+	if got := r.resolve(0, "kworker", "", nil, now); got != (otlp.Process{Comm: "kworker", Service: "kworker"}) {
 		t.Errorf("resolve without a process = %+v", got)
 	}
-	if got := r.resolve(0, "", "nfs-server.service", now); got.Service != "nfs-server.service" {
+	if got := r.resolve(0, "", "nfs-server.service", nil, now); got.Service != "nfs-server.service" {
 		t.Errorf("resolve without comm = %+v", got)
 	}
-	if got := r.resolve(0, "", "", now); got.Service != procinfo.UnknownService {
+	if got := r.resolve(0, "", "", nil, now); got.Service != procinfo.UnknownService {
 		t.Errorf("resolve without anything = %+v", got)
 	}
 
@@ -55,7 +55,7 @@ func TestIdentities(t *testing.T) {
 	exes[100] = "/usr/bin/ruby"
 	stuck[100] = true
 	r.beginInterval()
-	if got := r.resolve(100, "ruby", "billing.service", now.Add(2*time.Minute)); got != want {
+	if got := r.resolve(100, "ruby", "billing.service", nil, now.Add(2*time.Minute)); got != want {
 		t.Errorf("resolve of a stuck process = %+v, want %+v", got, want)
 	}
 
@@ -89,7 +89,7 @@ func TestPrefetchBudget(t *testing.T) {
 	// An earlier interval left an identity for one of the stuck ones.
 	r.beginInterval()
 	r.byPID[1000] = procRead{exe: "/usr/bin/app", env: map[string]string{"OTEL_SERVICE_NAME": "known"}, complete: true}
-	r.resolve(1000, "app", "known.service", now)
+	r.resolve(1000, "app", "known.service", nil, now)
 
 	r.beginInterval()
 	pids := []uint32{1, 2, 3}
@@ -101,15 +101,15 @@ func TestPrefetchBudget(t *testing.T) {
 	if d := time.Since(start); d > time.Second {
 		t.Errorf("prefetch took %s with a budget of %s", d, r.budget)
 	}
-	if got := r.resolve(2, "app", "", now); got.Service != "svc" {
+	if got := r.resolve(2, "app", "", nil, now); got.Service != "svc" {
 		t.Errorf("a process read in time = %+v", got)
 	}
-	if got := r.resolve(1000, "app", "known.service", now); got.Service != "known" {
+	if got := r.resolve(1000, "app", "known.service", nil, now); got.Service != "known" {
 		t.Errorf("a stuck process with an earlier identity = %+v", got)
 	}
 	// One without an earlier identity is named without its environment, and
 	// /proc is not read again in the interval.
-	if got := r.resolve(1050, "worker", "", now); got.Service != "worker" {
+	if got := r.resolve(1050, "worker", "", nil, now); got.Service != "worker" {
 		t.Errorf("a stuck process without an earlier identity = %+v", got)
 	}
 }
@@ -123,11 +123,11 @@ func TestReusedPID(t *testing.T) {
 	r.comm = func(uint32) string { return "python3" }
 	r.env = func(uint32) (map[string]string, bool) { return map[string]string{"OTEL_SERVICE_NAME": "billing"}, true }
 	r.beginInterval()
-	if got := r.resolve(100, "python3", "billing.service", now); got.Service != "billing" {
+	if got := r.resolve(100, "python3", "billing.service", nil, now); got.Service != "billing" {
 		t.Errorf("resolve = %+v", got)
 	}
 	// The flow of a curl that exited; its PID now runs python3.
-	if got := r.resolve(100, "curl", "billing.service", now); got.Service != "curl" || got.Exe != "" {
+	if got := r.resolve(100, "curl", "billing.service", nil, now); got.Service != "curl" || got.Exe != "" {
 		t.Errorf("resolve of a reused PID = %+v", got)
 	}
 }

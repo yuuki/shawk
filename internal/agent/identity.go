@@ -151,8 +151,9 @@ func (r *identities) readNow(pid uint32) procRead {
 	return p
 }
 
-// resolve returns the identity of the process pid with comm in unit.
-func (r *identities) resolve(pid uint32, comm, unit string, now time.Time) otlp.Process {
+// resolve returns the identity of the process pid with comm in unit, which
+// is the unit of the container ctr if it is not nil.
+func (r *identities) resolve(pid uint32, comm, unit string, ctr *procinfo.Container, now time.Time) otlp.Process {
 	k := unitComm{unit, comm}
 	p := r.read(pid)
 	if p.comm != "" && p.comm != comm {
@@ -168,8 +169,11 @@ func (r *identities) resolve(pid uint32, comm, unit string, now time.Time) otlp.
 			return l.proc
 		}
 	}
-	svc := procinfo.ServiceName(p.env, p.exe, comm, unit, r.fallback)
+	svc := procinfo.ServiceName(p.env, p.exe, comm, unit, ctr.Workload(), r.fallback)
 	proc := otlp.Process{Unit: unit, Comm: comm, Exe: p.exe, Service: svc.Name, ServiceNamespace: svc.Namespace}
+	if ctr != nil {
+		proc.ContainerID = ctr.ID
+	}
 	if p.exe != "" && p.complete {
 		r.latest[k] = latestIdentity{proc: proc, at: now}
 	}

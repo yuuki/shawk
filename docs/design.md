@@ -402,14 +402,51 @@ about agents whose peers are folded that way (§5.2).
   short-lived job is often removed before the end of the interval,
   `tp_btf/cgroup_mkdir` reports the path of every cgroup when it is created,
   and the agent keeps it for an hour.
+- A container is named after what stays the same when it is recreated, not
+  after its id: `k8s/<namespace>/<workload>/<container>` for a container of
+  a pod of Kubernetes, `docker/<project>/<service>` for Docker Compose,
+  `docker/<name>`, `podman/<name>` or `containerd/<name>` (nerdctl)
+  otherwise. Its full id is the attribute `container.id`. The agent finds
+  the container in the cgroup path, made by the systemd driver of the
+  runtime (`docker-<id>.scope`, `libpod-<id>.scope`,
+  `cri-containerd-<id>.scope`, `crio-<id>.scope`, `nerdctl-<id>.scope`) or
+  by its cgroupfs driver (`/docker/<id>`, `/libpod_parent/libpod-<id>`,
+  `/kubepods/<class>/pod<uid>/<id>`, `crio-<id>`), and reads the names
+  from the state the runtime keeps on disk: `config.v2.json` of Docker
+  (under `data-root` of `/etc/docker/daemon.json`, by default
+  `/var/lib/docker`), `containers.json` of containers/storage for Podman,
+  and the annotations of the `config.json` of the OCI bundle for
+  containerd (`/run/containerd/io.containerd.runtime.v2.task`) and CRI-O
+  (`/run/containers/storage`). The APIs of the runtimes are on Unix
+  sockets, which the agent's unit does not allow. The state is read when
+  the cgroup is created, so that a container removed within an interval
+  keeps its name, and kept for an hour after its last use. A container
+  whose state cannot be read (a rootless container, whose state is in the
+  home directory the unit hides, or a runtime with another state
+  directory) is named `<runtime>-<12 hex digits of the id>`, which changes
+  when it is recreated. The workload of a pod is the name of the pod
+  without the suffixes Kubernetes appends to the pods it creates
+  (`web-5d8f7c9b6-x7z2k` and `node-exporter-x7z2k` become `web` and
+  `node-exporter`, `db-0` becomes `db`); the owner of a pod is known only
+  to the API server, which the agent does not ask, so a pod named by hand
+  that ends like a generated name loses that end too.
 - `service.name` follows the order of OBI, so that both name a service the
   same way: `OTEL_SERVICE_NAME`, then `service.name` in
   `OTEL_RESOURCE_ATTRIBUTES` of the process (only the `OTEL_` variables of
   `/proc/PID/environ` are read; the rest is discarded as soon as it is
-  read), then the base name of the executable, then comm, then the unit,
-  then `~unknown` (a socket whose owner is not known).
+  read), then the workload of the pod of Kubernetes of the process, then
+  the base name of the executable, then comm, then the unit, then
+  `~unknown` (a socket whose owner is not known).
   `-service-name-fallback=unit` uses the unit instead of the executable.
-  `service.namespace` is read from `OTEL_RESOURCE_ATTRIBUTES`.
+  `service.namespace` is read from `OTEL_RESOURCE_ATTRIBUTES`, else it is
+  the namespace of the pod. OBI with the metadata of Kubernetes names the
+  processes of a pod the same way (it also reads the annotations and
+  labels of the pod, such as `app.kubernetes.io/name`, which the agent
+  cannot see), and other containers after their executable, so the `job`
+  in Prometheus is the same for both. Containers of Docker or Podman that
+  run the same executable share a service name unless they set
+  `OTEL_SERVICE_NAME`, as with OBI, but PostgreSQL tells them apart by
+  unit; `-service-name-fallback=unit` names them after their unit.
 - Sockets of the kernel (§3.2) are named after their service port, the
   one thing that stays the same across reconnections: `~kernel:nfs` (2049),
   `~kernel:rpcbind` (111), `~kernel:smb` (139, 445), `~kernel:iscsi`
@@ -457,7 +494,8 @@ about agents whose peers are folded that way (§5.2).
 
 Every edge (a bundled flow with its process identity) is a series with the
 attributes `service.name`, `service.namespace`, `process.executable.name`,
-`process.executable.path`, `process.command`, `shawk.unit`, `shawk.role`
+`process.executable.path`, `process.command`, `shawk.unit`, `container.id`
+(for a process in a container), `shawk.role`
 (`client` or `server`), `network.transport`, `network.local.address`,
 `network.peer.address`, `server.port` (the service port, whatever the role)
 and `shawk.netns`, and `shawk.peer.folded=true` when the edge bundles the

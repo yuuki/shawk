@@ -1,5 +1,5 @@
 // Package procinfo resolves the identity of processes observed by the
-// tracer: cgroup paths, systemd unit names and executables.
+// tracer: cgroup paths, systemd unit names, containers and executables.
 package procinfo
 
 import (
@@ -25,9 +25,10 @@ const (
 	maxLearned = 100000
 )
 
-// Resolver maps cgroup ids to cgroup paths.
+// Resolver maps cgroup ids to cgroup paths and units.
 type Resolver struct {
-	root string // mount point of the cgroup v2 hierarchy
+	root       string // mount point of the cgroup v2 hierarchy
+	containers *Containers
 
 	mu       sync.Mutex
 	paths    map[uint64]string
@@ -44,17 +45,19 @@ type learnedPath struct {
 // are resolved.
 func NewResolver() *Resolver {
 	return &Resolver{
-		root:    cgroup2Mount("/proc/self/mountinfo"),
-		paths:   map[uint64]string{},
-		learned: map[uint64]learnedPath{},
+		root:       cgroup2Mount("/proc/self/mountinfo"),
+		containers: NewContainers(),
+		paths:      map[uint64]string{},
+		learned:    map[uint64]learnedPath{},
 	}
 }
 
 // Learn records the path of a cgroup reported when it was created, so that
-// it can be resolved after the cgroup is removed.
+// it can be resolved after the cgroup is removed. The state of the
+// container of the cgroup is read then too, while the runtime still has
+// it: a container removed within an interval keeps its name.
 func (r *Resolver) Learn(id uint64, path string) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if len(r.learned) >= maxLearned {
 		r.expire(time.Now())
 		if len(r.learned) >= maxLearned {
@@ -62,6 +65,28 @@ func (r *Resolver) Learn(id uint64, path string) {
 		}
 	}
 	r.learned[id] = learnedPath{path: path, at: time.Now()}
+	r.mu.Unlock()
+	if r.containers != nil {
+		if _, ok := cgroupContainer(path); ok {
+			r.unit(path)
+		}
+	}
+}
+
+// Unit returns the unit of the cgroup id (see Unit), and its container if
+// it is one. The unit of a container is named after its state, which the
+// runtime keeps on disk (see Container.Unit).
+func (r *Resolver) Unit(id uint64) (string, *Container) {
+	return r.unit(r.CgroupPath(id))
+}
+
+func (r *Resolver) unit(path string) (string, *Container) {
+	ref, ok := cgroupContainer(path)
+	if !ok || r.containers == nil {
+		return Unit(path), nil
+	}
+	ctr := r.containers.Lookup(ref.runtime, ref.id)
+	return ctr.Unit(), ctr
 }
 
 func (r *Resolver) expire(now time.Time) {
@@ -119,6 +144,9 @@ func (r *Resolver) scan() {
 	r.paths = paths
 	r.lastScan = time.Now()
 	r.expire(r.lastScan)
+	if r.containers != nil {
+		r.containers.expire(r.lastScan)
+	}
 }
 
 func cgroup2Mount(mountinfo string) string {
@@ -162,8 +190,7 @@ func unescapeMount(s string) string {
 }
 
 var (
-	containerScope = regexp.MustCompile(`^(docker|libpod|cri-containerd|crio)-([0-9a-f]{12})[0-9a-f]*\.scope$`)
-	sessionScope   = regexp.MustCompile(`^session-[^.]+\.scope$`)
+	sessionScope = regexp.MustCompile(`^session-[^.]+\.scope$`)
 	// Names systemd-run gives transient units without --unit:
 	//   run-<pid>                   systemd 228 and earlier
 	//   run-u<n>, run-u<n>-s<m>     after the D-Bus connection (229-256;
@@ -178,10 +205,13 @@ var (
 // Unit derives a stable name of the service a process belongs to from its
 // cgroup path. Names that change at every run, such as login sessions and
 // transient units, are normalized so that dependencies of the same service
-// accumulate under one name.
+// accumulate under one name. A container is named after its runtime and
+// abbreviated id, which Resolver.Unit replaces with a stable name when the
+// runtime has its state.
 //
 //	/system.slice/nginx.service                      -> nginx.service
 //	/system.slice/docker-0123456789ab....scope       -> docker-0123456789ab
+//	/kubepods/burstable/pod<uid>/0123456789ab...     -> container-0123456789ab
 //	/user.slice/user-1000.slice/session-3.scope      -> user-1000.slice/session.scope
 //	/user.slice/user-1000.slice/user@1000.service/app.slice/foo.service
 //	                                                 -> user@1000.service/foo.service
@@ -193,12 +223,8 @@ func Unit(cgroupPath string) string {
 	}
 	for i := len(parts) - 1; i >= 0; i-- {
 		p := parts[i]
-		if m := containerScope.FindStringSubmatch(p); m != nil {
-			kind := m[1]
-			if kind == "libpod" {
-				kind = "podman"
-			}
-			return kind + "-" + m[2]
+		if runtime, id, ok := containerOf(parts, i); ok {
+			return (&Container{Runtime: runtimeOrAny(runtime), ID: id}).Unit()
 		}
 		if runScope.MatchString(p) {
 			return "run." + p[strings.LastIndexByte(p, '.')+1:]
@@ -221,6 +247,34 @@ func Unit(cgroupPath string) string {
 		}
 	}
 	return parts[len(parts)-1]
+}
+
+// containerRef identifies a container by the cgroup the runtime made for
+// it; runtime is "" when the cgroup does not tell it.
+type containerRef struct{ runtime, id string }
+
+// cgroupContainer finds the container of a cgroup path: the innermost
+// cgroup of a container, unless a unit of systemd in the container is
+// deeper, as Unit does.
+func cgroupContainer(cgroupPath string) (containerRef, bool) {
+	parts := strings.FieldsFunc(cgroupPath, func(r rune) bool { return r == '/' })
+	for i := len(parts) - 1; i >= 0; i-- {
+		if runtime, id, ok := containerOf(parts, i); ok {
+			return containerRef{runtime, id}, true
+		}
+		p := parts[i]
+		if runScope.MatchString(p) || sessionScope.MatchString(p) || strings.HasSuffix(p, ".service") {
+			return containerRef{}, false
+		}
+	}
+	return containerRef{}, false
+}
+
+func runtimeOrAny(runtime string) string {
+	if runtime == "" {
+		return "container"
+	}
+	return runtime
 }
 
 // Comm returns the command name of a process (of its main thread), or "" if
