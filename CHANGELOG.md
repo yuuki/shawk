@@ -55,6 +55,22 @@
   aarch64) and upstream 5.14 and 5.15 in virtual machines (`make vm-test`),
   and on an arm64 runner. On Rocky Linux 9 on aarch64, which has no BPF
   trampolines, UDP is not traced.
+* Fixed: on kernels before 6.4, such as RHEL 9 and upstream 5.14, two
+  CPUs that created the same flow at once could lose a connection or its
+  bytes, counted in `shawk.agent.flows.dropped` as if the flow table were
+  full (#119): the `-EEXIST` of the CPU that lost the race was not
+  recognized, since the map operation returns it in 32 bits. A connection
+  whose count fails is now counted by its next walk or its close. An update
+  refused with `-EBUSY`, because another update of the same bucket is in
+  progress on the same CPU, is tried again, and the agent warns about those
+  lost, apart from the drops.
+* Fixed: UDP direction (#99). A connected client socket that existed before
+  the agent started and receives before it sends again, e.g. of a busy
+  resolver, is no longer recorded as a server of its own port; a socket on
+  a fixed port that queries servers and also answers clients, like ntpd,
+  records its clients as incoming instead of outgoing flows to each client
+  port; and the connected per-client sockets of a QUIC server started since
+  the last walk are servers.
 * Fixed: a UDP GSO send or GRO receive counted as one datagram, a peeked
   empty datagram counted twice, and IPv6 datagrams with extension headers
   were not counted.

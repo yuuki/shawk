@@ -717,3 +717,75 @@ func ipRule(t *testing.T, msgType uint16, table, action uint8, priority uint32, 
 		t.Fatalf("routing rule %d: %v", msgType, err)
 	}
 }
+
+// TestTCPManyShortConnections opens many short connections from several
+// goroutines at once, so that CPUs race to create the same flow and
+// contend for the locks of the flow table (#119). On kernels before 6.4,
+// such as upstream 5.14, the -EEXIST of the CPU that lost the race reads
+// as 0xffffffef in 64 bits, and was taken for a full table. Every
+// connection must be counted on both sides, and nothing counts as dropped.
+func TestTCPManyShortConnections(t *testing.T) {
+	tr := newTestTracer(t)
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go echo(c)
+		}
+	}()
+	srv := ln.Addr().(*net.TCPAddr).AddrPort()
+
+	const workers, perWorker = 8, 2500
+	errs := make(chan error, workers)
+	for range workers {
+		go func() {
+			buf := make([]byte, 1)
+			for range perWorker {
+				c, err := net.Dial("tcp4", srv.String())
+				if err != nil {
+					errs <- err
+					return
+				}
+				if _, err := c.Write(buf); err == nil {
+					_, err = io.ReadFull(c, buf)
+				}
+				c.Close()
+				if err != nil {
+					errs <- err
+					return
+				}
+			}
+			errs <- nil
+		}()
+	}
+	for range workers {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The servers close their side once they read the FIN.
+	time.Sleep(500 * time.Millisecond)
+
+	snap := collect(t, tr)
+	const conns = workers * perWorker
+	t.Logf("flow updates retried after contention: %d, lost to it: %d", snap.Retried, snap.Contended)
+	if snap.Drops != 0 {
+		t.Errorf("%d flow updates counted as dropped for a full flow table", snap.Drops)
+	}
+	for _, dir := range []Direction{DirOut, DirIn} {
+		f := findFlow(snap.Flows, dir, ProtoTCP, srv.Port(), srv.Addr())
+		if f == nil {
+			t.Fatalf("flow %v not found in %+v", dir, snap.Flows)
+		}
+		if f.Conns != conns || f.BytesSent != conns || f.BytesRecv != conns {
+			t.Errorf("flow %v: conns = %d, bytes sent/received = %d/%d, want %d each", dir, f.Conns, f.BytesSent, f.BytesRecv, conns)
+		}
+	}
+}

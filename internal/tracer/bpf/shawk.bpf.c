@@ -29,7 +29,8 @@
  * UDP
  *   - fentry/ip_send_skb, fentry/ip6_send_skb and fentry/skb_consume_udp
  *     bundle datagrams in process context. The direction of a socket is
- *     decided by its first datagram (see udp_direction()).
+ *     decided by its first datagram (see udp_direction()), and per peer on
+ *     a client socket that may also serve (see udp_peer_direction()).
  *
  * Bundled flows are written into one of two hash maps. User space flips the
  * active map at every interval and drains the inactive one, so that no
@@ -55,6 +56,7 @@ char LICENSE[] SEC("license") = "Dual BSD/GPL";
 #define AF_INET 2
 #define AF_INET6 10
 #define EEXIST 17
+#define EBUSY 16
 #define SOCK_DGRAM 2
 #define SOCK_BINDPORT_LOCK 8
 /*
@@ -109,6 +111,17 @@ volatile __u32 self_tgid = 0xffffffff;
 volatile __u32 owner_scan = 0;
 /* Flow updates dropped because the flow table was full. */
 __u64 flow_drops = 0;
+/*
+ * Insertions into the flow table that the kernel refused with -EBUSY, which
+ * a hash map returns when a program updates it while another update of a
+ * key of the same lock slot is in progress on the same CPU: an update
+ * nested in an interrupted one, or, on kernels that take the slot without
+ * disabling preemption (upstream 5.14), in a preempting task. They are not
+ * drops of a full table. flow_retries counts those retried, flow_busy those
+ * that failed again and were lost.
+ */
+__u64 flow_retries = 0;
+__u64 flow_busy = 0;
 /*
  * TCP connections opened without socket storage, which the next walk adopts:
  * their connection and the traffic until then are not counted.
@@ -182,10 +195,17 @@ struct {
 	__type(value, __u8);
 } udp_listen_ports SEC(".maps");
 
-/* Direction of a UDP socket, decided by its first datagram. */
+/*
+ * Direction of a UDP socket, decided by its first datagram (zero until
+ * then).
+ */
 struct shawk_udp_state {
 	__u32 dir;
+	__u32 flags;
 };
+
+/* Flags of struct shawk_udp_state. */
+#define US_PREEXISTING (1U << 0) /* found by the walk at startup */
 
 struct {
 	__uint(type, BPF_MAP_TYPE_SK_STORAGE);
@@ -193,6 +213,28 @@ struct {
 	__type(key, int);
 	__type(value, struct shawk_udp_state);
 } udp_states SEC(".maps");
+
+struct shawk_udp_peer_key {
+	__u64 cookie; /* of the socket */
+	__u8 addr[16];
+	__u16 port;
+	__u16 _pad[3];
+};
+
+/*
+ * Direction per peer of the UDP sockets that may play both roles: sockets
+ * bound to a port outside the ephemeral range that are not connected and
+ * sent their first datagram, such as the socket of ntpd, which queries its
+ * upstream servers and answers its clients on port 123. A peer that the
+ * socket sent to first is a server, one that sent first to the socket is a
+ * client (see udp_peer_direction()). Its capacity is set by user space.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 8192);
+	__type(key, struct shawk_udp_peer_key);
+	__type(value, __u32);
+} udp_peers SEC(".maps");
 
 /* The process an MPTCP connection belongs to. */
 struct shawk_owner {
@@ -536,7 +578,14 @@ flow_get(const struct shawk_flow_key *k)
 	struct shawk_flow_stats *fs;
 	__u32 idx = active_idx & 1;
 	void *map;
-	long err;
+	/*
+	 * Before Linux 6.4 the map operations that the JIT calls directly
+	 * return an int, and the upper half of the result is not
+	 * sign-extended: -EEXIST reads as 0xffffffef in 64 bits. Only the lower
+	 * half is compared, or losing a race to insert the same key on another
+	 * CPU would be taken for a drop and lose the update (#119).
+	 */
+	int err;
 
 	__builtin_memcpy(&key, k, sizeof(key));
 	map = bpf_map_lookup_elem(&flows, &idx);
@@ -546,6 +595,18 @@ flow_get(const struct shawk_flow_key *k)
 	if (fs)
 		return fs;
 	err = bpf_map_update_elem(map, &key, &zero, BPF_NOEXIST);
+	if (err == -EBUSY) {
+		/*
+		 * A preempted update usually completed meanwhile; one this
+		 * program interrupted cannot, and fails again.
+		 */
+		__sync_fetch_and_add(&flow_retries, 1);
+		err = bpf_map_update_elem(map, &key, &zero, BPF_NOEXIST);
+		if (err == -EBUSY) {
+			__sync_fetch_and_add(&flow_busy, 1);
+			return NULL;
+		}
+	}
 	if (err && err != -EEXIST) {
 		__sync_fetch_and_add(&flow_drops, 1);
 		return NULL;
@@ -672,19 +733,24 @@ static __always_inline bool ss_ready(const struct shawk_sock_state *ss)
 	return (ss->flags & (SS_READY | SS_IGNORE)) == SS_READY;
 }
 
+/*
+ * Counts an established connection once. When the flow cannot be updated,
+ * the connection stays uncounted and its next event (a walk or its close)
+ * counts it.
+ */
 static __always_inline void count_conn(struct shawk_sock_state *ss)
 {
 	struct shawk_flow_stats *fs;
 
 	if (ss->flags & SS_COUNTED)
 		return;
-	ss->flags |= SS_COUNTED;
 	fs = flow_get(&ss->key);
-	if (fs) {
-		__sync_fetch_and_add(&fs->conns, 1);
-		if (ss->pid)
-			fs->pid = ss->pid;
-	}
+	if (!fs)
+		return;
+	ss->flags |= SS_COUNTED;
+	__sync_fetch_and_add(&fs->conns, 1);
+	if (ss->pid)
+		fs->pid = ss->pid;
 }
 
 /*
@@ -910,6 +976,8 @@ int BPF_PROG(shawk_inet_sock_set_state, const struct sock *csk, int oldstate,
 	tp = bpf_skc_to_tcp_sock(sk);
 	if (!tp)
 		return 0;
+	/* A connection whose count failed when it was established. */
+	count_conn(ss);
 	/*
 	 * A connection whose traffic the last walk accounted, e.g. one reset
 	 * since, adds nothing: no empty flow is created.
@@ -1083,6 +1151,8 @@ int shawk_iter_tcp(struct bpf_iter__tcp *ctx)
 	fs = flow_get(&ss->key);
 	if (!fs)
 		return 0;
+	/* A connection whose count failed when it was established. */
+	count_conn(ss);
 	if (take_tcp_delta(ss, sk, tp, state, &d))
 		add_tcp_delta(fs, &d);
 	/* An MPTCP connection is open once, whatever its subflows. */
@@ -1116,25 +1186,77 @@ static __always_inline bool port_bound(const struct sock *sk)
  * A socket that sends first is still a server when it uses the port of a
  * known server socket, e.g. the per-client connected sockets of a QUIC
  * server. Server sockets that existed before the tracer started are marked
- * by iter/udp at startup.
+ * by iter/udp at startup, and a socket that receives first records its
+ * port at once, so that the connected sockets a new server opens next on
+ * its port are servers too, before the next walk.
+ *
+ * A connected socket that receives first is a client when the kernel chose
+ * its port, which no client could have known, and when it existed before the
+ * tracer started and is not on the port of a server socket: a client that
+ * sent its datagrams before (#99).
  */
 static __always_inline __u32 udp_direction(struct sock *sk, __u32 netns,
 					   __u16 lport, bool sending)
 {
 	struct shawk_listen_key lk = {.netns = netns, .port = lport};
 	struct shawk_udp_state *us;
+	bool listening, connected;
 	__u32 dir = DIR_IN;
+	__u8 one = 1;
 
 	us = bpf_sk_storage_get(&udp_states, sk, NULL, 0);
-	if (us)
+	if (us && us->dir)
 		return us->dir;
-	if (sending && !bpf_map_lookup_elem(&udp_listen_ports, &lk))
+	listening = bpf_map_lookup_elem(&udp_listen_ports, &lk) != NULL;
+	connected = BPF_CORE_READ(sk, __sk_common.skc_dport) != 0;
+	if (sending) {
+		if (!listening)
+			dir = DIR_OUT;
+	} else if (connected && !listening &&
+		   (!port_bound(sk) || (us && (us->flags & US_PREEXISTING)))) {
 		dir = DIR_OUT;
-	us = bpf_sk_storage_get(&udp_states, sk, NULL,
-				BPF_SK_STORAGE_GET_F_CREATE);
+	} else if (!connected && !listening && lport) {
+		if (bpf_map_update_elem(&udp_listen_ports, &lk, &one, BPF_ANY))
+			__sync_fetch_and_add(&listen_port_drops, 1);
+	}
+	if (!us)
+		us = bpf_sk_storage_get(&udp_states, sk, NULL,
+					BPF_SK_STORAGE_GET_F_CREATE);
 	if (us)
 		us->dir = dir;
 	return dir;
+}
+
+/*
+ * Returns the direction of a datagram to or from the peer raddr:rport on a
+ * socket whose direction is dir. On a socket that sent first from a bound
+ * port outside the ephemeral range, a peer that sent to it first is a
+ * client; the peers it sent to are remembered in udp_peers. A server
+ * socket keeps its direction for every peer: a reply to a client that
+ * udp_peers no longer held would make an outgoing flow per client port.
+ */
+static __always_inline __u32 udp_peer_direction(struct sock *sk, __u32 dir,
+						__u16 lport, const __u8 *raddr,
+						__u16 rport, bool sending)
+{
+	struct shawk_udp_peer_key pk = {};
+	__u32 *pd, in = DIR_IN;
+
+	if (dir != DIR_OUT || ephemeral(lport) || !port_bound(sk) ||
+	    BPF_CORE_READ(sk, __sk_common.skc_dport))
+		return dir;
+	pk.cookie = bpf_get_socket_cookie(sk);
+	__builtin_memcpy(pk.addr, raddr, 16);
+	pk.port = rport;
+	pd = bpf_map_lookup_elem(&udp_peers, &pk);
+	if (pd)
+		return *pd;
+	if (sending) {
+		bpf_map_update_elem(&udp_peers, &pk, &dir, BPF_NOEXIST);
+		return DIR_OUT;
+	}
+	bpf_map_update_elem(&udp_peers, &pk, &in, BPF_NOEXIST);
+	return DIR_IN;
 }
 
 /* Whether a UDP socket is an unconnected server socket worth listing. */
@@ -1145,7 +1267,7 @@ static __always_inline bool udp_listener(struct sock *sk, __u16 port)
 	if (!port || BPF_CORE_READ(sk, __sk_common.skc_dport))
 		return false;
 	us = bpf_sk_storage_get(&udp_states, sk, NULL, 0);
-	if (us)
+	if (us && us->dir)
 		return us->dir == DIR_IN;
 	/* Idle since the tracer started: trust an explicitly bound port. */
 	return port_bound(sk) && !ephemeral(port);
@@ -1275,6 +1397,8 @@ static __always_inline int handle_udp_send(struct sk_buff *skb)
 	__builtin_memcpy(key.laddr, h.saddr, 16);
 	__builtin_memcpy(key.raddr, h.daddr, 16);
 	key.direction = udp_direction(sk, key.netns, h.sport, true);
+	key.direction = udp_peer_direction(sk, key.direction, h.sport, h.daddr,
+					   h.dport, true);
 	key.port = key.direction == DIR_IN ? h.sport : h.dport;
 	key.proto = IPPROTO_UDP;
 	tgid = set_udp_owner(&key, sk, tgid);
@@ -1334,6 +1458,8 @@ int BPF_PROG(shawk_skb_consume_udp, struct sock *sk, struct sk_buff *skb,
 	__builtin_memcpy(key.laddr, h.daddr, 16);
 	__builtin_memcpy(key.raddr, h.saddr, 16);
 	key.direction = udp_direction(sk, key.netns, h.dport, false);
+	key.direction = udp_peer_direction(sk, key.direction, h.dport, h.saddr,
+					   h.sport, false);
 	key.port = key.direction == DIR_IN ? h.dport : h.sport;
 	key.proto = IPPROTO_UDP;
 	tgid = set_udp_owner(&key, sk, tgid);
@@ -1377,12 +1503,20 @@ int shawk_iter_udp(struct bpf_iter__udp *ctx)
 	if (!netns_ok(netns))
 		return 0;
 	port = BPF_CORE_READ(sk, __sk_common.skc_num);
-	if (initial_scan && port && port_bound(sk) &&
-	    !BPF_CORE_READ(sk, __sk_common.skc_dport)) {
+	/*
+	 * At startup, bound sockets that are not connected are servers. The
+	 * connected ones are marked so that receiving first does not make them
+	 * servers (see udp_direction()).
+	 */
+	if (initial_scan && port && port_bound(sk)) {
 		us = bpf_sk_storage_get(&udp_states, udp, NULL,
 					BPF_SK_STORAGE_GET_F_CREATE);
-		if (us && !us->dir)
-			us->dir = DIR_IN;
+		if (us && !us->dir) {
+			if (BPF_CORE_READ(sk, __sk_common.skc_dport))
+				us->flags |= US_PREEXISTING;
+			else
+				us->dir = DIR_IN;
+		}
 	}
 	if (!udp_listener(sk, port))
 		return 0;

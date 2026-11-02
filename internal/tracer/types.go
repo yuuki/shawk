@@ -194,6 +194,12 @@ type Snapshot struct {
 	// Drops is the cumulative number of flow updates dropped because the
 	// flow table was full.
 	Drops uint64
+	// Retried is the cumulative number of insertions into the flow table
+	// that the kernel refused because another update on the same CPU held
+	// the lock of their bucket, and that were tried again; Contended is
+	// the number of those that failed again and were lost. They are not
+	// counted in Drops (#119).
+	Retried, Contended uint64
 }
 
 func addrFrom16(b [16]uint8) netip.Addr {

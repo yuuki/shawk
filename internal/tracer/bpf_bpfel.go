@@ -94,9 +94,18 @@ type bpfShawkSockState struct {
 	Pad         uint32
 }
 
+type bpfShawkUdpPeerKey struct {
+	_      structs.HostLayout
+	Cookie uint64
+	Addr   [16]uint8
+	Port   uint16
+	Pad    [3]uint16
+}
+
 type bpfShawkUdpState struct {
-	_   structs.HostLayout
-	Dir uint32
+	_     structs.HostLayout
+	Dir   uint32
+	Flags uint32
 }
 
 // Names of all BPF objects in the ELF.
@@ -112,6 +121,7 @@ const (
 	bpfMapMptcpOwners            = "mptcp_owners"
 	bpfMapSockStates             = "sock_states"
 	bpfMapUdpListenPorts         = "udp_listen_ports"
+	bpfMapUdpPeers               = "udp_peers"
 	bpfMapUdpStates              = "udp_states"
 	bpfProgShawkCgroupMkdir      = "shawk_cgroup_mkdir"
 	bpfProgShawkInetSockSetState = "shawk_inet_sock_set_state"
@@ -126,7 +136,9 @@ const (
 	bpfVarCgroupEventDrops       = "cgroup_event_drops"
 	bpfVarEphPortHigh            = "eph_port_high"
 	bpfVarEphPortLow             = "eph_port_low"
+	bpfVarFlowBusy               = "flow_busy"
 	bpfVarFlowDrops              = "flow_drops"
+	bpfVarFlowRetries            = "flow_retries"
 	bpfVarFoldMode               = "fold_mode"
 	bpfVarInitialScan            = "initial_scan"
 	bpfVarLearnSelf              = "learn_self"
@@ -204,6 +216,7 @@ type bpfMapSpecs struct {
 	MptcpOwners    *ebpf.MapSpec `ebpf:"mptcp_owners"`
 	SockStates     *ebpf.MapSpec `ebpf:"sock_states"`
 	UdpListenPorts *ebpf.MapSpec `ebpf:"udp_listen_ports"`
+	UdpPeers       *ebpf.MapSpec `ebpf:"udp_peers"`
 	UdpStates      *ebpf.MapSpec `ebpf:"udp_states"`
 }
 
@@ -216,7 +229,9 @@ type bpfVariableSpecs struct {
 	CgroupEventDrops  *ebpf.VariableSpec `ebpf:"cgroup_event_drops"`
 	EphPortHigh       *ebpf.VariableSpec `ebpf:"eph_port_high"`
 	EphPortLow        *ebpf.VariableSpec `ebpf:"eph_port_low"`
+	FlowBusy          *ebpf.VariableSpec `ebpf:"flow_busy"`
 	FlowDrops         *ebpf.VariableSpec `ebpf:"flow_drops"`
+	FlowRetries       *ebpf.VariableSpec `ebpf:"flow_retries"`
 	FoldMode          *ebpf.VariableSpec `ebpf:"fold_mode"`
 	InitialScan       *ebpf.VariableSpec `ebpf:"initial_scan"`
 	LearnSelf         *ebpf.VariableSpec `ebpf:"learn_self"`
@@ -258,6 +273,7 @@ type bpfMaps struct {
 	MptcpOwners    *ebpf.Map `ebpf:"mptcp_owners"`
 	SockStates     *ebpf.Map `ebpf:"sock_states"`
 	UdpListenPorts *ebpf.Map `ebpf:"udp_listen_ports"`
+	UdpPeers       *ebpf.Map `ebpf:"udp_peers"`
 	UdpStates      *ebpf.Map `ebpf:"udp_states"`
 }
 
@@ -272,6 +288,7 @@ func (m *bpfMaps) Close() error {
 		m.MptcpOwners,
 		m.SockStates,
 		m.UdpListenPorts,
+		m.UdpPeers,
 		m.UdpStates,
 	)
 }
@@ -285,7 +302,9 @@ type bpfVariables struct {
 	CgroupEventDrops  *ebpf.Variable `ebpf:"cgroup_event_drops"`
 	EphPortHigh       *ebpf.Variable `ebpf:"eph_port_high"`
 	EphPortLow        *ebpf.Variable `ebpf:"eph_port_low"`
+	FlowBusy          *ebpf.Variable `ebpf:"flow_busy"`
 	FlowDrops         *ebpf.Variable `ebpf:"flow_drops"`
+	FlowRetries       *ebpf.Variable `ebpf:"flow_retries"`
 	FoldMode          *ebpf.Variable `ebpf:"fold_mode"`
 	InitialScan       *ebpf.Variable `ebpf:"initial_scan"`
 	LearnSelf         *ebpf.Variable `ebpf:"learn_self"`

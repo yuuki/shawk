@@ -114,6 +114,8 @@ type Tracer struct {
 	initialScan    *ebpf.Variable
 	activeIdx      *ebpf.Variable
 	flowDrops      *ebpf.Variable
+	flowRetries    *ebpf.Variable
+	flowBusy       *ebpf.Variable
 	listenDrops    *ebpf.Variable
 	storageFails   *ebpf.Variable
 	adopted        *ebpf.Variable
@@ -280,7 +282,7 @@ func (t *Tracer) configure(spec *ebpf.CollectionSpec) error {
 	for _, name := range []string{bpfMapFlows0, bpfMapFlows1} {
 		spec.Maps[name].MaxEntries = t.opts.MaxFlows
 	}
-	for _, name := range []string{bpfMapListenPorts, bpfMapUdpListenPorts, bpfMapMptcpOwners} {
+	for _, name := range []string{bpfMapListenPorts, bpfMapUdpListenPorts, bpfMapMptcpOwners, bpfMapUdpPeers} {
 		spec.Maps[name].MaxEntries = min(max(t.opts.MaxFlows, minListenPorts), maxListenPorts)
 	}
 	spec.Maps[bpfMapFlows].InnerMap.MaxEntries = t.opts.MaxFlows
@@ -306,6 +308,8 @@ func (t *Tracer) loadCore(spec *ebpf.CollectionSpec) error {
 	t.initialScan = coll.Variables[bpfVarInitialScan]
 	t.activeIdx = coll.Variables[bpfVarActiveIdx]
 	t.flowDrops = coll.Variables[bpfVarFlowDrops]
+	t.flowRetries = coll.Variables[bpfVarFlowRetries]
+	t.flowBusy = coll.Variables[bpfVarFlowBusy]
 	t.listenDrops = coll.Variables[bpfVarListenPortDrops]
 	t.storageFails = coll.Variables[bpfVarStorageFails]
 	t.adopted = coll.Variables[bpfVarAdoptedUnowned]
@@ -576,11 +580,17 @@ func (t *Tracer) Collect() (*Snapshot, error) {
 		return nil, err
 	}
 	flows = t.attribute(flows)
-	var drops uint64
-	if err := t.flowDrops.Get(&drops); err != nil {
-		return nil, err
+	t.warnOnIncrease(t.flowBusy, "some flow updates were lost because the flow table was being updated on the same CPU; a few connections or bytes may be missing")
+	snap := &Snapshot{Flows: flows, Listeners: listeners}
+	for _, c := range []struct {
+		v   *ebpf.Variable
+		dst *uint64
+	}{{t.flowDrops, &snap.Drops}, {t.flowRetries, &snap.Retried}, {t.flowBusy, &snap.Contended}} {
+		if err := c.v.Get(c.dst); err != nil {
+			return nil, err
+		}
 	}
-	return &Snapshot{Flows: flows, Listeners: listeners, Drops: drops}, nil
+	return snap, nil
 }
 
 // flip switches the active flow map and drains the previous one.
