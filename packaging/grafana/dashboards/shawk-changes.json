@@ -71,6 +71,26 @@
           "rawQuery": true,
           "rawSql": "SELECT gap_start AS time, gap_end AS timeend, 'not observed: ' || host AS text, host AS tags\nFROM shawk_v1.unobserved($__timeFrom(), $__timeTo())"
         }
+      },
+      {
+        "name": "Partly observed",
+        "datasource": {
+          "type": "grafana-postgresql-datasource",
+          "uid": "shawk-postgres"
+        },
+        "enable": true,
+        "iconColor": "rgba(255, 152, 48, 0.4)",
+        "target": {
+          "refId": "Anno",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shawk-postgres"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT gap_start AS time, gap_end AS timeend, 'partly observed: ' || host AS text, host AS tags\nFROM shawk_v1.partly_observed($__timeFrom(), $__timeTo())"
+        }
       }
     ]
   },

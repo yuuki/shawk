@@ -30,9 +30,24 @@ func (p *process) job() string {
 type edgeID struct {
 	role, proto string
 	local, peer netip.Addr
-	port        uint16
-	netns       uint64
+	// folded tells that the peer stands for every peer outside the internal
+	// ranges of the agent: the network 0.0.0.0/0 or ::/0, whose address is
+	// peer.
+	folded bool
+	port   uint16
+	netns  uint64
 	process
+}
+
+// peerString returns the peer of an edge as PostgreSQL's inet takes it: an
+// address, or the network of a folded peer.
+func (id *edgeID) peerString() string { return peerString(id.peer, id.folded) }
+
+func peerString(peer netip.Addr, folded bool) string {
+	if folded {
+		return netip.PrefixFrom(peer, 0).String()
+	}
+	return peer.String()
 }
 
 // valueKey identifies one of the metrics of an edge.
@@ -85,6 +100,13 @@ type hostBatch struct {
 	udpTraced    bool
 	netnsScope   string
 	dropped      int64
+	// droppedSince is the start of the counter of dropped flows, when the
+	// agent started, by the clock of the agent; zero if unknown.
+	droppedSince time.Time
+	// peerFold is what the agent folds (foldNone, foldIn or foldAll), and
+	// peerInternal the ranges it keeps exact, nil if it does not tell.
+	peerFold     string
+	peerInternal []netip.Prefix
 
 	// agent holds the metrics of the agent itself to forward.
 	agent pmetric.MetricSlice
@@ -124,6 +146,18 @@ func parseResource(rm pmetric.ResourceMetrics) (*hostBatch, error) {
 				b.addrs = append(b.addrs, a.Unmap())
 			}
 		}
+	}
+	b.peerFold = getString(res, attrPeerFold)
+	if b.peerFold == "" {
+		b.peerFold = foldNone
+	}
+	if v, ok := res.Get(attrPeerInternal); ok && v.Type() == pcommon.ValueTypeSlice {
+		s := v.Slice()
+		ss := make([]string, s.Len())
+		for i := range s.Len() {
+			ss[i] = s.At(i).AsString()
+		}
+		b.peerInternal = parsePrefixes(ss)
 	}
 
 	sms := rm.ScopeMetrics()
@@ -215,7 +249,11 @@ func (b *hostBatch) addMetric(m pmetric.Metric) {
 			})
 		case metricAgentFlowsDropped:
 			if m.Type() == pmetric.MetricTypeSum && m.Sum().DataPoints().Len() > 0 {
-				b.dropped = int64(numberValue(m.Sum().DataPoints().At(0)))
+				dp := m.Sum().DataPoints().At(0)
+				b.dropped = int64(numberValue(dp))
+				if dp.StartTimestamp() != 0 {
+					b.droppedSince = dp.StartTimestamp().AsTime()
+				}
 			}
 		}
 		m.CopyTo(b.agent.AppendEmpty())
@@ -292,6 +330,16 @@ func (b *hostBatch) edge(a pcommon.Map) *edgeInput {
 	}
 	id := edgeID{role: role, proto: proto, local: local.Unmap(), peer: peer.Unmap(), port: uint16(port),
 		netns: uint64(netns), process: parseProcess(a)}
+	if getString(a, attrPeerFolded) == "true" {
+		// The agent sends the unspecified address of the family of the
+		// folded peers.
+		id.folded = true
+		if id.peer.Is4() {
+			id.peer = netip.IPv4Unspecified()
+		} else {
+			id.peer = netip.IPv6Unspecified()
+		}
+	}
 	e, ok := b.edges[id]
 	if !ok {
 		e = &edgeInput{id: id, values: map[valueKey]point{}}
@@ -326,4 +374,18 @@ func parseAddr(s string) (netip.Addr, error) {
 		return a, err
 	}
 	return a.WithZone("").Unmap(), nil
+}
+
+// parsePrefix parses an address range without the bits beyond its length,
+// which PostgreSQL's cidr rejects; an IPv4-mapped range is taken as the IPv4
+// range, as addresses are.
+func parsePrefix(s string) (netip.Prefix, error) {
+	p, err := netip.ParsePrefix(s)
+	if err != nil {
+		return p, err
+	}
+	if a := p.Addr(); a.Is4In6() && p.Bits() >= 96 {
+		p = netip.PrefixFrom(a.Unmap(), p.Bits()-96)
+	}
+	return p.Masked(), nil
 }

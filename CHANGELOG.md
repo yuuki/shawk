@@ -1,5 +1,43 @@
 ## Unreleased
 
+* The kernel folds the peers outside the internal ranges of the host into
+  one dependency per local endpoint (#96). On an internet-facing host, the
+  clients of a local server on the Internet no longer make one flow, one
+  series and one edge in PostgreSQL per address, which filled the flow
+  table (and dropped the flows of other dependencies), the requests of the
+  agent and `shawk.edges`. `-internal-peers` lists the ranges whose peers
+  are kept exact (default `private`: RFC 1918, CGNAT, loopback, link-local
+  and IPv6 ULA; loopback and the addresses of the host are always kept);
+  `-fold-external` folds the external peers of incoming flows (`in`, the
+  default), of all flows (`all`) or of none (`none`). A folded edge carries
+  `shawk.peer.folded=true` with `network.peer.address` 0.0.0.0 or ::, and
+  the connector writes its peer to PostgreSQL as the network 0.0.0.0/0 or
+  ::/0 and names it `~external` (or after a range of `peer_cidrs` holding
+  the whole network); `keep_peer_address` outputs the network. The address
+  of each external client is no longer recorded; set `-fold-external=none`
+  where it is needed. A fleet that uses public addresses internally must
+  add them to `-internal-peers`, and so must one whose `peer_cidrs` name
+  public ranges, whose peers are otherwise named `~external`. The connector
+  logs a warning, at most once an hour per host, when an agent folds a
+  client (or, with `all`, a server) that runs an agent, whose connections
+  then do not match (not when both agents fold the other side), and, at
+  most once an hour per configuration, when agents fold the peers of a
+  range of `peer_cidrs`. An IPv6 range of `-internal-peers` that overlaps
+  `::ffff:0:0/96`, such as `::/0`, is refused. Upgrade the connectors
+  before the agents: a connector of the previous version keeps a folded
+  peer as the address 0.0.0.0 or ::, which it names `~unresolved`.
+* The periods in which an agent dropped flows are recorded (migration 11):
+  the new table `shawk.partial_observations` and the function
+  `shawk_v1.partly_observed(since, until)`, so that the absence of a
+  dependency over them is not taken for disuse. The fleet, dependency
+  details and changes dashboards annotate them, and the fleet dashboard
+  lists them. The drops of each run of an agent are compared with what
+  PostgreSQL holds for the run, so several connectors and restarts record
+  them once (`shawk.agent_sessions.counters_started`). `shawk_v1.agents`
+  and `shawk_v1.agent_addrs` gain the columns `peer_fold` and
+  `peer_internal` at their end. Connectors of the previous version keep
+  writing during an upgrade, but do not record these periods.
+  Run `grants.sql` again after the migration.
 * The systemd units are sandboxed: the agent keeps only the capabilities it
   needs (`CAP_BPF`, `CAP_PERFMON`, `CAP_SYS_ADMIN`, `CAP_SYS_PTRACE`,
   `CAP_DAC_READ_SEARCH`) and both units filter system calls and address

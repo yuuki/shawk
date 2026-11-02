@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -138,5 +139,27 @@ func TestRunRejectsLongInterval(t *testing.T) {
 	err := Run(context.Background(), Config{Interval: 2 * time.Minute, IdleTTL: time.Hour})
 	if err == nil || !strings.Contains(err.Error(), "at most") {
 		t.Errorf("Run with a 2m interval: %v", err)
+	}
+}
+
+func TestParseInternalPeers(t *testing.T) {
+	got, err := ParseInternalPeers("private, 203.0.113.0/24,192.0.2.7,10.1.2.3/8,2001:db8::/32,::ffff:10.0.0.0/104")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := append(slices.Clone(PrivatePeers), netip.MustParsePrefix("203.0.113.0/24"),
+		netip.MustParsePrefix("192.0.2.7/32"), netip.MustParsePrefix("2001:db8::/32"))
+	if !slices.Equal(got, want) {
+		t.Errorf("ParseInternalPeers = %v, want %v", got, want)
+	}
+	if got, err := ParseInternalPeers(""); err != nil || len(got) != 0 {
+		t.Errorf("ParseInternalPeers(\"\") = %v, %v; want none", got, err)
+	}
+	// ::/0 would also keep the IPv4 peers, which are looked up as
+	// IPv4-mapped addresses.
+	for _, bad := range []string{"intranet", "10.0.0.0/33", "fe80::1%eth0", "fe80::%eth0/64", "::/0", "::/80"} {
+		if _, err := ParseInternalPeers(bad); err == nil {
+			t.Errorf("ParseInternalPeers(%q) succeeded", bad)
+		}
 	}
 }

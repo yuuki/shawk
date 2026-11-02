@@ -50,6 +50,11 @@ type endpoint struct {
 type agentHost struct {
 	seen      time.Time // by the clock of the connector
 	udpTraced bool      // UDP edges are recorded only if UDP is traced
+	name      string    // of the host
+	// fold is what the agent folds (foldNone, foldIn, foldAll; empty if not
+	// known), and internal the ranges of peers it keeps exact.
+	fold     string
+	internal []netip.Prefix
 }
 
 // covers tells whether the agent records the edges of a protocol. An agent
@@ -59,12 +64,56 @@ func (h agentHost) covers(proto string) bool {
 	return proto != "udp" || h.udpTraced
 }
 
+// foldsClient tells whether the agent folds a client at an address into
+// its external peers: whether it folds the peers of its servers and the
+// address is outside the ranges it keeps exact.
+func (h agentHost) foldsClient(a netip.Addr) bool {
+	return (h.fold == foldIn || h.fold == foldAll) && !h.keeps(a)
+}
+
+// foldsServer tells whether the agent folds a server at an address into
+// its external peers: whether it folds the peers of its clients too and
+// the address is outside the ranges it keeps exact.
+func (h agentHost) foldsServer(a netip.Addr) bool {
+	return h.fold == foldAll && !h.keeps(a)
+}
+
+// keepsRange tells whether every address of a range is in a range the agent
+// keeps exact.
+func (h agentHost) keepsRange(r netip.Prefix) bool {
+	for _, p := range h.internal {
+		if p.Bits() <= r.Bits() && p.Contains(r.Addr()) {
+			return true
+		}
+	}
+	return false
+}
+
+// keeps tells whether an address is in a range the agent keeps exact.
+func (h agentHost) keeps(a netip.Addr) bool {
+	for _, p := range h.internal {
+		if p.Contains(a) {
+			return true
+		}
+	}
+	return false
+}
+
 // peer is the name of the peer of an edge.
 type peer struct {
 	name string // service.peer.name
 	// agent tells whether the peer runs on a host whose agent records the
 	// other side of the edge (shawk.peer.agent).
 	agent bool
+	// foldedBy is set on an edge whose peer runs an agent that folds this
+	// side into its external peers although it runs an agent too: the edges
+	// of the two sides do not match. It is the host of the peer and its
+	// name. On a client edge, the server folds its client: both sides count
+	// the connections (§7). On a server edge (foldsServer), the client folds
+	// its server, so its client edge names no service: agent is false, so
+	// that this side counts them.
+	foldedBy, foldedByName string
+	foldsServer            bool
 }
 
 // resolver names the peers of edges. It combines the endpoints, clients and
@@ -213,6 +262,11 @@ func (r *resolver) learn(b *hostBatch, now time.Time) {
 			learnInto(r.localEndpoints, endpointKey{e.id.local, e.id.port, e.id.proto},
 				endpoint{host: b.key, service: e.id.job(), exact: true}, now)
 		case roleClient:
+			if e.id.folded {
+				// Not a server address: no server edge has it as its local
+				// address.
+				continue
+			}
 			learnInto(r.localClients, clientKey{e.id.local, e.id.peer, e.id.port, e.id.proto},
 				endpoint{host: b.key, service: e.id.job(), exact: true}, now)
 		}
@@ -228,7 +282,8 @@ func (r *resolver) learn(b *hostBatch, now time.Time) {
 		}
 		m[b.key] = now
 	}
-	r.localAgents[b.key] = agentHost{seen: now, udpTraced: b.udpTraced}
+	r.localAgents[b.key] = agentHost{seen: now, udpTraced: b.udpTraced, name: b.hostname,
+		fold: b.peerFold, internal: b.peerInternal}
 }
 
 func expireLearned[K comparable, V comparable](m map[K]map[V]time.Time, t time.Time) {
@@ -269,7 +324,13 @@ func (r *resolver) expire(t, now time.Time) {
 // A loopback peer is on the host itself. So is a peer whose address several
 // live hosts hold at once, such as the address of a container bridge, when
 // the host holds it too; such an address is never resolved to another host.
+//
+// A folded peer, every peer outside the internal ranges of the agent, is
+// named after its network and has no agent.
 func (r *resolver) peer(host string, id *edgeID, now time.Time) peer {
+	if id.folded {
+		return peer{name: r.classifyFolded(id.peer)}
+	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	holders := r.holders(id.peer, now)
@@ -291,6 +352,14 @@ func (r *resolver) peer(host string, id *edgeID, now time.Time) peer {
 		for h := range holders {
 			if a, ok := r.agent(h, now); ok {
 				p.agent = a.covers(id.proto)
+				switch {
+				case !p.agent || h == host:
+				case id.role == roleClient && r.foldsPeer(a, h, id.local, false, now):
+					p.foldedBy, p.foldedByName = h, a.name
+				case id.role == roleServer && r.foldsPeer(a, h, id.local, true, now):
+					p.agent = false
+					p.foldedBy, p.foldedByName, p.foldsServer = h, a.name, true
+				}
 			}
 		}
 	}
@@ -305,6 +374,22 @@ func (r *resolver) peer(host string, id *edgeID, now time.Time) peer {
 		p.name = r.classify(id.peer)
 	}
 	return p
+}
+
+// foldsPeer tells whether the agent a of the host peer folds this side, at
+// the address local, into its external peers: a client if a is the agent of
+// its server, a server if it is that of its client (server). A loopback
+// address, and one that several hosts or peer itself hold, never reaches it
+// from outside. r.mu is held.
+func (r *resolver) foldsPeer(a agentHost, peer string, local netip.Addr, server bool, now time.Time) bool {
+	if !local.IsValid() || local.IsLoopback() || local.IsUnspecified() {
+		return false
+	}
+	if server && !a.foldsServer(local) || !server && !a.foldsClient(local) {
+		return false
+	}
+	hs := r.holders(local, now)
+	return len(hs) <= 1 && !hs[peer]
 }
 
 // holders returns the hosts with live agents that hold an address now. A
@@ -406,6 +491,19 @@ func (r *resolver) classify(a netip.Addr) string {
 	}
 	if isPrivate(a) {
 		return peerUnresolved
+	}
+	return peerExternal
+}
+
+// classifyFolded names a folded peer, the network of every address of the
+// family of a (0.0.0.0/0 or ::/0): a range of peer_cidrs that holds the
+// whole network, ~external otherwise, as peer_class() names the network in
+// PostgreSQL.
+func (r *resolver) classifyFolded(a netip.Addr) string {
+	for _, p := range r.cidrs {
+		if p.prefix.Bits() == 0 && p.prefix.Addr().BitLen() == a.BitLen() {
+			return p.name
+		}
 	}
 	return peerExternal
 }

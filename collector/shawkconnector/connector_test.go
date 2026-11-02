@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"net/netip"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -50,8 +52,30 @@ func TestGoldenRequest(t *testing.T) {
 	if !hb.time.Equal(t0.Add(15 * time.Second)) {
 		t.Errorf("time = %v", hb.time)
 	}
-	if len(hb.edges) != 3 || len(hb.listeners) != 2 {
+	if !hb.droppedSince.Equal(t0.Add(-time.Hour)) {
+		t.Errorf("dropped since %v", hb.droppedSince)
+	}
+	if len(hb.edges) != 4 || len(hb.listeners) != 2 {
 		t.Fatalf("%d edges, %d listeners", len(hb.edges), len(hb.listeners))
+	}
+	// An agent that folds the peers of its servers tells so, and sends their
+	// edges with a folded peer.
+	folded := 0
+	for _, e := range hb.edges {
+		if !e.id.folded {
+			continue
+		}
+		folded++
+		if e.id.role != roleServer || e.id.peerString() != "0.0.0.0/0" || e.id.port != 443 {
+			t.Errorf("folded edge = %+v", e.id)
+		}
+	}
+	if folded != 1 {
+		t.Errorf("%d folded edges, want 1", folded)
+	}
+	if hb.peerFold != foldIn || !slices.Contains(hb.peerInternal, netip.MustParsePrefix("10.0.0.0/8")) ||
+		!slices.Contains(hb.peerInternal, netip.MustParsePrefix("fc00::/7")) {
+		t.Errorf("fold = %q, internal peers = %v", hb.peerFold, hb.peerInternal)
 	}
 	var client *edgeInput
 	for _, e := range hb.edges {

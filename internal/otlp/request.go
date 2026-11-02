@@ -25,6 +25,10 @@ type Resource struct {
 	Addrs        []netip.Addr
 	Kernel       string
 	AgentVersion string
+	// PeerFold tells which edges fold their peers outside InternalPeers:
+	// "none", "in" or "all"; omitted when empty.
+	PeerFold      string
+	InternalPeers []netip.Prefix
 }
 
 // AgentStatus are the metrics of the agent itself.
@@ -231,6 +235,13 @@ func (r *Resource) proto() *resourcepb.Resource {
 		str(AttrServiceName, AgentServiceName),
 		str(AttrServiceVersion, r.AgentVersion),
 	)
+	if r.PeerFold != "" {
+		internal := make([]string, 0, len(r.InternalPeers))
+		for _, p := range r.InternalPeers {
+			internal = append(internal, p.String())
+		}
+		attrs = append(attrs, str(AttrPeerFold, r.PeerFold), stringArray(AttrPeerInternal, internal))
+	}
 	return &resourcepb.Resource{Attributes: attrs}
 }
 
@@ -246,7 +257,7 @@ func processAttrs(p *Process) []*commonpb.KeyValue {
 }
 
 func edgeAttrs(k *EdgeKey) []*commonpb.KeyValue {
-	return append(processAttrs(&k.Process),
+	attrs := append(processAttrs(&k.Process),
 		str(AttrRole, k.Role),
 		str(AttrTransport, k.Proto),
 		str(AttrLocalAddr, k.LocalAddr.String()),
@@ -254,6 +265,12 @@ func edgeAttrs(k *EdgeKey) []*commonpb.KeyValue {
 		integer(AttrServerPort, int64(k.Port)),
 		str(AttrNetNS, strconv.FormatUint(uint64(k.NetNS), 10)),
 	)
+	// network.peer.address stays an address, 0.0.0.0 or ::, which connectors
+	// that predate folding store as is.
+	if k.PeerFolded {
+		attrs = append(attrs, boolean(AttrPeerFolded, true))
+	}
+	return attrs
 }
 
 func listenerAttrs(k *ListenerKey) []*commonpb.KeyValue {
@@ -277,6 +294,20 @@ func str(k, v string) *commonpb.KeyValue {
 
 func integer(k string, v int64) *commonpb.KeyValue {
 	return &commonpb.KeyValue{Key: k, Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_IntValue{IntValue: v}}}
+}
+
+func boolean(k string, v bool) *commonpb.KeyValue {
+	return &commonpb.KeyValue{Key: k, Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_BoolValue{BoolValue: v}}}
+}
+
+// stringArray returns an attribute of an array of strings.
+func stringArray(k string, vs []string) *commonpb.KeyValue {
+	values := make([]*commonpb.AnyValue, 0, len(vs))
+	for _, v := range vs {
+		values = append(values, &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: v}})
+	}
+	return &commonpb.KeyValue{Key: k, Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_ArrayValue{
+		ArrayValue: &commonpb.ArrayValue{Values: values}}}}
 }
 
 // with returns attrs with one more attribute, without modifying attrs.
@@ -394,10 +425,21 @@ func compareEdgeKeys(a, b EdgeKey) int {
 		strings.Compare(a.Proto, b.Proto),
 		cmp.Compare(a.Port, b.Port),
 		a.PeerAddr.Compare(b.PeerAddr),
+		compareBool(a.PeerFolded, b.PeerFolded),
 		a.LocalAddr.Compare(b.LocalAddr),
 		cmp.Compare(a.NetNS, b.NetNS),
 		compareProcess(&a.Process, &b.Process),
 	)
+}
+
+func compareBool(a, b bool) int {
+	switch {
+	case a == b:
+		return 0
+	case a:
+		return 1
+	}
+	return -1
 }
 
 func compareListenerKeys(a, b ListenerKey) int {

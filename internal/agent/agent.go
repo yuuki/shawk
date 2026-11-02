@@ -13,6 +13,7 @@ import (
 	"os"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	colmetricspb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
@@ -32,6 +33,10 @@ type Config struct {
 	IdleTTL  time.Duration
 	NetNS    uint32 // 0 traces all network namespaces
 	MaxFlows uint32
+	// Fold tells which flows fold their peers outside InternalPeers into one
+	// edge per local endpoint (tracer.FoldMode).
+	Fold          tracer.FoldMode
+	InternalPeers []netip.Prefix
 	// MaxSeriesPerRequest bounds the edges and listeners in one request;
 	// a host with more sends several requests per interval.
 	MaxSeriesPerRequest int
@@ -50,6 +55,12 @@ type source interface {
 	Collect() (*tracer.Snapshot, error)
 	UDPEnabled() bool
 	ProgramStats() ([]tracer.ProgramStat, error)
+}
+
+// localAddrSetter is implemented by a source that folds peers and keeps
+// those at the addresses of the host.
+type localAddrSetter interface {
+	SetLocalAddrs([]netip.Addr) error
 }
 
 // Agent is a running agent.
@@ -96,12 +107,21 @@ func Run(ctx context.Context, cfg Config) error {
 	defer exp.Close()
 
 	cgroups := procinfo.NewResolver()
+	// The addresses of the host are internal from the first flow on, also
+	// for the connections the tracer adopts.
+	local, err := hostAddrs()
+	if err != nil {
+		cfg.Logger.Warn("listing the addresses of the host, whose peers are not folded", "error", err)
+	}
 	tr, err := tracer.New(tracer.Options{
-		NetNS:     cfg.NetNS,
-		MaxFlows:  cfg.MaxFlows,
-		OnCgroup:  cgroups.Learn,
-		TraceSelf: cfg.traceSelf,
-		Logger:    cfg.Logger,
+		NetNS:         cfg.NetNS,
+		MaxFlows:      cfg.MaxFlows,
+		OnCgroup:      cgroups.Learn,
+		TraceSelf:     cfg.traceSelf,
+		Fold:          cfg.Fold,
+		InternalPeers: cfg.InternalPeers,
+		LocalAddrs:    local,
+		Logger:        cfg.Logger,
 	})
 	if err != nil {
 		return fmt.Errorf("starting tracer: %w", err)
@@ -130,10 +150,12 @@ func Run(ctx context.Context, cfg Config) error {
 		cfg.Logger.Warn("the host has no machine id (/etc/machine-id); it is identified by its name only")
 	}
 	a := newAgent(cfg, tr, exp, cgroups, otlp.Resource{
-		MachineID:    machineID,
-		Hostname:     hostname,
-		Kernel:       kernelRelease(),
-		AgentVersion: version.Version,
+		MachineID:     machineID,
+		Hostname:      hostname,
+		Kernel:        kernelRelease(),
+		AgentVersion:  version.Version,
+		PeerFold:      cfg.Fold.String(),
+		InternalPeers: cfg.InternalPeers,
 	}, time.Now())
 	a.log.Info("agent started", "endpoint", cfg.Exporter.Endpoint, "protocol", cfg.Exporter.Protocol,
 		"interval", cfg.Interval, "idle_ttl", cfg.IdleTTL, "udp", tr.UDPEnabled())
@@ -186,6 +208,18 @@ func (a *Agent) exportTimeout() time.Duration {
 // tick closes an interval of the tracer and sends all live series. A failed
 // request is made up for by the next one, since the series are cumulative.
 func (a *Agent) tick(ctx context.Context) error {
+	// The addresses of the host are internal: a host may connect to its own
+	// public address. They are refreshed before the interval is closed.
+	// A failed listing keeps the addresses known before.
+	if l, ok := a.tracer.(localAddrSetter); ok && a.cfg.Fold != tracer.FoldNone {
+		addrs, err := hostAddrs()
+		if err == nil {
+			err = l.SetLocalAddrs(addrs)
+		}
+		if err != nil {
+			a.log.Warn("updating the addresses of the host, whose peers are not folded", "error", err)
+		}
+	}
 	snap, err := a.tracer.Collect()
 	if err != nil {
 		return err
@@ -235,13 +269,14 @@ func (a *Agent) observe(snap *tracer.Snapshot, start, end time.Time) {
 			role = otlp.RoleServer
 		}
 		k := otlp.EdgeKey{
-			Role:      role,
-			Proto:     f.Proto.String(),
-			LocalAddr: f.LocalAddr,
-			PeerAddr:  f.RemoteAddr,
-			Port:      f.Port,
-			NetNS:     f.NetNS,
-			Process:   a.process(f.PID, f.Comm, f.CgroupID, f.Port, f.Direction == tracer.DirIn, end),
+			Role:       role,
+			Proto:      f.Proto.String(),
+			LocalAddr:  f.LocalAddr,
+			PeerAddr:   f.RemoteAddr,
+			PeerFolded: f.Folded,
+			Port:       f.Port,
+			NetNS:      f.NetNS,
+			Process:    a.process(f.PID, f.Comm, f.CgroupID, f.Port, f.Direction == tracer.DirIn, end),
 		}
 		a.state.AddEdge(k, otlp.EdgeStats{
 			Conns:      f.Conns,
@@ -287,7 +322,7 @@ func (a *Agent) request(now time.Time) ([]*colmetricspb.ExportMetricsServiceRequ
 	// interfaces of the agent's own namespace unless it traces another
 	// one, and the local addresses of the series active recently.
 	if a.cfg.NetNS == 0 || a.cfg.NetNS == procinfo.NetNS() {
-		res.Addrs = hostAddrs()
+		res.Addrs, _ = hostAddrs()
 	}
 	for _, addr := range a.state.LocalAddrs(now.Add(-max(2*a.cfg.Interval, time.Minute))) {
 		if !slices.Contains(res.Addrs, addr) {
@@ -329,10 +364,10 @@ func kernelRelease() string {
 }
 
 // hostAddrs returns the addresses of the interfaces of the host.
-func hostAddrs() []netip.Addr {
+func hostAddrs() ([]netip.Addr, error) {
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	var out []netip.Addr
 	for _, a := range addrs {
@@ -342,7 +377,61 @@ func hostAddrs() []netip.Addr {
 			}
 		}
 	}
-	return out
+	return out, nil
+}
+
+// PrivatePeers are the ranges of addresses not routed on the Internet, which
+// "private" stands for in -internal-peers: RFC 1918, CGNAT, loopback,
+// link-local and IPv6 ULA. They are the ranges that peer_class() of
+// PostgreSQL and the shawk connector name ~unresolved.
+var PrivatePeers = []netip.Prefix{
+	netip.MustParsePrefix("10.0.0.0/8"),
+	netip.MustParsePrefix("172.16.0.0/12"),
+	netip.MustParsePrefix("192.168.0.0/16"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("127.0.0.0/8"),
+	netip.MustParsePrefix("169.254.0.0/16"),
+	netip.MustParsePrefix("fc00::/7"),
+	netip.MustParsePrefix("fe80::/10"),
+	netip.MustParsePrefix("::1/128"),
+}
+
+// ParseInternalPeers parses the -internal-peers flag: a comma-separated
+// list of prefixes or addresses, where "private" stands for PrivatePeers.
+func ParseInternalPeers(s string) ([]netip.Prefix, error) {
+	var out []netip.Prefix
+	for item := range strings.SplitSeq(s, ",") {
+		item = strings.TrimSpace(item)
+		switch {
+		case item == "":
+			continue
+		case item == "private":
+			out = append(out, PrivatePeers...)
+			continue
+		}
+		p, err := netip.ParsePrefix(item)
+		if err != nil {
+			a, aerr := netip.ParseAddr(item)
+			if aerr != nil || a.Zone() != "" {
+				return nil, fmt.Errorf("invalid internal range %q", item)
+			}
+			p = netip.PrefixFrom(a, a.BitLen())
+		}
+		if p.Addr().Zone() != "" {
+			return nil, fmt.Errorf("invalid internal range %q", item)
+		}
+		if p.Addr().Is4In6() && p.Bits() >= 96 {
+			p = netip.PrefixFrom(p.Addr().Unmap(), p.Bits()-96)
+		}
+		if err := tracer.CheckInternalPeer(p); err != nil {
+			return nil, err
+		}
+		p = p.Masked()
+		if !slices.Contains(out, p) {
+			out = append(out, p)
+		}
+	}
+	return out, nil
 }
 
 // ParseNetNS parses the --netns flag: "all", "self" or an inode number.

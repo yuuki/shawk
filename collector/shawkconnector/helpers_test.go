@@ -25,6 +25,9 @@ type tEdge struct {
 	tx, rx, retrans          int64
 	rttSum                   float64
 	rttCount                 uint64
+	// folded marks the peer as folded (shawk.peer.folded); peer is then
+	// 0.0.0.0 or ::.
+	folded bool
 }
 
 type tListener struct {
@@ -47,6 +50,14 @@ type tAgent struct {
 	// noUDP reports that UDP is not traced; netnsScope defaults to "all".
 	noUDP      bool
 	netnsScope string
+	// dropped is sent as shawk.agent.flows.dropped, counted since
+	// droppedSince (t0 if zero), when either is set.
+	dropped      int64
+	droppedSince time.Time
+	// fold and internal are sent as shawk.peer.fold and shawk.peer.internal
+	// when set.
+	fold     string
+	internal []string
 }
 
 func putProcess(a pcommon.Map, svc, ns, unit, comm, exe string) {
@@ -76,6 +87,15 @@ func (ta tAgent) metrics() pmetric.Metrics {
 	ra.PutStr(attrOSVersion, "5.14.0")
 	ra.PutStr(attrServiceName, agentServiceName)
 	ra.PutStr(attrServiceVersion, "test")
+	if ta.fold != "" {
+		ra.PutStr(attrPeerFold, ta.fold)
+	}
+	if ta.internal != nil {
+		s := ra.PutEmptySlice(attrPeerInternal)
+		for _, p := range ta.internal {
+			s.AppendEmpty().SetStr(p)
+		}
+	}
 	ms := rm.ScopeMetrics().AppendEmpty().Metrics()
 	now := pcommon.NewTimestampFromTime(ta.time)
 	metrics := map[string]pmetric.Metric{}
@@ -106,6 +126,9 @@ func (ta tAgent) metrics() pmetric.Metrics {
 			a.PutStr(attrPeerAddr, e.peer)
 			a.PutInt(attrServerPort, e.port)
 			a.PutStr(attrNetNS, "4026531840")
+			if e.folded {
+				a.PutBool(attrPeerFolded, true)
+			}
 		}
 		start := e.start
 		if start.IsZero() {
@@ -197,6 +220,16 @@ func (ta tAgent) metrics() pmetric.Metrics {
 	sp := metric(metricAgentSegmentStart, pmetric.MetricTypeGauge).Gauge().DataPoints().AppendEmpty()
 	sp.SetTimestamp(now)
 	sp.SetIntValue(seg.Unix())
+	if ta.dropped != 0 || !ta.droppedSince.IsZero() {
+		since := ta.droppedSince
+		if since.IsZero() {
+			since = t0
+		}
+		dp := metric(metricAgentFlowsDropped, pmetric.MetricTypeSum).Sum().DataPoints().AppendEmpty()
+		dp.SetStartTimestamp(pcommon.NewTimestampFromTime(since))
+		dp.SetTimestamp(now)
+		dp.SetIntValue(ta.dropped)
+	}
 	return md
 }
 

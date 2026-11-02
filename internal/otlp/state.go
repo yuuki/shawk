@@ -21,6 +21,9 @@ type EdgeKey struct {
 	Proto     string // "tcp" or "udp"
 	LocalAddr netip.Addr
 	PeerAddr  netip.Addr
+	// PeerFolded tells that the edge bundles the peers outside the internal
+	// ranges of the agent; PeerAddr is then 0.0.0.0 or ::.
+	PeerFolded bool
 	// Port is the service port: the peer port of a client edge and the local
 	// port of a server edge.
 	Port  uint16

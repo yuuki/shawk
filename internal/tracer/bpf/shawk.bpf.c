@@ -88,6 +88,7 @@ const volatile bool learn_self = true; /* false to trace the tracer itself */
 const volatile __u32 target_netns = 0; /* 0 means all network namespaces */
 const volatile __u16 eph_port_low = 32768;
 const volatile __u16 eph_port_high = 60999;
+const volatile __u8 fold_mode = FOLD_NONE; /* enum shawk_fold_mode */
 
 /* Runtime state shared with user space. */
 volatile __u32 active_idx = 0;
@@ -220,6 +221,19 @@ struct {
 	__type(value, struct shawk_owner);
 } mptcp_owners SEC(".maps");
 
+/*
+ * Address ranges whose peers are kept exact when peers are folded: the
+ * internal ranges, loopback and the addresses of the host, set by user
+ * space. A peer outside them is folded (see fold_peer()).
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__uint(max_entries, 4096);
+	__type(key, struct shawk_peer_prefix);
+	__type(value, __u8);
+} internal_peers SEC(".maps");
+
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, 256 * 1024);
@@ -286,6 +300,40 @@ static __always_inline int read_local_addr(const struct sock *sk, __u8 *laddr)
 	__u8 raddr[16];
 
 	return read_sock_addrs(sk, laddr, raddr);
+}
+
+static __always_inline bool v4mapped_addr(const __u8 *a)
+{
+	return *(const __u64 *)a == 0 && *(const __u16 *)(a + 8) == 0 &&
+	       a[10] == 0xff && a[11] == 0xff;
+}
+
+/*
+ * Folds the peer of a flow outside internal_peers: its remote address
+ * becomes 0.0.0.0 (IPv4-mapped) or ::, which stands for all such peers of
+ * the local endpoint, and KEY_FOLDED is set. On an internet-facing host,
+ * every client address would otherwise be a flow of its own, and the flow
+ * table, the series of the agent and the edges in PostgreSQL would grow
+ * with the clients of the Internet. Incoming flows are folded with
+ * FOLD_IN and FOLD_ALL, outgoing ones with FOLD_ALL only: the address of a
+ * server tells which external service a host uses.
+ */
+static __always_inline void fold_peer(struct shawk_flow_key *key)
+{
+	struct shawk_peer_prefix p = {.prefixlen = 128};
+
+	key->flags &= ~KEY_FOLDED;
+	if (fold_mode == FOLD_NONE ||
+	    (key->direction == DIR_OUT && fold_mode != FOLD_ALL))
+		return;
+	__builtin_memcpy(p.addr, key->raddr, 16);
+	if (bpf_map_lookup_elem(&internal_peers, &p))
+		return;
+	if (v4mapped_addr(key->raddr))
+		__builtin_memset(key->raddr + 12, 0, 4);
+	else
+		__builtin_memset(key->raddr, 0, 16);
+	key->flags |= KEY_FOLDED;
 }
 
 /* Fills the addresses, port and protocol of a TCP flow key. */
@@ -701,6 +749,7 @@ static __always_inline void on_active_open(struct sock *sk)
 		if (msk)
 			record_mptcp_owner(msk, &key, tgid);
 	}
+	fold_peer(&key);
 
 	ss = bpf_sk_storage_get(&sock_states, sk, NULL,
 				BPF_SK_STORAGE_GET_F_CREATE);
@@ -757,6 +806,7 @@ static __always_inline struct shawk_sock_state *on_passive_open(struct sock *sk)
 	 * SO_REUSEPORT; user space resolves the command name.
 	 */
 	key.cgroup_id = sock_cgroup_id(sk);
+	fold_peer(&key);
 
 	tp = bpf_skc_to_tcp_sock(sk);
 	if (!tp)
@@ -837,6 +887,7 @@ int BPF_PROG(shawk_inet_sock_set_state, const struct sock *csk, int oldstate,
 				return 0;
 			/* The local address is final once established. */
 			read_sock_addrs(sk, ss->key.laddr, ss->key.raddr);
+			fold_peer(&ss->key);
 			established_base(ss, tp, true);
 			count_conn(ss);
 		} else if (newstate == TCP_CLOSE && !(ss->flags & SS_JOIN)) {
@@ -935,6 +986,7 @@ static __always_inline void adopt_tcp(struct tcp_sock *tp, struct sock *sk,
 		return;
 	if (dir == DIR_IN)
 		key.cgroup_id = sock_cgroup_id(sk);
+	fold_peer(&key);
 	msk = subflow_msk(sk, &join);
 	if (msk && join)
 		flags |= SS_JOIN;
@@ -1226,6 +1278,7 @@ static __always_inline int handle_udp_send(struct sk_buff *skb)
 	key.port = key.direction == DIR_IN ? h.sport : h.dport;
 	key.proto = IPPROTO_UDP;
 	tgid = set_udp_owner(&key, sk, tgid);
+	fold_peer(&key);
 
 	fs = flow_get(&key);
 	if (!fs)
@@ -1284,6 +1337,7 @@ int BPF_PROG(shawk_skb_consume_udp, struct sock *sk, struct sk_buff *skb,
 	key.port = key.direction == DIR_IN ? h.dport : h.sport;
 	key.proto = IPPROTO_UDP;
 	tgid = set_udp_owner(&key, sk, tgid);
+	fold_peer(&key);
 
 	fs = flow_get(&key);
 	if (!fs)
