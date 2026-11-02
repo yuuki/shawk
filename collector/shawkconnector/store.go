@@ -195,23 +195,28 @@ ON CONFLICT (host_id, role, proto, local_addr, remote_addr, port, netns, process
 // queueSessions writes the sessions of a host, and the periods in which its
 // agent dropped flows.
 //
-// The dropped flows of a session are compared with what PostgreSQL holds,
-// so that a restart of the connector, or several connectors, record the same
-// periods: an increase since the heartbeat written before is recorded as a
-// period from that heartbeat to the new one, which extends the latest period
-// of the session when they meet. A session written for the first time
-// continues the latest session of the host if the counter of the agent ran
-// then (the agent did not restart: a new segment, or a new connector, starts
-// a new session) and did not decrease; its drops since that session are
-// recorded from the start of the session, or the end of that session if it
-// ends later. Otherwise every drop it counts is recorded from its start.
-// Times are by the clock of the connector, like heartbeats.
+// The dropped flows are a counter of the run of the agent, which every
+// session of the run carries with the start of its counters, the same for
+// all of them: the sessions of one run written by several connectors, or
+// by one connector before and after a restart, or after a step of the clock
+// of the agent, have different starts. A run is therefore compared with
+// what PostgreSQL holds for the same run, whichever its sessions: drops
+// beyond the most it counted are recorded as a period from its latest
+// heartbeat (or the start of the session, if later, as after failed
+// requests) to the new heartbeat. A heartbeat written by another connector
+// may be ahead by the clock of that connector; the two ends are then
+// ordered rather than the drops skipped. The drops of a run not seen before
+// are recorded from the start of the session. Without the start of the
+// counters, as from an agent that does not send it, the session itself
+// stands for the run. A period that meets the
+// latest period of the host extends it. Times are by the clock of the
+// connector, like heartbeats.
 //
 // The upsert of the host before has locked its row, so that the writes of a
 // host wait for each other and each compares with the one before.
 func queueSessions(b *pgx.Batch, h *hostChanges) {
 	var starts, beats []time.Time
-	var counters []*time.Time // nil if unknown
+	var runs []*time.Time // nil if unknown
 	var udp []bool
 	var scopes, folds []string
 	var internals []*string
@@ -225,11 +230,11 @@ func queueSessions(b *pgx.Batch, h *hostChanges) {
 		scopes = append(scopes, s.netnsScope)
 		dropped = append(dropped, s.dropped)
 		skews = append(skews, s.clockSkew.Seconds())
-		var counter *time.Time
-		if !s.droppedSince.IsZero() {
-			counter = &s.droppedSince
+		var run *time.Time
+		if !s.countersStarted.IsZero() {
+			run = &s.countersStarted
 		}
-		counters = append(counters, counter)
+		runs = append(runs, run)
 		folds = append(folds, s.peerFold)
 		var internal *string
 		if s.peerInternal != nil {
@@ -246,78 +251,79 @@ func queueSessions(b *pgx.Batch, h *hostChanges) {
 	if anyDropped {
 		b.Queue(`
 WITH u AS (
-  SELECT * FROM unnest($2::timestamptz[], $3::timestamptz[], $4::bigint[], $5::float8[], $6::timestamptz[])
-    AS u(started, beat, dropped, skew, counter_start)
+  -- One row per run: the sessions of a run in one batch count the same drops.
+  SELECT DISTINCT ON (coalesce(u.run, u.started), u.run IS NULL) u.*
+  FROM unnest($2::timestamptz[], $3::timestamptz[], $4::bigint[], $5::float8[], $6::timestamptz[])
+    AS u(started, beat, dropped, skew, run)
+  WHERE u.dropped > 0
+  ORDER BY coalesce(u.run, u.started), u.run IS NULL, u.dropped DESC, u.beat DESC
 ),
 d AS (
   SELECT u.started, u.beat, u.dropped,
          least(u.started + make_interval(secs => u.skew), u.beat) AS start,
-         cur.last_heartbeat AS cur_beat, cur.dropped_flows AS cur_dropped,
-         prev.last_heartbeat AS prev_beat, prev.dropped_flows AS prev_dropped,
-         prev.last_heartbeat IS NOT NULL AND prev.dropped_flows <= u.dropped
-           AND coalesce(u.counter_start <= prev.last_heartbeat, true) AS same_run
+         base.dropped AS base_dropped, base.beat AS base_beat
   FROM u
-  LEFT JOIN shawk.agent_sessions cur ON cur.host_id = $1 AND cur.started_at = u.started
-  LEFT JOIN LATERAL (
-    SELECT p.last_heartbeat, p.dropped_flows FROM shawk.agent_sessions p
-    WHERE p.host_id = $1 AND p.last_heartbeat <= u.beat
-    ORDER BY p.last_heartbeat DESC LIMIT 1
-  ) prev ON cur.started_at IS NULL
+  CROSS JOIN LATERAL (
+    SELECT max(s.dropped_flows) AS dropped, max(s.last_heartbeat) AS beat
+    FROM shawk.agent_sessions s
+    WHERE s.host_id = $1
+      AND CASE WHEN u.run IS NULL THEN s.started_at = u.started ELSE s.counters_started = u.run END
+  ) base
 ),
-inc AS (
-  SELECT started, beat,
-         CASE WHEN cur_beat IS NOT NULL THEN cur_beat
-              WHEN same_run THEN greatest(start, prev_beat)
-              ELSE start END AS since,
-         dropped - CASE WHEN cur_beat IS NOT NULL THEN cur_dropped
-                        WHEN same_run THEN prev_dropped
-                        ELSE 0 END AS n
+e AS (
+  SELECT started, beat, dropped - coalesce(base_dropped, 0) AS n,
+         CASE WHEN base_beat IS NULL THEN start ELSE greatest(base_beat, start) END AS since
   FROM d
+  WHERE dropped > coalesce(base_dropped, 0)
 ),
-p AS (SELECT * FROM inc WHERE n > 0 AND beat > since),
+p AS (SELECT started, least(since, beat) AS since, greatest(since, beat) AS until, n FROM e),
 latest AS (
-  SELECT DISTINCT ON (o.started_at) o.started_at, o.period_start, o.period_end
-  FROM shawk.partial_observations o JOIN p ON p.started = o.started_at
-  WHERE o.host_id = $1
-  ORDER BY o.started_at, o.period_start DESC
+  SELECT o.started_at, o.period_start, o.period_end
+  FROM shawk.partial_observations o WHERE o.host_id = $1
+  ORDER BY o.period_end DESC LIMIT 1
+),
+m AS (
+  SELECT max(p.until) AS until, sum(p.n) AS n
+  FROM p, latest WHERE p.since <= latest.period_end AND p.until >= latest.period_start
 ),
 extended AS (
   UPDATE shawk.partial_observations o
-  SET period_end = greatest(o.period_end, p.beat), dropped_flows = o.dropped_flows + p.n
-  FROM p JOIN latest ON latest.started_at = p.started
-  WHERE o.host_id = $1 AND o.started_at = p.started AND o.period_start = latest.period_start
-    AND p.since <= latest.period_end
-  RETURNING o.started_at
+  SET period_end = greatest(o.period_end, m.until), dropped_flows = o.dropped_flows + m.n
+  FROM m, latest
+  WHERE m.n IS NOT NULL AND o.host_id = $1
+    AND o.started_at = latest.started_at AND o.period_start = latest.period_start
+  RETURNING o.host_id
 )
 INSERT INTO shawk.partial_observations AS o (host_id, started_at, period_start, period_end, dropped_flows)
-SELECT $1, p.started, p.since, p.beat, p.n FROM p
-WHERE p.started NOT IN (SELECT started_at FROM extended)
+SELECT $1, p.started, p.since, p.until, p.n FROM p
+WHERE NOT EXISTS (SELECT FROM latest WHERE p.since <= latest.period_end AND p.until >= latest.period_start)
 ON CONFLICT (host_id, started_at, period_start) DO UPDATE SET
   period_end    = greatest(o.period_end, excluded.period_end),
   dropped_flows = o.dropped_flows + excluded.dropped_flows`,
-			h.key, starts, beats, dropped, skews, counters)
+			h.key, starts, beats, dropped, skews, runs)
 	}
 	// What the agent folds is kept as of the latest heartbeat, unless the
 	// session row does not tell it.
 	b.Queue(`
 INSERT INTO shawk.agent_sessions AS s (host_id, started_at, last_heartbeat, udp_traced, netns_scope, dropped_flows, clock_skew,
-                                       peer_fold, peer_internal)
+                                       peer_fold, peer_internal, counters_started)
 SELECT $1, u.started, u.beat, u.udp, u.scope, u.dropped, make_interval(secs => u.skew),
-       nullif(u.fold, ''), CASE WHEN u.fold <> '' THEN string_to_array(u.internal, ',')::cidr[] END
+       nullif(u.fold, ''), CASE WHEN u.fold <> '' THEN string_to_array(u.internal, ',')::cidr[] END, u.run
 FROM unnest($2::timestamptz[], $3::timestamptz[], $4::boolean[], $5::text[], $6::bigint[], $7::float8[],
-            $8::text[], $9::text[])
-  AS u(started, beat, udp, scope, dropped, skew, fold, internal)
+            $8::text[], $9::text[], $10::timestamptz[])
+  AS u(started, beat, udp, scope, dropped, skew, fold, internal, run)
 ON CONFLICT (host_id, started_at) DO UPDATE SET
-  clock_skew     = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat THEN excluded.clock_skew ELSE s.clock_skew END,
-  udp_traced     = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat THEN excluded.udp_traced ELSE s.udp_traced END,
-  netns_scope    = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat THEN excluded.netns_scope ELSE s.netns_scope END,
-  peer_fold      = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat AND excluded.peer_fold IS NOT NULL
-                        THEN excluded.peer_fold ELSE s.peer_fold END,
-  peer_internal  = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat AND excluded.peer_fold IS NOT NULL
-                        THEN excluded.peer_internal ELSE s.peer_internal END,
-  dropped_flows  = greatest(s.dropped_flows, excluded.dropped_flows),
-  last_heartbeat = greatest(s.last_heartbeat, excluded.last_heartbeat)`,
-		h.key, starts, beats, udp, scopes, dropped, skews, folds, internals)
+  clock_skew       = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat THEN excluded.clock_skew ELSE s.clock_skew END,
+  udp_traced       = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat THEN excluded.udp_traced ELSE s.udp_traced END,
+  netns_scope      = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat THEN excluded.netns_scope ELSE s.netns_scope END,
+  peer_fold        = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat AND excluded.peer_fold IS NOT NULL
+                          THEN excluded.peer_fold ELSE s.peer_fold END,
+  peer_internal    = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat AND excluded.peer_fold IS NOT NULL
+                          THEN excluded.peer_internal ELSE s.peer_internal END,
+  counters_started = coalesce(s.counters_started, excluded.counters_started),
+  dropped_flows    = greatest(s.dropped_flows, excluded.dropped_flows),
+  last_heartbeat   = greatest(s.last_heartbeat, excluded.last_heartbeat)`,
+		h.key, starts, beats, udp, scopes, dropped, skews, folds, internals, runs)
 }
 
 // queueListeners writes the listeners of a host: a row per listener with

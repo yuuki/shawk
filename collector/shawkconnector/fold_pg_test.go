@@ -122,12 +122,13 @@ func TestPGFoldedEdges(t *testing.T) {
 
 // sessionChanges returns the changes of a session of a host: started (by
 // the clock of the agent), its heartbeat, the dropped flows and the start of
-// their counter (by the clock of the connector), as offsets from base.
+// their counter (by the clock of the connector, which is skew ahead of that
+// of the agent), as offsets from base.
 func sessionChanges(host string, base time.Time, started, beat time.Duration, dropped int64, counter, skew time.Duration) *hostChanges {
 	h := newHostChanges(host)
 	h.setHost("m", host, "k", "v", base.Add(beat))
 	h.addSession(base.Add(started), sessionRow{lastHeartbeat: base.Add(beat), netnsScope: "all", dropped: dropped,
-		droppedSince: base.Add(counter), clockSkew: skew, peerFold: foldNone})
+		countersStarted: base.Add(counter).Add(-skew), clockSkew: skew, peerFold: foldNone})
 	return h
 }
 
@@ -362,4 +363,59 @@ func TestPGAgentsFoldUpgrade(t *testing.T) {
 	if !slices.Equal(got, []string{"in 10.0.0.0/8,fc00::/7"}) {
 		t.Errorf("session = %q", got)
 	}
+}
+
+// TestPGPartialObservationsRuns: the drops of one run of the agent are
+// recorded once, whatever sessions carry them: two connectors that write
+// the run under different sessions, a connector whose clock is ahead of
+// the other, and two sessions of the run in one batch, as after a step of
+// the clock of the agent.
+func TestPGPartialObservationsRuns(t *testing.T) {
+	m := func(n int) time.Duration { return time.Duration(n) * time.Minute }
+	total := func(t *testing.T, conn *pgx.Conn) string {
+		t.Helper()
+		return queryStrings(t, conn, `SELECT coalesce(sum(dropped_flows), 0)::bigint FROM shawk.partial_observations`)[0]
+	}
+	t.Run("two connectors", func(t *testing.T) {
+		dsn, conn := migratedDB(t)
+		base := time.Now().UTC().Truncate(time.Minute)
+		_, write := partialStore(t, dsn, base)
+		write("h1", m(-60), m(-10), 0, m(-60), 0) // connector A, under the start of the segment
+		write("h1", m(-12), m(-8), 0, m(-60), 0)  // connector B, under its floor
+		write("h1", m(-60), m(-7), 10, m(-60), 0) // A: 10 drops since B saw none
+		write("h1", m(-12), m(-6), 10, m(-60), 0) // B: the same 10 drops
+		if got := periods(t, conn, base); !slices.Equal(got, []string{"h1 -60 -8 -7 10"}) {
+			t.Errorf("periods = %q", got)
+		}
+	})
+	t.Run("connector clock ahead", func(t *testing.T) {
+		dsn, conn := migratedDB(t)
+		base := time.Now().UTC().Truncate(time.Minute)
+		_, write := partialStore(t, dsn, base)
+		write("h1", m(-60), m(-10), 0, m(-60), 0)
+		write("h1", m(-60), m(-8), 5, m(-60), 0) // connector A, a minute ahead
+		// Connector B, on time, receives the next request, with 3 drops more,
+		// stamped before the heartbeat A wrote.
+		write("h1", m(-60), m(-9)+30*time.Second, 8, m(-60), 0)
+		write("h1", m(-60), m(-7), 8, m(-60), 0)
+		if got := total(t, conn); got != "8" {
+			t.Errorf("recorded %s dropped flows, want 8; periods = %q", got, periods(t, conn, base))
+		}
+	})
+	t.Run("one batch", func(t *testing.T) {
+		dsn, conn := migratedDB(t)
+		ctx := context.Background()
+		base := time.Now().UTC().Truncate(time.Minute)
+		st, write := partialStore(t, dsn, base)
+		write("h1", m(-60), m(-10), 2, m(-60), 0)
+		h := sessionChanges("h1", base, m(-60), m(-9), 6, m(-60), 0)
+		h.addSession(base.Add(m(-50)), sessionRow{lastHeartbeat: base.Add(m(-8)), netnsScope: "all", dropped: 7,
+			countersStarted: base.Add(m(-60)), peerFold: foldNone})
+		if err := st.write(ctx, h); err != nil {
+			t.Fatal(err)
+		}
+		if got := total(t, conn); got != "7" {
+			t.Errorf("recorded %s dropped flows, want 7 (2 at start, then 5); periods = %q", got, periods(t, conn, base))
+		}
+	})
 }

@@ -15,16 +15,23 @@
 -- servers) or 'all' (of its clients too), and the ranges of peers it keeps
 -- exact besides its own addresses. NULL when not known: written by a
 -- connector of the previous version.
+--
+-- counters_started is when the counters of the agent started, by the clock
+-- of the agent as it sends it: the same for every session of one run of the
+-- agent, so that its dropped flows are compared within the run. NULL when
+-- not known; the drops a run counted before its first session with it are
+-- then recorded from the start of that session.
 ALTER TABLE shawk.agent_sessions
-  ADD COLUMN peer_fold     text,
-  ADD COLUMN peer_internal cidr[];
+  ADD COLUMN peer_fold        text,
+  ADD COLUMN peer_internal    cidr[],
+  ADD COLUMN counters_started timestamptz;
 
 -- Periods in which an agent observed its host but dropped flows because its
 -- flow table was full: dependencies active then may be missing. Times are by
 -- the clock of the connector, like heartbeats. The connector records a
--- period when the dropped flows of a session grow between two heartbeats,
--- and extends the latest period of the session when the next one starts
--- where it ends.
+-- period when the dropped flows of a run of the agent grow between two
+-- heartbeats, and extends the latest period of the host when the next one
+-- meets it.
 CREATE TABLE shawk.partial_observations (
   host_id       text NOT NULL REFERENCES shawk.hosts,
   started_at    timestamptz NOT NULL,     -- of the session

@@ -68,15 +68,35 @@ func (h agentHost) covers(proto string) bool {
 // its external peers: whether it folds the peers of its servers and the
 // address is outside the ranges it keeps exact.
 func (h agentHost) foldsClient(a netip.Addr) bool {
-	if h.fold != foldIn && h.fold != foldAll {
-		return false
-	}
+	return (h.fold == foldIn || h.fold == foldAll) && !h.keeps(a)
+}
+
+// foldsServer tells whether the agent folds a server at an address into
+// its external peers: whether it folds the peers of its clients too and
+// the address is outside the ranges it keeps exact.
+func (h agentHost) foldsServer(a netip.Addr) bool {
+	return h.fold == foldAll && !h.keeps(a)
+}
+
+// keepsRange tells whether every address of a range is in a range the agent
+// keeps exact.
+func (h agentHost) keepsRange(r netip.Prefix) bool {
 	for _, p := range h.internal {
-		if p.Contains(a) {
-			return false
+		if p.Bits() <= r.Bits() && p.Contains(r.Addr()) {
+			return true
 		}
 	}
-	return true
+	return false
+}
+
+// keeps tells whether an address is in a range the agent keeps exact.
+func (h agentHost) keeps(a netip.Addr) bool {
+	for _, p := range h.internal {
+		if p.Contains(a) {
+			return true
+		}
+	}
+	return false
 }
 
 // peer is the name of the peer of an edge.
@@ -85,11 +105,15 @@ type peer struct {
 	// agent tells whether the peer runs on a host whose agent records the
 	// other side of the edge (shawk.peer.agent).
 	agent bool
-	// foldedBy is set on a client edge whose server runs an agent that folds
-	// the client into its external peers although the client runs an agent
-	// too: the server edge does not match the client edge, and both count
-	// the connections (§7). It is the host of the server and its name.
+	// foldedBy is set on an edge whose peer runs an agent that folds this
+	// side into its external peers although it runs an agent too: the edges
+	// of the two sides do not match. It is the host of the peer and its
+	// name. On a client edge, the server folds its client: both sides count
+	// the connections (§7). On a server edge (foldsServer), the client folds
+	// its server, so its client edge names no service: agent is false, so
+	// that this side counts them.
 	foldedBy, foldedByName string
+	foldsServer            bool
 }
 
 // resolver names the peers of edges. It combines the endpoints, clients and
@@ -328,8 +352,13 @@ func (r *resolver) peer(host string, id *edgeID, now time.Time) peer {
 		for h := range holders {
 			if a, ok := r.agent(h, now); ok {
 				p.agent = a.covers(id.proto)
-				if p.agent && id.role == roleClient && h != host && r.foldsClient(a, h, id.local, now) {
+				switch {
+				case !p.agent || h == host:
+				case id.role == roleClient && r.foldsPeer(a, h, id.local, false, now):
 					p.foldedBy, p.foldedByName = h, a.name
+				case id.role == roleServer && r.foldsPeer(a, h, id.local, true, now):
+					p.agent = false
+					p.foldedBy, p.foldedByName, p.foldsServer = h, a.name, true
 				}
 			}
 		}
@@ -347,16 +376,20 @@ func (r *resolver) peer(host string, id *edgeID, now time.Time) peer {
 	return p
 }
 
-// foldsClient tells whether the agent a of server folds a client at the
-// address client into its external peers. A loopback address, and one that
-// several hosts or the server itself hold, never reaches it from outside.
-// r.mu is held.
-func (r *resolver) foldsClient(a agentHost, server string, client netip.Addr, now time.Time) bool {
-	if !client.IsValid() || client.IsLoopback() || client.IsUnspecified() || !a.foldsClient(client) {
+// foldsPeer tells whether the agent a of the host peer folds this side, at
+// the address local, into its external peers: a client if a is the agent of
+// its server, a server if it is that of its client (server). A loopback
+// address, and one that several hosts or peer itself hold, never reaches it
+// from outside. r.mu is held.
+func (r *resolver) foldsPeer(a agentHost, peer string, local netip.Addr, server bool, now time.Time) bool {
+	if !local.IsValid() || local.IsLoopback() || local.IsUnspecified() {
 		return false
 	}
-	hs := r.holders(client, now)
-	return len(hs) <= 1 && !hs[server]
+	if server && !a.foldsServer(local) || !server && !a.foldsClient(local) {
+		return false
+	}
+	hs := r.holders(local, now)
+	return len(hs) <= 1 && !hs[peer]
 }
 
 // holders returns the hosts with live agents that hold an address now. A

@@ -352,23 +352,31 @@ host into one flow per local endpoint:
   established, when its addresses are read again), and for every UDP
   datagram once the direction of its socket is known. Its remote address
   becomes 0.0.0.0 (IPv4-mapped) or ::, and `KEY_FOLDED` is set in the key,
-  so that it never merges with an exact one. A TCP connection costs one
-  lookup in the trie, and so does a datagram of a UDP server.
+  so that it never merges with an exact one. An accepted or adopted TCP
+  connection costs one lookup in the trie, and so does a datagram of a UDP
+  server; with `all`, an opened connection costs two.
 - A folded flow is sent with `network.peer.address` 0.0.0.0 or :: and
   `shawk.peer.folded=true`; the resource of the agent carries
   `shawk.peer.fold` and `shawk.peer.internal` (§4.2). PostgreSQL keeps its
   peer as the network 0.0.0.0/0 or ::/0 (§6), which `peer_class()` names
   `~external`: the names of the services and the dependencies between them
-  are those without folding. What is lost is the address of each external
-  client in `shawk_v1.dependencies`; set `-fold-external=none` where it is
-  needed.
+  are those without folding, provided the ranges of `peer_cidrs` are in
+  `-internal-peers` too. A folded peer has lost its address, so a peer in a
+  range of `peer_cidrs` outside them, such as a public range of an office,
+  is named `~external` rather than after its range; the connector warns
+  about agents that fold such ranges (§5.2). What is lost is the address
+  of each external client in `shawk_v1.dependencies`; set
+  `-fold-external=none` where it is needed.
 - `shawk flows` does not fold, so that it shows every address.
+- An IPv6 range that overlaps the IPv4-mapped addresses (`::ffff:0:0/96`),
+  such as `::/0`, is refused: the IPv4 peers are looked up as such
+  addresses, so it would keep them all.
 
 The flow table then holds about one flow per internal peer and local
 service, plus one per local endpoint for all external peers. A peer on an
 internal range of the fleet that is missing from `-internal-peers` is
-folded, so its connections are seen on the client side only; the
-connector warns about agents whose peers are folded that way (§5.2).
+folded, so its connections do not match on both sides; the connector warns
+about agents whose peers are folded that way (§5.2).
 
 ## 4. The agent
 
@@ -533,21 +541,24 @@ rejects as invalid data are dropped rather than kept for the next write,
 which would fail again (IPv6 zones are stripped from addresses before);
 the edges and listeners agents still send are then written again.
 
-The session also keeps what the agent folds (`shawk.peer.fold`, §5.2) and
-the ranges it keeps exact (`shawk.peer.internal`). When the flows the agent
-dropped (`shawk.agent.flows.dropped`) grew since the heartbeat written
-before, the period between the two heartbeats is recorded in
-`partial_observations`: the host was observed, but dependencies active
-then may be missing. A period that starts where the latest period of the
-session ends extends it. The count is compared with the session in
-PostgreSQL rather than with what the connector remembers, so a restart and
-several connectors record the same periods; the writes of a host wait for
-each other on the row of the host, which they update first. A session
-written for the first time continues the latest session of the host when
-the counter of the agent ran then (it started before that heartbeat and
-did not decrease), as after a restart of the connector or a new segment of
-the same agent, and records only the drops since; otherwise, as after a
-restart of the agent, it records every drop it counts from its start.
+The session also keeps what the agent folds (`shawk.peer.fold`, §5.2), the
+ranges it keeps exact (`shawk.peer.internal`), and when its counters
+started (`counters_started`, the start of `shawk.agent.flows.dropped` by
+the clock of the agent): the same for every session of one run of the
+agent, which tells its runs apart. The flows an agent dropped are a counter
+of its run, and the sessions of one run differ when several connectors
+write it, when a connector restarts, or after a step of the clock of the
+agent. When the drops of a run grow beyond the most PostgreSQL holds for
+the run, whatever its sessions, the period from the latest heartbeat of
+the run (or the start of the session, if later, as after failed requests)
+to the new heartbeat is recorded in `partial_observations`: the host was
+observed, but dependencies active then may be missing. The drops of a run
+not seen before are recorded from the start of its session. A heartbeat
+written by another connector may be ahead by the clock of that connector;
+the two ends are then swapped rather than the drops skipped. A period that
+meets the latest period of the host extends it. The writes of a host wait
+for each other on the row of the host, which they update first, so each
+compares with the one before.
 
 Changes still pending are lost when the connector crashes, or stops while
 the database is down; agents send again only the edges active within their
@@ -628,12 +639,19 @@ addresses. The two sides of their connections then do not match in
 PostgreSQL, and §7 counts them on both sides. When the connector sees a
 client edge to an address that one live host holds whose agent folds the
 client address this way (not loopback, nor an address several hosts or
-that host hold), it logs a warning naming both hosts and addresses, at most
-once an hour per pair of hosts, so that the address can be added to the
-internal ranges of the server's agent. What an agent folds comes from its
+that host hold), it logs a warning naming both hosts and addresses, so
+that the address can be added to the internal ranges of the server's
+agent. Likewise, an agent with `-fold-external=all` folds a server that
+runs an agent when the address of the server is outside its internal
+ranges: its client edge names no service, so the server edge tells that
+its peer has no agent (`shawk.peer.agent` false), to be counted, and the
+connector warns. Each host whose agent folds is logged at most once an
+hour, with the number of hosts it folded since. An agent that folds the
+peers in a range of `peer_cidrs`, which are then named `~external`, is
+logged too, at most once an hour. What an agent folds comes from its
 requests, or for hosts behind other connectors from
 `shawk_v1.agent_addrs`. The connector has no metrics of its own, so the
-warning is only logged.
+warnings are only logged.
 
 ### 5.3 Metrics to Prometheus
 
@@ -707,7 +725,7 @@ connector as migrations (`collector/shawkconnector/migrations`), applied by
 ```
 hosts(id, machine_id, hostname, kernel, agent_version, first_seen, last_seen)
 agent_sessions(host_id, started_at, last_heartbeat, udp_traced, netns_scope, dropped_flows, clock_skew,
-               peer_fold, peer_internal)  -- peer_*: NULL if written by an earlier connector
+               peer_fold, peer_internal, counters_started)  -- NULL if written by an earlier connector
 partial_observations(host_id, started_at, period_start, period_end, dropped_flows)  -- periods with drops
 host_addrs(host_id, addr, first_seen, last_seen)  -- one row per period
 processes(id, host_id, unit, comm, exe, service_name, first_seen, last_seen)  -- unique (host_id, unit, comm, service_name)
@@ -725,7 +743,9 @@ connector brings it up to date every 5 minutes
 
 `partial_observations` holds the periods in which an agent dropped flows
 (§5.1), by the clock of the connector, per session; `peer_fold` is `none`,
-`in` or `all`, and `peer_internal` the ranges the agent keeps exact.
+`in` or `all`, `peer_internal` the ranges the agent keeps exact, and
+`counters_started` when the counters of the agent started, by its clock,
+which tells its runs apart (§5.1).
 
 `service_name` has the form of the `job` label (`namespace/name`), so that
 names in PostgreSQL and Prometheus match.

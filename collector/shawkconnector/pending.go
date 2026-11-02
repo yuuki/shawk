@@ -57,11 +57,12 @@ type sessionRow struct {
 	udpTraced  bool
 	netnsScope string
 	dropped    int64
-	// droppedSince is when the counter of dropped flows started (the agent
-	// started), by the clock of the connector; zero if unknown. It tells
-	// whether the drops counted in an earlier session of the host are part
-	// of dropped.
-	droppedSince time.Time
+	// countersStarted is when the counters of the agent started, by the
+	// clock of the agent as it sends it: the same for every session of one
+	// run of the agent, whatever connector writes them and however its clock
+	// steps, so that the drops of a run are compared with those of the same
+	// run; zero if unknown.
+	countersStarted time.Time
 	// peerFold and peerInternal are what the agent folds and the ranges it
 	// keeps exact; peerFold is empty if unknown.
 	peerFold     string
@@ -254,9 +255,7 @@ func (c *changes) add(b *hostBatch, now time.Time) {
 		}
 		s := sessionRow{lastHeartbeat: now, clockSkew: skew, udpTraced: b.udpTraced,
 			netnsScope: b.netnsScope, dropped: b.dropped, peerFold: b.peerFold, peerInternal: b.peerInternal}
-		if !b.droppedSince.IsZero() {
-			s.droppedSince = b.droppedSince.Add(skew)
-		}
+		s.countersStarted = b.droppedSince
 		h.addSession(start, s)
 	}
 	// The host holds its addresses as of the requests that close intervals,

@@ -2,6 +2,7 @@ package shawkconnector
 
 import (
 	"context"
+	"fmt"
 	"net/netip"
 	"slices"
 	"testing"
@@ -242,8 +243,10 @@ func TestFoldedAgentPeerDiagnostic(t *testing.T) {
 	if s := find(out, metricConnOpened, "app", "nginx", roleClient, ""); len(s) != 1 || !s[0].agent {
 		t.Errorf("client series = %v", s)
 	}
-	// Once an hour per pair of hosts.
+	// Once an hour per host whose agent folds, with the hosts it folded
+	// since.
 	consume(t, c, sink, client("app-01", "198.51.100.7", t0.Add(15*time.Second), "203.0.113.10"))
+	consume(t, c, sink, client("app-05", "198.51.100.8", t0.Add(15*time.Second), "203.0.113.10"))
 	if got := foldWarnings(logs); len(got) != 0 {
 		t.Errorf("warned again within the hour: %q", got)
 	}
@@ -251,8 +254,8 @@ func TestFoldedAgentPeerDiagnostic(t *testing.T) {
 	*now = later
 	consume(t, c, sink, edge(later))
 	consume(t, c, sink, client("app-01", "198.51.100.7", later, "203.0.113.10"))
-	if got := foldWarnings(logs); len(got) != 1 {
-		t.Errorf("warnings an hour later = %q", got)
+	if got := logs.TakeAll(); len(got) != 1 || got[0].ContextMap()["hosts_folded"] != int64(2) {
+		t.Errorf("warnings an hour later = %v, want one with hosts_folded 2", got)
 	}
 
 	// UDP of a host that does not trace UDP: no server edge to mismatch.
@@ -279,9 +282,74 @@ func TestFoldedAgentPeerDiagnostic(t *testing.T) {
 	}
 }
 
+// TestFoldAllAgentServer: a client host whose agent folds the peers of its
+// clients too (-fold-external=all) folds a server that runs an agent when
+// the address of the server is outside its internal ranges. Its client
+// edge then names no service, so the server edge tells that its peer has
+// no agent, and is counted; the connector warns.
+func TestFoldAllAgentServer(t *testing.T) {
+	c, _, sink, _ := testConnector(t, nil)
+	logs := observe(c)
+	app := tAgent{host: "app-01", addrs: []string{"198.51.100.7"}, time: t0, fold: foldAll,
+		internal: []string{"10.0.0.0/8"},
+		edges: []tEdge{{role: "client", proto: "tcp", local: "198.51.100.7", peer: "0.0.0.0", folded: true, port: 443,
+			svc: "app", comm: "app", opened: 1}}}
+	web := tAgent{host: "web-01", addrs: []string{"203.0.113.10"}, time: t0, fold: foldIn,
+		internal:  []string{"10.0.0.0/8", "198.51.100.0/24"},
+		listeners: []tListener{{proto: "tcp", addr: "0.0.0.0", port: 443, svc: "nginx", comm: "nginx"}},
+		edges: []tEdge{{role: "server", proto: "tcp", local: "203.0.113.10", peer: "198.51.100.7", port: 443,
+			svc: "nginx", comm: "nginx", opened: 1}}}
+	consume(t, c, sink, app)
+	out := consume(t, c, sink, web)
+	s := find(out, metricConnOpened, "nginx", "*", roleServer, "")
+	if len(s) != 1 || s[0].agent {
+		t.Errorf("server series = %v, want one whose peer has no agent", s)
+	}
+	if got, want := foldWarnings(logs), []string{"app-01 198.51.100.7 -> web-01 203.0.113.10"}; !slices.Equal(got, want) {
+		t.Errorf("warnings = %q, want %q", got, want)
+	}
+	// A server in the internal ranges of the client stays matched.
+	app.internal = append(app.internal, "203.0.113.0/24")
+	app.time, web.time = t0.Add(15*time.Second), t0.Add(15*time.Second)
+	web.edges[0].opened = 2
+	consume(t, c, sink, app)
+	out = consume(t, c, sink, web)
+	// The series of the folded peer is kept until it is idle.
+	if s := find(out, metricConnOpened, "nginx", "*", roleServer, ""); !slices.ContainsFunc(s, func(s series) bool { return s.agent }) {
+		t.Errorf("server series = %v, want one whose peer has an agent", s)
+	}
+}
+
+// TestFoldedCIDRsWarning: an agent that folds the peers in a range of
+// peer_cidrs makes them ~external; the connector warns, once an hour per
+// host.
+func TestFoldedCIDRsWarning(t *testing.T) {
+	c, _, sink, now := testConnector(t, func(cfg *Config) {
+		cfg.PeerCIDRs = map[string]string{"office": "203.0.113.0/24", "dc": "10.20.0.0/16"}
+	})
+	logs := observe(c)
+	host := func(name string, fold string, internal ...string) tAgent {
+		return tAgent{host: name, addrs: []string{"10.0.0.9"}, time: *now, fold: fold, internal: internal}
+	}
+	consume(t, c, sink, host("edge-01", foldIn, "10.0.0.0/8"))
+	consume(t, c, sink, host("edge-02", foldIn, "10.0.0.0/8", "203.0.113.0/24"))
+	consume(t, c, sink, host("edge-03", foldNone))
+	got := logs.TakeAll()
+	if len(got) != 1 || got[0].ContextMap()["host"] != "edge-01" {
+		t.Fatalf("warnings = %v, want one for edge-01", got)
+	}
+	if r := got[0].ContextMap()["peer_cidrs"]; fmt.Sprint(r) != "[office=203.0.113.0/24]" {
+		t.Errorf("ranges = %v", r)
+	}
+	consume(t, c, sink, host("edge-01", foldIn, "10.0.0.0/8"))
+	if got := logs.TakeAll(); len(got) != 0 {
+		t.Errorf("warned again within the hour: %v", got)
+	}
+}
+
 // TestSessionFoldAndDrops: the session of a request carries what the agent
-// folds and when its counter of dropped flows started, by the clock of the
-// connector.
+// folds and when its counters started, by the clock of the agent, which
+// tells its runs apart whatever the clock of the connector.
 func TestSessionFoldAndDrops(t *testing.T) {
 	ch := newChanges(15 * time.Minute)
 	ta := webAgent(t0)
@@ -298,7 +366,7 @@ func TestSessionFoldAndDrops(t *testing.T) {
 		t.Fatalf("sessions = %v", h.sessions)
 	}
 	for _, s := range h.sessions {
-		if s.dropped != 5 || !s.droppedSince.Equal(t0.Add(-time.Hour+10*time.Second)) || s.peerFold != foldAll ||
+		if s.dropped != 5 || !s.countersStarted.Equal(t0.Add(-time.Hour)) || s.peerFold != foldAll ||
 			len(s.peerInternal) != 3 {
 			t.Errorf("session = %+v", s)
 		}
