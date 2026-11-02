@@ -248,6 +248,7 @@ type fakeStore struct {
 	migrated int
 	version  int // of the schema; SchemaVersion() if zero
 	cidrs    []namedPrefix
+	trans    []translation
 	refresh  int
 }
 
@@ -264,6 +265,13 @@ func (s *fakeStore) syncPeerCIDRs(_ context.Context, cidrs []namedPrefix) error 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.cidrs = cidrs
+	return nil
+}
+
+func (s *fakeStore) syncTranslations(_ context.Context, ts []translation) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.trans = ts
 	return nil
 }
 

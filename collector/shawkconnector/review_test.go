@@ -250,7 +250,7 @@ func BenchmarkRequestWithFleet(b *testing.B) {
 	for _, hosts := range []int{10, 10000} {
 		b.Run(fmt.Sprintf("hosts=%d", hosts), func(b *testing.B) {
 			a := newAggregator(15*time.Minute, 50, false, t0.Add(-time.Hour))
-			r := newResolver(nil)
+			r := newResolver(nil, nil)
 			now := t0
 			req := func(host string) *hostBatch {
 				md := tAgent{host: host, time: now, edges: []tEdge{

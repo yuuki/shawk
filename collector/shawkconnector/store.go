@@ -31,6 +31,8 @@ type store interface {
 	schemaVersion(ctx context.Context) (int, error)
 	// syncPeerCIDRs replaces the named address ranges of peers.
 	syncPeerCIDRs(ctx context.Context, cidrs []namedPrefix) error
+	// syncTranslations replaces the translations of addresses.
+	syncTranslations(ctx context.Context, ts []translation) error
 	// refreshDependencies brings the history of dependencies between
 	// services up to date.
 	refreshDependencies(ctx context.Context) (int64, error)
@@ -449,6 +451,35 @@ func (s *pgStore) syncPeerCIDRs(ctx context.Context, cidrs []namedPrefix) error 
 INSERT INTO shawk.peer_cidrs (prefix, name)
 SELECT * FROM unnest($1::cidr[], $2::text[])
 ON CONFLICT (prefix) DO UPDATE SET name = excluded.name`, prefixes, names)
+		return tx.SendBatch(ctx, b).Close()
+	})
+}
+
+// syncTranslations replaces the rows of shawk.translations with those of
+// the translations, keeping the rows that stay, so that the views see
+// either the old rows or the new ones.
+func (s *pgStore) syncTranslations(ctx context.Context, ts []translation) error {
+	var names, sides, protos, addrs []string
+	var ports []int32
+	for _, r := range translationRows(ts) {
+		names = append(names, r.name)
+		sides = append(sides, r.side)
+		protos = append(protos, r.proto)
+		addrs = append(addrs, r.prefix.String())
+		ports = append(ports, int32(r.port))
+	}
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		b := &pgx.Batch{}
+		b.Queue(`
+DELETE FROM shawk.translations t
+WHERE NOT EXISTS (
+  SELECT FROM unnest($1::text[], $2::text[], $3::text[], $4::cidr[], $5::integer[]) AS u(name, side, proto, addr, port)
+  WHERE u.name = t.name AND u.side = t.side AND u.proto = t.proto AND u.addr = t.addr AND u.port = t.port)`,
+			names, sides, protos, addrs, ports)
+		b.Queue(`
+INSERT INTO shawk.translations (name, side, proto, addr, port)
+SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::cidr[], $5::integer[])
+ON CONFLICT DO NOTHING`, names, sides, protos, addrs, ports)
 		return tx.SendBatch(ctx, b).Close()
 	})
 }

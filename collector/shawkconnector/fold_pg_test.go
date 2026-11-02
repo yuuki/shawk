@@ -85,7 +85,7 @@ func TestPGFoldedEdges(t *testing.T) {
 		[]string{"internet ~external"}) {
 		t.Errorf("peer_class with peer_cidrs = %q", got)
 	}
-	r := newResolver(must(parsePeerCIDRs(map[string]string{"internet": "0.0.0.0/0"})))
+	r := newResolver(must(parsePeerCIDRs(map[string]string{"internet": "0.0.0.0/0"})), nil)
 	if a, b := r.classifyFolded(addrOf("0.0.0.0")), r.classifyFolded(addrOf("::")); a != "internet" || b != peerExternal {
 		t.Errorf("connector names %s %s", a, b)
 	}

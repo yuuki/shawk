@@ -33,9 +33,11 @@ type shawkConnector struct {
 	// ready tells that the schema has been migrated, or checked to be
 	// recent enough, so that writes may proceed.
 	ready bool
-	// cidrsSynced tells that peer_cidrs has been written to PostgreSQL.
-	cidrsSynced bool
-	cidrs       []namedPrefix
+	// cidrsSynced tells that peer_cidrs and the translations have been
+	// written to PostgreSQL.
+	cidrsSynced  bool
+	cidrs        []namedPrefix
+	translations []translation
 
 	lastPrune, lastRefresh time.Time
 
@@ -62,17 +64,23 @@ func newConnector(set connector.Settings, cfg *Config, next consumer.Metrics) (*
 	if err != nil {
 		return nil, err
 	}
+	translations, err := parseTranslations(cfg.Translations)
+	if err != nil {
+		return nil, err
+	}
 	now := time.Now()
 	return &shawkConnector{
 		cfg:      cfg,
 		log:      set.Logger,
 		next:     next,
 		newStore: newPGStore,
-		resolver: newResolver(cidrs),
+		resolver: newResolver(cidrs, translations),
 		agg:      newAggregator(cfg.IdleTTL, cfg.MaxPeers, cfg.KeepPeerAddress, now),
 		changes:  newChanges(cfg.IdleTTL),
 		cidrs:    cidrs,
 		now:      time.Now,
+
+		translations: translations,
 
 		foldWarned: map[foldWarnKey]*foldWarning{},
 		cidrWarned: map[string]time.Time{},
@@ -114,8 +122,8 @@ func (c *shawkConnector) Start(ctx context.Context, _ component.Host) error {
 }
 
 // prepare migrates the schema if configured to, or checks its version,
-// writes peer_cidrs and reloads the names of peers. It reports whether the
-// schema is ready.
+// writes peer_cidrs and the translations, and reloads the names of peers.
+// It reports whether the schema is ready.
 func (c *shawkConnector) prepare(ctx context.Context) bool {
 	if !c.prepareSchemaOnly(ctx) {
 		return false
@@ -124,9 +132,12 @@ func (c *shawkConnector) prepare(ctx context.Context) bool {
 	synced := c.cidrsSynced
 	c.mu.Unlock()
 	if !synced {
-		// PostgreSQL names peers without a service by peer_cidrs too.
+		// PostgreSQL names peers without a service by peer_cidrs too, and
+		// matches edges through the translations.
 		if err := c.store.syncPeerCIDRs(ctx, c.cidrs); err != nil {
 			c.log.Warn("writing peer_cidrs to PostgreSQL", zap.Error(err))
+		} else if err := c.store.syncTranslations(ctx, c.translations); err != nil {
+			c.log.Warn("writing the translations to PostgreSQL", zap.Error(err))
 		} else {
 			c.mu.Lock()
 			c.cidrsSynced = true
