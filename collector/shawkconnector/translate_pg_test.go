@@ -131,7 +131,7 @@ func TestPGTranslations(t *testing.T) {
 		t.Errorf("translations = %q", got)
 	}
 	delete(c.cfg.Translations, "postgres-vip")
-	if err := c.store.syncTranslations(ctx, must(parseTranslations(c.cfg.Translations))); err != nil {
+	if err := c.store.syncConfig(ctx, c.cidrs, must(parseTranslations(c.cfg.Translations))); err != nil {
 		t.Fatal(err)
 	}
 	if got := queryStrings(t, conn, `SELECT DISTINCT name FROM shawk.translations`); !slices.Equal(got, []string{"api-lb", "web-lb"}) {
@@ -284,13 +284,15 @@ func TestPGTranslationPeriods(t *testing.T) {
 }
 
 // TestPGConcurrentTranslationSyncs: connectors that write different
-// translations at once leave those of one of them, not a mix of both.
+// translations and peer_cidrs at once leave those of one of them, not a mix
+// of both, also when the database defaults to REPEATABLE READ.
 func TestPGConcurrentTranslationSyncs(t *testing.T) {
 	dsn, conn := testDB(t)
 	ctx := context.Background()
 	if _, err := Migrate(ctx, conn); err != nil {
 		t.Fatal(err)
 	}
+	execAll(t, conn, `ALTER DATABASE `+conn.Config().Database+` SET default_transaction_isolation = 'repeatable read'`)
 	stores := make([]store, 2)
 	for i := range stores {
 		st, err := newPGStore(ctx, dsn)
@@ -307,6 +309,12 @@ func TestPGConcurrentTranslationSyncs(t *testing.T) {
 			"lb": {Virtual: []string{"10.0.100.1:80"}, Backends: []string{"10.0.1.30"}, Sources: []string{"10.0.100.250"},
 				Transport: "tcp"}})),
 	}
+	// Each connector also has its own peer_cidrs, which are written with the
+	// translations.
+	cidrs := [][]namedPrefix{
+		must(parsePeerCIDRs(map[string]string{"a": "10.1.0.0/16"})),
+		must(parsePeerCIDRs(map[string]string{"b": "10.2.0.0/16"})),
+	}
 	rows := func(ts []translation) []string {
 		var out []string
 		for _, r := range translationRows(ts) {
@@ -318,7 +326,7 @@ func TestPGConcurrentTranslationSyncs(t *testing.T) {
 	initial := must(parseTranslations(map[string]TranslationConfig{
 		"lb": {Virtual: []string{"10.0.100.1:80"}, Backends: []string{"10.0.1.10"}, Transport: "tcp"}}))
 	for round := range 20 {
-		if err := stores[0].syncTranslations(ctx, initial); err != nil {
+		if err := stores[0].syncConfig(ctx, nil, initial); err != nil {
 			t.Fatal(err)
 		}
 		var wg sync.WaitGroup
@@ -327,7 +335,7 @@ func TestPGConcurrentTranslationSyncs(t *testing.T) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				errs[i] = stores[i].syncTranslations(ctx, configs[i])
+				errs[i] = stores[i].syncConfig(ctx, cidrs[i], configs[i])
 			}()
 		}
 		wg.Wait()
@@ -335,8 +343,10 @@ func TestPGConcurrentTranslationSyncs(t *testing.T) {
 			t.Fatal(err)
 		}
 		got := queryStrings(t, conn, `SELECT name, side, proto, addr::text, port FROM shawk.translations`)
-		if !slices.Equal(got, rows(configs[0])) && !slices.Equal(got, rows(configs[1])) {
-			t.Fatalf("round %d: translations = %q", round, got)
+		ranges := queryStrings(t, conn, `SELECT name FROM shawk.peer_cidrs`)
+		if !(slices.Equal(got, rows(configs[0])) && slices.Equal(ranges, []string{"a"})) &&
+			!(slices.Equal(got, rows(configs[1])) && slices.Equal(ranges, []string{"b"})) {
+			t.Fatalf("round %d: translations = %q, peer_cidrs = %q", round, got, ranges)
 		}
 	}
 }
@@ -373,5 +383,159 @@ func TestPGTranslationDirectRouting(t *testing.T) {
 	}
 	if !slices.Equal(got, want) {
 		t.Errorf("dependencies:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+// TestPGTranslationStoppedAgent: a dependency matched through a translation
+// does not disappear when the agent of one side stops; it does when the
+// side that ended its row is still observed.
+func TestPGTranslationStoppedAgent(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		stopped string // the host whose agent stopped 20 minutes ago
+		ended   string // the edge that ended then: client or server
+		want    []string
+	}{
+		{"the agent of the server stopped", "db-01", "server", nil},
+		{"the agent of the client stopped", "app-01", "client", nil},
+		// db-01 still reports, and no longer serves the client.
+		{"the backend left", "", "server", []string{"disappeared app postgres 5432"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			cn, sink, conn := pgConnectorWith(t, func(cfg *Config) {
+				cfg.Translations = map[string]TranslationConfig{
+					"vip": {Virtual: []string{"10.0.100.1:5432"}, Backends: []string{"10.0.1.10"}},
+				}
+			})
+			now := time.Now().UTC().Truncate(time.Second)
+			lastC, lastS := now, now
+			if c.ended == "client" {
+				lastC = now.Add(-20 * time.Minute)
+			} else {
+				lastS = now.Add(-20 * time.Minute)
+			}
+			consume(t, cn, sink, tAgent{host: "db-01", addrs: []string{"10.0.1.10"}, time: now,
+				edges: []tEdge{{role: "server", proto: "tcp", local: "10.0.1.10", peer: "10.0.0.11", port: 5432,
+					svc: "postgres", comm: "postgres", opened: 1, first: now.Add(-2 * time.Hour), last: lastS}}})
+			consume(t, cn, sink, tAgent{host: "app-01", addrs: []string{"10.0.0.11"}, time: now,
+				edges: []tEdge{{role: "client", proto: "tcp", local: "10.0.0.11", peer: "10.0.100.1", port: 5432,
+					svc: "app", comm: "app", opened: 1, first: now.Add(-2 * time.Hour), last: lastC}}})
+			cn.flush(context.Background())
+			if c.stopped != "" {
+				execAll(t, conn, `UPDATE shawk.agent_sessions s SET last_heartbeat = now() - interval '20 minutes'
+				  FROM shawk.hosts h WHERE h.id = s.host_id AND h.hostname = '`+c.stopped+`'`)
+			}
+			for _, q := range []string{
+				`SELECT change, client_service, server_service, port FROM shawk_v1.dependency_changes_between(now() - interval '1 hour', now())
+				  WHERE server_service = 'postgres'`,
+				`SELECT change, client_service, server_service, port FROM shawk_v1.dependency_changes
+				  WHERE server_service = 'postgres' AND change = 'disappeared'`,
+			} {
+				if got := queryStrings(t, conn, q); !slices.Equal(got, c.want) {
+					t.Errorf("%s = %q, want %q", q, got, c.want)
+				}
+			}
+		})
+	}
+}
+
+// TestPGTranslationPrecedencePeriods: a relay with an agent that served the
+// virtual address before a relay without one takes precedence over the
+// translation in its period only, whatever the period asked for.
+func TestPGTranslationPrecedencePeriods(t *testing.T) {
+	c, sink, conn := pgConnectorWith(t, func(cfg *Config) {
+		cfg.Translations = map[string]TranslationConfig{
+			"vip": {Virtual: []string{"10.0.100.1:5432"}, Backends: []string{"10.0.1.10"}},
+		}
+	})
+	now := time.Now().UTC().Truncate(time.Second)
+	day := 24 * time.Hour
+	for _, a := range []tAgent{
+		{host: "lb-01", addrs: []string{"10.0.0.5"}, time: now, edges: []tEdge{{role: "server", proto: "tcp",
+			local: "10.0.100.1", peer: "10.0.0.11", port: 5432, svc: "haproxy", comm: "haproxy", opened: 1,
+			first: now.Add(-10 * day), last: now.Add(-2 * day)}}},
+		{host: "db-01", addrs: []string{"10.0.1.10"}, time: now, edges: []tEdge{{role: "server", proto: "tcp",
+			local: "10.0.1.10", peer: "10.0.0.11", port: 5432, svc: "postgres", comm: "postgres", opened: 1,
+			first: now.Add(-2*day + 10*time.Minute), last: now}}},
+		{host: "app-01", addrs: []string{"10.0.0.11"}, time: now, edges: []tEdge{{role: "client", proto: "tcp",
+			local: "10.0.0.11", peer: "10.0.100.1", port: 5432, svc: "app", comm: "app", opened: 1,
+			first: now.Add(-10 * day), last: now}}},
+	} {
+		consume(t, c, sink, a)
+	}
+	c.flush(context.Background())
+	q := `SELECT client_service, server_service, last_seen > now() - interval '1 day'`
+	for _, c := range []struct {
+		from string
+		want []string
+	}{
+		{"shawk.service_dependencies", []string{"app haproxy false", "app postgres true"}},
+		{"shawk.service_dependencies_between(now() - interval '1 day', now())", []string{"app postgres true"}},
+		{"shawk.service_dependencies_between(now() - interval '3 days', now())", []string{"app haproxy false", "app postgres true"}},
+	} {
+		if got := queryStrings(t, conn, q+" FROM "+c.from); !slices.Equal(got, c.want) {
+			t.Errorf("%s = %q, want %q", c.from, got, c.want)
+		}
+	}
+}
+
+// TestPGTranslationGap: an edge matched through translations keeps a row of
+// its own until the end of the last part its matched rows leave, such as a
+// failover from one backend to another, and shown only in the periods that
+// part is in; the row does not disappear while the client is observed. An
+// edge with its times out of order does not break the view.
+func TestPGTranslationGap(t *testing.T) {
+	c, sink, conn := pgConnectorWith(t, func(cfg *Config) {
+		cfg.Translations = map[string]TranslationConfig{
+			"vip": {Virtual: []string{"10.0.100.1:5432"}, Backends: []string{"10.0.1.10", "10.0.1.11"}},
+		}
+	})
+	now := time.Now().UTC().Truncate(time.Second)
+	failover := now.Add(-72 * time.Hour)
+	server := func(host, addr string, first, last time.Time) tAgent {
+		return tAgent{host: host, addrs: []string{addr}, time: now, edges: []tEdge{{role: "server", proto: "tcp",
+			local: addr, peer: "10.0.0.11", port: 5432, svc: "postgres", comm: "postgres", opened: 1, first: first, last: last}}}
+	}
+	for _, a := range []tAgent{
+		server("db-01", "10.0.1.10", now.Add(-240*time.Hour), failover),
+		server("db-02", "10.0.1.11", failover.Add(10*time.Minute), now),
+		{host: "app-01", addrs: []string{"10.0.0.11"}, time: now, edges: []tEdge{{role: "client", proto: "tcp",
+			local: "10.0.0.11", peer: "10.0.100.1", port: 5432, svc: "app", comm: "app", opened: 1,
+			first: now.Add(-240 * time.Hour), last: now}}},
+	} {
+		consume(t, c, sink, a)
+	}
+	c.flush(context.Background())
+	got := queryStrings(t, conn, `SELECT coalesce(server_host, '-'), observed_by, first_seen = $1, last_seen = $2
+	  FROM shawk_v1.dependencies WHERE observed_by = 'client'`, now.Add(-240*time.Hour), failover.Add(8*time.Minute))
+	if want := []string{"- client true true"}; !slices.Equal(got, want) {
+		t.Errorf("row of the client edge = %q, want %q", got, want)
+	}
+	for _, c := range []struct {
+		since, until string
+		want         []string
+	}{
+		{"now() - interval '1 hour'", "now()", []string{"db-02 both"}},
+		{"now() - interval '73 hours'", "now() - interval '71 hours'", []string{"- client", "db-01 both", "db-02 both"}},
+		{"now() - interval '100 hours'", "now() - interval '80 hours'", []string{"db-01 both"}},
+	} {
+		q := `SELECT coalesce(server_host, '-'), observed_by FROM shawk_v1.dependencies_between(` + c.since + `, ` + c.until + `)`
+		if got := queryStrings(t, conn, q); !slices.Equal(got, c.want) {
+			t.Errorf("%s = %q, want %q", q, got, c.want)
+		}
+	}
+
+	if got := queryStrings(t, conn, `SELECT change, client_service, server_service FROM shawk_v1.dependency_changes
+	  WHERE change = 'disappeared'`); len(got) != 0 {
+		t.Errorf("dependency_changes = %q", got)
+	}
+
+	execAll(t, conn, `UPDATE shawk.edges SET first_seen = last_seen + interval '1 minute' WHERE role = 'client'`)
+	for _, q := range []string{
+		`SELECT count(*) FROM shawk_v1.dependencies`,
+		`SELECT count(*) FROM shawk_v1.dependencies_between('-infinity', 'infinity')`,
+		`SELECT count(*) FROM shawk_v1.dependency_changes`,
+	} {
+		queryStrings(t, conn, q)
 	}
 }

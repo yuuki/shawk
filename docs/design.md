@@ -841,18 +841,29 @@ connector should have the same.
   server edge from a source those of every client of the relay. Such a
   server edge also keeps a row of its own, since clients without an agent
   may be behind the relay; the range of the sources can be named in
-  `peer_cidrs`. Another matched edge keeps a row of its own unless its
-  matched rows cover its period, within the margin (in a period asked
-  for, the part in it, with one of them in it): a client edge may also
-  have reached backends without an agent, or before their agents started,
-  and a server edge served the client directly. A client edge that a
-  server edge matches by address, such as that of a relay that runs an
-  agent, is not matched through a translation. The services, the
-  dependency map and `known_dependencies` follow.
-- **In the names of peers**, a client edge to a virtual address whose
-  address and port have no known service is named after the service at a
-  backend, with the `server.port` of the backend and `shawk.peer.agent` of
-  its host. Among the backends seen within 5 minutes of the most recently
+  `peer_cidrs`. Another matched edge keeps a row of its own if its matched
+  rows, within the margin, leave a part of its period (in a period asked
+  for, a part in it): a client edge may also have reached backends
+  without an agent, or before their agents started, and a server edge
+  served the client directly. That row runs from the start of the edge,
+  so that a side that stops observing does not make the other look new,
+  to the end of the last part left. On these rows and the matched ones,
+  the `client_observed_until` or `server_observed_until` of a side whose
+  edge outlives the row is NULL: whether the dependency ended there is
+  for the other side to tell, so that a stopped agent does not make it
+  look removed (§8). Over the periods in which a server edge at the
+  virtual address matches the client edge by address, such as that of a
+  relay that runs an agent, the client edge is not matched through the
+  translation; the row matched by address then has the period of that
+  server edge. The services, the dependency map, the changes and
+  `known_dependencies` follow.
+- **In the names of peers**, a client edge to a virtual address is named
+  after the service at a backend, with the `server.port` of the backend
+  and `shawk.peer.agent` of its host, unless a service was observed on a
+  socket at the virtual address and port within the alive window (a relay
+  that runs an agent); a listener on an unspecified address of the host
+  that holds the address, which the translation may bypass, does not
+  count. Among the backends seen within 5 minutes of the most recently
   seen one, one observed on a socket wins, then one whose agent records
   the server side, then the first by service, port and host, so that the
   choice does not change with every report of the backends. The services
@@ -861,9 +872,12 @@ connector should have the same.
   named after the client service whose client edge to a virtual address
   has the address of its peer, and is counted by that client, which keeps
   the virtual address exact (§7). Behind sources, the server sees the
-  relay, which is named after its address. The connector warns about the
-  agent of a backend that folds a client of a translation without sources
-  (§5.2).
+  relay, which is named after its address, with `shawk.peer.agent` false
+  even when an agent holds the address: the relay forwards in the kernel or
+  for clients without an agent, which no agent records. The connector
+  warns about the agent of a backend that folds a client of a translation
+  without sources, and about an agent with `-fold-external=all` that folds
+  the virtual address it connects to (§5.2).
 - Translations apply to the whole history: a former backend kept in its
   translation is matched over the period it served. The backends of
   Kubernetes services and Docker published ports change all the time and
@@ -921,7 +935,7 @@ names in PostgreSQL and Prometheus match.
 
 | view or function | |
 |---|---|
-| `dependencies` | one row per logical dependency: the client edge and the server edge matched by their addresses and port (loopback within a host and netns, addresses held by several hosts at once within a host), or through a translation (§5.4), when the last columns `virtual_addr`, `virtual_port` and `translation` tell the virtual address and port the client connected to and the name of the translation; `server_addr` and `port` are then those of the server, and `first_seen` and `last_seen` the period both edges were active in. `observed_by` is `both`, `client` or `server`; a one-sided row means no agent on the other side, or a NAT or load balancer between that no translation describes, or an edge matched through a translation over a time its matched rows do not cover, or the server side of a translation with sources, which keeps its own row. Edges are matched by address over all time: when an address moves to another host, the edges of each host that held it are matched with those of the peer. `client_observed_until` and `server_observed_until` are the latest heartbeats of the hosts: an old `last_seen` with a recent `observed_until` means *no longer used*; both old means *no longer observed*. A `client_addr` (or `server_addr`) that is the network `0.0.0.0/0` or `::/0` stands for the peers an agent folded (§5.2): such a row is one-sided, and its peer is named `~external`. |
+| `dependencies` | one row per logical dependency: the client edge and the server edge matched by their addresses and port (loopback within a host and netns, addresses held by several hosts at once within a host), or through a translation (§5.4), when the last columns `virtual_addr`, `virtual_port` and `translation` tell the virtual address and port the client connected to and the name of the translation; `server_addr` and `port` are then those of the server, and `first_seen` and `last_seen` the period both edges were active in. `observed_by` is `both`, `client` or `server`; a one-sided row means no agent on the other side, or a NAT or load balancer between that no translation describes, or an edge matched through a translation over a time its matched rows do not cover, or the server side of a translation with sources, which keeps its own row. On the rows of translations, the observation of a side whose edge outlives the row is NULL (§5.4). Edges are matched by address over all time: when an address moves to another host, the edges of each host that held it are matched with those of the peer. `client_observed_until` and `server_observed_until` are the latest heartbeats of the hosts: an old `last_seen` with a recent `observed_until` means *no longer used*; both old means *no longer observed*. A `client_addr` (or `server_addr`) that is the network `0.0.0.0/0` or `::/0` stands for the peers an agent folded (§5.2): such a row is one-sided, and its peer is named `~external`. |
 | `graph_nodes`, `graph_edges` | the dependency map between services in the format of the Grafana Node Graph; a peer without a service is named by `peer_class` |
 | `peer_class(addr)` | the name of a peer without a known service, as in `service.peer.name`: the narrowest range of `peer_cidrs`, `~unresolved` for an address not routed on the Internet, `~external` otherwise, including the networks of folded peers |
 | `dependency_changes` | dependencies between services that appeared, or disappeared while a host that saw them kept observing for 15 minutes |
@@ -1026,8 +1040,9 @@ parses. shawk runs beside it instead:
   port on loopback go through `docker-proxy`, a service of its own. Behind
   a relay that replaces the addresses of the clients, the server cannot
   tell its clients apart: every client of the relay is matched with every
-  server edge from it, and the server side is counted besides the clients
-  (§7).
+  server edge from it, which makes as many rows as clients times backends
+  (a million for a thousand clients of a thousand backends, seconds to
+  read), and the server side is counted besides the clients (§7).
 - **Addresses of container networks** are told apart only when several
   hosts with agents hold them at once. A container address held by one
   host with an agent may be attributed to that host for a peer on a host

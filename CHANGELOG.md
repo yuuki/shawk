@@ -14,8 +14,11 @@
   connected to. A server edge from the addresses of a relay keeps a row of
   its own too, since clients without an agent may be behind the relay, and
   so does another matched edge over a time its matched rows do not cover.
+  On these rows, the observation of a side whose edge outlives the row is
+  NULL, so that a stopped agent does not make a dependency disappear.
   `dependencies_between` is dropped and created again with the new
-  columns. In Prometheus, the peer of a client edge to a virtual address is
+  columns: drop a view or a `BEGIN ATOMIC` function of yours that depends
+  on it before the migration, and create it again after. In Prometheus, the peer of a client edge to a virtual address is
   the service at a backend, with the `server.port` of the backend, and the
   peer of a server edge behind a relay that keeps the addresses of the
   clients is the client service. The backends of Kubernetes services and
@@ -23,8 +26,10 @@
   the translations from conntrack on the hosts that make them is proposed
   in `docs/proposal-translation.md`.
 * Fixed: connectors that started at the same time with different
-  `peer_cidrs` could leave the ranges of both in PostgreSQL. The writes of
-  the configuration of connectors are serialized.
+  `peer_cidrs` could leave the ranges of both in PostgreSQL, and a
+  database that defaults to REPEATABLE READ failed the write. The
+  configuration of a connector (`peer_cidrs` and the translations) is
+  written in one transaction in READ COMMITTED, one connector at a time.
 * A container keeps its name when it is recreated (#104). `shawk.unit` of a
   process in a container was `docker-<id>`, `podman-<id>`,
   `cri-containerd-<id>` or `crio-<id>`, so every redeploy added rows to

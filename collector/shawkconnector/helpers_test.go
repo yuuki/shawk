@@ -261,17 +261,10 @@ func (s *fakeStore) schemaVersion(context.Context) (int, error) {
 	return s.version, nil
 }
 
-func (s *fakeStore) syncPeerCIDRs(_ context.Context, cidrs []namedPrefix) error {
+func (s *fakeStore) syncConfig(_ context.Context, cidrs []namedPrefix, ts []translation) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.cidrs = cidrs
-	return nil
-}
-
-func (s *fakeStore) syncTranslations(_ context.Context, ts []translation) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.trans = ts
+	s.cidrs, s.trans = cidrs, ts
 	return nil
 }
 

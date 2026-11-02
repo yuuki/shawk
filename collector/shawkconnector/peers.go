@@ -114,6 +114,10 @@ type peer struct {
 	// that this side counts them.
 	foldedBy, foldedByName string
 	foldsServer            bool
+	// foldedVirtual is set when the agent of the client folds the virtual
+	// address of a translation through which it reaches this server, rather
+	// than the address of the server.
+	foldedVirtual netip.Addr
 	// port is the port of the server, when the peer of a client edge is
 	// named through a translation whose backend has another port than the
 	// one the client connected to; 0 otherwise.
@@ -411,16 +415,32 @@ func (r *resolver) peer(host string, id *edgeID, now time.Time) peer {
 				case !p.agent || h == host:
 				case id.role == roleClient && r.foldsPeer(a, h, id.local, false, now):
 					p.foldedBy, p.foldedByName = h, a.name
-				case id.role == roleServer && r.foldsPeer(a, h, id.local, true, now):
+				case id.role == roleServer:
+					// Through a translation, the client connects to a virtual
+					// address, which its agent may fold.
+					v, through := r.foldedVirtual(a, h, id, now)
+					if !through && !r.foldsPeer(a, h, id.local, true, now) {
+						break
+					}
 					p.agent = false
-					p.foldedBy, p.foldedByName, p.foldsServer = h, a.name, true
+					p.foldedBy, p.foldedByName, p.foldsServer, p.foldedVirtual = h, a.name, true, v
 				}
 			}
 		}
 	}
 	if id.role == roleClient {
 		k := endpointKey{id.peer, id.port, id.proto}
-		p.name = best(host, r.localEndpoints[k], r.dbEndpoints[k], r.dbAge(now), sameHostOnly)
+		c := chooser{host: host, sameHostOnly: sameHostOnly}
+		if r.virtualOf(id) != nil {
+			// At a virtual address, only a service observed on a socket at it
+			// recently, such as a relay that runs an agent, comes before the
+			// backends: a listener on an unspecified address of a host that
+			// holds the address may be bypassed (DNAT), and a server edge of
+			// days ago replaced by a relay without an agent.
+			c.exactSince = now.Add(-aliveWindow)
+		}
+		c.add(r.localEndpoints[k], r.dbEndpoints[k], r.dbAge(now), 0)
+		p.name = c.best.service
 		if p.name == "" {
 			if c, t, ok := r.translatedServer(id, now); ok {
 				// The holder of the virtual address, if any, is not the server.
@@ -444,7 +464,13 @@ func (r *resolver) peer(host string, id *edgeID, now time.Time) peer {
 				// The client connected to the virtual address, which its agent
 				// keeps exact, whatever it does with the address of this host.
 				p.agent = covers
-				p.foldedBy, p.foldedByName, p.foldsServer = "", "", false
+				p.foldedBy, p.foldedByName, p.foldsServer, p.foldedVirtual = "", "", false, netip.Addr{}
+			} else if r.behindRelay(id) {
+				// The server sees a relay that replaces the addresses of its
+				// clients: an agent at the address of the relay records none of
+				// them, so this side counts the connections.
+				p.agent = false
+				p.foldedBy, p.foldedByName, p.foldsServer, p.foldedVirtual = "", "", false, netip.Addr{}
 			}
 		}
 	}
@@ -531,8 +557,11 @@ type chooser struct {
 	host string
 	// sameHostOnly leaves out the endpoints of other hosts.
 	sameHostOnly bool
-	best         endpoint
-	port         uint16 // of the best endpoint
+	// exactSince, if set, leaves out the endpoints inferred from listeners
+	// on unspecified addresses and those last seen before it.
+	exactSince time.Time
+	best       endpoint
+	port       uint16 // of the best endpoint
 }
 
 func (c *chooser) better(e endpoint, port uint16) bool {
@@ -557,6 +586,9 @@ func (c *chooser) better(e endpoint, port uint16) bool {
 // consider takes e, seen on port, if it is better.
 func (c *chooser) consider(e endpoint, port uint16) {
 	if c.sameHostOnly && e.host != c.host {
+		return
+	}
+	if !c.exactSince.IsZero() && (!e.exact || e.lastSeen.Before(c.exactSince)) {
 		return
 	}
 	if c.better(e, port) {
@@ -656,10 +688,7 @@ func betterBackend(c, b candidate) bool {
 // virtual address a client edge connects to, on the port of the backend or
 // the port of the edge. r.mu is held.
 func (r *resolver) translatedServer(id *edgeID, now time.Time) (candidate, *translation, bool) {
-	t := r.virtuals[endpointKey{id.peer, id.port, id.proto}]
-	if t == nil {
-		t = r.virtuals[endpointKey{id.peer, 0, id.proto}]
-	}
+	t := r.virtualOf(id)
 	if t == nil {
 		return candidate{}, nil, false
 	}
@@ -712,6 +741,50 @@ func (r *resolver) inRange(p netip.Prefix, port uint16, proto string, dbAge time
 	return r.rangeCache[k]
 }
 
+// virtualOf returns the translation whose virtual address a client edge
+// connects to, if any.
+func (r *resolver) virtualOf(id *edgeID) *translation {
+	if t := r.virtuals[endpointKey{id.peer, id.port, id.proto}]; t != nil {
+		return t
+	}
+	return r.virtuals[endpointKey{id.peer, 0, id.proto}]
+}
+
+// behindRelay tells whether a server edge is at a backend of a translation
+// with sources and from one of them.
+func (r *resolver) behindRelay(id *edgeID) bool {
+	for i := range r.translations {
+		t := &r.translations[i]
+		if len(t.sources) == 0 || !t.has(id.proto) || len(t.clientEnds(id.local, id.port)) == 0 {
+			continue
+		}
+		for _, s := range t.sources {
+			if s.Contains(id.peer) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// foldedVirtual returns a virtual address of a translation without sources
+// through which the client of a server edge reaches it, and that the agent a
+// of the client, on the host client, folds. r.mu is held.
+func (r *resolver) foldedVirtual(a agentHost, client string, id *edgeID, now time.Time) (netip.Addr, bool) {
+	for i := range r.translations {
+		t := &r.translations[i]
+		if len(t.sources) > 0 || !t.has(id.proto) {
+			continue
+		}
+		for _, v := range t.clientEnds(id.local, id.port) {
+			if r.foldsPeer(a, client, v.Addr(), true, now) {
+				return v.Addr(), true
+			}
+		}
+	}
+	return netip.Addr{}, false
+}
+
 // translatedClient finds the client service of a server edge at a backend
 // of a translation that keeps the address of the client: the service whose
 // client edge to a virtual address of the translation has the address of
@@ -725,23 +798,8 @@ func (r *resolver) translatedClient(host string, id *edgeID, sameHostOnly bool, 
 		if len(t.sources) > 0 || !t.has(id.proto) {
 			continue
 		}
-		fixed, same := t.reaches(id.local, id.port)
-		if !fixed && !same {
-			continue
-		}
-		for _, v := range t.virtual {
-			port := v.Port()
-			switch {
-			case port == 0:
-				// Every port reaches the same port of the backends.
-				if !same {
-					continue
-				}
-				port = id.port
-			case !fixed && port != id.port:
-				continue
-			}
-			k := clientKey{id.peer, v.Addr(), port, id.proto}
+		for _, v := range t.clientEnds(id.local, id.port) {
+			k := clientKey{id.peer, v.Addr(), v.Port(), id.proto}
 			c.add(r.localClients[k], r.dbClients[k], age, 0)
 		}
 	}

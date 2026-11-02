@@ -469,3 +469,74 @@ func TestTranslationBackendChoice(t *testing.T) {
 		t.Errorf("after the window: port %d", p.port)
 	}
 }
+
+// TestTranslationReview2: the server side behind a relay that replaces the
+// addresses of its clients counts them even when an agent holds the address
+// of the relay; at a virtual address, a listener on an unspecified address
+// or a server edge of days ago does not take precedence over the backends;
+// an agent that folds a virtual address is told to keep it exact.
+func TestTranslationReview2(t *testing.T) {
+	c, st, sink, now := testConnector(t, func(cfg *Config) {
+		cfg.Translations = map[string]TranslationConfig{
+			"web-lb": {Virtual: []string{"10.0.100.2:80"}, Backends: []string{"10.0.1.20:8080"}, Sources: []string{"10.0.100.250"}},
+			"pub":    {Virtual: []string{"10.0.0.5:8080"}, Backends: []string{"10.0.2.10:80"}},
+			"vip":    {Virtual: []string{"192.0.2.100:5432"}, Backends: []string{"198.51.100.10"}},
+		}
+	})
+	logs := observe(c)
+	ts := t0.Add(15 * time.Second)
+
+	// An IPVS director with an agent holds the source address.
+	consume(t, c, sink, tAgent{host: "lb-01", addrs: []string{"10.0.100.250"}, time: ts})
+	out := consume(t, c, sink, tAgent{host: "web-01", addrs: []string{"10.0.1.20"}, time: ts,
+		edges: []tEdge{{role: "server", proto: "tcp", local: "10.0.1.20", peer: "10.0.100.250", port: 8080,
+			svc: "web", comm: "web", opened: 9}}})
+	if s := find(out, metricConnOpened, "web", "*", roleServer, ""); len(s) != 1 || s[0].agent {
+		t.Errorf("server series behind the relay = %+v", s)
+	}
+
+	// docker-proxy listens on every address of the Docker host, but iptables
+	// sends the connections to the published port to the container.
+	consume(t, c, sink, tAgent{host: "dk", addrs: []string{"10.0.0.5"}, time: ts,
+		listeners: []tListener{{proto: "tcp", addr: "0.0.0.0", port: 8080, svc: "docker-proxy", comm: "docker-proxy"}}})
+	consume(t, c, sink, tAgent{host: "ct", addrs: []string{"10.0.2.10"}, time: ts,
+		listeners: []tListener{{proto: "tcp", addr: "0.0.0.0", port: 80, svc: "web2", comm: "web2"}}})
+	app := tAgent{host: "app-01", addrs: []string{"10.0.0.11"}, time: ts, fold: foldAll, internal: []string{"10.0.0.0/8"},
+		edges: []tEdge{
+			{role: "client", proto: "tcp", local: "10.0.0.11", peer: "10.0.0.5", port: 8080, svc: "app", comm: "app", opened: 1},
+			// The agent folds the public virtual address.
+			{role: "client", proto: "tcp", local: "10.0.0.11", peer: "0.0.0.0", folded: true, port: 5432, svc: "app", comm: "app", opened: 1},
+		}}
+	out = consume(t, c, sink, app)
+	if s := find(out, metricConnOpened, "app", "web2", roleClient, ""); len(s) != 1 || s[0].port != 80 {
+		t.Errorf("client series to the published port = %+v", find(out, metricConnOpened, "app", "*", roleClient, ""))
+	}
+	// A server edge at the virtual address seen two days ago, in PostgreSQL.
+	st.mu.Lock()
+	st.rows.endpoints = append(st.rows.endpoints, endpointRow{key: endpointKey{addrOf("10.0.0.5"), 8080, "tcp"},
+		endpoint: endpoint{host: "old", service: "haproxy", exact: true, lastSeen: now.Add(-48 * time.Hour)}})
+	st.mu.Unlock()
+	c.prepare(t.Context())
+	app.time = ts.Add(15 * time.Second)
+	out = consume(t, c, sink, app)
+	if s := find(out, metricConnOpened, "app", "haproxy", roleClient, ""); len(s) != 0 {
+		t.Errorf("client series named after a former server = %+v", s)
+	}
+
+	logs.TakeAll()
+	out = consume(t, c, sink, tAgent{host: "db-01", addrs: []string{"198.51.100.10"}, time: ts.Add(15 * time.Second),
+		edges: []tEdge{{role: "server", proto: "tcp", local: "198.51.100.10", peer: "10.0.0.11", port: 5432,
+			svc: "postgres", comm: "postgres", opened: 1}}})
+	// The client edge is folded, so the server side counts the connections.
+	if s := find(out, metricConnOpened, "postgres", "*", roleServer, ""); len(s) != 1 || s[0].agent {
+		t.Errorf("server series of a folded virtual address = %+v", s)
+	}
+	var got []string
+	for _, e := range logs.TakeAll() {
+		m := e.ContextMap()
+		got = append(got, fmt.Sprint(m["client_host"], " ", m["server_host"], " ", m["server_address"], " ", m["virtual_address"]))
+	}
+	if want := []string{"app-01 db-01 198.51.100.10 192.0.2.100"}; !slices.Equal(got, want) {
+		t.Errorf("warnings = %q, want %q", got, want)
+	}
+}

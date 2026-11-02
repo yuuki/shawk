@@ -68,6 +68,28 @@ func (t *translation) reaches(local netip.Addr, port uint16) (fixed, same bool) 
 	return fixed, same
 }
 
+// clientEnds returns the virtual addresses, with the port clients connect
+// to them on, through which a server at local on port is reached.
+func (t *translation) clientEnds(local netip.Addr, port uint16) []netip.AddrPort {
+	fixed, same := t.reaches(local, port)
+	var out []netip.AddrPort
+	for _, v := range t.virtual {
+		vp := v.Port()
+		switch {
+		case vp == 0:
+			// Every port reaches the same port of the backends.
+			if !same {
+				continue
+			}
+			vp = port
+		case !fixed && vp != port:
+			continue
+		}
+		out = append(out, netip.AddrPortFrom(v.Addr(), vp))
+	}
+	return out
+}
+
 // parseTranslations parses and checks the translations of the
 // configuration, ordered by name. Two translations may not share a virtual
 // address and port, so that a client edge reaches at most one.
