@@ -841,19 +841,29 @@ connector should have the same.
   server edge from a source those of every client of the relay. Such a
   server edge also keeps a row of its own, since clients without an agent
   may be behind the relay; the range of the sources can be named in
-  `peer_cidrs`. A client edge that a server edge matches by address, such
-  as that of a relay that runs an agent, is not matched through a
-  translation. The services, the dependency map and
-  `known_dependencies` follow.
+  `peer_cidrs`. Another matched edge keeps a row of its own unless its
+  matched rows cover its period, within the margin (in a period asked
+  for, the part in it, with one of them in it): a client edge may also
+  have reached backends without an agent, or before their agents started,
+  and a server edge served the client directly. A client edge that a
+  server edge matches by address, such as that of a relay that runs an
+  agent, is not matched through a translation. The services, the
+  dependency map and `known_dependencies` follow.
 - **In the names of peers**, a client edge to a virtual address whose
   address and port have no known service is named after the service at a
-  backend, chosen as in §5.2, with the `server.port` of the backend and
-  `shawk.peer.agent` of its host; the services in a range of backends are
-  looked up among the endpoints once per write interval. A server edge at
-  a backend of a translation without sources is named after the client
-  service whose client edge to a virtual address has the address of its
-  peer. Behind sources, the server sees the relay, which is named after its
-  address.
+  backend, with the `server.port` of the backend and `shawk.peer.agent` of
+  its host. Among the backends seen within 5 minutes of the most recently
+  seen one, one observed on a socket wins, then one whose agent records
+  the server side, then the first by service, port and host, so that the
+  choice does not change with every report of the backends. The services
+  in a range of backends are looked up among the endpoints once per write
+  interval. A server edge at a backend of a translation without sources is
+  named after the client service whose client edge to a virtual address
+  has the address of its peer, and is counted by that client, which keeps
+  the virtual address exact (§7). Behind sources, the server sees the
+  relay, which is named after its address. The connector warns about the
+  agent of a backend that folds a client of a translation without sources
+  (§5.2).
 - Translations apply to the whole history: a former backend kept in its
   translation is matched over the period it served. The backends of
   Kubernetes services and Docker published ports change all the time and
@@ -861,8 +871,13 @@ connector should have the same.
   them, from conntrack, is proposed in `docs/proposal-translation.md`.
 - An agent of a backend that folds its clients (§3.6) must keep the
   sources, or the clients of a translation without sources, in its
-  internal ranges (`-internal-peers`); a folded server edge has no address
-  to match.
+  internal ranges (`-internal-peers`), and an agent with
+  `-fold-external=all` the virtual addresses it connects to: a folded edge
+  has no address to match.
+- With LVS direct routing, the backends hold the virtual address and
+  accept the connections on it. As several hosts hold it at once, the
+  edges do not match by address (§5.2); list the virtual address as the
+  backend of its translation.
 
 ## 6. PostgreSQL
 
@@ -906,7 +921,7 @@ names in PostgreSQL and Prometheus match.
 
 | view or function | |
 |---|---|
-| `dependencies` | one row per logical dependency: the client edge and the server edge matched by their addresses and port (loopback within a host and netns, addresses held by several hosts at once within a host), or through a translation (§5.4), when the last columns `virtual_addr`, `virtual_port` and `translation` tell the virtual address and port the client connected to and the name of the translation; `server_addr` and `port` are then those of the server, and `first_seen` and `last_seen` the period both edges were active in. `observed_by` is `both`, `client` or `server`; a one-sided row means no agent on the other side, or a NAT or load balancer between that no translation describes, or the server side of a translation with sources, which keeps its own row. Edges are matched by address over all time: when an address moves to another host, the edges of each host that held it are matched with those of the peer. `client_observed_until` and `server_observed_until` are the latest heartbeats of the hosts: an old `last_seen` with a recent `observed_until` means *no longer used*; both old means *no longer observed*. A `client_addr` (or `server_addr`) that is the network `0.0.0.0/0` or `::/0` stands for the peers an agent folded (§5.2): such a row is one-sided, and its peer is named `~external`. |
+| `dependencies` | one row per logical dependency: the client edge and the server edge matched by their addresses and port (loopback within a host and netns, addresses held by several hosts at once within a host), or through a translation (§5.4), when the last columns `virtual_addr`, `virtual_port` and `translation` tell the virtual address and port the client connected to and the name of the translation; `server_addr` and `port` are then those of the server, and `first_seen` and `last_seen` the period both edges were active in. `observed_by` is `both`, `client` or `server`; a one-sided row means no agent on the other side, or a NAT or load balancer between that no translation describes, or an edge matched through a translation over a time its matched rows do not cover, or the server side of a translation with sources, which keeps its own row. Edges are matched by address over all time: when an address moves to another host, the edges of each host that held it are matched with those of the peer. `client_observed_until` and `server_observed_until` are the latest heartbeats of the hosts: an old `last_seen` with a recent `observed_until` means *no longer used*; both old means *no longer observed*. A `client_addr` (or `server_addr`) that is the network `0.0.0.0/0` or `::/0` stands for the peers an agent folded (§5.2): such a row is one-sided, and its peer is named `~external`. |
 | `graph_nodes`, `graph_edges` | the dependency map between services in the format of the Grafana Node Graph; a peer without a service is named by `peer_class` |
 | `peer_class(addr)` | the name of a peer without a known service, as in `service.peer.name`: the narrowest range of `peer_cidrs`, `~unresolved` for an address not routed on the Internet, `~external` otherwise, including the networks of folded peers |
 | `dependency_changes` | dependencies between services that appeared, or disappeared while a host that saw them kept observing for 15 minutes |

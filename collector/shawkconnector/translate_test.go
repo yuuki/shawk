@@ -381,3 +381,91 @@ func TestTranslatedClientPorts(t *testing.T) {
 		t.Errorf("client peer after the load = %+v", p)
 	}
 }
+
+// TestTranslationFolds: a server edge named through a translation is
+// counted by the agent of its client, which connected to the virtual
+// address and kept it exact, even when it folds the address of the server
+// (-fold-external=all); the agent of a backend that folds the clients of a
+// translation without sources is reported.
+func TestTranslationFolds(t *testing.T) {
+	c, _, sink, _ := testConnector(t, func(cfg *Config) {
+		cfg.Translations = map[string]TranslationConfig{
+			"vip": {Virtual: []string{"10.0.100.1:5432"}, Backends: []string{"192.0.2.10"}},
+		}
+	})
+	logs := observe(c)
+	ts := t0.Add(15 * time.Second)
+	db := func(at time.Time, opened int64) tAgent {
+		return tAgent{host: "db-01", addrs: []string{"192.0.2.10"}, time: at, fold: foldIn, internal: []string{"192.168.0.0/16"},
+			listeners: []tListener{{proto: "tcp", addr: "0.0.0.0", port: 5432, svc: "postgres", comm: "postgres"}},
+			edges: []tEdge{{role: "server", proto: "tcp", local: "192.0.2.10", peer: "10.0.0.11", port: 5432,
+				svc: "postgres", comm: "postgres", opened: opened}}}
+	}
+	app := tAgent{host: "app-01", addrs: []string{"10.0.0.11"}, time: ts, fold: foldAll, internal: []string{"10.0.0.0/8"},
+		edges: []tEdge{{role: "client", proto: "tcp", local: "10.0.0.11", peer: "10.0.100.1", port: 5432,
+			svc: "app", comm: "app", opened: 4}}}
+	consume(t, c, sink, db(ts, 4))
+	out := consume(t, c, sink, app)
+	if s := find(out, metricConnOpened, "app", "postgres", roleClient, ""); len(s) != 1 || !s[0].agent {
+		t.Errorf("client series = %+v", find(out, metricConnOpened, "app", "*", roleClient, ""))
+	}
+	// db-01 folds 10.0.0.11, outside its internal ranges, although it runs
+	// an agent: in reality its server edge would be folded.
+	if got := foldWarnings(logs); !slices.Equal(got, []string{"app-01 10.0.0.11 -> db-01 10.0.100.1"}) {
+		t.Errorf("warnings = %q", got)
+	}
+	out = consume(t, c, sink, db(ts.Add(15*time.Second), 6))
+	s := find(out, metricConnOpened, "postgres", "app", roleServer, "")
+	if len(s) != 1 || !s[0].agent || s[0].value != 2 {
+		// The agent of app-01 folds 192.0.2.10, but not this connection.
+		t.Errorf("server series = %+v", find(out, metricConnOpened, "postgres", "*", roleServer, ""))
+	}
+}
+
+// TestTranslationBackendChoice: the backend that names a client edge does
+// not depend on the order of maps, nor change with every report of the
+// backends: among those seen recently, one whose agent records the server
+// side wins, then the first by service, port and host.
+func TestTranslationBackendChoice(t *testing.T) {
+	ts, err := parseTranslations(map[string]TranslationConfig{
+		"range": {Virtual: []string{"10.0.100.1:80"}, Backends: []string{"10.0.1.0/24:8080"}},
+		"ports": {Virtual: []string{"10.0.100.2:80"}, Backends: []string{"10.0.2.10:8080", "10.0.2.11:9090"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := newResolver(nil, ts)
+	now := t0
+	ep := func(addr string, port uint16, host string, seen time.Time) endpointRow {
+		return endpointRow{key: endpointKey{addrOf(addr), port, "tcp"}, endpoint: endpoint{host: host, service: "web", exact: true, lastSeen: seen}}
+	}
+	alive := agentAddrRow{addr: addrOf("10.0.1.11"), host: "h-agent", seen: now, agent: agentHost{seen: now, udpTraced: true, name: "h-agent"}}
+	rows := peerRows{endpoints: []endpointRow{ep("10.0.1.10", 8080, "h-none", now), ep("10.0.1.11", 8080, "h-agent", now)},
+		agents: []agentAddrRow{alive}}
+	id := &edgeID{role: roleClient, proto: "tcp", local: addrOf("10.0.0.11"), peer: addrOf("10.0.100.1"), port: 80}
+	for i := range 50 {
+		r.load(rows, now)
+		if p := r.peer("app-01", id, now); p.name != "web" || !p.agent || p.port != 8080 {
+			t.Fatalf("load %d: peer = %+v", i, p)
+		}
+	}
+
+	// Two backends on other ports that report at different times: the port
+	// stays that of the first.
+	id = &edgeID{role: roleClient, proto: "tcp", local: addrOf("10.0.0.11"), peer: addrOf("10.0.100.2"), port: 80}
+	for i := range 6 {
+		at := now.Add(time.Duration(i) * 15 * time.Second)
+		addr := []string{"10.0.2.10", "10.0.2.11"}[i%2]
+		port := []uint16{8080, 9090}[i%2]
+		r.localEndpoints[endpointKey{addrOf(addr), port, "tcp"}] = map[endpoint]time.Time{{host: "h" + addr, service: "web", exact: true}: at}
+		if p := r.peer("app-01", id, at); p.port != 8080 {
+			t.Errorf("report %d: port %d", i, p.port)
+		}
+	}
+	// A backend not seen for longer than the window gives way.
+	later := now.Add(10 * time.Minute)
+	r.localEndpoints[endpointKey{addrOf("10.0.2.11"), 9090, "tcp"}] = map[endpoint]time.Time{{host: "h10.0.2.11", service: "web", exact: true}: later}
+	if p := r.peer("app-01", id, later); p.port != 9090 {
+		t.Errorf("after the window: port %d", p.port)
+	}
+}

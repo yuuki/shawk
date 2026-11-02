@@ -445,6 +445,9 @@ func (s *pgStore) syncPeerCIDRs(ctx context.Context, cidrs []namedPrefix) error 
 		names = append(names, c.name)
 	}
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, int64(configLock)); err != nil {
+			return err
+		}
 		b := &pgx.Batch{}
 		b.Queue(`DELETE FROM shawk.peer_cidrs WHERE NOT (prefix = ANY ($1::cidr[]))`, prefixes)
 		b.Queue(`
@@ -454,6 +457,12 @@ ON CONFLICT (prefix) DO UPDATE SET name = excluded.name`, prefixes, names)
 		return tx.SendBatch(ctx, b).Close()
 	})
 }
+
+// configLock is the key of the advisory lock that serializes the writes of
+// the configuration of connectors (peer_cidrs, translations): without it,
+// two connectors that write different ones at once both delete the rows of
+// before and insert their own, and the table holds the rows of both.
+const configLock = 0x73686179 // "shay"
 
 // syncTranslations replaces the rows of shawk.translations with those of
 // the translations, keeping the rows that stay, so that the views see
@@ -469,6 +478,11 @@ func (s *pgStore) syncTranslations(ctx context.Context, ts []translation) error 
 		ports = append(ports, int32(r.port))
 	}
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		// The statements after the lock see what a connector that held it
+		// before wrote.
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, int64(configLock)); err != nil {
+			return err
+		}
 		b := &pgx.Batch{}
 		b.Queue(`
 DELETE FROM shawk.translations t

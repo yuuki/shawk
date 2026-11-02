@@ -12,7 +12,8 @@
   with the address and port of the server; the new last columns
   `virtual_addr`, `virtual_port` and `translation` tell what the client
   connected to. A server edge from the addresses of a relay keeps a row of
-  its own too, since clients without an agent may be behind the relay.
+  its own too, since clients without an agent may be behind the relay, and
+  so does another matched edge over a time its matched rows do not cover.
   `dependencies_between` is dropped and created again with the new
   columns. In Prometheus, the peer of a client edge to a virtual address is
   the service at a backend, with the `server.port` of the backend, and the
@@ -21,6 +22,9 @@
   Docker published ports change too often to be written down; learning
   the translations from conntrack on the hosts that make them is proposed
   in `docs/proposal-translation.md`.
+* Fixed: connectors that started at the same time with different
+  `peer_cidrs` could leave the ranges of both in PostgreSQL. The writes of
+  the configuration of connectors are serialized.
 * A container keeps its name when it is recreated (#104). `shawk.unit` of a
   process in a container was `docker-<id>`, `podman-<id>`,
   `cri-containerd-<id>` or `crio-<id>`, so every redeploy added rows to

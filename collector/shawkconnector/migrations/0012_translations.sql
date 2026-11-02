@@ -51,7 +51,11 @@ CREATE TABLE shawk.translations (
 --     relay) and the client edge other servers (the other backends) over
 --     another period. The last columns tell the virtual address and port
 --     the client connected to and the name of the translation; they are
---     NULL on rows matched by address.
+--     NULL on rows matched by address;
+--   - an edge keeps a row of its own unless its matched rows cover its
+--     period (in the period asked for, with one of them in it): a client
+--     edge also reached backends without an agent, or before their agents
+--     started, and a server edge served the client directly.
 --
 -- The result has columns more, so the function is dropped and created
 -- again; the SQL functions that call it name its columns.
@@ -177,6 +181,7 @@ sb AS (
 -- The client and server edges matched through a translation: on the port
 -- of the backend or the port of the client edge, with times that overlap;
 -- through a translation without sources, with the address of the client.
+-- p_first and p_last are the period both were active in.
 translated AS (
   SELECT cv.id AS cid, cv.host_id AS c_host_id, cv.hostname AS c_hostname, cv.service_name AS c_service,
          cv.unit AS c_unit, cv.local_addr AS c_local, cv.remote_addr AS c_remote, cv.port AS c_port,
@@ -184,7 +189,9 @@ translated AS (
          sb.id AS sid, sb.host_id AS s_host_id, sb.hostname AS s_hostname, sb.service_name AS s_service,
          sb.unit AS s_unit, sb.local_addr AS s_local, sb.port AS s_port,
          sb.first_seen AS s_first, sb.last_seen AS s_last,
-         cv.proto, cv.translation, false AS snat
+         cv.proto, cv.translation, false AS snat,
+         least(greatest(cv.first_seen, sb.first_seen), least(cv.last_seen, sb.last_seen)) AS p_first,
+         greatest(greatest(cv.first_seen, sb.first_seen), least(cv.last_seen, sb.last_seen)) AS p_last
   FROM cv JOIN sb
     ON  sb.translation = cv.translation AND sb.proto = cv.proto
     AND sb.remote_addr = cv.local_addr AND sb.client_scope = cv.client_scope
@@ -197,12 +204,40 @@ translated AS (
          cv.first_seen, cv.last_seen,
          sb.id, sb.host_id, sb.hostname, sb.service_name, sb.unit, sb.local_addr, sb.port,
          sb.first_seen, sb.last_seen,
-         cv.proto, cv.translation, true
+         cv.proto, cv.translation, true,
+         least(greatest(cv.first_seen, sb.first_seen), least(cv.last_seen, sb.last_seen)),
+         greatest(greatest(cv.first_seen, sb.first_seen), least(cv.last_seen, sb.last_seen))
   FROM cv JOIN sb ON sb.translation = cv.translation AND sb.proto = cv.proto
   WHERE sb.snat
     AND (sb.fixed OR sb.port = cv.port)
     AND cv.first_seen <= sb.last_seen + interval '2 minutes'
     AND sb.first_seen <= cv.last_seen + interval '2 minutes'
+),
+-- The edges that their rows matched through translations cover: a client
+-- edge, or a server edge through a translation without sources, whose
+-- period the periods of its rows cover, within the margin. They need no row
+-- of their own; another edge keeps its row, since it was active when its
+-- other side was not observed (the client edge with other backends, the
+-- server edge with other clients). A server edge from a source always
+-- keeps its row: the clients behind the relay may have no agent. In
+-- [since, until], the edge is covered there, and one of its rows is in it.
+covered AS (
+  SELECT t.cid AS id
+  FROM translated t
+  GROUP BY t.cid, t.c_first, t.c_last
+  HAVING bool_or(t.p_last >= since AND t.p_first <= until)
+     AND CASE WHEN greatest(t.c_first, since) > least(t.c_last, until) THEN true
+              ELSE range_agg(tstzrange(t.p_first - interval '2 minutes', t.p_last + interval '2 minutes', '[]'))
+                     @> tstzrange(greatest(t.c_first, since), least(t.c_last, until), '[]') END
+  UNION ALL
+  SELECT t.sid
+  FROM translated t
+  WHERE NOT t.snat
+  GROUP BY t.sid, t.s_first, t.s_last
+  HAVING bool_or(t.p_last >= since AND t.p_first <= until)
+     AND CASE WHEN greatest(t.s_first, since) > least(t.s_last, until) THEN true
+              ELSE range_agg(tstzrange(t.p_first - interval '2 minutes', t.p_last + interval '2 minutes', '[]'))
+                     @> tstzrange(greatest(t.s_first, since), least(t.s_last, until), '[]') END
 ),
 d AS (
 SELECT
@@ -235,18 +270,14 @@ FULL JOIN (SELECT * FROM e WHERE role = 'server') s
   AND c.scope = s.scope
 LEFT JOIN observed co ON co.host_id = c.host_id
 LEFT JOIN observed so ON so.host_id = s.host_id
--- A client edge matched through a translation is on the rows below, and so
--- is a server edge matched through one that keeps the address of the
--- client; a server edge from a source keeps its own row.
-WHERE NOT (s.id IS NULL AND c.id IN (SELECT cid FROM translated))
-  AND NOT (c.id IS NULL AND s.id IN (SELECT sid FROM translated WHERE NOT snat))
+-- An edge whose rows below cover it needs no row of its own.
+WHERE NOT (s.id IS NULL AND c.id IN (SELECT id FROM covered))
+  AND NOT (c.id IS NULL AND s.id IN (SELECT id FROM covered))
 UNION ALL
 SELECT
   t.c_hostname, t.c_service, t.c_unit, t.c_local,
   t.s_hostname, t.s_service, t.s_unit, t.s_local,
-  t.s_port, t.proto,
-  least(greatest(t.c_first, t.s_first), least(t.c_last, t.s_last)),
-  greatest(greatest(t.c_first, t.s_first), least(t.c_last, t.s_last)),
+  t.s_port, t.proto, t.p_first, t.p_last,
   'both', co.observed_until, so.observed_until,
   t.c_remote, t.c_port, t.translation
 FROM translated t
@@ -367,6 +398,7 @@ sb AS (
 -- The client and server edges matched through a translation: on the port
 -- of the backend or the port of the client edge, with times that overlap;
 -- through a translation without sources, with the address of the client.
+-- p_first and p_last are the period both were active in.
 translated AS (
   SELECT cv.id AS cid, cv.host_id AS c_host_id, cv.hostname AS c_hostname, cv.service_name AS c_service,
          cv.unit AS c_unit, cv.local_addr AS c_local, cv.remote_addr AS c_remote, cv.port AS c_port,
@@ -374,7 +406,9 @@ translated AS (
          sb.id AS sid, sb.host_id AS s_host_id, sb.hostname AS s_hostname, sb.service_name AS s_service,
          sb.unit AS s_unit, sb.local_addr AS s_local, sb.port AS s_port,
          sb.first_seen AS s_first, sb.last_seen AS s_last,
-         cv.proto, cv.translation, false AS snat
+         cv.proto, cv.translation, false AS snat,
+         least(greatest(cv.first_seen, sb.first_seen), least(cv.last_seen, sb.last_seen)) AS p_first,
+         greatest(greatest(cv.first_seen, sb.first_seen), least(cv.last_seen, sb.last_seen)) AS p_last
   FROM cv JOIN sb
     ON  sb.translation = cv.translation AND sb.proto = cv.proto
     AND sb.remote_addr = cv.local_addr AND sb.client_scope = cv.client_scope
@@ -387,12 +421,35 @@ translated AS (
          cv.first_seen, cv.last_seen,
          sb.id, sb.host_id, sb.hostname, sb.service_name, sb.unit, sb.local_addr, sb.port,
          sb.first_seen, sb.last_seen,
-         cv.proto, cv.translation, true
+         cv.proto, cv.translation, true,
+         least(greatest(cv.first_seen, sb.first_seen), least(cv.last_seen, sb.last_seen)),
+         greatest(greatest(cv.first_seen, sb.first_seen), least(cv.last_seen, sb.last_seen))
   FROM cv JOIN sb ON sb.translation = cv.translation AND sb.proto = cv.proto
   WHERE sb.snat
     AND (sb.fixed OR sb.port = cv.port)
     AND cv.first_seen <= sb.last_seen + interval '2 minutes'
     AND sb.first_seen <= cv.last_seen + interval '2 minutes'
+),
+-- The edges that their rows matched through translations cover: a client
+-- edge, or a server edge through a translation without sources, whose
+-- period the periods of its rows cover, within the margin. They need no row
+-- of their own; another edge keeps its row, since it was active when its
+-- other side was not observed (the client edge with other backends, the
+-- server edge with other clients). A server edge from a source always
+-- keeps its row: the clients behind the relay may have no agent.
+covered AS (
+  SELECT t.cid AS id
+  FROM translated t
+  GROUP BY t.cid, t.c_first, t.c_last
+  HAVING range_agg(tstzrange(t.p_first - interval '2 minutes', t.p_last + interval '2 minutes', '[]'))
+           @> tstzrange(t.c_first, t.c_last, '[]')
+  UNION ALL
+  SELECT t.sid
+  FROM translated t
+  WHERE NOT t.snat
+  GROUP BY t.sid, t.s_first, t.s_last
+  HAVING range_agg(tstzrange(t.p_first - interval '2 minutes', t.p_last + interval '2 minutes', '[]'))
+           @> tstzrange(t.s_first, t.s_last, '[]')
 )
 SELECT
   c.hostname                                    AS client_host,
@@ -424,18 +481,14 @@ FULL JOIN (SELECT * FROM e WHERE role = 'server') s
   AND c.scope = s.scope
 LEFT JOIN observed co ON co.host_id = c.host_id
 LEFT JOIN observed so ON so.host_id = s.host_id
--- A client edge matched through a translation is on the rows below, and so
--- is a server edge matched through one that keeps the address of the
--- client; a server edge from a source keeps its own row.
-WHERE NOT (s.id IS NULL AND c.id IN (SELECT cid FROM translated))
-  AND NOT (c.id IS NULL AND s.id IN (SELECT sid FROM translated WHERE NOT snat))
+-- An edge whose rows below cover it needs no row of its own.
+WHERE NOT (s.id IS NULL AND c.id IN (SELECT id FROM covered))
+  AND NOT (c.id IS NULL AND s.id IN (SELECT id FROM covered))
 UNION ALL
 SELECT
   t.c_hostname, t.c_service, t.c_unit, t.c_local,
   t.s_hostname, t.s_service, t.s_unit, t.s_local,
-  t.s_port, t.proto,
-  least(greatest(t.c_first, t.s_first), least(t.c_last, t.s_last)),
-  greatest(greatest(t.c_first, t.s_first), least(t.c_last, t.s_last)),
+  t.s_port, t.proto, t.p_first, t.p_last,
   'both', co.observed_until, so.observed_until,
   t.c_remote, t.c_port, t.translation
 FROM translated t
