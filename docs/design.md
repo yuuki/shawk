@@ -533,6 +533,22 @@ rejects as invalid data are dropped rather than kept for the next write,
 which would fail again (IPv6 zones are stripped from addresses before);
 the edges and listeners agents still send are then written again.
 
+The session also keeps what the agent folds (`shawk.peer.fold`, §5.2) and
+the ranges it keeps exact (`shawk.peer.internal`). When the flows the agent
+dropped (`shawk.agent.flows.dropped`) grew since the heartbeat written
+before, the period between the two heartbeats is recorded in
+`partial_observations`: the host was observed, but dependencies active
+then may be missing. A period that starts where the latest period of the
+session ends extends it. The count is compared with the session in
+PostgreSQL rather than with what the connector remembers, so a restart and
+several connectors record the same periods; the writes of a host wait for
+each other on the row of the host, which they update first. A session
+written for the first time continues the latest session of the host when
+the counter of the agent ran then (it started before that heartbeat and
+did not decrease), as after a restart of the connector or a new segment of
+the same agent, and records only the drops since; otherwise, as after a
+restart of the agent, it records every drop it counts from its start.
+
 Changes still pending are lost when the connector crashes, or stops while
 the database is down; agents send again only the edges active within their
 idle TTL. So a session written by a connector starts no earlier than 2
@@ -548,8 +564,9 @@ exclusively, so that a migration waits for them and they wait for it.
 
 Rows last seen longer ago than `retention` (3 years by default) are deleted
 every hour by `shawk.prune()`, in batches of short transactions; processes
-and hosts go once nothing refers to them. Sessions are deleted with them,
-so `unobserved()` reports the time before the retention as not observed.
+and hosts go once nothing refers to them. Sessions and partly observed
+periods are deleted with them, so `unobserved()` reports the time before
+the retention as not observed.
 
 ### 5.2 Names of peers
 
@@ -568,6 +585,16 @@ sockets of the kernel (`~kernel:nfs`, §4.1) do.
 | either | unknown, in a range of `peer_cidrs` | the name of the narrowest range |
 | either | unknown, private address | `~unresolved` |
 | either | unknown, public address | `~external` |
+| either | folded (`0.0.0.0/0`, `::/0`) | a range of `peer_cidrs` that holds the whole network, `~external` otherwise |
+
+An agent may fold the peers outside its internal ranges into one peer per
+local endpoint: such an edge carries `shawk.peer.folded=true` and the
+address `0.0.0.0` or `::`, and the connector takes its peer as the network
+`0.0.0.0/0` or `::/0` (agents of the previous version never send the
+attribute; a peer `0.0.0.0` without it is an address, `~unresolved`). A
+folded peer is not looked up among services or clients, has no agent
+(`shawk.peer.agent` false), and a folded client edge names no server edge.
+The edge is written with the network as `remote_addr`.
 
 `shawk.peer.agent` tells whether the peer address belongs to a host whose
 agent is alive (closed an interval in the last 5 minutes, or the host
@@ -593,6 +620,21 @@ listener is written (up to one write interval), and a new client on the
 server side until its client edge reaches the connector;
 `shawk.peer.agent` is right meanwhile, so counting (§7) is not affected.
 
+An agent that folds the clients of its servers (`shawk.peer.fold` `in` or
+`all`) folds a client that runs an agent too when the address of the client
+is outside the ranges it keeps exact (`shawk.peer.internal`; its own
+addresses are always exact), as between hosts that talk over public
+addresses. The two sides of their connections then do not match in
+PostgreSQL, and §7 counts them on both sides. When the connector sees a
+client edge to an address that one live host holds whose agent folds the
+client address this way (not loopback, nor an address several hosts or
+that host hold), it logs a warning naming both hosts and addresses, at most
+once an hour per pair of hosts, so that the address can be added to the
+internal ranges of the server's agent. What an agent folds comes from its
+requests, or for hosts behind other connectors from
+`shawk_v1.agent_addrs`. The connector has no metrics of its own, so the
+warning is only logged.
+
 ### 5.3 Metrics to Prometheus
 
 Edge metrics are reduced to `service.peer.name`, `shawk.peer.agent`, `shawk.role`,
@@ -607,7 +649,8 @@ name, and `host.id` and `host.name` are promoted to labels by Prometheus.
   replicas and changing IPs of peers do not add series. Per host, local
   service and role, at most `max_peers` (50) peer names are used; the rest
   are folded into `~other`. `keep_peer_address` keeps
-  `network.peer.address` when it is really needed.
+  `network.peer.address` when it is really needed; for a folded peer it is
+  the network (`0.0.0.0/0`, `::/0`).
 - Inputs are cumulative per peer address; outputs merge several of them.
   The connector keeps the last value of every input series and adds the
   increase to the output, treating a decrease or a new start time as a
@@ -663,10 +706,13 @@ connector as migrations (`collector/shawkconnector/migrations`), applied by
 
 ```
 hosts(id, machine_id, hostname, kernel, agent_version, first_seen, last_seen)
-agent_sessions(host_id, started_at, last_heartbeat, udp_traced, netns_scope, dropped_flows)
+agent_sessions(host_id, started_at, last_heartbeat, udp_traced, netns_scope, dropped_flows, clock_skew,
+               peer_fold, peer_internal)  -- peer_*: NULL if written by an earlier connector
+partial_observations(host_id, started_at, period_start, period_end, dropped_flows)  -- periods with drops
 host_addrs(host_id, addr, first_seen, last_seen)  -- one row per period
 processes(id, host_id, unit, comm, exe, service_name, first_seen, last_seen)  -- unique (host_id, unit, comm, service_name)
 edges(id, host_id, process_id, role, proto, local_addr, remote_addr, port, netns, first_seen, last_seen)
+  -- remote_addr is the network 0.0.0.0/0 or ::/0 for folded peers
 listeners(host_id, process_id, proto, addr, port, netns, first_seen, last_seen)  -- the latest owner
 listener_owners(host_id, process_id, proto, addr, port, netns, first_seen, last_seen)  -- every known owner
 peer_cidrs(prefix, name)  -- written by the connector from its peer_cidrs
@@ -677,6 +723,10 @@ known_dependencies(client_service, server_service, port, proto, first_seen, last
 connector brings it up to date every 5 minutes
 (`shawk.refresh_known_dependencies()`).
 
+`partial_observations` holds the periods in which an agent dropped flows
+(§5.1), by the clock of the connector, per session; `peer_fold` is `none`,
+`in` or `all`, and `peer_internal` the ranges the agent keeps exact.
+
 `service_name` has the form of the `job` label (`namespace/name`), so that
 names in PostgreSQL and Prometheus match.
 
@@ -684,15 +734,16 @@ names in PostgreSQL and Prometheus match.
 
 | view or function | |
 |---|---|
-| `dependencies` | one row per logical dependency: the client edge and the server edge matched by their addresses and port (loopback within a host and netns, addresses held by several hosts at once within a host). `observed_by` is `both`, `client` or `server`; a one-sided row means no agent on the other side, or a NAT or load balancer between. Edges are matched by address over all time: when an address moves to another host, the edges of each host that held it are matched with those of the peer. `client_observed_until` and `server_observed_until` are the latest heartbeats of the hosts: an old `last_seen` with a recent `observed_until` means *no longer used*; both old means *no longer observed*. |
+| `dependencies` | one row per logical dependency: the client edge and the server edge matched by their addresses and port (loopback within a host and netns, addresses held by several hosts at once within a host). `observed_by` is `both`, `client` or `server`; a one-sided row means no agent on the other side, or a NAT or load balancer between. Edges are matched by address over all time: when an address moves to another host, the edges of each host that held it are matched with those of the peer. `client_observed_until` and `server_observed_until` are the latest heartbeats of the hosts: an old `last_seen` with a recent `observed_until` means *no longer used*; both old means *no longer observed*. A `client_addr` (or `server_addr`) that is the network `0.0.0.0/0` or `::/0` stands for the peers an agent folded (§5.2): such a row is one-sided, and its peer is named `~external`. |
 | `graph_nodes`, `graph_edges` | the dependency map between services in the format of the Grafana Node Graph; a peer without a service is named by `peer_class` |
-| `peer_class(addr)` | the name of a peer without a known service, as in `service.peer.name`: the narrowest range of `peer_cidrs`, `~unresolved` for an address not routed on the Internet, `~external` otherwise |
+| `peer_class(addr)` | the name of a peer without a known service, as in `service.peer.name`: the narrowest range of `peer_cidrs`, `~unresolved` for an address not routed on the Internet, `~external` otherwise, including the networks of folded peers |
 | `dependency_changes` | dependencies between services that appeared, or disappeared while a host that saw them kept observing for 15 minutes |
 | `service_endpoints` | addresses and ports services accept connections on: the last known listeners of each host (unspecified addresses expanded to the addresses of the host) and its server edges, for hosts that reported in the last 30 days, except addresses another host took over since; used by the connector |
 | `client_endpoints` | the client sides of connections in the last hour (client address, server address, port, client service); used by the connector to name the peer of a server edge |
-| `agent_addrs` | addresses of hosts whose agent closed an interval in the last 5 minutes; used by the connector |
-| `agents` | the latest segment of every host and whether its agent is alive |
+| `agent_addrs` | addresses of hosts whose agent closed an interval in the last 5 minutes, with what the agent traces and folds; used by the connector |
+| `agents` | the latest segment of every host and whether its agent is alive; the last columns, `peer_fold` and `peer_internal`, tell what the agent folds (NULL if written by a connector of an earlier version) |
 | `unobserved(since, until, tolerance)` | the periods in which each host was not observed; Grafana overlays them as annotations |
+| `partly_observed(since, until)` | the periods in which each host was observed but its agent dropped flows, cut to `[since, until]`: `host`, `gap_start`, `gap_end`, `dropped_flows` (flow updates dropped). A dependency may be missing from them although it was used; Grafana overlays them as annotations |
 | `dependencies_between(since, until)`, `graph_edges_between`, `graph_nodes_between`, `dependency_changes_between` | the same for the dependencies active in a period. They take the edges active in the period with a margin of 15 minutes before matching them, so a recent window does not scan the history (about 0.3 s instead of 3 s with a million edges) and both sides of a connection are matched at the edges of the period; the dashboards and alerts use them. A dependency appeared in a period when it was first seen in it and is not in `known_dependencies` from before it: one that comes back on new edges (a new container, an hourly job) did not appear |
 
 The connector role writes `shawk` and reads `shawk_v1`; Grafana reads
@@ -737,6 +788,14 @@ agent does not look like a removed dependency. Agents that stopped are
 alerted by Prometheus (`ShawkAgentDown`) for 24 hours, and by PostgreSQL
 (`shawk_v1.agents`) from then on for 30 days, labelled with the host id; a
 host reinstalled under the same name and alive is not alerted.
+
+The fleet, dependency details and changes dashboards overlay the periods in
+which a host was not observed (`unobserved()`, "not observed: host") and
+those in which its agent dropped flows (`partly_observed()`, "partly
+observed: host") as annotations, so that the absence of a dependency is not
+read as disuse over them. The fleet dashboard lists both kinds of periods
+side by side, and shows what each agent folds and the ranges it keeps
+exact.
 
 The panels of OBI use a minimal interval of a minute: OBI exports every 60
 seconds by default, and a rate over a shorter range would hold one sample.
