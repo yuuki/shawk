@@ -1,6 +1,7 @@
 # Passive path quality: design proposal
 
-Status: proposal (2026-11-02), not implemented; no issue yet. It answers
+Status: proposal (2026-11-02), not implemented; no issue yet. The
+decisions of §9 are made. It answers
 whether shawk should do what Pingmesh [1] does: not its active probing,
 but its measurements, taken on the connections that hosts open anyway.
 It was revised after an adversarial review (§10). The sections of
@@ -617,23 +618,25 @@ of `shawk_inet_sock_set_state` with `-bpf-stats` before and after.
    - **Excluding named services** (e.g. a prober) from the views of
      `shawk_v1` and the rules.
 
-## 9. Decisions to make
+## 9. Decisions (decided)
 
-1. **What to measure.** The handshake from `connect(2)` (recommended), or
-   the first RTT sample (§5).
-2. **The bucket bounds** of §3.1.
-3. **Granularity of the host family.** Per host towards sites
-   (`path_hosts: site`, recommended as the default), or towards zones.
-4. **Zones apart from `peer_cidrs`** (recommended).
-5. **The histogram between sites.**
-   - Classic buckets (recommended until verified), or an OTLP exponential
-     histogram, which Prometheus stores as a native histogram, with
-     power-of-two bounds instead of those of §3.1.
-   - To be verified: the TSDB settings it needs for native histograms,
-     including out-of-order native histograms within the window of 30
-     minutes.
-6. **`path_exclude_services`** as a list of services, or matching by other
-   attributes (unit, executable).
+All six were decided as recommended (2026-11-02):
+
+1. **What to measure.** The handshake from `connect(2)`. The first RTT
+   sample is left for later (§5).
+2. **The bucket bounds** are those of §3.1.
+3. **Granularity of the host family.** Per host towards sites:
+   `path_hosts: site` is the default, and `zone` and `none` are available.
+4. **Zones are kept apart from `peer_cidrs`.**
+5. **The histogram between sites** uses classic buckets with the bounds of
+   §3.1.
+   - An OTLP exponential histogram, which Prometheus would store as a
+     native histogram with power-of-two bounds, is reconsidered once the
+     TSDB settings it needs are verified. That includes out-of-order native
+     histograms within the window of 30 minutes.
+6. **`path_exclude_services`** is a list of services, named as the `job`
+   label names them (`namespace/name`), as everywhere else in shawk.
+   Matching by unit or executable is not added.
 
 ## 10. Adversarial review and responses (2026-11-02)
 
