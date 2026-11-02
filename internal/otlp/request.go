@@ -253,7 +253,11 @@ func processAttrs(p *Process) []*commonpb.KeyValue {
 	if p.Exe != "" {
 		attrs = append(attrs, str(AttrExeName, path.Base(p.Exe)), str(AttrExePath, p.Exe))
 	}
-	return append(attrs, str(AttrCommand, p.Comm), str(AttrUnit, p.Unit))
+	attrs = append(attrs, str(AttrCommand, p.Comm), str(AttrUnit, p.Unit))
+	if p.ContainerID != "" {
+		attrs = append(attrs, str(AttrContainerID, p.ContainerID))
+	}
+	return attrs
 }
 
 func edgeAttrs(k *EdgeKey) []*commonpb.KeyValue {
@@ -408,6 +412,7 @@ func compareProcess(a, b *Process) int {
 		strings.Compare(a.Exe, b.Exe),
 		strings.Compare(a.Service, b.Service),
 		strings.Compare(a.ServiceNamespace, b.ServiceNamespace),
+		strings.Compare(a.ContainerID, b.ContainerID),
 	)
 }
 

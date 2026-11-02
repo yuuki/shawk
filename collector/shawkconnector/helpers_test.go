@@ -20,6 +20,7 @@ type tEdge struct {
 	role, proto, local, peer string
 	port                     int64
 	svc, ns, unit, comm, exe string
+	containerID              string
 	start, first, last       time.Time
 	opened, failed, count    int64
 	tx, rx, retrans          int64
@@ -120,6 +121,9 @@ func (ta tAgent) metrics() pmetric.Metrics {
 	for _, e := range ta.edges {
 		attrs := func(a pcommon.Map) {
 			putProcess(a, e.svc, e.ns, e.unit, e.comm, e.exe)
+			if e.containerID != "" {
+				a.PutStr(attrContainerID, e.containerID)
+			}
 			a.PutStr(attrRole, e.role)
 			a.PutStr(attrTransport, e.proto)
 			a.PutStr(attrLocalAddr, e.local)

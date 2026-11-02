@@ -26,8 +26,11 @@ CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN CAP_SYS_PTRACE CAP_DAC_R
 LimitMEMLOCK=infinity
 NoNewPrivileges=yes
 # The agent reads the kernel BTF, the cgroup hierarchy, ip_local_port_range,
-# the machine id and /proc, and resolves executables by reading
-# /proc/PID/exe, whose path does not depend on what this unit hides.
+# the machine id, /proc and the state of the container runtimes (under
+# /var/lib/docker, /var/lib/containers, /run/containers and /run/containerd),
+# and resolves executables by reading /proc/PID/exe, whose path does not
+# depend on what this unit hides. Rootless containers keep their state in
+# the home directories hidden by ProtectHome, and are named by id.
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes

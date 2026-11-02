@@ -44,6 +44,7 @@ const (
 	attrExePath     = "process.executable.path"
 	attrCommand     = "process.command"
 	attrUnit        = "shawk.unit"
+	attrContainerID = "container.id"
 	attrRole        = "shawk.role"
 	attrTransport   = "network.transport"
 	attrLocalAddr   = "network.local.address"

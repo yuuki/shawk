@@ -402,14 +402,84 @@ about agents whose peers are folded that way (§5.2).
   short-lived job is often removed before the end of the interval,
   `tp_btf/cgroup_mkdir` reports the path of every cgroup when it is created,
   and the agent keeps it for an hour.
-- `service.name` follows the order of OBI, so that both name a service the
-  same way: `OTEL_SERVICE_NAME`, then `service.name` in
-  `OTEL_RESOURCE_ATTRIBUTES` of the process (only the `OTEL_` variables of
-  `/proc/PID/environ` are read; the rest is discarded as soon as it is
-  read), then the base name of the executable, then comm, then the unit,
-  then `~unknown` (a socket whose owner is not known).
+- A container is named after what stays the same when it is recreated, not
+  after its id: `k8s/<namespace>/<workload>/<container>` for a container of
+  a pod of Kubernetes, `docker/<project>/<service>` for Docker Compose,
+  `docker/<name>`, `podman/<name>` or `containerd/<name>` (nerdctl)
+  otherwise. Its full id is the attribute `container.id`. The agent finds
+  the container in the cgroup path, made by the systemd driver of the
+  runtime (`docker-<id>.scope`, `libpod-<id>.scope`,
+  `cri-containerd-<id>.scope`, `crio-<id>.scope`, `nerdctl-<id>.scope`) or
+  by its cgroupfs driver (`/docker/<id>`, `/libpod_parent/libpod-<id>`,
+  `/kubepods/<class>/pod<uid>/<id>`, `crio-<id>`), and reads the names
+  from the state the runtime keeps on disk: `config.v2.json` of Docker
+  (under `data-root` of `/etc/docker/daemon.json`, by default
+  `/var/lib/docker`), `containers.json` and `volatile-containers.json`
+  (`podman run --rm`) of containers/storage for Podman, and the
+  annotations of the `config.json` of the OCI bundle for containerd
+  (`/run/containerd/io.containerd.runtime.v2.task`) and CRI-O
+  (`/run/containers/storage`). The APIs of the runtimes are on Unix
+  sockets, which the agent's unit does not allow. The state is read when
+  the cgroup is created, so that a container removed within an interval
+  keeps its name, and kept for an hour after its last use.
+- Docker merges the labels of the image into those of the container, so an
+  image could claim to be any pod or Compose service. The labels of a pod
+  are believed only with the name cri-dockerd gives the container
+  (`k8s_<container>_<pod>_<namespace>_<uid>_<attempt>`), and those of
+  Compose only with the name Compose gives it
+  (`<project>-<service>-<number>`, or `_` for separators, or
+  `<project>-<service>-run-<id>` for `docker compose run`); a service with
+  `container_name` is named after it. Each part of the name is limited to
+  letters, digits, `_`, `.` and `-` (any other character becomes `_`) and
+  to 253 characters, so that it cannot add a level to the unit or the
+  `job`.
+- A container whose state cannot be read is named
+  `<runtime>-<12 hex digits of the id>`, or `container-<12 hex digits>`
+  when the cgroup does not tell the runtime (kubelet with cgroupfs), which
+  changes when it is recreated: a rootless container, whose state is in
+  the home directory the unit hides, a runtime with another state
+  directory (`data-root` set on the command line of `dockerd`, k3s, rke2
+  and microk8s, which run their own containerd), or a container of
+  containerd without a name (`ctr run`). A container in a container
+  (Docker in Docker, kind) keeps its state in the outer container, out of
+  reach, and is named after the outer one.
+- The workload of a pod is the name of the pod without the suffixes
+  Kubernetes appends to the pods it creates (`web-5d8f7c9b6-x7z2k` and
+  `node-exporter-x7z2k` become `web` and `node-exporter`, `db-0` becomes
+  `db`). The API server cuts the prefix of a generated name to 58
+  characters before the 5 random ones, so a generated name of 63
+  characters without `-` before the last 5 is cut at its last `-`, after
+  the part of the hash or of the minutes of a CronJob that is left; the
+  name is the same for every pod of the workload, but may lack the end of
+  a long name of a workload. The owner of a pod is known only to the API
+  server, which the agent does not ask, so a pod named by hand that ends
+  like a generated name loses that end too.
+- `service.name` follows the order of OBI: `OTEL_SERVICE_NAME`, then
+  `service.name` in `OTEL_RESOURCE_ATTRIBUTES` of the process (only the
+  `OTEL_` variables of `/proc/PID/environ` are read; the rest is discarded
+  as soon as it is read), then the workload of the pod of Kubernetes of
+  the process, then the base name of the executable, then comm, then the
+  unit, then `~unknown` (a socket whose owner is not known).
   `-service-name-fallback=unit` uses the unit instead of the executable.
-  `service.namespace` is read from `OTEL_RESOURCE_ATTRIBUTES`.
+  `service.namespace` is read from `OTEL_RESOURCE_ATTRIBUTES`, else it is
+  the namespace of the pod, also for a process that names its service
+  with `OTEL_SERVICE_NAME`, as OBI does.
+- OBI names the processes of other containers after their executable, as
+  the agent does, but it names a pod from the metadata the API server
+  gives it, which the agent cannot see: the annotation
+  `resource.opentelemetry.io/service.name`, then the labels
+  `app.kubernetes.io/instance` and `app.kubernetes.io/name`, then the
+  owner of the pod (the namespace from the annotation
+  `resource.opentelemetry.io/service.namespace` or the label
+  `app.kubernetes.io/part-of`). The `job` of a pod is the same in both
+  only when the pod has none of them and the name of its owner is what
+  the agent guesses; a chart of Helm usually sets these labels (the
+  controller of ingress-nginx is `ingress-nginx/ingress-nginx` in OBI and
+  `ingress-nginx/ingress-nginx-controller` here). A pod that sets
+  `OTEL_SERVICE_NAME` has the same `job` in both. Containers of Docker or
+  Podman that run the same executable share a service name unless they
+  set `OTEL_SERVICE_NAME`, as with OBI, but PostgreSQL tells them apart by
+  unit; `-service-name-fallback=unit` names them after their unit.
 - Sockets of the kernel (§3.2) are named after their service port, the
   one thing that stays the same across reconnections: `~kernel:nfs` (2049),
   `~kernel:rpcbind` (111), `~kernel:smb` (139, 445), `~kernel:iscsi`
@@ -457,7 +527,8 @@ about agents whose peers are folded that way (§5.2).
 
 Every edge (a bundled flow with its process identity) is a series with the
 attributes `service.name`, `service.namespace`, `process.executable.name`,
-`process.executable.path`, `process.command`, `shawk.unit`, `shawk.role`
+`process.executable.path`, `process.command`, `shawk.unit`, `container.id`
+(for a process in a container), `shawk.role`
 (`client` or `server`), `network.transport`, `network.local.address`,
 `network.peer.address`, `server.port` (the service port, whatever the role)
 and `shawk.netns`, and `shawk.peer.folded=true` when the edge bundles the

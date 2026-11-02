@@ -96,7 +96,7 @@ Run the agent on every host you want to observe:
 | `-otlp-ca-file` | CA bundle that verifies the collector |
 | `-otlp-cert-file`, `-otlp-key-file` | client certificate for a collector that requires one (the example configuration does) |
 | `-max-series-per-request` | dependencies and listeners per request (1000); a request also stays below 3 MiB, and a busy host sends several per interval |
-| `-service-name-fallback` | name of a service without `OTEL_SERVICE_NAME`: `exe` (executable name, as OBI) or `unit` (systemd unit) |
+| `-service-name-fallback` | name of a service without `OTEL_SERVICE_NAME`: `exe` (executable name, as OBI) or `unit` (systemd unit, or the name of the container); a container of Kubernetes is named after the workload of its pod either way |
 | `-interval`, `-idle-ttl` | export interval (15 s, at most 1 min) and how long a dependency is sent after its last activity (15 min) |
 | `-netns`, `-max-flows`, `-bpf-stats` | network namespaces to trace, capacity of the in-kernel flow table (also sizing the tables of listening ports), BPF run time statistics |
 | `-internal-peers`, `-fold-external` | address ranges whose peers are kept exact (`private`: the ranges not routed on the Internet), and which flows fold the other peers into one dependency per local endpoint: `in` (the clients of local servers, default), `all` or `none`; see [the design](docs/design.md#36-folding-external-peers) |

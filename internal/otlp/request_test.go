@@ -111,6 +111,9 @@ func TestRequest(t *testing.T) {
 	if _, ok := a["process.pid"]; ok {
 		t.Error("the PID is an attribute")
 	}
+	if _, ok := a["container.id"]; ok {
+		t.Error("container.id of a process outside containers")
+	}
 	if !metrics[MetricConnOpened].GetSum().IsMonotonic || metrics[MetricConnCount].GetSum().IsMonotonic {
 		t.Error("wrong monotonicity")
 	}
@@ -316,5 +319,13 @@ func TestRequestInvalidUTF8(t *testing.T) {
 	req := s.Request(Resource{Hostname: "h"}, AgentStatus{}, t0)
 	if _, err := proto.Marshal(req); err != nil {
 		t.Fatalf("marshal: %v", err)
+	}
+}
+
+func TestContainerIDAttribute(t *testing.T) {
+	p := Process{Unit: "docker/shop/db", Comm: "postgres", Service: "postgres", ContainerID: "0123abcd"}
+	a := attrMap(processAttrs(&p))
+	if a["container.id"] != "0123abcd" || a["shawk.unit"] != "docker/shop/db" {
+		t.Errorf("attributes = %v", a)
 	}
 }

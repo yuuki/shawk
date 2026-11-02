@@ -70,30 +70,39 @@ func TestServiceName(t *testing.T) {
 		name            string
 		env             map[string]string
 		exe, comm, unit string
+		workload        Service
 		fb              Fallback
 		want            Service
 	}{
 		{"service name variable", map[string]string{
 			"OTEL_SERVICE_NAME":        "billing",
 			"OTEL_RESOURCE_ATTRIBUTES": "service.name=ignored,service.namespace=shop",
-		}, "/usr/bin/ruby", "ruby", "billing.service", FallbackExe, Service{"billing", "shop"}},
+		}, "/usr/bin/ruby", "ruby", "billing.service", Service{}, FallbackExe, Service{"billing", "shop"}},
 		{"resource attributes", map[string]string{
 			"OTEL_RESOURCE_ATTRIBUTES": "service.name=cart",
-		}, "/usr/bin/java", "java", "cart.service", FallbackExe, Service{"cart", ""}},
+		}, "/usr/bin/java", "java", "cart.service", Service{}, FallbackExe, Service{"cart", ""}},
 		{"blank service name", map[string]string{"OTEL_SERVICE_NAME": " "},
-			"/usr/sbin/nginx", "nginx", "nginx.service", FallbackExe, Service{"nginx", ""}},
-		{"executable", nil, "/usr/lib/postgresql/16/bin/postgres", "postgres", "postgresql.service", FallbackExe, Service{"postgres", ""}},
-		{"comm without executable", nil, "", "kworker", "", FallbackExe, Service{"kworker", ""}},
-		{"unit without process", nil, "", "", "nfs-server.service", FallbackExe, Service{"nfs-server.service", ""}},
-		{"nothing known", nil, "", "", "", FallbackExe, Service{UnknownService, ""}},
-		{"unit", nil, "/usr/bin/ruby", "ruby", "billing.service", FallbackUnit, Service{"billing.service", ""}},
-		{"unit unknown", nil, "/usr/bin/ruby", "ruby", "", FallbackUnit, Service{"ruby", ""}},
+			"/usr/sbin/nginx", "nginx", "nginx.service", Service{}, FallbackExe, Service{"nginx", ""}},
+		{"executable", nil, "/usr/lib/postgresql/16/bin/postgres", "postgres", "postgresql.service", Service{}, FallbackExe, Service{"postgres", ""}},
+		{"comm without executable", nil, "", "kworker", "", Service{}, FallbackExe, Service{"kworker", ""}},
+		{"unit without process", nil, "", "", "nfs-server.service", Service{}, FallbackExe, Service{"nfs-server.service", ""}},
+		{"nothing known", nil, "", "", "", Service{}, FallbackExe, Service{UnknownService, ""}},
+		{"unit", nil, "/usr/bin/ruby", "ruby", "billing.service", Service{}, FallbackUnit, Service{"billing.service", ""}},
+		{"unit unknown", nil, "/usr/bin/ruby", "ruby", "", Service{}, FallbackUnit, Service{"ruby", ""}},
 		{"environment wins over unit", map[string]string{"OTEL_SERVICE_NAME": "billing"},
-			"/usr/bin/ruby", "ruby", "billing-v2.service", FallbackUnit, Service{"billing", ""}},
+			"/usr/bin/ruby", "ruby", "billing-v2.service", Service{}, FallbackUnit, Service{"billing", ""}},
 		{"namespace without name", map[string]string{"OTEL_RESOURCE_ATTRIBUTES": "service.namespace=shop"},
-			"/usr/bin/php-fpm", "php-fpm", "", FallbackExe, Service{"php-fpm", "shop"}},
+			"/usr/bin/php-fpm", "php-fpm", "", Service{}, FallbackExe, Service{"php-fpm", "shop"}},
+		{"workload of a pod", nil, "/usr/bin/java", "java", "k8s/shop/cart/app",
+			Service{"cart", "shop"}, FallbackExe, Service{"cart", "shop"}},
+		{"workload before unit", nil, "/usr/bin/java", "java", "k8s/shop/cart/app",
+			Service{"cart", "shop"}, FallbackUnit, Service{"cart", "shop"}},
+		{"environment wins over workload", map[string]string{"OTEL_SERVICE_NAME": "billing"},
+			"/usr/bin/java", "java", "k8s/shop/cart/app", Service{"cart", "shop"}, FallbackExe, Service{"billing", "shop"}},
+		{"namespace of the environment wins", map[string]string{"OTEL_RESOURCE_ATTRIBUTES": "service.namespace=eu"},
+			"/usr/bin/java", "java", "k8s/shop/cart/app", Service{"cart", "shop"}, FallbackExe, Service{"cart", "eu"}},
 	} {
-		if got := ServiceName(tc.env, tc.exe, tc.comm, tc.unit, tc.fb); got != tc.want {
+		if got := ServiceName(tc.env, tc.exe, tc.comm, tc.unit, tc.workload, tc.fb); got != tc.want {
 			t.Errorf("%s: ServiceName = %+v, want %+v", tc.name, got, tc.want)
 		}
 	}

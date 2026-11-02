@@ -310,7 +310,8 @@ func (a *Agent) process(pid uint32, comm string, cgroupID uint64, port uint16, s
 	if tracer.KernelOwned(comm, cgroupID) {
 		return otlp.Process{Comm: comm, Service: procinfo.KernelServiceName(port, server)}
 	}
-	return a.idents.resolve(pid, comm, procinfo.Unit(a.cgroups.CgroupPath(cgroupID)), now)
+	unit, ctr := a.cgroups.Unit(cgroupID)
+	return a.idents.resolve(pid, comm, unit, ctr, now)
 }
 
 // request builds the requests of the live series at now, and returns the

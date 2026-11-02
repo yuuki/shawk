@@ -172,19 +172,31 @@ func ResourceAttributes(s string) map[string]string {
 //
 //  1. OTEL_SERVICE_NAME in the environment of the process,
 //  2. service.name in OTEL_RESOURCE_ATTRIBUTES,
-//  3. the base name of the executable, or the unit with FallbackUnit,
-//  4. comm,
-//  5. the unit, then UnknownService, for sockets whose owner is unknown.
+//  3. the workload of the pod of Kubernetes of the process
+//     (Container.Workload),
+//  4. the base name of the executable, or the unit with FallbackUnit,
+//  5. comm,
+//  6. the unit, then UnknownService, for sockets whose owner is unknown.
 //
-// service.namespace in OTEL_RESOURCE_ATTRIBUTES gives the namespace. The
-// order follows OBI, so that both name a service the same way.
-func ServiceName(env map[string]string, exe, comm, unit string, fb Fallback) Service {
+// service.namespace in OTEL_RESOURCE_ATTRIBUTES gives the namespace, else
+// the namespace of the pod. The order follows OBI, so that both name a
+// service the same way: OBI names the processes of a pod after the
+// workload and namespace of the pod, and those of other containers after
+// their executable. Containers apart from Kubernetes are told apart by
+// their unit, or named after it with FallbackUnit.
+func ServiceName(env map[string]string, exe, comm, unit string, workload Service, fb Fallback) Service {
 	var s Service
 	attrs := ResourceAttributes(env["OTEL_RESOURCE_ATTRIBUTES"])
 	s.Namespace = attrs["service.namespace"]
+	if s.Namespace == "" {
+		s.Namespace = workload.Namespace
+	}
 	s.Name = strings.TrimSpace(env["OTEL_SERVICE_NAME"])
 	if s.Name == "" {
 		s.Name = attrs["service.name"]
+	}
+	if s.Name == "" {
+		s.Name = workload.Name
 	}
 	if s.Name == "" && fb == FallbackUnit {
 		s.Name = unit
