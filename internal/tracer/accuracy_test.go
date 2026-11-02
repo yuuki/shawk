@@ -775,9 +775,8 @@ func TestTCPManyShortConnections(t *testing.T) {
 
 	snap := collect(t, tr)
 	const conns = workers * perWorker
-	t.Logf("flow updates retried after contention: %d, lost to it: %d", snap.Retried, snap.Contended)
 	if snap.Drops != 0 {
-		t.Errorf("%d flow updates counted as dropped for a full flow table", snap.Drops)
+		t.Errorf("%d flow updates dropped, %d of them for contention", snap.Drops, snap.Contended)
 	}
 	for _, dir := range []Direction{DirOut, DirIn} {
 		f := findFlow(snap.Flows, dir, ProtoTCP, srv.Port(), srv.Addr())

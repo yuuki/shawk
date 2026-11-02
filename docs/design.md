@@ -258,30 +258,22 @@ by its first datagram and kept in the socket local storage:
   client;
 * a socket that sends first on the port of a known server socket (e.g. the
   per-client connected sockets of a QUIC server) is a server. The server
-  sockets found by the last walk are known, and a socket that receives
-  first adds its port at once, so that the connected sockets a server
-  started since opens on its port are servers too;
+  sockets found by the last walk are known, and an unconnected socket
+  bound to its port that receives first adds the port at once, so that the
+  connected sockets a server started since opens on its port are servers
+  too;
 * bound, unconnected sockets that exist when the agent starts are marked as
   servers, since their first datagram afterwards may be a reply;
-* a connected socket that receives first is a client when the kernel chose
-  its port, which no client could have known, or when it existed before the
-  agent started and is not on the port of a server socket: it sent its
-  request before.
+* a connected socket whose port the kernel chose is a client when it
+  receives first, since no client could have known its port: it sent its
+  request before the agent started.
 
-A socket bound to a port outside the ephemeral range that is not connected
-and sends first may also serve on its port, like ntpd, which queries its
-upstream servers and answers its clients on port 123 with one socket. For
-such sockets the direction is also decided per peer, in an LRU hash map
-keyed by the socket cookie and the peer (as large as the tables of
-listening ports): a peer it sent to first is a server, and a peer that
-sent to it first is a client. A socket that received first keeps its
-direction for every peer, since a reply to a client that the map no longer
-held would make an outgoing flow per client port; ntpd that answers a
-client before it queries its upstream servers records them as its clients.
-
-A client socket bound to a port and not connected that existed before the
-agent started and receives before it sends again is recorded as a server
-with its own port.
+A client socket that existed before the agent started and receives before it
+sends again is recorded as a server with its own port, unless it is
+connected and the kernel chose its port. A connected socket on a bound port
+cannot be told from a server connected to its client (socat, DTLS). A
+socket that both queries servers and answers clients on its port, like
+ntpd, has the direction of its first datagram for all its peers.
 
 UDP needs BPF trampolines. On kernels without them the agent keeps tracing
 TCP and reports that UDP is not traced.
@@ -878,10 +870,11 @@ parses. shawk runs beside it instead:
 - **Same port shared by different services** with `SO_REUSEPORT` cannot be
   told apart (§5.3 of the paper); this is rare.
 - **UDP peer-to-peer protocols** where both sides send first are recorded
-  as clients of each other's port. A UDP client socket bound to a port and
-  not connected that existed before the agent started and receives before
-  it sends again is recorded as a server (§3.3), and so are the upstream
-  servers of a socket that serves on its port and received before it sent.
+  as clients of each other's port. A UDP client socket that existed before
+  the agent started and receives before it sends again is recorded as a
+  server, unless it is connected on a port the kernel chose (§3.3). A
+  socket that is both client and server on its port, like ntpd, is
+  recorded with the direction of its first datagram for all its peers.
 - **MPTCP**: additional subflows opened by the server side (with a path
   manager that does so, which the default does not) are recorded as
   outgoing connections from the server. Data that MPTCP sends again on
@@ -906,9 +899,9 @@ parses. shawk runs beside it instead:
   have been used. An insertion that the kernel refuses because an update
   of the same bucket is in progress on the same CPU (`-EBUSY`, an update
   nested in an interrupted one, or on upstream 5.14 also in a preempting
-  task) is not a drop: it is tried again once, and the agent warns when
-  updates are lost to it. A connection whose count failed is counted by
-  its next walk or its close.
+  task) is counted as a drop too, and the agent warns that the table was
+  not full. A connection whose count failed is counted by its next walk or
+  its close.
   External peers are folded (§3.6), so the flows grow with the internal
   peers and the local services, not with the clients on the Internet; a
   host with very many internal clients, or with `-fold-external=none`, may

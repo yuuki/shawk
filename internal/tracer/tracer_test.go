@@ -581,103 +581,92 @@ func TestUDPDirection(t *testing.T) {
 	})
 
 	// A client that sent its request before the tracer started and receives
-	// the reply after it is a client, also when it bound a random port
-	// below the ephemeral range (#99).
-	for _, bound := range []bool{false, true} {
-		name := "connected client before the tracer receives first"
-		if bound {
-			name += " on a bound port"
+	// the reply after it is a client (#99).
+	t.Run("connected client before the tracer receives first", func(t *testing.T) {
+		requireRoot(t)
+		srv := listenUDPFixedPort(t, "udp4", "127.0.0.1")
+		defer srv.Close()
+		cli, err := net.DialUDP("udp4", nil, srv.LocalAddr().(*net.UDPAddr))
+		if err != nil {
+			t.Fatal(err)
 		}
-		t.Run(name, func(t *testing.T) {
-			requireRoot(t)
-			srv := listenUDPFixedPort(t, "udp4", "127.0.0.1")
-			defer srv.Close()
-			var laddr *net.UDPAddr
-			if bound {
-				l := listenUDPFixedPort(t, "udp4", "127.0.0.1")
-				laddr = l.LocalAddr().(*net.UDPAddr)
-				l.Close()
-			}
-			cli, err := net.DialUDP("udp4", laddr, srv.LocalAddr().(*net.UDPAddr))
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer cli.Close()
-			buf := make([]byte, 64)
-			if _, err := cli.Write(buf); err != nil {
-				t.Fatal(err)
-			}
-			_, from, err := srv.ReadFrom(buf)
-			if err != nil {
-				t.Fatal(err)
-			}
-			tr := newTestTracer(t)
-			requireUDP(t, tr)
-			if _, err := srv.WriteTo(buf, from); err != nil {
-				t.Fatal(err)
-			}
-			cli.SetReadDeadline(time.Now().Add(time.Second))
-			if _, err := cli.Read(buf); err != nil {
-				t.Fatal(err)
-			}
-			snap, err := tr.Collect()
-			if err != nil {
-				t.Fatal(err)
-			}
-			srvPort := uint16(srv.LocalAddr().(*net.UDPAddr).Port)
-			cliPort := uint16(cli.LocalAddr().(*net.UDPAddr).Port)
-			if f := findPort(snap.Flows, DirOut, srvPort); f == nil || f.MsgsRecv != 1 {
-				t.Errorf("client flow = %+v in %+v", f, snap.Flows)
-			}
-			for _, f := range snap.Flows {
-				if f.Proto == ProtoUDP && f.Port == cliPort {
-					t.Errorf("the client's port became a service port: %+v", f)
-				}
-			}
-		})
-	}
-
-	// Like ntpd, one socket on a fixed port queries its upstream server and
-	// answers its own clients (#99).
-	t.Run("socket that is both client and server", func(t *testing.T) {
+		defer cli.Close()
+		buf := make([]byte, 64)
+		if _, err := cli.Write(buf); err != nil {
+			t.Fatal(err)
+		}
+		_, from, err := srv.ReadFrom(buf)
+		if err != nil {
+			t.Fatal(err)
+		}
 		tr := newTestTracer(t)
 		requireUDP(t, tr)
-		up := listenUDPFixedPort(t, "udp4", "127.0.0.1")
-		defer up.Close()
-		go echo(up)
-		both := listenUDPFixedPort(t, "udp4", "127.0.0.1")
-		defer both.Close()
-		exchange(t, both, up.LocalAddr())
+		if _, err := srv.WriteTo(buf, from); err != nil {
+			t.Fatal(err)
+		}
+		cli.SetReadDeadline(time.Now().Add(time.Second))
+		if _, err := cli.Read(buf); err != nil {
+			t.Fatal(err)
+		}
+		snap, err := tr.Collect()
+		if err != nil {
+			t.Fatal(err)
+		}
+		srvPort := uint16(srv.LocalAddr().(*net.UDPAddr).Port)
+		cliPort := uint16(cli.LocalAddr().(*net.UDPAddr).Port)
+		if f := findPort(snap.Flows, DirOut, srvPort); f == nil || f.MsgsRecv != 1 {
+			t.Errorf("client flow = %+v in %+v", f, snap.Flows)
+		}
+		for _, f := range snap.Flows {
+			if f.Proto == ProtoUDP && f.Port == cliPort {
+				t.Errorf("the client's port became a service port: %+v", f)
+			}
+		}
+	})
+
+	// A server bound to its port and connected to its client, like socat or
+	// a DTLS server, that existed before the tracer started stays a server
+	// when it receives first.
+	t.Run("connected server before the tracer receives first", func(t *testing.T) {
+		requireRoot(t)
 		cli, err := net.ListenPacket("udp4", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer cli.Close()
-		go func() {
-			buf := make([]byte, 64)
-			both.SetReadDeadline(time.Now().Add(time.Second))
-			if _, from, err := both.ReadFrom(buf); err == nil {
-				both.WriteTo(buf, from)
-			}
-		}()
-		exchange(t, cli, both.LocalAddr())
-
+		l := listenUDPFixedPort(t, "udp4", "127.0.0.1")
+		laddr := l.LocalAddr().(*net.UDPAddr)
+		l.Close()
+		srv, err := net.DialUDP("udp4", laddr, cli.LocalAddr().(*net.UDPAddr))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer srv.Close()
+		tr := newTestTracer(t)
+		requireUDP(t, tr)
+		buf := make([]byte, 64)
+		if _, err := cli.WriteTo(buf, srv.LocalAddr()); err != nil {
+			t.Fatal(err)
+		}
+		srv.SetReadDeadline(time.Now().Add(time.Second))
+		if _, err := srv.Read(buf); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := srv.Write(buf); err != nil {
+			t.Fatal(err)
+		}
+		cli.SetReadDeadline(time.Now().Add(time.Second))
+		if _, _, err := cli.ReadFrom(buf); err != nil {
+			t.Fatal(err)
+		}
 		snap, err := tr.Collect()
 		if err != nil {
 			t.Fatal(err)
 		}
-		upPort := uint16(up.LocalAddr().(*net.UDPAddr).Port)
-		bothPort := uint16(both.LocalAddr().(*net.UDPAddr).Port)
+		srvPort := uint16(laddr.Port)
 		cliPort := uint16(cli.LocalAddr().(*net.UDPAddr).Port)
-		if f := findPort(snap.Flows, DirOut, upPort); f == nil || f.MsgsSent != 1 || f.MsgsRecv != 1 {
-			t.Errorf("flow to the upstream = %+v in %+v", f, snap.Flows)
-		}
-		// Both the server side of the socket and the client.
-		if f := findFlow(snap.Flows, DirIn, ProtoUDP, bothPort, netip.MustParseAddr("127.0.0.1")); f == nil || f.MsgsSent != 1 || f.MsgsRecv != 1 {
-			t.Errorf("flow from the client = %+v in %+v", f, snap.Flows)
-		}
-		if f := findPort(snap.Flows, DirOut, bothPort); f == nil || f.MsgsSent != 1 || f.MsgsRecv != 1 {
-			t.Errorf("flow of the client = %+v in %+v", f, snap.Flows)
+		if f := findPort(snap.Flows, DirIn, srvPort); f == nil || f.MsgsRecv != 1 || f.MsgsSent != 1 {
+			t.Errorf("server flow = %+v in %+v", f, snap.Flows)
 		}
 		for _, f := range snap.Flows {
 			if f.Proto == ProtoUDP && f.Port == cliPort {
