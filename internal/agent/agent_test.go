@@ -143,7 +143,7 @@ func TestRunRejectsLongInterval(t *testing.T) {
 }
 
 func TestParseInternalPeers(t *testing.T) {
-	got, err := ParseInternalPeers("private, 203.0.113.0/24,192.0.2.7,10.1.2.3/8,2001:db8::/32")
+	got, err := ParseInternalPeers("private, 203.0.113.0/24,192.0.2.7,10.1.2.3/8,2001:db8::/32,::ffff:10.0.0.0/104")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +155,9 @@ func TestParseInternalPeers(t *testing.T) {
 	if got, err := ParseInternalPeers(""); err != nil || len(got) != 0 {
 		t.Errorf("ParseInternalPeers(\"\") = %v, %v; want none", got, err)
 	}
-	for _, bad := range []string{"intranet", "10.0.0.0/33", "fe80::1%eth0", "fe80::%eth0/64"} {
+	// ::/0 would also keep the IPv4 peers, which are looked up as
+	// IPv4-mapped addresses.
+	for _, bad := range []string{"intranet", "10.0.0.0/33", "fe80::1%eth0", "fe80::%eth0/64", "::/0", "::/80"} {
 		if _, err := ParseInternalPeers(bad); err == nil {
 			t.Errorf("ParseInternalPeers(%q) succeeded", bad)
 		}

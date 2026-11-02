@@ -85,15 +85,6 @@ type FlowKey struct {
 	Folded bool
 }
 
-// RemotePrefix returns the remote address of a flow as a prefix: the
-// network 0.0.0.0/0 or ::/0 for a folded flow, a single address otherwise.
-func (k *FlowKey) RemotePrefix() netip.Prefix {
-	if k.Folded {
-		return netip.PrefixFrom(k.RemoteAddr, 0)
-	}
-	return netip.PrefixFrom(k.RemoteAddr, k.RemoteAddr.BitLen())
-}
-
 // FoldMode tells which flows fold their peers outside the internal ranges
 // into one flow per local endpoint, so that an internet-facing host does
 // not keep a flow per client address. It matches enum shawk_fold_mode of

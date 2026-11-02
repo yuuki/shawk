@@ -58,10 +58,32 @@ type Options struct {
 	// peer.
 	Fold FoldMode
 	// InternalPeers are the address ranges whose peers are kept exact when
-	// Fold folds peers. Loopback and the addresses given to SetLocalAddrs
-	// are always kept.
+	// Fold folds peers (see CheckInternalPeer). Loopback and the addresses
+	// of the host are always kept.
 	InternalPeers []netip.Prefix
-	Logger        *slog.Logger
+	// LocalAddrs are the addresses of the host when the tracer starts, kept
+	// from the first flow on, also for the connections it adopts;
+	// SetLocalAddrs replaces them.
+	LocalAddrs []netip.Addr
+	Logger     *slog.Logger
+}
+
+// v4InV6 are the IPv4-mapped IPv6 addresses, by which the programs look up
+// IPv4 peers.
+var v4InV6 = netip.MustParsePrefix("::ffff:0:0/96")
+
+// CheckInternalPeer reports an internal range that the programs would not
+// tell from the other address family: IPv4 peers are looked up as
+// IPv4-mapped IPv6 addresses, so an IPv6 range that overlaps them, such as
+// ::/0, would also keep the IPv4 peers in it.
+func CheckInternalPeer(p netip.Prefix) error {
+	if !p.IsValid() {
+		return fmt.Errorf("invalid internal range %s", p)
+	}
+	if p.Addr().Is6() && p.Overlaps(v4InV6) {
+		return fmt.Errorf("the IPv6 range %s overlaps the IPv4-mapped addresses (%s), which stand for IPv4 peers; list IPv4 ranges as such", p, v4InV6)
+	}
+	return nil
 }
 
 // keyFolded is KEY_FOLDED of struct shawk_flow_key.
@@ -173,6 +195,11 @@ func New(opts Options) (*Tracer, error) {
 	}
 	if opts.Logger == nil {
 		opts.Logger = slog.New(slog.DiscardHandler)
+	}
+	for _, p := range opts.InternalPeers {
+		if err := CheckInternalPeer(p); err != nil {
+			return nil, err
+		}
 	}
 	// Kernels before 5.11 charge BPF memory to RLIMIT_MEMLOCK.
 	if err := rlimit.RemoveMemlock(); err != nil {
@@ -295,6 +322,9 @@ func (t *Tracer) loadCore(spec *ebpf.CollectionSpec) error {
 		}
 		t.configuredPeers[k] = true
 	}
+	if err := t.setLocalAddrs(t.opts.LocalAddrs); err != nil {
+		return err
+	}
 
 	l, err := link.AttachTracing(link.TracingOptions{Program: coll.Programs[bpfProgShawkInetSockSetState]})
 	if err != nil {
@@ -414,34 +444,31 @@ func peerPrefixKey(p netip.Prefix) bpfShawkPeerPrefix {
 
 // SetLocalAddrs sets the addresses of the host, whose peers are never
 // folded, e.g. a host that connects to its own public address. It replaces
-// the addresses of the previous call; only the first maxLocalPeers are
-// kept.
+// the addresses of the previous call (or of Options.LocalAddrs); those in
+// an internal range need no entry, and only the first maxLocalPeers of the
+// others are kept.
 func (t *Tracer) SetLocalAddrs(addrs []netip.Addr) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	return t.setLocalAddrs(addrs)
+}
+
+func (t *Tracer) setLocalAddrs(addrs []netip.Addr) error {
 	if t.opts.Fold == FoldNone {
 		return nil
 	}
 	want := make(map[bpfShawkPeerPrefix]bool, len(addrs))
 	for _, a := range addrs {
+		a = a.WithZone("").Unmap()
+		if !a.IsValid() || t.internalAddr(a) {
+			continue
+		}
 		if len(want) == maxLocalPeers {
 			break
 		}
-		a = a.WithZone("")
-		if !a.IsValid() {
-			continue
-		}
 		want[peerPrefixKey(netip.PrefixFrom(a, a.BitLen()))] = true
 	}
-	for k := range want {
-		if t.localPeers[k] || t.configuredPeers[k] {
-			continue
-		}
-		if err := t.internalPeers.Update(&k, uint8(1), ebpf.UpdateAny); err != nil {
-			return fmt.Errorf("adding a local address to the internal ranges: %w", err)
-		}
-		t.localPeers[k] = true
-	}
+	// Former addresses go first, so that the trie has room for new ones.
 	for k := range t.localPeers {
 		if want[k] {
 			continue
@@ -451,7 +478,29 @@ func (t *Tracer) SetLocalAddrs(addrs []netip.Addr) error {
 		}
 		delete(t.localPeers, k)
 	}
+	for k := range want {
+		if t.localPeers[k] {
+			continue
+		}
+		if err := t.internalPeers.Update(&k, uint8(1), ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("adding a local address to the internal ranges: %w", err)
+		}
+		t.localPeers[k] = true
+	}
 	return nil
+}
+
+// internalAddr tells whether an address is in a range that is always kept
+// or in an internal range of the options.
+func (t *Tracer) internalAddr(a netip.Addr) bool {
+	for _, ps := range [][]netip.Prefix{alwaysInternal, t.opts.InternalPeers} {
+		for _, p := range ps {
+			if p.Contains(a) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // SelfPID returns the process id of the tracer as the kernel sees it. It

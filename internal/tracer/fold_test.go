@@ -32,10 +32,17 @@ func foldNetNS(t *testing.T) (func(f func()), uint32) {
 
 func newFoldTracer(t *testing.T, netns uint32, mode FoldMode, internal []netip.Prefix, maxFlows uint32) *Tracer {
 	t.Helper()
+	return startTracer(t, Options{NetNS: netns, Fold: mode, InternalPeers: internal, MaxFlows: maxFlows})
+}
+
+// startTracer starts a tracer of the flows of the tests with opts.
+func startTracer(t *testing.T, opts Options) *Tracer {
+	t.Helper()
 	requireRoot(t)
-	log := slog.New(slog.NewTextHandler(testLogWriter{t}, &slog.HandlerOptions{Level: slog.LevelWarn}))
-	tr, err := New(Options{NetNS: netns, TraceSelf: true, OwnerScanInterval: time.Hour, Fold: mode,
-		InternalPeers: internal, MaxFlows: maxFlows, Logger: log})
+	opts.TraceSelf = true
+	opts.OwnerScanInterval = time.Hour
+	opts.Logger = slog.New(slog.NewTextHandler(testLogWriter{t}, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	tr, err := New(opts)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -317,6 +324,76 @@ func TestFoldLocalAddrs(t *testing.T) {
 		t.Errorf("a former address of the host kept its address: %+v", f)
 	}
 	checkFolded(t, snap.Flows, DirIn, ProtoTCP, port, netip.IPv4Unspecified(), true)
+}
+
+// TestFoldLocalAddrsAtStart checks that the addresses of the host given at
+// start are kept from the first flow on, also for a connection the tracer
+// adopts: a connection between the host and its own public address,
+// established before the tracer started, keeps both sides.
+func TestFoldLocalAddrsAtStart(t *testing.T) {
+	run, ns := foldNetNS(t)
+	var ln net.Listener
+	run(func() { ln = echoServer(t, "tcp4", "198.18.0.1:0") })
+	srv := ln.Addr().(*net.TCPAddr).AddrPort()
+	c := dialFrom(t, run, "tcp4", "198.18.0.1", srv.String())
+	roundTrip(t, c, 1)
+
+	tr := startTracer(t, Options{NetNS: ns, Fold: FoldIn, InternalPeers: internal10,
+		LocalAddrs: []netip.Addr{netip.MustParseAddr("198.18.0.1")}})
+	roundTrip(t, c, 1000)
+	snap := collect(t, tr)
+	if in := checkFolded(t, snap.Flows, DirIn, ProtoTCP, srv.Port(), srv.Addr(), false); in != nil && in.BytesRecv < 1000 {
+		t.Errorf("adopted connection received %d bytes, want at least 1000", in.BytesRecv)
+	}
+}
+
+// TestSetLocalAddrsChurn checks that the addresses of a host that has as
+// many as the trie holds can still change, and that those in an internal
+// range take no room.
+func TestSetLocalAddrsChurn(t *testing.T) {
+	_, ns := foldNetNS(t)
+	tr := newFoldTracer(t, ns, FoldIn, internal10, 0)
+	addrs := func(first byte, n int) []netip.Addr {
+		var out []netip.Addr
+		for i := range n {
+			out = append(out, netip.AddrFrom4([4]byte{first, 0, byte(i >> 8), byte(i)}))
+		}
+		return out
+	}
+	// Those in 10.0.0.0/8 are internal anyway.
+	if err := tr.SetLocalAddrs(append(addrs(198, maxLocalPeers), addrs(10, 100)...)); err != nil {
+		t.Fatal(err)
+	}
+	next := append(addrs(198, maxLocalPeers-3), netip.MustParseAddr("203.0.113.1"),
+		netip.MustParseAddr("203.0.113.2"), netip.MustParseAddr("203.0.113.3"))
+	if err := tr.SetLocalAddrs(next); err != nil {
+		t.Fatalf("after 3 addresses changed: %v", err)
+	}
+	if len(tr.localPeers) != maxLocalPeers {
+		t.Errorf("%d local addresses in the trie, want %d", len(tr.localPeers), maxLocalPeers)
+	}
+	k := peerPrefixKey(netip.MustParsePrefix("203.0.113.3/32"))
+	var v uint8
+	if err := tr.internalPeers.Lookup(&k, &v); err != nil {
+		t.Errorf("new address not in the trie: %v", err)
+	}
+}
+
+// TestCheckInternalPeer checks that an IPv6 range that would also keep the
+// IPv4 peers, which are looked up as IPv4-mapped addresses, is refused.
+func TestCheckInternalPeer(t *testing.T) {
+	for p, ok := range map[string]bool{
+		"10.0.0.0/8": true, "0.0.0.0/0": true, "fc00::/7": true, "2001:db8::/32": true,
+		"::/0": false, "::/8": false, "::ffff:0:0/96": false, "::ffff:10.0.0.0/104": false,
+	} {
+		if err := CheckInternalPeer(netip.MustParsePrefix(p)); (err == nil) != ok {
+			t.Errorf("CheckInternalPeer(%s) = %v, want ok %t", p, err, ok)
+		}
+	}
+	requireRoot(t)
+	if _, err := New(Options{Fold: FoldIn, InternalPeers: []netip.Prefix{netip.MustParsePrefix("::/0")}}); err == nil {
+		t.Error("New accepted the internal range ::/0")
+	}
 }
 
 func TestPeerPrefixKey(t *testing.T) {

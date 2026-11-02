@@ -107,6 +107,12 @@ func Run(ctx context.Context, cfg Config) error {
 	defer exp.Close()
 
 	cgroups := procinfo.NewResolver()
+	// The addresses of the host are internal from the first flow on, also
+	// for the connections the tracer adopts.
+	local, err := hostAddrs()
+	if err != nil {
+		cfg.Logger.Warn("listing the addresses of the host, whose peers are not folded", "error", err)
+	}
 	tr, err := tracer.New(tracer.Options{
 		NetNS:         cfg.NetNS,
 		MaxFlows:      cfg.MaxFlows,
@@ -114,6 +120,7 @@ func Run(ctx context.Context, cfg Config) error {
 		TraceSelf:     cfg.traceSelf,
 		Fold:          cfg.Fold,
 		InternalPeers: cfg.InternalPeers,
+		LocalAddrs:    local,
 		Logger:        cfg.Logger,
 	})
 	if err != nil {
@@ -203,8 +210,13 @@ func (a *Agent) exportTimeout() time.Duration {
 func (a *Agent) tick(ctx context.Context) error {
 	// The addresses of the host are internal: a host may connect to its own
 	// public address. They are refreshed before the interval is closed.
+	// A failed listing keeps the addresses known before.
 	if l, ok := a.tracer.(localAddrSetter); ok && a.cfg.Fold != tracer.FoldNone {
-		if err := l.SetLocalAddrs(hostAddrs()); err != nil {
+		addrs, err := hostAddrs()
+		if err == nil {
+			err = l.SetLocalAddrs(addrs)
+		}
+		if err != nil {
 			a.log.Warn("updating the addresses of the host, whose peers are not folded", "error", err)
 		}
 	}
@@ -310,7 +322,7 @@ func (a *Agent) request(now time.Time) ([]*colmetricspb.ExportMetricsServiceRequ
 	// interfaces of the agent's own namespace unless it traces another
 	// one, and the local addresses of the series active recently.
 	if a.cfg.NetNS == 0 || a.cfg.NetNS == procinfo.NetNS() {
-		res.Addrs = hostAddrs()
+		res.Addrs, _ = hostAddrs()
 	}
 	for _, addr := range a.state.LocalAddrs(now.Add(-max(2*a.cfg.Interval, time.Minute))) {
 		if !slices.Contains(res.Addrs, addr) {
@@ -352,10 +364,10 @@ func kernelRelease() string {
 }
 
 // hostAddrs returns the addresses of the interfaces of the host.
-func hostAddrs() []netip.Addr {
+func hostAddrs() ([]netip.Addr, error) {
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	var out []netip.Addr
 	for _, a := range addrs {
@@ -365,7 +377,7 @@ func hostAddrs() []netip.Addr {
 			}
 		}
 	}
-	return out
+	return out, nil
 }
 
 // PrivatePeers are the ranges of addresses not routed on the Internet, which
@@ -407,6 +419,12 @@ func ParseInternalPeers(s string) ([]netip.Prefix, error) {
 		}
 		if p.Addr().Zone() != "" {
 			return nil, fmt.Errorf("invalid internal range %q", item)
+		}
+		if p.Addr().Is4In6() && p.Bits() >= 96 {
+			p = netip.PrefixFrom(p.Addr().Unmap(), p.Bits()-96)
+		}
+		if err := tracer.CheckInternalPeer(p); err != nil {
+			return nil, err
 		}
 		p = p.Masked()
 		if !slices.Contains(out, p) {

@@ -231,9 +231,6 @@ func printFlows(w io.Writer, flows []tracer.Flow) {
 	fmt.Fprintln(tw, "DIR\tPROTO\tLOCAL\tREMOTE\tPORT\tPROCESS\tPID\tCONNS\tOPEN\tSENT\tRECV")
 	for _, f := range flows {
 		local, remote := f.LocalAddr.String(), f.RemoteAddr.String()
-		if f.Folded {
-			remote = f.RemotePrefix().String()
-		}
 		arrow := "-->"
 		if f.Direction == tracer.DirIn {
 			arrow = "<--"
