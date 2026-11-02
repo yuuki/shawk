@@ -1,7 +1,7 @@
 {
   "uid": "shawk-fleet",
   "title": "shawk / Fleet",
-  "description": "Agents of shawk: liveness, observation gaps, drops and new dependencies.",
+  "description": "Agents of shawk: liveness, observation gaps and partly observed periods, drops and new dependencies.",
   "tags": [
     "shawk"
   ],
@@ -50,6 +50,26 @@
           "format": "table",
           "rawQuery": true,
           "rawSql": "SELECT gap_start AS time, gap_end AS timeend, 'not observed: ' || host AS text, host AS tags\nFROM shawk_v1.unobserved($__timeFrom(), $__timeTo())"
+        }
+      },
+      {
+        "name": "Partly observed",
+        "datasource": {
+          "type": "grafana-postgresql-datasource",
+          "uid": "shawk-postgres"
+        },
+        "enable": true,
+        "iconColor": "rgba(255, 152, 48, 0.4)",
+        "target": {
+          "refId": "Anno",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shawk-postgres"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT gap_start AS time, gap_end AS timeend, 'partly observed: ' || host AS text, host AS tags\nFROM shawk_v1.partly_observed($__timeFrom(), $__timeTo())"
         }
       }
     ]
@@ -321,7 +341,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT host, alive, agent_version, kernel, udp_traced, netns_scope, dropped_flows,\n       started_at AS observed_since, last_heartbeat, clock_skew\nFROM shawk_v1.agents\nORDER BY alive, host"
+          "rawSql": "SELECT host, alive, agent_version, kernel, udp_traced, netns_scope, dropped_flows,\n       started_at AS observed_since, last_heartbeat, clock_skew,\n       peer_fold AS folds, array_to_string(peer_internal, ', ') AS internal_peers\nFROM shawk_v1.agents\nORDER BY alive, host"
         }
       ],
       "options": {
@@ -332,7 +352,7 @@
         "defaults": {},
         "overrides": []
       },
-      "description": "The latest observation segment of every host. observed_since is the start of the segment: dependencies before it are not known from this segment. clock_skew is how far the clock of the host is behind the collector; times of dependencies come from the clock of the host."
+      "description": "The latest observation segment of every host. observed_since is the start of the segment: dependencies before it are not known from this segment. clock_skew is how far the clock of the host is behind the collector; times of dependencies come from the clock of the host. folds tells which peers outside internal_peers the agent folds into one per local endpoint (0.0.0.0/0 or ::/0, named ~external): none, in (the clients of its servers) or all (the servers of its clients too); it is empty for a host last written by a connector of an earlier version."
     },
     {
       "id": 6,
@@ -372,9 +392,9 @@
       "description": "Periods in which a host was not observed: absence of a dependency in a gap does not mean it was unused."
     },
     {
-      "id": 7,
+      "id": 11,
       "type": "table",
-      "title": "Dependencies that appeared today",
+      "title": "Partly observed periods in the time range",
       "datasource": {
         "type": "grafana-postgresql-datasource",
         "uid": "shawk-postgres"
@@ -383,6 +403,43 @@
         "x": 12,
         "y": 13,
         "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shawk-postgres"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT host, gap_start, gap_end, gap_end - gap_start AS duration, dropped_flows\nFROM shawk_v1.partly_observed($__timeFrom(), $__timeTo())\nORDER BY gap_start DESC"
+        }
+      ],
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "description": "Periods in which a host was observed but its agent dropped flows because its flow table was full: a dependency may be missing from them although it was used. dropped_flows counts the flow updates dropped."
+    },
+    {
+      "id": 7,
+      "type": "table",
+      "title": "Dependencies that appeared today",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "shawk-postgres"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 21,
+        "w": 24,
         "h": 8
       },
       "targets": [
@@ -417,7 +474,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 21,
+        "y": 29,
         "w": 8,
         "h": 8
       },
@@ -468,7 +525,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 21,
+        "y": 29,
         "w": 8,
         "h": 8
       },
@@ -520,7 +577,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 21,
+        "y": 29,
         "w": 8,
         "h": 8
       },

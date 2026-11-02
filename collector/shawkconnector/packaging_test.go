@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -248,14 +249,24 @@ func TestPGPackaged(t *testing.T) {
 	}
 	h := newHostChanges(hostKey("m-x", "x-01"))
 	h.setHost("m-x", "x-01", "5.14", "test", now)
-	h.addSession(now.Add(-time.Hour), sessionRow{lastHeartbeat: now, netnsScope: "all"})
+	h.addSession(now.Add(-time.Hour), sessionRow{lastHeartbeat: now.Add(-time.Minute), netnsScope: "all",
+		peerFold: foldIn, peerInternal: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}})
 	h.addAddr(addrOf("10.0.0.30"), span{now, now})
 	h.addProcess(procKey{"x.service", "x", "x"}, "/usr/bin/x", span{now, now})
 	h.addEdge(edgeRowKey{role: "client", proto: "tcp", local: addrOf("10.0.0.30"), peer: addrOf("10.0.0.10"), port: 5432,
 		netns: 1, procKey: procKey{"x.service", "x", "x"}}, span{now, now})
+	h.addEdge(edgeRowKey{role: "server", proto: "tcp", local: addrOf("10.0.0.30"), peer: addrOf("0.0.0.0"), folded: true,
+		port: 9000, netns: 1, procKey: procKey{"x.service", "x", "x"}}, span{now, now})
 	h.addListener(listenerRowKey{proto: "tcp", addr: addrOf("0.0.0.0"), port: 9000, netns: 1, procKey: procKey{"x.service", "x", "x"}}, span{now, now})
 	if err := pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error { return writeHost(ctx, tx, h) }); err != nil {
 		t.Errorf("writing as shawk_connector: %v", err)
+	}
+	// The agent dropped flows in the minute since: a partly observed period.
+	h = newHostChanges(hostKey("m-x", "x-01"))
+	h.setHost("m-x", "x-01", "5.14", "test", now)
+	h.addSession(now.Add(-time.Hour), sessionRow{lastHeartbeat: now, netnsScope: "all", dropped: 3, peerFold: foldIn})
+	if err := pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error { return writeHost(ctx, tx, h) }); err != nil {
+		t.Errorf("writing dropped flows as shawk_connector: %v", err)
 	}
 	for _, q := range []string{`SELECT count(*) FROM shawk_v1.service_endpoints`, `SELECT count(*) FROM shawk_v1.agent_addrs`,
 		`SELECT count(*) FROM shawk_v1.client_endpoints`, `SELECT shawk.prune(now() - interval '3 years')`,
@@ -332,6 +343,10 @@ func TestPGPackaged(t *testing.T) {
 		"shawk-dependency.json/shawk / Dependency details/Dependencies in PostgreSQL/A#0",
 		"shawk-changes.json/shawk / Changes/Changes/A#0",
 		"shawk-changes.json/shawk / Changes/Changes per hour/A#0",
+		"shawk-fleet.json/shawk / Fleet/Partly observed/Anno#0",
+		"shawk-fleet.json/shawk / Fleet/Partly observed periods in the time range/A#0",
+		"shawk-dependency.json/shawk / Dependency details/Partly observed/Anno#0",
+		"shawk-changes.json/shawk / Changes/Partly observed/Anno#0",
 	} {
 		if _, ok := rows[want]; !ok {
 			t.Errorf("no query %s; have %v", want, keys(rows))
