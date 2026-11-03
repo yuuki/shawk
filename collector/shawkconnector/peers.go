@@ -114,6 +114,14 @@ type peer struct {
 	// that this side counts them.
 	foldedBy, foldedByName string
 	foldsServer            bool
+	// foldedVirtual is set when the agent of the client folds the virtual
+	// address of a translation through which it reaches this server, rather
+	// than the address of the server.
+	foldedVirtual netip.Addr
+	// port is the port of the server, when the peer of a client edge is
+	// named through a translation whose backend has another port than the
+	// one the client connected to; 0 otherwise.
+	port uint16
 }
 
 // resolver names the peers of edges. It combines the endpoints, clients and
@@ -121,6 +129,10 @@ type peer struct {
 // since, which may not be written yet.
 type resolver struct {
 	cidrs []namedPrefix
+	// translations are those of the configuration, and virtuals their
+	// virtual addresses, with port 0 for every port.
+	translations []translation
+	virtuals     map[endpointKey]*translation
 
 	mu sync.RWMutex
 	// From shawk_v1.service_endpoints, shawk_v1.client_endpoints and
@@ -137,11 +149,36 @@ type resolver struct {
 	localClients   map[clientKey]map[endpoint]time.Time
 	localAddrs     map[netip.Addr]map[string]time.Time
 	localAgents    map[string]agentHost
+
+	// rangeCache holds the best service on the endpoints within a range of
+	// backends, found by a scan of the endpoints, until the next load or
+	// expiry.
+	rangeMu    sync.Mutex
+	rangeCache map[rangeKey][]candidate
 }
 
-func newResolver(cidrs []namedPrefix) *resolver {
+// rangeKey is a range of addresses of backends, on a port.
+type rangeKey struct {
+	prefix netip.Prefix
+	port   uint16
+	proto  string
+}
+
+func newResolver(cidrs []namedPrefix, translations []translation) *resolver {
+	virtuals := map[endpointKey]*translation{}
+	for i := range translations {
+		t := &translations[i]
+		for _, v := range t.virtual {
+			for _, proto := range t.protos {
+				virtuals[endpointKey{v.Addr(), v.Port(), proto}] = t
+			}
+		}
+	}
 	return &resolver{
 		cidrs:          cidrs,
+		translations:   translations,
+		virtuals:       virtuals,
+		rangeCache:     map[rangeKey][]candidate{},
 		dbEndpoints:    map[endpointKey][]endpoint{},
 		dbClients:      map[clientKey][]endpoint{},
 		dbAddrs:        map[netip.Addr]map[string]time.Time{},
@@ -208,7 +245,15 @@ func (r *resolver) load(rows peerRows, now time.Time) {
 	r.mu.Lock()
 	r.loaded = now
 	r.dbEndpoints, r.dbClients, r.dbAddrs, r.dbAgents = eps, cls, addrs, agents
+	r.clearRanges()
 	r.mu.Unlock()
+}
+
+// clearRanges forgets the services found within ranges of backends.
+func (r *resolver) clearRanges() {
+	r.rangeMu.Lock()
+	clear(r.rangeCache)
+	r.rangeMu.Unlock()
 }
 
 // dbAge is how long ago what was read from PostgreSQL was read, which is
@@ -312,6 +357,7 @@ func (r *resolver) expire(t, now time.Time) {
 			delete(r.localAgents, h)
 		}
 	}
+	r.clearRanges()
 }
 
 // peer names the peer of an edge of host at now.
@@ -327,6 +373,14 @@ func (r *resolver) expire(t, now time.Time) {
 //
 // A folded peer, every peer outside the internal ranges of the agent, is
 // named after its network and has no agent.
+//
+// A peer without a known service may be reached through a translation: the
+// peer of a client edge to a virtual address is the service at a backend,
+// on the port of the backend, and its agent records the other side; the
+// peer of a server edge at a backend of a translation that keeps the
+// address of the client is the client service whose client edge to a
+// virtual address has the address of the client. Behind a translation with
+// sources, the server sees the relay, which is named after its address.
 func (r *resolver) peer(host string, id *edgeID, now time.Time) peer {
 	if id.folded {
 		return peer{name: r.classifyFolded(id.peer)}
@@ -340,6 +394,9 @@ func (r *resolver) peer(host string, id *edgeID, now time.Time) peer {
 	sameHostOnly := loopback || shared
 
 	var p peer
+	// covers tells whether the agent of the peer records the other side,
+	// unless it folds this one.
+	var covers bool
 	switch {
 	case local:
 		// The host itself runs an agent; before its first complete interval
@@ -348,27 +405,74 @@ func (r *resolver) peer(host string, id *edgeID, now time.Time) peer {
 		if a, ok := r.agent(host, now); ok {
 			p.agent = a.covers(id.proto)
 		}
+		covers = p.agent
 	case len(holders) == 1:
 		for h := range holders {
 			if a, ok := r.agent(h, now); ok {
 				p.agent = a.covers(id.proto)
+				covers = p.agent
 				switch {
 				case !p.agent || h == host:
 				case id.role == roleClient && r.foldsPeer(a, h, id.local, false, now):
 					p.foldedBy, p.foldedByName = h, a.name
-				case id.role == roleServer && r.foldsPeer(a, h, id.local, true, now):
+				case id.role == roleServer:
+					// Through a translation, the client connects to a virtual
+					// address, which its agent may fold.
+					v, through := r.foldedVirtual(a, h, id, now)
+					if !through && !r.foldsPeer(a, h, id.local, true, now) {
+						break
+					}
 					p.agent = false
-					p.foldedBy, p.foldedByName, p.foldsServer = h, a.name, true
+					p.foldedBy, p.foldedByName, p.foldsServer, p.foldedVirtual = h, a.name, true, v
 				}
 			}
 		}
 	}
 	if id.role == roleClient {
 		k := endpointKey{id.peer, id.port, id.proto}
-		p.name = best(host, r.localEndpoints[k], r.dbEndpoints[k], r.dbAge(now), sameHostOnly)
+		c := chooser{host: host, sameHostOnly: sameHostOnly}
+		if r.virtualOf(id) != nil {
+			// At a virtual address, only a service observed on a socket at it
+			// recently, such as a relay that runs an agent, comes before the
+			// backends: a listener on an unspecified address of a host that
+			// holds the address may be bypassed (DNAT), and a server edge of
+			// days ago replaced by a relay without an agent.
+			c.exactSince = now.Add(-aliveWindow)
+		}
+		c.add(r.localEndpoints[k], r.dbEndpoints[k], r.dbAge(now), 0)
+		p.name = c.best.service
+		if p.name == "" {
+			if c, t, ok := r.translatedServer(id, now); ok {
+				// The holder of the virtual address, if any, is not the server.
+				p = peer{name: c.service, agent: c.agent}
+				if c.port != id.port {
+					p.port = c.port
+				}
+				// Through a translation without sources the backend sees the
+				// address of the client, which its agent may fold.
+				if a, ok := r.agent(c.host, now); ok && c.agent && c.host != host && len(t.sources) == 0 &&
+					r.foldsPeer(a, c.host, id.local, false, now) {
+					p.foldedBy, p.foldedByName = c.host, a.name
+				}
+			}
+		}
 	} else {
 		k := clientKey{id.peer, id.local, id.port, id.proto}
 		p.name = best(host, r.localClients[k], r.dbClients[k], r.dbAge(now), sameHostOnly)
+		if p.name == "" {
+			if p.name = r.translatedClient(host, id, sameHostOnly, now); p.name != "" {
+				// The client connected to the virtual address, which its agent
+				// keeps exact, whatever it does with the address of this host.
+				p.agent = covers
+				p.foldedBy, p.foldedByName, p.foldsServer, p.foldedVirtual = "", "", false, netip.Addr{}
+			} else if r.behindRelay(id) {
+				// The server sees a relay that replaces the addresses of its
+				// clients: an agent at the address of the relay records none of
+				// them, so this side counts the connections.
+				p.agent = false
+				p.foldedBy, p.foldedByName, p.foldsServer, p.foldedVirtual = "", "", false, netip.Addr{}
+			}
+		}
 	}
 	if p.name == "" {
 		p.name = r.classify(id.peer)
@@ -444,42 +548,262 @@ func (r *resolver) agent(host string, now time.Time) (agentHost, bool) {
 	return a, true
 }
 
-// best returns the service of the best candidate: one on the host itself,
-// then one observed on a socket rather than inferred from a listener on an
-// unspecified address, then the most recently seen one, then the first by
-// name, so that the choice does not depend on the order of maps.
-func best(host string, local map[endpoint]time.Time, db []endpoint, dbAge time.Duration, sameHostOnly bool) string {
-	var b endpoint
-	better := func(e endpoint) bool {
-		switch {
-		case b.service == "":
-			return true
-		case (e.host == host) != (b.host == host):
-			return e.host == host
-		case e.exact != b.exact:
-			return e.exact
-		case !e.lastSeen.Equal(b.lastSeen):
-			return e.lastSeen.After(b.lastSeen)
-		}
+// chooser picks the best of the services seen on endpoints: one on the
+// host itself, then one observed on a socket rather than inferred from a
+// listener on an unspecified address, then the most recently seen one, then
+// the first by name, port and host, so that the choice does not depend on
+// the order of maps.
+type chooser struct {
+	host string
+	// sameHostOnly leaves out the endpoints of other hosts.
+	sameHostOnly bool
+	// exactSince, if set, leaves out the endpoints inferred from listeners
+	// on unspecified addresses and those last seen before it.
+	exactSince time.Time
+	best       endpoint
+	port       uint16 // of the best endpoint
+}
+
+func (c *chooser) better(e endpoint, port uint16) bool {
+	b := c.best
+	switch {
+	case b.service == "":
+		return true
+	case (e.host == c.host) != (b.host == c.host):
+		return e.host == c.host
+	case e.exact != b.exact:
+		return e.exact
+	case !e.lastSeen.Equal(b.lastSeen):
+		return e.lastSeen.After(b.lastSeen)
+	case e.service != b.service:
 		return strings.Compare(e.service, b.service) < 0
+	case port != c.port:
+		return port < c.port
 	}
-	consider := func(e endpoint) {
-		if sameHostOnly && e.host != host {
-			return
-		}
-		if better(e) {
-			b = e
-		}
+	return e.host < b.host
+}
+
+// consider takes e, seen on port, if it is better.
+func (c *chooser) consider(e endpoint, port uint16) {
+	if c.sameHostOnly && e.host != c.host {
+		return
 	}
+	if !c.exactSince.IsZero() && (!e.exact || e.lastSeen.Before(c.exactSince)) {
+		return
+	}
+	if c.better(e, port) {
+		c.best, c.port = e, port
+	}
+}
+
+// add considers the endpoints the connector has seen, with the time it saw
+// them, and those read from PostgreSQL, whose times are dbAge older.
+func (c *chooser) add(local map[endpoint]time.Time, db []endpoint, dbAge time.Duration, port uint16) {
 	for e, at := range local {
 		e.lastSeen = at
-		consider(e)
+		c.consider(e, port)
 	}
 	for _, e := range db {
 		e.lastSeen = e.lastSeen.Add(dbAge)
-		consider(e)
+		c.consider(e, port)
 	}
-	return b.service
+}
+
+// best returns the service of the best candidate.
+func best(host string, local map[endpoint]time.Time, db []endpoint, dbAge time.Duration, sameHostOnly bool) string {
+	c := chooser{host: host, sameHostOnly: sameHostOnly}
+	c.add(local, db, dbAge, 0)
+	return c.best.service
+}
+
+// candidate is a service on an endpoint at a backend of a translation, on
+// the port of the backend. agent tells whether the agent of its host
+// records the server side.
+type candidate struct {
+	endpoint
+	port  uint16
+	agent bool
+}
+
+// backendWindow is how long before the most recently seen backend another
+// one may have been seen and still be current. Backends report at
+// different times; the choice among the current ones does not depend on
+// which reported last, so that it does not change with every report.
+const backendWindow = aliveWindow
+
+// appendCandidates appends the endpoints the connector has seen, with the
+// time it saw them, and those read from PostgreSQL, whose times are dbAge
+// older.
+func appendCandidates(cs []candidate, local map[endpoint]time.Time, db []endpoint, dbAge time.Duration, port uint16) []candidate {
+	for e, at := range local {
+		e.lastSeen = at
+		cs = append(cs, candidate{endpoint: e, port: port})
+	}
+	for _, e := range db {
+		e.lastSeen = e.lastSeen.Add(dbAge)
+		cs = append(cs, candidate{endpoint: e, port: port})
+	}
+	return cs
+}
+
+// pickBackend returns the best of the current candidates: one observed on a
+// socket rather than inferred from a listener on an unspecified address,
+// then one whose agent records the server side, then the first by service,
+// port and host.
+func pickBackend(cs []candidate) (candidate, bool) {
+	var newest time.Time
+	for _, c := range cs {
+		if c.lastSeen.After(newest) {
+			newest = c.lastSeen
+		}
+	}
+	var b candidate
+	found := false
+	for _, c := range cs {
+		if c.lastSeen.Before(newest.Add(-backendWindow)) {
+			continue
+		}
+		if !found || betterBackend(c, b) {
+			b, found = c, true
+		}
+	}
+	return b, found
+}
+
+func betterBackend(c, b candidate) bool {
+	switch {
+	case c.exact != b.exact:
+		return c.exact
+	case c.agent != b.agent:
+		return c.agent
+	case c.service != b.service:
+		return c.service < b.service
+	case c.port != b.port:
+		return c.port < b.port
+	}
+	return c.host < b.host
+}
+
+// translatedServer finds the service at a backend of the translation whose
+// virtual address a client edge connects to, on the port of the backend or
+// the port of the edge. r.mu is held.
+func (r *resolver) translatedServer(id *edgeID, now time.Time) (candidate, *translation, bool) {
+	t := r.virtualOf(id)
+	if t == nil {
+		return candidate{}, nil, false
+	}
+	age := r.dbAge(now)
+	var cs []candidate
+	for _, b := range t.backends {
+		port := b.port
+		if port == 0 {
+			port = id.port
+		}
+		if b.prefix.IsSingleIP() {
+			k := endpointKey{b.prefix.Addr(), port, id.proto}
+			cs = appendCandidates(cs, r.localEndpoints[k], r.dbEndpoints[k], age, port)
+			continue
+		}
+		cs = append(cs, r.inRange(b.prefix, port, id.proto, age)...)
+	}
+	for i := range cs {
+		if a, ok := r.agent(cs[i].host, now); ok {
+			cs[i].agent = a.covers(id.proto)
+		}
+	}
+	c, ok := pickBackend(cs)
+	return c, t, ok
+}
+
+// inRange returns the services on the endpoints within a range on a port.
+// It scans the endpoints, so the result is kept until the next load or
+// expiry. r.mu is held.
+func (r *resolver) inRange(p netip.Prefix, port uint16, proto string, dbAge time.Duration) []candidate {
+	k := rangeKey{p, port, proto}
+	r.rangeMu.Lock()
+	defer r.rangeMu.Unlock()
+	if cs, ok := r.rangeCache[k]; ok {
+		return cs
+	}
+	var cs []candidate
+	for ek, es := range r.localEndpoints {
+		if ek.port == port && ek.proto == proto && p.Contains(ek.addr) {
+			cs = appendCandidates(cs, es, nil, 0, port)
+		}
+	}
+	for ek, es := range r.dbEndpoints {
+		if ek.port == port && ek.proto == proto && p.Contains(ek.addr) {
+			cs = appendCandidates(cs, nil, es, dbAge, port)
+		}
+	}
+	// The slice is shared: callers append to a copy.
+	r.rangeCache[k] = cs[:len(cs):len(cs)]
+	return r.rangeCache[k]
+}
+
+// virtualOf returns the translation whose virtual address a client edge
+// connects to, if any.
+func (r *resolver) virtualOf(id *edgeID) *translation {
+	if t := r.virtuals[endpointKey{id.peer, id.port, id.proto}]; t != nil {
+		return t
+	}
+	return r.virtuals[endpointKey{id.peer, 0, id.proto}]
+}
+
+// behindRelay tells whether a server edge is at a backend of a translation
+// with sources and from one of them.
+func (r *resolver) behindRelay(id *edgeID) bool {
+	for i := range r.translations {
+		t := &r.translations[i]
+		if len(t.sources) == 0 || !t.has(id.proto) || len(t.clientEnds(id.local, id.port)) == 0 {
+			continue
+		}
+		for _, s := range t.sources {
+			if s.Contains(id.peer) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// foldedVirtual returns a virtual address of a translation without sources
+// through which the client of a server edge reaches it, and that the agent a
+// of the client, on the host client, folds. r.mu is held.
+func (r *resolver) foldedVirtual(a agentHost, client string, id *edgeID, now time.Time) (netip.Addr, bool) {
+	for i := range r.translations {
+		t := &r.translations[i]
+		if len(t.sources) > 0 || !t.has(id.proto) {
+			continue
+		}
+		for _, v := range t.clientEnds(id.local, id.port) {
+			if r.foldsPeer(a, client, v.Addr(), true, now) {
+				return v.Addr(), true
+			}
+		}
+	}
+	return netip.Addr{}, false
+}
+
+// translatedClient finds the client service of a server edge at a backend
+// of a translation that keeps the address of the client: the service whose
+// client edge to a virtual address of the translation has the address of
+// the client, on a port that reaches the port of the server edge. r.mu is
+// held.
+func (r *resolver) translatedClient(host string, id *edgeID, sameHostOnly bool, now time.Time) string {
+	c := chooser{host: host, sameHostOnly: sameHostOnly}
+	age := r.dbAge(now)
+	for i := range r.translations {
+		t := &r.translations[i]
+		if len(t.sources) > 0 || !t.has(id.proto) {
+			continue
+		}
+		for _, v := range t.clientEnds(id.local, id.port) {
+			k := clientKey{id.peer, v.Addr(), v.Port(), id.proto}
+			c.add(r.localClients[k], r.dbClients[k], age, 0)
+		}
+	}
+	return c.best.service
 }
 
 // classify names a peer without a known service from its address.

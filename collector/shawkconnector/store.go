@@ -29,8 +29,9 @@ type store interface {
 	// schemaVersion returns the version of the schema, 0 if it predates
 	// the function that tells it.
 	schemaVersion(ctx context.Context) (int, error)
-	// syncPeerCIDRs replaces the named address ranges of peers.
-	syncPeerCIDRs(ctx context.Context, cidrs []namedPrefix) error
+	// syncConfig replaces the named address ranges of peers and the
+	// translations of addresses.
+	syncConfig(ctx context.Context, cidrs []namedPrefix, ts []translation) error
 	// refreshDependencies brings the history of dependencies between
 	// services up to date.
 	refreshDependencies(ctx context.Context) (int64, error)
@@ -435,20 +436,53 @@ func (s *pgStore) schemaVersion(ctx context.Context) (int, error) {
 	return v, err
 }
 
-func (s *pgStore) syncPeerCIDRs(ctx context.Context, cidrs []namedPrefix) error {
+// configLock is the key of the advisory lock that serializes the writes of
+// the configuration of connectors (peer_cidrs, translations): without it,
+// two connectors that write different ones at once both delete the rows of
+// before and insert their own, and the tables hold the rows of both.
+const configLock = 0x73686179 // "shay"
+
+// syncConfig replaces the named address ranges of peers and the
+// translations in one transaction, keeping the rows that stay, so that the
+// views see either the old rows or the new ones. It runs in READ COMMITTED,
+// whatever the default of the database, so that the statements after the
+// lock see what a connector that held it before wrote.
+func (s *pgStore) syncConfig(ctx context.Context, cidrs []namedPrefix, ts []translation) error {
 	prefixes := make([]string, 0, len(cidrs))
-	names := make([]string, 0, len(cidrs))
+	cidrNames := make([]string, 0, len(cidrs))
 	for _, c := range cidrs {
 		prefixes = append(prefixes, c.prefix.String())
-		names = append(names, c.name)
+		cidrNames = append(cidrNames, c.name)
 	}
-	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+	var names, sides, protos, addrs []string
+	var ports []int32
+	for _, r := range translationRows(ts) {
+		names = append(names, r.name)
+		sides = append(sides, r.side)
+		protos = append(protos, r.proto)
+		addrs = append(addrs, r.prefix.String())
+		ports = append(ports, int32(r.port))
+	}
+	return pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.ReadCommitted}, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, int64(configLock)); err != nil {
+			return err
+		}
 		b := &pgx.Batch{}
 		b.Queue(`DELETE FROM shawk.peer_cidrs WHERE NOT (prefix = ANY ($1::cidr[]))`, prefixes)
 		b.Queue(`
 INSERT INTO shawk.peer_cidrs (prefix, name)
 SELECT * FROM unnest($1::cidr[], $2::text[])
-ON CONFLICT (prefix) DO UPDATE SET name = excluded.name`, prefixes, names)
+ON CONFLICT (prefix) DO UPDATE SET name = excluded.name`, prefixes, cidrNames)
+		b.Queue(`
+DELETE FROM shawk.translations t
+WHERE NOT EXISTS (
+  SELECT FROM unnest($1::text[], $2::text[], $3::text[], $4::cidr[], $5::integer[]) AS u(name, side, proto, addr, port)
+  WHERE u.name = t.name AND u.side = t.side AND u.proto = t.proto AND u.addr = t.addr AND u.port = t.port)`,
+			names, sides, protos, addrs, ports)
+		b.Queue(`
+INSERT INTO shawk.translations (name, side, proto, addr, port)
+SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::cidr[], $5::integer[])
+ON CONFLICT DO NOTHING`, names, sides, protos, addrs, ports)
 		return tx.SendBatch(ctx, b).Close()
 	})
 }

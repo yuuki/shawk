@@ -9,7 +9,12 @@
 #                                        app puma ==persistent==> db:5433 postgres
 #                                        app puma --IPv6--> db:5434 postgres
 #                                        app puma --UDP---> db:5353 named
+#                                        app puma --vip:6432--> db:5435 postgres
 #                                                         db:9187 exporter (unused)
+#
+# The virtual address vip is translated by iptables in the namespace of app,
+# as kube-proxy does for a Service on the host of its client, to db and
+# another port; the collector knows it from its translations.
 #
 # Every service runs in a cgroup of its own, like a systemd unit, and the
 # agents enter the namespaces with nsenter, which keeps /sys and thus the
@@ -19,8 +24,8 @@
 # default -netns all, as on a host whose services run in containers: every
 # dependency, including that of ext, is then observed on both sides by it.
 #
-# Requires root, cgroup v2, iproute2 (ip, ss), python3, psql, nsenter and
-# unshare (util-linux). Every wait has a deadline.
+# Requires root, cgroup v2, iproute2 (ip, ss), iptables with NAT, python3,
+# psql, nsenter and unshare (util-linux). Every wait has a deadline.
 # SHAWK_E2E_POSTGRES_DSN is a database dedicated to the test: its schemas
 # shawk and shawk_v1 are dropped and recreated. The agents must trace UDP
 # (BPF trampolines): without them, the UDP dependency is not checked unless
@@ -45,6 +50,7 @@ AGENTS=()
 
 declare -A ADDR=([lb]=$NET.5 [app]=$NET.11 [db]=$NET.10 [ext]=$NET.50)
 declare -A ADDR6=([lb]=${NET6}:5 [app]=${NET6}:11 [db]=${NET6}:10 [ext]=${NET6}:50)
+VIP=$NET.100
 
 # The cgroup v2 hierarchy, as the agent finds it.
 CGROOT="$(awk '$0 ~ / - cgroup2 / { print $5; exit }' /proc/self/mountinfo)"
@@ -143,17 +149,20 @@ svc() { # host name args...
 	PIDS+=($!)
 }
 
-svc db postgres --listen 5432 --listen 5433
+svc db postgres --listen 5432 --listen 5433 --listen 5435
 svc db postgres --listen 5434 --bind ::
 svc db postgres --listen 9187 --bind "${ADDR[db]}"
 svc db named --udp-listen 5353
 svc app redis-server --listen 6379 --bind 127.0.0.1
-for p in 5432 5433 5434 9187; do wait_for 10 "postgres to listen on $p" listening db $p; done
+for p in 5432 5433 5434 5435 9187; do wait_for 10 "postgres to listen on $p" listening db $p; done
 wait_for 10 "named to listen" listening db 5353 -u
 wait_for 10 "redis-server to listen" listening app 6379
+ip netns exec "$PREFIX-app" iptables -t nat -A OUTPUT -d "$VIP" -p tcp --dport 6432 \
+	-j DNAT --to-destination "${ADDR[db]}:5435"
 # A long-lived connection established before any agent starts.
 svc app puma --listen 8080 --upstream "${ADDR[db]}:5432" --upstream 127.0.0.1:6379 \
-	--upstream "[${ADDR6[db]}]:5434" --udp-upstream "${ADDR[db]}:5353" --persist "${ADDR[db]}:5433"
+	--upstream "[${ADDR6[db]}]:5434" --udp-upstream "${ADDR[db]}:5353" --persist "${ADDR[db]}:5433" \
+	--upstream "$VIP:6432"
 svc lb haproxy --listen 80 --upstream "${ADDR[app]}:8080"
 wait_for 10 "puma to listen" listening app 8080
 wait_for 10 "haproxy to listen" listening lb 80
@@ -171,6 +180,8 @@ connectors:
   shawk:
     postgres: { dsn_file: "$WORK/dsn", migrate: true }
     write_interval: 2s
+    translations:
+      vip: { virtual: ["$VIP:6432"], backends: ["${ADDR[db]}:5435"], transport: tcp }
 exporters:
   debug: { verbosity: detailed }
 service:
@@ -234,7 +245,7 @@ SELECT coalesce(client_host, host(client_addr)), coalesce(client_service, '-'), 
        coalesce(server_host, '-'), coalesce(server_service, '-'), coalesce(server_unit, '-'),
        proto, port, family(server_addr), observed_by
 FROM shawk_v1.dependencies
-WHERE port IN (80, 5353, 5432, 5433, 5434, 6379, 8080)
+WHERE port IN (80, 5353, 5432, 5433, 5434, 5435, 6379, 8080)
   AND (server_addr << '$NET.0/24' OR server_addr << '${NET6}:/64' OR (port = 6379 AND server_addr << '127.0.0.0/8'))
   AND ($1)
 ORDER BY port, 1"
@@ -254,6 +265,7 @@ want_deps() {
 	echo "$app puma $u-app-puma.service $db postgres $u-db-postgres.service tcp 5432 4 both
 $app puma $u-app-puma.service $db postgres $u-db-postgres.service tcp 5433 4 both
 $app puma $u-app-puma.service $db postgres $u-db-postgres.service tcp 5434 6 both
+$app puma $u-app-puma.service $db postgres $u-db-postgres.service tcp 5435 4 both
 $app puma $u-app-puma.service $app redis-server $u-app-redis-server.service tcp 6379 4 both
 $lb haproxy $u-lb-haproxy.service $app puma $u-app-puma.service tcp 8080 4 both"
 }
@@ -272,6 +284,14 @@ poll 60 deps_written || true
 poll 30 peers_named || true
 
 check "dependencies" "$(deps_sql true)" "$deps_want"
+
+# puma connects to the virtual address, which only the translation ties to
+# postgres.
+check "dependencies through the translation" "
+SELECT client_host, server_host, host(server_addr), port, host(virtual_addr), virtual_port, translation
+FROM shawk_v1.dependencies_between(now() - interval '1 hour', now())
+WHERE translation IS NOT NULL OR server_addr = '$VIP'" \
+"app-01 db-01 ${ADDR[db]} 5435 $VIP 6432 vip"
 
 check "unused listeners" "
 SELECT s.host, s.port, s.service

@@ -166,7 +166,7 @@ func TestFoldedPeerNames(t *testing.T) {
 // TestFoldedPeerCIDRs: a range of peer_cidrs that holds a whole network
 // names its folded peers, as peer_class() does in PostgreSQL.
 func TestFoldedPeerCIDRs(t *testing.T) {
-	r := newResolver(must(parsePeerCIDRs(map[string]string{"internet": "0.0.0.0/0", "docs": "2001:db8::/32"})))
+	r := newResolver(must(parsePeerCIDRs(map[string]string{"internet": "0.0.0.0/0", "docs": "2001:db8::/32"})), nil)
 	for _, tc := range []struct {
 		peer string
 		want string

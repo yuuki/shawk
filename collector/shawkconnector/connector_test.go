@@ -437,7 +437,7 @@ func TestNarrowestCIDRWins(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := newResolver(ps)
+	r := newResolver(ps, nil)
 	for addr, want := range map[string]string{"10.1.2.3": "host", "10.1.9.9": "narrow", "10.9.9.9": "wide",
 		"172.16.0.1": "~unresolved", "100.64.0.1": "~unresolved", "fd00::1": "~unresolved", "2001:db8::1": "~external"} {
 		if got := r.classify(addrOf(addr)); got != want {

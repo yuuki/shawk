@@ -33,9 +33,11 @@ type shawkConnector struct {
 	// ready tells that the schema has been migrated, or checked to be
 	// recent enough, so that writes may proceed.
 	ready bool
-	// cidrsSynced tells that peer_cidrs has been written to PostgreSQL.
-	cidrsSynced bool
-	cidrs       []namedPrefix
+	// cidrsSynced tells that peer_cidrs and the translations have been
+	// written to PostgreSQL.
+	cidrsSynced  bool
+	cidrs        []namedPrefix
+	translations []translation
 
 	lastPrune, lastRefresh time.Time
 
@@ -62,17 +64,23 @@ func newConnector(set connector.Settings, cfg *Config, next consumer.Metrics) (*
 	if err != nil {
 		return nil, err
 	}
+	translations, err := parseTranslations(cfg.Translations)
+	if err != nil {
+		return nil, err
+	}
 	now := time.Now()
 	return &shawkConnector{
 		cfg:      cfg,
 		log:      set.Logger,
 		next:     next,
 		newStore: newPGStore,
-		resolver: newResolver(cidrs),
+		resolver: newResolver(cidrs, translations),
 		agg:      newAggregator(cfg.IdleTTL, cfg.MaxPeers, cfg.KeepPeerAddress, now),
 		changes:  newChanges(cfg.IdleTTL),
 		cidrs:    cidrs,
 		now:      time.Now,
+
+		translations: translations,
 
 		foldWarned: map[foldWarnKey]*foldWarning{},
 		cidrWarned: map[string]time.Time{},
@@ -114,8 +122,8 @@ func (c *shawkConnector) Start(ctx context.Context, _ component.Host) error {
 }
 
 // prepare migrates the schema if configured to, or checks its version,
-// writes peer_cidrs and reloads the names of peers. It reports whether the
-// schema is ready.
+// writes peer_cidrs and the translations, and reloads the names of peers.
+// It reports whether the schema is ready.
 func (c *shawkConnector) prepare(ctx context.Context) bool {
 	if !c.prepareSchemaOnly(ctx) {
 		return false
@@ -124,9 +132,10 @@ func (c *shawkConnector) prepare(ctx context.Context) bool {
 	synced := c.cidrsSynced
 	c.mu.Unlock()
 	if !synced {
-		// PostgreSQL names peers without a service by peer_cidrs too.
-		if err := c.store.syncPeerCIDRs(ctx, c.cidrs); err != nil {
-			c.log.Warn("writing peer_cidrs to PostgreSQL", zap.Error(err))
+		// PostgreSQL names peers without a service by peer_cidrs too, and
+		// matches edges through the translations.
+		if err := c.store.syncConfig(ctx, c.cidrs, c.translations); err != nil {
+			c.log.Warn("writing peer_cidrs and the translations to PostgreSQL", zap.Error(err))
 		} else {
 			c.mu.Lock()
 			c.cidrsSynced = true
@@ -438,8 +447,14 @@ func (c *shawkConnector) foldedAgentPeer(b *hostBatch, id *edgeID, p peer, now t
 		client, server = zap.String("client_host", folder), zap.String("server_host", b.hostname)
 		clientAddr, serverAddr = zap.String("client_address", id.peer.String()), zap.String("server_address", id.local.String())
 	}
-	c.log.Warn(msg, client, clientAddr, server, serverAddr, zap.Uint16("port", id.port),
-		zap.String("transport", id.proto), zap.Int("hosts_folded", n))
+	fields := []zap.Field{client, clientAddr, server, serverAddr, zap.Uint16("port", id.port),
+		zap.String("transport", id.proto), zap.Int("hosts_folded", n)}
+	if p.foldedVirtual.IsValid() {
+		msg = "the agent of a client folds the virtual address of a translation to a server that runs an agent " +
+			"into its external peers (-fold-external=all); add the virtual address to the internal peers of the client's agent (-internal-peers)"
+		fields = append(fields, zap.String("virtual_address", p.foldedVirtual.String()))
+	}
+	c.log.Warn(msg, fields...)
 }
 
 // foldedCIDRs logs agents that fold peers in ranges of peer_cidrs: a

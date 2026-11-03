@@ -1,5 +1,35 @@
 ## Unreleased
 
+* Dependencies through relays without an agent that rewrite addresses
+  (#107): load balancers, keepalived or LVS virtual addresses, TCP
+  proxies. `translations` in the configuration of the connector gives
+  their virtual addresses, their backends and, for a relay that replaces
+  the addresses of the clients, the addresses the backends see them at;
+  the connector writes them to the new table `shawk.translations`
+  (migration 12; run `grants.sql` again). `shawk_v1.dependencies` and
+  `dependencies_between` match a client edge to a virtual address with
+  the server edges at its backends, over the period both were active in,
+  with the address and port of the server; the new last columns
+  `virtual_addr`, `virtual_port` and `translation` tell what the client
+  connected to. A server edge from the addresses of a relay keeps a row of
+  its own too, since clients without an agent may be behind the relay, and
+  so does another matched edge over a time its matched rows do not cover.
+  On these rows, the observation of a side whose edge outlives the row is
+  NULL, so that a stopped agent does not make a dependency disappear.
+  `dependencies_between` is dropped and created again with the new
+  columns: drop a view or a `BEGIN ATOMIC` function of yours that depends
+  on it before the migration, and create it again after. In Prometheus, the peer of a client edge to a virtual address is
+  the service at a backend, with the `server.port` of the backend, and the
+  peer of a server edge behind a relay that keeps the addresses of the
+  clients is the client service. The backends of Kubernetes services and
+  Docker published ports change too often to be written down; learning
+  the translations from conntrack on the hosts that make them is proposed
+  in `docs/proposal-translation.md`.
+* Fixed: connectors that started at the same time with different
+  `peer_cidrs` could leave the ranges of both in PostgreSQL, and a
+  database that defaults to REPEATABLE READ failed the write. The
+  configuration of a connector (`peer_cidrs` and the translations) is
+  written in one transaction in READ COMMITTED, one connector at a time.
 * A container keeps its name when it is recreated (#104). `shawk.unit` of a
   process in a container was `docker-<id>`, `podman-<id>`,
   `cri-containerd-<id>` or `crio-<id>`, so every redeploy added rows to

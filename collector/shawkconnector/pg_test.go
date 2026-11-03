@@ -76,11 +76,21 @@ func TestPGMigrate(t *testing.T) {
 // pgConnector returns a started connector writing to a fresh database.
 func pgConnector(t *testing.T) (*shawkConnector, *consumertest.MetricsSink, *pgx.Conn) {
 	t.Helper()
+	return pgConnectorWith(t, nil)
+}
+
+// pgConnectorWith returns a started connector with the configuration mod
+// changes, writing to a fresh database.
+func pgConnectorWith(t *testing.T, mod func(*Config)) (*shawkConnector, *consumertest.MetricsSink, *pgx.Conn) {
+	t.Helper()
 	dsn, conn := testDB(t)
 	cfg := createDefaultConfig()
 	cfg.Postgres.DSN = dsn
 	cfg.Postgres.Migrate = true
 	cfg.WriteInterval = 10 * time.Minute
+	if mod != nil {
+		mod(cfg)
+	}
 	sink := new(consumertest.MetricsSink)
 	c, err := newConnector(connectortest.NewNopSettings(Type), cfg, sink)
 	if err != nil {

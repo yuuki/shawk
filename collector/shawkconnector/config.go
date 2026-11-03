@@ -30,6 +30,12 @@ type Config struct {
 	// last seen; zero keeps them forever. The connector deletes older rows
 	// every hour.
 	Retention time.Duration `mapstructure:"retention"`
+	// Translations are relays without an agent that rewrite the addresses of
+	// connections (load balancers, virtual addresses, TCP proxies), by name.
+	// The client edges to their virtual addresses are matched with the
+	// server edges of their backends, in PostgreSQL and in the names of
+	// peers.
+	Translations map[string]TranslationConfig `mapstructure:"translations"`
 }
 
 // PostgresConfig configures the connection to PostgreSQL.
@@ -78,6 +84,9 @@ func (c *Config) Validate() error {
 		errs = append(errs, errors.New("max_peers must be at least 1"))
 	}
 	if _, err := parsePeerCIDRs(c.PeerCIDRs); err != nil {
+		errs = append(errs, err)
+	}
+	if _, err := parseTranslations(c.Translations); err != nil {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
