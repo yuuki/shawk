@@ -149,6 +149,19 @@ type resolver struct {
 	localClients   map[clientKey]map[endpoint]time.Time
 	localAddrs     map[netip.Addr]map[string]time.Time
 	localAgents    map[string]agentHost
+	// The learned translations, by their client side and, for those that
+	// keep the address of the client, by their server side, with when they
+	// were last seen: read from PostgreSQL (by the clock of the agents, as
+	// of loaded) and seen by this connector.
+	dbLearned           map[learnedClientKey]map[learnedBackend]time.Time
+	dbLearnedServers    map[learnedServerKey]map[learnedClient]time.Time
+	localLearned        map[learnedClientKey]map[learnedBackend]time.Time
+	localLearnedServers map[learnedServerKey]map[learnedClient]time.Time
+	// localServed are the services of the server edges this connector saw,
+	// by their client address, server address and port: whether a client
+	// reached a relay with an agent at a virtual address, as direct tells
+	// in PostgreSQL.
+	localServed map[clientKey]map[endpoint]time.Time
 
 	// rangeCache holds the best service on the endpoints within a range of
 	// backends, found by a scan of the endpoints, until the next load or
@@ -187,6 +200,12 @@ func newResolver(cidrs []namedPrefix, translations []translation) *resolver {
 		localClients:   map[clientKey]map[endpoint]time.Time{},
 		localAddrs:     map[netip.Addr]map[string]time.Time{},
 		localAgents:    map[string]agentHost{},
+
+		dbLearned:           map[learnedClientKey]map[learnedBackend]time.Time{},
+		dbLearnedServers:    map[learnedServerKey]map[learnedClient]time.Time{},
+		localLearned:        map[learnedClientKey]map[learnedBackend]time.Time{},
+		localLearnedServers: map[learnedServerKey]map[learnedClient]time.Time{},
+		localServed:         map[clientKey]map[endpoint]time.Time{},
 	}
 }
 
@@ -217,6 +236,7 @@ type peerRows struct {
 	endpoints []endpointRow
 	clients   []clientRow
 	agents    []agentAddrRow
+	learned   []learnedRow
 }
 
 // load replaces what was read from PostgreSQL at now.
@@ -242,9 +262,11 @@ func (r *resolver) load(rows peerRows, now time.Time) {
 			agents[a.host] = a.agent
 		}
 	}
+	learned, learnedServers := loadLearned(rows.learned)
 	r.mu.Lock()
 	r.loaded = now
 	r.dbEndpoints, r.dbClients, r.dbAddrs, r.dbAgents = eps, cls, addrs, agents
+	r.dbLearned, r.dbLearnedServers = learned, learnedServers
 	r.clearRanges()
 	r.mu.Unlock()
 }
@@ -306,6 +328,10 @@ func (r *resolver) learn(b *hostBatch, now time.Time) {
 		case roleServer:
 			learnInto(r.localEndpoints, endpointKey{e.id.local, e.id.port, e.id.proto},
 				endpoint{host: b.key, service: e.id.job(), exact: true}, now)
+			if !e.id.folded {
+				learnInto(r.localServed, clientKey{e.id.peer, e.id.local, e.id.port, e.id.proto},
+					endpoint{host: b.key, service: e.id.job(), exact: true}, now)
+			}
 		case roleClient:
 			if e.id.folded {
 				// Not a server address: no server edge has it as its local
@@ -315,6 +341,16 @@ func (r *resolver) learn(b *hostBatch, now time.Time) {
 			learnInto(r.localClients, clientKey{e.id.local, e.id.peer, e.id.port, e.id.proto},
 				endpoint{host: b.key, service: e.id.job(), exact: true}, now)
 		}
+	}
+	for _, x := range b.translations {
+		// The agent sends a translation for its idle TTL after its last use:
+		// it was last seen as long before now as before the request, by the
+		// clock of the agent.
+		at := now
+		if !x.last.IsZero() && !b.time.IsZero() && x.last.Before(b.time) {
+			at = now.Add(x.last.Sub(b.time))
+		}
+		learnTranslation(b.key, x.id, at, r.localLearned, r.localLearnedServers)
 	}
 	if !b.final {
 		return
@@ -351,6 +387,9 @@ func (r *resolver) expire(t, now time.Time) {
 	defer r.mu.Unlock()
 	expireLearned(r.localEndpoints, t)
 	expireLearned(r.localClients, t)
+	expireLearned(r.localLearned, t)
+	expireLearned(r.localLearnedServers, t)
+	expireLearned(r.localServed, t)
 	expireLearned(r.localAddrs, now.Add(-aliveWindow))
 	for h, a := range r.localAgents {
 		if a.seen.Before(now.Add(-aliveWindow)) {
@@ -431,7 +470,8 @@ func (r *resolver) peer(host string, id *edgeID, now time.Time) peer {
 	if id.role == roleClient {
 		k := endpointKey{id.peer, id.port, id.proto}
 		c := chooser{host: host, sameHostOnly: sameHostOnly}
-		if r.virtualOf(id) != nil {
+		learned := r.virtualOf(id) == nil && len(r.learnedOf(host, id, now)) > 0
+		if r.virtualOf(id) != nil || learned {
 			// At a virtual address, only a service observed on a socket at it
 			// recently, such as a relay that runs an agent, comes before the
 			// backends: a listener on an unspecified address of a host that
@@ -439,7 +479,17 @@ func (r *resolver) peer(host string, id *edgeID, now time.Time) peer {
 			// days ago replaced by a relay without an agent.
 			c.exactSince = now.Add(-aliveWindow)
 		}
-		c.add(r.localEndpoints[k], r.dbEndpoints[k], r.dbAge(now), 0)
+		if learned {
+			// Through a learned translation, only a service whose server edge
+			// from this client this connector saw recently comes first, as a
+			// match by address does in PostgreSQL: a container that reaches a
+			// published port of its host goes through docker-proxy, which
+			// serves the address, while the clients of other hosts go to the
+			// container.
+			c.add(r.localServed[clientKey{id.local, id.peer, id.port, id.proto}], nil, 0, 0)
+		} else {
+			c.add(r.localEndpoints[k], r.dbEndpoints[k], r.dbAge(now), 0)
+		}
 		p.name = c.best.service
 		if p.name == "" {
 			if c, t, ok := r.translatedServer(id, now); ok {
@@ -451,6 +501,16 @@ func (r *resolver) peer(host string, id *edgeID, now time.Time) peer {
 				// Through a translation without sources the backend sees the
 				// address of the client, which its agent may fold.
 				if a, ok := r.agent(c.host, now); ok && c.agent && c.host != host && len(t.sources) == 0 &&
+					r.foldsPeer(a, c.host, id.local, false, now) {
+					p.foldedBy, p.foldedByName = c.host, a.name
+				}
+			} else if !learned {
+			} else if c, ok := r.learnedServer(host, id, now); ok {
+				p = peer{name: c.service, agent: c.agent}
+				if c.port != id.port {
+					p.port = c.port
+				}
+				if a, ok := r.agent(c.host, now); ok && c.agent && c.host != host && c.dnat &&
 					r.foldsPeer(a, c.host, id.local, false, now) {
 					p.foldedBy, p.foldedByName = c.host, a.name
 				}
@@ -470,6 +530,11 @@ func (r *resolver) peer(host string, id *edgeID, now time.Time) peer {
 				// clients: an agent at the address of the relay records none of
 				// them, so this side counts the connections.
 				p.agent = false
+				p.foldedBy, p.foldedByName, p.foldsServer, p.foldedVirtual = "", "", false, netip.Addr{}
+			} else if p.name = r.learnedClientName(host, id, now); p.name != "" {
+				// As through a static translation without sources. A learned
+				// SNAT keeps its name: the source forwards several clients.
+				p.agent = covers
 				p.foldedBy, p.foldedByName, p.foldsServer, p.foldedVirtual = "", "", false, netip.Addr{}
 			}
 		}
@@ -623,6 +688,9 @@ type candidate struct {
 	endpoint
 	port  uint16
 	agent bool
+	// dnat tells, of a backend of a learned translation, that it sees the
+	// address of the client.
+	dnat bool
 }
 
 // backendWindow is how long before the most recently seen backend another
@@ -767,7 +835,8 @@ func (r *resolver) behindRelay(id *edgeID) bool {
 	return false
 }
 
-// foldedVirtual returns a virtual address of a translation without sources
+// foldedVirtual returns a virtual address of a translation without sources,
+// static or learned (DNAT),
 // through which the client of a server edge reaches it, and that the agent a
 // of the client, on the host client, folds. r.mu is held.
 func (r *resolver) foldedVirtual(a agentHost, client string, id *edgeID, now time.Time) (netip.Addr, bool) {
@@ -779,6 +848,15 @@ func (r *resolver) foldedVirtual(a agentHost, client string, id *edgeID, now tim
 		for _, v := range t.clientEnds(id.local, id.port) {
 			if r.foldsPeer(a, client, v.Addr(), true, now) {
 				return v.Addr(), true
+			}
+		}
+	}
+	// Through a learned DNAT the client connects to its virtual address.
+	k := learnedServerKey{id.proto, id.local, id.port, id.peer}
+	for _, m := range []map[learnedClient]time.Time{r.localLearnedServers[k], r.dbLearnedServers[k]} {
+		for lc := range m {
+			if r.foldsPeer(a, client, lc.virtual, true, now) {
+				return lc.virtual, true
 			}
 		}
 	}

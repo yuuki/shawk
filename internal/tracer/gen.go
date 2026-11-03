@@ -1,3 +1,3 @@
 package tracer
 
-//go:generate go tool bpf2go -cc clang -cflags "-O2 -g -Wall -Werror -mcpu=v3" -target bpfel -type shawk_flow_key -type shawk_flow_stats -type shawk_iter_rec -type shawk_cgroup_event -type shawk_peer_prefix bpf bpf/shawk.bpf.c -- -I./bpf/include
+//go:generate go tool bpf2go -cc clang -cflags "-O2 -g -Wall -Werror -mcpu=v3" -target bpfel -type shawk_flow_key -type shawk_flow_stats -type shawk_iter_rec -type shawk_cgroup_event -type shawk_peer_prefix -type shawk_xlat_key -type shawk_xlat_stats -type shawk_xlat_conn bpf bpf/shawk.bpf.c -- -I./bpf/include

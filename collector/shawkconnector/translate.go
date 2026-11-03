@@ -145,6 +145,10 @@ func parseTranslation(name string, c TranslationConfig) (translation, error) {
 	if strings.TrimSpace(name) == "" {
 		return translation{}, errors.New("translations: a translation has no name")
 	}
+	if strings.HasPrefix(name, "~") {
+		// ~learned names the rows matched through learned translations.
+		return fail("a name may not start with ~, which names learned translations (%s)", learnedName)
+	}
 	switch c.Transport {
 	case "":
 		t.protos = []string{"tcp", "udp"}

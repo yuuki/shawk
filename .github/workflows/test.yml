@@ -55,12 +55,12 @@ jobs:
       # unit and its sandbox, with the binaries built by make e2e.
       - name: Agent under the packaged systemd unit
         run: sudo test/packaging/agent-unit.sh ./shawk collector/_build/shawk-collector
-      # The kernel RPM of make compat, whose SHA-256 the script pins.
+      # The kernel RPMs of make compat, whose SHA-256 the scripts pin.
       - name: Cache the Rocky Linux 9 kernel
         uses: actions/cache@v4
         with:
           path: build/kernel
-          key: kernel-rpm-${{ hashFiles('scripts/fetch-kernel-btf.sh') }}
+          key: kernel-rpm-${{ hashFiles('scripts/fetch-kernel-btf.sh', 'scripts/fetch-module-btf.sh') }}
           restore-keys: kernel-rpm-
       - name: Compatibility with the Rocky Linux 9 kernel
         run: make compat

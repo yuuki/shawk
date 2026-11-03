@@ -29,6 +29,8 @@ type tEdge struct {
 	// folded marks the peer as folded (shawk.peer.folded); peer is then
 	// 0.0.0.0 or ::.
 	folded bool
+	// netns is the network namespace, 4026531840 if empty.
+	netns string
 }
 
 type tListener struct {
@@ -38,6 +40,18 @@ type tListener struct {
 	first, last              time.Time
 }
 
+// tTranslation is a translation of addresses the host of an agent made:
+// client -> virtual:vport, seen by backend:bport from source (the client
+// if empty).
+type tTranslation struct {
+	proto, client, virtual string
+	vport                  int64
+	source, backend        string
+	bport                  int64
+	netns                  string // 4026531840 if empty
+	first, last            time.Time
+}
+
 type tAgent struct {
 	host, machineID string
 	addrs           []string
@@ -45,6 +59,7 @@ type tAgent struct {
 	segment         time.Time
 	edges           []tEdge
 	listeners       []tListener
+	translations    []tTranslation
 	// partial omits the metrics of the agent: a request of an interval that
 	// is not its last.
 	partial bool
@@ -129,7 +144,11 @@ func (ta tAgent) metrics() pmetric.Metrics {
 			a.PutStr(attrLocalAddr, e.local)
 			a.PutStr(attrPeerAddr, e.peer)
 			a.PutInt(attrServerPort, e.port)
-			a.PutStr(attrNetNS, "4026531840")
+			netns := e.netns
+			if netns == "" {
+				netns = "4026531840"
+			}
+			a.PutStr(attrNetNS, netns)
 			if e.folded {
 				a.PutBool(attrPeerFolded, true)
 			}
@@ -197,6 +216,39 @@ func (ta tAgent) metrics() pmetric.Metrics {
 			dp.Attributes().PutStr(attrLocalAddr, l.addr)
 			dp.Attributes().PutInt(attrServerPort, l.port)
 			dp.Attributes().PutStr(attrNetNS, "4026531840")
+			dp.SetTimestamp(now)
+			dp.SetIntValue(t.Unix())
+		}
+	}
+	for _, x := range ta.translations {
+		first, last := x.first, x.last
+		if last.IsZero() {
+			last = ta.time
+		}
+		if first.IsZero() {
+			first = last
+		}
+		source, netns, proto := x.source, x.netns, x.proto
+		if source == "" {
+			source = x.client
+		}
+		if netns == "" {
+			netns = "4026531840"
+		}
+		if proto == "" {
+			proto = "tcp"
+		}
+		for name, t := range map[string]time.Time{metricTranslationFirst: first, metricTranslationLast: last} {
+			dp := metric(name, pmetric.MetricTypeGauge).Gauge().DataPoints().AppendEmpty()
+			a := dp.Attributes()
+			a.PutStr(attrTransport, proto)
+			a.PutStr(attrNetNS, netns)
+			a.PutStr(attrTranslationClient, x.client)
+			a.PutStr(attrTranslationVirtual, x.virtual)
+			a.PutInt(attrTranslationVirtualPort, x.vport)
+			a.PutStr(attrTranslationSource, source)
+			a.PutStr(attrTranslationBackend, x.backend)
+			a.PutInt(attrTranslationBackendPort, x.bport)
 			dp.SetTimestamp(now)
 			dp.SetIntValue(t.Unix())
 		}
@@ -295,7 +347,7 @@ func (s *fakeStore) write(_ context.Context, h *hostChanges) error {
 	return nil
 }
 
-func (s *fakeStore) peers(context.Context) (peerRows, error) {
+func (s *fakeStore) peers(context.Context, time.Duration) (peerRows, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.rows, nil

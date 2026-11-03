@@ -225,7 +225,7 @@ func TestUnitsSandboxed(t *testing.T) {
 		}
 		for k, need := range map[string][]string{
 			"CapabilityBoundingSet":   {"CAP_BPF", "CAP_PERFMON", "CAP_SYS_ADMIN", "CAP_SYS_PTRACE", "CAP_DAC_READ_SEARCH"},
-			"SystemCallFilter":        {"@system-service", "bpf", "setns"},
+			"SystemCallFilter":        {"@system-service", "bpf", "perf_event_open", "setns"},
 			"RestrictAddressFamilies": {"AF_INET", "AF_INET6", "AF_NETLINK"},
 			"RestrictNamespaces":      {"net"},
 		} {

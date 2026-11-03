@@ -35,6 +35,7 @@ func (f *fakeSource) Collect() (*tracer.Snapshot, error) {
 }
 
 func (f *fakeSource) UDPEnabled() bool                            { return true }
+func (f *fakeSource) TranslationsTraced() bool                    { return true }
 func (f *fakeSource) ProgramStats() ([]tracer.ProgramStat, error) { return nil, nil }
 
 // fakeExporter records the requests and fails the next fail ones.
@@ -323,5 +324,44 @@ func TestTickFolded(t *testing.T) {
 	}
 	if len(src.local) != 0 {
 		t.Errorf("the addresses of the host were given without folding")
+	}
+}
+
+// TestTickTranslations checks that the translations of a snapshot are sent
+// with their attributes, and with the drops and whether they are traced in
+// the metrics of the agent.
+func TestTickTranslations(t *testing.T) {
+	x := tracer.Translation{Proto: tracer.ProtoTCP, NetNS: 7, Client: netip.MustParseAddr("10.0.0.1"),
+		Virtual: netip.MustParseAddr("10.96.0.10"), VirtualPort: 5432, Source: netip.MustParseAddr("10.0.0.1"),
+		Backend: netip.MustParseAddr("10.244.0.5"), BackendPort: 6432}
+	src := &fakeSource{snaps: []*tracer.Snapshot{{Translations: []tracer.Translation{x}, TranslationDrops: 3}}}
+	exp := &fakeExporter{}
+	a := newTestAgent(src, exp, 0, time.Now())
+	if err := a.tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]string
+	var traced, dropped int64 = -1, -1
+	for _, m := range exp.sent[0].ResourceMetrics[0].ScopeMetrics[0].Metrics {
+		switch m.Name {
+		case otlp.MetricTranslationLast:
+			got = attrs(m.GetGauge().DataPoints[0].Attributes)
+		case otlp.MetricAgentTranslationsTraced:
+			traced = m.GetGauge().DataPoints[0].GetAsInt()
+		case otlp.MetricAgentTranslationsDropped:
+			dropped = m.GetSum().DataPoints[0].GetAsInt()
+		}
+	}
+	want := map[string]string{"network.transport": "tcp", "shawk.netns": "7",
+		"shawk.translation.client.address": "10.0.0.1", "shawk.translation.virtual.address": "10.96.0.10",
+		"shawk.translation.virtual.port": "5432", "shawk.translation.source.address": "10.0.0.1",
+		"shawk.translation.backend.address": "10.244.0.5", "shawk.translation.backend.port": "6432"}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("%s = %q, want %q (%v)", k, got[k], v, got)
+		}
+	}
+	if traced != 1 || dropped != 3 {
+		t.Errorf("traced = %d, dropped = %d", traced, dropped)
 	}
 }

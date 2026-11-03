@@ -99,6 +99,32 @@ type bpfShawkUdpState struct {
 	Dir uint32
 }
 
+type bpfShawkXlatConn struct {
+	_   structs.HostLayout
+	Key bpfShawkXlatKey
+	Gen uint64
+}
+
+type bpfShawkXlatKey struct {
+	_       structs.HostLayout
+	Client  [16]uint8
+	Virt    [16]uint8
+	Source  [16]uint8
+	Backend [16]uint8
+	Netns   uint32
+	Vport   uint16
+	Bport   uint16
+	Proto   uint8
+	Pad     [7]uint8
+}
+
+type bpfShawkXlatStats struct {
+	_     structs.HostLayout
+	Conns uint64
+	Live  int64
+	Gen   uint64
+}
+
 // Names of all BPF objects in the ELF.
 //
 // Used for safe lookups in a Collection or CollectionSpec.
@@ -113,7 +139,11 @@ const (
 	bpfMapSockStates             = "sock_states"
 	bpfMapUdpListenPorts         = "udp_listen_ports"
 	bpfMapUdpStates              = "udp_states"
+	bpfMapXlatConns              = "xlat_conns"
+	bpfMapXlats                  = "xlats"
 	bpfProgShawkCgroupMkdir      = "shawk_cgroup_mkdir"
+	bpfProgShawkCtConfirm        = "shawk_ct_confirm"
+	bpfProgShawkCtDestroy        = "shawk_ct_destroy"
 	bpfProgShawkInetSockSetState = "shawk_inet_sock_set_state"
 	bpfProgShawkIp6SendSkb       = "shawk_ip6_send_skb"
 	bpfProgShawkIpSendSkb        = "shawk_ip_send_skb"
@@ -139,7 +169,11 @@ const (
 	bpfVarTargetNetns            = "target_netns"
 	bpfVarUnusedCgroupEvent      = "unused_cgroup_event"
 	bpfVarUnusedIterRec          = "unused_iter_rec"
+	bpfVarUnusedXlatConn         = "unused_xlat_conn"
+	bpfVarUnusedXlatKey          = "unused_xlat_key"
+	bpfVarUnusedXlatStats        = "unused_xlat_stats"
 	bpfVarWalkGen                = "walk_gen"
+	bpfVarXlatDrops              = "xlat_drops"
 )
 
 // loadBpf returns the embedded CollectionSpec for bpf.
@@ -185,6 +219,8 @@ type bpfSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type bpfProgramSpecs struct {
 	ShawkCgroupMkdir      *ebpf.ProgramSpec `ebpf:"shawk_cgroup_mkdir"`
+	ShawkCtConfirm        *ebpf.ProgramSpec `ebpf:"shawk_ct_confirm"`
+	ShawkCtDestroy        *ebpf.ProgramSpec `ebpf:"shawk_ct_destroy"`
 	ShawkInetSockSetState *ebpf.ProgramSpec `ebpf:"shawk_inet_sock_set_state"`
 	ShawkIp6SendSkb       *ebpf.ProgramSpec `ebpf:"shawk_ip6_send_skb"`
 	ShawkIpSendSkb        *ebpf.ProgramSpec `ebpf:"shawk_ip_send_skb"`
@@ -208,6 +244,8 @@ type bpfMapSpecs struct {
 	SockStates     *ebpf.MapSpec `ebpf:"sock_states"`
 	UdpListenPorts *ebpf.MapSpec `ebpf:"udp_listen_ports"`
 	UdpStates      *ebpf.MapSpec `ebpf:"udp_states"`
+	XlatConns      *ebpf.MapSpec `ebpf:"xlat_conns"`
+	Xlats          *ebpf.MapSpec `ebpf:"xlats"`
 }
 
 // bpfVariableSpecs contains global variables before they are loaded into the kernel.
@@ -232,7 +270,11 @@ type bpfVariableSpecs struct {
 	TargetNetns       *ebpf.VariableSpec `ebpf:"target_netns"`
 	UnusedCgroupEvent *ebpf.VariableSpec `ebpf:"unused_cgroup_event"`
 	UnusedIterRec     *ebpf.VariableSpec `ebpf:"unused_iter_rec"`
+	UnusedXlatConn    *ebpf.VariableSpec `ebpf:"unused_xlat_conn"`
+	UnusedXlatKey     *ebpf.VariableSpec `ebpf:"unused_xlat_key"`
+	UnusedXlatStats   *ebpf.VariableSpec `ebpf:"unused_xlat_stats"`
 	WalkGen           *ebpf.VariableSpec `ebpf:"walk_gen"`
+	XlatDrops         *ebpf.VariableSpec `ebpf:"xlat_drops"`
 }
 
 // bpfObjects contains all objects after they have been loaded into the kernel.
@@ -265,6 +307,8 @@ type bpfMaps struct {
 	SockStates     *ebpf.Map `ebpf:"sock_states"`
 	UdpListenPorts *ebpf.Map `ebpf:"udp_listen_ports"`
 	UdpStates      *ebpf.Map `ebpf:"udp_states"`
+	XlatConns      *ebpf.Map `ebpf:"xlat_conns"`
+	Xlats          *ebpf.Map `ebpf:"xlats"`
 }
 
 func (m *bpfMaps) Close() error {
@@ -279,6 +323,8 @@ func (m *bpfMaps) Close() error {
 		m.SockStates,
 		m.UdpListenPorts,
 		m.UdpStates,
+		m.XlatConns,
+		m.Xlats,
 	)
 }
 
@@ -304,7 +350,11 @@ type bpfVariables struct {
 	TargetNetns       *ebpf.Variable `ebpf:"target_netns"`
 	UnusedCgroupEvent *ebpf.Variable `ebpf:"unused_cgroup_event"`
 	UnusedIterRec     *ebpf.Variable `ebpf:"unused_iter_rec"`
+	UnusedXlatConn    *ebpf.Variable `ebpf:"unused_xlat_conn"`
+	UnusedXlatKey     *ebpf.Variable `ebpf:"unused_xlat_key"`
+	UnusedXlatStats   *ebpf.Variable `ebpf:"unused_xlat_stats"`
 	WalkGen           *ebpf.Variable `ebpf:"walk_gen"`
+	XlatDrops         *ebpf.Variable `ebpf:"xlat_drops"`
 }
 
 // bpfPrograms contains all programs after they have been loaded into the kernel.
@@ -312,6 +362,8 @@ type bpfVariables struct {
 // It can be passed to loadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type bpfPrograms struct {
 	ShawkCgroupMkdir      *ebpf.Program `ebpf:"shawk_cgroup_mkdir"`
+	ShawkCtConfirm        *ebpf.Program `ebpf:"shawk_ct_confirm"`
+	ShawkCtDestroy        *ebpf.Program `ebpf:"shawk_ct_destroy"`
 	ShawkInetSockSetState *ebpf.Program `ebpf:"shawk_inet_sock_set_state"`
 	ShawkIp6SendSkb       *ebpf.Program `ebpf:"shawk_ip6_send_skb"`
 	ShawkIpSendSkb        *ebpf.Program `ebpf:"shawk_ip_send_skb"`
@@ -324,6 +376,8 @@ type bpfPrograms struct {
 func (p *bpfPrograms) Close() error {
 	return _BpfClose(
 		p.ShawkCgroupMkdir,
+		p.ShawkCtConfirm,
+		p.ShawkCtDestroy,
 		p.ShawkInetSockSetState,
 		p.ShawkIp6SendSkb,
 		p.ShawkIpSendSkb,

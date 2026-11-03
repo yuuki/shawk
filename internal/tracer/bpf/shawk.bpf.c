@@ -31,6 +31,11 @@
  *     bundle datagrams in process context. The direction of a socket is
  *     decided by its first datagram (see udp_direction()).
  *
+ * Translations of addresses (conntrack, module nf_conntrack)
+ *   - kprobe/__nf_conntrack_confirm learns the translations of new
+ *     connections, and kprobe/nf_ct_destroy (destroy_conntrack before Linux
+ *     5.19) counts those still alive. See shawk_ct_confirm.
+ *
  * Bundled flows are written into one of two hash maps. User space flips the
  * active map at every interval and drains the inactive one, so that no
  * update is lost while reading.
@@ -1683,5 +1688,271 @@ int shawk_iter_task_file(struct bpf_iter__task_file *ctx)
 	rec.cgroup_id = task_cgroup_id(task);
 	rec.ino = BPF_CORE_READ(file, f_inode, i_ino);
 	bpf_seq_write(seq, &rec, sizeof(rec));
+	return 0;
+}
+
+/*
+ * Translations of addresses, learned from conntrack.
+ *
+ * __nf_conntrack_confirm runs once per new conntrack entry, when its first
+ * packet leaves the last hook (POSTROUTING, or INPUT for the host itself):
+ * DNAT (PREROUTING, OUTPUT) and SNAT (POSTROUTING, INPUT) are done by then,
+ * and IPVS with net.ipv4.vs.conntrack=1 has rewritten the reply tuple. An
+ * entry whose reply tuple does not mirror its original tuple is a
+ * translation, bundled in xlats by struct shawk_xlat_key. The tuples are
+ * compared rather than the NAT bits of the status, which IPVS does not set.
+ *
+ * A connection is confirmed once, so a translation used only by long-lived
+ * connections would look unused after its first interval. xlat_conns holds
+ * the entries counted in the live count of their key, with the key and its
+ * generation; the destroy program, which runs once per entry when its last
+ * reference goes, removes them and decrements the count of that key if it
+ * is still the same generation.
+ *
+ * A kprobe is skipped while another BPF program or a map update of a system
+ * call runs on the CPU, e.g. when a softirq frees an entry then. An entry
+ * whose destroy was missed is found again when its memory, which conntrack
+ * reuses, is confirmed as another entry, translated or not: its former key
+ * is decremented then. A key that user space deleted, while an entry counted in it was
+ * still alive, and that was added again has another generation, which that
+ * entry does not decrement.
+ *
+ * Both programs are kprobes: fentry needs BPF trampolines, which arm64 has
+ * only since Linux 6.0, and they run once per connection, not per packet.
+ * The maps are not flipped like the flows, so that the live counts persist;
+ * user space deletes the keys idle for an interval.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, MAX_FLOWS);
+	__type(key, struct shawk_xlat_key);
+	__type(value, struct shawk_xlat_stats);
+} xlats SEC(".maps");
+
+/*
+ * The conntrack entries counted in the live count of their translation, by
+ * address. Tracing programs need preallocated hash maps before Linux 6.1.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 4 * MAX_FLOWS);
+	__type(key, __u64);
+	__type(value, struct shawk_xlat_conn);
+} xlat_conns SEC(".maps");
+
+/*
+ * Translations not counted because xlats was full, or not counted as alive
+ * because xlat_conns was.
+ */
+__u64 xlat_drops = 0;
+
+const struct shawk_xlat_key *unused_xlat_key __attribute__((unused));
+const struct shawk_xlat_stats *unused_xlat_stats __attribute__((unused));
+const struct shawk_xlat_conn *unused_xlat_conn __attribute__((unused));
+
+/*
+ * The registers of the first argument of a kprobe, by architecture. The
+ * object is shared by x86_64 and arm64, so the registers are found by CO-RE
+ * in the BTF of the running kernel.
+ */
+struct pt_regs___x86 {
+	unsigned long di;
+} __attribute__((preserve_access_index));
+
+struct pt_regs___arm64 {
+	unsigned long regs[31];
+} __attribute__((preserve_access_index));
+
+/*
+ * The registers are read with bpf_probe_read_kernel(): the compiler merges
+ * direct loads of the two flavors into arithmetic on the context, which the
+ * verifier rejects.
+ */
+static __always_inline __u64 kprobe_arg1(struct pt_regs *ctx)
+{
+	struct pt_regs___x86 *x86 = (void *)ctx;
+	struct pt_regs___arm64 *arm64 = (void *)ctx;
+
+	if (bpf_core_field_exists(x86->di))
+		return BPF_CORE_READ(x86, di);
+	return BPF_CORE_READ(arm64, regs[0]);
+}
+
+/* Reads an address of a tuple of conntrack as an IPv6 address. */
+static __always_inline void ct_addr(__u8 *dst, const union nf_inet_addr *a,
+				    __u16 family)
+{
+	if (family == AF_INET)
+		v4mapped(dst, BPF_CORE_READ(a, ip));
+	else
+		BPF_CORE_READ_INTO((struct in6_addr *)dst, a, in6);
+}
+
+/*
+ * Fills the key of the translation of a conntrack entry. Returns -1 if the
+ * entry is not TCP or UDP over IP, or translates nothing: a change of the
+ * port of the source alone, as a null binding that avoids a clash makes,
+ * changes no address the edges are matched by.
+ */
+static __always_inline int xlat_key(const struct nf_conn *ct,
+				    struct shawk_xlat_key *k)
+{
+	const struct nf_conntrack_tuple *o = &ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple;
+	const struct nf_conntrack_tuple *r = &ct->tuplehash[IP_CT_DIR_REPLY].tuple;
+	__u16 family = BPF_CORE_READ(o, src.l3num);
+	__u8 proto = BPF_CORE_READ(o, dst.protonum);
+
+	if ((family != AF_INET && family != AF_INET6) ||
+	    (proto != IPPROTO_TCP && proto != IPPROTO_UDP))
+		return -1;
+	ct_addr(k->client, &o->src.u3, family);
+	ct_addr(k->virt, &o->dst.u3, family);
+	ct_addr(k->backend, &r->src.u3, family);
+	ct_addr(k->source, &r->dst.u3, family);
+	k->vport = bpf_ntohs(BPF_CORE_READ(o, dst.u.all));
+	k->bport = bpf_ntohs(BPF_CORE_READ(r, src.u.all));
+	k->proto = proto;
+	k->netns = BPF_CORE_READ(ct, ct_net.net, ns.inum);
+	if (k->vport == k->bport && !__builtin_memcmp(k->virt, k->backend, 16) &&
+	    !__builtin_memcmp(k->client, k->source, 16))
+		return -1;
+	return 0;
+}
+
+static __always_inline bool internal_addr(const __u8 *a)
+{
+	struct shawk_peer_prefix p = {.prefixlen = 128};
+
+	__builtin_memcpy(p.addr, a, 16);
+	return bpf_map_lookup_elem(&internal_peers, &p) != NULL;
+}
+
+/*
+ * Whether the edges of a translation would have no address to match when
+ * peers are folded (see fold_peer()): the server sees the source as its
+ * peer and folds it if it is outside the internal ranges; a client or a
+ * backend outside them is taken to run no agent, whose agent would fold
+ * this host; and with FOLD_ALL the client folds the virtual address. This
+ * keeps the clients of the Internet of a published port or a NodePort, and
+ * the destinations on the Internet of a masquerade, out of xlats.
+ */
+static __always_inline bool xlat_folded(const struct shawk_xlat_key *k)
+{
+	if (fold_mode == FOLD_NONE)
+		return false;
+	if (!internal_addr(k->source) || !internal_addr(k->client) ||
+	    !internal_addr(k->backend))
+		return true;
+	return fold_mode == FOLD_ALL && !internal_addr(k->virt);
+}
+
+static __always_inline bool same_xlat(const struct shawk_xlat_key *a,
+				      const struct shawk_xlat_key *b)
+{
+	const __u64 *x = (const __u64 *)a, *y = (const __u64 *)b;
+
+#pragma unroll
+	for (int i = 0; i < sizeof(*a) / 8; i++)
+		if (x[i] != y[i])
+			return false;
+	return true;
+}
+
+/* Decrements the live count of the key an entry was counted in. */
+static __always_inline void xlat_release(const struct shawk_xlat_conn *c)
+{
+	struct shawk_xlat_stats *st = bpf_map_lookup_elem(&xlats, &c->key);
+
+	if (st && st->gen == c->gen)
+		__sync_fetch_and_add(&st->live, -1);
+}
+
+/* NFCT_PTRMASK: the low bits of sk_buff._nfct hold enum ip_conntrack_info. */
+#define NFCT_PTRMASK_ (~7ULL)
+
+/*
+ * The arguments a kprobe reads, which TestProgramPrototypes and
+ * TestKernelCompatibility compare with the kernel:
+ * KPROBE(shawk_ct_confirm, struct sk_buff *skb)
+ */
+SEC("kprobe/__nf_conntrack_confirm")
+int shawk_ct_confirm(struct pt_regs *ctx)
+{
+	struct sk_buff *skb = (struct sk_buff *)kprobe_arg1(ctx);
+	struct shawk_xlat_stats zero = {}, *st;
+	struct shawk_xlat_conn conn = {};
+	struct shawk_xlat_conn *old;
+	/* An int: before Linux 6.4 the result is not sign-extended (see flow_get()). */
+	int err;
+	__u64 ct;
+
+	ct = BPF_CORE_READ(skb, _nfct) & NFCT_PTRMASK_;
+	if (!ct)
+		return 0;
+	if (xlat_key((const struct nf_conn *)ct, &conn.key) ||
+	    !netns_ok(conn.key.netns) || xlat_folded(&conn.key)) {
+		/*
+		 * Most entries translate nothing; one at the address of an entry
+		 * whose destroy was missed releases it all the same.
+		 */
+		old = bpf_map_lookup_elem(&xlat_conns, &ct);
+		if (old) {
+			xlat_release(old);
+			bpf_map_delete_elem(&xlat_conns, &ct);
+		}
+		return 0;
+	}
+	st = bpf_map_lookup_elem(&xlats, &conn.key);
+	if (!st) {
+		zero.gen = bpf_ktime_get_ns();
+		bpf_map_update_elem(&xlats, &conn.key, &zero, BPF_NOEXIST);
+		st = bpf_map_lookup_elem(&xlats, &conn.key);
+		if (!st) {
+			__sync_fetch_and_add(&xlat_drops, 1);
+			return 0;
+		}
+	}
+	conn.gen = st->gen;
+	/*
+	 * The entry is inserted first, so that two CPUs confirming the same
+	 * entry at once count it once: an unconfirmed entry shared by clones of
+	 * a packet (a bridged broadcast) may be confirmed twice.
+	 */
+	err = bpf_map_update_elem(&xlat_conns, &ct, &conn, BPF_NOEXIST);
+	if (err == -EEXIST) {
+		old = bpf_map_lookup_elem(&xlat_conns, &ct);
+		if (!old || (old->gen == conn.gen && same_xlat(&old->key, &conn.key)))
+			return 0;
+		/* Left by a destroy that was missed; the memory is another entry now. */
+		xlat_release(old);
+		err = bpf_map_update_elem(&xlat_conns, &ct, &conn, BPF_ANY);
+	}
+	__sync_fetch_and_add(&st->conns, 1);
+	if (err)
+		__sync_fetch_and_add(&xlat_drops, 1);
+	else
+		__sync_fetch_and_add(&st->live, 1);
+	return 0;
+}
+
+/*
+ * Attached to nf_ct_destroy, or to destroy_conntrack on kernels before 5.19
+ * (Rocky Linux 9 has the new name), whose argument is the struct
+ * nf_conntrack at the start of the entry.
+ * KPROBE(shawk_ct_destroy, struct nf_conntrack *nfct)
+ */
+SEC("kprobe/nf_ct_destroy")
+int shawk_ct_destroy(struct pt_regs *ctx)
+{
+	__u64 ct = kprobe_arg1(ctx);
+	struct shawk_xlat_conn *c;
+
+	if (!ct)
+		return 0;
+	c = bpf_map_lookup_elem(&xlat_conns, &ct);
+	if (!c)
+		return 0;
+	xlat_release(c);
+	bpf_map_delete_elem(&xlat_conns, &ct);
 	return 0;
 }

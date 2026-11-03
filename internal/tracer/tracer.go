@@ -65,7 +65,11 @@ type Options struct {
 	// from the first flow on, also for the connections it adopts;
 	// SetLocalAddrs replaces them.
 	LocalAddrs []netip.Addr
-	Logger     *slog.Logger
+	// LearnTranslations learns the translations of addresses the host
+	// makes (DNAT, SNAT, IPVS) from conntrack, once the module
+	// nf_conntrack is loaded (see Snapshot.Translations).
+	LearnTranslations bool
+	Logger            *slog.Logger
 }
 
 // v4InV6 are the IPv4-mapped IPv6 addresses, by which the programs look up
@@ -171,6 +175,23 @@ type Tracer struct {
 	// warnings rate-limits the warnings about kernel counters.
 	warnings    map[string]counterWarning
 	statsCloser io.Closer
+
+	// conntrackSpec is the specification the conntrack programs are loaded
+	// from once nf_conntrack is loaded, and conntrackTried the last
+	// attempt. xlats is nil until they are loaded; xlatLast holds the
+	// counts of each translation at the last read.
+	conntrackSpec   *ebpf.CollectionSpec
+	conntrackTried  time.Time
+	conntrackLogged bool
+	// conntrackBackoff is the wait before the next load after one failed.
+	conntrackBackoff time.Duration
+	xlats            *ebpf.Map
+	xlatDrops        *ebpf.Variable
+	xlatLast         map[bpfShawkXlatKey]bpfShawkXlatStats
+	// conntrackLinks are the links of conntrackPrograms, in their order, and
+	// xlatConnsMap the entries counted live; for tests.
+	conntrackLinks []link.Link
+	xlatConnsMap   *ebpf.Map
 }
 
 type sockAddrKey struct {
@@ -244,6 +265,10 @@ func New(opts Options) (*Tracer, error) {
 	} else {
 		t.udp = true
 	}
+	if opts.LearnTranslations {
+		t.conntrackSpec = spec
+		t.tryConntrack(time.Now())
+	}
 
 	// Adopt connections and listeners that existed before the tracer
 	// started, then resolve their owners. The first walk also tells the
@@ -295,6 +320,8 @@ func (t *Tracer) configure(spec *ebpf.CollectionSpec) error {
 		spec.Maps[name].MaxEntries = min(max(t.opts.MaxFlows, minListenPorts), maxListenPorts)
 	}
 	spec.Maps[bpfMapFlows].InnerMap.MaxEntries = t.opts.MaxFlows
+	spec.Maps[bpfMapXlats].MaxEntries = t.opts.MaxFlows
+	spec.Maps[bpfMapXlatConns].MaxEntries = xlatConnsPerFlow * t.opts.MaxFlows
 	return nil
 }
 
@@ -304,6 +331,7 @@ func (t *Tracer) loadCore(spec *ebpf.CollectionSpec) error {
 	for _, p := range udpPrograms {
 		delete(core.Programs, p.prog)
 	}
+	withoutConntrack(core)
 	coll, err := ebpf.NewCollection(core)
 	if err != nil {
 		return fmt.Errorf("loading BPF objects: %w", verifierError(err))
@@ -405,6 +433,7 @@ func (t *Tracer) watchCgroups(coll *ebpf.Collection) error {
 // loadUDP loads the UDP programs sharing the maps of the core collection.
 func (t *Tracer) loadUDP(spec *ebpf.CollectionSpec) error {
 	udp := spec.Copy()
+	withoutConntrack(udp)
 	want := map[string]bool{}
 	for _, p := range udpPrograms {
 		want[p.prog] = true
@@ -598,12 +627,28 @@ func (t *Tracer) Collect() (*Snapshot, error) {
 		return nil, err
 	}
 	flows = t.attribute(flows)
+	t.tryConntrack(time.Now())
+	// The flows are drained already: an error with the translations loses
+	// those of the interval only.
+	xlats, err := t.collectTranslations()
+	if err != nil {
+		t.warnOnce("reading the translations of addresses", err)
+	}
 	t.warnOnIncrease(t.flowBusy, "some flow updates were dropped because the flow table was being updated on the same CPU, not because it was full")
-	snap := &Snapshot{Flows: flows, Listeners: listeners}
-	for _, c := range []struct {
+	snap := &Snapshot{Flows: flows, Listeners: listeners, Translations: xlats}
+	counters := []struct {
 		v   *ebpf.Variable
 		dst *uint64
-	}{{t.flowDrops, &snap.Drops}, {t.flowBusy, &snap.Contended}, {t.cgroupDrops, &snap.CgroupEventDrops}} {
+	}{{t.flowDrops, &snap.Drops}, {t.flowBusy, &snap.Contended}, {t.cgroupDrops, &snap.CgroupEventDrops}}
+	if t.xlatDrops != nil {
+		t.warnOnIncrease(t.xlatDrops, "some translations of addresses were not learned, or not kept while their connections are open, because their in-kernel tables were full; raise -max-flows",
+			"translations", t.xlats.MaxEntries(), "connections", xlatConnsPerFlow*t.xlats.MaxEntries())
+		counters = append(counters, struct {
+			v   *ebpf.Variable
+			dst *uint64
+		}{t.xlatDrops, &snap.TranslationDrops})
+	}
+	for _, c := range counters {
 		if err := c.v.Get(c.dst); err != nil {
 			return nil, err
 		}
@@ -914,6 +959,20 @@ func (t *Tracer) warnOnIncrease(v *ebpf.Variable, msg string, args ...any) {
 	t.warnings[msg] = w
 }
 
+// warnOnce logs an error at most once an hour for msg.
+func (t *Tracer) warnOnce(msg string, err error) {
+	w := t.warnings[msg]
+	if time.Since(w.warned) < time.Hour {
+		return
+	}
+	w.warned = time.Now()
+	if t.warnings == nil {
+		t.warnings = map[string]counterWarning{}
+	}
+	t.warnings[msg] = w
+	t.log.Warn(msg, "error", err)
+}
+
 // refreshOwners scans the owners and remembers the listeners, of those the
 // last walk found, that it found no holder of.
 func (t *Tracer) refreshOwners(listeners []Listener, inos []uint64) error {
@@ -1148,6 +1207,8 @@ func (t *Tracer) EnableStats() error {
 
 // ProgramStats returns the run time statistics of the attached programs.
 func (t *Tracer) ProgramStats() ([]ProgramStat, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	var out []ProgramStat
 	for name, prog := range t.progs {
 		s, err := prog.Stats()

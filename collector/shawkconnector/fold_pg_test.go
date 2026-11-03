@@ -96,7 +96,7 @@ func TestPGFoldedEdges(t *testing.T) {
 	if want := []string{"app-01 none -", "web-01 all {10.0.0.0/8}"}; !slices.Equal(got, want) {
 		t.Errorf("agents = %q, want %q", got, want)
 	}
-	rows, err := c.store.peers(ctx)
+	rows, err := c.store.peers(ctx, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -259,7 +259,7 @@ func TestPGPartialObservationsConcurrent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := writeHost(ctx, tx, sessionChanges("h1", base, m(-60), m(-2), 5, m(-60), 0)); err != nil {
+	if err := writeHost(ctx, tx, sessionChanges("h1", base, m(-60), m(-2), 5, m(-60), 0), true); err != nil {
 		t.Fatal(err)
 	}
 	done := make(chan error, 1)

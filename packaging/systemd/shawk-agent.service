@@ -14,7 +14,7 @@ RestartSec=5s
 
 # The agent runs as root with these capabilities only; it keeps no state
 # on disk, opens no port and only dials the collector.
-#   CAP_BPF, CAP_PERFMON  load and attach the BPF programs
+#   CAP_BPF, CAP_PERFMON  load and attach the BPF programs, kprobes included
 #   CAP_SYS_ADMIN         enter the other network namespaces (setns) to walk
 #                         their sockets; -bpf-stats
 #   CAP_SYS_PTRACE        read /proc/PID/exe, environ and ns/net of processes
@@ -51,9 +51,10 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
-# bpf is not in @system-service. Other calls fail with EPERM rather than
-# killing the agent.
-SystemCallFilter=@system-service bpf setns
+# bpf is not in @system-service, nor perf_event_open, which attaches the
+# kprobes that learn translations from conntrack. Other calls fail with
+# EPERM rather than killing the agent.
+SystemCallFilter=@system-service bpf perf_event_open setns
 SystemCallErrorNumber=EPERM
 UMask=0077
 

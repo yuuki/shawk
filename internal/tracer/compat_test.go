@@ -29,6 +29,9 @@ import (
 // bpf_core_field_exists: their relocations may not resolve.
 var optionalTypes = map[string]bool{
 	"tcp_sock___smc": true, // syn_smc, with CONFIG_SMC only (not in RHEL 9)
+	// The registers of the arguments of kprobes, of one architecture each.
+	"pt_regs___x86":   true,
+	"pt_regs___arm64": true,
 }
 
 // optionalRelocation reports whether a relocation is of a field of
@@ -56,6 +59,23 @@ func TestKernelCompatibility(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loading %s: %v", path, err)
 	}
+	// The BTF of kernel modules, e.g. nf_conntrack, split on the kernel's.
+	targets := []*btf.Spec{target}
+	for _, m := range filepath.SplitList(os.Getenv("SHAWK_TARGET_MODULE_BTF")) {
+		if m == "" {
+			continue
+		}
+		mf, err := os.Open(m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		spec, err := btf.LoadSplitSpecFromReader(mf, target)
+		mf.Close()
+		if err != nil {
+			t.Fatalf("loading %s: %v", m, err)
+		}
+		targets = append(targets, spec)
+	}
 	spec, err := loadBpf()
 	if err != nil {
 		t.Fatal(err)
@@ -64,7 +84,7 @@ func TestKernelCompatibility(t *testing.T) {
 
 	for name, prog := range spec.Programs {
 		t.Run(name, func(t *testing.T) {
-			checkAttachTarget(t, target, prog)
+			checkAttachTarget(t, targets, prog)
 
 			var relos []*btf.CORERelocation
 			for i := range prog.Instructions {
@@ -81,7 +101,7 @@ func TestKernelCompatibility(t *testing.T) {
 					t.Errorf("instruction %d: atomic operation %v is not supported by the arm64 JIT before Linux 5.18", i, op)
 				}
 			}
-			fixups, err := btf.CORERelocate(relos, []*btf.Spec{target}, binary.LittleEndian, spec.Types.TypeID)
+			fixups, err := btf.CORERelocate(relos, targets, binary.LittleEndian, spec.Types.TypeID)
 			if err != nil {
 				t.Fatalf("CO-RE relocation: %v", err)
 			}
@@ -99,8 +119,23 @@ func TestKernelCompatibility(t *testing.T) {
 	}
 }
 
-func checkAttachTarget(t *testing.T, target *btf.Spec, prog *ebpf.ProgramSpec) {
+func checkAttachTarget(t *testing.T, targets []*btf.Spec, prog *ebpf.ProgramSpec) {
 	t.Helper()
+	if prog.Type == ebpf.Kprobe {
+		// A kprobe attaches to the first of its targets the kernel has.
+		for _, name := range kprobeTargets(prog) {
+			for _, target := range targets {
+				var fn *btf.Func
+				if target.TypeByName(name, &fn) == nil {
+					checkPrototype(t, target, prog, name)
+					return
+				}
+			}
+		}
+		t.Errorf("none of the attach targets %v is available", kprobeTargets(prog))
+		return
+	}
+	target := targets[0]
 	var err error
 	switch prog.AttachType {
 	case ebpf.AttachTraceFEntry, ebpf.AttachTraceFExit:
@@ -121,8 +156,18 @@ func checkAttachTarget(t *testing.T, target *btf.Spec, prog *ebpf.ProgramSpec) {
 		t.Errorf("looking up attach target %s: %v", prog.AttachTo, err)
 	}
 	if prog.AttachType != ebpf.AttachTraceIter {
-		checkPrototype(t, target, prog)
+		checkPrototype(t, target, prog, prog.AttachTo)
 	}
+}
+
+// kprobeTargets returns the kernel functions a kprobe may attach to.
+func kprobeTargets(prog *ebpf.ProgramSpec) []string {
+	for _, p := range conntrackPrograms {
+		if p.prog == prog.Name {
+			return p.targets
+		}
+	}
+	return []string{prog.AttachTo}
 }
 
 // sourcePrototypes returns the parameters that the programs attached to
@@ -139,8 +184,11 @@ func sourcePrototypes(t *testing.T) map[string][]string {
 		t.Fatal(err)
 	}
 	re := regexp.MustCompile(`SEC\("(?:fentry|fexit|tp_btf)/\w+"\)\s*int\s+BPF_PROG\(\s*(\w+)([^)]*)\)`)
+	// A kprobe declares the arguments it reads in a comment.
+	kre := regexp.MustCompile(`KPROBE\((\w+)((?:,[^,)]+)*)\)`)
 	protos := map[string][]string{}
-	for _, m := range re.FindAllStringSubmatch(string(src), -1) {
+	matches := append(re.FindAllStringSubmatch(string(src), -1), kre.FindAllStringSubmatch(string(src), -1)...)
+	for _, m := range matches {
 		params := []string{}
 		for _, p := range strings.Split(m[2], ",") {
 			if p = strings.TrimSpace(p); p != "" {
@@ -181,30 +229,30 @@ func declType(spec *btf.Spec, decl string) string {
 
 // kernelPrototype returns the parameters of the kernel function or BTF
 // tracepoint a program attaches to, without the context of a tracepoint.
-func kernelPrototype(spec *btf.Spec, prog *ebpf.ProgramSpec) ([]string, error) {
+func kernelPrototype(spec *btf.Spec, prog *ebpf.ProgramSpec, attachTo string) ([]string, error) {
 	var proto *btf.FuncProto
 	switch prog.AttachType {
 	case ebpf.AttachTraceRawTp:
 		var td *btf.Typedef
-		if err := spec.TypeByName("btf_trace_"+prog.AttachTo, &td); err != nil {
+		if err := spec.TypeByName("btf_trace_"+attachTo, &td); err != nil {
 			return nil, err
 		}
 		ptr, ok := btf.UnderlyingType(td).(*btf.Pointer)
 		if !ok {
-			return nil, fmt.Errorf("btf_trace_%s is not a function pointer", prog.AttachTo)
+			return nil, fmt.Errorf("btf_trace_%s is not a function pointer", attachTo)
 		}
 		if proto, ok = ptr.Target.(*btf.FuncProto); !ok || len(proto.Params) == 0 {
-			return nil, fmt.Errorf("btf_trace_%s is not a function pointer", prog.AttachTo)
+			return nil, fmt.Errorf("btf_trace_%s is not a function pointer", attachTo)
 		}
 		proto = &btf.FuncProto{Return: proto.Return, Params: proto.Params[1:]}
 	default:
 		var fn *btf.Func
-		if err := spec.TypeByName(prog.AttachTo, &fn); err != nil {
+		if err := spec.TypeByName(attachTo, &fn); err != nil {
 			return nil, err
 		}
 		var ok bool
 		if proto, ok = fn.Type.(*btf.FuncProto); !ok {
-			return nil, fmt.Errorf("%s has no prototype", prog.AttachTo)
+			return nil, fmt.Errorf("%s has no prototype", attachTo)
 		}
 	}
 	params := make([]string, 0, len(proto.Params))
@@ -214,14 +262,14 @@ func kernelPrototype(spec *btf.Spec, prog *ebpf.ProgramSpec) ([]string, error) {
 	return params, nil
 }
 
-func checkPrototype(t *testing.T, target *btf.Spec, prog *ebpf.ProgramSpec) {
+func checkPrototype(t *testing.T, target *btf.Spec, prog *ebpf.ProgramSpec, attachTo string) {
 	t.Helper()
 	decls, ok := sourcePrototypes(t)[prog.Name]
 	if !ok {
-		t.Errorf("BPF_PROG of %s not found in the source", prog.Name)
+		t.Errorf("BPF_PROG or KPROBE of %s not found in the source", prog.Name)
 		return
 	}
-	got, err := kernelPrototype(target, prog)
+	got, err := kernelPrototype(target, prog, attachTo)
 	if err != nil {
 		return // reported by checkAttachTarget
 	}
@@ -230,7 +278,7 @@ func checkPrototype(t *testing.T, target *btf.Spec, prog *ebpf.ProgramSpec) {
 		want = append(want, declType(target, d))
 	}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
-		t.Errorf("parameters of %s = %v, %s reads %v", prog.AttachTo, got, prog.Name, want)
+		t.Errorf("parameters of %s = %v, %s reads %v", attachTo, got, prog.Name, want)
 	}
 }
 
@@ -266,14 +314,21 @@ func TestProgramPrototypes(t *testing.T) {
 			continue
 		}
 		n++
-		target := kernel
-		if _, err := kernelPrototype(kernel, prog); errors.Is(err, btf.ErrNotFound) {
-			if target = moduleSpecOf(prog); target == nil {
-				skipUnavailable(t, "attach target %s is not in the kernel's BTF", prog.AttachTo)
-				continue
+		found := false
+		for _, name := range kprobeTargets(prog) {
+			target := kernel
+			if _, err := kernelPrototype(kernel, prog, name); errors.Is(err, btf.ErrNotFound) {
+				if target = moduleSpecOf(prog, name); target == nil {
+					continue
+				}
 			}
+			checkPrototype(t, target, prog, name)
+			found = true
+			break
 		}
-		checkPrototype(t, target, prog)
+		if !found {
+			skipUnavailable(t, "none of the attach targets %v is in the kernel's BTF", kprobeTargets(prog))
+		}
 	}
 	if want := len(sourcePrototypes(t)); n != want {
 		t.Errorf("%d programs attach to kernel functions or tracepoints, the source declares %d", n, want)
@@ -282,7 +337,7 @@ func TestProgramPrototypes(t *testing.T) {
 
 // moduleSpecOf returns the BTF of the kernel module that holds the attach
 // target of a program, or nil.
-func moduleSpecOf(prog *ebpf.ProgramSpec) *btf.Spec {
+func moduleSpecOf(prog *ebpf.ProgramSpec, attachTo string) *btf.Spec {
 	entries, _ := os.ReadDir("/sys/kernel/btf")
 	for _, e := range entries {
 		if e.Name() == "vmlinux" {
@@ -292,7 +347,7 @@ func moduleSpecOf(prog *ebpf.ProgramSpec) *btf.Spec {
 		if err != nil {
 			continue
 		}
-		if _, err := kernelPrototype(spec, prog); err == nil {
+		if _, err := kernelPrototype(spec, prog, attachTo); err == nil {
 			return spec
 		}
 	}
