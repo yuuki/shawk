@@ -303,8 +303,10 @@ func TestRequestsOrder(t *testing.T) {
 	s.AddEdge(c, EdgeStats{Conns: 1}, t0, t0)
 	s.AddEdge(srv, EdgeStats{Conns: 1}, t0, t0)
 	s.AddListener(ListenerKey{Proto: "tcp", Addr: netip.MustParseAddr("127.0.0.1"), Port: 6379}, t0)
+	s.AddTranslation(TranslationKey{Proto: "tcp", Client: netip.MustParseAddr("10.0.0.1"), Virtual: netip.MustParseAddr("10.96.0.1"),
+		VirtualPort: 80, Source: netip.MustParseAddr("10.0.0.1"), Backend: netip.MustParseAddr("10.0.0.9"), BackendPort: 8080}, t0)
 	reqs := s.Requests(Resource{Hostname: "h"}, AgentStatus{}, t0, 1)
-	if len(reqs) != 3 {
+	if len(reqs) != 4 {
 		t.Fatalf("%d requests", len(reqs))
 	}
 	kinds := []string{}
@@ -313,12 +315,14 @@ func TestRequestsOrder(t *testing.T) {
 			switch m.Name {
 			case MetricListenerLast:
 				kinds = append(kinds, "listener")
+			case MetricTranslationLast:
+				kinds = append(kinds, "translation")
 			case MetricEdgeLast:
 				kinds = append(kinds, fmt.Sprint(attrMap(m.GetGauge().DataPoints[0].Attributes)["shawk.role"]))
 			}
 		}
 	}
-	if fmt.Sprint(kinds) != "[listener server client]" {
+	if fmt.Sprint(kinds) != "[listener translation server client]" {
 		t.Errorf("order = %v", kinds)
 	}
 }

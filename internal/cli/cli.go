@@ -103,7 +103,7 @@ func runAgent(ctx context.Context, args []string, _ io.Writer) error {
 		caFile   = fs.String("otlp-ca-file", "", "PEM file of the CAs that verify the collector (default: system roots)")
 		certFile = fs.String("otlp-cert-file", "", "PEM client certificate for a collector that requires one (mutual TLS)")
 		keyFile  = fs.String("otlp-key-file", "", "PEM key of -otlp-cert-file")
-		perReq   = fs.Int("max-series-per-request", 1000, "dependencies and listeners per OTLP request, which also stays below 3 MiB; more are sent in several requests")
+		perReq   = fs.Int("max-series-per-request", 1000, "dependencies, listeners and translations per OTLP request, which also stays below 3 MiB; more are sent in several requests")
 		interval = fs.Duration("interval", 15*time.Second, "collection and export interval, at most 1m")
 		idleTTL  = fs.Duration("idle-ttl", 15*time.Minute, "how long a dependency is sent after its last activity")
 		netns    = fs.String("netns", "all", `network namespaces to trace: "all", "self" or an inode number`)
@@ -115,6 +115,8 @@ func runAgent(ctx context.Context, args []string, _ io.Writer) error {
 		fallback = fs.String("service-name-fallback", "exe",
 			`name of a service without OTEL_SERVICE_NAME: "exe" (executable name) or "unit" (systemd unit)`)
 		bpfStats = fs.Bool("bpf-stats", false, "enable and send run time statistics of the BPF programs (small overhead)")
+		learn    = fs.Bool("learn-translations", true,
+			"learn the translations of addresses the host makes (DNAT, SNAT, IPVS) from conntrack, so that dependencies through them are matched")
 		logLevel = fs.String("log-level", "info", "log level: debug, info, warn or error")
 	)
 	if err := parseFlags(fs, args); err != nil {
@@ -159,6 +161,7 @@ func runAgent(ctx context.Context, args []string, _ io.Writer) error {
 		InternalPeers:       internalPeers,
 		ServiceFallback:     fb,
 		BPFStats:            *bpfStats,
+		LearnTranslations:   *learn,
 		Logger:              logger,
 	})
 }

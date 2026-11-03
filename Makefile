@@ -69,10 +69,15 @@ check-object: ## check that the committed BPF object matches the source
 rocky9.btf:
 	scripts/fetch-kernel-btf.sh "" $@
 
+# The module of the programs that learn translations (conntrack).
+rocky9-nf_conntrack.btf:
+	scripts/fetch-module-btf.sh net/netfilter/nf_conntrack "" $@
+
 .PHONY: compat
-compat: rocky9.btf ## check the BPF programs against the Rocky Linux 9 kernel
-	SHAWK_TARGET_BTF=$(CURDIR)/rocky9.btf $(GO) test -run TestKernelCompatibility -v ./internal/tracer/
+compat: rocky9.btf rocky9-nf_conntrack.btf ## check the BPF programs against the Rocky Linux 9 kernel
+	SHAWK_TARGET_BTF=$(CURDIR)/rocky9.btf SHAWK_TARGET_MODULE_BTF=$(CURDIR)/rocky9-nf_conntrack.btf \
+		$(GO) test -run TestKernelCompatibility -v ./internal/tracer/
 
 .PHONY: clean
 clean:
-	rm -rf shawk shawk-migrate tracer.test rocky9.btf build collector/_build
+	rm -rf shawk shawk-migrate tracer.test rocky9.btf rocky9-nf_conntrack.btf build collector/_build

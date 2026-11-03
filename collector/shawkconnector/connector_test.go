@@ -142,8 +142,29 @@ func TestGoldenRequest(t *testing.T) {
 	for i := range hb.agent.Len() {
 		names = append(names, hb.agent.At(i).Name())
 	}
-	if got := strings.Join(names, ","); got != "shawk.agent.up,shawk.agent.udp.traced,shawk.agent.flows.dropped,shawk.agent.cgroup_events.dropped,shawk.agent.container_reads.dropped,shawk.agent.export.failures,shawk.agent.bpf.run_count,shawk.agent.bpf.run_time" {
+	if got := strings.Join(names, ","); got != "shawk.agent.up,shawk.agent.udp.traced,shawk.agent.flows.dropped,shawk.agent.cgroup_events.dropped,shawk.agent.container_reads.dropped,shawk.agent.export.failures,shawk.agent.translations.traced,shawk.agent.translations.dropped,shawk.agent.bpf.run_count,shawk.agent.bpf.run_time" {
 		t.Errorf("forwarded agent metrics = %s", got)
+	}
+	// kube-proxy translates a ClusterIP to a pod, and the host masquerades a
+	// container.
+	a := netip.MustParseAddr
+	for _, id := range []translationID{
+		{proto: "tcp", netns: 4026531840, client: a("10.0.0.11"), virtual: a("10.96.0.10"), vport: 5432,
+			source: a("10.0.0.11"), backend: a("10.244.1.7"), bport: 6432},
+		{proto: "udp", netns: 4026531840, client: a("172.17.0.2"), virtual: a("10.0.0.53"), vport: 53,
+			source: a("10.0.0.11"), backend: a("10.0.0.53"), bport: 53},
+	} {
+		x := hb.translations[id]
+		if x == nil {
+			t.Errorf("translation %+v not decoded from %v", id, hb.translations)
+			continue
+		}
+		if !x.first.Equal(t0.Add(15*time.Second)) || !x.last.Equal(x.first) {
+			t.Errorf("translation %+v seen %v..%v", id, x.first, x.last)
+		}
+	}
+	if len(hb.translations) != 2 || hb.invalid != 0 {
+		t.Errorf("%d translations, %d invalid points", len(hb.translations), hb.invalid)
 	}
 }
 

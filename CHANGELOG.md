@@ -24,6 +24,28 @@
   previous version ignores the new metrics, and the edges of agents of the
   previous version have none of the new series. The flow tables of the
   agent take 2.6 MB more with the default `-max-flows`.
+* Translations of addresses learned from conntrack (#107, phase 2). The
+  agent of a host that translates addresses learns its translations with
+  two kprobes on the module nf_conntrack, once it is loaded: Docker
+  published ports and the masquerade of containers, kube-proxy (iptables,
+  nftables, IPVS with `net.ipv4.vs.conntrack=1`), REDIRECT and any DNAT or
+  SNAT rule. Translations used by open connections stay in use while they
+  are open. It sends them as `shawk.translation.first_seen` and
+  `last_seen`, and `shawk.agent.translations.traced` and `dropped`; the
+  new flag `-learn-translations` (default `true`) turns it off. With
+  folding, translations of clients and servers outside the internal ranges
+  are not learned. The connector writes them to the new table
+  `shawk.learned_translations` (migration 13, which replaces
+  `dependencies_between`, `dependencies` and `shawk.prune` in place; run
+  `grants.sql` again, which now also sets default privileges for the
+  tables of later migrations; until then the connector leaves the learned
+  translations out and warns), and the views match edges through them like static
+  translations, which come first; the `translation` of such a row is
+  `~learned`, and a translation of the configuration may no longer have a
+  name starting with `~`. In Prometheus, a client edge to a virtual address
+  is named after the backend, and a server edge of a DNAT after its client.
+  The systemd unit of the agent allows `perf_event_open`, which kprobes
+  need: a unit copied from an older package learns no translations.
 * Pods are named from their labels and annotations, as OBI names them
   (#124): `service.name` is the annotation
   `resource.opentelemetry.io/service.name`, then the labels

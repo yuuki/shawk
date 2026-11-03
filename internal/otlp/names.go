@@ -30,6 +30,9 @@ const (
 	MetricListenerFirst = "shawk.listener.first_seen"
 	MetricListenerLast  = "shawk.listener.last_seen"
 
+	MetricTranslationFirst = "shawk.translation.first_seen"
+	MetricTranslationLast  = "shawk.translation.last_seen"
+
 	MetricAgentUp             = "shawk.agent.up"
 	MetricAgentSegmentStart   = "shawk.agent.segment.start"
 	MetricAgentUDPTraced      = "shawk.agent.udp.traced"
@@ -39,6 +42,9 @@ const (
 	MetricAgentExportFailures = "shawk.agent.export.failures"
 	MetricAgentBPFRunCount    = "shawk.agent.bpf.run_count"
 	MetricAgentBPFRunTime     = "shawk.agent.bpf.run_time"
+
+	MetricAgentTranslationsTraced  = "shawk.agent.translations.traced"
+	MetricAgentTranslationsDropped = "shawk.agent.translations.dropped"
 )
 
 // Names of the attributes.
@@ -69,6 +75,15 @@ const (
 	AttrNetNSScope   = "shawk.netns.scope"
 	AttrBPFProgram   = "shawk.bpf.program"
 	AttrErrorType    = "error.type"
+
+	// Attributes of a translation of addresses (see TranslationKey).
+	AttrTranslationClient      = "shawk.translation.client.address"
+	AttrTranslationVirtual     = "shawk.translation.virtual.address"
+	AttrTranslationVirtualPort = "shawk.translation.virtual.port"
+	AttrTranslationSource      = "shawk.translation.source.address"
+	AttrTranslationBackend     = "shawk.translation.backend.address"
+	AttrTranslationBackendPort = "shawk.translation.backend.port"
+
 	ScopeName        = "github.com/yuuki/shawk"
 	AgentServiceName = "shawk-agent"
 )

@@ -117,6 +117,27 @@ type ListenerKey struct {
 	Process
 }
 
+// TranslationKey identifies a translation of addresses the host made, as
+// conntrack holds it: the client connected to Virtual on VirtualPort, and
+// the backend at Backend on BackendPort saw the connection from Source,
+// which is Client unless the host replaced the address of the client.
+type TranslationKey struct {
+	Proto       string // "tcp" or "udp"
+	NetNS       uint32
+	Client      netip.Addr
+	Virtual     netip.Addr
+	VirtualPort uint16
+	Source      netip.Addr
+	Backend     netip.Addr
+	BackendPort uint16
+}
+
+// Translation is the state of a translation series.
+type Translation struct {
+	FirstSeen time.Time
+	LastSeen  time.Time
+}
+
 // Edge is the state of an edge series.
 type Edge struct {
 	// Start is when the cumulative counters started.
@@ -141,14 +162,16 @@ type Listener struct {
 
 // State holds the live series of an agent.
 type State struct {
-	idleTTL   time.Duration
-	edges     map[EdgeKey]*Edge
-	listeners map[ListenerKey]*Listener
+	idleTTL      time.Duration
+	edges        map[EdgeKey]*Edge
+	listeners    map[ListenerKey]*Listener
+	translations map[TranslationKey]*Translation
 }
 
 // NewState returns an empty state that drops series idle for idleTTL.
 func NewState(idleTTL time.Duration) *State {
-	return &State{idleTTL: idleTTL, edges: map[EdgeKey]*Edge{}, listeners: map[ListenerKey]*Listener{}}
+	return &State{idleTTL: idleTTL, edges: map[EdgeKey]*Edge{}, listeners: map[ListenerKey]*Listener{},
+		translations: map[TranslationKey]*Translation{}}
 }
 
 // AddEdge accounts the statistics of the interval (start, end] to an edge.
@@ -186,6 +209,19 @@ func (s *State) AddListener(k ListenerKey, t time.Time) {
 	}
 }
 
+// AddTranslation records that a translation was in use at t: a new
+// connection went through it, or one was open.
+func (s *State) AddTranslation(k TranslationKey, t time.Time) {
+	x, ok := s.translations[k]
+	if !ok {
+		x = &Translation{FirstSeen: t}
+		s.translations[k] = x
+	}
+	if t.After(x.LastSeen) {
+		x.LastSeen = t
+	}
+}
+
 // BeginInterval prepares the series for the statistics of a new interval:
 // the connections of an edge are open only if the interval reports them.
 func (s *State) BeginInterval() {
@@ -210,6 +246,12 @@ func (s *State) Expire(now time.Time) int {
 			n++
 		}
 	}
+	for k, x := range s.translations {
+		if now.Sub(x.LastSeen) > s.idleTTL {
+			delete(s.translations, k)
+			n++
+		}
+	}
 	return n
 }
 
@@ -218,6 +260,10 @@ func (s *State) Edges() map[EdgeKey]*Edge { return s.edges }
 
 // Listeners returns the live listener series. The map must not be modified.
 func (s *State) Listeners() map[ListenerKey]*Listener { return s.listeners }
+
+// Translations returns the live translation series. The map must not be
+// modified.
+func (s *State) Translations() map[TranslationKey]*Translation { return s.translations }
 
 // LocalAddrs returns the specified local addresses of the series active
 // since a time, such as the addresses of containers in other network

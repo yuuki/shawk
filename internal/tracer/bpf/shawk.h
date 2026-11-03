@@ -150,4 +150,35 @@ struct shawk_cgroup_event {
 	char path[CGROUP_PATH_LEN];
 };
 
+/*
+ * A translation of addresses learned from conntrack (see shawk_ct_confirm):
+ * the client connected to virtual:vport, and the backend at backend:bport
+ * saw the connection from source, which is the client unless the host
+ * replaced its address (SNAT). The ports of the client and of the source
+ * are ephemeral and dropped, as in flows.
+ */
+struct shawk_xlat_key {
+	__u8 client[16];  /* original source (IPv4-mapped IPv6 for IPv4) */
+	__u8 virt[16];    /* original destination */
+	__u8 source[16];  /* reply destination */
+	__u8 backend[16]; /* reply source */
+	__u32 netns;      /* network namespace of the conntrack entry */
+	__u16 vport;      /* original destination port */
+	__u16 bport;      /* reply source port */
+	__u8 proto;       /* IPPROTO_TCP or IPPROTO_UDP */
+	__u8 _pad[7];
+};
+
+struct shawk_xlat_stats {
+	__u64 conns; /* entries confirmed since the key was added */
+	__s64 live;  /* entries alive now that were seen confirmed */
+	__u64 gen;   /* when the key was added, which tells it from a former one */
+};
+
+/* A conntrack entry counted in the live count of its translation. */
+struct shawk_xlat_conn {
+	struct shawk_xlat_key key;
+	__u64 gen; /* shawk_xlat_stats.gen of the key it was counted in */
+};
+
 #endif /* __SHAWK_H */

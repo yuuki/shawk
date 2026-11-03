@@ -48,6 +48,11 @@ type AgentStatus struct {
 	ContainerReadsDrops uint64
 	ExportFailures      uint64 // cumulative
 	BPFPrograms         []BPFProgram
+	// TranslationsTraced tells whether translations of addresses are
+	// learned from conntrack; TranslationsDropped is the cumulative number
+	// of those not learned because the in-kernel tables were full.
+	TranslationsTraced  bool
+	TranslationsDropped uint64
 }
 
 // BPFProgram is the run time statistic of a BPF program.
@@ -73,15 +78,16 @@ var maxRequestBytes = MaxRequestBytes
 const agentReserve = 16 << 10
 
 // Requests builds the requests that carry all live series at now, each with
-// at most maxSeries edges and listeners (0 means no limit) and at most
+// at most maxSeries edges, listeners and translations (0 means no limit) and at most
 // MaxRequestBytes, so that every request stays below the size limits of
 // the receiver. The metrics of the agent itself are in the last request
 // only: it closes the interval, and the connector emits the aggregated
 // metrics of the host when it arrives.
 //
-// Listeners come first, then server edges, then client edges, so that the
-// connector has learned the services of the host before it names the peers
-// of client edges, such as a client of a service on the same host.
+// Listeners come first, then translations, then server edges, then client
+// edges, so that the connector has learned the services and translations
+// of the host before it names the peers of client edges, such as a client
+// of a service on the same host, or through a translation the host makes.
 func (s *State) Requests(res Resource, st AgentStatus, now time.Time, maxSeries int) []*colmetricspb.ExportMetricsServiceRequest {
 	listeners := make([]ListenerKey, 0, len(s.listeners))
 	for k := range s.listeners {
@@ -94,6 +100,11 @@ func (s *State) Requests(res Resource, st AgentStatus, now time.Time, maxSeries 
 		edges = append(edges, k)
 	}
 	slices.SortFunc(edges, compareEdgeKeys)
+	xlats := make([]TranslationKey, 0, len(s.translations))
+	for k := range s.translations {
+		xlats = append(xlats, k)
+	}
+	slices.SortFunc(xlats, compareTranslationKeys)
 
 	resource := res.proto()
 	budget := maxRequestBytes - proto.Size(resource) - agentReserve
@@ -129,6 +140,12 @@ func (s *State) Requests(res Resource, st AgentStatus, now time.Time, maxSeries 
 		attrs := listenerAttrs(k)
 		add(listenerSize(attrs))
 		s.addListener(b, k, attrs)
+	}
+	for i := range xlats {
+		k := &xlats[i]
+		attrs := translationAttrs(k)
+		add(listenerSize(attrs))
+		s.addTranslation(b, k, attrs)
 	}
 	for i := range edges {
 		k := &edges[i]
@@ -245,6 +262,12 @@ func (s *State) addListener(b *builder, k *ListenerKey, attrs []*commonpb.KeyVal
 	b.gauge(MetricListenerLast, "s", l.LastSeen.Unix(), attrs)
 }
 
+func (s *State) addTranslation(b *builder, k *TranslationKey, attrs []*commonpb.KeyValue) {
+	x := s.translations[*k]
+	b.gauge(MetricTranslationFirst, "s", x.FirstSeen.Unix(), attrs)
+	b.gauge(MetricTranslationLast, "s", x.LastSeen.Unix(), attrs)
+}
+
 func addAgent(b *builder, st *AgentStatus) {
 	// No unit "1": Prometheus would add the suffix _ratio to the names.
 	b.gauge(MetricAgentUp, "", 1, []*commonpb.KeyValue{str(AttrNetNSScope, st.NetNSScope)})
@@ -258,6 +281,12 @@ func addAgent(b *builder, st *AgentStatus) {
 	b.sum(MetricAgentCgroupsDropped, "{event}", true, st.Started, st.CgroupEventsDropped, nil)
 	b.sum(MetricAgentReadsDropped, "{read}", true, st.Started, st.ContainerReadsDrops, nil)
 	b.sum(MetricAgentExportFailures, "{request}", true, st.Started, st.ExportFailures, nil)
+	traced := int64(0)
+	if st.TranslationsTraced {
+		traced = 1
+	}
+	b.gauge(MetricAgentTranslationsTraced, "", traced, nil)
+	b.sum(MetricAgentTranslationsDropped, "{translation}", true, st.Started, st.TranslationsDropped, nil)
 	for _, p := range st.BPFPrograms {
 		attrs := []*commonpb.KeyValue{str(AttrBPFProgram, p.Name)}
 		b.sum(MetricAgentBPFRunCount, "{run}", true, st.Started, p.RunCount, attrs)
@@ -322,6 +351,19 @@ func edgeAttrs(k *EdgeKey) []*commonpb.KeyValue {
 		attrs = append(attrs, boolean(AttrPeerFolded, true))
 	}
 	return attrs
+}
+
+func translationAttrs(k *TranslationKey) []*commonpb.KeyValue {
+	return []*commonpb.KeyValue{
+		str(AttrTransport, k.Proto),
+		str(AttrNetNS, strconv.FormatUint(uint64(k.NetNS), 10)),
+		str(AttrTranslationClient, k.Client.String()),
+		str(AttrTranslationVirtual, k.Virtual.String()),
+		integer(AttrTranslationVirtualPort, int64(k.VirtualPort)),
+		str(AttrTranslationSource, k.Source.String()),
+		str(AttrTranslationBackend, k.Backend.String()),
+		integer(AttrTranslationBackendPort, int64(k.BackendPort)),
+	}
 }
 
 func listenerAttrs(k *ListenerKey) []*commonpb.KeyValue {
@@ -513,6 +555,19 @@ func compareBool(a, b bool) int {
 		return 1
 	}
 	return -1
+}
+
+func compareTranslationKeys(a, b TranslationKey) int {
+	return cmp.Or(
+		strings.Compare(a.Proto, b.Proto),
+		a.Virtual.Compare(b.Virtual),
+		cmp.Compare(a.VirtualPort, b.VirtualPort),
+		a.Client.Compare(b.Client),
+		a.Backend.Compare(b.Backend),
+		cmp.Compare(a.BackendPort, b.BackendPort),
+		a.Source.Compare(b.Source),
+		cmp.Compare(a.NetNS, b.NetNS),
+	)
 }
 
 func compareListenerKeys(a, b ListenerKey) int {

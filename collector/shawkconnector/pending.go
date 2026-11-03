@@ -76,26 +76,28 @@ type hostChanges struct {
 	kernel, version     string
 	span
 
-	sessions  map[time.Time]*sessionRow
-	addrs     map[netip.Addr]span
-	processes map[procKey]*procRow
-	edges     map[edgeRowKey]span
-	listeners map[listenerRowKey]span
+	sessions     map[time.Time]*sessionRow
+	addrs        map[netip.Addr]span
+	processes    map[procKey]*procRow
+	edges        map[edgeRowKey]span
+	listeners    map[listenerRowKey]span
+	translations map[translationID]span
 }
 
 func newHostChanges(key string) *hostChanges {
 	return &hostChanges{
-		key:       key,
-		sessions:  map[time.Time]*sessionRow{},
-		addrs:     map[netip.Addr]span{},
-		processes: map[procKey]*procRow{},
-		edges:     map[edgeRowKey]span{},
-		listeners: map[listenerRowKey]span{},
+		key:          key,
+		sessions:     map[time.Time]*sessionRow{},
+		addrs:        map[netip.Addr]span{},
+		processes:    map[procKey]*procRow{},
+		edges:        map[edgeRowKey]span{},
+		listeners:    map[listenerRowKey]span{},
+		translations: map[translationID]span{},
 	}
 }
 
 func (h *hostChanges) size() int {
-	return len(h.sessions) + len(h.addrs) + len(h.processes) + len(h.edges) + len(h.listeners)
+	return len(h.sessions) + len(h.addrs) + len(h.processes) + len(h.edges) + len(h.listeners) + len(h.translations)
 }
 
 func (h *hostChanges) setHost(machineID, hostname, kernel, version string, t time.Time) {
@@ -142,6 +144,12 @@ func (h *hostChanges) addListener(k listenerRowKey, s span) {
 	h.listeners[k] = cur
 }
 
+func (h *hostChanges) addTranslation(k translationID, s span) {
+	cur := h.translations[k]
+	cur.merge(s)
+	h.translations[k] = cur
+}
+
 // merge adds the changes of o, which are older, back into h after o failed
 // to be written.
 func (h *hostChanges) merge(o *hostChanges) {
@@ -166,6 +174,9 @@ func (h *hostChanges) merge(o *hostChanges) {
 	for k, s := range o.listeners {
 		h.addListener(k, s)
 	}
+	for k, s := range o.translations {
+		h.addTranslation(k, s)
+	}
 }
 
 // changes accumulates the changes of every host until they are written. To
@@ -176,8 +187,9 @@ type changes struct {
 	pending map[string]*hostChanges
 	// accepted are the spans last accepted for writing, with when they were
 	// last reported.
-	acceptedEdges     map[string]map[edgeRowKey]acceptedSpan
-	acceptedListeners map[string]map[listenerRowKey]acceptedSpan
+	acceptedEdges        map[string]map[edgeRowKey]acceptedSpan
+	acceptedListeners    map[string]map[listenerRowKey]acceptedSpan
+	acceptedTranslations map[string]map[translationID]acceptedSpan
 	// floors bound the start of the sessions of hosts.
 	floors map[string]sessionFloor
 }
@@ -207,11 +219,12 @@ type acceptedSpan struct {
 
 func newChanges(ttl time.Duration) *changes {
 	return &changes{
-		ttl:               ttl,
-		pending:           map[string]*hostChanges{},
-		acceptedEdges:     map[string]map[edgeRowKey]acceptedSpan{},
-		acceptedListeners: map[string]map[listenerRowKey]acceptedSpan{},
-		floors:            map[string]sessionFloor{},
+		ttl:                  ttl,
+		pending:              map[string]*hostChanges{},
+		acceptedEdges:        map[string]map[edgeRowKey]acceptedSpan{},
+		acceptedListeners:    map[string]map[listenerRowKey]acceptedSpan{},
+		acceptedTranslations: map[string]map[translationID]acceptedSpan{},
+		floors:               map[string]sessionFloor{},
 	}
 }
 
@@ -326,6 +339,29 @@ func (c *changes) add(b *hostBatch, now time.Time) {
 		}
 		h.addListener(k, s)
 	}
+
+	xlats := c.acceptedTranslations[b.key]
+	if xlats == nil {
+		xlats = map[translationID]acceptedSpan{}
+		c.acceptedTranslations[b.key] = xlats
+	}
+	for _, x := range b.translations {
+		if x.last.IsZero() {
+			continue
+		}
+		s := span{x.first, x.last}
+		if s.first.IsZero() {
+			s.first = s.last
+		}
+		acc, ok := xlats[x.id]
+		changed := !ok || s.first.Before(acc.first) || s.last.After(acc.last)
+		acc.span.merge(s)
+		acc.seen = now
+		xlats[x.id] = acc
+		if changed {
+			h.addTranslation(x.id, s)
+		}
+	}
 }
 
 // take returns the pending changes and starts new ones.
@@ -347,6 +383,7 @@ func (c *changes) restore(h *hostChanges) {
 func (c *changes) forget(key string, now time.Time) {
 	delete(c.acceptedEdges, key)
 	delete(c.acceptedListeners, key)
+	delete(c.acceptedTranslations, key)
 	if f, ok := c.floors[key]; ok {
 		f.start = now.Add(-f.skew).Add(-minAgentIdleTTL).Truncate(time.Second)
 		c.floors[key] = f
@@ -373,6 +410,16 @@ func (c *changes) expire(now time.Time) {
 		}
 		if len(m) == 0 {
 			delete(c.acceptedListeners, host)
+		}
+	}
+	for host, m := range c.acceptedTranslations {
+		for k, a := range m {
+			if now.Sub(a.seen) > c.ttl {
+				delete(m, k)
+			}
+		}
+		if len(m) == 0 {
+			delete(c.acceptedTranslations, host)
 		}
 	}
 	for host, f := range c.floors {
