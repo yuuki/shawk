@@ -10,6 +10,7 @@
 #                                        app puma --IPv6--> db:5434 postgres
 #                                        app puma --UDP---> db:5353 named
 #                                        app puma --vip:6432--> db:5435 postgres
+#                                        app puma --refused---> db:5999 (nothing listens)
 #                                                         db:9187 exporter (unused)
 #
 # The virtual address vip is translated by iptables in the namespace of app,
@@ -162,7 +163,7 @@ ip netns exec "$PREFIX-app" iptables -t nat -A OUTPUT -d "$VIP" -p tcp --dport 6
 # A long-lived connection established before any agent starts.
 svc app puma --listen 8080 --upstream "${ADDR[db]}:5432" --upstream 127.0.0.1:6379 \
 	--upstream "[${ADDR6[db]}]:5434" --udp-upstream "${ADDR[db]}:5353" --persist "${ADDR[db]}:5433" \
-	--upstream "$VIP:6432"
+	--upstream "$VIP:6432" --upstream "${ADDR[db]}:5999"
 svc lb haproxy --listen 80 --upstream "${ADDR[app]}:8080"
 wait_for 10 "puma to listen" listening app 8080
 wait_for 10 "haproxy to listen" listening lb 80
@@ -322,6 +323,11 @@ grep -q 'service.peer.name: Str(haproxy)' "$WORK/collector.log" || fail "no seri
 grep -q 'shawk.peer.agent: Bool(true)' "$WORK/collector.log" || fail "no series of a peer with an agent"
 grep -q 'service.peer.name: Str(~unresolved)' "$WORK/collector.log" || fail "no series of the client without an agent"
 if grep -q 'network.peer.address' "$WORK/collector.log"; then fail "peer addresses forwarded"; fi
+# The handshakes of the active opens, and the failures to the port where
+# nothing listens by reason.
+grep -q 'Name: shawk.tcp.handshake$' "$WORK/collector.log" || fail "no handshakes forwarded"
+grep -q 'Name: shawk.tcp.syn_retransmits$' "$WORK/collector.log" || fail "no SYN retransmissions forwarded"
+grep -q 'error.type: Str(refused)' "$WORK/collector.log" || fail "no refused connections forwarded"
 
 # One agent traces every namespace, as on a host with containers. The
 # addresses of the namespaces move from the hosts above to node-01, and

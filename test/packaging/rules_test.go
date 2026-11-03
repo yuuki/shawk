@@ -72,6 +72,13 @@ load 1m
   shawk_tcp_retransmits_total{job="shop/app", instance="app-01", shawk_role="client", service_peer_name="postgres", shawk_peer_agent="true", server_port="5432", network_transport="tcp"} 0+60x10
   shawk_tcp_retransmits_total{job="postgres", instance="db-01", shawk_role="server", service_peer_name="office-lan", shawk_peer_agent="false", server_port="5432", network_transport="tcp"} 0+120x10
   shawk_tcp_retransmits_total{job="postgres", instance="db-01", shawk_role="server", service_peer_name="shop/app", shawk_peer_agent="true", server_port="5432", network_transport="tcp"} 0+180x10
+  shawk_tcp_handshake_seconds_sum{job="shop/app", instance="app-01", shawk_role="client", service_peer_name="postgres", shawk_peer_agent="true", server_port="5432", network_transport="tcp"} 0+1.2x10
+  shawk_tcp_handshake_seconds_count{job="shop/app", instance="app-01", shawk_role="client", service_peer_name="postgres", shawk_peer_agent="true", server_port="5432", network_transport="tcp"} 0+60x10
+  shawk_tcp_handshake_seconds_sum{job="shop/app", instance="app-02", shawk_role="client", service_peer_name="postgres", shawk_peer_agent="true", server_port="5432", network_transport="tcp"} 0+0.6x10
+  shawk_tcp_handshake_seconds_count{job="shop/app", instance="app-02", shawk_role="client", service_peer_name="postgres", shawk_peer_agent="true", server_port="5432", network_transport="tcp"} 0+60x10
+  shawk_tcp_syn_retransmits_total{job="shop/app", instance="app-01", shawk_role="client", service_peer_name="postgres", shawk_peer_agent="true", server_port="5432", network_transport="tcp"} 0+12x10
+  shawk_connection_failed_by_reason_total{job="shop/app", instance="app-01", shawk_role="client", service_peer_name="postgres", shawk_peer_agent="true", server_port="5432", network_transport="tcp", error_type="timeout"} 0+18x10
+  shawk_connection_failed_by_reason_total{job="shop/app", instance="app-01", shawk_role="client", service_peer_name="postgres", shawk_peer_agent="true", server_port="5432", network_transport="tcp", error_type="refused"} 0+12x10
   shawk_udp_datagrams_total{job="shop/app", instance="app-01", shawk_role="client", service_peer_name="~external", shawk_peer_agent="false", server_port="53", network_transport="udp", network_io_direction="transmit"} 0+60x10
   shawk_udp_datagrams_total{job="shop/app", instance="app-01", shawk_role="client", service_peer_name="~external", shawk_peer_agent="false", server_port="53", network_transport="udp", network_io_direction="receive"} 0+120x10
   shawk_agent_up{job="shawk-agent", host_name="app-01"} 1x30
@@ -99,6 +106,17 @@ eval instant at 10m ` + r("shawk:dependency_connections:rate5m") + `
 
 eval instant at 10m ` + r("shawk:dependency_connection_failures:rate5m") + `
   {` + app + `} 0.5
+
+eval instant at 10m ` + r("shawk:dependency_connection_failures_by_reason:rate5m") + `
+  {` + app + `, error_type="timeout"} 0.3
+  {` + app + `, error_type="refused"} 0.2
+
+# 20 ms on app-01 and 10 ms on app-02, which open as many connections.
+eval instant at 10m ` + r("shawk:dependency_handshake_seconds_sum:rate5m") + " / " + r("shawk:dependency_handshake_seconds_count:rate5m") + `
+  {` + app + `} 0.015
+
+eval instant at 10m ` + r("shawk:dependency_syn_retransmits:rate5m") + `
+  {` + app + `} 0.2
 
 eval instant at 10m ` + r("shawk:dependency_open_connections") + `
   {` + app + `} 4

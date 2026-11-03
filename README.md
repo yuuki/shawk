@@ -45,7 +45,7 @@ See [docs/design.md](docs/design.md) for the design.
 | `shawk agent` | traces the dependencies of its host and sends them every 15 s as OTLP metrics; no database, no open port |
 | shawk connector | writes dependencies, listeners and observation segments to PostgreSQL, names the peer of every dependency (`service.peer.name`), and forwards aggregated metrics without addresses to Prometheus |
 | PostgreSQL | whether a dependency exists, since when and until when: the views of the schema `shawk_v1` |
-| Prometheus | how much flows: connections, failures, bytes, RTT and retransmissions per dependency |
+| Prometheus | how much flows: connections, failures by reason, bytes, RTT, time to connect and retransmissions per dependency |
 | Grafana | dashboards (fleet, dependency map, dependency details, changes, application layer) and alerts |
 
 ## Requirements
@@ -155,9 +155,11 @@ In Grafana:
   periods, dropped flows, new dependencies.
 * **shawk / Dependency map**: services reached from the selected ones,
   upstream, downstream or both, to a depth.
-* **shawk / Dependency details**: connections, failure ratio, bytes, RTT and
-  retransmissions from Prometheus, with both ends, first and last seen
-  times and how long each side has been observed from PostgreSQL.
+* **shawk / Dependency details**: connections, failure ratio, bytes, RTT,
+  retransmissions, mean connect time, SYN retransmissions and failures by
+  reason (refused, timeout, unreachable, ...) from Prometheus, with both
+  ends, first and last seen times and how long each side has been observed
+  from PostgreSQL.
 * **shawk / Changes**: dependencies that appeared or disappeared.
 * **shawk / Application layer (OBI)**: OBI's RED metrics next to the
   network dependencies of the same service.
@@ -181,6 +183,12 @@ In PromQL, with the recording rules:
 
 ```promql
 shawk:dependency_connections:rate5m{dst="postgres"}
+
+# The mean time to connect to postgres, from connect(2) to the SYN-ACK, and
+# the clients whose connects time out.
+shawk:dependency_handshake_seconds_sum:rate5m{dst="postgres"}
+  / shawk:dependency_handshake_seconds_count:rate5m{dst="postgres"}
+shawk:dependency_connection_failures_by_reason:rate5m{dst="postgres", error_type="timeout"} > 0
 ```
 
 `shawk flows` shows the bundled flows of the local host live, without a

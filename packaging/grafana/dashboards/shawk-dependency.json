@@ -451,6 +451,169 @@
       }
     },
     {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Mean connect time",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "shawk-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 24,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (src, dst, server_port) (shawk:dependency_handshake_seconds_sum:rate5m{src=~\"$src\", dst=~\"$dst\"})\n  / sum by (src, dst, server_port) (shawk:dependency_handshake_seconds_count:rate5m{src=~\"$src\", dst=~\"$dst\"})",
+          "range": true,
+          "legendFormat": "{{src}} → {{dst}}:{{server_port}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Mean time of the TCP handshakes of the client side, from connect(2) to the SYN-ACK. A SYN lost or dropped on the way adds a retransmission timeout of a second or more."
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "SYN retransmissions per attempt",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "shawk-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 24,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (src, dst, server_port) (shawk:dependency_syn_retransmits:rate5m{src=~\"$src\", dst=~\"$dst\"})\n  / (sum by (src, dst, server_port) (shawk:dependency_handshake_seconds_count:rate5m{src=~\"$src\", dst=~\"$dst\"})\n     + sum by (src, dst, server_port) (shawk:dependency_connection_failures:rate5m{src=~\"$src\", dst=~\"$dst\"}))",
+          "range": true,
+          "legendFormat": "{{src}} → {{dst}}:{{server_port}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "SYNs that the client side retransmitted per connection attempt, established or failed: a SYN or its SYN-ACK was lost, or dropped by a firewall, a network policy or a server whose accept queue is full."
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Connection failures by reason",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "shawk-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 32,
+        "w": 24,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (src, dst, server_port, error_type) (shawk:dependency_connection_failures_by_reason:rate5m{src=~\"$src\", dst=~\"$dst\"})",
+          "range": true,
+          "legendFormat": "{{src}} → {{dst}}:{{server_port}} {{error_type}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 30,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Failed connection attempts of the client side by reason: refused (a reset or ICMP port unreachable: no listener, or a firewall that rejects), timeout (no answer to any SYN), unreachable (ICMP from a router or a firewall, or no answer to ARP/ND), local (no SYN sent, e.g. no free local port), aborted (the application gave up first, often after its own connect timeout) and _OTHER."
+    },
+    {
       "id": 7,
       "type": "timeseries",
       "title": "UDP datagrams",
@@ -460,7 +623,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 24,
+        "y": 40,
         "w": 24,
         "h": 8
       },
@@ -523,7 +686,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 32,
+        "y": 48,
         "w": 24,
         "h": 10
       },
@@ -560,7 +723,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 42,
+        "y": 58,
         "w": 24,
         "h": 8
       },
