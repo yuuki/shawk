@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
@@ -148,9 +149,23 @@ type hostBatch struct {
 	final bool
 	// invalid counts the data points that could not be decoded.
 	invalid int
+	// limited tells, of a request that closes an interval, that series of
+	// the host were dropped in the interval, beyond max_series_per_host.
+	limited bool
 }
 
 var errNotAgent = errors.New("the resource is not a shawk agent")
+
+// maxInternalPeers bounds the ranges of shawk.peer.internal the connector
+// keeps of a host: an agent keeps at most 4096 ranges exact, with the
+// addresses of its host.
+const maxInternalPeers = 4096
+
+// maxStringBytes bounds the strings of agents the connector keeps, so that
+// every series it holds has a bounded size: a longer string is cut. Agents
+// send names and paths, of which the longest, a path of an executable, is
+// below PATH_MAX (4096 bytes).
+const maxStringBytes = 4096
 
 // parseResource decodes the metrics of one agent.
 func parseResource(rm pmetric.ResourceMetrics) (*hostBatch, error) {
@@ -186,8 +201,8 @@ func parseResource(rm pmetric.ResourceMetrics) (*hostBatch, error) {
 	}
 	if v, ok := res.Get(attrPeerInternal); ok && v.Type() == pcommon.ValueTypeSlice {
 		s := v.Slice()
-		ss := make([]string, s.Len())
-		for i := range s.Len() {
+		ss := make([]string, min(s.Len(), maxInternalPeers))
+		for i := range ss {
 			ss[i] = s.At(i).AsString()
 		}
 		b.peerInternal = parsePrefixes(ss)
@@ -343,9 +358,19 @@ func numberValue(dp pmetric.NumberDataPoint) float64 {
 
 // getString returns a string attribute, made acceptable to PostgreSQL
 // (see cleanString): a value it refuses would drop the changes of the host.
+// It is cut to maxStringBytes, at the start of a character.
 func getString(m pcommon.Map, k string) string {
 	if v, ok := m.Get(k); ok {
-		return cleanString(v.AsString())
+		s := v.AsString()
+		if len(s) > maxStringBytes {
+			n := maxStringBytes
+			for n > 0 && !utf8.RuneStart(s[n]) {
+				n--
+			}
+			// A copy, so that the long string is not held.
+			s = strings.Clone(s[:n])
+		}
+		return cleanString(s)
 	}
 	return ""
 }

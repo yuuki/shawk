@@ -21,6 +21,9 @@ func TestConfigValidate(t *testing.T) {
 		"bad cidr":          func(c *Config) { c.PeerCIDRs = map[string]string{"x": "10.0.0.0/33"} },
 		"reserved name":     func(c *Config) { c.PeerCIDRs = map[string]string{"~other": "10.0.0.0/8"} },
 		"short retention":   func(c *Config) { c.Retention = time.Hour },
+		"no hosts":          func(c *Config) { c.MaxHosts = 0 },
+		"no series":         func(c *Config) { c.MaxSeriesPerHost = 0 },
+		"no pending rows":   func(c *Config) { c.MaxPendingRows = 0 },
 	} {
 		c := *ok
 		mod(&c)

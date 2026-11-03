@@ -162,6 +162,13 @@ type resolver struct {
 	// reached a relay with an agent at a virtual address, as direct tells
 	// in PostgreSQL.
 	localServed map[clientKey]map[endpoint]time.Time
+	// inferred counts the endpoints of localEndpoints inferred from the
+	// listeners of each host on unspecified addresses, one per address of
+	// the host and port. maxInferred bounds them per host, and those a
+	// request infers (0: unbounded); the others are named from PostgreSQL
+	// after its next load.
+	inferred    map[string]int
+	maxInferred int
 
 	// rangeCache holds the best service on the endpoints within a range of
 	// backends, found by a scan of the endpoints, until the next load or
@@ -206,6 +213,7 @@ func newResolver(cidrs []namedPrefix, translations []translation) *resolver {
 		localLearned:        map[learnedClientKey]map[learnedBackend]time.Time{},
 		localLearnedServers: map[learnedServerKey]map[learnedClient]time.Time{},
 		localServed:         map[clientKey]map[endpoint]time.Time{},
+		inferred:            map[string]int{},
 	}
 }
 
@@ -309,6 +317,7 @@ func learnInto[K comparable](m map[K]map[endpoint]time.Time, k K, e endpoint, no
 func (r *resolver) learn(b *hostBatch, now time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	budget := r.maxInferred
 	for _, l := range b.listeners {
 		svc := l.id.job()
 		if !l.id.addr.IsUnspecified() {
@@ -317,10 +326,16 @@ func (r *resolver) learn(b *hostBatch, now time.Time) {
 			continue
 		}
 		for _, a := range b.addrs {
+			if r.maxInferred > 0 {
+				if budget == 0 {
+					break
+				}
+				budget--
+			}
 			if l.id.addr.Is4() && !a.Is4() {
 				continue
 			}
-			learnInto(r.localEndpoints, endpointKey{a, l.id.port, l.id.proto}, endpoint{host: b.key, service: svc}, now)
+			r.infer(endpointKey{a, l.id.port, l.id.proto}, endpoint{host: b.key, service: svc}, now)
 		}
 	}
 	for _, e := range b.edges {
@@ -367,6 +382,21 @@ func (r *resolver) learn(b *hostBatch, now time.Time) {
 		fold: b.peerFold, internal: b.peerInternal}
 }
 
+// infer learns an endpoint inferred from a listener on an unspecified
+// address, unless its host holds maxInferred of them already. r.mu is held.
+func (r *resolver) infer(k endpointKey, e endpoint, now time.Time) {
+	if e.service == "" || e.service == unknownService {
+		return
+	}
+	if _, ok := r.localEndpoints[k][e]; !ok {
+		if r.maxInferred > 0 && r.inferred[e.host] >= r.maxInferred {
+			return
+		}
+		r.inferred[e.host]++
+	}
+	learnInto(r.localEndpoints, k, e, now)
+}
+
 func expireLearned[K comparable, V comparable](m map[K]map[V]time.Time, t time.Time) {
 	for k, es := range m {
 		for e, at := range es {
@@ -385,7 +415,22 @@ func expireLearned[K comparable, V comparable](m map[K]map[V]time.Time, t time.T
 func (r *resolver) expire(t, now time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	expireLearned(r.localEndpoints, t)
+	for k, es := range r.localEndpoints {
+		for e, at := range es {
+			if !at.Before(t) {
+				continue
+			}
+			delete(es, e)
+			if !e.exact {
+				if r.inferred[e.host]--; r.inferred[e.host] <= 0 {
+					delete(r.inferred, e.host)
+				}
+			}
+		}
+		if len(es) == 0 {
+			delete(r.localEndpoints, k)
+		}
+	}
 	expireLearned(r.localClients, t)
 	expireLearned(r.localLearned, t)
 	expireLearned(r.localLearnedServers, t)

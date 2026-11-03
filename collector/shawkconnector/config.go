@@ -44,6 +44,19 @@ type Config struct {
 	// the receiver must require client certificates. "none" (the default)
 	// believes the host.name and host.id of every request.
 	HostIdentity string `mapstructure:"host_identity"`
+	// MaxHosts bounds the hosts the connector holds: those that sent within
+	// idle_ttl. The requests of further hosts are refused until hosts
+	// expire; the hosts held are never evicted.
+	MaxHosts int `mapstructure:"max_hosts"`
+	// MaxSeriesPerHost bounds the edges, listeners, translations and
+	// addresses the connector holds per host, from their first request
+	// until idle_ttl after their latest. Further ones are dropped until
+	// some expire, and the host is not observed meanwhile.
+	MaxSeriesPerHost int `mapstructure:"max_series_per_host"`
+	// MaxPendingRows bounds the rows kept for PostgreSQL while they cannot
+	// be written. Beyond it, the changes of the hosts pending the longest
+	// are dropped, and the hosts are not observed over them.
+	MaxPendingRows int `mapstructure:"max_pending_rows"`
 }
 
 // PostgresConfig configures the connection to PostgreSQL.
@@ -61,12 +74,25 @@ type PostgresConfig struct {
 // maxWriteInterval is the longest write interval.
 const maxWriteInterval = time.Minute
 
+// The defaults of max_hosts, max_series_per_host and max_pending_rows are
+// far above what one connector serves (it takes the requests of its hosts
+// one at a time), what a large host sends (the flow table of an agent holds
+// 16384 flows per interval by default), and the rows of such a fleet.
+const (
+	defaultMaxHosts         = 10000
+	defaultMaxSeriesPerHost = 100000
+	defaultMaxPendingRows   = 10000000
+)
+
 func createDefaultConfig() *Config {
 	return &Config{
-		WriteInterval: time.Minute,
-		IdleTTL:       15 * time.Minute,
-		MaxPeers:      50,
-		Retention:     3 * 365 * 24 * time.Hour,
+		WriteInterval:    time.Minute,
+		IdleTTL:          15 * time.Minute,
+		MaxPeers:         50,
+		Retention:        3 * 365 * 24 * time.Hour,
+		MaxHosts:         defaultMaxHosts,
+		MaxSeriesPerHost: defaultMaxSeriesPerHost,
+		MaxPendingRows:   defaultMaxPendingRows,
 	}
 }
 
@@ -90,6 +116,15 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxPeers < 1 {
 		errs = append(errs, errors.New("max_peers must be at least 1"))
+	}
+	if c.MaxHosts < 1 {
+		errs = append(errs, errors.New("max_hosts must be at least 1"))
+	}
+	if c.MaxSeriesPerHost < 1 {
+		errs = append(errs, errors.New("max_series_per_host must be at least 1"))
+	}
+	if c.MaxPendingRows < 1 {
+		errs = append(errs, errors.New("max_pending_rows must be at least 1"))
 	}
 	if _, err := parsePeerCIDRs(c.PeerCIDRs); err != nil {
 		errs = append(errs, err)
