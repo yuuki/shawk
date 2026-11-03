@@ -158,6 +158,10 @@ load 1m
   shawk_agent_udp_traced{job="shawk-agent", host_name="app-03"} 0x30
   shawk_agent_export_failures_total{job="shawk-agent", host_name="app-01"} 0x30
   shawk_agent_export_failures_total{job="shawk-agent", host_name="app-03"} 0+1x30
+  shawk_agent_cgroup_events_dropped_total{job="shawk-agent", host_name="app-01"} 0x30
+  shawk_agent_cgroup_events_dropped_total{job="shawk-agent", host_name="app-03"} 0x10 2504x20
+  shawk_agent_container_reads_dropped_total{job="shawk-agent", host_name="app-01"} 0x30
+  shawk_agent_container_reads_dropped_total{job="shawk-agent", host_name="app-03"} 0x15 7x15
 
 eval instant at 20m ` + a("ShawkUDPNotTraced") + `
   shawk_agent_udp_traced{job="shawk-agent", host_name="app-03"} 0
@@ -165,6 +169,15 @@ eval instant at 20m ` + a("ShawkUDPNotTraced") + `
 # One failure a minute.
 eval instant at 20m ` + a("ShawkExportFailures") + `
   {job="shawk-agent", host_name="app-03"} 15
+
+eval instant at 15m ` + a("ShawkCgroupEventsDropped") + `
+  {job="shawk-agent", host_name="app-03"} 2504
+
+# Resolved 10 minutes after the burst.
+eval instant at 25m ` + a("ShawkCgroupEventsDropped") + `
+
+eval instant at 20m ` + a("ShawkContainerReadsDropped") + `
+  {job="shawk-agent", host_name="app-03"} 7
 `
 	promqltest.RunTest(t, script, promqltest.NewTestEngine(t, false, 0, promqltest.DefaultMaxSamplesPerQuery))
 	for name, e := range alerts {

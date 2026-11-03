@@ -165,6 +165,25 @@ groups:
           summary: "shawk agent on {{ $labels.host_name }} drops flows"
           description: "The in-kernel flow table is full; raise -max-flows of the agent."
 
+      # The kernel reports new cgroups through a ring buffer of about 500
+      # events; a burst of new cgroups, such as a node starting many pods,
+      # can overflow it.
+      - alert: ShawkCgroupEventsDropped
+        expr: increase(shawk_agent_cgroup_events_dropped_total[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "shawk agent on {{ $labels.host_name }} misses new cgroups"
+          description: "The kernel dropped the events of some new cgroups; the flows of those removed within an interval are named by cgroup id instead of their service."
+
+      - alert: ShawkContainerReadsDropped
+        expr: increase(shawk_agent_container_reads_dropped_total[10m]) > 0
+        labels:
+          severity: info
+        annotations:
+          summary: "shawk agent on {{ $labels.host_name }} reads containers late"
+          description: "More new containers than the agent could queue to read; those removed before their flows are exported are named by id."
+
       - alert: ShawkUDPNotTraced
         expr: shawk_agent_udp_traced == 0
         for: 1h

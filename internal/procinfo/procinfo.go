@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -42,6 +43,7 @@ type Resolver struct {
 	readerOnce sync.Once
 	pending    chan string
 	reads      sync.WaitGroup // queued reads, waited for in tests
+	dropped    atomic.Uint64  // reads not queued because the queue was full
 }
 
 type learnedPath struct {
@@ -91,20 +93,28 @@ func (r *Resolver) Learn(id uint64, path string) {
 func (r *Resolver) queueRead(path string) {
 	r.readerOnce.Do(func() {
 		r.pending = make(chan string, maxPendingReads)
-		go func() {
-			for p := range r.pending {
-				r.unit(p)
-				r.reads.Done()
-			}
-		}()
+		go r.readQueued()
 	})
 	r.reads.Add(1)
 	select {
 	case r.pending <- path:
 	default:
+		r.dropped.Add(1)
 		r.reads.Done()
 	}
 }
+
+// readQueued reads the state of the containers of the queued paths.
+func (r *Resolver) readQueued() {
+	for p := range r.pending {
+		r.unit(p)
+		r.reads.Done()
+	}
+}
+
+// ReadsDropped returns how many reads of the state of containers of new
+// cgroups were not queued because the queue was full (cumulative).
+func (r *Resolver) ReadsDropped() uint64 { return r.dropped.Load() }
 
 // Unit returns the unit of the cgroup id (see Unit), and its container if
 // it is one. The unit of a container is named after its state, which the

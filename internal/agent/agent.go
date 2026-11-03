@@ -340,6 +340,7 @@ func (a *Agent) request(now time.Time) ([]*colmetricspb.ExportMetricsServiceRequ
 		UDPTraced:           a.tracer.UDPEnabled(),
 		FlowsDropped:        a.drops,
 		CgroupEventsDropped: a.cgroupDrops,
+		ContainerReadsDrops: a.cgroups.ReadsDropped(),
 		ExportFailures:      a.failures,
 	}
 	if a.cfg.BPFStats {

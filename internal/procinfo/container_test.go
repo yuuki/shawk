@@ -409,9 +409,15 @@ func TestLearnQueue(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, root, "/var/lib/docker/containers/"+id1+"/config.v2.json", `{"Name": "/web", "Config": {}}`)
 	r := &Resolver{containers: newContainers(root), paths: map[uint64]string{}, learned: map[uint64]learnedPath{}}
+	// The worker starts after the burst, as if it were reading a large file.
+	r.readerOnce.Do(func() { r.pending = make(chan string, maxPendingReads) })
 	for i := range 3 * maxPendingReads {
 		r.Learn(uint64(100+i), "/system.slice/docker-"+id1+".scope")
 	}
+	if got := r.ReadsDropped(); got != 2*maxPendingReads {
+		t.Errorf("ReadsDropped = %d, want %d", got, 2*maxPendingReads)
+	}
+	go r.readQueued()
 	r.reads.Wait()
 	if unit, _ := r.Unit(100); unit != "docker/web" {
 		t.Errorf("Unit(100) = %q", unit)
