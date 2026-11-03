@@ -152,6 +152,36 @@ changes; see below.
 * `make build` and `make collector` set the version without the `v` of the
   tag (`0.8.0`), like the release.
 
+### Security
+
+* **An agent can no longer write as another host.** The connector believed
+  the `host.name` and `host.id` that every request carries, so the holder
+  of any client certificate could add dependencies to another host, or
+  send its `shawk_agent_up`, or make PostgreSQL drop its changes with a
+  string it refuses. With `host_identity: certificate`, which
+  `packaging/collector/config.yaml` sets, the connector accepts the
+  metrics of a host only from an agent whose verified client certificate
+  names its `host.name` (a DNS name, or the common name of a certificate
+  without DNS names); the certificates of the agents must name their
+  hosts as `hostname` prints them. The receiver passes the certificate on
+  over gRPC only, so the example configuration no longer receives agents
+  over HTTP (port 4328). The connector replaces NUL and invalid UTF-8 in
+  the strings of agents, which PostgreSQL refuses.
+* **A user can no longer name their processes after another container.**
+  A user to whom systemd delegates cgroups (`user@1000.service`) could
+  make one named after a container of the host, and the agent named the
+  user's flows after that container, its pod and its service. Only the
+  outermost container of a cgroup, outside any unit, is named after the
+  state of the runtimes of the host; a container in a unit is named by id
+  after the unit (`user@1000.service/podman-0123456789ab` for a rootless
+  container, `podman-0123456789ab` before).
+* **A user can no longer stop the export of a host.** `service.name` and
+  `service.namespace`, from the environment of any process, were sent
+  whole; with 128 KiB each, the series of one connection exceeded the
+  size of a request, which the collector refused, and the rest of every
+  interval was not sent. They are cut to 255 bytes, and a series too
+  large for a request is left out and logged.
+
 ### Fixed
 
 * On kernels whose TCP iterator skips sockets (Linux before 6.17 without

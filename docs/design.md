@@ -610,6 +610,16 @@ after twice as long each time, up to an hour:
   containerd without a name (`ctr run`). A container in a container
   (Docker in Docker, kind) keeps its state in the outer container, out of
   reach, and is named after the outer one.
+- Only the outermost container of a cgroup, and only one the runtimes of
+  the host made, is named after the state they keep. A user to whom a unit
+  delegates its cgroups (`user@1000.service`, or a service with
+  `Delegate=yes` and `User=`), or a container allowed to write its own,
+  can make a cgroup named after any container of the host, whose id
+  `/proc/PID/cgroup` shows to everyone. The runtimes of the host make
+  theirs in slices or at the root, never in a unit, so a container in a
+  unit is named by id after the unit
+  (`user@1000.service/podman-0123456789ab`), and one in another container
+  after the outer one.
 - The workload of a pod, in its unit, is the name of the pod without the
   suffixes Kubernetes appends to the pods it creates
   (`web-5d8f7c9b6-x7z2k` and `node-exporter-x7z2k` become `web` and
@@ -804,7 +814,20 @@ replaced.
   collected.
 - **TLS.** An `https://` endpoint verifies the collector (`-otlp-ca-file`)
   and may present a client certificate (`-otlp-cert-file`,
-  `-otlp-key-file`) to a receiver that requires one.
+  `-otlp-key-file`) to a receiver that requires one. With
+  `host_identity: certificate` the connector accepts the metrics of a
+  host only from an agent whose verified certificate names its
+  `host.name` (a DNS name, or the common name of a certificate without
+  DNS names; no wildcards), so that an agent, or anyone who holds one
+  certificate, cannot write as another host; the receiver passes the
+  certificate on over gRPC only, and requests over HTTP are refused. A
+  refused request fails for the agent (`shawk.agent.export.failures`).
+  With `none`, the default, the connector believes the `host.name` and
+  `host.id` of every request.
+- **Size.** `service.name` and `service.namespace`, which the environment
+  of any process sets, are cut to 255 bytes; a series too large for a
+  request alone is left out, and logged, rather than sent in a request
+  the receiver refuses, which would stop the rest of the interval.
 - **Cumulative.** Counters are totals since the series started, so a failed
   request is made up for by the next one. Requests are not retried.
 - **Idle TTL.** A series with no activity (connections, bytes, datagrams or
