@@ -80,9 +80,10 @@ const agentReserve = 16 << 10
 // Requests builds the requests that carry all live series at now, each with
 // at most maxSeries edges, listeners and translations (0 means no limit) and at most
 // MaxRequestBytes, so that every request stays below the size limits of
-// the receiver. The metrics of the agent itself are in the last request
-// only: it closes the interval, and the connector emits the aggregated
-// metrics of the host when it arrives.
+// the receiver; a series larger than that alone is left out (Oversized).
+// The metrics of the agent itself are in the last request only: it closes
+// the interval, and the connector emits the aggregated metrics of the host
+// when it arrives.
 //
 // Listeners come first, then translations, then server edges, then client
 // edges, so that the connector has learned the services and translations
@@ -127,31 +128,42 @@ func (s *State) Requests(res Resource, st AgentStatus, now time.Time, maxSeries 
 		b = newBuilder(now)
 		count, size = 0, 0
 	}
-	// add starts a new request if a series of n bytes would not fit.
-	add := func(n int) {
+	// add starts a new request if a series of n bytes would not fit. A
+	// series that does not fit in an empty request either is left out: the
+	// receiver would refuse the request, and the rest of the interval
+	// would not be sent.
+	add := func(n int) bool {
+		if n > budget {
+			s.oversized++
+			return false
+		}
 		if count > 0 && ((maxSeries > 0 && count >= maxSeries) || size+n > budget) {
 			flush(false)
 		}
 		count++
 		size += n
+		return true
 	}
 	for i := range listeners {
 		k := &listeners[i]
 		attrs := listenerAttrs(k)
-		add(listenerSize(attrs))
-		s.addListener(b, k, attrs)
+		if add(listenerSize(attrs)) {
+			s.addListener(b, k, attrs)
+		}
 	}
 	for i := range xlats {
 		k := &xlats[i]
 		attrs := translationAttrs(k)
-		add(listenerSize(attrs))
-		s.addTranslation(b, k, attrs)
+		if add(listenerSize(attrs)) {
+			s.addTranslation(b, k, attrs)
+		}
 	}
 	for i := range edges {
 		k := &edges[i]
 		attrs := edgeAttrs(k)
-		add(edgeSize(k, s.edges[*k], attrs))
-		s.addEdge(b, k, attrs)
+		if add(edgeSize(k, s.edges[*k], attrs)) {
+			s.addEdge(b, k, attrs)
+		}
 	}
 	flush(true)
 	return reqs

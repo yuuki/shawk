@@ -166,7 +166,14 @@ type State struct {
 	edges        map[EdgeKey]*Edge
 	listeners    map[ListenerKey]*Listener
 	translations map[TranslationKey]*Translation
+	// oversized counts the series left out of requests because alone they
+	// exceed the size of a request (see Requests).
+	oversized uint64
 }
+
+// Oversized returns how many series were left out of requests because
+// alone they exceed the size of a request (cumulative).
+func (s *State) Oversized() uint64 { return s.oversized }
 
 // NewState returns an empty state that drops series idle for idleTTL.
 func NewState(idleTTL time.Duration) *State {
