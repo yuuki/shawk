@@ -40,6 +40,14 @@ func goldenRequest() *colmetricspb.ExportMetricsServiceRequest {
 	s.AddListener(ListenerKey{Proto: "tcp", Addr: netip.MustParseAddr("0.0.0.0"), Port: 8080, NetNS: 4026531840,
 		Process: app}, t0.Add(15*time.Second))
 	s.AddListener(ListenerKey{Proto: "udp", Addr: netip.MustParseAddr("0.0.0.0"), Port: 68, NetNS: 4026531840}, t0.Add(15*time.Second))
+	// kube-proxy on the host translates a ClusterIP to a pod, and
+	// masquerades a container that leaves with the address of the host.
+	s.AddTranslation(TranslationKey{Proto: "tcp", NetNS: 4026531840, Client: netip.MustParseAddr("10.0.0.11"),
+		Virtual: netip.MustParseAddr("10.96.0.10"), VirtualPort: 5432, Source: netip.MustParseAddr("10.0.0.11"),
+		Backend: netip.MustParseAddr("10.244.1.7"), BackendPort: 6432}, t0.Add(15*time.Second))
+	s.AddTranslation(TranslationKey{Proto: "udp", NetNS: 4026531840, Client: netip.MustParseAddr("172.17.0.2"),
+		Virtual: netip.MustParseAddr("10.0.0.53"), VirtualPort: 53, Source: netip.MustParseAddr("10.0.0.11"),
+		Backend: netip.MustParseAddr("10.0.0.53"), BackendPort: 53}, t0.Add(15*time.Second))
 	return s.Request(Resource{
 		MachineID: "4c4c4544003910528036b4c04f4d3732", Hostname: "app-01", Kernel: "5.14.0-503.el9.x86_64",
 		AgentVersion: "v0.9.0", Addrs: []netip.Addr{netip.MustParseAddr("127.0.0.1"), netip.MustParseAddr("10.0.0.11")},
@@ -52,6 +60,7 @@ func goldenRequest() *colmetricspb.ExportMetricsServiceRequest {
 	}, AgentStatus{
 		Started: t0.Add(-time.Hour), SegmentStart: t0.Add(-time.Hour), NetNSScope: "all", UDPTraced: true,
 		FlowsDropped: 7, CgroupEventsDropped: 3, ContainerReadsDrops: 2, ExportFailures: 1,
+		TranslationsTraced: true, TranslationsDropped: 2,
 		BPFPrograms: []BPFProgram{{Name: "shawk_tcp_state", RunCount: 42, RunTime: 3 * time.Millisecond}},
 	}, t0.Add(15*time.Second))
 }

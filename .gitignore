@@ -2,6 +2,7 @@
 /dist
 /tracer.test
 /rocky9.btf
+/rocky9-nf_conntrack.btf
 /build/
 *.db
 *.db-shm

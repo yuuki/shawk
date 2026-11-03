@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/netip"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -24,8 +25,9 @@ type store interface {
 	// deleted.
 	prune(ctx context.Context, retention time.Duration, maxRows int) (int64, error)
 	// peers reads the endpoints of services, the client sides of
-	// connections and the addresses of agents.
-	peers(ctx context.Context) (peerRows, error)
+	// connections, the addresses of agents, and the translations learned
+	// in the last learnedTTL.
+	peers(ctx context.Context, learnedTTL time.Duration) (peerRows, error)
 	// schemaVersion returns the version of the schema, 0 if it predates
 	// the function that tells it.
 	schemaVersion(ctx context.Context) (int, error)
@@ -40,6 +42,43 @@ type store interface {
 
 type pgStore struct {
 	pool *pgxpool.Pool
+	// warn logs a problem of the configuration of the database; nil drops it.
+	warn func(msg string)
+
+	// learnedMu guards learnedOK, whether the role may write and read
+	// shawk.learned_translations, as checked at learnedChecked: without
+	// grants.sql run again after migration 13, the writes of the hosts and
+	// the names of peers would fail as a whole.
+	learnedMu      sync.Mutex
+	learnedOK      bool
+	learnedChecked time.Time
+}
+
+// learnedRecheck is how often the privileges on learned_translations are
+// checked again, so that running grants.sql takes effect.
+const learnedRecheck = 10 * time.Minute
+
+// learnedAllowed tells whether the role may write and read the learned
+// translations, checking at most every learnedRecheck.
+func (s *pgStore) learnedAllowed(ctx context.Context) bool {
+	s.learnedMu.Lock()
+	defer s.learnedMu.Unlock()
+	if !s.learnedChecked.IsZero() && time.Since(s.learnedChecked) < learnedRecheck {
+		return s.learnedOK
+	}
+	var ok bool
+	// has_table_privilege with a list is true if any of them is held.
+	err := s.pool.QueryRow(ctx, `SELECT has_table_privilege('shawk.learned_translations', 'SELECT')
+  AND has_table_privilege('shawk.learned_translations', 'INSERT')
+  AND has_table_privilege('shawk.learned_translations', 'UPDATE')`).Scan(&ok)
+	if err != nil {
+		return s.learnedOK
+	}
+	if !ok && s.warn != nil && (s.learnedOK || s.learnedChecked.IsZero()) {
+		s.warn("the role of the connector may not write shawk.learned_translations; run grants.sql again after the migration: translations learned by agents are not written nor used")
+	}
+	s.learnedOK, s.learnedChecked = ok, time.Now()
+	return ok
 }
 
 // newPGStore returns a store backed by PostgreSQL. It connects lazily, so
@@ -73,10 +112,13 @@ func (s *pgStore) migrate(ctx context.Context) ([]string, error) {
 }
 
 func (s *pgStore) write(ctx context.Context, h *hostChanges) error {
-	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error { return writeHost(ctx, tx, h) })
+	learned := len(h.translations) > 0 && s.learnedAllowed(ctx)
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error { return writeHost(ctx, tx, h, learned) })
 }
 
-func writeHost(ctx context.Context, tx pgx.Tx, h *hostChanges) error {
+// writeHost writes the changes of a host; its learned translations only if
+// learned is set.
+func writeHost(ctx context.Context, tx pgx.Tx, h *hostChanges, learned bool) error {
 	// Writes wait for a migration in progress, which holds this lock, so
 	// that they do not deadlock with it. The lock is taken before the batch:
 	// preparing its statements already locks the tables they write.
@@ -189,6 +231,9 @@ ON CONFLICT (host_id, role, proto, local_addr, remote_addr, port, netns, process
 
 	if len(h.listeners) > 0 {
 		queueListeners(b, h)
+	}
+	if learned {
+		queueTranslations(b, h)
 	}
 	return tx.SendBatch(ctx, b).Close()
 }
@@ -425,6 +470,38 @@ ON CONFLICT (host_id, proto, addr, port, netns) DO UPDATE SET
 		h.key, units, comms, services, protos, addrs, ports, netns, firsts, lasts)
 }
 
+// queueTranslations writes the translations of addresses a host made, with
+// the times of its agent, like edges.
+func queueTranslations(b *pgx.Batch, h *hostChanges) {
+	var protos, clients, virtuals, sources, backends []string
+	var netns []int64
+	var vports, bports []int32
+	var firsts, lasts []time.Time
+	for k, s := range h.translations {
+		protos = append(protos, k.proto)
+		netns = append(netns, int64(k.netns))
+		clients = append(clients, k.client.String())
+		virtuals = append(virtuals, k.virtual.String())
+		vports = append(vports, int32(k.vport))
+		sources = append(sources, k.source.String())
+		backends = append(backends, k.backend.String())
+		bports = append(bports, int32(k.bport))
+		firsts = append(firsts, s.first)
+		lasts = append(lasts, s.last)
+	}
+	b.Queue(`
+INSERT INTO shawk.learned_translations AS t (host_id, proto, netns, client_addr, virtual_addr, virtual_port,
+                                             source_addr, backend_addr, backend_port, first_seen, last_seen)
+SELECT $1, u.proto, u.netns, u.client::inet, u.virtual::inet, u.vport, u.source::inet, u.backend::inet, u.bport, u.f, u.l
+FROM unnest($2::text[], $3::bigint[], $4::text[], $5::text[], $6::integer[], $7::text[], $8::text[], $9::integer[],
+            $10::timestamptz[], $11::timestamptz[]) AS u(proto, netns, client, virtual, vport, source, backend, bport, f, l)
+ON CONFLICT (host_id, proto, netns, client_addr, virtual_addr, virtual_port, source_addr, backend_addr, backend_port)
+DO UPDATE SET
+  first_seen = least(t.first_seen, excluded.first_seen),
+  last_seen  = greatest(t.last_seen, excluded.last_seen)`,
+		h.key, protos, netns, clients, virtuals, vports, sources, backends, bports, firsts, lasts)
+}
+
 func (s *pgStore) schemaVersion(ctx context.Context) (int, error) {
 	var v int
 	err := s.pool.QueryRow(ctx, `SELECT shawk.schema_version()`).Scan(&v)
@@ -500,7 +577,7 @@ func (s *pgStore) prune(ctx context.Context, retention time.Duration, maxRows in
 	return n, err
 }
 
-func (s *pgStore) peers(ctx context.Context) (peerRows, error) {
+func (s *pgStore) peers(ctx context.Context, learnedTTL time.Duration) (peerRows, error) {
 	var out peerRows
 	err := queryRows(ctx, s.pool, `SELECT host(addr), port, proto, host_id, service, last_seen, exact FROM shawk_v1.service_endpoints`,
 		func(rows pgx.Rows) error {
@@ -560,6 +637,35 @@ FROM shawk_v1.agent_addrs`,
 				r.addr = a.Unmap()
 				out.agents = append(out.agents, r)
 			}
+			return nil
+		})
+	if err != nil || !s.learnedAllowed(ctx) {
+		return out, err
+	}
+	err = queryRows(ctx, s.pool, fmt.Sprintf(`SELECT host_id, proto, netns, host(client_addr), host(virtual_addr), virtual_port,
+  host(source_addr), host(backend_addr), backend_port, last_seen
+FROM shawk.learned_translations
+WHERE last_seen > now() - make_interval(secs => %f)`, learnedTTL.Seconds()),
+		func(rows pgx.Rows) error {
+			var r learnedRow
+			var client, virtual, source, backend string
+			var vport, bport int32
+			var netns int64
+			if err := rows.Scan(&r.host, &r.id.proto, &netns, &client, &virtual, &vport, &source, &backend, &bport,
+				&r.lastSeen); err != nil {
+				return err
+			}
+			var addrs [4]netip.Addr
+			for i, a := range []string{client, virtual, source, backend} {
+				addr, err := netip.ParseAddr(a)
+				if err != nil {
+					return nil
+				}
+				addrs[i] = addr.Unmap()
+			}
+			r.id.netns, r.id.vport, r.id.bport = uint64(netns), uint16(vport), uint16(bport)
+			r.id.client, r.id.virtual, r.id.source, r.id.backend = addrs[0], addrs[1], addrs[2], addrs[3]
+			out.learned = append(out.learned, r)
 			return nil
 		})
 	return out, err

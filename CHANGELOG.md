@@ -1,5 +1,27 @@
 ## Unreleased
 
+* Translations of addresses learned from conntrack (#107, phase 2). The
+  agent of a host that translates addresses learns its translations with
+  two kprobes on the module nf_conntrack, once it is loaded: Docker
+  published ports and the masquerade of containers, kube-proxy (iptables,
+  nftables, IPVS with `net.ipv4.vs.conntrack=1`), REDIRECT and any DNAT or
+  SNAT rule. Translations used by open connections stay in use while they
+  are open. It sends them as `shawk.translation.first_seen` and
+  `last_seen`, and `shawk.agent.translations.traced` and `dropped`; the
+  new flag `-learn-translations` (default `true`) turns it off. With
+  folding, translations of clients and servers outside the internal ranges
+  are not learned. The connector writes them to the new table
+  `shawk.learned_translations` (migration 13, which replaces
+  `dependencies_between`, `dependencies` and `shawk.prune` in place; run
+  `grants.sql` again, which now also sets default privileges for the
+  tables of later migrations; until then the connector leaves the learned
+  translations out and warns), and the views match edges through them like static
+  translations, which come first; the `translation` of such a row is
+  `~learned`, and a translation of the configuration may no longer have a
+  name starting with `~`. In Prometheus, a client edge to a virtual address
+  is named after the backend, and a server edge of a DNAT after its client.
+  The systemd unit of the agent allows `perf_event_open`, which kprobes
+  need: a unit copied from an older package learns no translations.
 * Pods are named from their labels and annotations, as OBI names them
   (#124): `service.name` is the annotation
   `resource.opentelemetry.io/service.name`, then the labels
@@ -23,9 +45,10 @@
   of new cgroups were not queued to be read because the queue was full,
   and the new Prometheus alerts `ShawkCgroupEventsDropped` (warning) and
   `ShawkContainerReadsDropped` (info) fire when either counter increases.
-  A test of the kernel creates a burst of 3000 cgroups: a reader that
-  keeps up gets all of them, one that stalls gets the 496 that the ring
-  buffer holds, and the drops of the others are counted.
+  A test of the kernel creates 3000 cgroups: a reader that keeps up gets
+  all of them in batches that the ring buffer holds, one that stalls gets
+  the 496 that it holds of a burst, and the drops of the others are
+  counted.
 * The state of a container is read on a worker instead of the goroutine
   that drains the events of new cgroups (#126), which the kernel dropped
   while it read the files of the runtimes, such as several MB of

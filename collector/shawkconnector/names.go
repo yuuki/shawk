@@ -21,6 +21,9 @@ const (
 	metricListenerFirst = "shawk.listener.first_seen"
 	metricListenerLast  = "shawk.listener.last_seen"
 
+	metricTranslationFirst = "shawk.translation.first_seen"
+	metricTranslationLast  = "shawk.translation.last_seen"
+
 	metricAgentPrefix       = "shawk.agent."
 	metricAgentUp           = "shawk.agent.up"
 	metricAgentSegmentStart = "shawk.agent.segment.start"
@@ -60,6 +63,15 @@ const (
 	// agent: which edges it folds, and the ranges it keeps exact.
 	attrPeerFold     = "shawk.peer.fold"
 	attrPeerInternal = "shawk.peer.internal"
+
+	// The attributes of a translation of addresses that the host of the
+	// agent made (DNAT, SNAT, IPVS), learned from conntrack.
+	attrTranslationClient      = "shawk.translation.client.address"
+	attrTranslationVirtual     = "shawk.translation.virtual.address"
+	attrTranslationVirtualPort = "shawk.translation.virtual.port"
+	attrTranslationSource      = "shawk.translation.source.address"
+	attrTranslationBackend     = "shawk.translation.backend.address"
+	attrTranslationBackendPort = "shawk.translation.backend.port"
 
 	agentServiceName = "shawk-agent"
 	scopeName        = "github.com/yuuki/shawk/collector/shawkconnector"

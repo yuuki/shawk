@@ -107,6 +107,9 @@ func (c *shawkConnector) Start(ctx context.Context, _ component.Host) error {
 	if err != nil {
 		return err
 	}
+	if ps, ok := st.(*pgStore); ok {
+		ps.warn = func(msg string) { c.log.Warn(msg) }
+	}
 	c.store = st
 
 	loopCtx, cancel := context.WithCancel(context.Background())
@@ -143,7 +146,7 @@ func (c *shawkConnector) prepare(ctx context.Context) bool {
 		}
 	}
 	at := c.now()
-	rows, err := c.store.peers(ctx)
+	rows, err := c.store.peers(ctx, c.cfg.IdleTTL)
 	if err != nil {
 		c.log.Warn("reading the names of peers from PostgreSQL", zap.Error(err))
 		return true

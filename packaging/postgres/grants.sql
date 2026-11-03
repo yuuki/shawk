@@ -19,3 +19,10 @@ GRANT SELECT ON ALL TABLES IN SCHEMA shawk_v1 TO shawk_connector;
 -- time limit).
 GRANT USAGE ON SCHEMA shawk_v1 TO shawk_grafana;
 GRANT SELECT ON ALL TABLES IN SCHEMA shawk_v1 TO shawk_grafana;
+
+-- Tables and views of later migrations, which shawk-migrate creates as the
+-- owner, get the same privileges; run this file again after a migration all
+-- the same, for the objects it does not create itself.
+ALTER DEFAULT PRIVILEGES IN SCHEMA shawk GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO shawk_connector;
+ALTER DEFAULT PRIVILEGES IN SCHEMA shawk GRANT USAGE ON SEQUENCES TO shawk_connector;
+ALTER DEFAULT PRIVILEGES IN SCHEMA shawk_v1 GRANT SELECT ON TABLES TO shawk_connector, shawk_grafana;

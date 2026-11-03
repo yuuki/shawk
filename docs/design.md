@@ -305,6 +305,7 @@ require upstream 5.14 or later:
 | cgroup pointer in `sock_cgroup_data` (else the owner of accepted connections is resolved in user space only) | 5.15, RHEL 9 |
 | TCP iterator that locks each socket (else rare double counting) | 5.19, RHEL 9 |
 | fentry (UDP only) | 5.5 on x86_64, 6.0 on arm64 (not in RHEL 9 on arm64) |
+| kprobes on the module nf_conntrack (translations, §3.7; `CONFIG_KPROBES`, the system call `perf_event_open`) | `__nf_conntrack_confirm`, and `nf_ct_destroy` since 5.19 and in RHEL 9, `destroy_conntrack` before |
 
 What is tested in CI: the tests that load the programs run on the kernel of
 the Ubuntu runners (6.8 to 7.0) on x86_64 and arm64, and in virtual
@@ -312,11 +313,15 @@ machines (`test/vm/run.sh`, `make vm-test`) on the kernel of Rocky Linux 9.6
 (x86_64 and aarch64) and on upstream 5.14 (x86_64) and 5.15 (x86_64 and
 aarch64). On aarch64 before 6.0, Rocky Linux 9 included, UDP is not traced:
 the fentry programs load but cannot attach, and the tests check that the
-tracer reports it and traces TCP.
+tracer reports it and traces TCP. The virtual machines load the modules of
+nf_conntrack and nf_tables (from kernel-modules-core of Rocky Linux, and
+the modules package of the mainline builds), and the tests of translations
+write NAT rules of nftables over netlink.
 
 All struct accesses use CO-RE. `TestKernelCompatibility` checks every
 attach target, helper and CO-RE relocation against the BTF of the Rocky Linux
-9.6 kernel (`scripts/fetch-kernel-btf.sh`); for example `sk_userlocks` is a
+9.6 kernel (`scripts/fetch-kernel-btf.sh`) and of its module nf_conntrack
+(`scripts/fetch-module-btf.sh`); for example `sk_userlocks` is a
 plain byte in recent kernels but a 4-bit bitfield at a different offset in
 5.14. It also compares the parameters of the kernel functions and BTF
 tracepoints the programs attach to with those `BPF_PROG` declares in the
@@ -390,6 +395,54 @@ service, plus one per local endpoint for all external peers. A peer on an
 internal range of the fleet that is missing from `-internal-peers` is
 folded, so its connections do not match on both sides; the connector warns
 about agents whose peers are folded that way (§5.2).
+
+### 3.7 Translations of addresses learned from conntrack
+
+A host that translates addresses (DNAT of Docker published ports and of
+kube-proxy, REDIRECT, IPVS with `net.ipv4.vs.conntrack=1`, SNAT and
+masquerade) learns its translations from conntrack, so that the connector
+can match the two sides of the connections (§5.4). Two kprobes on the
+module nf_conntrack, a collection of their own sharing the maps of the
+others, are loaded once the module is (`/sys/module/nf_conntrack`, looked
+for every minute); a load that fails with the module there is tried again
+after twice as long each time, up to an hour:
+
+- `__nf_conntrack_confirm` runs once per new conntrack entry, when its
+  first packet leaves the last hook: DNAT and SNAT are both done, and IPVS
+  has rewritten the reply tuple. An entry whose reply tuple does not mirror
+  its original one is a translation: client C connected to virtual V:Pv,
+  and backend B:Pb saw it from source S (C unless the host replaced it).
+  The ephemeral ports of the client and the source are dropped, as in
+  flows; the key (`struct shawk_xlat_key`) also holds the network
+  namespace and the protocol (TCP or UDP). The tuples are compared rather
+  than the NAT bits of the status, which IPVS does not set.
+- `nf_ct_destroy` (`destroy_conntrack` before 5.19) runs once per entry
+  when it goes. A connection is confirmed once, so the table `xlats`
+  counts the live entries of each translation besides those confirmed,
+  and `xlat_conns` the entries counted, with their key and its
+  generation: a translation is in use in every interval in which one of
+  its connections is open, as edges are.
+- The register of the first argument is read by CO-RE (`di` on x86_64,
+  `regs[0]` on arm64), so one object serves both; kprobes need no BPF
+  trampolines, and run once per connection, not per packet.
+- A kprobe is skipped while another BPF program, or a map update of a
+  system call, runs on the CPU. A missed destroy leaves its entry in
+  `xlat_conns` until conntrack reuses its memory for another entry,
+  translated or not, whose confirmation releases it; until then the
+  translation looks live.
+- `-netns` restricts the translations to a network namespace. With
+  folding (§3.6), a translation whose source, client or backend is
+  outside the internal ranges is not learned, nor with `all` one whose
+  virtual address is: no edge would match it, and the clients of the
+  Internet of a published port stay out of the table.
+- User space reads `xlats` at every interval: a translation is active if it
+  is new, has a new entry or a live one; one idle for an interval is
+  deleted. `xlats` holds `-max-flows` translations and `xlat_conns` four
+  times as many live entries (about 140 bytes each, 9 MiB at the
+  default), allocated once nf_conntrack is loaded (on most hosts of RHEL
+  9, whose firewalld loads it, and on hosts with Docker or kube-proxy);
+  what does not fit is counted in `shawk.agent.translations.dropped`.
+- `-learn-translations=false` turns it off.
 
 ## 4. The agent
 
@@ -595,11 +648,19 @@ continues the same series.
 
 Listening sockets are sent as `shawk.listener.first_seen` and
 `shawk.listener.last_seen` with the transport, address, port, netns and
-process attributes. The agent itself sends `shawk.agent.up` (with
+process attributes. Translations of addresses the host made (§3.7) are sent
+as `shawk.translation.first_seen` and `shawk.translation.last_seen` with
+`network.transport`, `shawk.netns`, `shawk.translation.client.address`,
+`shawk.translation.virtual.address`, `shawk.translation.virtual.port`,
+`shawk.translation.source.address`, `shawk.translation.backend.address`
+and `shawk.translation.backend.port`; they come after the listeners and
+before the edges of an interval, so that the connector knows them when it
+names the edges of the same host. The agent itself sends `shawk.agent.up` (with
 `shawk.netns.scope`), `shawk.agent.segment.start`, `shawk.agent.udp.traced`,
 `shawk.agent.flows.dropped`, `shawk.agent.cgroup_events.dropped`,
-`shawk.agent.container_reads.dropped`, `shawk.agent.export.failures`, and
-with
+`shawk.agent.container_reads.dropped`, `shawk.agent.export.failures`,
+`shawk.agent.translations.traced` and `shawk.agent.translations.dropped`,
+and with
 `-bpf-stats` the run count and time of each BPF program. The resource
 carries `host.id`, `host.name`, `host.ip` (addresses of the interfaces of
 the traced namespaces, and the local addresses of the series active in the
@@ -927,10 +988,41 @@ connector should have the same.
   without sources, and about an agent with `-fold-external=all` that folds
   the virtual address it connects to (§5.2).
 - Translations apply to the whole history: a former backend kept in its
-  translation is matched over the period it served. The backends of
-  Kubernetes services and Docker published ports change all the time and
-  cannot be written down; learning the translations on the hosts that make
-  them, from conntrack, is proposed in `docs/proposal-translation.md`.
+  translation is matched over the period it served.
+- **Learned translations.** The backends of Kubernetes services and Docker
+  published ports change all the time and cannot be written down: the
+  agents of the hosts that make the translations learn them (§3.7), and the
+  connector writes them to `shawk.learned_translations` with the times of
+  the agent. A client edge to a virtual address that no static translation
+  has (with its port, or without one) is matched through the learned rows
+  with its client address, virtual address and port, in its scope (a
+  loopback client in the host and namespace of the row, a shared address on
+  the host of the row, any host otherwise), and with the server edges at
+  their backend, on its port, from their source, in the same scope; the
+  rows whose periods overlap both edges, within 2 minutes, are combined
+  (two directors in turn), and the matched row has the part of the periods
+  of the edges that their span covers, so that a client that moved to
+  another backend leaves the former one. The rules above apply otherwise:
+  a match by address first, rows of their own for the parts not matched,
+  a server edge from another source than the client (SNAT) keeps its
+  whole row, observations NULL on the side that outlives the row. The
+  `translation` of such a row is `~learned`; a name of the configuration
+  may not start with `~`. In the names of peers, a client edge is named
+  after the best service at the backends of its learned rows seen within
+  5 minutes of the most recent one, with the port of the backend (a
+  backend at a loopback or shared address on the host of the row only),
+  unless the connector saw the server edge of a service at the virtual
+  address from this client recently, as a match by address comes first:
+  docker-proxy serves the containers of its host that reach a published
+  port at the address of the host, while the clients of other hosts are
+  DNATed to the container. A server edge of a DNAT is named after the client
+  whose client edge has the virtual address and port, as through a static
+  translation without sources. A server edge behind a learned SNAT keeps
+  its name and `shawk.peer.agent`: it bundles every client its source
+  forwards or masquerades, and the host of the source translated them, so
+  its agent sees those on it. The connector reads the learned rows of the
+  idle TTL with the endpoints; static translations come first in the names
+  too.
 - An agent of a backend that folds its clients (§3.6) must keep the
   sources, or the clients of a translation without sources, in its
   internal ranges (`-internal-peers`), and an agent with
@@ -963,6 +1055,8 @@ listeners(host_id, process_id, proto, addr, port, netns, first_seen, last_seen) 
 listener_owners(host_id, process_id, proto, addr, port, netns, first_seen, last_seen)  -- every known owner
 peer_cidrs(prefix, name)  -- written by the connector from its peer_cidrs
 translations(name, side, proto, addr, port)  -- written by the connector from its translations (§5.4)
+learned_translations(host_id, proto, netns, client_addr, virtual_addr, virtual_port, source_addr,
+                     backend_addr, backend_port, first_seen, last_seen)  -- learned by agents (§3.7, §5.4)
 known_dependencies(client_service, server_service, port, proto, first_seen, last_seen)
 ```
 
@@ -983,7 +1077,7 @@ names in PostgreSQL and Prometheus match.
 
 | view or function | |
 |---|---|
-| `dependencies` | one row per logical dependency: the client edge and the server edge matched by their addresses and port (loopback within a host and netns, addresses held by several hosts at once within a host), or through a translation (§5.4), when the last columns `virtual_addr`, `virtual_port` and `translation` tell the virtual address and port the client connected to and the name of the translation; `server_addr` and `port` are then those of the server, and `first_seen` and `last_seen` the period both edges were active in. `observed_by` is `both`, `client` or `server`; a one-sided row means no agent on the other side, or a NAT or load balancer between that no translation describes, or an edge matched through a translation over a time its matched rows do not cover, or the server side of a translation with sources, which keeps its own row. On the rows of translations, the observation of a side whose edge outlives the row is NULL (§5.4). Edges are matched by address over all time: when an address moves to another host, the edges of each host that held it are matched with those of the peer. `client_observed_until` and `server_observed_until` are the latest heartbeats of the hosts: an old `last_seen` with a recent `observed_until` means *no longer used*; both old means *no longer observed*. A `client_addr` (or `server_addr`) that is the network `0.0.0.0/0` or `::/0` stands for the peers an agent folded (§5.2): such a row is one-sided, and its peer is named `~external`. |
+| `dependencies` | one row per logical dependency: the client edge and the server edge matched by their addresses and port (loopback within a host and netns, addresses held by several hosts at once within a host), or through a translation (§5.4), when the last columns `virtual_addr`, `virtual_port` and `translation` tell the virtual address and port the client connected to and the name of the translation (`~learned` for a translation learned by an agent); `server_addr` and `port` are then those of the server, and `first_seen` and `last_seen` the period both edges were active in. `observed_by` is `both`, `client` or `server`; a one-sided row means no agent on the other side, or a NAT or load balancer between that no translation describes, or an edge matched through a translation over a time its matched rows do not cover, or the server side of a translation with sources, which keeps its own row. On the rows of translations, the observation of a side whose edge outlives the row is NULL (§5.4). Edges are matched by address over all time: when an address moves to another host, the edges of each host that held it are matched with those of the peer. `client_observed_until` and `server_observed_until` are the latest heartbeats of the hosts: an old `last_seen` with a recent `observed_until` means *no longer used*; both old means *no longer observed*. A `client_addr` (or `server_addr`) that is the network `0.0.0.0/0` or `::/0` stands for the peers an agent folded (§5.2): such a row is one-sided, and its peer is named `~external`. |
 | `graph_nodes`, `graph_edges` | the dependency map between services in the format of the Grafana Node Graph; a peer without a service is named by `peer_class` |
 | `peer_class(addr)` | the name of a peer without a known service, as in `service.peer.name`: the narrowest range of `peer_cidrs`, `~unresolved` for an address not routed on the Internet, `~external` otherwise, including the networks of folded peers |
 | `dependency_changes` | dependencies between services that appeared, or disappeared while a host that saw them kept observing for 15 minutes |
@@ -1082,10 +1176,23 @@ parses. shawk runs beside it instead:
 - **Relays that rewrite addresses** (NAT, IPVS, kube-proxy, cloud load
   balancers) hide the real peer, as discussed in §5.2 of the paper.
   Dependencies end at the relay address and are seen on one side only,
-  unless `translations` describes the relay (§5.4). Translations are
-  static: the backends of Kubernetes services and Docker published ports
-  change too often to be written down, and the connections to a published
-  port on loopback go through `docker-proxy`, a service of its own. Behind
+  unless `translations` describes the relay or the agent of the host that
+  translates learns it from conntrack (§5.4, §3.7). Learned translations
+  cover one hop: a connection translated on two hosts (a container behind
+  the masquerade of its host to a published port of another host) is not
+  matched, nor one through IPVS without `conntrack=1` (#139) or a datapath
+  without netfilter conntrack (the kube-proxy replacement of Cilium), nor,
+  until their client opens another, the connections confirmed before the
+  agent started (after a restart of the agent, a pool of long-lived
+  connections then shows on both sides apart until a new connection). A
+  sidecar proxy that REDIRECTs (Istio, Linkerd) is a dependency of its
+  client when the server is reached at another address (a ClusterIP); when
+  the sidecar connects from the address of its pod to the address the
+  application connected to, the application depends on the server, and the
+  inbound edge of the sidecar has a row of its own. The connections to a published port on
+  loopback go through `docker-proxy`, a service of its own. Learned SNAT
+  of clients that a host forwards from other hosts (a NodePort) leaves
+  those without an agent uncounted in Prometheus. Behind
   a relay that replaces the addresses of the clients, the server cannot
   tell its clients apart: every client of the relay is matched with every
   server edge from it, which makes as many rows as clients times backends

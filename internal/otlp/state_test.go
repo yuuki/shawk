@@ -71,6 +71,13 @@ func TestStateExpire(t *testing.T) {
 	lk := ListenerKey{Proto: "tcp", Addr: netip.MustParseAddr("0.0.0.0"), Port: 8080, Process: k.Process}
 	s.AddEdge(k, EdgeStats{Conns: 5}, t0, t0.Add(15*time.Second))
 	s.AddListener(lk, t0.Add(15*time.Second))
+	xk := TranslationKey{Proto: "tcp", Client: netip.MustParseAddr("10.0.0.1"), Virtual: netip.MustParseAddr("10.96.0.1"),
+		VirtualPort: 80, Source: netip.MustParseAddr("10.0.0.1"), Backend: netip.MustParseAddr("10.0.0.9"), BackendPort: 8080}
+	s.AddTranslation(xk, t0)
+	s.AddTranslation(xk, t0.Add(15*time.Second))
+	if x := s.Translations()[xk]; x.FirstSeen != t0 || x.LastSeen != t0.Add(15*time.Second) {
+		t.Errorf("translation = %+v", x)
+	}
 
 	// An open connection keeps the edge alive.
 	k2 := k
@@ -84,8 +91,8 @@ func TestStateExpire(t *testing.T) {
 	if n := s.Expire(t0.Add(15*time.Second + ttl)); n != 0 {
 		t.Errorf("expired %d series at the TTL", n)
 	}
-	if n := s.Expire(t0.Add(16*time.Second + ttl)); n != 2 {
-		t.Errorf("expired %d series after the TTL, want 2", n)
+	if n := s.Expire(t0.Add(16*time.Second + ttl)); n != 3 {
+		t.Errorf("expired %d series after the TTL, want 3", n)
 	}
 	if _, ok := s.Edges()[k2]; !ok {
 		t.Error("an edge with an open connection expired")

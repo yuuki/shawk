@@ -197,6 +197,13 @@ type Snapshot struct {
 	// Contended is the part of Drops that the kernel refused because
 	// another update on the same CPU held the lock of their bucket (#119).
 	Contended uint64
+	// Translations are the translations of addresses with a new or a live
+	// conntrack entry in the interval (Options.LearnTranslations).
+	Translations []Translation
+	// TranslationDrops is the cumulative number of translations not
+	// learned, or not kept while their connections are open, because the
+	// in-kernel tables were full.
+	TranslationDrops uint64
 	// CgroupEventDrops is the cumulative number of cgroups created whose
 	// event the kernel dropped because the ring buffer was full: their
 	// paths are not learned (#126).
