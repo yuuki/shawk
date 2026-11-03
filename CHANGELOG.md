@@ -11,6 +11,24 @@ again. Upgrade the agents and the connectors together. External peers are
 now folded by default, and the Prometheus `job` of processes in pods
 changes; see below.
 
+For the security fixes below, bring `/etc/shawk/collector.yaml`, which
+the packages keep once edited, in line with the new example, and:
+
+* give each agent a client certificate that names its host as `hostname`
+  prints it, without wildcards (`host_identity: certificate`), and send
+  over gRPC to port 4327;
+* issue the certificates of OBI from a CA of their own, installed as
+  `/etc/shawk/tls/obi-ca.crt`: the collector does not start without it;
+* run Prometheus with `--web.config.file` (`packaging/prometheus/web.yml`),
+  set the header of the collector in `SHAWK_PROMETHEUS_AUTHORIZATION` in
+  `/etc/shawk/collector.env`, and the password of Grafana in
+  `SHAWK_GRAFANA_PROMETHEUS_PASSWORD`;
+* run `setup.sql` in a terminal, since it asks for the passwords; roles
+  that an earlier `setup.sql` created keep theirs, `change-me` unless it
+  was edited: change them in psql with `\password ROLE`;
+* as a superuser, run in the database `shawk` the two `REVOKE`s that
+  `setup.sql` now runs there, then run `grants.sql` again.
+
 ### Added
 
 * **Time to connect and why connects fail**, per dependency, measured
@@ -181,6 +199,143 @@ changes; see below.
   state of the runtimes of the host; a container in a unit is named by id
   after the unit (`user@1000.service/podman-0123456789ab` for a rootless
   container, `podman-0123456789ab` before).
+* **An agent can no longer make series in Prometheus without limit.** The
+  connector forwarded every metric whose name starts with `shawk.agent.`
+  whole, with its unit, attributes and points, and the direction of
+  bytes, the names of local services and host names as agents sent them,
+  so one host could make series until Prometheus ran out of memory. The
+  metrics of the agents are now made anew from what the agents send: the
+  metrics, types and units they have, the values of `shawk.netns.scope`
+  and `shawk.bpf.program` they send, and one point per metric or BPF
+  program; other metrics, attributes and points are dropped and logged
+  at most once a minute. A `network.io.direction` other than `transmit`
+  and `receive` is output as `_OTHER`. The new option `max_services`
+  (default 200) bounds the local services per host that have a `job` of
+  their own; the others share the job `~other`, whose peers `max_peers`
+  bounds as for one service. Service names and namespaces, host names,
+  host ids and agent versions are cut to 255 bytes, and
+  `service.peer.name` to 511. PostgreSQL keeps every service, whole.
+* **An agent can no longer name the peers of another host after its own
+  service.** A listener or a server edge that an agent reported at the
+  address of another host was taken for the service at that address, and
+  a time far in the future kept it the most recently seen for good: the
+  client edges of other hosts to that address were named after the
+  agent's service in Prometheus. The services and clients that a host
+  reports at an address that another live host holds alone no longer
+  name peers, nor count as the service at a backend of a translation.
+  The times of edges, listeners, translations and processes are written
+  no later than 2 minutes ahead of the clock of the connector. An agent
+  can still claim the address of a host that runs no live agent, or make
+  an address shared by declaring it in `host.ip` (`docs/design.md`,
+  section 10).
+* **The memory of the connector is bounded.** Its state is keyed by what
+  agents send, and had no size limit: an agent could send thousands of
+  host names with a thousand edges each, which were held for `idle_ttl`,
+  or as long as PostgreSQL was down, until the collector ran out of
+  memory. Three new options bound it. `max_hosts` (default 10000) refuses
+  the requests of further hosts, which their agents count as failed
+  exports, until a held host expires. `max_series_per_host` (100000)
+  drops the new edges, listeners, translations and addresses of a host
+  beyond it, and the host is not observed in the intervals with drops.
+  `max_pending_rows` (10 million) drops the changes of the hosts pending
+  the longest while PostgreSQL cannot be written, and these hosts are not
+  observed over the changes lost. Strings from agents are cut to 4096
+  bytes. The defaults leave room for a large fleet: lower `max_hosts` to
+  the size of yours to bound the memory more tightly.
+* **OBI can no longer send to the receiver of agents.** The two receivers
+  of `packaging/collector/config.yaml` trusted the same client CA
+  (`agents-ca.crt`), so a certificate issued to OBI, which often runs on
+  hosts or in containers trusted less than the agents, was accepted by
+  `otlp/shawk` and could send agent data there. The receiver `otlp`
+  (ports 4317 and 4318) now trusts `/etc/shawk/tls/obi-ca.crt`: issue the
+  certificates of OBI from another CA and install its certificate there,
+  readable by `shawk-collector`, or leave out the receiver `otlp` and the
+  pipelines `metrics/obi` and `traces/obi`. The collector does not start
+  without that file.
+* **The push to Prometheus is authenticated and encrypted.** The example
+  collector pushed to the OTLP receiver of Prometheus, and to the trace
+  store, in cleartext, and Prometheus accepted any push: anyone who could
+  reach it could write `shawk_agent_up`, bypassing the client
+  certificates the collector requires of agents, and silence the alerts
+  on agents. `packaging/collector/config.yaml` now pushes over TLS,
+  verifying Prometheus with `/etc/shawk/tls/prometheus-ca.crt`, with an
+  `Authorization` header from `SHAWK_PROMETHEUS_AUTHORIZATION`, which the
+  unit reads from the new `/etc/shawk/collector.env` (installed readable
+  by root only; `docker run --env-file` for the image). The new
+  `packaging/prometheus/web.yml`, for `--web.config.file`, serves
+  Prometheus over TLS to the users of `basic_auth_users` only; Prometheus
+  refuses to start until its placeholder hashes are replaced. The Grafana
+  data source `shawk-prometheus` logs in as `grafana`, with the password
+  in `$SHAWK_GRAFANA_PROMETHEUS_PASSWORD`, and verifies Prometheus with
+  `/etc/grafana/tls/prometheus-ca.crt`. Prometheus does not tell readers
+  from writers: every user can push. The trace exporter uses TLS
+  (`/etc/shawk/tls/tempo-ca.crt`) with a client certificate
+  (`/etc/shawk/tls/collector-client.crt`) that the store can require.
+* **The roles of shawk can no longer create objects in its database.**
+  The read-only transactions and the statement timeout of `shawk_grafana`
+  are only defaults, which a session can lift (`SET statement_timeout =
+  0`, `BEGIN READ WRITE`) with SQL that anyone who can view the
+  dashboards can send through the data source. `shawk_grafana` and
+  `shawk_connector` could then fill the disk with tables and functions in
+  the schema `public` (on PostgreSQL 14), temporary tables and large
+  objects. `setup.sql` now revokes from `PUBLIC`, in the database
+  `shawk`, the creation in `public` and of large objects, and
+  `grants.sql` that of temporary tables. On an existing database, run as
+  a superuser in `shawk` `REVOKE CREATE ON SCHEMA public FROM PUBLIC` and
+  `REVOKE EXECUTE ON FUNCTION lo_creat(integer), lo_create(oid),
+  lo_from_bytea(oid, bytea) FROM PUBLIC`, then run `grants.sql` again. A
+  session can still run a long query: `packaging/README.md` suggests
+  limits that it cannot lift.
+* **No default passwords for PostgreSQL.** `packaging/postgres/setup.sql`
+  created the roles `shawk_owner`, `shawk_connector` and `shawk_grafana`
+  with the password `change-me`, which stayed if the script was run
+  without being edited. It now creates them without passwords, and psql
+  asks for each (`\password`) and sends it hashed, so the passwords are in
+  neither the script, the command line nor the server log: run it in a
+  terminal. If you ran an earlier `setup.sql` unedited, set new passwords
+  in psql with `\password shawk_owner` and the same for the other two.
+  The examples connect to PostgreSQL with `sslmode=verify-full` instead
+  of `require`, which accepts any certificate: the connection string of
+  the connector names the CA with `sslrootcert`, and the Grafana data
+  source with `sslRootCertFile` (`/etc/grafana/shawk-postgres-ca.crt`).
+  Change `/etc/shawk/postgres-dsn` the same way; its host must be a name
+  in the certificate of the server.
+* **A link can no longer add SQL to the queries of a dashboard.** A link
+  can set any value of a dashboard variable (`?var-depth=`), and the
+  panels run their SQL as whoever opens it. The dependency map put
+  `$depth` into its SQL unquoted, and `$service`, `$src` and `$dst` used
+  the `singlequote` format, whose backslash PostgreSQL does not read as
+  an escape, so that a quote in a value ended the string. Every variable
+  in the SQL of the dashboards now uses the `sqlstring` format, and the
+  depth is cast from it: a depth that is not a number fails the query.
+* **Releases can be verified.** The archives, packages and the image
+  `ghcr.io/yuuki/shawk-collector` carry an attestation of their build
+  provenance, signed for the release workflow: check one with `gh
+  attestation verify FILE --repo yuuki/shawk`, or the image with
+  `oci://ghcr.io/yuuki/shawk-collector:VERSION` (the version without its
+  `v`) in place of `FILE`. The release workflow pins its actions by
+  commit and goreleaser by version, the image pins its base by digest,
+  and the tests that run before a release can only read the repository.
+* **A user can no longer grow the agent without bound with processes
+  whose environment cannot be read.** A read of `/proc/PID/environ` that
+  hangs, e.g. on memory mapped from a FUSE file system that its user
+  stalls, kept a goroutine and a file descriptor of the agent for good,
+  one per such process, and each new one took a reader for 200 ms of the
+  second the agent spends reading `/proc` per interval. At most 32 reads
+  are now outstanding at once; while 32 hang, no environment is read and
+  processes keep their latest identity. At most 4096 processes back off,
+  and the agent logs how many reads hang at most every 10 minutes.
+* **The agent no longer follows redirects, and warns about cleartext
+  export.** Over HTTP/protobuf, a 307 or 308 from the collector, or from
+  anything in the path, sent the request again with its body to another
+  address, possibly from `https://` to `http://`. Redirects are not
+  followed: a 3xx response is a failed export
+  (`shawk.agent.export.failures`) whose error names the status and the
+  `Location`. The agent warns at start when `-otlp-endpoint` (or
+  `OTEL_EXPORTER_OTLP_ENDPOINT`) uses `http://` and its host is neither
+  `localhost` nor a loopback address, since the dependencies,
+  executables, services, name and machine id of the host then cross the
+  network unencrypted.
 
 ### Fixed
 
