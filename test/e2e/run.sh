@@ -14,7 +14,8 @@
 #
 # The virtual address vip is translated by iptables in the namespace of app,
 # as kube-proxy does for a Service on the host of its client, to db and
-# another port; the collector knows it from its translations.
+# another port; the agent of app learns the translation from conntrack, and
+# the collector has no translations in its configuration.
 #
 # Every service runs in a cgroup of its own, like a systemd unit, and the
 # agents enter the namespaces with nsenter, which keeps /sys and thus the
@@ -180,8 +181,6 @@ connectors:
   shawk:
     postgres: { dsn_file: "$WORK/dsn", migrate: true }
     write_interval: 2s
-    translations:
-      vip: { virtual: ["$VIP:6432"], backends: ["${ADDR[db]}:5435"], transport: tcp }
 exporters:
   debug: { verbosity: detailed }
 service:
@@ -221,6 +220,15 @@ if [[ "$udp_traced" != t ]]; then
 	[[ "$STRICT" == 1 ]] && fail "the agents do not trace UDP"
 	echo "WARNING: the agents do not trace UDP; the UDP dependency is not checked" >&2
 	UDP=false
+fi
+
+# The agent of app must learn translations, unless the kernel cannot
+# (kprobes) and the run is not strict.
+LEARNED=true
+if ! grep -q 'msg="learning translations of addresses from conntrack"' "$WORK/app-01-agent.log"; then
+	[[ "$STRICT" == 1 ]] && fail "the agent of app does not learn translations: $(grep -i translation "$WORK/app-01-agent.log")"
+	echo "WARNING: the agent of app does not learn translations; the dependency through vip is not checked" >&2
+	LEARNED=false
 fi
 
 svc ext client --client "${ADDR[lb]}:80"
@@ -264,9 +272,15 @@ want_deps() {
 	fi
 	echo "$app puma $u-app-puma.service $db postgres $u-db-postgres.service tcp 5432 4 both
 $app puma $u-app-puma.service $db postgres $u-db-postgres.service tcp 5433 4 both
-$app puma $u-app-puma.service $db postgres $u-db-postgres.service tcp 5434 6 both
-$app puma $u-app-puma.service $db postgres $u-db-postgres.service tcp 5435 4 both
-$app puma $u-app-puma.service $app redis-server $u-app-redis-server.service tcp 6379 4 both
+$app puma $u-app-puma.service $db postgres $u-db-postgres.service tcp 5434 6 both"
+	# Through vip, which the learned translation alone ties to the client.
+	if $LEARNED; then
+		echo "$app puma $u-app-puma.service $db postgres $u-db-postgres.service tcp 5435 4 both"
+	elif [[ "$app" != node-01 ]]; then
+		# A row of the server alone, which the checks of node-01 leave out.
+		echo "${ADDR[app]} - - $db postgres $u-db-postgres.service tcp 5435 4 server"
+	fi
+	echo "$app puma $u-app-puma.service $app redis-server $u-app-redis-server.service tcp 6379 4 both
 $lb haproxy $u-lb-haproxy.service $app puma $u-app-puma.service tcp 8080 4 both"
 }
 
@@ -285,13 +299,21 @@ poll 30 peers_named || true
 
 check "dependencies" "$(deps_sql true)" "$deps_want"
 
-# puma connects to the virtual address, which only the translation ties to
-# postgres.
-check "dependencies through the translation" "
+# puma connects to the virtual address, which only the translation the agent
+# of app learned ties to postgres.
+if $LEARNED; then
+	check "dependencies through the learned translation" "
 SELECT client_host, server_host, host(server_addr), port, host(virtual_addr), virtual_port, translation
 FROM shawk_v1.dependencies_between(now() - interval '1 hour', now())
 WHERE translation IS NOT NULL OR server_addr = '$VIP'" \
-"app-01 db-01 ${ADDR[db]} 5435 $VIP 6432 vip"
+"app-01 db-01 ${ADDR[db]} 5435 $VIP 6432 ~learned"
+	check "learned translations" "
+SELECT DISTINCT h.hostname, t.proto, host(t.client_addr), host(t.virtual_addr), t.virtual_port, host(t.source_addr),
+       host(t.backend_addr), t.backend_port
+FROM shawk.learned_translations t JOIN shawk.hosts h ON h.id = t.host_id
+WHERE t.virtual_addr = '$VIP'" \
+"app-01 tcp ${ADDR[app]} $VIP 6432 ${ADDR[app]} ${ADDR[db]} 5435"
+fi
 
 check "unused listeners" "
 SELECT s.host, s.port, s.service

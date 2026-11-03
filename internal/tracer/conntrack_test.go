@@ -8,6 +8,7 @@ import (
 	"os"
 	"slices"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -58,8 +59,9 @@ func natNetNS(t *testing.T) (func(f func()), uint32) {
 }
 
 // listenIn listens on addr in the namespace of run and accepts until the
-// test ends, keeping the connections open.
-func listenIn(t *testing.T, run func(func()), addr string) {
+// test ends, keeping the connections open. It returns a function that
+// closes the listener and the connections.
+func listenIn(t *testing.T, run func(func()), addr string) (closeAll func()) {
 	t.Helper()
 	var (
 		ln  net.Listener
@@ -69,16 +71,31 @@ func listenIn(t *testing.T, run func(func()), addr string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { ln.Close() })
+	var (
+		mu    sync.Mutex
+		conns []net.Conn
+	)
+	closeAll = func() {
+		ln.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range conns {
+			c.Close()
+		}
+	}
+	t.Cleanup(closeAll)
 	go func() {
 		for {
 			c, err := ln.Accept()
 			if err != nil {
 				return
 			}
-			t.Cleanup(func() { c.Close() })
+			mu.Lock()
+			conns = append(conns, c)
+			mu.Unlock()
 		}
 	}()
+	return closeAll
 }
 
 func findTranslation(xs []Translation, want Translation) bool {
@@ -94,8 +111,9 @@ func TestTranslations(t *testing.T) {
 	if !tr.TranslationsTraced() {
 		skipUnavailable(t, "translations are not learned from conntrack")
 	}
+	var closers []func()
 	for _, a := range []string{"10.99.0.2:5435", "10.99.0.3:5436"} {
-		listenIn(t, run, a)
+		closers = append(closers, listenIn(t, run, a))
 	}
 	collect(t, tr)
 	dnat := dialFrom(t, run, "tcp4", "10.99.0.1", "10.200.0.1:6432")
@@ -127,7 +145,10 @@ func TestTranslations(t *testing.T) {
 	dnat.Close()
 	snat.Close()
 	direct.Close()
-	// The entries of the namespace go with it.
+	for _, c := range closers {
+		c()
+	}
+	// The entries of the namespace go with it, once its sockets are closed.
 	unix.Unmount(netnsPath(t, ns), unix.MNT_DETACH)
 	deadline := time.Now().Add(30 * time.Second)
 	for {

@@ -143,7 +143,7 @@ func (c *shawkConnector) prepare(ctx context.Context) bool {
 		}
 	}
 	at := c.now()
-	rows, err := c.store.peers(ctx)
+	rows, err := c.store.peers(ctx, c.cfg.IdleTTL)
 	if err != nil {
 		c.log.Warn("reading the names of peers from PostgreSQL", zap.Error(err))
 		return true

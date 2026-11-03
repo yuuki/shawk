@@ -26,7 +26,10 @@
 # 6.0, including Rocky Linux 9), they run with SHAWK_TEST_NO_UDP=1: UDP
 # tracing must be reported unavailable. The initramfs holds the modules of
 # the NFS client for Rocky Linux 9 (from kernel-modules-core), which init
-# loads; the other kernels run with SHAWK_TEST_NO_NFS=1. Further arguments of the test binaries can be given in
+# loads; the other kernels run with SHAWK_TEST_NO_NFS=1. It also holds the
+# modules of conntrack and nf_tables with NAT, from kernel-modules-core or
+# the modules package of the mainline build, for the tests of translations;
+# a kernel given by its path runs with SHAWK_TEST_NO_CONNTRACK=1. Further arguments of the test binaries can be given in
 # VM_TEST_ARGS, e.g. VM_TEST_ARGS='-test.run=TestUDP'.
 #
 # Requires go, qemu-system-x86_64 or qemu-system-aarch64, cpio, gzip, curl,
@@ -52,8 +55,11 @@ fetch() { "$ROOT/scripts/fetch-verified.sh" "$@"; }
 # The environment may declare a kernel without BPF trampolines, e.g. one
 # given by its path.
 no_udp="${SHAWK_TEST_NO_UDP:-}"
-# The package holding the modules of the NFS client, if any.
+# The package holding the modules of the NFS client, if any (Rocky Linux),
+# and the package of the netfilter modules that the tests of translations
+# load (conntrack and nf_tables with NAT).
 modules=""
+nfmodules=""
 
 # Packages signed by the Rocky Linux 9 release key (rpmkeys --checksig, key id
 # 350d275d). The mainline builds are pinned by the SHA-256 they had when
@@ -65,7 +71,8 @@ rocky9/x86_64)
 	pkg=$(fetch $rocky/x86_64/os/Packages/k/kernel-core-5.14.0-570.58.1.el9_6.x86_64.rpm \
 		e24873a95fc2c4bdc1fbc6e3416064266eeed6005e2b44684f5d1fcfdc7c6c7f)
 	modules=$(fetch $rocky/x86_64/os/Packages/k/kernel-modules-core-5.14.0-570.58.1.el9_6.x86_64.rpm \
-		af3acc764136bc51035c0ae5ea93d7166cc02818c3032c089c2876c5024135d8) ;;
+		af3acc764136bc51035c0ae5ea93d7166cc02818c3032c089c2876c5024135d8)
+	nfmodules=$modules ;;
 rocky9/aarch64)
 	# arm64 has BPF trampolines since Linux 6.0, and RHEL 9 did not backport
 	# them: fentry programs load but do not attach.
@@ -73,17 +80,24 @@ rocky9/aarch64)
 	pkg=$(fetch $rocky/aarch64/os/Packages/k/kernel-core-5.14.0-570.58.1.el9_6.aarch64.rpm \
 		f0eb542737285c1a7fd386a2cbb5f464228b847762d585d8bd47aa013512d7dd)
 	modules=$(fetch $rocky/aarch64/os/Packages/k/kernel-modules-core-5.14.0-570.58.1.el9_6.aarch64.rpm \
-		decce35b2fad61a7601ae1786411f9e053c89df8b0d3a3c873d4c83525a5fd11) ;;
+		decce35b2fad61a7601ae1786411f9e053c89df8b0d3a3c873d4c83525a5fd11)
+	nfmodules=$modules ;;
 5.14/x86_64)
 	pkg=$(fetch $mainline/v5.14.21/amd64/linux-image-unsigned-5.14.21-051421-generic_5.14.21-051421.202111210831_amd64.deb \
-		632912f5bc688328e7f75d0e3b5038146aa8650c46f6d6fdb20f0ceed6a245e0) ;;
+		632912f5bc688328e7f75d0e3b5038146aa8650c46f6d6fdb20f0ceed6a245e0)
+	nfmodules=$(fetch $mainline/v5.14.21/amd64/linux-modules-5.14.21-051421-generic_5.14.21-051421.202111210831_amd64.deb \
+		69783c0baecbb260106e91850ff0170978476c8c7334a8c5a734057bff21488a) ;;
 5.15/x86_64)
 	pkg=$(fetch $mainline/v5.15.224/amd64/linux-image-unsigned-5.15.224-0515224-generic_5.15.224-0515224.202610301525_amd64.deb \
-		bce2733d9144d11e31f9680c69cd093a656e68b0fe50b315c364c2544cf5a29e) ;;
+		bce2733d9144d11e31f9680c69cd093a656e68b0fe50b315c364c2544cf5a29e)
+	nfmodules=$(fetch $mainline/v5.15.224/amd64/linux-modules-5.15.224-0515224-generic_5.15.224-0515224.202610301525_amd64.deb \
+		9c03f8b68f2f8be55e1847ad477182faf1e8f14fb9d2b3e7aa6df08a97c6577a) ;;
 5.15/aarch64)
 	: "${no_udp:=1}"
 	pkg=$(fetch $mainline/v5.15.224/arm64/linux-image-unsigned-5.15.224-0515224-generic_5.15.224-0515224.202610301525_arm64.deb \
-		dee11976dee32b5e762a74fa027a17619b9c425135f84fae6be1d0c6bc1fb7bd) ;;
+		dee11976dee32b5e762a74fa027a17619b9c425135f84fae6be1d0c6bc1fb7bd)
+	nfmodules=$(fetch $mainline/v5.15.224/arm64/linux-modules-5.15.224-0515224-generic_5.15.224-0515224.202610301525_arm64.deb \
+		e70cc5629bd04165cbd2cdfd14787a22f41c544d083f40673a2ff4d3b3bbcc94) ;;
 *)
 	if [[ ! -f "$KERNEL" ]]; then
 		echo "unknown kernel $KERNEL for $ARCH" >&2
@@ -130,6 +144,30 @@ if [[ -n "$modules" ]]; then
 	done
 	no_nfs=0
 fi
+# conntrack and nf_tables with NAT (TestTranslations), unless the kernel
+# has no package of modules (a kernel given by its path).
+no_conntrack=1
+nf=(lib/libcrc32c net/ipv4/netfilter/nf_defrag_ipv4 net/ipv6/netfilter/nf_defrag_ipv6
+	net/netfilter/nf_conntrack net/netfilter/nf_nat net/netfilter/nfnetlink net/netfilter/nf_tables
+	net/netfilter/nft_chain_nat net/netfilter/nft_nat)
+if [[ -n "$nfmodules" ]]; then
+	mkdir -p "$WORK/nf" "$initrd/vm/modules"
+	case "$nfmodules" in
+	*.rpm)
+		pats=(); for m in "${nf[@]}"; do pats+=("./lib/modules/*/kernel/$m.ko.xz"); done
+		(cd "$WORK/nf" && rpm2cpio "$nfmodules" | cpio -idm --quiet "${pats[@]}")
+		for m in "${nf[@]}"; do
+			xz -dc "$WORK"/nf/lib/modules/*/kernel/"$m".ko.xz >"$initrd/vm/modules/$(basename "$m").ko"
+		done ;;
+	*.deb)
+		pats=(); for m in "${nf[@]}"; do pats+=("./lib/modules/*/kernel/$m.ko"); done
+		dpkg-deb --fsys-tarfile "$nfmodules" | tar -x -C "$WORK/nf" --wildcards "${pats[@]}"
+		for m in "${nf[@]}"; do
+			cp "$WORK"/nf/lib/modules/*/kernel/"$m".ko "$initrd/vm/modules/"
+		done ;;
+	esac
+	no_conntrack=0
+fi
 (
 	cd "$ROOT"
 	export CGO_ENABLED=0 GOOS=linux GOARCH=$goarch
@@ -146,7 +184,7 @@ EOF
 
 # Unknown parameters of the kernel command line are passed to init as
 # environment variables.
-cmdline="console=$console panic=-1 quiet SHAWK_TEST_STRICT=${SHAWK_TEST_STRICT:-1} SHAWK_TEST_NO_UDP=${no_udp:-0} SHAWK_TEST_NO_NFS=${SHAWK_TEST_NO_NFS:-$no_nfs}"
+cmdline="console=$console panic=-1 quiet SHAWK_TEST_STRICT=${SHAWK_TEST_STRICT:-1} SHAWK_TEST_NO_UDP=${no_udp:-0} SHAWK_TEST_NO_NFS=${SHAWK_TEST_NO_NFS:-$no_nfs} SHAWK_TEST_NO_CONNTRACK=${SHAWK_TEST_NO_CONNTRACK:-$no_conntrack}"
 opts=(-m 2G -smp 2 -nographic -no-reboot -kernel "$image" -initrd "$WORK/initramfs.gz" -append "$cmdline")
 host="$(uname -m)"
 if [[ "$host" == "$ARCH" && -r /dev/kvm && -w /dev/kvm ]]; then

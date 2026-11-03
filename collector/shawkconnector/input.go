@@ -75,6 +75,27 @@ type edgeInput struct {
 	values      map[valueKey]point
 }
 
+// translationID identifies a translation of addresses that a host made:
+// the client connected to virtual on vport, and the backend at backend on
+// bport saw the connection from source, which is the client unless the
+// host replaced its address (SNAT).
+type translationID struct {
+	proto           string
+	netns           uint64
+	client, virtual netip.Addr
+	vport           uint16
+	source, backend netip.Addr
+	bport           uint16
+}
+
+// dnat tells whether the backend sees the address of the client.
+func (id *translationID) dnat() bool { return id.source == id.client }
+
+type translationInput struct {
+	id          translationID
+	first, last time.Time
+}
+
 type listenerID struct {
 	proto string
 	addr  netip.Addr
@@ -98,8 +119,9 @@ type hostBatch struct {
 	addrs        []netip.Addr
 	time         time.Time // of the latest data point
 
-	edges     map[edgeID]*edgeInput
-	listeners map[listenerID]*listenerInput
+	edges        map[edgeID]*edgeInput
+	listeners    map[listenerID]*listenerInput
+	translations map[translationID]*translationInput
 
 	segmentStart time.Time
 	udpTraced    bool
@@ -138,6 +160,7 @@ func parseResource(rm pmetric.ResourceMetrics) (*hostBatch, error) {
 		agentVersion: getString(res, attrServiceVersion),
 		edges:        map[edgeID]*edgeInput{},
 		listeners:    map[listenerID]*listenerInput{},
+		translations: map[translationID]*translationInput{},
 		agent:        pmetric.NewMetricSlice(),
 	}
 	if b.hostname == "" {
@@ -234,6 +257,16 @@ func (b *hostBatch) addMetric(m pmetric.Metric) {
 					l.first = t
 				} else {
 					l.last = t
+				}
+			}
+		})
+	case metricTranslationFirst, metricTranslationLast:
+		forGauge(b, m, func(dp pmetric.NumberDataPoint, t time.Time) {
+			if x := b.translation(dp.Attributes()); x != nil {
+				if name == metricTranslationFirst {
+					x.first = t
+				} else {
+					x.last = t
 				}
 			}
 		})
@@ -370,6 +403,35 @@ func (b *hostBatch) listener(a pcommon.Map) *listenerInput {
 		b.listeners[id] = l
 	}
 	return l
+}
+
+// translation returns the translation of the attributes of a data point,
+// or nil if they are invalid.
+func (b *hostBatch) translation(a pcommon.Map) *translationInput {
+	proto := getString(a, attrTransport)
+	netns, ok1 := getInt(a, attrNetNS)
+	vport, ok2 := getInt(a, attrTranslationVirtualPort)
+	bport, ok3 := getInt(a, attrTranslationBackendPort)
+	var addrs [4]netip.Addr
+	valid := (proto == "tcp" || proto == "udp") && ok1 && ok2 && ok3 &&
+		vport >= 0 && vport <= 65535 && bport >= 0 && bport <= 65535
+	for i, k := range []string{attrTranslationClient, attrTranslationVirtual, attrTranslationSource, attrTranslationBackend} {
+		addr, err := parseAddr(getString(a, k))
+		valid = valid && err == nil && !addr.IsUnspecified()
+		addrs[i] = addr
+	}
+	if !valid {
+		b.invalid++
+		return nil
+	}
+	id := translationID{proto: proto, netns: uint64(netns), client: addrs[0], virtual: addrs[1], vport: uint16(vport),
+		source: addrs[2], backend: addrs[3], bport: uint16(bport)}
+	x, ok := b.translations[id]
+	if !ok {
+		x = &translationInput{id: id}
+		b.translations[id] = x
+	}
+	return x
 }
 
 // parseAddr parses an address without its IPv6 zone, which PostgreSQL's
