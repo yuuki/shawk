@@ -68,10 +68,33 @@ struct shawk_peer_prefix {
 	__u8 addr[16];
 };
 
+/*
+ * Buckets of the handshake durations of TCP active opens. Their upper
+ * bounds, inclusive, are 100 µs, 250 µs, 500 µs, 1 ms, 2.5 ms, 10 ms,
+ * 50 ms, 250 ms, 1 s and 3 s (see hs_bucket()); the last bucket has none.
+ * The histogram shawk.tcp.handshake of the agent has the same bounds.
+ */
+#define HS_BUCKETS 11
+
+/*
+ * Why a TCP active open failed, the error.type of the agent (see
+ * fail_reason()). A failure without one of these reasons is counted in
+ * conn_fails only: conn_fails minus the sum of fails is the reason _OTHER.
+ */
+enum shawk_fail_reason {
+	FAIL_REFUSED = 0,     /* a reset or ICMP port unreachable */
+	FAIL_TIMEOUT = 1,     /* no answer to any SYN */
+	FAIL_UNREACHABLE = 2, /* ICMP unreachable or prohibited, no ARP/ND answer */
+	FAIL_LOCAL = 3,       /* no SYN was built: no free local port, no buffer */
+	FAIL_ABORTED = 4,     /* the application closed the socket first */
+	FAIL_REASONS = 5,
+};
+
 struct shawk_flow_stats {
 	__u64 bytes_sent;
 	__u64 bytes_recv;
 	__u64 rtt_sum_us;   /* sum of smoothed RTT samples (TCP) */
+	__u64 hs_sum_us;    /* sum of the handshake durations of hs_buckets, in µs */
 	__u32 conns;        /* TCP connections established in the interval */
 	__u32 conn_fails;   /* TCP active opens that failed in the interval */
 	__u32 open_conns;   /* TCP connections open at the end of the interval */
@@ -80,6 +103,18 @@ struct shawk_flow_stats {
 	__u32 retrans;      /* TCP segments retransmitted */
 	__u32 rtt_samples;  /* number of RTT samples */
 	__u32 pid;          /* last observed process id */
+	/*
+	 * TCP active opens established in the interval by the duration of
+	 * their handshake, from connect(2) to the SYN-ACK. Those without a
+	 * duration (see handshake_done()) are counted in conns only.
+	 */
+	__u32 hs_buckets[HS_BUCKETS];
+	/*
+	 * SYNs retransmitted by the active opens counted in the interval, as
+	 * connections or as failures.
+	 */
+	__u32 syn_retrans;
+	__u32 fails[FAIL_REASONS]; /* failed active opens by reason */
 };
 
 enum shawk_iter_rec_type {

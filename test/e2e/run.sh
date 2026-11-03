@@ -11,6 +11,7 @@
 #                                        app puma --UDP---> db:5353 named
 #                                        app puma --vip:6432--> db:5435 postgres
 #                                        app puma --vip:6433--> db:5436 postgres
+#                                        app client --refused-> db:5999 (nothing listens)
 #                                                         db:9187 exporter (unused)
 #
 # The virtual address vip is translated by iptables in the namespace of app,
@@ -168,6 +169,8 @@ ip netns exec "$PREFIX-app" iptables -t nat -A OUTPUT -d "$VIP" -p tcp --dport 6
 svc app puma --listen 8080 --upstream "${ADDR[db]}:5432" --upstream 127.0.0.1:6379 \
 	--upstream "[${ADDR6[db]}]:5434" --udp-upstream "${ADDR[db]}:5353" --persist "${ADDR[db]}:5433" \
 	--upstream "$VIP:6432" --upstream "$VIP:6433"
+# Connects refused where nothing listens, apart from the requests of puma.
+svc app client --client "${ADDR[db]}:5999"
 svc lb haproxy --listen 80 --upstream "${ADDR[app]}:8080"
 wait_for 10 "puma to listen" listening app 8080
 wait_for 10 "haproxy to listen" listening lb 80
@@ -357,12 +360,37 @@ check "dependency map" \
 puma postgres
 ~unresolved haproxy"
 
-# The forwarded metrics name the peers and carry no addresses.
+# forwarded METRIC PATTERN...: whether the collector forwarded a data point
+# of METRIC whose attributes hold every PATTERN, with a value or a count
+# above 0.
+forwarded() {
+	PATTERNS="$(printf '%s\n' "${@:2}")" awk -v metric="$1" '
+		BEGIN { n = split(ENVIRON["PATTERNS"], pat, "\n") }
+		/-> Name: / { name = $NF }
+		/DataPoints #/ { attrs = "" }
+		/^ *-> / { attrs = attrs $0 "\n" }
+		/^(Value|Count): / && name == metric && $NF + 0 > 0 {
+			ok = 1
+			for (i = 1; i <= n; i++) if (!index(attrs, pat[i])) ok = 0
+			if (ok) found = 1
+		}
+		END { exit !found }' "$WORK/collector.log"
+}
+
+# The forwarded metrics name the peers and carry no addresses. Clients
+# connect to a port where nothing listens too, which is ~unresolved on the
+# client side.
 grep -q 'service.peer.name: Str(postgres)' "$WORK/collector.log" || fail "no series of puma to postgres"
 grep -q 'service.peer.name: Str(haproxy)' "$WORK/collector.log" || fail "no series of puma's server side"
 grep -q 'shawk.peer.agent: Bool(true)' "$WORK/collector.log" || fail "no series of a peer with an agent"
-grep -q 'service.peer.name: Str(~unresolved)' "$WORK/collector.log" || fail "no series of the client without an agent"
+forwarded shawk.connection.opened 'service.peer.name: Str(~unresolved)' 'shawk.peer.agent: Bool(false)' 'shawk.role: Str(server)' ||
+	fail "no series of the client without an agent"
 if grep -q 'network.peer.address' "$WORK/collector.log"; then fail "peer addresses forwarded"; fi
+# The handshakes of the active opens, and the failures to the port where
+# nothing listens by reason. A new series of a reason emits 0 first.
+poll 30 forwarded shawk.tcp.handshake 'service.peer.name: Str(postgres)' || fail "no handshakes of puma to postgres forwarded"
+grep -q 'Name: shawk.tcp.syn_retransmits$' "$WORK/collector.log" || fail "no SYN retransmissions forwarded"
+poll 30 forwarded shawk.connection.failed.by_reason 'error.type: Str(refused)' || fail "no refused connections forwarded"
 
 # One agent traces every namespace, as on a host with containers. The
 # addresses of the namespaces move from the hosts above to node-01, and

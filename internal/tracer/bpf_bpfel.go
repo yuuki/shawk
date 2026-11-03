@@ -38,6 +38,7 @@ type bpfShawkFlowStats struct {
 	BytesSent  uint64
 	BytesRecv  uint64
 	RttSumUs   uint64
+	HsSumUs    uint64
 	Conns      uint32
 	ConnFails  uint32
 	OpenConns  uint32
@@ -46,6 +47,10 @@ type bpfShawkFlowStats struct {
 	Retrans    uint32
 	RttSamples uint32
 	Pid        uint32
+	HsBuckets  [11]uint32
+	SynRetrans uint32
+	Fails      [5]uint32
+	_          [4]byte
 }
 
 type bpfShawkIterRec struct {
@@ -88,10 +93,13 @@ type bpfShawkSockState struct {
 	Key         bpfShawkFlowKey
 	SentBase    uint64
 	RecvBase    uint64
+	SynNs       uint64
 	RetransBase uint32
 	Pid         uint32
 	Flags       uint32
+	HsUs        uint32
 	Walked      uint32
+	Pad         uint32
 }
 
 type bpfShawkUdpState struct {

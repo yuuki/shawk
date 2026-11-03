@@ -103,14 +103,19 @@ bytes sent/received, UDP datagrams, retransmissions and smoothed RTT samples.
 They cover the edge weights listed in §2.4 of the paper (throughput, RTT,
 messages, errors and connections), except that TCP messages are not counted
 since there is no hook on the data path; failed connection attempts and
-retransmissions stand for errors, and open connections are added.
+retransmissions stand for errors, and open connections are added. For the
+active opens of TCP it also accumulates the handshakes, by duration from
+`connect(2)` to the SYN-ACK in fixed buckets and their sum, the SYNs they
+retransmitted, and the failures by reason (§3.2): the measurement of
+Pingmesh, taken passively on the connections that hosts open anyway
+(`docs/proposal-path-quality.md`).
 
 ### 3.2 TCP: tracepoints and socket iterators only
 
 | hook | role |
 |---|---|
 | `tp_btf/inet_sock_set_state` CLOSE→SYN_SENT | **active open**. Runs inside `connect(2)`, so the current task is the client. The flow key and the owner are stored in the socket local storage (`BPF_MAP_TYPE_SK_STORAGE`). |
-| SYN_SENT→ESTABLISHED / →CLOSE | count an established / failed outgoing connection |
+| SYN_SENT→ESTABLISHED / →CLOSE | count an established / failed outgoing connection, with the duration of its handshake, the SYNs it retransmitted and the reason of a failure (below) |
 | SYN_RECV→* | **passive open**; counts an incoming connection. It usually goes to ESTABLISHED; a child created by a TCP Fast Open SYN, which carries data and is accepted at once, may also be closed or reset before the handshake completes. Other children that leave SYN_RECV for CLOSE failed to be created (e.g. without a route to the client) and are not counted. On a socket that went through SYN_SENT it ends a simultaneous open instead, e.g. of a socket connected to itself, which stays outgoing. |
 | *→CLOSE | account the remaining bytes of the connection, if any |
 | `iter/tcp` (every interval) | account byte deltas of long-lived connections, sample RTT, count open connections, list listening sockets, **adopt** connections established before the agent started |
@@ -159,6 +164,52 @@ may rarely be counted twice. Atomic exchange is avoided because the arm64 JIT
 supports it only since Linux 5.18. The direction of a
 connection is decided once, when it is opened, and kept in the socket local
 storage.
+
+**Handshakes and failures of active opens.** CLOSE→SYN_SENT stores
+`bpf_ktime_get_ns()` in the socket storage, inside `connect(2)` before the
+local port is chosen; SYN_SENT→ESTABLISHED takes the duration, rounded up to
+whole microseconds and saturated at 71 minutes. It is counted with the
+connection, into the bucket whose upper bound, inclusive, it reaches first:
+100 µs, 250 µs, 500 µs, 1 ms (within a rack or a data center), 2.5 ms,
+10 ms, 50 ms, 250 ms (between data centers and regions), 1 s and 3 s, and
+a last bucket without bound. The last ones separate handshakes that waited
+for a retransmission timeout from those that did not; how many SYNs were
+lost comes from the retransmissions, not from the buckets, since the
+schedule of SYNs differs between kernels (Linux 5.14 and RHEL 9 send them at
+0, 1, 3, 7 s and so on, kernels with `net.ipv4.tcp_syn_linear_timeouts`
+start with one a second). The SYNs retransmitted are `total_retrans` when
+the active open is established or fails: the SYN is all that a socket in
+SYN_SENT retransmits, since data carried by a Fast Open SYN is
+retransmitted after `tcp_finish_connect()`. They are attempts, not losses
+on the wire: SYNs dropped on the host (netfilter, egress BPF, the qdisc)
+count, a lost SYN-ACK counts as a retransmitted SYN, and a retransmission
+skipped while the previous copy is still queued does not. Like the
+connection, the handshake waits in the socket storage until its flow can be
+updated, so a dropped update counts it later (`SS_RECOUNT`). A socket in
+`TCP_REPAIR` has no duration, nor does a connect with
+`TCP_FASTOPEN_CONNECT`, which may be deferred to the first write; a
+simultaneous open, an adopted connection, an additional subflow of MPTCP
+and the agent's own connections have no handshake at all. The reason of a
+failure, the `error.type` of the agent, is decided at SYN_SENT→CLOSE:
+
+| condition, in order | reason |
+|---|---|
+| no segment sent (`segs_out`), and the connect deferred by `TCP_FASTOPEN_CONNECT` (`defer_connect`) | `aborted`: a deferred connect closed before its first write |
+| no segment sent | `local`: no SYN was built, e.g. no free local port (`EADDRNOTAVAIL` from `inet_hash_connect()`) or no buffer |
+| `sk_err` `ECONNREFUSED` | `refused`: a reset (no listener), or an ICMP port unreachable, which iptables and nft send to reject by default |
+| `sk_err` `ETIMEDOUT` | `timeout`: no answer to any SYN |
+| `sk_err` `EHOSTUNREACH`, `ENETUNREACH`, `EHOSTDOWN`, `ENONET`, `EACCES` | `unreachable`: an ICMP error from a router or a firewall (firewalld's administratively prohibited is `EACCES` over IPv6), or no answer to ARP/ND |
+| no `sk_err`, the first subflow of an MPTCP connection whose MPTCP socket has an `sk_err` | its reason: kernels without `tcp_done_with_error()` move the error there before `tcp_done()` |
+| no `sk_err`, the socket not held by a process (`sk_lock.owned`) | the reason of `sk_err_soft`, else `timeout`: a timer or an ICMP error closed it, but user space already took the error, which kernels without `tcp_done_with_error()` report before `tcp_done()`: 5.14 and RHEL 9, and others before 6.11 or before its backports (5.15.165, 6.1.110, 6.6.50) |
+| no `sk_err` | `aborted`: the application closed the socket first, usually after its own connect timeout |
+| another `sk_err` (`ECONNABORTED` from `ss -K`, ...) | `_OTHER`: the kernel counts it in the failures only, and the agent sends the failures without another reason as `_OTHER` |
+
+A stale `ECONNRESET` that `connect(AF_UNSPEC)` leaves in `sk_err` survives
+only until `tcp_connect_init()` builds a SYN, so it is seen with no segment
+sent only. A failed simultaneous open counts as `_OTHER`. The cost is two
+`bpf_ktime_get_ns()` calls and a few comparisons per connection, and a few
+reads per failure, on a flow looked up anyway; the flow statistics take 136
+bytes and the socket storage 112.
 
 A connection that existed before the agent started is adopted by the first
 walk. It is incoming when its local port is listening; it then belongs to
@@ -669,7 +720,17 @@ continues the same series.
 | `shawk.udp.datagrams` | Counter, `{datagram}` | UDP datagrams, with `network.io.direction` |
 | `shawk.tcp.retransmits` | Counter, `{segment}` | segments the local socket retransmitted |
 | `shawk.tcp.rtt` | Histogram without buckets, `s` | smoothed RTT samples (sum and count) |
+| `shawk.tcp.handshake` | Histogram, `s` | handshakes of the active opens established, by duration, with the bounds of §3.2 (TCP client side only) |
+| `shawk.tcp.syn_retransmits` | Counter, `{segment}` | SYNs the active opens retransmitted, established or failed (TCP client side only) |
+| `shawk.connection.failed.by_reason` | Counter, `{connection}` | failed attempts with `error.type` (`refused`, `timeout`, `unreachable`, `local`, `aborted`, `_OTHER`; TCP client side only) |
 | `shawk.edge.first_seen`, `shawk.edge.last_seen` | Gauge, `s` | Unix time of the first and last activity |
+
+A reason of failure is sent from its first occurrence on an edge on, with
+the start of the interval it first occurred in as the start of its
+counter, so that an edge does not carry six points of zeros and the
+connector takes the first value as new rather than as a baseline.
+`shawk.connection.failed` is unchanged; it also counts the failures of
+agents that predate the reasons.
 
 Listening sockets are sent as `shawk.listener.first_seen` and
 `shawk.listener.last_seen` with the transport, address, port, netns and
@@ -703,7 +764,9 @@ replaced.
   minute) the agent sends all live series of the host over OTLP (gRPC or
   HTTP/protobuf, gzip), in requests of at most `-max-series-per-request`
   (1000) edges and listeners and at most 3 MiB, below the 4 MiB default
-  limit of a gRPC receiver. Listeners come first, then server edges, then
+  limit of a gRPC receiver; the size of every series is bounded before it
+  is encoded, with the buckets of its handshakes and the reasons of
+  failure it carries. Listeners come first, then server edges, then
   client edges, so that the connector knows the services of the host
   before it names the peers of its clients. The last request carries the
   metrics of the agent and closes the interval; after a failed request the
@@ -879,14 +942,16 @@ warnings are only logged.
 ### 5.3 Metrics to Prometheus
 
 Edge metrics are reduced to `service.peer.name`, `shawk.peer.agent`, `shawk.role`,
-`server.port`, `network.transport` and, for bytes and datagrams,
-`network.io.direction`, and summed into **one resource per host and local
-service**: `service.name` and `service.namespace` of the resource are those
+`server.port`, `network.transport`, for bytes and datagrams
+`network.io.direction`, and for failures by reason `error.type`, and summed
+into **one resource per host and local service**: `service.name` and `service.namespace` of the resource are those
 of the local process, so Prometheus labels the series with the same `job`
 as the metrics of OBI for the service. `service.instance.id` is the host
 name, and `host.id` and `host.name` are promoted to labels by Prometheus.
 
-- Series are bounded by host × local service × peer service × port × role;
+- Series are bounded by host × local service × peer service × port × role,
+  and for failures by reason × the six values of `error.type` (others are
+  output as `_OTHER`);
   replicas and changing IPs of peers do not add series. Per host, local
   service and role, at most `max_peers` (50) peer names are used; the rest
   are folded into `~other`. `keep_peer_address` keeps
@@ -903,6 +968,18 @@ name, and `host.id` and `host.name` are promoted to labels by Prometheus.
   restart of the connector, or a host routed to another connector, thus
   does not add past totals at once. Open connections are the sum of the
   values the inputs had in the interval that closes.
+- Histograms are forwarded without buckets, as their sum and count, which
+  give the mean RTT and connect time of a dependency: buckets would add 10
+  series to every client dependency of TCP. The histogram of handshakes of
+  an agent with other bounds than those of §3.2 is invalid, and a
+  histogram restarts as a whole when any of its buckets decreases.
+- The output series of a reason of failure is created at its first
+  increase. It emits 0 the first time and the increase from the next
+  interval on, since `rate()` and `increase()` take the first sample of a
+  series as its start, and failures are often few. The other outputs start
+  with their whole value, so the failures by reason may count the failures
+  of the first interval of a new dependency, which
+  `shawk_connection_failed_total` leaves out.
 - An agent may send an interval in several requests. The outputs of a
   host are emitted once per interval, when the last request (the one with
   the metrics of the agent) arrives; an interval whose last request is
@@ -929,8 +1006,15 @@ name, and `host.id` and `host.name` are promoted to labels by Prometheus.
 | `shawk_connection_count` | open connections |
 | `shawk_network_io_bytes_total`, `shawk_udp_datagrams_total` | traffic |
 | `shawk_tcp_retransmits_total` | retransmitted segments |
-| `shawk_tcp_rtt_seconds_sum`, `shawk_tcp_rtt_seconds_count` | RTT |
+| `shawk_tcp_rtt_seconds_sum`, `shawk_tcp_rtt_seconds_count`, `shawk_tcp_rtt_seconds_bucket{le="+Inf"}` | RTT |
+| `shawk_tcp_handshake_seconds_sum`, `shawk_tcp_handshake_seconds_count`, `shawk_tcp_handshake_seconds_bucket{le="+Inf"}` | time to connect |
+| `shawk_tcp_syn_retransmits_total` | retransmitted SYNs |
+| `shawk_connection_failed_by_reason_total{error_type}` | failures by reason, one series per reason that occurred |
 | `shawk_agent_*` | agents |
+
+A client dependency of TCP thus has 13 series, and one per reason of
+failure that occurred: opened, failed, open connections, two of bytes,
+retransmits, three of RTT, three of handshakes and SYN retransmits.
 
 Prometheus needs `--web.enable-otlp-receiver`,
 `otlp.promote_resource_attributes: [host.id, host.name]` and an
@@ -1126,7 +1210,7 @@ recording rules in `packaging/prometheus/shawk-rules.yml` count it once:
 | metric | per dependency |
 |---|---|
 | connections, open connections, bytes, datagrams, RTT | the client side; the server side only when the client has no agent (`shawk_peer_agent="false"`) |
-| connection failures | the client side only (the server never sees them) |
+| connection failures, by reason, handshakes, SYN retransmissions | the client side only (the server never sees them, and its side of a handshake is not measured) |
 | retransmissions | both sides: each counts its own retransmitted segments; `shawk_role` is the sender |
 
 The two sides differ in `shawk_role`, so their `or` is a union.
@@ -1170,6 +1254,10 @@ observed: host") as annotations, so that the absence of a dependency is not
 read as disuse over them. The fleet dashboard lists both kinds of periods
 side by side, and shows what each agent folds and the ranges it keeps
 exact.
+
+The dependency details dashboard shows the mean connect time, the SYN
+retransmissions per connection attempt and the failures by reason of a
+dependency, next to its RTT and retransmissions.
 
 The panels of OBI use a minimal interval of a minute: OBI exports every 60
 seconds by default, and a rate over a shorter range would hold one sample.
@@ -1283,6 +1371,33 @@ parses. shawk runs beside it instead:
   change. Until then, they are not counted as open, and their traffic is
   accounted when they close or are found. Connections of the kernel, MPTCP
   subflows and children not yet accepted are not found.
+- **Handshakes** are measured on the connections that are opened only: a
+  path without new connections, such as one of connection pools, is not,
+  which active probing would add. A SYN counts as lost when it was
+  retransmitted, whatever dropped it or its SYN-ACK: a local firewall or a
+  network policy, a remote firewall that drops, or a server whose accept
+  or SYN queue is full; and an accept queue that fills between the SYN and
+  the final ACK makes the server drop the ACK while the client is
+  established. The duration includes the search for a free local port,
+  which slows down when the ephemeral ports to a destination run out, and
+  ends when the kernel of the client processes the SYN-ACK. A sidecar that
+  intercepts connections locally (iptables REDIRECT) answers the handshake
+  itself, in microseconds; a proxy or a load balancer that terminates TCP
+  is the end of the measured path. The schedules of SYNs differ between
+  kernels, so the buckets above 1 s of a mixed fleet are not comparable.
+  Failures before CLOSE→SYN_SENT, such as no route (`ip_route_connect()`)
+  or a cgroup BPF connect program, are not seen at all. A firewall that
+  rejects with a reset or ICMP port unreachable gives `refused`, which
+  reads as a service that is down; an application whose connect timeout is
+  below a second turns losses into `aborted`. An ICMP error processed
+  while `connect(2)` holds the socket only sets the soft error, and the
+  socket fails at the next SYN, a second later with one retransmission.
+  The fallback for the error taken by user space on kernels without
+  `tcp_done_with_error()` covers that race only in part. A SYN that an LSM denies on output
+  (SELinux returns `ECONNREFUSED` to `tcp_connect()`) is `aborted`, and so
+  is a connect deferred by `TCP_FASTOPEN_CONNECT` whose first write fails
+  to send the SYN. UDP has no handshake, and QUIC sets up its
+  connections in user space.
 - **Connections that predate the agent** are counted from the adoption on.
   One accepted by a listener created with a backlog of 0 whose listener is
   gone is recorded as outgoing.

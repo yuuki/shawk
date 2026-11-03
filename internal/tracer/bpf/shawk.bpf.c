@@ -10,8 +10,12 @@
  *                               current task is the client process. The
  *                               bundled flow key and the owner are kept in the
  *                               socket local storage.
- *       SYN_SENT -> ESTABLISHED counts an established outgoing connection.
- *       SYN_SENT -> CLOSE       counts a failed outgoing connection.
+ *       SYN_SENT -> ESTABLISHED counts an established outgoing connection,
+ *                               with the duration of its handshake and the
+ *                               SYNs it retransmitted.
+ *       SYN_SENT -> CLOSE       counts a failed outgoing connection, with
+ *                               the reason of the failure and the SYNs it
+ *                               retransmitted.
  *       SYN_RECV -> *           passive open; counts an incoming connection.
  *                               Its owner is the owner of the listening
  *                               socket, which user space resolves. On a
@@ -59,8 +63,15 @@ char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
 #define AF_INET 2
 #define AF_INET6 10
-#define EEXIST 17
+#define EACCES 13
 #define EBUSY 16
+#define EEXIST 17
+#define ENONET 64
+#define ENETUNREACH 101
+#define ETIMEDOUT 110
+#define ECONNREFUSED 111
+#define EHOSTDOWN 112
+#define EHOSTUNREACH 113
 #define SOCK_DGRAM 2
 #define SOCK_BINDPORT_LOCK 8
 /*
@@ -89,6 +100,14 @@ char LICENSE[] SEC("license") = "Dual BSD/GPL";
  * count it: its next walk or its close counts it.
  */
 #define SS_RECOUNT (1U << 4)
+/*
+ * An active open whose SYN was answered: count_conn() counts the SYNs it
+ * retransmitted, which retrans_base holds until the traffic of the
+ * connection is first taken, with its connection. With SS_HS_TIME, it also
+ * counts the duration of its handshake, hs_us.
+ */
+#define SS_HANDSHAKE (1U << 5)
+#define SS_HS_TIME (1U << 6)
 
 #define IPPROTO_MPTCP_ 262
 
@@ -160,10 +179,13 @@ struct shawk_sock_state {
 	struct shawk_flow_key key;
 	__u64 sent_base; /* tcp_sock.bytes_acked already accounted */
 	__u64 recv_base; /* tcp_sock.bytes_received already accounted */
+	__u64 syn_ns;    /* bpf_ktime_get_ns() at CLOSE -> SYN_SENT */
 	__u32 retrans_base;
 	__u32 pid;
 	__u32 flags;
+	__u32 hs_us; /* duration of the handshake, with SS_HS_TIME */
 	__u32 walked; /* walk_gen of the last walk that accounted the connection */
+	__u32 _pad;
 };
 
 struct {
@@ -559,11 +581,16 @@ static __always_inline __u64 task_cgroup_id(struct task_struct *task)
 	return BPF_CORE_READ(task, cgroups, dfl_cgrp, kn, id);
 }
 
+/*
+ * The value of a new flow. On the stack, it would take 136 bytes of the 512
+ * of every program that creates flows.
+ */
+static const struct shawk_flow_stats zero_stats = {};
+
 /* Looks up or creates the bundled flow in the active map. */
 static __always_inline struct shawk_flow_stats *
 flow_get(const struct shawk_flow_key *k)
 {
-	struct shawk_flow_stats zero = {};
 	struct shawk_flow_key key;
 	struct shawk_flow_stats *fs;
 	__u32 idx = active_idx & 1;
@@ -584,7 +611,7 @@ flow_get(const struct shawk_flow_key *k)
 	fs = bpf_map_lookup_elem(map, &key);
 	if (fs)
 		return fs;
-	err = bpf_map_update_elem(map, &key, &zero, BPF_NOEXIST);
+	err = bpf_map_update_elem(map, &key, &zero_stats, BPF_NOEXIST);
 	if (err && err != -EEXIST) {
 		/*
 		 * Retrying -EBUSY would fail again: the update holding the lock
@@ -718,9 +745,83 @@ static __always_inline bool ss_ready(const struct shawk_sock_state *ss)
 }
 
 /*
- * Counts an established connection once. When the flow cannot be updated,
- * the connection stays uncounted and its next event (a walk or its close)
- * counts it.
+ * Returns the bucket of a handshake duration in µs (see HS_BUCKETS). The
+ * bounds are inclusive, as those of OTLP histograms.
+ */
+static __always_inline __u32 hs_bucket(__u32 us)
+{
+	if (us <= 100)
+		return 0;
+	if (us <= 250)
+		return 1;
+	if (us <= 500)
+		return 2;
+	if (us <= 1000)
+		return 3;
+	if (us <= 2500)
+		return 4;
+	if (us <= 10000)
+		return 5;
+	if (us <= 50000)
+		return 6;
+	if (us <= 250000)
+		return 7;
+	if (us <= 1000000)
+		return 8;
+	if (us <= 3000000)
+		return 9;
+	return 10;
+}
+
+/*
+ * SYN_SENT -> ESTABLISHED: the SYN of an active open was answered. Its
+ * handshake is counted with its connection (SS_HANDSHAKE): the SYNs it
+ * retransmitted, which total_retrans holds alone at this point, since data
+ * carried by a Fast Open SYN is retransmitted after tcp_finish_connect(),
+ * and the time since connect(2), rounded up to whole µs and saturated at 71
+ * minutes.
+ *
+ * Some active opens have no duration. A socket in TCP_REPAIR (CRIU) is
+ * established without a SYN. A connect with TCP_FASTOPEN_CONNECT is
+ * deferred to the first write when a cookie is known, so its wait includes
+ * the time the application took to write; it is left out whether it was
+ * deferred or not, which this hook cannot tell.
+ */
+static __always_inline void handshake_done(struct shawk_sock_state *ss,
+					   struct tcp_sock *tp)
+{
+	__u64 us;
+
+	ss->flags |= SS_HANDSHAKE;
+	if (BPF_CORE_READ_BITFIELD_PROBED(tp, repair) ||
+	    BPF_CORE_READ_BITFIELD_PROBED(tp, fastopen_connect))
+		return;
+	us = (bpf_ktime_get_ns() - ss->syn_ns + 999) / 1000;
+	ss->hs_us = us > 0xffffffff ? 0xffffffff : us;
+	ss->flags |= SS_HS_TIME;
+}
+
+/* Counts the handshake of a connection with the connection (see count_conn()). */
+static __always_inline void count_handshake(struct shawk_flow_stats *fs,
+					    const struct shawk_sock_state *ss)
+{
+	__u32 b;
+
+	if (ss->retrans_base)
+		__sync_fetch_and_add(&fs->syn_retrans, ss->retrans_base);
+	if (!(ss->flags & SS_HS_TIME))
+		return;
+	b = hs_bucket(ss->hs_us);
+	if (b >= HS_BUCKETS)
+		return;
+	__sync_fetch_and_add(&fs->hs_buckets[b], 1);
+	__sync_fetch_and_add(&fs->hs_sum_us, ss->hs_us);
+}
+
+/*
+ * Counts an established connection once, with its handshake for an active
+ * open. When the flow cannot be updated, the connection stays uncounted and
+ * its next event (a walk or its close) counts it.
  */
 static __always_inline void count_conn(struct shawk_sock_state *ss)
 {
@@ -735,8 +836,139 @@ static __always_inline void count_conn(struct shawk_sock_state *ss)
 	}
 	ss->flags = (ss->flags | SS_COUNTED) & ~SS_RECOUNT;
 	__sync_fetch_and_add(&fs->conns, 1);
+	if (ss->flags & SS_HANDSHAKE)
+		count_handshake(fs, ss);
 	if (ss->pid)
 		fs->pid = ss->pid;
+}
+
+/* The reason of an error of a socket, or -1 for _OTHER. */
+static __always_inline int errno_reason(int err)
+{
+	switch (err) {
+	case ECONNREFUSED:
+		return FAIL_REFUSED;
+	case ETIMEDOUT:
+		return FAIL_TIMEOUT;
+	case EHOSTUNREACH:
+	case ENETUNREACH:
+	case EHOSTDOWN:
+	case ENONET:
+	case EACCES:
+		return FAIL_UNREACHABLE;
+	}
+	return -1;
+}
+
+/* defer_connect of struct inet_sock, a bitfield before Linux 6.6 and in RHEL 9. */
+struct inet_sock___defer {
+	__u8 defer_connect: 1;
+} __attribute__((preserve_access_index));
+
+/* inet_flags of struct inet_sock, since Linux 6.6. */
+struct inet_sock___flags {
+	unsigned long inet_flags;
+} __attribute__((preserve_access_index));
+
+/*
+ * The bit of inet_sock.inet_flags that replaces defer_connect since Linux
+ * 6.6, INET_FLAGS_DEFER_CONNECT; an anonymous enum cannot be relocated.
+ * TestDeferConnectBit compares it with the BTF of the kernel.
+ */
+#define INET_FLAGS_DEFER_CONNECT_ 19
+
+/*
+ * Whether a connect with TCP_FASTOPEN_CONNECT waits for the first write to
+ * send its SYN (tcp_fastopen_defer_connect()).
+ */
+static __always_inline bool connect_deferred(struct sock *sk)
+{
+	struct inet_sock___defer *old = (void *)sk;
+	struct inet_sock___flags *inet = (void *)sk;
+
+	if (bpf_core_field_exists(inet->inet_flags))
+		return (BPF_CORE_READ(inet, inet_flags) >> INET_FLAGS_DEFER_CONNECT_) & 1;
+	if (bpf_core_field_exists(old->defer_connect))
+		return BPF_CORE_READ_BITFIELD_PROBED(old, defer_connect);
+	return false;
+}
+
+/*
+ * Returns why an active open failed (SYN_SENT -> CLOSE), or -1 for _OTHER.
+ *
+ * - No segment sent: the connect was deferred by TCP_FASTOPEN_CONNECT and
+ *   the socket closed before its first write, or tcp_connect() did not get
+ *   as far as building a SYN, e.g. without a free local port (EADDRNOTAVAIL
+ *   from inet_hash_connect(), returned by connect(2) and never in sk_err),
+ *   also with TCP_FASTOPEN_CONNECT, before the connect could be deferred.
+ *   A deferred connect that fails at its first write for want of a buffer
+ *   is taken as aborted. sk_err may hold the stale ECONNRESET that
+ *   connect(AF_UNSPEC) left (tcp_disconnect(), which also clears segs_out),
+ *   which tcp_connect_init() clears once a SYN is built.
+ * - sk_err set before tcp_done(): a reset or ICMP port unreachable
+ *   (ECONNREFUSED), the last SYN unanswered (ETIMEDOUT), an ICMP error from
+ *   a router or a firewall, or no answer to ARP/ND (EHOSTUNREACH and the
+ *   others of errno_reason(); ICMPv6 administratively prohibited gives
+ *   EACCES).
+ * - Kernels without tcp_done_with_error() (before 6.11, and stable releases
+ *   before its backport, such as 5.15.165, 6.1.110 and 6.6.50), RHEL 9 and
+ *   5.14 among them, report the error in tcp_write_err() and
+ *   tcp_v4_err()/tcp_v6_err() before tcp_done(). For the first subflow of an MPTCP connection, the report
+ *   moves the error to the MPTCP socket at once (__mptcp_error_report()
+ *   takes it with sock_error()), where it is read instead.
+ * - No error, on a socket that no process holds: a timer or an ICMP error
+ *   closed it, but user space already took the error, which SO_ERROR does
+ *   without the socket lock once the error is reported (above). The
+ *   soft error of an ICMP error tells which, if any; otherwise the timer.
+ * - No error, on a socket that a process holds: the application closed it
+ *   or disconnected it first, usually after its own connect timeout.
+ */
+static __always_inline int fail_reason(struct sock *sk, struct tcp_sock *tp)
+{
+	bool join;
+	__u64 msk;
+	int err;
+
+	if (!BPF_CORE_READ(tp, segs_out)) {
+		if (connect_deferred(sk))
+			return FAIL_ABORTED;
+		return FAIL_LOCAL;
+	}
+	err = BPF_CORE_READ(sk, sk_err);
+	if (err)
+		return errno_reason(err);
+	msk = subflow_msk(sk, &join);
+	if (msk && !join) {
+		err = BPF_CORE_READ((struct sock *)msk, sk_err);
+		if (err)
+			return errno_reason(err);
+	}
+	if (!BPF_CORE_READ(sk, sk_lock.owned)) {
+		err = BPF_CORE_READ(sk, sk_err_soft);
+		return err ? errno_reason(err) : FAIL_TIMEOUT;
+	}
+	return FAIL_ABORTED;
+}
+
+/*
+ * Counts the reason of a failed active open and the SYNs it retransmitted,
+ * which total_retrans holds alone in SYN_SENT.
+ */
+static __always_inline void count_failure(struct shawk_flow_stats *fs,
+					  struct sock *sk)
+{
+	struct tcp_sock *tp = bpf_skc_to_tcp_sock(sk);
+	__u32 retrans;
+	int r;
+
+	if (!tp)
+		return;
+	retrans = BPF_CORE_READ(tp, total_retrans);
+	if (retrans)
+		__sync_fetch_and_add(&fs->syn_retrans, retrans);
+	r = fail_reason(sk, tp);
+	if (r >= 0 && r < FAIL_REASONS)
+		__sync_fetch_and_add(&fs->fails[r], 1);
 }
 
 /*
@@ -812,9 +1044,11 @@ static __always_inline void on_active_open(struct sock *sk)
 	ss->key = key;
 	ss->sent_base = 0;
 	ss->recv_base = 0;
+	ss->syn_ns = bpf_ktime_get_ns();
 	ss->retrans_base = 0;
 	ss->pid = tgid;
 	ss->flags = flags | (tgid == self_tgid ? SS_IGNORE : 0);
+	ss->hs_us = 0;
 	/* The next walk accounts it first (see account_skipped()). */
 	ss->walked = walk_gen;
 }
@@ -944,11 +1178,19 @@ int BPF_PROG(shawk_inet_sock_set_state, const struct sock *csk, int oldstate,
 			read_sock_addrs(sk, ss->key.laddr, ss->key.raddr);
 			fold_peer(&ss->key);
 			established_base(ss, tp, true);
+			/*
+			 * A simultaneous open (SYN_SENT -> SYN_RECV ->
+			 * ESTABLISHED) has no handshake of its own.
+			 */
+			if (oldstate == TCP_SYN_SENT)
+				handshake_done(ss, tp);
 			count_conn(ss);
 		} else if (newstate == TCP_CLOSE && !(ss->flags & SS_JOIN)) {
 			fs = flow_get(&ss->key);
 			if (fs) {
 				__sync_fetch_and_add(&fs->conn_fails, 1);
+				if (oldstate == TCP_SYN_SENT)
+					count_failure(fs, sk);
 				fs->pid = ss->pid;
 			}
 		}

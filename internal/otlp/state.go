@@ -49,6 +49,37 @@ type EdgeStats struct {
 	Retrans    uint64
 	RTTSumUs   uint64
 	RTTSamples uint64
+	// Of the active opens of a TCP client edge: the handshakes established
+	// by duration, in the buckets of HandshakeBounds, and the sum of their
+	// durations; the SYNs retransmitted; and the failures by reason, in the
+	// order of FailReasons. ConnFails minus the sum of Fails failed for
+	// another reason (ErrorOther).
+	Handshakes     [len(HandshakeBounds) + 1]uint64
+	HandshakeSumUs uint64
+	SynRetrans     uint64
+	Fails          [len(FailReasons)]uint64
+}
+
+// fails returns the failures for reason i of FailReasons, or for ErrorOther
+// when i is len(FailReasons).
+func (s *EdgeStats) fails(i int) uint64 {
+	if i < len(s.Fails) {
+		return s.Fails[i]
+	}
+	n := s.ConnFails
+	for _, c := range s.Fails {
+		n -= min(c, n)
+	}
+	return n
+}
+
+// handshakes returns the number of handshakes with a duration.
+func (s *EdgeStats) handshakes() uint64 {
+	var n uint64
+	for _, c := range s.Handshakes {
+		n += c
+	}
+	return n
 }
 
 // active tells whether the statistics of an interval show activity.
@@ -67,6 +98,14 @@ func (s *EdgeStats) add(o *EdgeStats) {
 	s.Retrans += o.Retrans
 	s.RTTSumUs += o.RTTSumUs
 	s.RTTSamples += o.RTTSamples
+	for i := range s.Handshakes {
+		s.Handshakes[i] += o.Handshakes[i]
+	}
+	s.HandshakeSumUs += o.HandshakeSumUs
+	s.SynRetrans += o.SynRetrans
+	for i := range s.Fails {
+		s.Fails[i] += o.Fails[i]
+	}
 }
 
 // ListenerKey identifies a listener series.
@@ -106,6 +145,13 @@ type Edge struct {
 	FirstSeen time.Time
 	LastSeen  time.Time
 	Total     EdgeStats
+	// FailStart is when the counter of each reason of failure started, in
+	// the order of FailReasons and then ErrorOther: the start of the
+	// interval in which the reason first occurred on the edge, zero before.
+	// A reason is sent from then on only, so that an edge does not carry
+	// a data point for every reason, and the connector takes its first
+	// value as new rather than as a baseline.
+	FailStart [len(FailReasons) + 1]time.Time
 }
 
 // Listener is the state of a listener series.
@@ -141,6 +187,11 @@ func (s *State) AddEdge(k EdgeKey, st EdgeStats, start, end time.Time) {
 		s.edges[k] = e
 	}
 	e.Total.add(&st)
+	for i := range e.FailStart {
+		if e.FailStart[i].IsZero() && st.fails(i) > 0 {
+			e.FailStart[i] = start
+		}
+	}
 	if st.active() && end.After(e.LastSeen) {
 		e.LastSeen = end
 	}

@@ -2,6 +2,7 @@ package otlp
 
 import (
 	"cmp"
+	"encoding/binary"
 	"net/netip"
 	"path"
 	"slices"
@@ -149,7 +150,7 @@ func (s *State) Requests(res Resource, st AgentStatus, now time.Time, maxSeries 
 	for i := range edges {
 		k := &edges[i]
 		attrs := edgeAttrs(k)
-		add(edgeSize(k, attrs))
+		add(edgeSize(k, s.edges[*k], attrs))
 		s.addEdge(b, k, attrs)
 	}
 	flush(true)
@@ -157,22 +158,46 @@ func (s *State) Requests(res Resource, st AgentStatus, now time.Time, maxSeries 
 }
 
 // pointOverhead bounds the encoded size of a data point besides its
-// attributes: timestamps, value, count and sum, the bucket of a histogram,
-// and the tag and length of the point.
+// attributes: timestamps, value, count and sum, the bucket of a histogram
+// without bounds, and the tag and length of the point.
 const pointOverhead = 64
+
+// bucketsOverhead bounds the encoded size of the buckets of the histogram
+// of handshakes beyond pointOverhead: its explicit bounds and its counts,
+// both packed fixed64, with their tags and lengths.
+const bucketsOverhead = 8*len(HandshakeBounds) + 8*(len(HandshakeBounds)+1) + 2*(1+binary.MaxVarintLen16)
 
 // directionSize bounds the size of the attribute network.io.direction.
 var directionSize = attrsSize([]*commonpb.KeyValue{str(AttrIODirection, DirTransmit)})
 
+// errorTypeSize bounds the size of the attribute error.type.
+var errorTypeSize = func() int {
+	n := attrsSize([]*commonpb.KeyValue{str(AttrErrorType, ErrorOther)})
+	for _, r := range FailReasons {
+		n = max(n, attrsSize([]*commonpb.KeyValue{str(AttrErrorType, r)}))
+	}
+	return n
+}()
+
 // edgeSize bounds the encoded size of the data points of an edge.
-func edgeSize(k *EdgeKey, attrs []*commonpb.KeyValue) int {
+func edgeSize(k *EdgeKey, e *Edge, attrs []*commonpb.KeyValue) int {
 	a := attrsSize(attrs)
 	// Two gauges, first and last seen, and two directions of bytes.
 	n := 2*(a+pointOverhead) + 2*(a+directionSize+pointOverhead)
 	switch k.Proto {
 	case "tcp":
-		// Opened, failed, open connections, retransmits and RTT.
-		n += 5 * (a + pointOverhead)
+		// Opened, open connections, retransmits and RTT.
+		n += 4 * (a + pointOverhead)
+		if k.Role == RoleClient {
+			// Failed, SYN retransmits and the histogram of handshakes.
+			n += 3*(a+pointOverhead) + bucketsOverhead
+			// The reasons of failure that occurred.
+			for _, t := range e.FailStart {
+				if !t.IsZero() {
+					n += a + errorTypeSize + pointOverhead
+				}
+			}
+		}
 	case "udp":
 		n += 2 * (a + directionSize + pointOverhead)
 	}
@@ -207,6 +232,20 @@ func (s *State) addEdge(b *builder, k *EdgeKey, attrs []*commonpb.KeyValue) {
 		b.sum(MetricConnCount, "{connection}", false, start, t.OpenConns, attrs)
 		b.sum(MetricRetransmits, "{segment}", true, start, t.Retrans, attrs)
 		b.rtt(start, t.RTTSamples, float64(t.RTTSumUs)/1e6, attrs)
+		if k.Role == RoleClient {
+			b.handshake(start, t, attrs)
+			b.sum(MetricSynRetransmits, "{segment}", true, start, t.SynRetrans, attrs)
+			for i, fs := range e.FailStart {
+				if fs.IsZero() {
+					continue
+				}
+				reason := ErrorOther
+				if i < len(FailReasons) {
+					reason = FailReasons[i]
+				}
+				b.sum(MetricConnFailedByReason, "{connection}", true, fs, t.fails(i), with(attrs, AttrErrorType, reason))
+			}
+		}
 	case "udp":
 		b.sum(MetricUDPDatagrams, "{datagram}", true, start, t.MsgsSent, with(attrs, AttrIODirection, DirTransmit))
 		b.sum(MetricUDPDatagrams, "{datagram}", true, start, t.MsgsRecv, with(attrs, AttrIODirection, DirReceive))
@@ -452,6 +491,27 @@ func (b *builder) rtt(start time.Time, count uint64, sum float64, attrs []*commo
 		Count:             count,
 		Sum:               &sum,
 		BucketCounts:      []uint64{count},
+	})
+}
+
+// handshake adds the histogram of the handshakes of an edge, with the
+// bounds of the buckets of the kernel.
+func (b *builder) handshake(start time.Time, t *EdgeStats, attrs []*commonpb.KeyValue) {
+	m := b.metric(MetricHandshake, "s", func() *metricspb.Metric {
+		return &metricspb.Metric{Data: &metricspb.Metric_Histogram{Histogram: &metricspb.Histogram{
+			AggregationTemporality: metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_CUMULATIVE,
+		}}}
+	})
+	sum := float64(t.HandshakeSumUs) / 1e6
+	h := m.GetHistogram()
+	h.DataPoints = append(h.DataPoints, &metricspb.HistogramDataPoint{
+		Attributes:        attrs,
+		StartTimeUnixNano: nanos(start),
+		TimeUnixNano:      b.now,
+		Count:             t.handshakes(),
+		Sum:               &sum,
+		BucketCounts:      slices.Clone(t.Handshakes[:]),
+		ExplicitBounds:    slices.Clone(HandshakeBounds[:]),
 	})
 }
 
