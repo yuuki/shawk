@@ -233,7 +233,9 @@ func (a *aggregator) add(b *hostBatch, peerOf func(*edgeID) peer, now time.Time,
 			if !fresh {
 				continue
 			}
-			key := outKey{metric: vk.metric, dir: vk.dir, errType: vk.errType, peer: name, peerAgent: p.agent,
+			// Inputs of unknown reasons keep series of their own, which
+			// add up in the output of _OTHER.
+			key := outKey{metric: vk.metric, dir: vk.dir, errType: outErrorType(vk.errType), peer: name, peerAgent: p.agent,
 				role: e.id.role, transport: e.id.proto, port: e.id.port}
 			if p.port != 0 {
 				// Through a translation, the port of the server.

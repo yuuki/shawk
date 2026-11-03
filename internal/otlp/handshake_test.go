@@ -141,3 +141,25 @@ func TestErrorTypeSize(t *testing.T) {
 		}
 	}
 }
+
+// TestFailStartAfterExpiry checks that an edge that expires and comes back
+// starts its reasons of failure again, from the interval they occur in.
+func TestFailStartAfterExpiry(t *testing.T) {
+	s := NewState(time.Minute)
+	c := clientEdge()
+	var st EdgeStats
+	st.ConnFails, st.Fails[0] = 1, 1
+	s.AddEdge(c, st, t0, t0.Add(15*time.Second))
+	s.Expire(t0.Add(2 * time.Minute))
+	if len(s.edges) != 0 {
+		t.Fatal("the edge did not expire")
+	}
+	back := t0.Add(3 * time.Minute)
+	var again EdgeStats
+	again.ConnFails, again.Fails[1] = 1, 1
+	s.AddEdge(c, again, back, back.Add(15*time.Second))
+	e := s.edges[c]
+	if !e.FailStart[0].IsZero() || !e.FailStart[1].Equal(back) || e.Total.Fails[0] != 0 || e.Total.Fails[1] != 1 {
+		t.Errorf("reasons after the edge came back: starts %v, totals %v", e.FailStart, e.Total.Fails)
+	}
+}

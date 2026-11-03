@@ -140,9 +140,9 @@ func (s *State) Requests(res Resource, st AgentStatus, now time.Time, maxSeries 
 const pointOverhead = 64
 
 // bucketsOverhead bounds the encoded size of the buckets of the histogram
-// of handshakes beyond pointOverhead: its explicit bounds, packed doubles,
-// and its counts, packed varints, with their tags and lengths.
-const bucketsOverhead = 8*len(HandshakeBounds) + binary.MaxVarintLen64*(len(HandshakeBounds)+1) + 2*(1+binary.MaxVarintLen16)
+// of handshakes beyond pointOverhead: its explicit bounds and its counts,
+// both packed fixed64, with their tags and lengths.
+const bucketsOverhead = 8*len(HandshakeBounds) + 8*(len(HandshakeBounds)+1) + 2*(1+binary.MaxVarintLen16)
 
 // directionSize bounds the size of the attribute network.io.direction.
 var directionSize = attrsSize([]*commonpb.KeyValue{str(AttrIODirection, DirTransmit)})

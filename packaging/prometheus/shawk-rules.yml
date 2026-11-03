@@ -128,9 +128,12 @@ groups:
           )
 
       # Failures by reason (error_type): refused, timeout, unreachable,
-      # local, aborted and _OTHER. Their sum is
-      # shawk:dependency_connection_failures:rate5m, once every agent sends
-      # them.
+      # local, aborted and _OTHER. Their sum is close to
+      # shawk:dependency_connection_failures:rate5m, but not equal: agents
+      # that predate the reasons send none, and a new series of a reason
+      # emits 0 first, so that its first failures count here, while those
+      # in the first sample of a new series of shawk_connection_failed_total
+      # do not count there.
       - record: shawk:dependency_connection_failures_by_reason:rate5m
         expr: |
           sum by (src, dst, server_port, network_transport, error_type) (

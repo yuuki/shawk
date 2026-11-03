@@ -78,6 +78,21 @@ const (
 // errorTypeOther is the error.type of failures without a known reason.
 const errorTypeOther = "_OTHER"
 
+// errorTypes are the values of error.type that agents send. Another value
+// is output as errorTypeOther, so that an agent cannot make a series per
+// value.
+var errorTypes = map[string]bool{
+	"refused": true, "timeout": true, "unreachable": true, "local": true, "aborted": true, errorTypeOther: true,
+}
+
+// outErrorType returns the error.type of an output for that of an input.
+func outErrorType(t string) string {
+	if t == "" || errorTypes[t] {
+		return t
+	}
+	return errorTypeOther
+}
+
 // handshakeBounds are the explicit bounds, in seconds, of the histogram
 // shawk.tcp.handshake of the agents. An input with other bounds is invalid.
 var handshakeBounds = []float64{0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.01, 0.05, 0.25, 1, 3}

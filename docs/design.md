@@ -176,7 +176,7 @@ failure, the `error.type` of the agent, is decided at SYN_SENT→CLOSE:
 | `sk_err` `EHOSTUNREACH`, `ENETUNREACH`, `EHOSTDOWN`, `ENONET`, `EACCES` | `unreachable`: an ICMP error from a router or a firewall (firewalld's administratively prohibited is `EACCES` over IPv6), or no answer to ARP/ND |
 | no `sk_err`, the socket not held by a process (`sk_lock.owned`) | the reason of `sk_err_soft`, else `timeout`: a timer or an ICMP error closed it, but user space already took the error, which Linux 5.14 and RHEL 9 report before `tcp_done()` |
 | no `sk_err` | `aborted`: the application closed the socket first, usually after its own connect timeout |
-| another `sk_err` (`ECONNABORTED` from `ss -K`, ...) | `_OTHER`, counted in the failures only |
+| another `sk_err` (`ECONNABORTED` from `ss -K`, ...) | `_OTHER`: the kernel counts it in the failures only, and the agent sends the failures without another reason as `_OTHER` |
 
 A stale `ECONNRESET` that `connect(AF_UNSPEC)` leaves in `sk_err` survives
 only until `tcp_connect_init()` builds a SYN, so it is seen with no segment
@@ -814,7 +814,9 @@ of the local process, so Prometheus labels the series with the same `job`
 as the metrics of OBI for the service. `service.instance.id` is the host
 name, and `host.id` and `host.name` are promoted to labels by Prometheus.
 
-- Series are bounded by host × local service × peer service × port × role;
+- Series are bounded by host × local service × peer service × port × role,
+  and for failures by reason × the six values of `error.type` (others are
+  output as `_OTHER`);
   replicas and changing IPs of peers do not add series. Per host, local
   service and role, at most `max_peers` (50) peer names are used; the rest
   are folded into `~other`. `keep_peer_address` keeps
@@ -839,7 +841,10 @@ name, and `host.id` and `host.name` are promoted to labels by Prometheus.
 - The output series of a reason of failure is created at its first
   increase. It emits 0 the first time and the increase from the next
   interval on, since `rate()` and `increase()` take the first sample of a
-  series as its start, and failures are often few.
+  series as its start, and failures are often few. The other outputs start
+  with their whole value, so the failures by reason may count the failures
+  of the first interval of a new dependency, which
+  `shawk_connection_failed_total` leaves out.
 - An agent may send an interval in several requests. The outputs of a
   host are emitted once per interval, when the last request (the one with
   the metrics of the agent) arrives; an interval whose last request is

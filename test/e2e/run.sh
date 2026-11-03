@@ -323,11 +323,21 @@ grep -q 'service.peer.name: Str(haproxy)' "$WORK/collector.log" || fail "no seri
 grep -q 'shawk.peer.agent: Bool(true)' "$WORK/collector.log" || fail "no series of a peer with an agent"
 grep -q 'service.peer.name: Str(~unresolved)' "$WORK/collector.log" || fail "no series of the client without an agent"
 if grep -q 'network.peer.address' "$WORK/collector.log"; then fail "peer addresses forwarded"; fi
+# forwarded METRIC PATTERN: whether the collector forwarded a data point of
+# METRIC whose attributes hold PATTERN, with a value or a count above 0.
+forwarded() {
+	awk -v metric="$1" -v pat="$2" '
+		/-> Name: / { name = $NF }
+		/DataPoints #/ { attrs = "" }
+		/^ *-> / { attrs = attrs $0 "\n" }
+		/^(Value|Count): / && name == metric && index(attrs, pat) && $NF + 0 > 0 { found = 1 }
+		END { exit !found }' "$WORK/collector.log"
+}
 # The handshakes of the active opens, and the failures to the port where
-# nothing listens by reason.
-grep -q 'Name: shawk.tcp.handshake$' "$WORK/collector.log" || fail "no handshakes forwarded"
+# nothing listens by reason. A new series of a reason emits 0 first.
+poll 30 forwarded shawk.tcp.handshake 'service.peer.name: Str(postgres)' || fail "no handshakes of puma to postgres forwarded"
 grep -q 'Name: shawk.tcp.syn_retransmits$' "$WORK/collector.log" || fail "no SYN retransmissions forwarded"
-grep -q 'error.type: Str(refused)' "$WORK/collector.log" || fail "no refused connections forwarded"
+poll 30 forwarded shawk.connection.failed.by_reason 'error.type: Str(refused)' || fail "no refused connections forwarded"
 
 # One agent traces every namespace, as on a host with containers. The
 # addresses of the namespaces move from the hosts above to node-01, and

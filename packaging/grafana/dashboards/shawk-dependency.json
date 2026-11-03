@@ -525,7 +525,7 @@
             "uid": "shawk-prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (src, dst, server_port) (shawk:dependency_syn_retransmits:rate5m{src=~\"$src\", dst=~\"$dst\"})\n  / (sum by (src, dst, server_port) (shawk:dependency_handshake_seconds_count:rate5m{src=~\"$src\", dst=~\"$dst\"})\n     + sum by (src, dst, server_port) (shawk:dependency_connection_failures:rate5m{src=~\"$src\", dst=~\"$dst\"}))",
+          "expr": "sum by (src, dst, server_port) (shawk:dependency_syn_retransmits:rate5m{src=~\"$src\", dst=~\"$dst\"})\n  / sum by (src, dst, server_port) (\n      shawk:dependency_handshake_seconds_count:rate5m{src=~\"$src\", dst=~\"$dst\"}\n      or shawk:dependency_connection_failures_by_reason:rate5m{src=~\"$src\", dst=~\"$dst\"})",
           "range": true,
           "legendFormat": "{{src}} → {{dst}}:{{server_port}}"
         }
@@ -554,7 +554,7 @@
           "sort": "desc"
         }
       },
-      "description": "SYNs that the client side retransmitted per connection attempt, established or failed: a SYN or its SYN-ACK was lost, or dropped by a firewall, a network policy or a server whose accept queue is full."
+      "description": "SYNs that the client side retransmitted per connection attempt, established or failed: a SYN or its SYN-ACK was lost, or dropped by a firewall, a network policy or a server whose accept queue is full. The attempts are the handshakes and the failures by reason, which agents send with the retransmissions; connects with TCP_FASTOPEN_CONNECT have no handshake and raise the ratio."
     },
     {
       "id": 12,

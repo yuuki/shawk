@@ -234,3 +234,43 @@ func TestHistogramResetsAsAWhole(t *testing.T) {
 		}
 	}
 }
+
+// TestHandshakeOutputsOfUnknownReasons checks that a reason the connector
+// does not know is output as _OTHER, with the failures of _OTHER.
+func TestHandshakeOutputsOfUnknownReasons(t *testing.T) {
+	c, _, sink, now := testConnector(t, nil)
+	agent := func(reasons map[string]tReason) tAgent {
+		*now = now.Add(15 * time.Second)
+		return tAgent{host: "app-01", addrs: []string{"10.0.0.11"}, time: *now, edges: []tEdge{{
+			role: roleClient, proto: "tcp", local: "10.0.0.11", peer: "1.1.1.1", port: 443, svc: "app", comm: "app",
+			failed: 9, start: t0, handshakes: hsBuckets(nil), reasons: reasons}}}
+	}
+	consume(t, c, sink, agent(map[string]tReason{"nope": {value: 2}, errorTypeOther: {value: 1}}))
+	out := consume(t, c, sink, agent(map[string]tReason{"nope": {value: 5}, errorTypeOther: {value: 4}}))
+	if s := findReason(out, errorTypeOther); len(s) != 1 || s[0].value != 9 {
+		t.Errorf("_OTHER = %v, want 9", s)
+	}
+	if s := findReason(out, "nope"); len(s) != 0 {
+		t.Errorf("an unknown reason has a series: %v", s)
+	}
+}
+
+// TestHandshakeOutputsAfterAgentRestart checks that the reasons of an agent
+// that restarted count from zero again, without losing or repeating
+// failures.
+func TestHandshakeOutputsAfterAgentRestart(t *testing.T) {
+	c, _, sink, now := testConnector(t, nil)
+	agent := func(v int64, start time.Time) tAgent {
+		*now = now.Add(15 * time.Second)
+		return tAgent{host: "app-01", addrs: []string{"10.0.0.11"}, time: *now, edges: []tEdge{{
+			role: roleClient, proto: "tcp", local: "10.0.0.11", peer: "1.1.1.1", port: 443, svc: "app", comm: "app",
+			failed: v, start: start, handshakes: hsBuckets(nil), reasons: map[string]tReason{"refused": {value: v, start: start}}}}}
+	}
+	consume(t, c, sink, agent(2, t0))
+	consume(t, c, sink, agent(3, t0))
+	restart := *now
+	out := consume(t, c, sink, agent(1, restart))
+	if s := findReason(out, "refused"); len(s) != 1 || s[0].value != 4 {
+		t.Errorf("refused after a restart = %v, want 4", s)
+	}
+}

@@ -18,8 +18,9 @@
   `shawk:dependency_handshake_seconds_count:rate5m`,
   `shawk:dependency_syn_retransmits:rate5m` and
   `shawk:dependency_connection_failures_by_reason:rate5m`, and panels in
-  the dependency details dashboard. Nothing existing changes, and the agents
-  and connectors can be upgraded in either order: a connector of the
+  the dependency details dashboard. No existing metric, label or table
+  changes (`shawk flows` gains three columns), and the agents and
+  connectors can be upgraded in either order: a connector of the
   previous version ignores the new metrics, and the edges of agents of the
   previous version have none of the new series. The flow tables of the
   agent take 2.6 MB more with the default `-max-flows`.

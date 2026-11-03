@@ -191,3 +191,30 @@ eval instant at 20m ` + a("ShawkExportFailures") + `
 		}
 	}
 }
+
+// TestSYNRetransmitRatio evaluates the panel of SYN retransmissions per
+// attempt of the dependency details dashboard, whose denominator is a union
+// of handshakes and failures by reason.
+func TestSYNRetransmitRatio(t *testing.T) {
+	records, _ := loadRules(t)
+	d := loadJSON(t, grafana+"/dashboards/shawk-dependency.json")
+	var expr string
+	for _, p := range d["panels"].([]any) {
+		p := p.(map[string]any)
+		if p["title"] == "SYN retransmissions per attempt" {
+			expr = p["targets"].([]any)[0].(map[string]any)["expr"].(string)
+		}
+	}
+	if expr == "" {
+		t.Fatal("no panel of SYN retransmissions per attempt")
+	}
+	// All clients and servers: the recording rules are inlined, which takes
+	// no matchers.
+	expr = strings.ReplaceAll(expr, `{src=~"$src", dst=~"$dst"}`, "")
+	// 0.2 SYNs/s over 2 handshakes/s and 0.5 failures/s.
+	script := series + `
+eval instant at 10m ` + inline(expr, records) + `
+  {src="shop/app", dst="postgres", server_port="5432"} 0.08
+`
+	promqltest.RunTest(t, script, promqltest.NewTestEngine(t, false, 0, promqltest.DefaultMaxSamplesPerQuery))
+}
