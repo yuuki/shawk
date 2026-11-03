@@ -3,6 +3,8 @@ package cli
 import (
 	"bytes"
 	"testing"
+
+	"github.com/yuuki/shawk/internal/tracer"
 )
 
 func TestHumanBytes(t *testing.T) {
@@ -45,5 +47,26 @@ func TestAgentFlags(t *testing.T) {
 		if code := Main(args, &out, &errOut); code != 2 {
 			t.Errorf("exit code of %v = %d", args, code)
 		}
+	}
+}
+
+func TestFlowColumns(t *testing.T) {
+	var s tracer.FlowStats
+	if got := failures(&s); got != "0" {
+		t.Errorf("failures without any = %q", got)
+	}
+	if got := meanHandshake(&s); got != "-" {
+		t.Errorf("mean handshake without any = %q", got)
+	}
+	s.ConnFails = 4
+	s.Fails[tracer.FailTimeout] = 2
+	s.Fails[tracer.FailRefused] = 1
+	if got, want := failures(&s), "4 (refused:1 timeout:2 other:1)"; got != want {
+		t.Errorf("failures = %q, want %q", got, want)
+	}
+	s.Handshakes[0], s.Handshakes[9] = 1, 1
+	s.HandshakeSumUs = 1_000_200
+	if got, want := meanHandshake(&s), "500.1ms"; got != want {
+		t.Errorf("mean handshake = %q, want %q", got, want)
 	}
 }

@@ -19,8 +19,13 @@ const (
 	MetricUDPDatagrams = "shawk.udp.datagrams"
 	MetricRetransmits  = "shawk.tcp.retransmits"
 	MetricRTT          = "shawk.tcp.rtt"
-	MetricEdgeFirst    = "shawk.edge.first_seen"
-	MetricEdgeLast     = "shawk.edge.last_seen"
+	// Of the active opens of TCP client edges: the handshakes established,
+	// by duration, the SYNs retransmitted, and the failures by error.type.
+	MetricHandshake          = "shawk.tcp.handshake"
+	MetricSynRetransmits     = "shawk.tcp.syn_retransmits"
+	MetricConnFailedByReason = "shawk.connection.failed.by_reason"
+	MetricEdgeFirst          = "shawk.edge.first_seen"
+	MetricEdgeLast           = "shawk.edge.last_seen"
 
 	MetricListenerFirst = "shawk.listener.first_seen"
 	MetricListenerLast  = "shawk.listener.last_seen"
@@ -61,6 +66,7 @@ const (
 	AttrIODirection  = "network.io.direction"
 	AttrNetNSScope   = "shawk.netns.scope"
 	AttrBPFProgram   = "shawk.bpf.program"
+	AttrErrorType    = "error.type"
 	ScopeName        = "github.com/yuuki/shawk"
 	AgentServiceName = "shawk-agent"
 )
@@ -73,3 +79,17 @@ const (
 	DirTransmit = "transmit"
 	DirReceive  = "receive"
 )
+
+// HandshakeBounds are the explicit bounds, in seconds, of the histogram
+// shawk.tcp.handshake: those of the buckets of handshakes in the kernel
+// (tracer.HandshakeBounds), which the shawk connector expects.
+var HandshakeBounds = [...]float64{0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.01, 0.05, 0.25, 1, 3}
+
+// FailReasons are the values of error.type of
+// shawk.connection.failed.by_reason, in the order of EdgeStats.Fails and of
+// tracer.FailReason. Failures for another reason have ErrorOther, the value
+// OpenTelemetry gives an error without a known type.
+var FailReasons = [...]string{"refused", "timeout", "unreachable", "local", "aborted"}
+
+// ErrorOther is the error.type of failures without one of FailReasons.
+const ErrorOther = "_OTHER"

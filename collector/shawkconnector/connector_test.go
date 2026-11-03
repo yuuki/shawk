@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"math"
 	"net/netip"
 	"os"
 	"slices"
@@ -95,20 +96,37 @@ func TestGoldenRequest(t *testing.T) {
 		t.Errorf("client edge seen %v..%v", client.first, client.last)
 	}
 	for k, v := range map[valueKey]float64{
-		{metric: metricConnOpened}:                 3,
-		{metric: metricConnFailed}:                 1,
-		{metric: metricConnCount}:                  2,
-		{metric: metricRetransmits}:                4,
-		{metric: metricNetworkIO, dir: "transmit"}: 100,
-		{metric: metricNetworkIO, dir: "receive"}:  200,
-		{metric: metricRTT}:                        0.0015,
+		{metric: metricConnOpened}:                                  3,
+		{metric: metricConnFailed}:                                  2,
+		{metric: metricConnCount}:                                   2,
+		{metric: metricRetransmits}:                                 4,
+		{metric: metricNetworkIO, dir: "transmit"}:                  100,
+		{metric: metricNetworkIO, dir: "receive"}:                   200,
+		{metric: metricRTT}:                                         0.0015,
+		{metric: metricHandshake}:                                   1.2006,
+		{metric: metricSynRetransmits}:                              3,
+		{metric: metricConnFailedByReason, errType: "timeout"}:      1,
+		{metric: metricConnFailedByReason, errType: errorTypeOther}: 1,
 	} {
-		if p, ok := client.values[k]; !ok || p.value != v || p.start.AsTime() != t0 {
+		if p, ok := client.values[k]; !ok || math.Abs(p.value-v) > 1e-9 || p.start.AsTime() != t0 {
 			t.Errorf("%v = %+v, want %v", k, p, v)
 		}
 	}
-	if p := client.values[valueKey{metric: metricRTT}]; p.count != 3 {
-		t.Errorf("rtt count = %d", p.count)
+	if p := client.values[valueKey{metric: metricRTT}]; p.count != 3 || p.buckets != nil {
+		t.Errorf("rtt = %+v", p)
+	}
+	if p := client.values[valueKey{metric: metricHandshake}]; p.count != 3 ||
+		!slices.Equal(p.buckets, []uint64{0, 0, 2, 0, 0, 0, 0, 0, 0, 1, 0}) {
+		t.Errorf("handshakes = %+v", p)
+	}
+	// Server edges have none of the metrics of active opens.
+	for _, e := range hb.edges {
+		for k := range e.values {
+			if e.id.role == roleServer && (k.metric == metricHandshake || k.metric == metricSynRetransmits ||
+				k.metric == metricConnFailedByReason || k.metric == metricConnFailed) {
+				t.Errorf("server edge %+v has %s", e.id, k.metric)
+			}
+		}
 	}
 	var names []string
 	for i := range hb.agent.Len() {

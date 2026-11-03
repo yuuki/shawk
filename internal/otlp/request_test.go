@@ -248,7 +248,15 @@ func TestRequestsByteLimit(t *testing.T) {
 		k.PeerAddr = netip.MustParseAddr(fmt.Sprintf("2001:db8:aaaa:bbbb:cccc:eeee:%x:2", i))
 		k.Exe = exe
 		k.Service = "worker-with-a-long-service-name"
-		s.AddEdge(k, EdgeStats{Conns: 1, RTTSamples: 1, RTTSumUs: 100}, t0, t0)
+		// Every reason of failure, and handshakes in every bucket.
+		st := EdgeStats{Conns: 1, RTTSamples: 1, RTTSumUs: 100, ConnFails: 6, SynRetrans: 1 << 40, HandshakeSumUs: 1 << 50}
+		for j := range st.Fails {
+			st.Fails[j] = 1
+		}
+		for j := range st.Handshakes {
+			st.Handshakes[j] = 1 << 40
+		}
+		s.AddEdge(k, st, t0, t0)
 		u := k
 		u.Proto = "udp"
 		s.AddEdge(u, EdgeStats{MsgsSent: 1}, t0, t0)

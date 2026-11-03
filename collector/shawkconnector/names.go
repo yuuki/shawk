@@ -15,8 +15,14 @@ const (
 	metricUDPDatagrams = "shawk.udp.datagrams"
 	metricRetransmits  = "shawk.tcp.retransmits"
 	metricRTT          = "shawk.tcp.rtt"
-	metricEdgeFirst    = "shawk.edge.first_seen"
-	metricEdgeLast     = "shawk.edge.last_seen"
+	// Of the active opens of TCP client edges: the handshakes established,
+	// by duration (handshakeBounds), the SYNs retransmitted, and the
+	// failures by error.type.
+	metricHandshake          = "shawk.tcp.handshake"
+	metricSynRetransmits     = "shawk.tcp.syn_retransmits"
+	metricConnFailedByReason = "shawk.connection.failed.by_reason"
+	metricEdgeFirst          = "shawk.edge.first_seen"
+	metricEdgeLast           = "shawk.edge.last_seen"
 
 	metricListenerFirst = "shawk.listener.first_seen"
 	metricListenerLast  = "shawk.listener.last_seen"
@@ -53,6 +59,7 @@ const (
 	attrNetNS       = "shawk.netns"
 	attrIODirection = "network.io.direction"
 	attrNetNSScope  = "shawk.netns.scope"
+	attrErrorType   = "error.type"
 	// attrPeerFolded marks an edge whose peer is folded: every peer outside
 	// the internal ranges of the agent, sent as the address 0.0.0.0 or ::.
 	attrPeerFolded = "shawk.peer.folded"
@@ -67,6 +74,13 @@ const (
 	roleClient = "client"
 	roleServer = "server"
 )
+
+// errorTypeOther is the error.type of failures without a known reason.
+const errorTypeOther = "_OTHER"
+
+// handshakeBounds are the explicit bounds, in seconds, of the histogram
+// shawk.tcp.handshake of the agents. An input with other bounds is invalid.
+var handshakeBounds = []float64{0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.01, 0.05, 0.25, 1, 3}
 
 // Values of shawk.peer.fold: an agent folds no peers, the peers of its
 // servers (in), or the peers of its servers and clients (all). An agent

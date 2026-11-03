@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"sort"
 	"strconv"
+	"strings"
 	"syscall"
 	"text/tabwriter"
 	"time"
@@ -228,7 +229,7 @@ func printFlows(w io.Writer, flows []tracer.Flow) {
 	})
 	fmt.Fprintf(w, "--- %s\n", time.Now().Format(time.TimeOnly))
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "DIR\tPROTO\tLOCAL\tREMOTE\tPORT\tPROCESS\tPID\tCONNS\tOPEN\tSENT\tRECV")
+	fmt.Fprintln(tw, "DIR\tPROTO\tLOCAL\tREMOTE\tPORT\tPROCESS\tPID\tCONNS\tFAILED\tHANDSHAKE\tSYN-RETRANS\tOPEN\tSENT\tRECV")
 	for _, f := range flows {
 		local, remote := f.LocalAddr.String(), f.RemoteAddr.String()
 		arrow := "-->"
@@ -239,10 +240,42 @@ func printFlows(w io.Writer, flows []tracer.Flow) {
 		if f.Proto == tracer.ProtoUDP {
 			conns = fmt.Sprintf("%dmsg", f.MsgsSent+f.MsgsRecv)
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%s\t%d\t%s\t%d\t%s\t%s\n", arrow, f.Proto, local, remote, f.Port, f.Comm,
-			f.PID, conns, f.OpenConns, humanBytes(f.BytesSent), humanBytes(f.BytesRecv))
+		// Only active opens of TCP have handshakes and failures.
+		failed, handshake, synRetrans := "-", "-", "-"
+		if f.Proto == tracer.ProtoTCP && f.Direction == tracer.DirOut {
+			failed, handshake, synRetrans = failures(&f.FlowStats), meanHandshake(&f.FlowStats), strconv.FormatUint(f.SynRetrans, 10)
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%s\t%d\t%s\t%s\t%s\t%s\t%d\t%s\t%s\n", arrow, f.Proto, local, remote, f.Port, f.Comm,
+			f.PID, conns, failed, handshake, synRetrans, f.OpenConns, humanBytes(f.BytesSent), humanBytes(f.BytesRecv))
 	}
 	tw.Flush()
+}
+
+// failures formats the failed active opens of a flow with their reasons,
+// e.g. "3 (timeout:2 refused:1)".
+func failures(s *tracer.FlowStats) string {
+	if s.ConnFails == 0 {
+		return "0"
+	}
+	var reasons []string
+	for r := range tracer.FailReason(tracer.NumFailReasons) {
+		if n := s.Fails[r]; n > 0 {
+			reasons = append(reasons, fmt.Sprintf("%s:%d", r, n))
+		}
+	}
+	if n := s.OtherFails(); n > 0 {
+		reasons = append(reasons, fmt.Sprintf("other:%d", n))
+	}
+	return fmt.Sprintf("%d (%s)", s.ConnFails, strings.Join(reasons, " "))
+}
+
+// meanHandshake formats the mean duration of the handshakes of a flow.
+func meanHandshake(s *tracer.FlowStats) string {
+	n := s.HandshakeCount()
+	if n == 0 {
+		return "-"
+	}
+	return (time.Duration(s.HandshakeSumUs/n) * time.Microsecond).String()
 }
 
 func humanBytes(n uint64) string {

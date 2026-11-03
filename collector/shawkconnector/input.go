@@ -3,6 +3,7 @@ package shawkconnector
 import (
 	"errors"
 	"net/netip"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -57,8 +58,9 @@ func peerString(peer netip.Addr, folded bool) string {
 
 // valueKey identifies one of the metrics of an edge.
 type valueKey struct {
-	metric string
-	dir    string // network.io.direction, for bytes and datagrams
+	metric  string
+	dir     string // network.io.direction, for bytes and datagrams
+	errType string // error.type, for failures by reason
 }
 
 // point is a cumulative value of an input series.
@@ -67,6 +69,8 @@ type point struct {
 	time  pcommon.Timestamp
 	value float64
 	count uint64 // of a histogram
+	// buckets are the counts of a histogram with explicit bounds.
+	buckets []uint64
 }
 
 type edgeInput struct {
@@ -184,7 +188,8 @@ func (b *hostBatch) observe(ts pcommon.Timestamp) {
 func (b *hostBatch) addMetric(m pmetric.Metric) {
 	name := m.Name()
 	switch name {
-	case metricConnOpened, metricConnFailed, metricConnCount, metricNetworkIO, metricUDPDatagrams, metricRetransmits:
+	case metricConnOpened, metricConnFailed, metricConnCount, metricNetworkIO, metricUDPDatagrams, metricRetransmits,
+		metricSynRetransmits, metricConnFailedByReason:
 		if m.Type() != pmetric.MetricTypeSum {
 			b.invalid++
 			return
@@ -193,17 +198,23 @@ func (b *hostBatch) addMetric(m pmetric.Metric) {
 		for i := range dps.Len() {
 			dp := dps.At(i)
 			b.observe(dp.Timestamp())
+			k := valueKey{metric: name}
+			switch name {
+			case metricNetworkIO, metricUDPDatagrams:
+				k.dir = getString(dp.Attributes(), attrIODirection)
+			case metricConnFailedByReason:
+				if k.errType = getString(dp.Attributes(), attrErrorType); k.errType == "" {
+					b.invalid++
+					continue
+				}
+			}
 			e := b.edge(dp.Attributes())
 			if e == nil {
 				continue
 			}
-			k := valueKey{metric: name}
-			if name == metricNetworkIO || name == metricUDPDatagrams {
-				k.dir = getString(dp.Attributes(), attrIODirection)
-			}
 			e.values[k] = point{start: dp.StartTimestamp(), time: dp.Timestamp(), value: numberValue(dp)}
 		}
-	case metricRTT:
+	case metricRTT, metricHandshake:
 		if m.Type() != pmetric.MetricTypeHistogram {
 			b.invalid++
 			return
@@ -212,9 +223,19 @@ func (b *hostBatch) addMetric(m pmetric.Metric) {
 		for i := range dps.Len() {
 			dp := dps.At(i)
 			b.observe(dp.Timestamp())
+			p := point{start: dp.StartTimestamp(), time: dp.Timestamp(), value: dp.Sum(), count: dp.Count()}
+			if name == metricHandshake {
+				// The buckets of an agent with other bounds would not add
+				// up with those of the others.
+				if !slices.Equal(dp.ExplicitBounds().AsRaw(), handshakeBounds) ||
+					dp.BucketCounts().Len() != len(handshakeBounds)+1 {
+					b.invalid++
+					continue
+				}
+				p.buckets = dp.BucketCounts().AsRaw()
+			}
 			if e := b.edge(dp.Attributes()); e != nil {
-				e.values[valueKey{metric: name}] = point{start: dp.StartTimestamp(), time: dp.Timestamp(),
-					value: dp.Sum(), count: dp.Count()}
+				e.values[valueKey{metric: name}] = p
 			}
 		}
 	case metricEdgeFirst, metricEdgeLast:

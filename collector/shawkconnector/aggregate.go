@@ -12,25 +12,39 @@ type outMetric struct {
 	unit string
 	// gauge is true for shawk.connection.count, a non-monotonic sum whose
 	// output is the sum of the current values of its inputs.
-	gauge     bool
+	gauge bool
+	// histogram is true for a histogram without buckets, whose sum and
+	// count give the mean.
 	histogram bool
+	// sparse is true for a metric whose inputs are sent from their first
+	// increase only, the failures by reason: an output series is created
+	// at its first increase, emits 0 the first time, and the increase from
+	// the next interval on, since rate() and increase() of Prometheus take
+	// the first sample of a series as its start. Other outputs start with
+	// their edge, when the increases of a dependency that is new are rarely
+	// what matters.
+	sparse bool
 }
 
 // outMetrics are the metrics aggregated and forwarded.
 var outMetrics = map[string]outMetric{
-	metricConnOpened:   {unit: "{connection}"},
-	metricConnFailed:   {unit: "{connection}"},
-	metricConnCount:    {unit: "{connection}", gauge: true},
-	metricNetworkIO:    {unit: "By"},
-	metricUDPDatagrams: {unit: "{datagram}"},
-	metricRetransmits:  {unit: "{segment}"},
-	metricRTT:          {unit: "s", histogram: true},
+	metricConnOpened:         {unit: "{connection}"},
+	metricConnFailed:         {unit: "{connection}"},
+	metricConnCount:          {unit: "{connection}", gauge: true},
+	metricNetworkIO:          {unit: "By"},
+	metricUDPDatagrams:       {unit: "{datagram}"},
+	metricRetransmits:        {unit: "{segment}"},
+	metricRTT:                {unit: "s", histogram: true},
+	metricHandshake:          {unit: "s", histogram: true},
+	metricSynRetransmits:     {unit: "{segment}"},
+	metricConnFailedByReason: {unit: "{connection}", sparse: true},
 }
 
 // outMetricOrder is the order of the metrics in the output.
 var outMetricOrder = []string{
 	metricConnOpened, metricConnFailed, metricConnCount, metricNetworkIO,
-	metricUDPDatagrams, metricRetransmits, metricRTT,
+	metricUDPDatagrams, metricRetransmits, metricRTT, metricHandshake,
+	metricSynRetransmits, metricConnFailedByReason,
 }
 
 // inputKey identifies an input series within its host.
@@ -41,11 +55,12 @@ type inputKey struct {
 
 // inputState is the latest point of an input series.
 type inputState struct {
-	start pcommon.Timestamp
-	time  pcommon.Timestamp
-	value float64
-	count uint64
-	seen  time.Time // by the clock of the connector
+	start   pcommon.Timestamp
+	time    pcommon.Timestamp
+	value   float64
+	count   uint64
+	buckets []uint64
+	seen    time.Time // by the clock of the connector
 	// rebase tells that the clock of the agent went back: the next point is
 	// a new baseline, whatever its time.
 	rebase bool
@@ -76,6 +91,7 @@ type outResource struct {
 type outKey struct {
 	metric    string
 	dir       string
+	errType   string // error.type
 	peer      string // service.peer.name
 	peerAgent bool   // shawk.peer.agent
 	role      string
@@ -89,6 +105,10 @@ type outSeries struct {
 	value float64
 	count uint64
 	seen  time.Time
+	// held is the increase of a sparse series that has not been emitted
+	// yet, which emits 0 first; pending tells that it has not.
+	held    float64
+	pending bool
 	// gauge holds the latest value of each input of a gauge, with the time
 	// of its point.
 	gauge map[inputKey]gaugePoint
@@ -213,8 +233,8 @@ func (a *aggregator) add(b *hostBatch, peerOf func(*edgeID) peer, now time.Time,
 			if !fresh {
 				continue
 			}
-			key := outKey{metric: vk.metric, dir: vk.dir, peer: name, peerAgent: p.agent, role: e.id.role,
-				transport: e.id.proto, port: e.id.port}
+			key := outKey{metric: vk.metric, dir: vk.dir, errType: vk.errType, peer: name, peerAgent: p.agent,
+				role: e.id.role, transport: e.id.proto, port: e.id.port}
 			if p.port != 0 {
 				// Through a translation, the port of the server.
 				key.port = p.port
@@ -224,7 +244,10 @@ func (a *aggregator) add(b *hostBatch, peerOf func(*edgeID) peer, now time.Time,
 			}
 			s := r.series[key]
 			if s == nil {
-				s = &outSeries{start: clampTime(toConnector(pt.start.AsTime()), a.started, now)}
+				if m.sparse && dv == 0 {
+					continue
+				}
+				s = &outSeries{start: clampTime(toConnector(pt.start.AsTime()), a.started, now), pending: m.sparse}
 				r.series[key] = s
 			}
 			s.seen = now
@@ -233,6 +256,10 @@ func (a *aggregator) add(b *hostBatch, peerOf func(*edgeID) peer, now time.Time,
 					s.gauge = map[inputKey]gaugePoint{}
 				}
 				s.gauge[ik] = gaugePoint{pt.value, pt.time}
+				continue
+			}
+			if s.pending {
+				s.held += dv
 				continue
 			}
 			s.value += dv
@@ -323,14 +350,14 @@ func restamp(ms pmetric.MetricSlice, toConnector func(time.Time) time.Time, now 
 func (a *aggregator) delta(h *hostOutputs, k inputKey, p point, ts, now time.Time) (float64, uint64, bool) {
 	in := h.inputs[k]
 	if in == nil {
-		h.inputs[k] = &inputState{start: p.start, time: p.time, value: p.value, count: p.count, seen: now}
+		h.inputs[k] = &inputState{start: p.start, time: p.time, value: p.value, count: p.count, buckets: p.buckets, seen: now}
 		if a.isNew(h, p.start.AsTime(), ts, now) {
 			return p.value, p.count, true
 		}
 		return 0, 0, true
 	}
 	if in.rebase {
-		in.start, in.time, in.value, in.count, in.seen, in.rebase = p.start, p.time, p.value, p.count, now, false
+		in.start, in.time, in.value, in.count, in.buckets, in.seen, in.rebase = p.start, p.time, p.value, p.count, p.buckets, now, false
 		return 0, 0, true
 	}
 	switch {
@@ -342,15 +369,30 @@ func (a *aggregator) delta(h *hostOutputs, k inputKey, p point, ts, now time.Tim
 	}
 	var dv float64
 	var dc uint64
-	if p.start != in.start || p.value < in.value || p.count < in.count {
+	if p.start != in.start || p.value < in.value || p.count < in.count || decreased(p.buckets, in.buckets) {
 		// The series restarted, e.g. the agent restarted or dropped the
-		// series after its idle TTL and saw it again.
+		// series after its idle TTL and saw it again. A histogram restarts
+		// as a whole, so that its buckets never decrease either.
 		dv, dc = p.value, p.count
 	} else {
 		dv, dc = p.value-in.value, p.count-in.count
 	}
-	in.start, in.time, in.value, in.count, in.seen = p.start, p.time, p.value, p.count, now
+	in.start, in.time, in.value, in.count, in.buckets, in.seen = p.start, p.time, p.value, p.count, p.buckets, now
 	return dv, dc, true
+}
+
+// decreased tells whether any of the buckets of a histogram is below its
+// previous count.
+func decreased(buckets, prev []uint64) bool {
+	if len(buckets) != len(prev) {
+		return len(prev) > 0
+	}
+	for i, c := range buckets {
+		if c < prev[i] {
+			return true
+		}
+	}
+	return false
 }
 
 // isNew tells whether the whole value of an input series seen for the first
@@ -492,6 +534,13 @@ func (r *outResource) appendTo(k svcKey, h *hostOutputs, interval pcommon.Timest
 			dpAttrs.PutStr(attrTransport, key.transport)
 			if key.dir != "" {
 				dpAttrs.PutStr(attrIODirection, key.dir)
+			}
+			if key.errType != "" {
+				dpAttrs.PutStr(attrErrorType, key.errType)
+			}
+			if s.pending {
+				s.value += s.held
+				s.held, s.pending = 0, false
 			}
 			if key.peerAddr != "" {
 				dpAttrs.PutStr(attrPeerAddr, key.peerAddr)

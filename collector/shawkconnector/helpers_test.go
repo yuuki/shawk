@@ -29,6 +29,22 @@ type tEdge struct {
 	// folded marks the peer as folded (shawk.peer.folded); peer is then
 	// 0.0.0.0 or ::.
 	folded bool
+	// handshakes are the buckets of shawk.tcp.handshake of a TCP client
+	// edge, sent with hsSum and synRetrans when not nil, as agents since
+	// the handshakes were measured do; hsBounds replaces its bounds.
+	handshakes []uint64
+	hsSum      float64
+	hsBounds   []float64
+	synRetrans int64
+	// reasons are sent as shawk.connection.failed.by_reason.
+	reasons map[string]tReason
+}
+
+// tReason is a reason of failure of an edge: its count since start, t0 if
+// zero.
+type tReason struct {
+	value int64
+	start time.Time
 }
 
 type tListener struct {
@@ -162,6 +178,37 @@ func (ta tAgent) metrics() pmetric.Metrics {
 			dp.SetSum(e.rttSum)
 			dp.SetCount(e.rttCount)
 			dp.BucketCounts().FromRaw([]uint64{e.rttCount})
+			if e.handshakes != nil {
+				dp := metric(metricHandshake, pmetric.MetricTypeHistogram).Histogram().DataPoints().AppendEmpty()
+				attrs(dp.Attributes())
+				dp.SetStartTimestamp(pcommon.NewTimestampFromTime(start))
+				dp.SetTimestamp(now)
+				dp.SetSum(e.hsSum)
+				var n uint64
+				for _, c := range e.handshakes {
+					n += c
+				}
+				dp.SetCount(n)
+				dp.BucketCounts().FromRaw(e.handshakes)
+				bounds := e.hsBounds
+				if bounds == nil {
+					bounds = handshakeBounds
+				}
+				dp.ExplicitBounds().FromRaw(bounds)
+				sum(metricSynRetransmits, e.synRetrans, "")
+			}
+			for r, v := range e.reasons {
+				dp := metric(metricConnFailedByReason, pmetric.MetricTypeSum).Sum().DataPoints().AppendEmpty()
+				attrs(dp.Attributes())
+				dp.Attributes().PutStr(attrErrorType, r)
+				rs := v.start
+				if rs.IsZero() {
+					rs = t0
+				}
+				dp.SetStartTimestamp(pcommon.NewTimestampFromTime(rs))
+				dp.SetTimestamp(now)
+				dp.SetIntValue(v.value)
+			}
 		} else {
 			sum(metricUDPDatagrams, 1, "transmit")
 			sum(metricUDPDatagrams, 1, "receive")
@@ -349,10 +396,13 @@ func testConnector(t *testing.T, mod func(*Config)) (*shawkConnector, *fakeStore
 // series is an output data point flattened for comparisons.
 type series struct {
 	job, instance, metric, peer, role, dir string
+	errType                                string
 	agent                                  bool
 	port                                   int64
 	value                                  float64
 	count                                  uint64
+	// buckets are those of a histogram, nil for one without bounds.
+	buckets []uint64
 }
 
 func flatten(md pmetric.Metrics) []series {
@@ -374,8 +424,8 @@ func flatten(md pmetric.Metrics) []series {
 					port, _ := getInt(a, attrServerPort)
 					agent, _ := a.Get(attrPeerAgent)
 					out = append(out, series{job: job, instance: inst, metric: m.Name(), peer: getString(a, attrPeerService),
-						agent: agent.Bool(),
-						role:  getString(a, attrRole), dir: getString(a, attrIODirection), port: port, value: v, count: c})
+						agent: agent.Bool(), errType: getString(a, attrErrorType),
+						role: getString(a, attrRole), dir: getString(a, attrIODirection), port: port, value: v, count: c})
 				}
 				switch m.Type() {
 				case pmetric.MetricTypeSum:
@@ -392,6 +442,9 @@ func flatten(md pmetric.Metrics) []series {
 					for l := range m.Histogram().DataPoints().Len() {
 						dp := m.Histogram().DataPoints().At(l)
 						add(dp.Attributes(), dp.Sum(), dp.Count())
+						if dp.ExplicitBounds().Len() > 0 {
+							out[len(out)-1].buckets = dp.BucketCounts().AsRaw()
+						}
 					}
 				}
 			}
