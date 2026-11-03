@@ -1,5 +1,14 @@
 ## Unreleased
 
+* The state of a container is read on a worker instead of the goroutine
+  that drains the events of new cgroups (#126), which the kernel dropped
+  while it read the files of the runtimes, such as several MB of
+  `containers.json` on a busy host of Podman or CRI-O: the cgroups of a
+  burst of new containers lost their paths. The export no longer waits
+  for these reads either. The new counter
+  `shawk.agent.cgroup_events.dropped`
+  (`shawk_agent_cgroup_events_dropped_total`) tells how many new cgroups
+  the kernel did not report because the agent read too slowly.
 * Dependencies through relays without an agent that rewrite addresses
   (#107): load balancers, keepalived or LVS virtual addresses, TCP
   proxies. `translations` in the configuration of the connector gives

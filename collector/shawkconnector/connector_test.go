@@ -114,7 +114,7 @@ func TestGoldenRequest(t *testing.T) {
 	for i := range hb.agent.Len() {
 		names = append(names, hb.agent.At(i).Name())
 	}
-	if got := strings.Join(names, ","); got != "shawk.agent.up,shawk.agent.udp.traced,shawk.agent.flows.dropped,shawk.agent.export.failures,shawk.agent.bpf.run_count,shawk.agent.bpf.run_time" {
+	if got := strings.Join(names, ","); got != "shawk.agent.up,shawk.agent.udp.traced,shawk.agent.flows.dropped,shawk.agent.cgroup_events.dropped,shawk.agent.export.failures,shawk.agent.bpf.run_count,shawk.agent.bpf.run_time" {
 		t.Errorf("forwarded agent metrics = %s", got)
 	}
 }
