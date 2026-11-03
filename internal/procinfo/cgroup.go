@@ -72,6 +72,8 @@ var (
 //	/system.slice/docker-0123456789ab....scope       -> docker-0123456789ab
 //	/kubepods/burstable/pod<uid>/0123456789ab...     -> container-0123456789ab
 //	/system.slice/docker-<outer>.scope/docker/<inner> -> docker-<outer 12 hex>
+//	/user.slice/user-1000.slice/user@1000.service/user.slice/libpod-0123456789ab....scope
+//	                                                 -> user@1000.service/podman-0123456789ab
 //	/user.slice/user-1000.slice/session-3.scope      -> user-1000.slice/session.scope
 //	/user.slice/user-1000.slice/user@1000.service/app.slice/foo.service
 //	                                                 -> user@1000.service/foo.service
@@ -81,9 +83,9 @@ func Unit(cgroupPath string) string {
 	if len(parts) == 0 {
 		return ""
 	}
-	if refs := cgroupContainers(cgroupPath); len(refs) > 0 {
+	if refs, under := cgroupContainers(cgroupPath); len(refs) > 0 {
 		outer := refs[len(refs)-1]
-		return (&Container{Runtime: runtimeOrAny(outer.runtime), ID: outer.id}).Unit()
+		return (&Container{Runtime: runtimeOrAny(outer.runtime), ID: outer.id, Under: under}).Unit()
 	}
 	for i := len(parts) - 1; i >= 0; i-- {
 		p := parts[i]
@@ -119,10 +121,15 @@ type containerRef struct{ runtime, id string }
 // systemd is deeper than the innermost container, e.g. a service of
 // systemd in a container, which then names the process, as in Unit; it
 // stops at a unit above the containers, such as user@1000.service above
-// the containers of a rootless runtime.
-func cgroupContainers(cgroupPath string) []containerRef {
+// the containers of a rootless runtime, and returns that unit as under.
+//
+// The runtimes of the host make the cgroups of their containers in slices
+// or at the root of the hierarchy, never in a unit: a unit above the
+// containers delegates its cgroups to a user (user@1000.service, or a
+// service with Delegate=yes and User=), who may name them after any
+// container of the host. Their state is not read (see Resolver.unit).
+func cgroupContainers(cgroupPath string) (refs []containerRef, under string) {
 	parts := strings.FieldsFunc(cgroupPath, func(r rune) bool { return r == '/' })
-	var refs []containerRef
 	for i := len(parts) - 1; i >= 0; i-- {
 		if runtime, id, ok := containerOf(parts, i); ok {
 			refs = append(refs, containerRef{runtime, id})
@@ -130,10 +137,13 @@ func cgroupContainers(cgroupPath string) []containerRef {
 		}
 		p := parts[i]
 		if runScope.MatchString(p) || sessionScope.MatchString(p) || strings.HasSuffix(p, ".service") {
+			if len(refs) > 0 {
+				under = Unit("/" + strings.Join(parts[:i+1], "/"))
+			}
 			break
 		}
 	}
-	return refs
+	return refs, under
 }
 
 func runtimeOrAny(runtime string) string {

@@ -81,7 +81,7 @@ func (r *Resolver) Learn(id uint64, path string) {
 	}
 	r.learned[id] = learnedPath{path: path, at: time.Now()}
 	r.mu.Unlock()
-	if r.containers != nil && len(cgroupContainers(path)) > 0 {
+	if refs, under := cgroupContainers(path); r.containers != nil && len(refs) > 0 && under == "" {
 		r.queueRead(path)
 	}
 }
@@ -121,23 +121,25 @@ func (r *Resolver) Unit(id uint64) (string, *Container) {
 	return r.unit(r.CgroupPath(id))
 }
 
-// unit names the innermost container of a cgroup path whose state the
-// runtime has. A container in a container, e.g. with Docker in Docker,
-// keeps its state in the outer one, out of reach, and is named after the
-// outer container. Without any state, the outermost container names it by
-// id, as Unit does.
+// unit names the outermost container of a cgroup path after the state its
+// runtime keeps. A container in a container, e.g. with Docker in Docker or
+// kind, keeps its state in the outer one, out of reach, and is named after
+// the outer container; so is a cgroup that a container allowed to write its
+// cgroups made in its own with the name of another container of the host.
+// A container in the cgroup of a unit (see cgroupContainers) is named by
+// id, after the unit. Without any state, the outermost container names it
+// by id, as Unit does.
 func (r *Resolver) unit(path string) (string, *Container) {
-	refs := cgroupContainers(path)
+	refs, under := cgroupContainers(path)
 	if len(refs) == 0 || r.containers == nil {
 		return Unit(path), nil
 	}
-	var ctr *Container
-	for _, ref := range refs {
-		var found bool
-		if ctr, found = r.containers.Lookup(ref.runtime, ref.id); found {
-			break
-		}
+	outer := refs[len(refs)-1]
+	if under != "" {
+		ctr := &Container{Runtime: runtimeOrAny(outer.runtime), ID: outer.id, Under: under}
+		return ctr.Unit(), ctr
 	}
+	ctr, _ := r.containers.Lookup(outer.runtime, outer.id)
 	return ctr.Unit(), ctr
 }
 
