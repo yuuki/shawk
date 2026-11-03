@@ -1,11 +1,12 @@
 # Passive path quality: design proposal
 
-Status: proposal (2026-11-02), not implemented; no issue yet. The
-decisions of §9 are made. It answers
+Status: phase 1 (§3.1–§3.3) implemented (2026-11-03); phases 2 and 3
+proposed; no issue yet. The decisions of §9 are made. It answers
 whether shawk should do what Pingmesh [1] does: not its active probing,
 but its measurements, taken on the connections that hosts open anyway.
-It was revised after an adversarial review (§10). The sections of
-`docs/design.md` that would change are listed in §6.
+It was revised after an adversarial review (§10); what the implementation
+of phase 1 changed or left out is in §11. The sections of
+`docs/design.md` that change are listed in §6.
 
 ## 1. Problem
 
@@ -685,6 +686,66 @@ evidence.
 | Series arithmetic: a histogram without buckets still has `_bucket{le="+Inf"}`, so buckets add 10 series, not 12 | valid | Corrected; §6 notes the same omission in §5.3 of the design. |
 | Zones: IPv4-mapped prefixes would never match; duplicates and empty names; a zone holding the whole network | valid | §3.4 (parsing, folded peers). |
 | Missing pieces: §4.2, §4.3 and §5.3 of the design, OTLP names, where the alerts live, `_OTHER`, `shawk flows -json`, the collector example | valid | Added to §3, §6 and §7. |
+
+## 11. Implementation of phase 1 (2026-11-03)
+
+Phase 1 follows §3.1–§3.3, with the differences below. They come from a
+review of this proposal against the code before the implementation, and
+from the implementation itself.
+
+| finding | response |
+|---|---|
+| `count_conn()` also counts passive opens (`on_passive_open()`, and their recount), whose `retrans_base` holds the SYN-ACKs they retransmitted (phase 3) | `SS_HANDSHAKE` is set at SYN_SENT→ESTABLISHED only; `count_conn()` adds the SYN retransmissions and the duration only with it. |
+| The active opens without a duration (`TCP_REPAIR`, `TCP_FASTOPEN_CONNECT`) still count their SYN retransmissions, so one flag cannot tell both | A second flag, `SS_HS_TIME`, marks the duration pending. They count in `conns`, not in the buckets, so the number of handshakes is that of the durations. |
+| At SYN_SENT→ESTABLISHED, a connect with `TCP_FASTOPEN_CONNECT` that was deferred to its first write cannot be told from one that sent its SYN at once, without a cookie (`inet->defer_connect` is a bitfield before 6.6 and a flag after) | Every connect with the option has no duration, as §3.1 says of the deferred ones. |
+| A simultaneous open (SYN_SENT→SYN_RECV→ESTABLISHED) has no handshake (§3.1), but the proposal does not say what its failure is | Reasons are decided at SYN_SENT→CLOSE only; a failed simultaneous open is `_OTHER`. |
+| The stale `ECONNRESET` of `connect(AF_UNSPEC)` survives only until `tcp_connect_init()` clears `sk_err` when it builds a SYN | Nothing beyond the order of §3.1 (no segment sent first) is needed; a test closes a socket after `connect(AF_UNSPEC)` and a new connect, which is `aborted`. |
+| A duration truncated to microseconds would put 100.4 µs in the bucket of 100 µs | It is rounded up, so that the bounds hold as inclusive upper bounds. |
+| The tests of §7 need `ip`, `tc` and `nft`, which the virtual machines of `test/vm` do not have (their initramfs holds the test binary alone) | The tests run on loopback in network namespaces: a listener with a full accept queue drops SYNs, and raw sockets read a SYN and answer it with an ICMP error (port unreachable, host and network unreachable, host unknown, administratively prohibited), as a router or a firewall would. Not tested: ARP without an answer, netem, ICMPv6 (`EACCES`) and `ss -K`. |
+| The timer of a retransmission may expire up to a tick before 1 s, and a failed blocking connect clears `total_retrans` (`tcp_disconnect()` in `inet_stream_connect()`) | The test of a lost SYN accepts 0.9 s; the tests read `TCP_INFO` after non-blocking connects. |
+| The connector needs the buckets of its inputs for phase 2 only | Phase 1 keeps them in the input state, checks the bounds and resets histograms as a whole; outputs have no buckets until the family of sites. |
+| The new series of a reason emits 0 first (§3.3), but the proposal does not say when a reason whose first value is a baseline (after a restart of the connector) creates its series | At its first increase, like a new reason: a baseline creates none. |
+| "SYN retransmissions per attempt" (§3.5) has no denominator | The handshakes with a duration plus the failures, both of the client side; `shawk:dependency_connections:rate5m` also counts the server side of clients without an agent, which has no SYN retransmissions. |
+| The claims of sizes (storage 104→112 bytes, flow statistics 56→136 bytes, 2.6 MB for the two maps), of the `.rodata` zero value and of the fields on 5.14 | Confirmed: `make compat` passes against Rocky Linux 9, and every program loads on Linux 6.18. |
+
+Two independent subagents then reviewed the implementation: the kernel
+side against the sources of v5.14, v5.15, v6.1, v6.6, v6.9 to v6.12,
+mainline and CentOS Stream 9, with experiments on Linux 6.18; and the
+pipeline against the code, with tests of their own. Neither found a
+blocker.
+
+| finding | validity | response |
+|---|---|---|
+| Before 6.11 (RHEL 9 too), the error report of the first subflow of an MPTCP connection takes its `sk_err` (`__mptcp_error_report()` calls `sock_error()`) before `tcp_done()`, so an ICMP error reads as `timeout` | valid (from the sources; 6.18 reports after `tcp_done()`) | `fail_reason()` reads the `sk_err` of the MPTCP socket, where the report moved it. `TestConnectFailureMPTCP` checks it on the kernels of CI without `tcp_done_with_error()`: 5.14 and Rocky Linux 9 (the 5.15 of CI has its backport). |
+| A connect with `TCP_FASTOPEN_CONNECT` that fails before it is deferred, e.g. without a free local port, is `aborted` | confirmed (6.18) | The rule of §3.1 tests `defer_connect` instead of `fastopen_connect`: a bitfield before 6.6 and in RHEL 9, bit 19 of `inet_flags` since, read through flavors that `TestKernelCompatibility` requires one of. The durations still leave out every connect with the option, since a non-blocking first write clears `defer_connect` before the SYN-ACK. |
+| A SYN that an LSM denies on output (SELinux returns `ECONNREFUSED` to `tcp_connect()`) is `aborted` | valid (from the sources) | Documented in §10 of the design; `snd_nxt == snd_una` would tell it, but could not be tested here. |
+| The error is reported before `tcp_done()` on every kernel without `tcp_done_with_error()`, not only on 5.14 and RHEL 9 | valid | The comments and the design say so; a second review found the backports to stable (5.15.165, 6.1.110, 6.6.50). |
+| The tests of ICMP errors could read `SO_ERROR` between the report and `tcp_done()` on kernels before 6.11 | valid (reasoned) | The tests wait 20 ms after the wakeup. Not covered: ICMPv6 (`EACCES`), the fallback on `sk_err_soft`, and the count of a handshake by a walk. |
+| The failures by reason do not add up to `shawk_connection_failed_total`: a new series of a reason emits 0 first, while that of the failures starts with its whole value | valid | The comment of the rules and §5.3 of the design say so; `shawk.connection.failed` is unchanged. |
+| A step back of the clock of an agent by less than 2 minutes makes the first value of a new reason a baseline (`isNew()`) | confirmed by the reviewer | Accepted: new edges behave the same, and such steps are rare. |
+| The SYN retransmissions per attempt of the dashboard divided by failures that agents of the previous version count without SYN retransmissions | valid | The attempts are the handshakes and the failures by reason, both sent with the retransmissions (`TestSYNRetransmitRatio`). Connects with `TCP_FASTOPEN_CONNECT`, without a handshake, still raise the ratio. |
+| The checks of the e2e test pass with values of 0 | valid | Those of handshakes and of refused connects require values above 0; that of SYN retransmissions requires the series only, since the e2e test loses no SYN. |
+| The connector outputs any `error.type`, so an agent could make a series per value | valid | Unknown values are output as `_OTHER`. |
+| An input of handshakes with other bounds loses its sum and count too, so changing the bounds needs the connectors upgraded first | by design (§3.3) | Noted. |
+| The bound of series in §5.3 of the design, the row of `_OTHER`, the encoding of buckets (fixed64, not varints) and the changelog were off | valid | Corrected. |
+| Missing tests: the start of a reason when its edge comes back, unknown reasons, a restart of the agent | valid | Added. |
+
+After the fixes, two other subagents reviewed the pull request again: the
+kernel side with the same sources and the stable tags, and with the tests
+in virtual machines of 5.14.21, 5.15.224 and Rocky Linux 9; and the
+pipeline with tests of their own. They found the fixes right, and:
+
+| finding | validity | response |
+|---|---|---|
+| `TestHandshakeWithoutDuration` failed in CI (aarch64, emulated): its server closed without reading what the client sent, which resets the connection, and the client could see the reset before reading | confirmed (4 of 10 runs on Rocky Linux 9) | The server reads first. |
+| `tcp_done_with_error()` was backported to stable (5.15.165, 6.1.110, 6.6.50), so "before 6.11" was wrong, and the 5.15 of CI does not exercise the fallback for MPTCP | confirmed (`TestConnectFailureMPTCP` fails without the fallback on 5.14.21 and Rocky Linux 9, passes on 5.15.224) | The comments, the design and this table name the kernels without `tcp_done_with_error()`. |
+| On kernels without it, an application that connects an MPTCP socket again without reading `SO_ERROR` leaves the error on the MPTCP socket, which a later aborted connect would read as its reason | reasoned only | Accepted: it takes an application that ignores two errors. |
+| Bit 19 of `inet_flags` is written in the BPF source, and nothing checks it | valid | `TestDeferConnectBit` compares it with the BTF of the running kernel and of `SHAWK_TARGET_BTF`. |
+| The test of SYN retransmissions per attempt gave its value for the wrong denominators too | confirmed | It has a fixture of its own: a client of an agent of the previous version, and a dependency without failures. |
+| The refused upstream made the check of the client without an agent in the e2e test pass on the client side, and it was in the requests of puma | confirmed | The check requires a server series with `shawk.peer.agent` false; a client of its own makes the refused connects. |
+| Nothing tied the reasons of the connector to those of the agent | valid | The golden request carries every reason, which the test of the connector compares with those it knows. |
+| SYN retransmissions per attempt exceed 1 when connects time out, which a percentage misreads | valid | A plain number. |
+| The screenshot of the dependency details in the README predates the new panels | valid | Left for the next screenshots. |
 
 ## References
 

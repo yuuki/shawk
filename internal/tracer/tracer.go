@@ -790,8 +790,14 @@ func preferredOwner(cands []owner) (owner, bool) {
 	return best, ok
 }
 
+// The buckets and reasons of struct shawk_flow_stats are those of FlowStats.
+var (
+	_ [len(bpfShawkFlowStats{}.HsBuckets)]struct{} = [len(FlowStats{}.Handshakes)]struct{}{}
+	_ [len(bpfShawkFlowStats{}.Fails)]struct{}     = [len(FlowStats{}.Fails)]struct{}{}
+)
+
 func convertFlow(k *bpfShawkFlowKey, v *bpfShawkFlowStats) Flow {
-	return Flow{
+	f := Flow{
 		FlowKey: FlowKey{
 			Direction:  Direction(k.Direction),
 			Proto:      Proto(k.Proto),
@@ -804,19 +810,28 @@ func convertFlow(k *bpfShawkFlowKey, v *bpfShawkFlowStats) Flow {
 			Folded:     k.Flags&keyFolded != 0,
 		},
 		FlowStats: FlowStats{
-			Conns:      uint64(v.Conns),
-			ConnFails:  uint64(v.ConnFails),
-			OpenConns:  uint64(v.OpenConns),
-			BytesSent:  v.BytesSent,
-			BytesRecv:  v.BytesRecv,
-			MsgsSent:   uint64(v.MsgsSent),
-			MsgsRecv:   uint64(v.MsgsRecv),
-			Retrans:    uint64(v.Retrans),
-			RTTSumUs:   v.RttSumUs,
-			RTTSamples: uint64(v.RttSamples),
-			PID:        v.Pid,
+			Conns:          uint64(v.Conns),
+			ConnFails:      uint64(v.ConnFails),
+			OpenConns:      uint64(v.OpenConns),
+			BytesSent:      v.BytesSent,
+			BytesRecv:      v.BytesRecv,
+			MsgsSent:       uint64(v.MsgsSent),
+			MsgsRecv:       uint64(v.MsgsRecv),
+			Retrans:        uint64(v.Retrans),
+			RTTSumUs:       v.RttSumUs,
+			RTTSamples:     uint64(v.RttSamples),
+			HandshakeSumUs: v.HsSumUs,
+			SynRetrans:     uint64(v.SynRetrans),
+			PID:            v.Pid,
 		},
 	}
+	for i, n := range v.HsBuckets {
+		f.Handshakes[i] = uint64(n)
+	}
+	for i, n := range v.Fails {
+		f.Fails[i] = uint64(n)
+	}
+	return f
 }
 
 // scanSockets walks TCP and UDP sockets and returns the listeners and the

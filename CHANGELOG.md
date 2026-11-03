@@ -1,5 +1,29 @@
 ## Unreleased
 
+* The time to connect and why connects fail, per dependency, measured
+  passively on the connections that hosts open (phase 1 of
+  `docs/proposal-path-quality.md`). The state change program of TCP now
+  measures the handshake of every active open from `connect(2)` to the
+  SYN-ACK, the SYNs it retransmitted, and the reason of a failure:
+  `refused`, `timeout`, `unreachable`, `local` (no SYN sent, e.g. no free
+  local port), `aborted` (the application gave up first) or `_OTHER`.
+  The agent sends them on TCP client edges as the new metrics
+  `shawk.tcp.handshake` (a histogram with buckets from 100 µs to 3 s),
+  `shawk.tcp.syn_retransmits` and `shawk.connection.failed.by_reason`
+  (with `error.type`), and `shawk flows` shows them. The connector
+  forwards them per dependency as `shawk_tcp_handshake_seconds_sum` and
+  `_count`, `shawk_tcp_syn_retransmits_total` and
+  `shawk_connection_failed_by_reason_total{error_type}`, with the new
+  recording rules `shawk:dependency_handshake_seconds_sum:rate5m`,
+  `shawk:dependency_handshake_seconds_count:rate5m`,
+  `shawk:dependency_syn_retransmits:rate5m` and
+  `shawk:dependency_connection_failures_by_reason:rate5m`, and panels in
+  the dependency details dashboard. No existing metric, label or table
+  changes (`shawk flows` gains three columns), and the agents and
+  connectors can be upgraded in either order: a connector of the
+  previous version ignores the new metrics, and the edges of agents of the
+  previous version have none of the new series. The flow tables of the
+  agent take 2.6 MB more with the default `-max-flows`.
 * Translations of addresses learned from conntrack (#107, phase 2). The
   agent of a host that translates addresses learns its translations with
   two kprobes on the module nf_conntrack, once it is loaded: Docker

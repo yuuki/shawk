@@ -299,6 +299,11 @@ func (a *Agent) observe(snap *tracer.Snapshot, start, end time.Time) {
 			Retrans:    f.Retrans,
 			RTTSumUs:   f.RTTSumUs,
 			RTTSamples: f.RTTSamples,
+			// The buckets and reasons of the tracer are those of OTLP.
+			Handshakes:     f.Handshakes,
+			HandshakeSumUs: f.HandshakeSumUs,
+			SynRetrans:     f.SynRetrans,
+			Fails:          f.Fails,
 		}, start, end)
 	}
 	for _, x := range snap.Translations {

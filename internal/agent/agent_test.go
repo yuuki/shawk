@@ -16,6 +16,7 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/yuuki/shawk/internal/otlp"
+	"github.com/yuuki/shawk/internal/tracer"
 )
 
 type collector struct {
@@ -160,6 +161,24 @@ func TestParseInternalPeers(t *testing.T) {
 	for _, bad := range []string{"intranet", "10.0.0.0/33", "fe80::1%eth0", "fe80::%eth0/64", "::/0", "::/80"} {
 		if _, err := ParseInternalPeers(bad); err == nil {
 			t.Errorf("ParseInternalPeers(%q) succeeded", bad)
+		}
+	}
+}
+
+// TestHandshakeContract checks that the buckets and the reasons of failure
+// of the tracer are those that the agent sends.
+func TestHandshakeContract(t *testing.T) {
+	if len(tracer.HandshakeBounds) != len(otlp.HandshakeBounds) {
+		t.Fatalf("%d bounds in the tracer, %d in OTLP", len(tracer.HandshakeBounds), len(otlp.HandshakeBounds))
+	}
+	for i, b := range tracer.HandshakeBounds {
+		if b.Seconds() != otlp.HandshakeBounds[i] {
+			t.Errorf("bound %d is %v in the tracer and %vs in OTLP", i, b, otlp.HandshakeBounds[i])
+		}
+	}
+	for r := range tracer.FailReason(tracer.NumFailReasons) {
+		if r.String() != otlp.FailReasons[r] {
+			t.Errorf("reason %d is %s in the tracer and %s in OTLP", r, r, otlp.FailReasons[r])
 		}
 	}
 }

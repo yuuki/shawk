@@ -3,6 +3,7 @@ package tracer
 import (
 	"fmt"
 	"net/netip"
+	"time"
 )
 
 // Direction is the direction of a flow seen from the local host.
@@ -136,6 +137,55 @@ func KernelOwned(comm string, cgroupID uint64) bool {
 	return comm == KernelComm && cgroupID == 0
 }
 
+// HandshakeBounds are the upper bounds, inclusive, of the buckets of the
+// handshake durations of TCP active opens (FlowStats.Handshakes), as
+// hs_bucket() of the BPF programs counts them; the last bucket has none.
+var HandshakeBounds = [...]time.Duration{
+	100 * time.Microsecond, 250 * time.Microsecond, 500 * time.Microsecond, time.Millisecond,
+	2500 * time.Microsecond, 10 * time.Millisecond, 50 * time.Millisecond, 250 * time.Millisecond,
+	time.Second, 3 * time.Second,
+}
+
+// FailReason tells why a TCP active open failed. It matches enum
+// shawk_fail_reason of the BPF programs.
+type FailReason uint8
+
+const (
+	// FailRefused is a reset from the peer (no listener) or an ICMP port
+	// unreachable, which firewalls also send to reject.
+	FailRefused FailReason = iota
+	// FailTimeout is no answer to any SYN.
+	FailTimeout
+	// FailUnreachable is an ICMP error from a router or a firewall, or no
+	// answer to ARP or neighbor discovery.
+	FailUnreachable
+	// FailLocal is a connect that sent no SYN, e.g. without a free local
+	// port.
+	FailLocal
+	// FailAborted is a connect that the application gave up first.
+	FailAborted
+
+	// NumFailReasons is the number of reasons, the length of
+	// FlowStats.Fails.
+	NumFailReasons = 5
+)
+
+func (r FailReason) String() string {
+	switch r {
+	case FailRefused:
+		return "refused"
+	case FailTimeout:
+		return "timeout"
+	case FailUnreachable:
+		return "unreachable"
+	case FailLocal:
+		return "local"
+	case FailAborted:
+		return "aborted"
+	}
+	return fmt.Sprintf("reason(%d)", uint8(r))
+}
+
 // FlowStats holds the statistics of a bundled flow in an interval.
 type FlowStats struct {
 	Conns      uint64 // TCP connections established
@@ -148,7 +198,20 @@ type FlowStats struct {
 	Retrans    uint64 // TCP retransmitted segments
 	RTTSumUs   uint64
 	RTTSamples uint64
-	PID        uint32 // last observed process id
+	// Handshakes are the TCP active opens established, by the duration of
+	// their handshake from connect(2) (buckets of HandshakeBounds), and
+	// HandshakeSumUs the sum of their durations. Connections established
+	// without a duration (TCP_REPAIR, TCP_FASTOPEN_CONNECT) and
+	// simultaneous opens are counted in Conns only.
+	Handshakes     [len(HandshakeBounds) + 1]uint64
+	HandshakeSumUs uint64
+	// SynRetrans are the SYNs that the TCP active opens counted in Conns
+	// or ConnFails retransmitted.
+	SynRetrans uint64
+	// Fails are the TCP active opens that failed, by FailReason. ConnFails
+	// minus their sum failed for another reason.
+	Fails [NumFailReasons]uint64
+	PID   uint32 // last observed process id
 }
 
 // Add accumulates o into s.
@@ -163,9 +226,35 @@ func (s *FlowStats) Add(o FlowStats) {
 	s.Retrans += o.Retrans
 	s.RTTSumUs += o.RTTSumUs
 	s.RTTSamples += o.RTTSamples
+	for i := range s.Handshakes {
+		s.Handshakes[i] += o.Handshakes[i]
+	}
+	s.HandshakeSumUs += o.HandshakeSumUs
+	s.SynRetrans += o.SynRetrans
+	for i := range s.Fails {
+		s.Fails[i] += o.Fails[i]
+	}
 	if o.PID != 0 {
 		s.PID = o.PID
 	}
+}
+
+// HandshakeCount returns the number of handshakes with a duration.
+func (s *FlowStats) HandshakeCount() uint64 {
+	var n uint64
+	for _, c := range s.Handshakes {
+		n += c
+	}
+	return n
+}
+
+// OtherFails returns the failed active opens without a FailReason.
+func (s *FlowStats) OtherFails() uint64 {
+	n := s.ConnFails
+	for _, c := range s.Fails {
+		n -= min(c, n)
+	}
+	return n
 }
 
 // Flow is a bundled flow with its statistics.

@@ -24,7 +24,12 @@ func goldenRequest() *colmetricspb.ExportMetricsServiceRequest {
 	app := Process{Unit: "app.service", Comm: "puma", Exe: "/usr/bin/ruby", Service: "app", ServiceNamespace: "shop"}
 	s.AddEdge(EdgeKey{Role: RoleClient, Proto: "tcp", LocalAddr: netip.MustParseAddr("10.0.0.11"),
 		PeerAddr: netip.MustParseAddr("10.0.0.10"), Port: 5432, NetNS: 4026531840, Process: app},
-		EdgeStats{Conns: 3, ConnFails: 1, OpenConns: 2, BytesSent: 100, BytesRecv: 200, Retrans: 4, RTTSumUs: 1500, RTTSamples: 3},
+		EdgeStats{Conns: 3, ConnFails: 7, OpenConns: 2, BytesSent: 100, BytesRecv: 200, Retrans: 4, RTTSumUs: 1500, RTTSamples: 3,
+			// Two handshakes of 0.3 ms and one of 1.2 s, after a lost SYN;
+			// failures for every reason, which the connector must know,
+			// two by timeout and one for another reason.
+			Handshakes: [len(HandshakeBounds) + 1]uint64{2: 2, 9: 1}, HandshakeSumUs: 1_200_600, SynRetrans: 3,
+			Fails: [len(FailReasons)]uint64{1, 2, 1, 1, 1}},
 		t0, t0.Add(15*time.Second))
 	s.AddEdge(EdgeKey{Role: RoleServer, Proto: "tcp", LocalAddr: netip.MustParseAddr("10.0.0.11"),
 		PeerAddr: netip.MustParseAddr("10.0.0.5"), Port: 8080, NetNS: 4026531840, Process: app},

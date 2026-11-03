@@ -11,7 +11,7 @@ tested (`make test`) but meant to be adapted.
 | `collector/config.yaml` | Collector configuration: the `otlp/shawk` receiver for agents, the shawk connector, Prometheus and OBI pipelines. |
 | `postgres/setup.sql`, `postgres/grants.sql` | Roles (`shawk_owner`, `shawk_connector`, `shawk_grafana`), database and privileges. |
 | `prometheus/prometheus.yml` | Settings Prometheus needs for the OTLP push of the collector. |
-| `prometheus/shawk-rules.yml` | Recording rules that count each dependency once, and alerts. |
+| `prometheus/shawk-rules.yml` | Recording rules that count each dependency once (connections, failures and their reasons, bytes, RTT, time to connect, retransmissions), and alerts. |
 | `grafana/provisioning/` | Data sources (uids `shawk-postgres`, `shawk-prometheus`), the dashboard provider and SQL alert rules. |
 | `grafana/dashboards/` | Dashboards: fleet, dependency map, dependency details, changes, application layer (OBI). |
 

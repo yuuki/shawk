@@ -244,7 +244,9 @@ func TestTCPSelfConnect(t *testing.T) {
 	if out == nil {
 		t.Fatalf("outgoing flow not found in %+v", snap.Flows)
 	}
-	if out.Conns != 1 || out.BytesSent != 100 || out.BytesRecv != 100 || out.Comm != testComm {
+	// A simultaneous open has no handshake of its own.
+	if out.Conns != 1 || out.BytesSent != 100 || out.BytesRecv != 100 || out.Comm != testComm ||
+		out.HandshakeCount() != 0 || out.SynRetrans != 0 {
 		t.Errorf("outgoing flow = %+v", out)
 	}
 }

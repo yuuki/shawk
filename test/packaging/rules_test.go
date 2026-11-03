@@ -72,6 +72,13 @@ load 1m
   shawk_tcp_retransmits_total{job="shop/app", instance="app-01", shawk_role="client", service_peer_name="postgres", shawk_peer_agent="true", server_port="5432", network_transport="tcp"} 0+60x10
   shawk_tcp_retransmits_total{job="postgres", instance="db-01", shawk_role="server", service_peer_name="office-lan", shawk_peer_agent="false", server_port="5432", network_transport="tcp"} 0+120x10
   shawk_tcp_retransmits_total{job="postgres", instance="db-01", shawk_role="server", service_peer_name="shop/app", shawk_peer_agent="true", server_port="5432", network_transport="tcp"} 0+180x10
+  shawk_tcp_handshake_seconds_sum{job="shop/app", instance="app-01", shawk_role="client", service_peer_name="postgres", shawk_peer_agent="true", server_port="5432", network_transport="tcp"} 0+1.2x10
+  shawk_tcp_handshake_seconds_count{job="shop/app", instance="app-01", shawk_role="client", service_peer_name="postgres", shawk_peer_agent="true", server_port="5432", network_transport="tcp"} 0+60x10
+  shawk_tcp_handshake_seconds_sum{job="shop/app", instance="app-02", shawk_role="client", service_peer_name="postgres", shawk_peer_agent="true", server_port="5432", network_transport="tcp"} 0+0.6x10
+  shawk_tcp_handshake_seconds_count{job="shop/app", instance="app-02", shawk_role="client", service_peer_name="postgres", shawk_peer_agent="true", server_port="5432", network_transport="tcp"} 0+60x10
+  shawk_tcp_syn_retransmits_total{job="shop/app", instance="app-01", shawk_role="client", service_peer_name="postgres", shawk_peer_agent="true", server_port="5432", network_transport="tcp"} 0+12x10
+  shawk_connection_failed_by_reason_total{job="shop/app", instance="app-01", shawk_role="client", service_peer_name="postgres", shawk_peer_agent="true", server_port="5432", network_transport="tcp", error_type="timeout"} 0+18x10
+  shawk_connection_failed_by_reason_total{job="shop/app", instance="app-01", shawk_role="client", service_peer_name="postgres", shawk_peer_agent="true", server_port="5432", network_transport="tcp", error_type="refused"} 0+12x10
   shawk_udp_datagrams_total{job="shop/app", instance="app-01", shawk_role="client", service_peer_name="~external", shawk_peer_agent="false", server_port="53", network_transport="udp", network_io_direction="transmit"} 0+60x10
   shawk_udp_datagrams_total{job="shop/app", instance="app-01", shawk_role="client", service_peer_name="~external", shawk_peer_agent="false", server_port="53", network_transport="udp", network_io_direction="receive"} 0+120x10
   shawk_agent_up{job="shawk-agent", host_name="app-01"} 1x30
@@ -99,6 +106,17 @@ eval instant at 10m ` + r("shawk:dependency_connections:rate5m") + `
 
 eval instant at 10m ` + r("shawk:dependency_connection_failures:rate5m") + `
   {` + app + `} 0.5
+
+eval instant at 10m ` + r("shawk:dependency_connection_failures_by_reason:rate5m") + `
+  {` + app + `, error_type="timeout"} 0.3
+  {` + app + `, error_type="refused"} 0.2
+
+# 20 ms on app-01 and 10 ms on app-02, which open as many connections.
+eval instant at 10m ` + r("shawk:dependency_handshake_seconds_sum:rate5m") + " / " + r("shawk:dependency_handshake_seconds_count:rate5m") + `
+  {` + app + `} 0.015
+
+eval instant at 10m ` + r("shawk:dependency_syn_retransmits:rate5m") + `
+  {` + app + `} 0.2
 
 eval instant at 10m ` + r("shawk:dependency_open_connections") + `
   {` + app + `} 4
@@ -185,4 +203,46 @@ eval instant at 20m ` + a("ShawkContainerReadsDropped") + `
 			t.Errorf("%s: %v", name, err)
 		}
 	}
+}
+
+// TestSYNRetransmitRatio evaluates the panel of SYN retransmissions per
+// attempt of the dependency details dashboard. Its denominator is the union
+// of the handshakes and the failures by reason, which the agents that send
+// the retransmissions send too: app-03, of the previous version, sends
+// failures only, and the dependency on redis-server has no failures.
+func TestSYNRetransmitRatio(t *testing.T) {
+	records, _ := loadRules(t)
+	d := loadJSON(t, grafana+"/dashboards/shawk-dependency.json")
+	var expr string
+	for _, p := range d["panels"].([]any) {
+		p := p.(map[string]any)
+		if p["title"] == "SYN retransmissions per attempt" {
+			expr = p["targets"].([]any)[0].(map[string]any)["expr"].(string)
+		}
+	}
+	if expr == "" {
+		t.Fatal("no panel of SYN retransmissions per attempt")
+	}
+	// All clients and servers: the recording rules are inlined, which takes
+	// no matchers.
+	expr = strings.ReplaceAll(expr, `{src=~"$src", dst=~"$dst"}`, "")
+	pg := `job="shop/app", shawk_role="client", service_peer_name="postgres", shawk_peer_agent="true", server_port="5432", network_transport="tcp"`
+	redis := `job="shop/app", instance="app-01", shawk_role="client", service_peer_name="redis-server", shawk_peer_agent="true", server_port="6379", network_transport="tcp"`
+	script := `
+load 1m
+  shawk_tcp_handshake_seconds_count{instance="app-01", ` + pg + `} 0+120x10
+  shawk_tcp_syn_retransmits_total{instance="app-01", ` + pg + `} 0+30x10
+  shawk_connection_failed_by_reason_total{instance="app-01", ` + pg + `, error_type="timeout"} 0+30x10
+  shawk_connection_failed_total{instance="app-01", ` + pg + `} 0+30x10
+  shawk_connection_failed_total{instance="app-03", ` + pg + `} 0+60x10
+  shawk_tcp_handshake_seconds_count{` + redis + `} 0+60x10
+  shawk_tcp_syn_retransmits_total{` + redis + `} 0+6x10
+
+# 0.5 SYNs/s over 2 handshakes/s and 0.5 failures/s of app-01; 0.1 SYNs/s
+# over 1 handshake/s.
+eval instant at 10m ` + inline(expr, records) + `
+  {src="shop/app", dst="postgres", server_port="5432"} 0.2
+  {src="shop/app", dst="redis-server", server_port="6379"} 0.1
+`
+	promqltest.RunTest(t, script, promqltest.NewTestEngine(t, false, 0, promqltest.DefaultMaxSamplesPerQuery))
 }
