@@ -345,8 +345,9 @@ func edgeAttrs(k *EdgeKey) []*commonpb.KeyValue {
 		integer(AttrServerPort, int64(k.Port)),
 		str(AttrNetNS, strconv.FormatUint(uint64(k.NetNS), 10)),
 	)
-	// network.peer.address stays an address, 0.0.0.0 or ::, which connectors
-	// that predate folding store as is.
+	// The network.peer.address of a folded edge is 0.0.0.0 or ::, an address
+	// like that of any edge; shawk.peer.folded tells that it stands for the
+	// peers outside the internal ranges.
 	if k.PeerFolded {
 		attrs = append(attrs, boolean(AttrPeerFolded, true))
 	}

@@ -208,8 +208,8 @@ eval instant at 20m ` + a("ShawkContainerReadsDropped") + `
 // TestSYNRetransmitRatio evaluates the panel of SYN retransmissions per
 // attempt of the dependency details dashboard. Its denominator is the union
 // of the handshakes and the failures by reason, which the agents that send
-// the retransmissions send too: app-03, of the previous version, sends
-// failures only, and the dependency on redis-server has no failures.
+// the retransmissions send too: app-03 sends failures without handshakes,
+// and the dependency on redis-server has no failures.
 func TestSYNRetransmitRatio(t *testing.T) {
 	records, _ := loadRules(t)
 	d := loadJSON(t, grafana+"/dashboards/shawk-dependency.json")
