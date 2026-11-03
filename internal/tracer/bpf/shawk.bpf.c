@@ -841,41 +841,87 @@ static __always_inline int errno_reason(int err)
 	return -1;
 }
 
+/* defer_connect of struct inet_sock, a bitfield before Linux 6.6 and in RHEL 9. */
+struct inet_sock___defer {
+	__u8 defer_connect: 1;
+} __attribute__((preserve_access_index));
+
+/* inet_flags of struct inet_sock, since Linux 6.6. */
+struct inet_sock___flags {
+	unsigned long inet_flags;
+} __attribute__((preserve_access_index));
+
+/*
+ * The bit of inet_sock.inet_flags that replaces defer_connect since Linux
+ * 6.6, INET_FLAGS_DEFER_CONNECT; an anonymous enum cannot be relocated.
+ */
+#define INET_FLAGS_DEFER_CONNECT_ 19
+
+/*
+ * Whether a connect with TCP_FASTOPEN_CONNECT waits for the first write to
+ * send its SYN (tcp_fastopen_defer_connect()).
+ */
+static __always_inline bool connect_deferred(struct sock *sk)
+{
+	struct inet_sock___defer *old = (void *)sk;
+	struct inet_sock___flags *inet = (void *)sk;
+
+	if (bpf_core_field_exists(inet->inet_flags))
+		return (BPF_CORE_READ(inet, inet_flags) >> INET_FLAGS_DEFER_CONNECT_) & 1;
+	if (bpf_core_field_exists(old->defer_connect))
+		return BPF_CORE_READ_BITFIELD_PROBED(old, defer_connect);
+	return false;
+}
+
 /*
  * Returns why an active open failed (SYN_SENT -> CLOSE), or -1 for _OTHER.
  *
- * - No segment sent: tcp_connect() did not get as far as building a SYN,
- *   e.g. without a free local port (EADDRNOTAVAIL from inet_hash_connect(),
- *   returned by connect(2) and never in sk_err), or the connect was
- *   deferred by TCP_FASTOPEN_CONNECT and the socket closed before its first
- *   write. sk_err may then hold the stale ECONNRESET that connect(AF_UNSPEC)
- *   left (tcp_disconnect(), which also clears segs_out), which
- *   tcp_connect_init() clears once a SYN is built.
+ * - No segment sent: the connect was deferred by TCP_FASTOPEN_CONNECT and
+ *   the socket closed before its first write, or tcp_connect() did not get
+ *   as far as building a SYN, e.g. without a free local port (EADDRNOTAVAIL
+ *   from inet_hash_connect(), returned by connect(2) and never in sk_err),
+ *   also with TCP_FASTOPEN_CONNECT, before the connect could be deferred.
+ *   A deferred connect that fails at its first write for want of a buffer
+ *   is taken as aborted. sk_err may hold the stale ECONNRESET that
+ *   connect(AF_UNSPEC) left (tcp_disconnect(), which also clears segs_out),
+ *   which tcp_connect_init() clears once a SYN is built.
  * - sk_err set before tcp_done(): a reset or ICMP port unreachable
  *   (ECONNREFUSED), the last SYN unanswered (ETIMEDOUT), an ICMP error from
  *   a router or a firewall, or no answer to ARP/ND (EHOSTUNREACH and the
  *   others of errno_reason(); ICMPv6 administratively prohibited gives
  *   EACCES).
+ * - Kernels before 6.11 (tcp_done_with_error()), RHEL 9 among them, report
+ *   the error in tcp_write_err() and tcp_v4_err()/tcp_v6_err() before
+ *   tcp_done(). For the first subflow of an MPTCP connection, the report
+ *   moves the error to the MPTCP socket at once (__mptcp_error_report()
+ *   takes it with sock_error()), where it is read instead.
  * - No error, on a socket that no process holds: a timer or an ICMP error
- *   closed it, but user space already took the error (SO_ERROR takes it
- *   without the socket lock). Linux 5.14 and RHEL 9 report the error in
- *   tcp_write_err() and tcp_v4_err()/tcp_v6_err() before tcp_done(). The
+ *   closed it, but user space already took the error, which SO_ERROR does
+ *   without the socket lock once the error is reported (before 6.11). The
  *   soft error of an ICMP error tells which, if any; otherwise the timer.
  * - No error, on a socket that a process holds: the application closed it
  *   or disconnected it first, usually after its own connect timeout.
  */
 static __always_inline int fail_reason(struct sock *sk, struct tcp_sock *tp)
 {
+	bool join;
+	__u64 msk;
 	int err;
 
 	if (!BPF_CORE_READ(tp, segs_out)) {
-		if (BPF_CORE_READ_BITFIELD_PROBED(tp, fastopen_connect))
+		if (connect_deferred(sk))
 			return FAIL_ABORTED;
 		return FAIL_LOCAL;
 	}
 	err = BPF_CORE_READ(sk, sk_err);
 	if (err)
 		return errno_reason(err);
+	msk = subflow_msk(sk, &join);
+	if (msk && !join) {
+		err = BPF_CORE_READ((struct sock *)msk, sk_err);
+		if (err)
+			return errno_reason(err);
+	}
 	if (!BPF_CORE_READ(sk, sk_lock.owned)) {
 		err = BPF_CORE_READ(sk, sk_err_soft);
 		return err ? errno_reason(err) : FAIL_TIMEOUT;

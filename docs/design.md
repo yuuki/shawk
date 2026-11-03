@@ -169,12 +169,13 @@ failure, the `error.type` of the agent, is decided at SYN_SENT→CLOSE:
 
 | condition, in order | reason |
 |---|---|
-| no segment sent (`segs_out`), with `TCP_FASTOPEN_CONNECT` | `aborted`: a deferred connect closed before its first write |
+| no segment sent (`segs_out`), and the connect deferred by `TCP_FASTOPEN_CONNECT` (`defer_connect`) | `aborted`: a deferred connect closed before its first write |
 | no segment sent | `local`: no SYN was built, e.g. no free local port (`EADDRNOTAVAIL` from `inet_hash_connect()`) or no buffer |
 | `sk_err` `ECONNREFUSED` | `refused`: a reset (no listener), or an ICMP port unreachable, which iptables and nft send to reject by default |
 | `sk_err` `ETIMEDOUT` | `timeout`: no answer to any SYN |
 | `sk_err` `EHOSTUNREACH`, `ENETUNREACH`, `EHOSTDOWN`, `ENONET`, `EACCES` | `unreachable`: an ICMP error from a router or a firewall (firewalld's administratively prohibited is `EACCES` over IPv6), or no answer to ARP/ND |
-| no `sk_err`, the socket not held by a process (`sk_lock.owned`) | the reason of `sk_err_soft`, else `timeout`: a timer or an ICMP error closed it, but user space already took the error, which Linux 5.14 and RHEL 9 report before `tcp_done()` |
+| no `sk_err`, the first subflow of an MPTCP connection | the reason of the `sk_err` of the MPTCP socket, to which kernels before 6.11 move the error before `tcp_done()` |
+| no `sk_err`, the socket not held by a process (`sk_lock.owned`) | the reason of `sk_err_soft`, else `timeout`: a timer or an ICMP error closed it, but user space already took the error, which kernels before 6.11 (RHEL 9 among them) report before `tcp_done()` |
 | no `sk_err` | `aborted`: the application closed the socket first, usually after its own connect timeout |
 | another `sk_err` (`ECONNABORTED` from `ss -K`, ...) | `_OTHER`: the kernel counts it in the failures only, and the agent sends the failures without another reason as `_OTHER` |
 
@@ -1205,8 +1206,11 @@ parses. shawk runs beside it instead:
   below a second turns losses into `aborted`. An ICMP error processed
   while `connect(2)` holds the socket only sets the soft error, and the
   socket fails at the next SYN, a second later with one retransmission.
-  The fallback for the error taken by user space on Linux 5.14 and RHEL 9
-  covers that race only in part. UDP has no handshake, and QUIC sets up its
+  The fallback for the error taken by user space on kernels before 6.11
+  covers that race only in part. A SYN that an LSM denies on output
+  (SELinux returns `ECONNREFUSED` to `tcp_connect()`) is `aborted`, and so
+  is a connect deferred by `TCP_FASTOPEN_CONNECT` whose first write fails
+  to send the SYN. UDP has no handshake, and QUIC sets up its
   connections in user space.
 - **Connections that predate the agent** are counted from the adoption on.
   One accepted by a listener created with a backlog of 0 whose listener is

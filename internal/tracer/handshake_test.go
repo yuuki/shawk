@@ -107,6 +107,9 @@ func (s *testSock) wait(t *testing.T, timeout time.Duration) error {
 		}
 		break
 	}
+	// Kernels before 6.11 wake the socket up before tcp_done(), and reading
+	// SO_ERROR before the tracepoint would take its error (fail_reason()).
+	time.Sleep(20 * time.Millisecond)
 	errno, err := unix.GetsockoptInt(s.fd, unix.SOL_SOCKET, unix.SO_ERROR)
 	if err != nil {
 		t.Fatal(err)
@@ -467,6 +470,44 @@ func TestConnectFailureReasons(t *testing.T) {
 	}
 }
 
+// TestConnectFailureMPTCP checks the reason of an MPTCP connect that an
+// ICMP error fails, which kernels before 6.11 move from the first subflow
+// to the MPTCP socket before the subflow closes.
+func TestConnectFailureMPTCP(t *testing.T) {
+	tr, run := handshakeTracer(t, 0)
+	src := loopback4(20)
+	var hole netip.AddrPort
+	run(func() {
+		enableMPTCP(t)
+		hole, _ = blackhole(t)
+		syns := newSYNReader(t)
+		fd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_CLOEXEC|unix.SOCK_NONBLOCK, ipprotoMPTCP)
+		if err != nil {
+			skipUnavailable(t, "MPTCP is unavailable: %v", err)
+		}
+		s := &testSock{fd: fd}
+		t.Cleanup(s.close)
+		if err := unix.Bind(fd, &unix.SockaddrInet4{Addr: src.As4()}); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.connect(hole); !errors.Is(err, unix.EINPROGRESS) {
+			t.Fatalf("connect: %v", err)
+		}
+		sendICMPUnreachable(t, 3, syns.next(t, src, hole.Port()))
+		if err := s.wait(t, 5*time.Second); !errors.Is(err, unix.ECONNREFUSED) {
+			t.Fatalf("connect: %v, want %v", err, unix.ECONNREFUSED)
+		}
+	})
+	snap, err := tr.Collect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := clientFlow(src, hole, snap)
+	if out == nil || out.ConnFails != 1 || out.Fails[FailRefused] != 1 || out.SynRetrans != 0 {
+		t.Errorf("flow = %+v, want a refused connect", out)
+	}
+}
+
 // TestConnectFailureTimeout checks connects that time out, under both
 // schedules of SYN retransmissions where the kernel has linear timeouts.
 func TestConnectFailureTimeout(t *testing.T) {
@@ -530,7 +571,7 @@ func TestConnectFailureTimeout(t *testing.T) {
 
 // TestConnectFailureLocal checks connects that fail before sending a SYN, for
 // want of a free local port, also on a socket that connect(AF_UNSPEC) left
-// with the error ECONNRESET.
+// with the error ECONNRESET, and with TCP_FASTOPEN_CONNECT.
 func TestConnectFailureLocal(t *testing.T) {
 	tr, run := handshakeTracer(t, 0)
 	var srv netip.AddrPort
@@ -558,14 +599,22 @@ func TestConnectFailureLocal(t *testing.T) {
 		if err := a.connect(srv); !errors.Is(err, unix.EADDRNOTAVAIL) {
 			t.Fatalf("connect after connect(AF_UNSPEC) without a free port: %v", err)
 		}
+		// A connect with TCP_FASTOPEN_CONNECT fails before it can be
+		// deferred.
+		fo := newSock(t, netip.Addr{}, false, func(fd int) error {
+			return unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_FASTOPEN_CONNECT, 1)
+		})
+		if err := fo.connect(srv); !errors.Is(err, unix.EADDRNOTAVAIL) {
+			t.Fatalf("connect with TCP_FASTOPEN_CONNECT without a free port: %v", err)
+		}
 	})
 	snap, err := tr.Collect()
 	if err != nil {
 		t.Fatal(err)
 	}
 	out := clientFlow(srv.Addr(), srv, snap)
-	if out == nil || out.Conns != 2 || out.ConnFails != 2 || out.Fails[FailLocal] != 2 || out.SynRetrans != 0 {
-		t.Errorf("flow = %+v, want 2 connections and 2 local failures", out)
+	if out == nil || out.Conns != 2 || out.ConnFails != 3 || out.Fails[FailLocal] != 3 || out.SynRetrans != 0 {
+		t.Errorf("flow = %+v, want 2 connections and 3 local failures", out)
 	}
 }
 

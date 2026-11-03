@@ -708,6 +708,28 @@ from the implementation itself.
 | "SYN retransmissions per attempt" (§3.5) has no denominator | The handshakes with a duration plus the failures, both of the client side; `shawk:dependency_connections:rate5m` also counts the server side of clients without an agent, which has no SYN retransmissions. |
 | The claims of sizes (storage 104→112 bytes, flow statistics 56→136 bytes, 2.6 MB for the two maps), of the `.rodata` zero value and of the fields on 5.14 | Confirmed: `make compat` passes against Rocky Linux 9, and every program loads on Linux 6.18. |
 
+Two independent subagents then reviewed the implementation: the kernel
+side against the sources of v5.14, v5.15, v6.1, v6.6, v6.9 to v6.12,
+mainline and CentOS Stream 9, with experiments on Linux 6.18; and the
+pipeline against the code, with tests of their own. Neither found a
+blocker.
+
+| finding | validity | response |
+|---|---|---|
+| Before 6.11 (RHEL 9 too), the error report of the first subflow of an MPTCP connection takes its `sk_err` (`__mptcp_error_report()` calls `sock_error()`) before `tcp_done()`, so an ICMP error reads as `timeout` | valid (from the sources; 6.18 reports after `tcp_done()`) | `fail_reason()` reads the `sk_err` of the MPTCP socket, where the report moved it. `TestConnectFailureMPTCP` checks it on the kernels of CI before 6.11. |
+| A connect with `TCP_FASTOPEN_CONNECT` that fails before it is deferred, e.g. without a free local port, is `aborted` | confirmed (6.18) | The rule of §3.1 tests `defer_connect` instead of `fastopen_connect`: a bitfield before 6.6 and in RHEL 9, bit 19 of `inet_flags` since, read through flavors that `TestKernelCompatibility` requires one of. The durations still leave out every connect with the option, since a non-blocking first write clears `defer_connect` before the SYN-ACK. |
+| A SYN that an LSM denies on output (SELinux returns `ECONNREFUSED` to `tcp_connect()`) is `aborted` | valid (from the sources) | Documented in §10 of the design; `snd_nxt == snd_una` would tell it, but could not be tested here. |
+| The error is reported before `tcp_done()` on every kernel before 6.11, not only on 5.14 and RHEL 9 | valid | The comments and the design say so. |
+| The tests of ICMP errors could read `SO_ERROR` between the report and `tcp_done()` on kernels before 6.11 | valid (reasoned) | The tests wait 20 ms after the wakeup. Not covered: ICMPv6 (`EACCES`), the fallback on `sk_err_soft`, and the count of a handshake by a walk. |
+| The failures by reason do not add up to `shawk_connection_failed_total`: a new series of a reason emits 0 first, while that of the failures starts with its whole value | valid | The comment of the rules and §5.3 of the design say so; `shawk.connection.failed` is unchanged. |
+| A step back of the clock of an agent by less than 2 minutes makes the first value of a new reason a baseline (`isNew()`) | confirmed by the reviewer | Accepted: new edges behave the same, and such steps are rare. |
+| The SYN retransmissions per attempt of the dashboard divided by failures that agents of the previous version count without SYN retransmissions | valid | The attempts are the handshakes and the failures by reason, both sent with the retransmissions (`TestSYNRetransmitRatio`). Connects with `TCP_FASTOPEN_CONNECT`, without a handshake, still raise the ratio. |
+| The checks of the e2e test pass with values of 0 | valid | They require values above 0. |
+| The connector outputs any `error.type`, so an agent could make a series per value | valid | Unknown values are output as `_OTHER`. |
+| An input of handshakes with other bounds loses its sum and count too, so changing the bounds needs the connectors upgraded first | by design (§3.3) | Noted. |
+| The bound of series in §5.3 of the design, the row of `_OTHER`, the encoding of buckets (fixed64, not varints) and the changelog were off | valid | Corrected. |
+| Missing tests: the start of a reason when its edge comes back, unknown reasons, a restart of the agent | valid | Added. |
+
 ## References
 
 1. Chuanxiong Guo et al. *Pingmesh: A Large-Scale System for Data Center

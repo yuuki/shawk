@@ -28,7 +28,9 @@ import (
 // only some kernels have, which the programs read behind
 // bpf_core_field_exists: their relocations may not resolve.
 var optionalTypes = map[string]bool{
-	"tcp_sock___smc": true, // syn_smc, with CONFIG_SMC only (not in RHEL 9)
+	"tcp_sock___smc":    true, // syn_smc, with CONFIG_SMC only (not in RHEL 9)
+	"inet_sock___defer": true, // defer_connect, a bitfield before Linux 6.6
+	"inet_sock___flags": true, // inet_flags, since Linux 6.6 (not in RHEL 9)
 }
 
 // optionalRelocation reports whether a relocation is of a field of
@@ -90,10 +92,20 @@ func TestKernelCompatibility(t *testing.T) {
 					t.Logf("%v => %v", relos[i], fx.String())
 				}
 			}
+			// defer_connect is in one of its flavors in every kernel.
+			deferConnect := false
 			for i, fx := range fixups {
 				if strings.Contains(fx.String(), "poison") && !optionalRelocation(relos[i]) {
 					t.Errorf("unresolvable CO-RE relocation %v", relos[i])
 				}
+				r := relos[i].String()
+				if strings.Contains(r, "byte_off") && (strings.Contains(r, `"inet_sock___defer"`) || strings.Contains(r, `"inet_sock___flags"`)) &&
+					!strings.Contains(fx.String(), "poison") {
+					deferConnect = true
+				}
+			}
+			if name == "shawk_inet_sock_set_state" && !deferConnect {
+				t.Error("neither flavor of defer_connect of struct inet_sock exists")
 			}
 		})
 	}
