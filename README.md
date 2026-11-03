@@ -90,16 +90,19 @@ Run the agent on every host you want to observe:
 
 | flag | |
 |---|---|
-| `-otlp-endpoint` | URL of the `otlp/shawk` receiver of the collector; `http://` disables TLS (default `$OTEL_EXPORTER_OTLP_ENDPOINT` or `http://localhost:4327`) |
-| `-otlp-protocol` | `grpc` (default) or `http/protobuf` |
+| `-otlp-endpoint` | URL of the `otlp/shawk` receiver of the collector; `http://` disables TLS (default `$OTEL_EXPORTER_OTLP_ENDPOINT`, else `http://localhost:4327`, or `http://localhost:4328` with `http/protobuf`) |
+| `-otlp-protocol` | `grpc` or `http/protobuf` (default `$OTEL_EXPORTER_OTLP_PROTOCOL`, else `grpc`) |
 | `-otlp-ca-file` | CA bundle that verifies the collector |
 | `-otlp-cert-file`, `-otlp-key-file` | client certificate for a collector that requires one (the example configuration does) |
 | `-max-series-per-request` | dependencies, listeners and translations per request (1000); a request also stays below 3 MiB, and a busy host sends several per interval |
 | `-service-name-fallback` | name of a service without `OTEL_SERVICE_NAME`: `exe` (executable name, as OBI) or `unit` (systemd unit, or the name of the container); a container of Kubernetes is named after the workload of its pod either way |
 | `-interval`, `-idle-ttl` | export interval (15 s, at most 1 min) and how long a dependency is sent after its last activity (15 min) |
-| `-netns`, `-max-flows`, `-bpf-stats` | network namespaces to trace, capacity of the in-kernel flow table (also sizing the tables of listening ports), BPF run time statistics |
+| `-netns`, `-max-flows`, `-bpf-stats` | network namespaces to trace (`all`, the default, `self` or an inode number), capacity of the in-kernel flow table per interval (16384; also sizes the tables of listening ports), BPF run time statistics |
 | `-learn-translations` | learn the translations of addresses the host makes (Docker published ports and masquerade, kube-proxy, IPVS, any DNAT or SNAT) from conntrack, once nf_conntrack is loaded (default `true`); see [the design](docs/design.md#37-translations-of-addresses-learned-from-conntrack) |
 | `-internal-peers`, `-fold-external` | address ranges whose peers are kept exact (`private`: the ranges not routed on the Internet), and which flows fold the other peers into one dependency per local endpoint: `in` (the clients of local servers, default), `all` or `none`; see [the design](docs/design.md#36-folding-external-peers) |
+| `-log-level` | `debug`, `info` (default), `warn` or `error` |
+
+`shawk` exits with status 2 on a usage error and 1 on any other error.
 
 Services that share an executable on a host (`ruby`, `python`, `java`,
 `php-fpm`) should set `OTEL_SERVICE_NAME`, e.g. with `Environment=` in a
@@ -131,11 +134,15 @@ Then set up PostgreSQL, the collector and Prometheus with the examples in
 ```bash
 psql -v ON_ERROR_STOP=1 -f packaging/postgres/setup.sql          # roles and database; edit the passwords
 ./shawk-migrate -dsn 'postgres://shawk_owner:...@db/shawk'        # the schema
-psql -v ON_ERROR_STOP=1 -d shawk -U shawk_owner -f packaging/postgres/grants.sql
+psql -v ON_ERROR_STOP=1 -d shawk -U shawk_owner -f packaging/postgres/grants.sql   # privileges
 ```
 
+Run `shawk-migrate` and then `grants.sql` again when an upgrade brings new
+migrations.
+
 `packaging/collector/config.yaml` receives the agents on `otlp/shawk`
-(port 4327) and OBI on `otlp` (port 4317), both with TLS and client certificates, writes PostgreSQL with the role
+(port 4327 for gRPC, 4328 for HTTP) and OBI on `otlp` (4317, 4318), both
+with TLS and client certificates, writes PostgreSQL with the role
 `shawk_connector` and pushes metrics to Prometheus;
 `packaging/prometheus/` has the Prometheus settings and the recording rules
 that count each dependency once; `packaging/grafana/` has data sources,
@@ -225,19 +232,23 @@ shawk:dependency_connection_failures_by_reason:rate5m{dst="postgres", error_type
 ```
 
 `shawk flows` shows the bundled flows of the local host live, without a
-collector, for debugging.
+collector, for debugging (`-json` prints JSON lines).
 
 ## Development
 
 ```bash
 make generate   # compile the BPF programs (needs clang and llvm-strip)
+make vet        # go vet and gofmt of all modules
 make test       # unit tests of all modules; BPF tests run as root,
                 # PostgreSQL tests with SHAWK_TEST_POSTGRES_DSN=postgres://...
 make test-root  # load the BPF programs into the running kernel (sudo)
+make vm-test    # the tests of test-root in a QEMU virtual machine with
+                # KERNEL=rocky9 (default), 5.14 or 5.15 and ARCH=x86_64 or aarch64
 make e2e        # multi-host test with network namespaces, a collector and
                 # PostgreSQL (sudo, SHAWK_E2E_POSTGRES_DSN)
-make compat     # check CO-RE relocations against the Rocky Linux 9 kernel,
-                # whose RPM is downloaded once to build/ and checksummed
+make compat     # check the BPF programs against the BTF of the Rocky Linux 9
+                # kernel and its module nf_conntrack, whose RPM is
+                # downloaded once to build/ and checksummed
 make check-object  # check that the committed BPF object matches the source
 make vmlinux    # regenerate the kernel types (vmlinux.h) from the running
                 # kernel with bpftool
@@ -248,6 +259,11 @@ The repository has three Go modules: the agent (`.`), the shawk connector
 agent) and the tests of the packaging examples (`test/packaging/`). The
 generated BPF object (`internal/tracer/bpf_bpfel.o`) is committed, so
 building shawk needs only Go.
+
+[docs/design.md](docs/design.md) describes what shawk does and is kept up
+to date with the code. [docs/proposals/](docs/proposals/) holds designs of
+work not implemented yet, and [docs/research/](docs/research/README.md)
+background research written while designing shawk, not maintained.
 
 ## History
 
