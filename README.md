@@ -1,7 +1,5 @@
 # shawk
 
-<img alt="shawk-logo" src="docs/images/logo.png" width="160">
-
 **The record of network dependencies of your servers.** shawk traces which
 process talks to which network service on every host with eBPF, keeps the
 record in PostgreSQL with the periods each host was observed, sends the
