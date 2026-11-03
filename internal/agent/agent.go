@@ -85,6 +85,7 @@ type Agent struct {
 	drops       uint64
 	xlatDrops   uint64
 	cgroupDrops uint64
+	oversized   uint64 // series left out of requests, as last logged
 }
 
 // withDefaults returns cfg with the defaults of the fields left unset.
@@ -255,6 +256,10 @@ func (a *Agent) tick(ctx context.Context) error {
 	a.idents.expire(now)
 
 	reqs, segStart := a.request(now)
+	if n := a.state.Oversized(); n > a.oversized {
+		a.log.Warn("leaving out series too large for a request", "series", n-a.oversized)
+		a.oversized = n
+	}
 	// The last request carries the metrics of the agent and closes the
 	// interval; after a failure the rest is not sent, and the next interval
 	// makes up for it since the series are cumulative. Every request has its
