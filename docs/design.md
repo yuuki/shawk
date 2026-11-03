@@ -629,7 +629,9 @@ after twice as long each time, up to an hour:
   `-service-name-fallback=unit` uses the unit instead of the executable.
   `service.namespace` is read from `OTEL_RESOURCE_ATTRIBUTES`, else it is
   the namespace of the service of the pod, also for a process that names
-  its service with `OTEL_SERVICE_NAME`, as OBI does.
+  its service with `OTEL_SERVICE_NAME`, as OBI does. Both are cut to 255
+  bytes: the environment of any process sets them, and they are repeated
+  in every data point of its series.
 - The service of a pod is named as OBI names it from the metadata the API
   server gives it (`pkg/kube/store.go`): the annotation
   `resource.opentelemetry.io/service.name`, then the labels
@@ -792,7 +794,9 @@ replaced.
   (1000) edges, listeners and translations and at most 3 MiB, below the
   4 MiB default limit of a gRPC receiver; the size of every series is
   bounded before it is encoded, with the buckets of its handshakes and the
-  reasons of failure it carries. Listeners come first, then translations, then
+  reasons of failure it carries. A series larger than a request alone is
+  left out and logged, rather than sent in a request the receiver
+  refuses, which would stop the rest of the interval. Listeners come first, then translations, then
   server edges, then client edges, so that the connector knows the services
   and translations of the host before it names the peers of its clients; the
   example pipeline passes the requests of the agents to the connector as
