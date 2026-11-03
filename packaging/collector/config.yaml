@@ -42,6 +42,9 @@ connectors:
     write_interval: 1m
     idle_ttl: 15m
     max_peers: 50
+    # Local services per host with a job of their own in Prometheus; the
+    # others share the job ~other. PostgreSQL keeps them all.
+    max_services: 200
     peer_cidrs:
       office-lan: 192.168.10.0/24
     # Relays without an agent that rewrite addresses: load balancers,

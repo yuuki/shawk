@@ -56,8 +56,8 @@ func TestPackagedCollectorConfig(t *testing.T) {
 		t.Error(err)
 	}
 	if cfg.Postgres.DSNFile == "" || cfg.WriteInterval != time.Minute || cfg.IdleTTL != 15*time.Minute ||
-		cfg.MaxPeers != 50 || cfg.PeerCIDRs["office-lan"] != "192.168.10.0/24" || cfg.Retention != 3*365*24*time.Hour ||
-		cfg.HostIdentity != hostIdentityCertificate {
+		cfg.MaxPeers != 50 || cfg.MaxServices != 200 || cfg.PeerCIDRs["office-lan"] != "192.168.10.0/24" ||
+		cfg.Retention != 3*365*24*time.Hour || cfg.HostIdentity != hostIdentityCertificate {
 		t.Errorf("config = %+v", cfg)
 	}
 	// Both receivers require client certificates; the receiver of agents

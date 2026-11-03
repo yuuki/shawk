@@ -995,13 +995,27 @@ the service. `service.instance.id` is the host name, and `host.id` and
 `host.name` are promoted to labels by Prometheus.
 
 - Series are bounded by host × local service × peer service × port × role,
-  and for failures by reason × the six values of `error.type` (others are
-  output as `_OTHER`);
-  replicas and changing IPs of peers do not add series. Per host, local
-  service and role, at most `max_peers` (50) peer names are used; the rest
-  are folded into `~other`. `keep_peer_address` keeps
-  `network.peer.address` when it is really needed; for a folded peer it is
-  the network (`0.0.0.0/0`, `::/0`).
+  for bytes and datagrams × the two values of `network.io.direction`
+  (`transmit` and `receive`; others are output as `_OTHER`), and for
+  failures by reason × the six values of `error.type` (others are output as
+  `_OTHER`);
+  replicas and changing IPs of peers do not add series. Per host, at most
+  `max_services` (200) local services are used, and per host, local
+  service and role, at most `max_peers` (50) peer names; the rest are
+  folded into `~other`, in the order they come. The services beyond
+  `max_services` make the job `~other`, whose peers `max_peers` bounds as
+  those of one service; PostgreSQL keeps them apart. A service or a peer
+  unused for `idle_ttl` leaves its place to another. The default of
+  `max_services` leaves room for the 110 pods that Kubernetes runs on a
+  node by default, besides the services of the node. `keep_peer_address`
+  keeps `network.peer.address` when it is really needed; for a folded peer
+  it is the network (`0.0.0.0/0`, `::/0`).
+- Agents choose the names of their services and hosts, so the values of
+  `service.name` and `service.namespace` of a local service, `host.name`
+  (and so `instance`), `host.id` and the `service.version` of the agents are
+  cut to 255 bytes, at the start of a character, as agents cut the names of
+  services (§4.1), and `service.peer.name`, which may have a namespace, to
+  511 bytes. PostgreSQL keeps them whole.
 - Inputs are cumulative per peer address; outputs merge several of them.
   The connector keeps the last value of every input series and adds the
   increase to the output, treating a decrease or a new start time as a
@@ -1047,7 +1061,17 @@ the service. `service.instance.id` is the host name, and `host.id` and
   not reliable yet: the resource of a host changes with `host.ip`,
   `service.version` and `shawk.peer.internal`, so a host may move between
   connectors, which then count its outputs twice (#128).
-- The metrics of the agents are forwarded under `job="shawk-agent"`.
+- The metrics of the agents are forwarded under `job="shawk-agent"`: those
+  of §4.2 but `shawk.agent.segment.start`, which is written to PostgreSQL
+  only. Each is made anew with the type and unit the agents send, one point
+  (one per program for the run counts and times of `-bpf-stats`), and the
+  attribute it has with the values the agents send: `shawk.netns.scope` of
+  `shawk.agent.up` (`all` or the inode of a network namespace), and
+  `shawk.bpf.program` (a BPF program of the agent). Other metrics, points
+  and values are dropped, and other attributes left out, so that an agent
+  cannot make series of its own choosing; the connector logs what it drops
+  at most once a minute, with its number. A connector older than its agents
+  drops the metrics they added.
 
 | Prometheus name | |
 |---|---|
