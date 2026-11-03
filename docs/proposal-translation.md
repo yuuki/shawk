@@ -293,9 +293,11 @@ connection that conntrack tracks, whatever made the translation:
 - **Attaching.** nf_conntrack is a module on most distributions, loaded
   when a rule needs it, which may be after the agent starts (Docker, a
   first `iptables -t nat`). The programs are a collection of their own,
-  sharing the maps, as the UDP programs are. If the module is not loaded
-  (`/sys/module/nf_conntrack` is missing) or loading fails, the tracer
-  tries again at most once a minute; the agent logs the first failure.
+  sharing the maps, as the UDP programs are. While the module is not
+  loaded (`/sys/module/nf_conntrack` is missing), the tracer looks for it
+  every minute; a load that fails with the module there is tried again
+  after twice as long each time, up to an hour, since every attempt
+  creates the maps. The agent logs the first failure.
   The kprobes of a module that is unloaded and loaded again are not
   re-armed; the agent must then be restarted (documented, rare: a module
   in use by NAT rules cannot be unloaded).
@@ -737,6 +739,25 @@ attach target.
    delete lost it. Fixed: it is taken out with its values and put back.
    Also: the warning of a full table names both capacities, and the
    learned rows are looked up only when there are some.
+
+**Second review of the implementation of phase 2 (2026-11-03).**
+
+1. The agent sends a translation for its idle TTL after its last use, and
+   the connector took every request as a new sighting, so the fix of 1
+   above did not hold within one connector. Fixed: a translation is as old
+   as its last seen time before the request.
+2. Without `grants.sql` run again after migration 13, the writes of every
+   host that sends translations, the names of peers and the retention of
+   all connectors failed. Fixed: the connector checks its privileges on
+   the table (every 10 minutes) and leaves the learned translations out,
+   with a warning; `shawk.prune` skips them, and the hosts; `grants.sql`
+   sets default privileges for the tables of later migrations.
+3. The e2e test no longer covered static translations. Fixed: a second
+   port of the virtual address has one, which comes first.
+4. An error reading the translations lost the flows of the interval.
+   Fixed: it is logged, and the snapshot keeps its flows.
+5. The documents said the load is retried every minute. Fixed.
+6. A network namespace out of range was accepted. Fixed.
 
 **First review (2026-11-02).**
 

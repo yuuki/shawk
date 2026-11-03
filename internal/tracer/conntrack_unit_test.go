@@ -91,3 +91,28 @@ func TestTranslationsIdleRace(t *testing.T) {
 		t.Errorf("idle translation kept: %+v, %v", v, err)
 	}
 }
+
+// TestCollectTranslationError checks that an error reading the
+// translations does not lose the flows of the interval.
+func TestCollectTranslationError(t *testing.T) {
+	tr := startTracer(t, Options{})
+	// A map whose keys are not translations: reading it fails.
+	m, err := ebpf.NewMap(&ebpf.MapSpec{Type: ebpf.Hash, KeySize: 4, ValueSize: 4, MaxEntries: 1})
+	if err != nil {
+		skipUnavailable(t, "creating the map: %v", err)
+	}
+	defer m.Close()
+	if err := m.Put(uint32(1), uint32(1)); err != nil {
+		t.Fatal(err)
+	}
+	tr.mu.Lock()
+	tr.xlats, tr.xlatLast = m, map[bpfShawkXlatKey]bpfShawkXlatStats{}
+	tr.mu.Unlock()
+	if _, err := tr.collectTranslations(); err == nil {
+		t.Fatal("reading the map does not fail")
+	}
+	snap, err := tr.Collect()
+	if err != nil || snap == nil {
+		t.Fatalf("Collect = %v, %v", snap, err)
+	}
+}

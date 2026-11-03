@@ -13,7 +13,9 @@
   are not learned. The connector writes them to the new table
   `shawk.learned_translations` (migration 13, which replaces
   `dependencies_between`, `dependencies` and `shawk.prune` in place; run
-  `grants.sql` again), and the views match edges through them like static
+  `grants.sql` again, which now also sets default privileges for the
+  tables of later migrations; until then the connector leaves the learned
+  translations out and warns), and the views match edges through them like static
   translations, which come first; the `translation` of such a row is
   `~learned`, and a translation of the configuration may no longer have a
   name starting with `~`. In Prometheus, a client edge to a virtual address

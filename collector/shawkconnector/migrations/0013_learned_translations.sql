@@ -37,6 +37,10 @@ LANGUAGE plpgsql AS $$
 DECLARE
   n bigint;
   total bigint := 0;
+  -- Without grants.sql run again after this migration, the role of the
+  -- connector may not read the learned translations: the retention goes on
+  -- without them, and keeps the hosts.
+  learned boolean := has_table_privilege('shawk.learned_translations', 'SELECT, DELETE');
 BEGIN
   PERFORM pg_advisory_xact_lock_shared(1936220535);  -- 0x73686177, see Migrate
 
@@ -64,9 +68,11 @@ BEGIN
     SELECT ctid FROM shawk.partial_observations WHERE period_end < cutoff LIMIT max_rows);
   GET DIAGNOSTICS n = ROW_COUNT; total := total + n;
 
-  DELETE FROM shawk.learned_translations WHERE last_seen < cutoff AND ctid IN (
-    SELECT ctid FROM shawk.learned_translations WHERE last_seen < cutoff LIMIT max_rows);
-  GET DIAGNOSTICS n = ROW_COUNT; total := total + n;
+  IF learned THEN
+    DELETE FROM shawk.learned_translations WHERE last_seen < cutoff AND ctid IN (
+      SELECT ctid FROM shawk.learned_translations WHERE last_seen < cutoff LIMIT max_rows);
+    GET DIAGNOSTICS n = ROW_COUNT; total := total + n;
+  END IF;
 
   DELETE FROM shawk.known_dependencies WHERE last_seen < cutoff AND ctid IN (
     SELECT ctid FROM shawk.known_dependencies WHERE last_seen < cutoff LIMIT max_rows);
@@ -85,17 +91,19 @@ BEGIN
       LIMIT max_rows);
   GET DIAGNOSTICS n = ROW_COUNT; total := total + n;
 
-  DELETE FROM shawk.hosts h WHERE h.last_seen < cutoff
-    AND NOT EXISTS (SELECT FROM shawk.agent_sessions s WHERE s.host_id = h.id)
-    AND NOT EXISTS (SELECT FROM shawk.partial_observations o WHERE o.host_id = h.id)
-    AND NOT EXISTS (SELECT FROM shawk.host_addrs a WHERE a.host_id = h.id)
-    AND NOT EXISTS (SELECT FROM shawk.processes p WHERE p.host_id = h.id)
-    AND NOT EXISTS (SELECT FROM shawk.edges e WHERE e.host_id = h.id)
-    AND NOT EXISTS (SELECT FROM shawk.listeners l WHERE l.host_id = h.id)
-    AND NOT EXISTS (SELECT FROM shawk.listener_owners o WHERE o.host_id = h.id)
-    AND NOT EXISTS (SELECT FROM shawk.learned_translations t WHERE t.host_id = h.id)
-    AND h.id IN (SELECT h2.id FROM shawk.hosts h2 WHERE h2.last_seen < cutoff LIMIT max_rows);
-  GET DIAGNOSTICS n = ROW_COUNT; total := total + n;
+  IF learned THEN
+    DELETE FROM shawk.hosts h WHERE h.last_seen < cutoff
+      AND NOT EXISTS (SELECT FROM shawk.agent_sessions s WHERE s.host_id = h.id)
+      AND NOT EXISTS (SELECT FROM shawk.partial_observations o WHERE o.host_id = h.id)
+      AND NOT EXISTS (SELECT FROM shawk.host_addrs a WHERE a.host_id = h.id)
+      AND NOT EXISTS (SELECT FROM shawk.processes p WHERE p.host_id = h.id)
+      AND NOT EXISTS (SELECT FROM shawk.edges e WHERE e.host_id = h.id)
+      AND NOT EXISTS (SELECT FROM shawk.listeners l WHERE l.host_id = h.id)
+      AND NOT EXISTS (SELECT FROM shawk.listener_owners o WHERE o.host_id = h.id)
+      AND NOT EXISTS (SELECT FROM shawk.learned_translations t WHERE t.host_id = h.id)
+      AND h.id IN (SELECT h2.id FROM shawk.hosts h2 WHERE h2.last_seen < cutoff LIMIT max_rows);
+    GET DIAGNOSTICS n = ROW_COUNT; total := total + n;
+  END IF;
 
   RETURN total;
 END

@@ -333,7 +333,14 @@ func (r *resolver) learn(b *hostBatch, now time.Time) {
 		}
 	}
 	for _, x := range b.translations {
-		learnTranslation(b.key, x.id, now, r.localLearned, r.localLearnedServers)
+		// The agent sends a translation for its idle TTL after its last use:
+		// it was last seen as long before now as before the request, by the
+		// clock of the agent.
+		at := now
+		if !x.last.IsZero() && !b.time.IsZero() && x.last.Before(b.time) {
+			at = now.Add(x.last.Sub(b.time))
+		}
+		learnTranslation(b.key, x.id, at, r.localLearned, r.localLearnedServers)
 	}
 	if !b.final {
 		return

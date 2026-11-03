@@ -259,7 +259,7 @@ func TestPGPartialObservationsConcurrent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := writeHost(ctx, tx, sessionChanges("h1", base, m(-60), m(-2), 5, m(-60), 0)); err != nil {
+	if err := writeHost(ctx, tx, sessionChanges("h1", base, m(-60), m(-2), 5, m(-60), 0), true); err != nil {
 		t.Fatal(err)
 	}
 	done := make(chan error, 1)

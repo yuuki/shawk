@@ -604,9 +604,11 @@ func (t *Tracer) Collect() (*Snapshot, error) {
 	}
 	flows = t.attribute(flows)
 	t.tryConntrack(time.Now())
+	// The flows are drained already: an error with the translations loses
+	// those of the interval only.
 	xlats, err := t.collectTranslations()
 	if err != nil {
-		return nil, err
+		t.warnOnce("reading the translations of addresses", err)
 	}
 	t.warnOnIncrease(t.flowBusy, "some flow updates were dropped because the flow table was being updated on the same CPU, not because it was full")
 	snap := &Snapshot{Flows: flows, Listeners: listeners, Translations: xlats}
@@ -931,6 +933,20 @@ func (t *Tracer) warnOnIncrease(v *ebpf.Variable, msg string, args ...any) {
 		t.warnings = map[string]counterWarning{}
 	}
 	t.warnings[msg] = w
+}
+
+// warnOnce logs an error at most once an hour for msg.
+func (t *Tracer) warnOnce(msg string, err error) {
+	w := t.warnings[msg]
+	if time.Since(w.warned) < time.Hour {
+		return
+	}
+	w.warned = time.Now()
+	if t.warnings == nil {
+		t.warnings = map[string]counterWarning{}
+	}
+	t.warnings[msg] = w
+	t.log.Warn(msg, "error", err)
 }
 
 // refreshOwners scans the owners and remembers the listeners, of those the

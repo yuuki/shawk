@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/netip"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -41,6 +42,40 @@ type store interface {
 
 type pgStore struct {
 	pool *pgxpool.Pool
+	// warn logs a problem of the configuration of the database; nil drops it.
+	warn func(msg string)
+
+	// learnedMu guards learnedOK, whether the role may write and read
+	// shawk.learned_translations, as checked at learnedChecked: without
+	// grants.sql run again after migration 13, the writes of the hosts and
+	// the names of peers would fail as a whole.
+	learnedMu      sync.Mutex
+	learnedOK      bool
+	learnedChecked time.Time
+}
+
+// learnedRecheck is how often the privileges on learned_translations are
+// checked again, so that running grants.sql takes effect.
+const learnedRecheck = 10 * time.Minute
+
+// learnedAllowed tells whether the role may write and read the learned
+// translations, checking at most every learnedRecheck.
+func (s *pgStore) learnedAllowed(ctx context.Context) bool {
+	s.learnedMu.Lock()
+	defer s.learnedMu.Unlock()
+	if !s.learnedChecked.IsZero() && time.Since(s.learnedChecked) < learnedRecheck {
+		return s.learnedOK
+	}
+	var ok bool
+	err := s.pool.QueryRow(ctx, `SELECT has_table_privilege('shawk.learned_translations', 'SELECT, INSERT, UPDATE')`).Scan(&ok)
+	if err != nil {
+		return s.learnedOK
+	}
+	if !ok && s.warn != nil && (s.learnedOK || s.learnedChecked.IsZero()) {
+		s.warn("the role of the connector may not write shawk.learned_translations; run grants.sql again after the migration: translations learned by agents are not written nor used")
+	}
+	s.learnedOK, s.learnedChecked = ok, time.Now()
+	return ok
 }
 
 // newPGStore returns a store backed by PostgreSQL. It connects lazily, so
@@ -74,10 +109,13 @@ func (s *pgStore) migrate(ctx context.Context) ([]string, error) {
 }
 
 func (s *pgStore) write(ctx context.Context, h *hostChanges) error {
-	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error { return writeHost(ctx, tx, h) })
+	learned := len(h.translations) > 0 && s.learnedAllowed(ctx)
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error { return writeHost(ctx, tx, h, learned) })
 }
 
-func writeHost(ctx context.Context, tx pgx.Tx, h *hostChanges) error {
+// writeHost writes the changes of a host; its learned translations only if
+// learned is set.
+func writeHost(ctx context.Context, tx pgx.Tx, h *hostChanges, learned bool) error {
 	// Writes wait for a migration in progress, which holds this lock, so
 	// that they do not deadlock with it. The lock is taken before the batch:
 	// preparing its statements already locks the tables they write.
@@ -191,7 +229,7 @@ ON CONFLICT (host_id, role, proto, local_addr, remote_addr, port, netns, process
 	if len(h.listeners) > 0 {
 		queueListeners(b, h)
 	}
-	if len(h.translations) > 0 {
+	if learned {
 		queueTranslations(b, h)
 	}
 	return tx.SendBatch(ctx, b).Close()
@@ -598,7 +636,7 @@ FROM shawk_v1.agent_addrs`,
 			}
 			return nil
 		})
-	if err != nil {
+	if err != nil || !s.learnedAllowed(ctx) {
 		return out, err
 	}
 	err = queryRows(ctx, s.pool, fmt.Sprintf(`SELECT host_id, proto, netns, host(client_addr), host(virtual_addr), virtual_port,

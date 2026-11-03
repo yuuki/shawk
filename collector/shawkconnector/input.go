@@ -2,6 +2,7 @@ package shawkconnector
 
 import (
 	"errors"
+	"math"
 	"net/netip"
 	"strconv"
 	"strings"
@@ -413,7 +414,7 @@ func (b *hostBatch) translation(a pcommon.Map) *translationInput {
 	vport, ok2 := getInt(a, attrTranslationVirtualPort)
 	bport, ok3 := getInt(a, attrTranslationBackendPort)
 	var addrs [4]netip.Addr
-	valid := (proto == "tcp" || proto == "udp") && ok1 && ok2 && ok3 &&
+	valid := (proto == "tcp" || proto == "udp") && ok1 && ok2 && ok3 && netns >= 0 && netns <= math.MaxUint32 &&
 		vport >= 0 && vport <= 65535 && bport >= 0 && bport <= 65535
 	for i, k := range []string{attrTranslationClient, attrTranslationVirtual, attrTranslationSource, attrTranslationBackend} {
 		addr, err := parseAddr(getString(a, k))

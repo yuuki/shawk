@@ -403,8 +403,9 @@ kube-proxy, REDIRECT, IPVS with `net.ipv4.vs.conntrack=1`, SNAT and
 masquerade) learns its translations from conntrack, so that the connector
 can match the two sides of the connections (§5.4). Two kprobes on the
 module nf_conntrack, a collection of their own sharing the maps of the
-others, are loaded once the module is (`/sys/module/nf_conntrack`), and
-tried again every minute until then:
+others, are loaded once the module is (`/sys/module/nf_conntrack`, looked
+for every minute); a load that fails with the module there is tried again
+after twice as long each time, up to an hour:
 
 - `__nf_conntrack_confirm` runs once per new conntrack entry, when its
   first packet leaves the last hook: DNAT and SNAT are both done, and IPVS

@@ -195,3 +195,45 @@ func TestLearnedFoldedVirtual(t *testing.T) {
 		}
 	}
 }
+
+// TestLearnedStaleBackendResent: the agent goes on sending the former
+// translation, with its last seen time, for its idle TTL; it is as old as
+// that.
+func TestLearnedStaleBackendResent(t *testing.T) {
+	c, _, sink, now := testConnector(t, nil)
+	ts := t0.Add(15 * time.Second)
+	old := tTranslation{client: "10.0.0.11", virtual: "10.0.0.2", vport: 8080, backend: "172.17.0.5", bport: 80, first: ts, last: ts}
+	consume(t, c, sink, tAgent{host: "h2", addrs: []string{"10.0.0.2", "172.17.0.5", "172.17.0.6"}, time: ts,
+		edges:        []tEdge{{role: "server", proto: "tcp", local: "172.17.0.5", peer: "10.0.0.11", port: 80, svc: "web", comm: "web", opened: 1}},
+		translations: []tTranslation{old}})
+	*now = t0.Add(10 * time.Minute)
+	ts = ts.Add(10 * time.Minute)
+	consume(t, c, sink, tAgent{host: "h2", addrs: []string{"10.0.0.2", "172.17.0.5", "172.17.0.6"}, time: ts,
+		edges: []tEdge{
+			{role: "server", proto: "tcp", local: "172.17.0.6", peer: "10.0.0.11", port: 80, svc: "web", comm: "web", opened: 1},
+			{role: "server", proto: "tcp", local: "172.17.0.5", peer: "10.0.0.99", port: 80, svc: "api", comm: "api", opened: 1}},
+		translations: []tTranslation{old, {client: "10.0.0.11", virtual: "10.0.0.2", vport: 8080, backend: "172.17.0.6", bport: 80}}})
+	out := consume(t, c, sink, tAgent{host: "k", addrs: []string{"10.0.0.11"}, time: ts,
+		edges: []tEdge{{role: "client", proto: "tcp", local: "10.0.0.11", peer: "10.0.0.2", port: 8080, svc: "curl", comm: "curl", opened: 1}}})
+	got := slices.Collect(maps.Keys(peersOf(out, "curl", roleClient)))
+	if !slices.Equal(got, []string{"web:80"}) {
+		t.Errorf("client peers = %v, want web:80", got)
+	}
+}
+
+// TestTranslationInputBounds: a translation with a network namespace or a
+// port out of range is invalid.
+func TestTranslationInputBounds(t *testing.T) {
+	for _, netns := range []string{"-1", "4294967296"} {
+		md := tAgent{host: "h", addrs: []string{"10.0.0.1"}, time: t0, partial: true,
+			translations: []tTranslation{{client: "10.0.0.1", virtual: "10.96.0.1", vport: 80, backend: "10.0.1.1", bport: 80,
+				netns: netns}}}.metrics()
+		b, err := parseResource(md.ResourceMetrics().At(0))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(b.translations) != 0 || b.invalid == 0 {
+			t.Errorf("netns %s: %d translations, %d invalid points", netns, len(b.translations), b.invalid)
+		}
+	}
+}
