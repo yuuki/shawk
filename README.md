@@ -35,10 +35,10 @@ See [docs/design.md](docs/design.md) for the design.
 
 ## How it fits together
 
-```
- every host: eBPF ─ shawk agent ── OTLP ──→ collector with the shawk connector ─┬─→ PostgreSQL ─┐
-                                                                               └─→ Prometheus ─┴─→ Grafana
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/architecture-dark.svg">
+  <img alt="On every host, eBPF programs in the kernel trace the sockets of all processes, and the shawk agent sends the bundled flows as OTLP metrics every 15 seconds to an OpenTelemetry Collector with the shawk connector. The connector writes dependencies, listeners and observation segments to PostgreSQL and metrics per service without addresses to Prometheus; Grafana shows both. OBI can send application-layer metrics to the same collector." src="docs/images/architecture-light.svg">
+</picture>
 
 | component | what it does |
 |---|---|
@@ -161,6 +161,37 @@ In Grafana:
 * **shawk / Changes**: dependencies that appeared or disappeared.
 * **shawk / Application layer (OBI)**: OBI's RED metrics next to the
   network dependencies of the same service.
+
+The screenshots below, from Grafana 13.3, are of a demo: nine hosts, the
+network namespaces of one machine with an agent each, over an hour in which
+the agent of `cache-01` stopped for a few minutes, `legacy-cron` stopped
+using `postgres`, a `nightly-report` ran for five minutes, and `storefront`
+was deployed to use `redis-server` instead of `memcached` and a new
+`recommend` service, started three minutes later. The kernel of the demo
+cannot trace UDP.
+
+The dependency map of `haproxy`, upstream and downstream. Clients without an
+agent are named `~external` (outside the internal ranges) and `~unresolved`,
+and the payment API by `peer_cidrs`:
+
+![The dependency map: ~external to haproxy on lb-01, to storefront on web-01 and web-02, to catalog, memcached, redis-server, recommend and postgres; order-worker to postgres, redis-server and payment-gateway; legacy-cron, nightly-report and ~unresolved to postgres](docs/images/grafana-dependency-map.png)
+
+The dependency details of `storefront`. After the deployment its open
+connections move from `memcached` to `redis-server`, and until `recommend`
+started, its connections to that port failed and had no service to be named
+after (`~unresolved`). The red band is the period in which `cache-01` was not
+observed:
+
+![The dependency details of storefront: connections, connection failure ratio, request and response bytes, mean RTT, retransmitted segments and open connections per dependency over the hour](docs/images/grafana-dependency-details.png)
+
+The fleet, with the observation gap of `cache-01` and the dependencies that
+appeared today:
+
+![The fleet: 9 agents alive, 0 silent, 9 without UDP tracing, 15 new dependencies today; the agents, the observation gap of cache-01 and the dependencies that appeared today](docs/images/grafana-fleet.png)
+
+The table of the changes of the hour:
+
+![The changes: nightly-report to postgres appeared and disappeared, recommend to redis-server and storefront to redis-server and recommend appeared, storefront to memcached and legacy-cron to postgres disappeared](docs/images/grafana-changes.png)
 
 In SQL, against the contract views of `shawk_v1`:
 
