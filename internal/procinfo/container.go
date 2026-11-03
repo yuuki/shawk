@@ -35,6 +35,12 @@ type Container struct {
 	// Pod holds what the runtime keeps of the labels and annotations of
 	// the pod; nil when it keeps none or they could not be read.
 	Pod *PodMeta
+	// Under is the unit of systemd whose cgroup holds the container, such
+	// as user@1000.service for a rootless runtime: its user made the
+	// cgroup, and may have named it after another container, so the state
+	// of the runtimes of the host is not read for it. "" for the
+	// containers of the runtimes of the host.
+	Under string
 }
 
 // PodMeta holds the labels and annotations of a pod that name its service
@@ -126,6 +132,8 @@ const shortID = 12
 //	docker/shop/db              the service db of the Compose project shop
 //	podman/redis                a container named redis
 //	docker-0123456789ab         a container whose state could not be read
+//	user@1000.service/podman-0123456789ab
+//	                            a container in the cgroup of a unit (Under)
 //
 // The parts of the name come from the state of the container, which its
 // owner or the author of its image may set, so each is limited to the
@@ -149,6 +157,9 @@ func (c *Container) Unit() string {
 	id := c.ID
 	if len(id) > shortID {
 		id = id[:shortID]
+	}
+	if c.Under != "" {
+		return c.Under + "/" + c.Runtime + "-" + id
 	}
 	return c.Runtime + "-" + id
 }
