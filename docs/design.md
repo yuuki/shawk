@@ -715,12 +715,20 @@ after twice as long each time, up to an hour:
   them apart.
 - `/proc` is read for the processes of an interval several at once, within
   one second per interval. A read of the environment takes the lock of the
-  memory map of the process, which a stuck process may hold; it gives up
-  after 200 ms, and a process whose read timed out is not read again for 5
-  minutes after the read returns. The command name in `/proc` must match
-  that of the flow, so that a PID reused by another process since is not
-  trusted. When a process exits before `/proc` is read, or is not read in
-  time, the latest identity seen for the same unit and comm is used.
+  memory map of the process, which a stuck process may hold, for good if
+  its memory is mapped from a FUSE file system that its user stalls. The
+  agent stops waiting after 200 ms, and a process whose read timed out is
+  not read again until 5 minutes after the read returns; at most 4096
+  processes back off at once. A read that hangs holds a goroutine and a
+  file descriptor until it returns, and a user can make one hang per
+  process, so at most 32 reads are outstanding at once. The agent reads 8
+  processes at once, so the other processes are read as before while up
+  to 24 reads hang; once 32 hang, no environment is read until one
+  returns. The agent logs how many hang at most every 10 minutes. The
+  command name in `/proc` must match that of the flow, so that a PID
+  reused by another process since is not trusted. When a process exits
+  before `/proc` is read, or is not read in time, the latest identity seen
+  for the same unit and comm is used.
 - The host is identified by `host.id` (`/etc/machine-id`, else
   `/var/lib/dbus/machine-id`) and `host.name`. In PostgreSQL a host is the
   hash of both, so that VMs cloned with the same machine id stay apart.
