@@ -152,6 +152,15 @@ changes; see below.
 * `make build` and `make collector` set the version without the `v` of the
   tag (`0.8.0`), like the release.
 
+### Security
+
+* **A user can no longer stop the export of a host.** `service.name` and
+  `service.namespace`, from the environment of any process, were sent
+  whole; with 128 KiB each, the series of one connection exceeded the
+  size of a request, which the collector refused, and the rest of every
+  interval was not sent. They are cut to 255 bytes, and a series too
+  large for a request is left out and logged.
+
 ### Fixed
 
 * On kernels whose TCP iterator skips sockets (Linux before 6.17 without
