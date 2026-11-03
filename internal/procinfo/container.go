@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -33,6 +34,84 @@ type Container struct {
 	ComposeProject, ComposeService string
 	// The pod of a container of Kubernetes.
 	PodNamespace, PodName, ContainerName string
+	// Pod holds what the runtime keeps of the labels and annotations of
+	// the pod; nil when it keeps none or they could not be read.
+	Pod *PodMeta
+}
+
+// PodMeta holds the labels and annotations of a pod that name its service
+// or tell its owner, as the runtime keeps them on disk. Labels is nil when
+// the runtime does not keep them (containerd), Annotations when it keeps
+// none of them.
+type PodMeta struct {
+	Labels, Annotations map[string]string
+}
+
+// The labels and annotations of a pod that OBI names its service from
+// (pkg/kube/store.go, serviceNameNamespaceOwnerID), in its order, and
+// those that tell the owner of the pod.
+const (
+	annotationServiceName      = "resource.opentelemetry.io/service.name"
+	annotationServiceNamespace = "resource.opentelemetry.io/service.namespace"
+	annotationConfigSource     = "kubernetes.io/config.source"
+	labelPodTemplateHash       = "pod-template-hash"
+)
+
+var (
+	serviceNameLabels      = []string{"app.kubernetes.io/instance", "app.kubernetes.io/name"}
+	serviceNamespaceLabels = []string{"app.kubernetes.io/part-of"}
+	jobNameLabels          = []string{"batch.kubernetes.io/job-name", "job-name"}
+	podAnnotationKeys      = []string{annotationServiceName, annotationServiceNamespace, annotationConfigSource}
+	podLabelKeys           = slices.Concat(serviceNameLabels, serviceNamespaceLabels, jobNameLabels,
+		[]string{labelPodTemplateHash})
+)
+
+// newPodMeta keeps the labels and annotations of a pod that PodMeta holds,
+// so that the cache of containers does not hold every label of every pod.
+// It returns nil if there are none.
+func newPodMeta(labels, annotations map[string]string) *PodMeta {
+	pick := func(m map[string]string, keys []string) map[string]string {
+		var out map[string]string
+		for _, k := range keys {
+			if v, ok := m[k]; ok {
+				if out == nil {
+					out = map[string]string{}
+				}
+				out[k] = v
+			}
+		}
+		return out
+	}
+	m := &PodMeta{Annotations: pick(annotations, podAnnotationKeys)}
+	if labels != nil {
+		m.Labels = pick(labels, podLabelKeys)
+		if m.Labels == nil {
+			m.Labels = map[string]string{}
+		}
+	}
+	if m.Labels == nil && m.Annotations == nil {
+		return nil
+	}
+	return m
+}
+
+// value returns the value of the first key the pod has, as OBI looks them
+// up (valueFromMetadata): the annotation, then the labels in order. A key
+// the pod has with an empty value ends the search, and OBI then falls
+// back to the owner.
+func (m *PodMeta) value(annotation string, labels []string) string {
+	if m == nil {
+		return ""
+	}
+	if v, ok := m.Annotations[annotation]; ok {
+		return v
+	}
+	for _, k := range labels {
+		if v, ok := m.Labels[k]; ok {
+			return v
+		}
+	}
+	return ""
 }
 
 // shortID is the length of the abbreviated id of a container, as docker ps
@@ -84,16 +163,78 @@ func (c *Container) podNamespace() string {
 }
 
 // Workload returns the service of a container of Kubernetes, named as OBI
-// names it from the metadata of the pod when the pod has no annotation or
-// label that names its service: the workload that owns the pod in the
-// namespace of the pod. It is zero for other containers, which OBI names
-// after their executable.
+// names it from the metadata of the pod (pkg/kube/store.go,
+// serviceNameNamespaceOwnerID):
+//
+//   - the name is the annotation resource.opentelemetry.io/service.name,
+//     then the label app.kubernetes.io/instance, then the label
+//     app.kubernetes.io/name, then the owner of the pod (PodOwner);
+//   - the namespace is the annotation
+//     resource.opentelemetry.io/service.namespace, then the label
+//     app.kubernetes.io/part-of, then the namespace of the pod.
+//
+// The labels and annotations are those the runtime keeps on disk (Pod);
+// without them the name is the owner guessed from the name of the pod. It
+// is zero for other containers, which OBI names after their executable.
 func (c *Container) Workload() Service {
 	if c == nil || c.PodName == "" {
 		return Service{}
 	}
-	return Service{Name: namePart(PodWorkload(c.PodName)), Namespace: namePart(c.podNamespace())}
+	name := c.Pod.value(annotationServiceName, serviceNameLabels)
+	if name == "" {
+		name = c.PodOwner()
+	}
+	ns := c.Pod.value(annotationServiceNamespace, serviceNamespaceLabels)
+	if ns == "" {
+		ns = c.podNamespace()
+	}
+	return Service{Name: namePart(name), Namespace: namePart(ns)}
 }
+
+// PodOwner returns the name of the top owner of the pod of a container, as
+// OBI names it (pkg/kube/kubecache/meta/types.go, ownersFrom), from the
+// labels and annotations of the pod when the runtime keeps them:
+//
+//   - a static pod (annotation kubernetes.io/config.source other than api)
+//     is owned by its Node, whose name ends the name of the pod;
+//   - a pod of a Job (label batch.kubernetes.io/job-name or job-name) is
+//     owned by a CronJob named after the Job cut at its last -, as OBI
+//     assumes of every Job (data-load becomes data);
+//   - a pod of a ReplicaSet of a Deployment (label pod-template-hash) is
+//     owned by the Deployment, the name of the pod before -<hash>-.
+//
+// Otherwise the owner is guessed from the name of the pod (PodWorkload).
+func (c *Container) PodOwner() string {
+	if m := c.Pod; m != nil {
+		if src, ok := m.Annotations[annotationConfigSource]; ok && src != "api" {
+			if node := nodeName(); node != "" && strings.HasSuffix(c.PodName, "-"+node) {
+				return node
+			}
+		}
+		for _, k := range jobNameLabels {
+			if job := m.Labels[k]; job != "" {
+				if i := strings.LastIndexByte(job, '-'); i > 0 {
+					return job[:i]
+				}
+				return job
+			}
+		}
+		if h := m.Labels[labelPodTemplateHash]; h != "" {
+			if i := strings.LastIndex(c.PodName, "-"+h+"-"); i > 0 {
+				return c.PodName[:i]
+			}
+		}
+	}
+	return PodWorkload(c.PodName)
+}
+
+// nodeName returns the name of the Node of the host, which kubelet takes
+// from the host name in lower case unless --hostname-override is set;
+// replaced in tests.
+var nodeName = sync.OnceValue(func() string {
+	h, _ := os.Hostname()
+	return strings.ToLower(h)
+})
 
 // maxNamePart bounds the length of a part of the name of a container: the
 // names of pods and containers of Kubernetes have at most 63 characters,
@@ -410,9 +551,23 @@ func (c *Containers) dockerDataRoot() string {
 
 // readDocker reads <data-root>/containers/<id>/config.v2.json.
 func (c *Containers) readDocker(id string) *Container {
+	name, labels, ok := c.dockerConfig(id)
+	if !ok {
+		return nil
+	}
+	ctr := &Container{Runtime: RuntimeDocker, ID: id, Name: name}
+	dockerLabels(ctr, labels)
+	if ctr.PodName != "" {
+		ctr.Pod = c.dockerSandbox(ctr, labels)
+	}
+	return ctr
+}
+
+// dockerConfig reads the name and labels of a container of Docker.
+func (c *Containers) dockerConfig(id string) (name string, labels map[string]string, ok bool) {
 	b := c.readFile(filepath.Join(c.dockerDataRoot(), "containers", id, "config.v2.json"))
 	if b == nil {
-		return nil
+		return "", nil, false
 	}
 	var cfg struct {
 		Name   string
@@ -421,11 +576,47 @@ func (c *Containers) readDocker(id string) *Container {
 		}
 	}
 	if json.Unmarshal(b, &cfg) != nil {
+		return "", nil, false
+	}
+	return strings.TrimPrefix(cfg.Name, "/"), cfg.Config.Labels, true
+}
+
+// criDockerdAnnotation prefixes the labels in which cri-dockerd keeps the
+// annotations of a pod on its sandbox (core/helpers.go, makeLabels).
+const criDockerdAnnotation = "annotation."
+
+// dockerSandbox reads the labels and annotations of the pod of a container
+// of cri-dockerd from its sandbox, k8s_POD_<pod>_<namespace>_<uid>_<attempt>,
+// whose labels are those of the pod, and whose labels prefixed with
+// annotation. are its annotations. The sandbox is named by the label
+// io.kubernetes.sandbox.id of the container, and believed only with the
+// name cri-dockerd gives the sandbox of the same pod.
+func (c *Containers) dockerSandbox(ctr *Container, labels map[string]string) *PodMeta {
+	f := strings.Split(ctr.Name, "_")
+	name, sb := ctr.Name, labels
+	if f[1] != "POD" {
+		id := labels["io.kubernetes.sandbox.id"]
+		if !containerIDHex.MatchString(id) {
+			return nil
+		}
+		var ok bool
+		if name, sb, ok = c.dockerConfig(id); !ok {
+			return nil
+		}
+	}
+	g := strings.Split(name, "_")
+	if len(g) < 5 || g[0] != "k8s" || g[1] != "POD" || g[2] != f[2] || g[3] != f[3] || g[4] != f[4] {
 		return nil
 	}
-	ctr := &Container{Runtime: RuntimeDocker, ID: id, Name: strings.TrimPrefix(cfg.Name, "/")}
-	dockerLabels(ctr, cfg.Config.Labels)
-	return ctr
+	l, a := map[string]string{}, map[string]string{}
+	for k, v := range sb {
+		if k, ok := strings.CutPrefix(k, criDockerdAnnotation); ok {
+			a[k] = v
+		} else {
+			l[k] = v
+		}
+	}
+	return newPodMeta(l, a)
 }
 
 // composeIndex is the end of the name Docker Compose gives a container
@@ -547,13 +738,56 @@ func (c *Containers) crioBundle(id, path string) *Container {
 	if a["io.kubernetes.pod.name"] == "" {
 		return nil
 	}
-	return &Container{
+	ctr := &Container{
 		Runtime:       RuntimeCRIO,
 		ID:            id,
 		PodNamespace:  a["io.kubernetes.pod.namespace"],
 		PodName:       a["io.kubernetes.pod.name"],
 		ContainerName: a["io.kubernetes.container.name"],
 	}
+	ctr.Pod = c.crioSandbox(ctr, a)
+	return ctr
+}
+
+// The annotations CRI-O sets on the bundles of its containers
+// (pkg/annotations): the id of the sandbox of the pod, and on the bundle
+// of the sandbox, the labels and annotations of the pod in JSON
+// (server/sandbox_run_linux.go, setupSandboxAnnotations).
+const (
+	crioSandboxID   = "io.kubernetes.cri-o.SandboxID"
+	crioLabels      = "io.kubernetes.cri-o.Labels"
+	crioAnnotations = "io.kubernetes.cri-o.Annotations"
+)
+
+// crioSandbox reads the labels and annotations of the pod of a container
+// of CRI-O from the bundle of its sandbox, which CRI-O saves in the
+// directory of the sandbox even when it runs no infra container. The
+// sandbox is believed only if its labels name the same pod.
+func (c *Containers) crioSandbox(ctr *Container, a map[string]string) *PodMeta {
+	sb := a
+	if id := a[crioSandboxID]; id != ctr.ID {
+		if !containerIDHex.MatchString(id) {
+			return nil
+		}
+		sb = nil
+		for _, root := range []string{storageRoots[1], storageRoots[0]} {
+			for _, p := range c.glob(filepath.Join(root, "*-containers", id, "userdata", "config.json")) {
+				if sb = c.readBundle(p); sb != nil {
+					break
+				}
+			}
+			if sb != nil {
+				break
+			}
+		}
+	}
+	var labels, annotations map[string]string
+	if json.Unmarshal([]byte(sb[crioLabels]), &labels) != nil ||
+		labels["io.kubernetes.pod.name"] != ctr.PodName || labels["io.kubernetes.pod.namespace"] != ctr.PodNamespace {
+		return nil
+	}
+	_ = json.Unmarshal([]byte(sb[crioAnnotations]), &annotations)
+	return newPodMeta(labels, annotations)
 }
 
 // containerdTasks is where containerd keeps the OCI bundles of the running
@@ -589,9 +823,35 @@ func (c *Containers) readContainerd(id string) *Container {
 		if ctr.Name == "" && ctr.PodName == "" {
 			continue
 		}
+		if ctr.PodName != "" {
+			ctr.Pod = c.containerdSandbox(ctr, ns.Name(), a)
+		}
 		return ctr
 	}
 	return nil
+}
+
+// containerdSandbox reads the annotations of the pod of a container of
+// containerd from the bundle of its sandbox (io.kubernetes.cri.sandbox-id),
+// which has those of the annotations of the pod that pod_annotations of
+// the runtime handler lets through. containerd keeps the labels of the
+// pod only in its metadata store, out of reach. The sandbox is believed
+// only if it names the same pod.
+func (c *Containers) containerdSandbox(ctr *Container, ns string, a map[string]string) *PodMeta {
+	sb := a
+	if a["io.kubernetes.cri.container-type"] != "sandbox" {
+		id := a["io.kubernetes.cri.sandbox-id"]
+		if !containerIDHex.MatchString(id) {
+			return nil
+		}
+		if sb = c.readBundle(filepath.Join(containerdTasks, ns, id, "config.json")); sb == nil {
+			return nil
+		}
+	}
+	if sb["io.kubernetes.cri.sandbox-name"] != ctr.PodName || sb["io.kubernetes.cri.sandbox-namespace"] != ctr.PodNamespace {
+		return nil
+	}
+	return newPodMeta(nil, sb)
 }
 
 // readBundle returns the annotations of the config.json of an OCI bundle,
