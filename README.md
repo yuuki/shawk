@@ -142,8 +142,9 @@ migrations. A database created by v0.8.0 must be created again: see the
 [CHANGELOG](CHANGELOG.md) and [packaging/](packaging/README.md).
 
 `packaging/collector/config.yaml` receives the agents on `otlp/shawk`
-(port 4327 for gRPC, 4328 for HTTP) and OBI on `otlp` (4317, 4318), both
-with TLS and client certificates, writes PostgreSQL with the role
+(port 4327, gRPC) and OBI on `otlp` (4317, 4318), both with TLS and client
+certificates, accepts the metrics of a host only from an agent whose
+certificate names it (`host_identity: certificate`), writes PostgreSQL with the role
 `shawk_connector` and pushes metrics to Prometheus;
 `packaging/prometheus/` has the Prometheus settings and the recording rules
 that count each dependency once; `packaging/grafana/` has data sources,

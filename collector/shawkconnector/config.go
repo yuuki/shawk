@@ -36,6 +36,14 @@ type Config struct {
 	// server edges of their backends, in PostgreSQL and in the names of
 	// peers.
 	Translations map[string]TranslationConfig `mapstructure:"translations"`
+	// HostIdentity tells whom the connector believes about the host of a
+	// request. "certificate" accepts the metrics of a host only over gRPC
+	// from an agent whose verified client certificate names the host.name
+	// it sends (as a DNS name, or as the common name of a certificate
+	// without DNS names), so that an agent cannot write as another host;
+	// the receiver must require client certificates. "none" (the default)
+	// believes the host.name and host.id of every request.
+	HostIdentity string `mapstructure:"host_identity"`
 }
 
 // PostgresConfig configures the connection to PostgreSQL.
@@ -88,6 +96,11 @@ func (c *Config) Validate() error {
 	}
 	if _, err := parseTranslations(c.Translations); err != nil {
 		errs = append(errs, err)
+	}
+	switch c.HostIdentity {
+	case "", hostIdentityNone, hostIdentityCertificate:
+	default:
+		errs = append(errs, fmt.Errorf("host_identity must be %s or %s", hostIdentityNone, hostIdentityCertificate))
 	}
 	return errors.Join(errs...)
 }

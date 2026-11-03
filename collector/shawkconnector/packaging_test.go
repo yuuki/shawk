@@ -56,14 +56,22 @@ func TestPackagedCollectorConfig(t *testing.T) {
 		t.Error(err)
 	}
 	if cfg.Postgres.DSNFile == "" || cfg.WriteInterval != time.Minute || cfg.IdleTTL != 15*time.Minute ||
-		cfg.MaxPeers != 50 || cfg.PeerCIDRs["office-lan"] != "192.168.10.0/24" || cfg.Retention != 3*365*24*time.Hour {
+		cfg.MaxPeers != 50 || cfg.PeerCIDRs["office-lan"] != "192.168.10.0/24" || cfg.Retention != 3*365*24*time.Hour ||
+		cfg.HostIdentity != hostIdentityCertificate {
 		t.Errorf("config = %+v", cfg)
 	}
 	// Both receivers require client certificates; the receiver of agents
-	// accepts the largest requests of an agent.
+	// accepts the largest requests of an agent, over gRPC only, which
+	// passes the client certificate on to the connector (host_identity).
 	for _, r := range []string{"otlp/shawk", "otlp"} {
 		protocols, _ := doc.Receivers[r].(map[string]any)["protocols"].(map[string]any)
 		for _, proto := range []string{"grpc", "http"} {
+			if r == "otlp/shawk" && proto == "http" {
+				if protocols[proto] != nil {
+					t.Errorf("%s: HTTP carries no client certificate to the connector", r)
+				}
+				continue
+			}
 			p, _ := protocols[proto].(map[string]any)
 			tls, _ := p["tls"].(map[string]any)
 			if tls["client_ca_file"] == nil || tls["cert_file"] == nil || tls["key_file"] == nil {
@@ -74,9 +82,6 @@ func TestPackagedCollectorConfig(t *testing.T) {
 			}
 			if proto == "grpc" && p["max_recv_msg_size_mib"] != 16 {
 				t.Errorf("%s: max_recv_msg_size_mib = %v", r, p["max_recv_msg_size_mib"])
-			}
-			if proto == "http" && p["max_request_body_size"] != 16<<20 {
-				t.Errorf("%s: max_request_body_size = %v", r, p["max_request_body_size"])
 			}
 		}
 	}

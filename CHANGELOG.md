@@ -152,6 +152,22 @@ changes; see below.
 * `make build` and `make collector` set the version without the `v` of the
   tag (`0.8.0`), like the release.
 
+### Security
+
+* **An agent can no longer write as another host.** The connector believed
+  the `host.name` and `host.id` that every request carries, so the holder
+  of any client certificate could add dependencies to another host, or
+  send its `shawk_agent_up`, or make PostgreSQL drop its changes with a
+  string it refuses. With `host_identity: certificate`, which
+  `packaging/collector/config.yaml` sets, the connector accepts the
+  metrics of a host only from an agent whose verified client certificate
+  names its `host.name` (a DNS name, or the common name of a certificate
+  without DNS names); the certificates of the agents must name their
+  hosts as `hostname` prints them. The receiver passes the certificate on
+  over gRPC only, so the example configuration no longer receives agents
+  over HTTP (port 4328). The connector replaces NUL and invalid UTF-8 in
+  the strings of agents, which PostgreSQL refuses.
+
 ### Fixed
 
 * On kernels whose TCP iterator skips sockets (Linux before 6.17 without

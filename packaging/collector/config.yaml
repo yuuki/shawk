@@ -8,7 +8,9 @@
 # (shawk-collector; 65532 in the container image).
 receivers:
   # shawk agents only (-otlp-cert-file and -otlp-key-file). A request of an
-  # agent stays below 3 MiB; the limits leave room.
+  # agent stays below 3 MiB; the limits leave room. gRPC only: the connector
+  # checks the client certificate of every request (host_identity), which
+  # the receiver passes on over gRPC, not over HTTP.
   otlp/shawk:
     protocols:
       grpc:
@@ -18,10 +20,6 @@ receivers:
           cert_file: /etc/shawk/tls/collector.crt
           key_file: /etc/shawk/tls/collector.key
           client_ca_file: /etc/shawk/tls/agents-ca.crt
-      http:
-        endpoint: 0.0.0.0:4328
-        max_request_body_size: 16777216
-        tls: *shawk_tls
   # OBI and other instrumentation, with the variables of the OpenTelemetry
   # SDK: OTEL_EXPORTER_OTLP_ENDPOINT=https://..., OTEL_EXPORTER_OTLP_CERTIFICATE,
   # OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE and OTEL_EXPORTER_OTLP_CLIENT_KEY.
@@ -60,6 +58,10 @@ connectors:
     #     backends: [10.0.1.0/24:8080]
     #     sources: [10.0.100.250]            # what the backends see the clients at
     keep_peer_address: false
+    # The certificate of an agent must name its host as `hostname` prints
+    # it (a DNS name, or the common name of a certificate without DNS
+    # names): an agent cannot write as another host.
+    host_identity: certificate
     retention: 26280h         # 3 years; 0 keeps rows forever
 
 processors:
