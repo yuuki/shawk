@@ -1,7 +1,11 @@
 package shawkconnector
 
 import (
+	"cmp"
+	"maps"
 	"net/netip"
+	"slices"
+	"strings"
 	"time"
 )
 
@@ -107,8 +111,10 @@ func newHostChanges(key string) *hostChanges {
 	}
 }
 
+// size is the number of rows to write: the host, and its sessions,
+// addresses, processes, edges, listeners and translations.
 func (h *hostChanges) size() int {
-	return len(h.sessions) + len(h.addrs) + len(h.processes) + len(h.edges) + len(h.listeners) + len(h.translations)
+	return 1 + len(h.sessions) + len(h.addrs) + len(h.processes) + len(h.edges) + len(h.listeners) + len(h.translations)
 }
 
 func (h *hostChanges) setHost(machineID, hostname, kernel, version string, t time.Time) {
@@ -282,9 +288,19 @@ func (c *changes) add(b *hostBatch, now time.Time) {
 		// The clock of the agent stepped: keep the floor at the same time.
 		f.start = f.start.Add(f.skew - skew)
 	}
+	if b.limited {
+		// Series of the host were dropped in the interval this request
+		// closes (max_series_per_host), and may never be written: the
+		// session ends at its last heartbeat, and the next one starts no
+		// earlier than this request. A series dropped then and not sent
+		// again was last active before it.
+		if t := now.Add(-skew).Truncate(time.Second); t.After(f.start) {
+			f.start = t
+		}
+	}
 	f.skew, f.seen = skew, now
 	c.floors[b.key] = f
-	if !b.segmentStart.IsZero() {
+	if !b.segmentStart.IsZero() && !b.limited {
 		start := b.segmentStart
 		if start.Before(f.start) {
 			start = f.start
@@ -414,6 +430,31 @@ func (c *changes) forget(key string, now time.Time) {
 		f.start = now.Add(-f.skew).Add(-minAgentIdleTTL).Truncate(time.Second)
 		c.floors[key] = f
 	}
+}
+
+// bound drops the pending changes of whole hosts, those pending the longest
+// first, until at most max rows are pending, and forgets them as dropped at
+// now. It returns the hosts and rows dropped.
+func (c *changes) bound(max int, now time.Time) (hosts, rows int) {
+	size := c.pendingSize()
+	if size <= max {
+		return 0, 0
+	}
+	pending := slices.SortedFunc(maps.Values(c.pending), func(a, b *hostChanges) int {
+		return cmp.Or(a.first.Compare(b.first), strings.Compare(a.key, b.key))
+	})
+	for _, h := range pending {
+		if size <= max {
+			break
+		}
+		n := h.size()
+		size -= n
+		hosts++
+		rows += n
+		delete(c.pending, h.key)
+		c.forget(h.key, now)
+	}
+	return hosts, rows
 }
 
 // expire forgets accepted spans not reported for the TTL.

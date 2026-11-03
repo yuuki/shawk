@@ -893,9 +893,9 @@ later time, from a clock further ahead or made up by an agent, is written
 as 2 minutes ahead, so that it does not stay the `last_seen` of its row
 (`greatest()`), win the choice of the most recently seen endpoint (§5.2)
 and escape the retention. While the database is down, changes accumulate
-(in proportion to the number of edges, not to time) and are written when
-it returns, and
-the connector writes what is pending when it stops. Rows that PostgreSQL
+(in proportion to the number of edges, not to time, up to
+`max_pending_rows`, §5.5) and are written when it returns, and the
+connector writes what is pending when it stops. Rows that PostgreSQL
 rejects as invalid data are dropped rather than kept for the next write,
 which would fail again (IPv6 zones are stripped from addresses before);
 the edges and listeners agents still send are then written again.
@@ -1020,9 +1020,9 @@ connector warns. Each host whose agent folds is logged at most once an
 hour, with the number of hosts it folded since. When both agents fold the
 other side, both edges are folded and neither tells the other host, so
 nothing is logged. Agents that fold the peers in a range of `peer_cidrs`,
-which are then named `~external`, are logged too, at most once an hour per
-configuration of the agents (a range of a whole network, which names the
-folded peers, is left out). What an agent folds comes from its
+which are then named `~external`, are logged too, at most once an hour for
+what they fold and the ranges they fold (a range of a whole network, which
+names the folded peers, is left out). What an agent folds comes from its
 requests, or for hosts behind other connectors from
 `shawk_v1.agent_addrs`. The connector has no metrics of its own, so the
 warnings are only logged.
@@ -1284,6 +1284,55 @@ should have the same: the last one to write wins.
   accept the connections on it. As several hosts hold it at once, the
   edges do not match by address (§5.2); list the virtual address as the
   backend of its translation.
+
+### 5.5 Bounds of what is held
+
+The state of the connector is keyed by what agents send: their hosts and
+series, the names of peers learned from them, and the changes pending for
+PostgreSQL. The `memory_limiter` processor refuses requests when memory
+runs short, but cannot free what the connector holds, so the connector
+bounds it:
+
+- **Hosts** (`max_hosts`, 10000): a host is held from its first request
+  until it has not sent for `idle_ttl`. While the bound is reached, the
+  requests of other hosts are refused with an error that is not permanent
+  (the agent counts a failed export); hosts held are never evicted.
+- **Series per host** (`max_series_per_host`, 100000): its edges,
+  listeners, translations and addresses, each held from its first request
+  until `idle_ttl` after its latest. New ones beyond the bound are dropped;
+  those held are kept. A series dropped may never be written, so the host
+  is not observed in an interval in which series were dropped: its session
+  ends at the heartbeat before, and the next session starts no earlier than
+  the request that closed that interval. A series dropped then that is not
+  sent again was last active before that request, since an agent sends a
+  series for its idle TTL, at least 2 minutes and four intervals, after
+  its last activity. The input series of the edges of a host, one per
+  metric, direction and reason of failure, are bounded to 16 times the
+  bound (an edge of the agent has at most 15); the metrics to Prometheus
+  leave out those beyond. The endpoints inferred from the listeners of a
+  host on unspecified addresses, one per address of the host and port, are
+  bounded by `max_series_per_host`; those beyond are named from PostgreSQL
+  after the next load (§5.2).
+- **Pending rows** (`max_pending_rows`, 10 million): the rows kept for
+  PostgreSQL while they cannot be written, because writes fail or the
+  schema is not ready. Beyond the bound, the changes of the hosts pending
+  the longest are dropped whole, like rows that PostgreSQL rejects (§5.1):
+  the edges and listeners agents still send are written again, and the
+  next session of such a host starts no earlier than 2 minutes before the
+  drop, so that the time since its last heartbeat written shows as not
+  observed.
+
+The strings of agents are cut to 4096 bytes and `shawk.peer.internal` to
+4096 ranges, so that what is held of a series or a host has a bounded
+size. The refusals and the series dropped are logged at most once a
+minute, the pending changes dropped at every write interval. The defaults
+are far above what one connector serves (it takes the requests of its
+hosts one at a time), what a large host sends (the flow table of an agent
+holds 16384 flows per interval by default; a host whose agent has a much
+larger `-max-flows` may need a larger `max_series_per_host`), and the rows
+of such a fleet. Lower `max_hosts` to the size of the fleet, with room, to
+bound memory more tightly: the connector holds about 5 KB per edge with
+its metrics, and about 300 bytes per pending row.
 
 ## 6. PostgreSQL
 

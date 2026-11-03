@@ -27,6 +27,7 @@ type shawkConnector struct {
 	newStore func(ctx context.Context, dsn string) (store, error)
 	store    store
 	resolver *resolver
+	limits   *limits
 
 	mu      sync.Mutex
 	agg     *aggregator
@@ -53,6 +54,12 @@ type shawkConnector struct {
 	// once a minute.
 	agentDropped        int
 	lastAgentDroppedLog time.Time
+	// Requests of hosts refused by max_hosts, and series and input series
+	// dropped by max_series_per_host, logged at most once a minute each.
+	hostsRefused                 int
+	lastHostsLog                 time.Time
+	seriesDropped, inputsDropped int
+	lastSeriesLog                time.Time
 
 	// foldWarned holds, by host whose agent folds the edges of hosts that run
 	// an agent and by side it folds, when it was last logged and the hosts
@@ -77,13 +84,18 @@ func newConnector(set connector.Settings, cfg *Config, next consumer.Metrics) (*
 		return nil, err
 	}
 	now := time.Now()
+	res := newResolver(cidrs, translations)
+	res.maxInferred = cfg.MaxSeriesPerHost
+	agg := newAggregator(cfg.IdleTTL, cfg.MaxPeers, cfg.MaxServices, cfg.KeepPeerAddress, now)
+	agg.maxInputs = maxValuesPerEdge * cfg.MaxSeriesPerHost
 	return &shawkConnector{
 		cfg:      cfg,
 		log:      set.Logger,
 		next:     next,
 		newStore: newPGStore,
-		resolver: newResolver(cidrs, translations),
-		agg:      newAggregator(cfg.IdleTTL, cfg.MaxPeers, cfg.MaxServices, cfg.KeepPeerAddress, now),
+		resolver: res,
+		limits:   newLimits(cfg.MaxHosts, cfg.MaxSeriesPerHost, cfg.IdleTTL),
+		agg:      agg,
 		changes:  newChanges(cfg.IdleTTL),
 		cidrs:    cidrs,
 		now:      time.Now,
@@ -223,10 +235,11 @@ func (c *shawkConnector) loop(ctx context.Context) {
 			// Writes and the reload of peers have their own deadlines, so
 			// that a slow write does not stop the names from being reloaded.
 			wctx, cancel := context.WithTimeout(ctx, c.cfg.WriteInterval)
-			if c.prepareSchemaOnly(wctx) {
-				c.flush(wctx)
-			}
+			written := c.prepareSchemaOnly(wctx) && c.flush(wctx)
 			cancel()
+			if !written {
+				c.boundPending()
+			}
 			rctx, cancel := context.WithTimeout(ctx, c.cfg.WriteInterval)
 			c.prepare(rctx)
 			cancel()
@@ -250,6 +263,7 @@ func (c *shawkConnector) loop(ctx context.Context) {
 			}
 			c.mu.Unlock()
 			c.resolver.expire(now.Add(-c.cfg.IdleTTL), now)
+			c.limits.expire(now)
 		}
 	}
 }
@@ -315,8 +329,9 @@ func (c *shawkConnector) refreshIfDue(ctx context.Context) {
 }
 
 // flush writes the pending changes, one transaction per host. The changes
-// of a host that fail to be written are kept for the next flush.
-func (c *shawkConnector) flush(ctx context.Context) {
+// of a host that fail to be written are kept for the next flush. It reports
+// whether none failed.
+func (c *shawkConnector) flush(ctx context.Context) bool {
 	c.mu.Lock()
 	pending := c.changes.take()
 	c.mu.Unlock()
@@ -348,6 +363,24 @@ func (c *shawkConnector) flush(ctx context.Context) {
 		c.log.Error("writing to PostgreSQL; the changes are kept for the next write",
 			zap.Int("hosts", failed), zap.Int("pending_rows", size), zap.Error(lastErr))
 	}
+	return failed == 0
+}
+
+// boundPending drops the changes of the hosts pending the longest beyond
+// max_pending_rows, after they could not be written. As after changes that
+// PostgreSQL rejects, the edges and listeners agents still send are written
+// again, and the next session of such a host starts no earlier than the
+// idle TTL of an agent before now: the time in between shows as not
+// observed.
+func (c *shawkConnector) boundPending() {
+	c.mu.Lock()
+	hosts, rows := c.changes.bound(c.cfg.MaxPendingRows, c.now())
+	c.mu.Unlock()
+	if hosts > 0 {
+		c.log.Error("dropping the changes of hosts that could not be written to PostgreSQL, beyond max_pending_rows; "+
+			"the hosts are not observed over them", zap.Int("hosts", hosts), zap.Int("rows", rows),
+			zap.Int("max_pending_rows", c.cfg.MaxPendingRows))
+	}
 }
 
 func (c *shawkConnector) Shutdown(context.Context) error {
@@ -371,7 +404,7 @@ func (c *shawkConnector) Shutdown(context.Context) error {
 func (c *shawkConnector) ConsumeMetrics(ctx context.Context, md pmetric.Metrics) error {
 	out := pmetric.NewMetrics()
 	now := c.now()
-	var refused error
+	var refused, full error
 	rms := md.ResourceMetrics()
 	for i := range rms.Len() {
 		b, err := parseResource(rms.At(i))
@@ -386,6 +419,11 @@ func (c *shawkConnector) ConsumeMetrics(ctx context.Context, md pmetric.Metrics)
 		if err := c.checkIdentity(ctx, b); err != nil {
 			c.refuse(b, err, now)
 			refused = err
+			continue
+		}
+		admitted, dropped := c.limits.admit(b, now)
+		if !admitted {
+			full = c.refuseHost(b, now)
 			continue
 		}
 		if b.invalid > 0 {
@@ -405,7 +443,12 @@ func (c *shawkConnector) ConsumeMetrics(ctx context.Context, md pmetric.Metrics)
 			}
 			return p
 		}, now, out)
+		inputs := c.agg.dropped
+		c.agg.dropped = 0
 		c.mu.Unlock()
+		if dropped > 0 || inputs > 0 {
+			c.dropSeries(b, dropped, inputs, now)
+		}
 	}
 	if out.ResourceMetrics().Len() > 0 {
 		if err := c.next.ConsumeMetrics(ctx, out); err != nil {
@@ -417,7 +460,50 @@ func (c *shawkConnector) ConsumeMetrics(ctx context.Context, md pmetric.Metrics)
 		// logs it, and its observation segment does not succeed.
 		return consumererror.NewPermanent(fmt.Errorf("refusing the metrics of the host: %w", refused))
 	}
+	if full != nil {
+		// Likewise; the host may be taken once hosts held expire, so the
+		// error is not permanent.
+		return full
+	}
 	return nil
+}
+
+// refuseHost logs a batch of a new host refused by max_hosts, at most once
+// a minute, and returns the error for the agent.
+func (c *shawkConnector) refuseHost(b *hostBatch, now time.Time) error {
+	err := fmt.Errorf("refusing the metrics of a new host: the connector holds max_hosts (%d) hosts", c.cfg.MaxHosts)
+	c.mu.Lock()
+	c.hostsRefused++
+	n := c.hostsRefused
+	if !c.lastHostsLog.IsZero() && now.Sub(c.lastHostsLog) < time.Minute {
+		c.mu.Unlock()
+		return err
+	}
+	c.lastHostsLog, c.hostsRefused = now, 0
+	c.mu.Unlock()
+	c.log.Error("refusing the metrics of new hosts beyond max_hosts, until hosts held stop sending for idle_ttl",
+		zap.String("host", b.hostname), zap.Int("refused", n), zap.Int("max_hosts", c.cfg.MaxHosts))
+	return err
+}
+
+// dropSeries logs the series of a host dropped by max_series_per_host, and
+// its input series dropped beyond maxValuesPerEdge times it, at most once a
+// minute.
+func (c *shawkConnector) dropSeries(b *hostBatch, series, inputs int, now time.Time) {
+	c.mu.Lock()
+	c.seriesDropped += series
+	c.inputsDropped += inputs
+	s, in := c.seriesDropped, c.inputsDropped
+	if !c.lastSeriesLog.IsZero() && now.Sub(c.lastSeriesLog) < time.Minute {
+		c.mu.Unlock()
+		return
+	}
+	c.lastSeriesLog, c.seriesDropped, c.inputsDropped = now, 0, 0
+	c.mu.Unlock()
+	c.log.Error("dropping new series of hosts beyond max_series_per_host, until others stop for idle_ttl; "+
+		"a host is not observed in the intervals in which its dependencies, listeners, translations or addresses are dropped",
+		zap.String("host", b.hostname), zap.Int("series", s), zap.Int("metric_series", in),
+		zap.Int("max_series_per_host", c.cfg.MaxSeriesPerHost))
 }
 
 // checkIdentity checks, with host_identity: certificate, that the client
@@ -534,8 +620,9 @@ func (c *shawkConnector) foldedAgentPeer(b *hostBatch, id *edgeID, p peer, now t
 // folded peer has lost its address, so it is named ~external rather than
 // after its range. A range of a whole network names the folded peers
 // themselves, and is left out. Agents usually share their configuration,
-// so each configuration (what is folded and the ranges kept exact) is
-// logged at most once an hour, with a host that has it. c.mu is held.
+// so what is folded, with the ranges folded, is logged at most once an hour,
+// with a host that folds them. The ranges are those of peer_cidrs, so
+// that agents do not make the warnings held grow. c.mu is held.
 func (c *shawkConnector) foldedCIDRs(b *hostBatch, now time.Time) {
 	if !b.final || (b.peerFold != foldIn && b.peerFold != foldAll) {
 		return
@@ -550,7 +637,7 @@ func (c *shawkConnector) foldedCIDRs(b *hostBatch, now time.Time) {
 	if len(folded) == 0 {
 		return
 	}
-	k := fmt.Sprint(b.peerFold, b.peerInternal)
+	k := fmt.Sprint(b.peerFold, folded)
 	if t, ok := c.cidrWarned[k]; ok && now.Sub(t) < foldWarnInterval {
 		return
 	}

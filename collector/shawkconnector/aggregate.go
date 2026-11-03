@@ -158,7 +158,17 @@ type aggregator struct {
 	// peers are the values of service.peer.name in use per group, with
 	// when they were last used.
 	peers map[peerGroup]map[string]time.Time
+
+	// maxInputs bounds the input series of a host (0: unbounded); dropped
+	// counts the new ones dropped beyond it, until they are taken.
+	maxInputs int
+	dropped   int
 }
+
+// maxValuesPerEdge is how many input series an edge may have on average
+// within the bound of a host: an edge of the agent has at most 15, those of
+// TCP clients with the six reasons of failure.
+const maxValuesPerEdge = 16
 
 func newAggregator(ttl time.Duration, maxPeers, maxServices int, keepPeerAddr bool, started time.Time) *aggregator {
 	return &aggregator{
@@ -366,10 +376,15 @@ func restamp(ms pmetric.MetricSlice, toConnector func(time.Time) time.Time, now 
 // delta returns how much an input series increased since its last point,
 // and whether the point is newer than that one. A point that is not newer
 // (a request that arrived late or twice) changes nothing. ts is the time of
-// the request by the clock of the agent.
+// the request by the clock of the agent. A new input series beyond
+// maxInputs is dropped.
 func (a *aggregator) delta(h *hostOutputs, k inputKey, p point, ts, now time.Time) (float64, uint64, bool) {
 	in := h.inputs[k]
 	if in == nil {
+		if a.maxInputs > 0 && len(h.inputs) >= a.maxInputs {
+			a.dropped++
+			return 0, 0, false
+		}
 		h.inputs[k] = &inputState{start: p.start, time: p.time, value: p.value, count: p.count, buckets: p.buckets, seen: now}
 		if a.isNew(h, p.start.AsTime(), ts, now) {
 			return p.value, p.count, true

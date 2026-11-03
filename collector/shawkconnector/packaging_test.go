@@ -59,7 +59,8 @@ func TestPackagedCollectorConfig(t *testing.T) {
 	}
 	if cfg.Postgres.DSNFile == "" || cfg.WriteInterval != time.Minute || cfg.IdleTTL != 15*time.Minute ||
 		cfg.MaxPeers != 50 || cfg.MaxServices != 200 || cfg.PeerCIDRs["office-lan"] != "192.168.10.0/24" ||
-		cfg.Retention != 3*365*24*time.Hour || cfg.HostIdentity != hostIdentityCertificate {
+		cfg.Retention != 3*365*24*time.Hour || cfg.HostIdentity != hostIdentityCertificate ||
+		cfg.MaxHosts != 10000 || cfg.MaxSeriesPerHost != 100000 || cfg.MaxPendingRows != 10000000 {
 		t.Errorf("config = %+v", cfg)
 	}
 	// Both receivers require client certificates, each from its own CA, so
