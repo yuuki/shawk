@@ -814,7 +814,16 @@ replaced.
   collected.
 - **TLS.** An `https://` endpoint verifies the collector (`-otlp-ca-file`)
   and may present a client certificate (`-otlp-cert-file`,
-  `-otlp-key-file`) to a receiver that requires one.
+  `-otlp-key-file`) to a receiver that requires one. With
+  `host_identity: certificate` the connector accepts the metrics of a
+  host only from an agent whose verified certificate names its
+  `host.name` (a DNS name, or the common name of a certificate without
+  DNS names; no wildcards), so that an agent, or anyone who holds one
+  certificate, cannot write as another host; the receiver passes the
+  certificate on over gRPC only, and requests over HTTP are refused. A
+  refused request fails for the agent (`shawk.agent.export.failures`).
+  With `none`, the default, the connector believes the `host.name` and
+  `host.id` of every request.
 - **Cumulative.** Counters are totals since the series started, so a failed
   request is made up for by the next one. Requests are not retried.
 - **Idle TTL.** A series with no activity (connections, bytes, datagrams or

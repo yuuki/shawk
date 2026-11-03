@@ -13,6 +13,7 @@ import (
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/connector"
 	"go.opentelemetry.io/collector/consumer"
+	"go.opentelemetry.io/collector/consumer/consumererror"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.uber.org/zap"
 )
@@ -45,6 +46,9 @@ type shawkConnector struct {
 	// minute.
 	downstreamErrs    int
 	lastDownstreamLog time.Time
+	// Requests refused by host_identity, logged at most once a minute.
+	refused        int
+	lastRefusedLog time.Time
 
 	// foldWarned holds, by host whose agent folds the edges of hosts that run
 	// an agent and by side it folds, when it was last logged and the hosts
@@ -363,6 +367,7 @@ func (c *shawkConnector) Shutdown(context.Context) error {
 func (c *shawkConnector) ConsumeMetrics(ctx context.Context, md pmetric.Metrics) error {
 	out := pmetric.NewMetrics()
 	now := c.now()
+	var refused error
 	rms := md.ResourceMetrics()
 	for i := range rms.Len() {
 		b, err := parseResource(rms.At(i))
@@ -372,6 +377,11 @@ func (c *shawkConnector) ConsumeMetrics(ctx context.Context, md pmetric.Metrics)
 				continue
 			}
 			c.log.Warn("ignoring a resource", zap.Error(err))
+			continue
+		}
+		if err := c.checkIdentity(ctx, b); err != nil {
+			c.refuse(b, err, now)
+			refused = err
 			continue
 		}
 		if b.invalid > 0 {
@@ -395,7 +405,41 @@ func (c *shawkConnector) ConsumeMetrics(ctx context.Context, md pmetric.Metrics)
 			c.downstreamError(err, now)
 		}
 	}
+	if refused != nil {
+		// The agent counts the failure (shawk.agent.export.failures) and
+		// logs it, and its observation segment does not succeed.
+		return consumererror.NewPermanent(fmt.Errorf("refusing the metrics of the host: %w", refused))
+	}
 	return nil
+}
+
+// checkIdentity checks, with host_identity: certificate, that the client
+// certificate of the request names the host of a batch.
+func (c *shawkConnector) checkIdentity(ctx context.Context, b *hostBatch) error {
+	if c.cfg.HostIdentity != hostIdentityCertificate {
+		return nil
+	}
+	cert, err := clientCertificate(ctx)
+	if err != nil {
+		return err
+	}
+	return certifiedHost(cert, b.hostname)
+}
+
+// refuse logs a batch refused by host_identity, at most once a minute.
+func (c *shawkConnector) refuse(b *hostBatch, err error, now time.Time) {
+	c.mu.Lock()
+	c.refused++
+	n := c.refused
+	if !c.lastRefusedLog.IsZero() && now.Sub(c.lastRefusedLog) < time.Minute {
+		c.mu.Unlock()
+		return
+	}
+	c.lastRefusedLog = now
+	c.refused = 0
+	c.mu.Unlock()
+	c.log.Warn("refusing the metrics of a host that the client certificate does not name (host_identity)",
+		zap.String("host", b.hostname), zap.Int("refused", n), zap.Error(err))
 }
 
 // foldWarnInterval is how often a host is logged by foldedAgentPeer and
