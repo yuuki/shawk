@@ -132,8 +132,8 @@ Then set up PostgreSQL, the collector and Prometheus with the examples in
 [packaging/](packaging/README.md):
 
 ```bash
-psql -v ON_ERROR_STOP=1 -f packaging/postgres/setup.sql          # roles and database; edit the passwords
-./shawk-migrate -dsn 'postgres://shawk_owner:...@db/shawk'        # the schema
+psql -v ON_ERROR_STOP=1 -f packaging/postgres/setup.sql                            # roles and database; asks for their passwords
+./shawk-migrate -dsn 'postgres://shawk_owner:...@db/shawk?sslmode=verify-full'     # the schema
 psql -v ON_ERROR_STOP=1 -d shawk -U shawk_owner -f packaging/postgres/grants.sql   # privileges
 ```
 
