@@ -54,7 +54,9 @@ var commands = map[string]command{
 	"agent": runAgent,
 	"flows": runFlows,
 	"version": func(_ context.Context, args []string, stdout, stderr io.Writer) error {
-		if err := parseFlags(flag.NewFlagSet("version", flag.ContinueOnError), args, stderr); err != nil {
+		fs := flag.NewFlagSet("version", flag.ContinueOnError)
+		fs.Usage = func() { fmt.Fprintln(stderr, "Usage: shawk version") }
+		if err := parseFlags(fs, args, stderr); err != nil {
 			return err
 		}
 		fmt.Fprintln(stdout, "shawk", version.Version)
@@ -176,7 +178,7 @@ func runAgent(ctx context.Context, args []string, _, stderr io.Writer) error {
 	if *perReq < 1 {
 		return fmt.Errorf("%w: -max-series-per-request must be positive", errUsage)
 	}
-	return agent.Run(ctx, agent.Config{
+	cfg := agent.Config{
 		Exporter: otlp.ExporterConfig{Endpoint: *endpoint, Protocol: *protocol, CAFile: *caFile,
 			CertFile: *certFile, KeyFile: *keyFile},
 		MaxSeriesPerRequest: *perReq,
@@ -190,7 +192,11 @@ func runAgent(ctx context.Context, args []string, _, stderr io.Writer) error {
 		BPFStats:            *bpfStats,
 		LearnTranslations:   *learn,
 		Logger:              logger,
-	})
+	}
+	if err := cfg.Validate(); err != nil {
+		return fmt.Errorf("%w: %v", errUsage, err)
+	}
+	return agent.Run(ctx, cfg)
 }
 
 func envOr(name, def string) string {
@@ -210,6 +216,12 @@ func runFlows(ctx context.Context, args []string, w, stderr io.Writer) error {
 	)
 	if err := parseFlags(fs, args, stderr); err != nil {
 		return err
+	}
+	if *interval <= 0 {
+		return fmt.Errorf("%w: -interval must be positive", errUsage)
+	}
+	if *count < 0 {
+		return fmt.Errorf("%w: -count must not be negative", errUsage)
 	}
 	ns, err := agent.ParseNetNS(*netns)
 	if err != nil {

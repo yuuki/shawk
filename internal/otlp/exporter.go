@@ -60,8 +60,14 @@ type Exporter interface {
 	Close() error
 }
 
-// NewExporter returns an exporter. It does not connect yet.
-func NewExporter(cfg ExporterConfig) (Exporter, error) {
+// Validate checks the configuration without reading its files.
+func (cfg ExporterConfig) Validate() error {
+	_, err := cfg.endpoint()
+	return err
+}
+
+// endpoint validates the configuration and returns the parsed endpoint.
+func (cfg ExporterConfig) endpoint() (*url.URL, error) {
 	u, err := url.Parse(cfg.Endpoint)
 	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
 		return nil, fmt.Errorf("invalid OTLP endpoint %q: want http://HOST:PORT or https://HOST:PORT", cfg.Endpoint)
@@ -71,6 +77,20 @@ func NewExporter(cfg ExporterConfig) (Exporter, error) {
 	}
 	if (cfg.CertFile == "") != (cfg.KeyFile == "") {
 		return nil, errors.New("set both or neither of the client certificate and its key")
+	}
+	switch cfg.Protocol {
+	case "", ProtocolGRPC, ProtocolHTTP:
+	default:
+		return nil, fmt.Errorf("invalid OTLP protocol %q: want %s or %s", cfg.Protocol, ProtocolGRPC, ProtocolHTTP)
+	}
+	return u, nil
+}
+
+// NewExporter returns an exporter. It does not connect yet.
+func NewExporter(cfg ExporterConfig) (Exporter, error) {
+	u, err := cfg.endpoint()
+	if err != nil {
+		return nil, err
 	}
 	var tlsConf *tls.Config
 	if u.Scheme == "https" {
@@ -114,7 +134,7 @@ func NewExporter(cfg ExporterConfig) (Exporter, error) {
 		tr.TLSClientConfig = tlsConf
 		return &httpExporter{url: u.String(), client: &http.Client{Transport: tr}}, nil
 	}
-	return nil, fmt.Errorf("invalid OTLP protocol %q: want %s or %s", cfg.Protocol, ProtocolGRPC, ProtocolHTTP)
+	panic("unreachable: the protocol was validated")
 }
 
 type grpcExporter struct {

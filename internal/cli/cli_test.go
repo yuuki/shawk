@@ -42,15 +42,24 @@ func TestAgentFlags(t *testing.T) {
 		{"agent", "-log-level", "loud"},
 		{"agent", "extra"},
 		{"agent", "-no-such-flag"},
+		{"agent", "-interval", "2m"},
+		{"agent", "-idle-ttl", "1m"},
+		{"agent", "-otlp-endpoint", "localhost:4327"},
+		{"agent", "-otlp-protocol", "carrier-pigeon"},
+		{"agent", "-otlp-cert-file", "client.crt", "-otlp-key-file", "client.key"}, // without https://
 		{"flows", "extra"},
+		{"flows", "-interval", "0"},
+		{"flows", "-count", "-1"},
 	} {
 		if code := Main(args, &out, &errOut); code != 2 {
 			t.Errorf("exit code of %v = %d", args, code)
 		}
 	}
-	// A valid command line whose command fails is not a usage error.
-	if code := Main([]string{"agent", "-otlp-endpoint", "localhost:4327"}, &out, &errOut); code != 1 {
-		t.Errorf("exit code of an agent with an invalid endpoint = %d", code)
+	// A valid command line whose command fails is not a usage error: the CA
+	// file is read when the agent starts.
+	if code := Main([]string{"agent", "-otlp-endpoint", "https://localhost:4327", "-otlp-ca-file", "/nonexistent/ca.pem"},
+		&out, &errOut); code != 1 {
+		t.Errorf("exit code of an agent whose CA file is missing = %d", code)
 	}
 }
 
