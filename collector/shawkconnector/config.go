@@ -19,6 +19,10 @@ type Config struct {
 	// MaxPeers bounds the values of service.peer.name per host, local
 	// service and role; the others are folded into ~other.
 	MaxPeers int `mapstructure:"max_peers"`
+	// MaxServices bounds the local services per host, whose service.name
+	// and service.namespace make the job of the outputs; the others are
+	// folded into ~other. PostgreSQL keeps them all.
+	MaxServices int `mapstructure:"max_services"`
 	// PeerCIDRs names address ranges of peers that are not resolved to a
 	// service, e.g. office-lan: 192.168.10.0/24. A value may list several
 	// prefixes separated by commas. The narrowest matching range wins.
@@ -66,6 +70,7 @@ func createDefaultConfig() *Config {
 		WriteInterval: time.Minute,
 		IdleTTL:       15 * time.Minute,
 		MaxPeers:      50,
+		MaxServices:   200,
 		Retention:     3 * 365 * 24 * time.Hour,
 	}
 }
@@ -90,6 +95,9 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxPeers < 1 {
 		errs = append(errs, errors.New("max_peers must be at least 1"))
+	}
+	if c.MaxServices < 1 {
+		errs = append(errs, errors.New("max_services must be at least 1"))
 	}
 	if _, err := parsePeerCIDRs(c.PeerCIDRs); err != nil {
 		errs = append(errs, err)
