@@ -54,6 +54,12 @@
   database that defaults to REPEATABLE READ failed the write. The
   configuration of a connector (`peer_cidrs` and the translations) is
   written in one transaction in READ COMMITTED, one connector at a time.
+* Fixed: the edges of the dependency map dashboard had no arrowheads in
+  Grafana 12.2 and 13.3, so the direction of a dependency could not be
+  seen. The Node Graph refers to the arrowhead of an edge by its id,
+  unescaped, in `url(#...)`, which the spaces of the ids of
+  `shawk_v1.graph_edges` (`client -> server`) made invalid. The dashboard
+  shows the md5 of the id instead; `shawk_v1` is unchanged.
 * A container keeps its name when it is recreated (#104). `shawk.unit` of a
   process in a container was `docker-<id>`, `podman-<id>`,
   `cri-containerd-<id>` or `crio-<id>`, so every redeploy added rows to
