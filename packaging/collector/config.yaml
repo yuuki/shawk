@@ -42,8 +42,10 @@ receivers:
 connectors:
   shawk:
     postgres:
-      # A connection string of the role shawk_connector, e.g.
-      # postgres://shawk_connector:PASSWORD@db.example:5432/shawk?sslmode=require
+      # A connection string of the role shawk_connector that verifies the
+      # certificate of the server against the CA in sslrootcert (without
+      # sslrootcert, the CAs of the system), e.g.
+      # postgres://shawk_connector:PASSWORD@db.example:5432/shawk?sslmode=verify-full&sslrootcert=/etc/shawk/tls/postgres-ca.crt
       dsn_file: /etc/shawk/postgres-dsn
       migrate: false          # apply the schema with shawk-migrate
     write_interval: 1m

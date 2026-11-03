@@ -18,10 +18,17 @@ tested (`make test`) but meant to be adapted.
 Setting up PostgreSQL:
 
 ```sh
-psql -v ON_ERROR_STOP=1 -f packaging/postgres/setup.sql          # as a superuser; edit the passwords first
-shawk-migrate -dsn 'postgres://shawk_owner:...@db/shawk'          # make shawk-migrate
+psql -v ON_ERROR_STOP=1 -f packaging/postgres/setup.sql                        # as a superuser; asks for the passwords
+shawk-migrate -dsn 'postgres://shawk_owner:...@db/shawk?sslmode=verify-full'   # make shawk-migrate
 psql -v ON_ERROR_STOP=1 -d shawk -U shawk_owner -f packaging/postgres/grants.sql
 ```
+
+`setup.sql` creates the roles without passwords; then psql asks for the
+password of each role, twice, and sends it hashed, so that it is in neither
+the script, the command line nor the server log. Run it in a terminal. A
+role without a password cannot log in with one: if psql stops at a password
+that did not match, set the passwords left in psql, e.g.
+`\password shawk_grafana`.
 
 `grants.sql` runs after `shawk-migrate`, and again after an upgrade that
 brings new migrations; it also sets default privileges for the tables that
@@ -41,8 +48,15 @@ string of the role `shawk_connector` to `/etc/shawk/postgres-dsn`, readable
 by that user only:
 
 ```sh
-sudo install -m 0640 -g shawk-collector /dev/stdin /etc/shawk/postgres-dsn <<<'postgres://shawk_connector:...@db/shawk?sslmode=require'
+sudo install -m 0640 -g shawk-collector /dev/stdin /etc/shawk/postgres-dsn <<<'postgres://shawk_connector:...@db/shawk?sslmode=verify-full&sslrootcert=/etc/shawk/tls/postgres-ca.crt'
 ```
+
+With `sslmode=verify-full`, the connector and `shawk-migrate` check that the
+certificate of PostgreSQL is signed by the CA in the file that `sslrootcert`
+names (without `sslrootcert`, by a CA of the system) and names the host of
+the connection string. With `sslmode=require` they accept any certificate,
+so whoever can intercept the connection can pose as the server and be sent
+the password. The Grafana data source names its CA with `sslRootCertFile`.
 
 Both receivers of the example configuration require TLS with client
 certificates, each from its own CA: `otlp/shawk` accepts those of
