@@ -2,6 +2,7 @@ package tracer
 
 import (
 	"bufio"
+	"encoding/binary"
 	"fmt"
 	"net"
 	"net/netip"
@@ -407,11 +408,32 @@ func testListenerReplaced(t *testing.T, overlap bool) {
 	}
 }
 
+// cgroupEventsCapacity returns how many events the ring buffer of cgroup
+// events holds: each record has a header of 8 bytes, and records are
+// aligned to 8 bytes.
+func cgroupEventsCapacity(t *testing.T) int {
+	t.Helper()
+	spec, err := loadBpf()
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := (binary.Size(bpfShawkCgroupEvent{}) + 8 + 7) &^ 7
+	return int(spec.Maps["cgroup_events"].MaxEntries) / record
+}
+
 // TestCgroupBurst creates a burst of cgroups, as a node starting many pods
 // does (#126). A reader that keeps up, as procinfo.Resolver.Learn, which
 // only records the path, gets the events of all of them; one that stops
 // reading, as Learn did while it read the state of containers, gets the
 // kernel to drop some, which CgroupEventDrops counts.
+//
+// How far a reader falls behind a burst depends on the scheduler as much as
+// on the reader: on a virtual machine, the 3000 cgroups can all be created
+// before the reader runs, and fill the ring buffer even if the reader
+// returns at once. A reader that keeps up therefore gets the cgroups in
+// batches of three quarters of what the ring buffer holds, the rest being
+// left to the cgroups that the host creates meanwhile, and the next batch
+// starts once the reader has reported the previous one.
 func TestCgroupBurst(t *testing.T) {
 	requireRoot(t)
 	root := cgroup2Root()
@@ -419,10 +441,18 @@ func TestCgroupBurst(t *testing.T) {
 		skipUnavailable(t, "cgroup v2 is not mounted")
 	}
 	const n = 3000
+	capacity := cgroupEventsCapacity(t)
+	if capacity < 4 || capacity >= n {
+		t.Fatalf("the ring buffer holds %d cgroup events", capacity)
+	}
 	for _, stalled := range []bool{false, true} {
 		name := "a reader that keeps up"
 		if stalled {
 			name = "a reader that stalls"
+		}
+		batch := n
+		if !stalled {
+			batch = capacity * 3 / 4
 		}
 		t.Run(name, func(t *testing.T) {
 			parent := filepath.Join(root, fmt.Sprintf("shawktest-burst-%d", os.Getpid()))
@@ -459,6 +489,11 @@ func TestCgroupBurst(t *testing.T) {
 				}
 				os.Remove(parent)
 			}()
+			reported := func() int {
+				mu.Lock()
+				defer mu.Unlock()
+				return len(seen)
+			}
 			start := time.Now()
 			for i := range n {
 				d := filepath.Join(parent, fmt.Sprintf("c%d", i))
@@ -466,6 +501,14 @@ func TestCgroupBurst(t *testing.T) {
 					t.Fatal(err)
 				}
 				dirs = append(dirs, d)
+				if (i+1)%batch != 0 || i+1 == n {
+					continue
+				}
+				// A batch that the reader has not reported in 5 seconds
+				// shows below as events neither reported nor dropped.
+				for deadline := time.Now().Add(5 * time.Second); reported() < i+1 && time.Now().Before(deadline); {
+					time.Sleep(time.Millisecond)
+				}
 			}
 			elapsed := time.Since(start)
 			release()
@@ -479,7 +522,7 @@ func TestCgroupBurst(t *testing.T) {
 				got := len(seen)
 				mu.Unlock()
 				if uint64(got)+snap.CgroupEventDrops >= n || time.Now().After(deadline) {
-					t.Logf("%d cgroups in %v: %d reported, %d dropped", n, elapsed, got, snap.CgroupEventDrops)
+					t.Logf("%d cgroups in batches of %d in %v: %d reported, %d dropped", n, batch, elapsed, got, snap.CgroupEventDrops)
 					if uint64(got)+snap.CgroupEventDrops < n {
 						t.Errorf("%d cgroups neither reported nor counted as dropped", n-got-int(snap.CgroupEventDrops))
 					}
