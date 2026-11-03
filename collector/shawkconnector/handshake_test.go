@@ -214,7 +214,7 @@ func TestHandshakeInvalidInputs(t *testing.T) {
 // TestHistogramResetsAsAWhole checks that a histogram whose bucket decreased
 // restarts, even when its count and sum did not.
 func TestHistogramResetsAsAWhole(t *testing.T) {
-	a := newAggregator(time.Hour, 100, false, t0.Add(-time.Hour))
+	a := newAggregator(time.Hour, 100, 200, false, t0.Add(-time.Hour))
 	h := &hostOutputs{inputs: map[inputKey]*inputState{}, resources: map[svcKey]*outResource{}, emitted: t0}
 	k := inputKey{value: valueKey{metric: metricHandshake}}
 	start := pcommon.NewTimestampFromTime(t0)

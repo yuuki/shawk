@@ -76,6 +76,9 @@ type hostOutputs struct {
 	machineID, hostname string
 	inputs              map[inputKey]*inputState
 	resources           map[svcKey]*outResource
+	// services are the local services forwarded under their own job, with
+	// when they were last used: at most max_services.
+	services map[svcKey]time.Time
 	// latest is the time of the newest request of the host, and emitted the
 	// time of the latest request whose outputs were emitted, which closed an
 	// interval, both by the clock of the agent. emitted is zero until the
@@ -146,6 +149,7 @@ const newSeriesWindow = 2 * time.Minute
 type aggregator struct {
 	ttl          time.Duration
 	maxPeers     int
+	maxServices  int
 	keepPeerAddr bool
 	// started is when the connector started.
 	started time.Time
@@ -156,10 +160,11 @@ type aggregator struct {
 	peers map[peerGroup]map[string]time.Time
 }
 
-func newAggregator(ttl time.Duration, maxPeers int, keepPeerAddr bool, started time.Time) *aggregator {
+func newAggregator(ttl time.Duration, maxPeers, maxServices int, keepPeerAddr bool, started time.Time) *aggregator {
 	return &aggregator{
 		ttl:          ttl,
 		maxPeers:     maxPeers,
+		maxServices:  maxServices,
 		keepPeerAddr: keepPeerAddr,
 		started:      started,
 		hosts:        map[string]*hostOutputs{},
@@ -182,6 +187,18 @@ func (a *aggregator) peer(g peerGroup, name string, now time.Time) string {
 	return name
 }
 
+// service returns the local service of the outputs of a process on a
+// host: its name and namespace cut to maxLabelValue bytes, or ~other for
+// the services beyond max_services.
+func (a *aggregator) service(h *hostOutputs, p *process, now time.Time) svcKey {
+	k := svcKey{service: cutLabel(p.service, maxLabelValue), svcNS: cutLabel(p.svcNS, maxLabelValue)}
+	if _, ok := h.services[k]; !ok && len(h.services) >= a.maxServices {
+		return svcKey{service: serviceOther}
+	}
+	h.services[k] = now
+	return k
+}
+
 // add accounts a request of a host received at now. If the request closes
 // an interval, it appends to out every live output series of the host and
 // the metrics of the agent.
@@ -197,7 +214,8 @@ func (a *aggregator) add(b *hostBatch, peerOf func(*edgeID) peer, now time.Time,
 
 	h := a.hosts[b.key]
 	if h == nil {
-		h = &hostOutputs{inputs: map[inputKey]*inputState{}, resources: map[svcKey]*outResource{}}
+		h = &hostOutputs{inputs: map[inputKey]*inputState{}, resources: map[svcKey]*outResource{},
+			services: map[svcKey]time.Time{}}
 		a.hosts[b.key] = h
 	}
 	h.machineID, h.hostname = b.machineID, b.hostname
@@ -215,14 +233,14 @@ func (a *aggregator) add(b *hostBatch, peerOf func(*edgeID) peer, now time.Time,
 	}
 
 	for _, e := range b.edges {
-		sk := svcKey{service: e.id.service, svcNS: e.id.svcNS}
+		sk := a.service(h, &e.id.process, now)
 		r := h.resources[sk]
 		if r == nil {
 			r = &outResource{series: map[outKey]*outSeries{}}
 			h.resources[sk] = r
 		}
 		p := peerOf(&e.id)
-		name := a.peer(peerGroup{b.key, e.id.service, e.id.svcNS, e.id.role}, p.name, now)
+		name := a.peer(peerGroup{b.key, sk.service, sk.svcNS, e.id.role}, cutLabel(p.name, maxPeerName), now)
 		for vk, pt := range e.values {
 			m, ok := outMetrics[vk.metric]
 			if !ok {
@@ -233,10 +251,10 @@ func (a *aggregator) add(b *hostBatch, peerOf func(*edgeID) peer, now time.Time,
 			if !fresh {
 				continue
 			}
-			// Inputs of unknown reasons keep series of their own, which
-			// add up in the output of _OTHER.
-			key := outKey{metric: vk.metric, dir: vk.dir, errType: outErrorType(vk.errType), peer: name, peerAgent: p.agent,
-				role: e.id.role, transport: e.id.proto, port: e.id.port}
+			// Inputs of unknown reasons or directions keep series of their
+			// own, which add up in the output of _OTHER.
+			key := outKey{metric: vk.metric, dir: outDirection(vk.dir), errType: outErrorType(vk.errType), peer: name,
+				peerAgent: p.agent, role: e.id.role, transport: e.id.proto, port: e.id.port}
 			if p.port != 0 {
 				// Through a translation, the port of the server.
 				key.port = p.port
@@ -288,7 +306,7 @@ func (a *aggregator) add(b *hostBatch, peerOf func(*edgeID) peer, now time.Time,
 		attrs := rm.Resource().Attributes()
 		attrs.PutStr(attrServiceName, agentServiceName)
 		if b.agentVersion != "" {
-			attrs.PutStr(attrServiceVersion, b.agentVersion)
+			attrs.PutStr(attrServiceVersion, cutLabel(b.agentVersion, maxLabelValue))
 		}
 		putHostAttrs(attrs, b.machineID, b.hostname)
 		sm := rm.ScopeMetrics().AppendEmpty()
@@ -439,7 +457,12 @@ func (a *aggregator) expire(now time.Time) {
 				delete(h.resources, sk)
 			}
 		}
-		if len(h.resources) == 0 && len(h.inputs) == 0 {
+		for sk, t := range h.services {
+			if now.Sub(t) > a.ttl {
+				delete(h.services, sk)
+			}
+		}
+		if len(h.resources) == 0 && len(h.inputs) == 0 && len(h.services) == 0 {
 			delete(a.hosts, host)
 		}
 	}
@@ -455,10 +478,13 @@ func (a *aggregator) expire(now time.Time) {
 	}
 }
 
+// putHostAttrs puts the attributes of a host on a resource, cut to
+// maxLabelValue bytes: Prometheus makes labels of them all.
 func putHostAttrs(attrs pcommon.Map, machineID, hostname string) {
+	hostname = cutLabel(hostname, maxLabelValue)
 	attrs.PutStr(attrServiceInstanceID, hostname)
 	if machineID != "" {
-		attrs.PutStr(attrHostID, machineID)
+		attrs.PutStr(attrHostID, cutLabel(machineID, maxLabelValue))
 	}
 	attrs.PutStr(attrHostName, hostname)
 }

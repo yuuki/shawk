@@ -66,7 +66,7 @@ func goldenRequest() *colmetricspb.ExportMetricsServiceRequest {
 		Started: t0.Add(-time.Hour), SegmentStart: t0.Add(-time.Hour), NetNSScope: "all", UDPTraced: true,
 		FlowsDropped: 7, CgroupEventsDropped: 3, ContainerReadsDrops: 2, ExportFailures: 1,
 		TranslationsTraced: true, TranslationsDropped: 2,
-		BPFPrograms: []BPFProgram{{Name: "shawk_tcp_state", RunCount: 42, RunTime: 3 * time.Millisecond}},
+		BPFPrograms: []BPFProgram{{Name: "shawk_inet_sock_set_state", RunCount: 42, RunTime: 3 * time.Millisecond}},
 	}, t0.Add(15*time.Second))
 }
 
