@@ -90,7 +90,7 @@ Run the agent on every host you want to observe:
 
 | flag | |
 |---|---|
-| `-otlp-endpoint` | URL of the `otlp/shawk` receiver of the collector; `http://` disables TLS (default `$OTEL_EXPORTER_OTLP_ENDPOINT`, else `http://localhost:4327`, or `http://localhost:4328` with `http/protobuf`) |
+| `-otlp-endpoint` | URL of the `otlp/shawk` receiver of the collector; `http://` disables TLS, and the agent warns when its host is not `localhost` or a loopback address (default `$OTEL_EXPORTER_OTLP_ENDPOINT`, else `http://localhost:4327`, or `http://localhost:4328` with `http/protobuf`) |
 | `-otlp-protocol` | `grpc` or `http/protobuf` (default `$OTEL_EXPORTER_OTLP_PROTOCOL`, else `grpc`) |
 | `-otlp-ca-file` | CA bundle that verifies the collector |
 | `-otlp-cert-file`, `-otlp-key-file` | client certificate for a collector that requires one (the example configuration does) |
@@ -132,8 +132,8 @@ Then set up PostgreSQL, the collector and Prometheus with the examples in
 [packaging/](packaging/README.md):
 
 ```bash
-psql -v ON_ERROR_STOP=1 -f packaging/postgres/setup.sql          # roles and database; edit the passwords
-./shawk-migrate -dsn 'postgres://shawk_owner:...@db/shawk'        # the schema
+psql -v ON_ERROR_STOP=1 -f packaging/postgres/setup.sql                            # roles and database; asks for their passwords
+./shawk-migrate -dsn 'postgres://shawk_owner:...@db/shawk?sslmode=verify-full'     # the schema
 psql -v ON_ERROR_STOP=1 -d shawk -U shawk_owner -f packaging/postgres/grants.sql   # privileges
 ```
 
@@ -143,7 +143,8 @@ migrations. A database created by v0.8.0 must be created again: see the
 
 `packaging/collector/config.yaml` receives the agents on `otlp/shawk`
 (port 4327, gRPC) and OBI on `otlp` (4317, 4318), both with TLS and client
-certificates, accepts the metrics of a host only from an agent whose
+certificates from two separate CAs (a certificate of OBI cannot send as an
+agent), accepts the metrics of a host only from an agent whose
 certificate names it (`host_identity: certificate`), writes PostgreSQL with the role
 `shawk_connector` and pushes metrics to Prometheus;
 `packaging/prometheus/` has the Prometheus settings and the recording rules

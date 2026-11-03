@@ -86,6 +86,11 @@ type Agent struct {
 	xlatDrops   uint64
 	cgroupDrops uint64
 	oversized   uint64 // series left out of requests, as last logged
+
+	// When the reads of environments that hang were last logged, and the
+	// reads skipped then.
+	stuckLogged  time.Time
+	stuckSkipped uint64
 }
 
 // withDefaults returns cfg with the defaults of the fields left unset.
@@ -128,6 +133,11 @@ func Run(ctx context.Context, cfg Config) error {
 		return err
 	}
 	defer exp.Close()
+	if cfg.Exporter.CleartextRemote() {
+		cfg.Logger.Warn("the OTLP endpoint is not a loopback address and does not use TLS: the dependencies of the host, "+
+			"the executables and services of its processes, its name and its machine id are sent unencrypted; use https://",
+			"endpoint", cfg.Exporter.Endpoint)
+	}
 
 	cgroups := procinfo.NewResolver()
 	// The addresses of the host are internal from the first flow on, also
@@ -260,6 +270,7 @@ func (a *Agent) tick(ctx context.Context) error {
 		a.log.Warn("leaving out series too large for a request", "series", n-a.oversized)
 		a.oversized = n
 	}
+	a.logStuckReads(now)
 	// The last request carries the metrics of the agent and closes the
 	// interval; after a failure the rest is not sent, and the next interval
 	// makes up for it since the series are cumulative. Every request has its
@@ -276,6 +287,24 @@ func (a *Agent) tick(ctx context.Context) error {
 	}
 	a.segment.Succeeded(segStart, now)
 	return nil
+}
+
+// stuckLogEvery is how often at most the reads of environments that hang
+// are logged.
+const stuckLogEvery = 10 * time.Minute
+
+// logStuckReads logs the reads of environments that hang, if any, at most
+// every stuckLogEvery: each holds a goroutine and a file descriptor, and
+// once procinfo.MaxEnvironReads hang no process is read in time.
+func (a *Agent) logStuckReads(now time.Time) {
+	s := a.idents.stuck()
+	if s.Stuck == 0 || now.Sub(a.stuckLogged) < stuckLogEvery {
+		return
+	}
+	a.log.Warn("reads of the environment of processes hang, e.g. on a stalled FUSE or network file system; once all slots are held, environments are not read and processes keep their latest identity",
+		"stuck", s.Stuck, "slots", procinfo.MaxEnvironReads, "skipped", s.Skipped-a.stuckSkipped)
+	a.stuckLogged = now
+	a.stuckSkipped = s.Skipped
 }
 
 // observe accounts a snapshot of the interval (start, end] to the series.

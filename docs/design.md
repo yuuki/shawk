@@ -610,6 +610,16 @@ after twice as long each time, up to an hour:
   containerd without a name (`ctr run`). A container in a container
   (Docker in Docker, kind) keeps its state in the outer container, out of
   reach, and is named after the outer one.
+- Only the outermost container of a cgroup, and only one the runtimes of
+  the host made, is named after the state they keep. A user to whom a unit
+  delegates its cgroups (`user@1000.service`, or a service with
+  `Delegate=yes` and `User=`), or a container allowed to write its own,
+  can make a cgroup named after any container of the host, whose id
+  `/proc/PID/cgroup` shows to everyone. The runtimes of the host make
+  theirs in slices or at the root, never in a unit, so a container in a
+  unit is named by id after the unit
+  (`user@1000.service/podman-0123456789ab`), and one in another container
+  after the outer one.
 - The workload of a pod, in its unit, is the name of the pod without the
   suffixes Kubernetes appends to the pods it creates
   (`web-5d8f7c9b6-x7z2k` and `node-exporter-x7z2k` become `web` and
@@ -715,12 +725,20 @@ after twice as long each time, up to an hour:
   them apart.
 - `/proc` is read for the processes of an interval several at once, within
   one second per interval. A read of the environment takes the lock of the
-  memory map of the process, which a stuck process may hold; it gives up
-  after 200 ms, and a process whose read timed out is not read again for 5
-  minutes after the read returns. The command name in `/proc` must match
-  that of the flow, so that a PID reused by another process since is not
-  trusted. When a process exits before `/proc` is read, or is not read in
-  time, the latest identity seen for the same unit and comm is used.
+  memory map of the process, which a stuck process may hold, for good if
+  its memory is mapped from a FUSE file system that its user stalls. The
+  agent stops waiting after 200 ms, and a process whose read timed out is
+  not read again until 5 minutes after the read returns; at most 4096
+  processes back off at once. A read that hangs holds a goroutine and a
+  file descriptor until it returns, and a user can make one hang per
+  process, so at most 32 reads are outstanding at once. The agent reads 8
+  processes at once, so the other processes are read as before while up
+  to 24 reads hang; once 32 hang, no environment is read until one
+  returns. The agent logs how many hang at most every 10 minutes. The
+  command name in `/proc` must match that of the flow, so that a PID
+  reused by another process since is not trusted. When a process exits
+  before `/proc` is read, or is not read in time, the latest identity seen
+  for the same unit and comm is used.
 - The host is identified by `host.id` (`/etc/machine-id`, else
   `/var/lib/dbus/machine-id`) and `host.name`. In PostgreSQL a host is the
   hash of both, so that VMs cloned with the same machine id stay apart.
@@ -808,7 +826,15 @@ replaced.
   collected.
 - **TLS.** An `https://` endpoint verifies the collector (`-otlp-ca-file`)
   and may present a client certificate (`-otlp-cert-file`,
-  `-otlp-key-file`) to a receiver that requires one. With
+  `-otlp-key-file`) to a receiver that requires one. An `http://`
+  endpoint sends the dependencies of the host, the executables and
+  services of its processes, its name and its machine id unencrypted; the
+  agent warns at start when the host of the endpoint is neither
+  `localhost` nor a loopback address. Over HTTP/protobuf the agent does
+  not follow redirects: a 3xx response fails the request
+  (`shawk.agent.export.failures`), so that a collector, or anything in
+  the path, cannot send the export to another address, or from
+  `https://` to `http://`. With
   `host_identity: certificate` the connector accepts the metrics of a
   host only from an agent whose verified certificate names its
   `host.name` (a DNS name, or the common name of a certificate without
@@ -817,7 +843,11 @@ replaced.
   certificate on over gRPC only, and requests over HTTP are refused. A
   refused request fails for the agent (`shawk.agent.export.failures`).
   With `none`, the default, the connector believes the `host.name` and
-  `host.id` of every request.
+  `host.id` of every request. The example configuration trusts another CA
+  on the receiver of OBI (`otlp`, `obi-ca.crt`) than on that of agents
+  (`otlp/shawk`, `agents-ca.crt`): OBI often runs on hosts or in
+  containers trusted less than the agents, and its certificates must not
+  send as an agent, even for the host they name.
 - **Cumulative.** Counters are totals since the series started, so a failed
   request is made up for by the next one. Requests are not retried.
 - **Idle TTL.** A series with no activity (connections, bytes, datagrams or
@@ -1283,7 +1313,11 @@ names in PostgreSQL and Prometheus match.
 | `dependencies_between(since, until)`, `graph_edges_between`, `graph_nodes_between`, `dependency_changes_between` | the same for the dependencies active in a period. They take the edges active in the period with a margin of 15 minutes before matching them, so a recent window does not scan the history (about 0.3 s instead of 3 s with a million edges) and both sides of a connection are matched at the edges of the period; the dashboards and alerts use them. A dependency appeared in a period when it was first seen in it and is not in `known_dependencies` from before it: one that comes back on new edges (a new container, an hourly job) did not appear |
 
 The connector role writes `shawk` and reads `shawk_v1`; Grafana reads
-`shawk_v1` only (`packaging/postgres`).
+`shawk_v1` only (`packaging/postgres`). Neither may create objects in the
+database: tables or functions in `public`, temporary tables or large
+objects. The read-only transactions and the statement timeout that
+`setup.sql` gives Grafana are defaults that a session can change; the
+privileges are what hold.
 
 ## 7. Counting each dependency once
 
@@ -1361,9 +1395,11 @@ parses. shawk runs beside it instead:
   `application_service_graph` features) of selected services and sends to
   the `otlp` receiver of the same collector, with a client certificate
   (`OTEL_EXPORTER_OTLP_CERTIFICATE`, `OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE`,
-  `OTEL_EXPORTER_OTLP_CLIENT_KEY`); its network and statistics features
-  stay disabled, since shawk observes the same per process. Its metrics
-  are not batched in the collector: they carry the clock of their host.
+  `OTEL_EXPORTER_OTLP_CLIENT_KEY`) from another CA than those of the
+  agents, which the receiver of agents refuses (§4.3); its network and
+  statistics features stay disabled, since shawk observes the same per
+  process. Its metrics are not batched in the collector: they carry the
+  clock of their host.
 - Both name services the same way and both set the resource `service.name`,
   so `job` matches; dashboards use one `$service` variable for both.
 - `host.id` is the machine id in both. Cloned VMs should regenerate it

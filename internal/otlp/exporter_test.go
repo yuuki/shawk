@@ -8,6 +8,9 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -85,6 +88,34 @@ func TestHTTPExporter(t *testing.T) {
 	}
 }
 
+// TestHTTPExporterRedirect checks that a redirect does not send the request
+// elsewhere and fails the export.
+func TestHTTPExporterRedirect(t *testing.T) {
+	var delivered atomic.Int32
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		delivered.Add(1)
+	}))
+	defer other.Close()
+	for _, code := range []int{http.StatusFound, http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, other.URL+"/v1/metrics", code)
+		}))
+		exp, err := NewExporter(ExporterConfig{Endpoint: srv.URL, Protocol: ProtocolHTTP})
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = exp.Export(context.Background(), testRequest())
+		if err == nil || !strings.Contains(err.Error(), strconv.Itoa(code)) || !strings.Contains(err.Error(), other.URL) {
+			t.Errorf("%d: %v", code, err)
+		}
+		exp.Close()
+		srv.Close()
+	}
+	if n := delivered.Load(); n != 0 {
+		t.Errorf("%d requests were redirected", n)
+	}
+}
+
 type metricsServer struct {
 	colmetricspb.UnimplementedMetricsServiceServer
 	got chan *colmetricspb.ExportMetricsServiceRequest
@@ -136,6 +167,26 @@ func TestNewExporterErrors(t *testing.T) {
 	} {
 		if _, err := NewExporter(cfg); err == nil {
 			t.Errorf("NewExporter(%+v) succeeded", cfg)
+		}
+	}
+}
+
+func TestCleartextRemote(t *testing.T) {
+	for ep, want := range map[string]bool{
+		"http://10.0.0.1:4327":           true,
+		"http://collector.example:4327":  true,
+		"http://[2001:db8::1]:4327":      true,
+		"http://localhost:4327":          false,
+		"http://LOCALHOST.:4327":         false,
+		"http://127.0.0.1:4327":          false,
+		"http://127.0.0.2:4327":          false,
+		"http://[::1]:4327":              false,
+		"https://10.0.0.1:4327":          false,
+		"https://collector.example:4327": false,
+		"collector.example:4327":         false, // invalid
+	} {
+		if got := (ExporterConfig{Endpoint: ep}).CleartextRemote(); got != want {
+			t.Errorf("%s: %v, want %v", ep, got, want)
 		}
 	}
 }

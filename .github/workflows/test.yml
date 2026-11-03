@@ -4,6 +4,11 @@ on:
   pull_request:
   workflow_call:
 
+# The tests only read the repository, also when release.yml calls them, which
+# grants no more. Actions are pinned by commit.
+permissions:
+  contents: read
+
 jobs:
   test:
     # Hosted runners allow loading BPF programs with sudo, including fentry,
@@ -23,8 +28,8 @@ jobs:
       SHAWK_TEST_POSTGRES_DSN: postgres://postgres:postgres@localhost:5432/postgres
       SHAWK_E2E_POSTGRES_DSN: postgres://postgres:postgres@localhost:5432/shawke2e
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
       - name: Install tools
@@ -57,7 +62,7 @@ jobs:
         run: sudo test/packaging/agent-unit.sh ./shawk collector/_build/shawk-collector
       # The kernel RPMs of make compat, whose SHA-256 the scripts pin.
       - name: Cache the Rocky Linux 9 kernel
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: build/kernel
           key: kernel-rpm-${{ hashFiles('scripts/fetch-kernel-btf.sh', 'scripts/fetch-module-btf.sh') }}
@@ -84,8 +89,8 @@ jobs:
           - { kernel: "5.15", arch: x86_64, qemu: qemu-system-x86 }
           - { kernel: "5.15", arch: aarch64, qemu: qemu-system-arm }
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
       - name: Install QEMU
@@ -98,7 +103,7 @@ jobs:
           sudo udevadm trigger --name-match=kvm
       # The kernel packages, whose SHA-256 the script pins.
       - name: Cache the kernel
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: build/kernel
           key: kernel-${{ matrix.kernel }}-${{ matrix.arch }}-${{ hashFiles('test/vm/run.sh') }}
@@ -112,8 +117,8 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
       - name: Unit tests

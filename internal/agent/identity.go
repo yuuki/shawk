@@ -22,6 +22,8 @@ type identities struct {
 	exe  func(pid uint32) string
 	comm func(pid uint32) string
 	env  func(pid uint32) (map[string]string, bool)
+	// stuck tells how many reads of environments hang; replaced in tests.
+	stuck func() procinfo.EnvironReads
 	// budget bounds the time spent reading /proc in an interval.
 	budget time.Duration
 }
@@ -29,8 +31,9 @@ type identities struct {
 // procReadBudget bounds the time spent reading /proc for the processes of
 // an interval, and procReaders how many are read at once. A read of the
 // environment of a process can block while the process is stuck; such
-// reads time out (procinfo.OTelEnv), and the processes left when the
-// budget is spent keep their latest identity.
+// reads time out, and once procinfo.MaxEnvironReads hang no read starts
+// (procinfo.OTelEnv). The processes not read in time, and those left when
+// the budget is spent, keep their latest identity.
 const (
 	procReadBudget = time.Second
 	procReaders    = 8
@@ -59,6 +62,7 @@ func newIdentities(fb procinfo.Fallback, ttl time.Duration) *identities {
 		exe:      procinfo.Exe,
 		comm:     procinfo.Comm,
 		env:      procinfo.OTelEnv,
+		stuck:    procinfo.StuckEnvironReads,
 		budget:   procReadBudget,
 	}
 }
