@@ -1,140 +1,373 @@
-# アドレス変換の先まで依存をたどる：設計案（#107）
+# Dependencies through translations of addresses: design proposal
 
-状態：第 1 段階（§3.1〜§3.4、設定に書く静的な変換）を実装済み（2026-11-02、ブランチ `claude/translations-107`）。第 2 段階（§3.5、変換するホストで conntrack から学ぶ）と第 3 段階（§3.6、docker-proxy）は未着手。対象はイシュー #107。英語の設計文書は `docs/design.md` の §5.4、§6、§7、§10。実装で決めたことは §9 にある。
+Status: phase 1 (§3.1–§3.4, static translations in the configuration of
+the connector) is implemented (2026-11-02, branch
+`claude/translations-107`); phases 2 (§3.5, translations learned from
+conntrack) and 3 (§3.6, docker-proxy) are not. It answers issue #107. The
+design is in `docs/design.md` §5.4, §6, §7 and §10. Two adversarial
+reviews changed the implementation (§10).
 
-## 1. 問題
+## 1. Problem
 
-依存はソケットのアドレスで記録する。次のものを通る接続では、クライアントはどのエージェントも持たないアドレス（仮想アドレス）を記録する。
+Dependencies are recorded by socket addresses. When a connection goes
+through one of the following, the client records an address that no agent
+owns, a *virtual address*:
 
-- DNAT：Docker の公開ポート、kube-proxy（iptables、IPVS）、keepalived/LVS の仮想アドレス
-- エージェントのない TCP プロキシ
-- クラウドやハードウェアのロードバランサ
+- DNAT: Docker published ports, kube-proxy (iptables, IPVS),
+  keepalived/LVS virtual addresses;
+- a TCP proxy without an agent;
+- a cloud or hardware load balancer.
 
-クライアント C が仮想アドレス V のポート Pv に接続し、中継がバックエンド B のポート Pr に転送するとき、両側は次のように記録する。
+A client C connects to the virtual address V on port Pv, and the relay
+forwards to the backend B on port Pr. The two sides record:
 
-| 側 | エッジ（自分、相手、ポート） | `peer_class()` による相手の名前 |
+| side | edge (local, peer, port) | name of the peer by `peer_class()` |
 |---|---|---|
-| クライアント | (C, V, Pv) | V の範囲の名前（`~unresolved` など） |
-| サーバ（DNAT だけ） | (B, C, Pr) | C のクライアントのエッジ (C, B, Pr) がないので C の範囲の名前 |
-| サーバ（SNAT、プロキシ） | (B, S, Pr)、S は中継の送信元 | S の範囲の名前 |
+| client | (C, V, Pv) | the range of V (`~unresolved`, ...) |
+| server, DNAT only | (B, C, Pr) | the range of C: no client edge (C, B, Pr) |
+| server, SNAT or a proxy | (B, S, Pr), S an address of the relay | the range of S |
 
-`shawk_v1.dependencies` では、どちらも片側だけの行になる。依存の地図は仮想アドレスで終わり、VIP 越しに使われるデータベースについて「誰がまだ使っているか」に答えられない。論文の §5.2 の問題で、`docs/design.md` の §10 に制約として書いてある。
+`shawk_v1.dependencies` has a one-sided row for each. The dependency map
+ends at the virtual address, so *who still uses this database?* has no
+answer for the clients that reach it through a VIP. This is §5.2 of the
+paper, and `docs/design.md` §10 listed it as a limitation.
 
-## 2. 方針の要点
+## 2. Approach
 
-- 「仮想アドレスとポート → バックエンドのアドレスとポート」の対応（以下「変換」と呼ぶ）を PostgreSQL に持ち、ビューとコネクタの名付けが、アドレスで突き合わないエッジをそれを通して突き合わせる。
-- 変換の出どころは 3 つある。最初は、設定に書く静的な変換（エージェントもカーネルも変えない。イシューが「先にできる」と書いているもの）。次に、変換するホストのエージェントがカーネルの conntrack から学ぶ変換。最後に docker-proxy。
-- 変換は 2 種類に分ける。クライアントのアドレスを残すもの（DNAT）は、クライアントのアドレスで 1 対 1 に結べる。送信元を置き換えるもの（SNAT、プロキシ）は、サーバからクライアントを区別できないので、仮想アドレスへのクライアントのエッジすべてと結ぶ。
+- Keep the mapping from a virtual address and port to the addresses and
+  ports of the backends (a *translation*) in PostgreSQL. The views, and
+  the connector when it names peers, match through it the edges that their
+  addresses do not match.
+- Translations come from three sources: first static ones in the
+  configuration of the connector, which change neither the agent nor the
+  kernel (the issue notes that this can come first); then translations
+  that the agents of the hosts that translate learn from conntrack; then
+  docker-proxy.
+- There are two kinds. A translation that keeps the address of the client
+  (DNAT) matches one client edge with one server edge, by the address of
+  the client. One that replaces it (SNAT, a proxy) cannot tell the clients
+  apart on the server: every client edge to the virtual address is matched
+  with every server edge from the relay.
 
-## 3. 設計
+## 3. Design
 
-### 3.1 設定（第 1 段階）
+### 3.1 Configuration (phase 1)
 
-コネクタの設定に `translations` を足す。名前ごとの map にしたのは、コレクタの設定ファイルを重ねたときに名前ごとにまとまるため（`peer_cidrs` と同じ）。
+`translations` in the configuration of the connector, a map by name, so
+that configuration files of the collector merge by name, as `peer_cidrs`
+does:
 
 ```yaml
 connectors:
   shawk:
     translations:
-      postgres-vip:                 # keepalived の VIP、LVS の NAT
+      postgres-vip:                 # a keepalived VIP, LVS NAT
         virtual: [10.0.100.1:5432]
         backends: [10.0.1.10, 10.0.1.11]
         transport: tcp
-      web-lb:                       # 送信元を置き換えるロードバランサ
+      web-lb:                       # a load balancer that replaces the client addresses
         virtual: ["10.0.100.2:80", "[2001:db8::2]:80"]
         backends: [10.0.1.0/24:8080]
         sources: [10.0.100.250]
 ```
 
-- `virtual`：クライアントが接続するアドレス。ポートを付けるとそのポートだけ、付けなければすべてのポート。範囲は書けない（§4）。
-- `backends`：中継が転送するサーバのアドレスか範囲。ポートを付けるとそのポート、付けなければクライアントが接続したポート。台数の変わるバックエンドには範囲を書く。
-- `sources`：サーバから見たクライアントのアドレスの範囲。中継が送信元を置き換えるときに書く。空ならサーバはクライアントのアドレスを見る（DNAT）。
-- `transport`：`tcp`、`udp`、空なら両方。
-- 検証：同じ仮想アドレスとポートは 2 つの変換に入れられない（ポートのない仮想アドレスはすべてのポートと重なる）。バックエンドにポートを付けるなら、仮想アドレスにもポートが要る（すべてのポートを 1 つのポートに転送することはない）。クライアントのエッジが行き着く変換は 1 つになる。
+- `virtual`: the addresses clients connect to, with a port, or without one
+  for every port. Not ranges (§5).
+- `backends`: the addresses or ranges of the servers the relay forwards
+  to, with their port, or without one for the port the client connected
+  to. Backends that come and go are written as a range.
+- `sources`: the ranges the servers see the clients at, when the relay
+  replaces their addresses. Empty when the servers see the addresses of the
+  clients (DNAT).
+- `transport`: `tcp`, `udp`, or empty for both.
+- Checks: a virtual address and port belongs to one translation at most (a
+  virtual address without a port overlaps every port), so that a client
+  edge reaches one translation; a backend with a port needs virtual
+  addresses with a port (every port is not forwarded to one).
+- With LVS direct routing the backends hold the virtual address and accept
+  the connections on it; as several hosts hold it at once, the edges do not
+  match by address. The virtual address is then its own backend.
 
 ### 3.2 PostgreSQL
 
-- **表：** `shawk.translations(name, side, proto, addr, port)`。1 行が変換の 1 要素で、`side` は `virtual`、`backend`、`source`。コネクタが設定から書く（`peer_cidrs` と同じ）。消して入れ直すのではなく、なくなった行を消して新しい行を足すので、ビューは古い行か新しい行のどちらかを見る。
-- **突き合わせ（`dependencies`、`dependencies_between`）：**
-  1. まず今までどおりアドレスで突き合わせる（クライアントとサーバのエッジの FULL JOIN）。
-  2. アドレスで突き合わないクライアントのエッジのうち、仮想アドレスへのものを、バックエンドにあるサーバのエッジと結ぶ。ポートはバックエンドのポート、なければクライアントのポート。
-  3. DNAT：サーバのエッジの相手がクライアントのアドレスであること。スコープも揃える（ループバックはホストと名前空間の中、複数のホストが同時に持つアドレスは同じホストの中）。SNAT：サーバのエッジの相手が `sources` に入ること。
-  4. 2 つのエッジの期間が重なること（ホストの時計とエージェントの間隔のため 2 分の余裕を持たせる）。行の `first_seen`、`last_seen` は重なった期間にする。仮想アドレスへのエッジはすべてのバックエンドへの接続を束ね、SNAT のサーバのエッジはすべてのクライアントを束ねるので、両方の和にすると、使われなくなった依存が最近まで使われたように見える。退役したバックエンドを設定に残しておけば、その期間の依存も結ばれる。
-  5. SNAT のサーバのエッジは、結んだ行のほかに、それだけの行（`observed_by = 'server'`）も残す。エージェントのないクライアントも中継の後ろにいるかもしれないので、消すと「使われていない」と読めてしまう。中継の送信元には `peer_cidrs` で名前を付けられる。ほかのエッジも、結んだ行の期間が自分の期間を（余裕を含めて）覆わないかぎり、自分の行を残す（期間を指定したときは、その中の部分を覆い、結んだ行の 1 つがその中にあること）。クライアントのエッジは、エージェントのないバックエンドや、エージェントが動く前のバックエンドにもつないでいたかもしれず、サーバのエッジはクライアントから直接つながれていたかもしれない。
-  6. 結んだ行の `server_addr` と `port` はサーバのもの。末尾に `virtual_addr`、`virtual_port`（クライアントが接続したアドレスとポート）と `translation`（変換の名前）を足す。アドレスで突き合った行と片側の行では NULL。
-  7. アドレスで突き合うクライアントのエッジは変換を通さない。仮想アドレスにエージェントのあるサーバがいる（エージェントのある HAProxy）なら、それが相手である。サーバのエッジは、アドレスで突き合っていても変換を通して結ぶ（同じクライアントが直接と VIP 越しの両方でつなぐ場合）。
-- **契約：** `dependencies_between` は返す列が増えるので DROP して作り直す（呼び出す SQL 関数は列名で参照している）。`dependencies` は CREATE OR REPLACE で末尾に列を足す。サービス単位のビュー、`known_dependencies`、`graph_edges` は `dependencies` から作るので、変更なしで変換を通した依存になる。
+- **Table:** `shawk.translations(name, side, proto, addr, port)`, one row
+  per element of a translation; `side` is `virtual`, `backend` or
+  `source`. The connector writes it from its configuration with
+  `peer_cidrs`, in one transaction in READ COMMITTED under an advisory
+  lock, deleting the rows that went and inserting the new ones, so that
+  the views see the old rows or the new ones, and two connectors that
+  write at once leave the configuration of one of them.
+- **Matching** (`dependencies`, `dependencies_between`):
+  1. Edges are matched by address as before (the FULL JOIN of client and
+     server edges).
+  2. A client edge to a virtual address is matched with the server edges at
+     the backends: on the port of the backend, or that of the client edge;
+     through a translation without sources, with the address of the client
+     as peer, in the same scope (loopback within a host and network
+     namespace, an address held by several hosts within the host); through
+     one with sources, from a source; and when their periods overlap,
+     within 2 minutes for the clocks of the hosts and the intervals of the
+     agents.
+  3. Not over the periods in which a server edge at the virtual address
+     matches the client edge by address (a relay that runs an agent, such
+     as HAProxy): the row matched by address then has the period of that
+     server edge, since the client edge also reached the backends.
+  4. A matched row is the dependency of the client on the server: the
+     address and port of the server, and the period both edges were active
+     in. A client edge to a virtual address bundles its connections to
+     every backend, and a server edge from a source those of every client
+     of the relay, so the union of the two periods would make a former
+     backend look current. A former backend kept in its translation is
+     matched over the period it served.
+  5. The new last columns `virtual_addr`, `virtual_port` and
+     `translation` tell what the client connected to; they are NULL on the
+     other rows.
+  6. A server edge from a source keeps a row of its own besides its
+     matched rows, since clients without an agent may be behind the relay;
+     its range can be named in `peer_cidrs`. Another matched edge keeps a
+     row of its own if its matched rows, within the margin, leave a part of
+     its period (in a period asked for, a part in it): a client edge may
+     also have reached backends without an agent, or before their agents
+     started, and a server edge served the client directly. That row runs
+     from the start of the edge, so that a side that stops observing does
+     not make the other look new, to the end of the last part left.
+  7. On these rows, the observation (`client_observed_until`,
+     `server_observed_until`) of a side whose edge outlives the row is
+     NULL: whether the dependency ended there is for the other side to
+     tell, so that a stopped agent does not make it look removed.
+- **Contract:** `dependencies_between` returns more columns, so it is
+  dropped and created again; the SQL functions that call it name its
+  columns. `dependencies` gets them at its end with `CREATE OR REPLACE`.
+  The views and functions built on them (services, map, changes,
+  `known_dependencies`) follow unchanged.
 
-### 3.3 コネクタの名前（Prometheus）
+### 3.3 Names of peers (Prometheus)
 
-- **クライアントのエッジ：** アドレスで相手のサービスが見つからず、相手が仮想アドレスなら、バックエンドのエンドポイントのサービスを選ぶ。最も新しく見えたバックエンドから 5 分以内に見えたものの中で、ソケットで観測したもの、エージェントがサーバ側を記録するもの、サービス名、ポート、ホストの順に選ぶ。バックエンドの報告の順で選ぶと、ポートの違うバックエンドの間で報告のたびに系列が移るため。範囲のバックエンドはエンドポイントを走査し、結果を書き込み間隔ごとに捨てるキャッシュに持つ。`server.port` はバックエンドのポートにし、PostgreSQL の行と揃える。`shawk.peer.agent` はバックエンドのホストのエージェントで決める。バックエンドのエージェントがクライアントのアドレスを集約するなら（変換に送信元がないとき）、§5.2 の警告を出す。
-- **サーバのエッジ（DNAT）：** アドレスでクライアントのエッジが見つからず、自分が変換のバックエンドなら、クライアントのエッジ（クライアントのアドレス、仮想アドレス、仮想ポート）を引く。クライアントは仮想アドレスにつないでいて、そのエージェントは仮想アドレスを正確に残しているので、このホストのアドレスを集約する設定（`-fold-external=all`）でも `shawk.peer.agent` は true にし、クライアント側だけで数える。
-- **サーバのエッジ（SNAT）：** 相手は中継の送信元で、その範囲の名前のまま。
+- **Client edge:** to a virtual address, it is named after the service at
+  a backend, with the `server.port` of the backend, as PostgreSQL matches
+  it, and `shawk.peer.agent` of the host of the backend. A service
+  observed on a socket at the virtual address and port within the alive
+  window (a relay that runs an agent) comes first; a listener on an
+  unspecified address of a host that holds the address, which DNAT may
+  bypass (docker-proxy), does not. Among the backends seen within 5
+  minutes of the most recently seen one, one observed on a socket wins,
+  then one whose agent records the server side, then the first by service,
+  port and host, so that the choice does not change with every report of
+  the backends. The endpoints in a range of backends are looked up once
+  per write interval.
+- **Server edge behind a translation without sources:** it is named after
+  the client service whose client edge to a virtual address has the
+  address of its peer. That client connected to the virtual address, which
+  its agent keeps exact, so it counts the connections
+  (`shawk.peer.agent` true) even if it folds the address of the server.
+- **Server edge behind sources:** the peer is the relay, named after its
+  address, with `shawk.peer.agent` false even when an agent holds that
+  address (an IPVS director, a node that does SNAT): no agent records the
+  connections it forwards.
+- **Warnings:** the connector warns about the agent of a backend that
+  folds a client of a translation without sources, and about an agent
+  with `-fold-external=all` that folds the virtual address it connects to,
+  naming that address.
 
-### 3.4 数え方（§7）
+### 3.4 Counting (§7 of the design)
 
-- DNAT：サーバ側の相手はクライアントで、エージェントがあれば `shawk_peer_agent="true"`。クライアント側だけで数える。今までと同じ。
-- SNAT：サーバ側の相手は中継で `shawk_peer_agent="false"` なので、サーバ側でも数える。クライアントにエージェントがあれば、クライアント側でも数える。辺は別（`src=app` と `src=<中継の名前>`）なので辺ごとの値は正しいが、サーバに入る量を辺で合計すると二重になる。サーバ側からはどのクライアントの接続か分からないので避けられない。文書に書く。
+- DNAT: the peer of the server side is the client; with an agent, it has
+  `shawk_peer_agent="true"`, and only the client side counts, as before.
+- SNAT: the peer of the server side is the relay, with
+  `shawk_peer_agent="false"`, so the server side counts, and so do the
+  clients that run an agent. The dependencies differ (`src=app` and
+  `src=<the relay>`), so each is right, but their sum into the server
+  counts those clients twice. The server cannot tell its clients apart.
 
-### 3.5 第 2 段階：変換するホストで変換を学ぶ
+### 3.5 Phase 2: translations learned on the hosts that make them
 
-- **対象：** Docker の公開ポート（iptables、nftables の DNAT）、kube-proxy（iptables、nftables、IPVS）、LVS の director。設定には書けない、動的に変わる変換。
-- **方法：** BPF で `__nf_conntrack_confirm`（nf_conntrack モジュール。モジュールの BTF で fentry、なければ kprobe）を追い、NAT した接続（`status & IPS_NAT_MASK`）の元の向きと返りの向きのタプルを読む。新しい接続ごとに 1 回で、確定の時点では DNAT（PREROUTING、OUTPUT）も SNAT（POSTROUTING）も済んでいる。エフェメラルポートを落として（クライアント、仮想アドレス、仮想ポート → 送信元、バックエンド、バックエンドのポート）に束ね、フローと同じく 2 枚のマップを毎インターバル読む。netlink で conntrack の表を読むには `CAP_NET_ADMIN` が要るが、エージェントのユニットは与えていない。BPF なら権限は増えない。
-- **IPVS：** `net.ipv4.vs.conntrack=1` なら、IPVS は確定の前に conntrack の返りのタプルを書き換える（kube-proxy の IPVS モードは設定する）。設定しない LVS は `ip_vs_conn` を別に追う必要があり、あとで決める。
-- **OTLP：** 新しいメトリクス `shawk.translation.first_seen`、`shawk.translation.last_seen`。属性は transport、クライアントのアドレス、仮想アドレスとポート、送信元、バックエンドのアドレスとポート、netns。
-- **PostgreSQL：** `shawk.learned_translations(host_id, proto, client_addr, virtual_addr, virtual_port, source_addr, backend_addr, backend_port, first_seen, last_seen)`。クライアントごとに正確なので、SNAT でもクライアントを区別できる（ノードのアドレスに SNAT する kube-proxy でも 1 対 1 に結べる）。保持期間で消す。ビューは静的な変換と同じ形で学んだ変換も使い、その期間に限って突き合わせる。
-- **テスト：** 名前空間と iptables の DNAT（`make test-root`、VM テスト）、Rocky Linux 9 の BTF での互換性テスト。
+- **Scope:** Docker published ports (iptables or nftables DNAT),
+  kube-proxy (iptables, nftables, IPVS), LVS directors: translations that
+  change too often to be written down.
+- **Kernel:** trace `__nf_conntrack_confirm` (module nf_conntrack; fentry
+  with the BTF of the module, else a kprobe) and read the tuples of both
+  directions of the connections it confirms with NAT
+  (`status & IPS_NAT_MASK`). It runs once per new connection, and by then
+  DNAT (PREROUTING, OUTPUT) and SNAT (POSTROUTING) are both done. Drop the
+  ephemeral ports, bundle by (client, virtual address, virtual port →
+  source, backend, backend port), and read the two maps at every interval
+  as for flows. Reading the conntrack table over netlink would need
+  `CAP_NET_ADMIN`, which the unit of the agent does not grant; BPF needs
+  no new capability.
+- **IPVS:** with `net.ipv4.vs.conntrack=1` (kube-proxy in IPVS mode sets
+  it), IPVS rewrites the reply tuple of conntrack before the confirmation.
+  Without it, `ip_vs_conn` would have to be traced too; to be decided.
+- **OTLP:** `shawk.translation.first_seen` and `shawk.translation.last_seen`
+  with the transport, the client address, the virtual address and port,
+  the source, the backend address and port, and the netns.
+- **PostgreSQL:** `shawk.learned_translations(host_id, proto, client_addr,
+  virtual_addr, virtual_port, source_addr, backend_addr, backend_port,
+  first_seen, last_seen)`. It is exact per client, so that SNAT is matched
+  one to one too (kube-proxy masquerading to the address of the node). The
+  views use it like static translations, over its period; it goes with the
+  retention.
+- **Tests:** namespaces and iptables DNAT (`make test-root`, the virtual
+  machines), and the compatibility test against the BTF of Rocky Linux 9.
 
-### 3.6 第 3 段階：docker-proxy
+### 3.6 Phase 3: docker-proxy
 
-- ループバックやヘアピンで公開ポートに接続すると、Docker のユーザ空間のプロキシ（docker-proxy）を通る。docker-proxy はホストのサービスとして現れ、クライアントからのサーバ側のエッジ（127.0.0.1:8080）と、コンテナへのクライアント側のエッジ（172.17.0.1 → 172.17.0.2:80）を持つ。
-- どの公開ポートがどのコンテナのどのポートに行くかは、docker-proxy のコマンドライン（`-host-port`、`-container-ip`、`-container-port`）か、Docker の状態（`config.v2.json` の `NetworkSettings.Ports`）にある。エージェントは #104 から `config.v2.json` を読んでいる。
-- 案：エージェントがこれを第 2 段階と同じ経路で変換として送り、ビューは docker-proxy のエッジを中継として扱う（アドレスでの突き合わせから外し、変換を通して結ぶ）。クライアントはコンテナのサービスに結ばれる。
+- A connection to a published port on loopback, or hairpinned, goes
+  through the userland proxy of Docker. docker-proxy shows up as a service
+  of the host, with a server edge from the client (127.0.0.1:8080) and a
+  client edge to the container (172.17.0.1 → 172.17.0.2:80).
+- Which published port goes to which container and port is on the command
+  line of docker-proxy (`-host-port`, `-container-ip`, `-container-port`)
+  and in the state of Docker (`NetworkSettings.Ports` of `config.v2.json`),
+  which the agent reads since #104.
+- The agent would send it as a translation, by the path of phase 2, and
+  the views would treat the edges of docker-proxy as those of a relay: out
+  of the matching by address, matched through the translation, so that the
+  client is linked to the service of the container.
 
-## 4. 採らなかった案
+## 4. Limitations
 
-| 案 | 採らない理由 |
+- Translations are static in phase 1: Kubernetes services and Docker
+  published ports need phase 2, and docker-proxy phase 3.
+- Behind sources, every client of the relay is matched with every server
+  edge from it, which makes as many rows as clients times backends (a
+  million for a thousand of each, seconds to read), and the server side is
+  counted besides the clients (§3.4).
+- An agent of a backend that folds its clients must keep the sources, or
+  the clients of a translation without sources, in its internal ranges,
+  and an agent with `-fold-external=all` the virtual addresses it connects
+  to: a folded edge has no address to match.
+- The connectors must have the same translations: the last one to write
+  them wins, as for `peer_cidrs`.
+
+## 5. Alternatives not taken
+
+| alternative | why not |
 |---|---|
-| 仮想アドレスを範囲で書けるようにする | サーバ側の名前付けでは、クライアントのエッジを（クライアント、仮想アドレス、ポート）で引くので、仮想アドレスそのものが要る。ClusterIP の範囲のように、範囲の中の仮想アドレスごとにバックエンドが違うことが多く、範囲で書いても表せない。 |
-| 変換を通した行の期間を、両方のエッジの期間の和にする | §3.2 の 4。退役したバックエンドが最近まで使われたように見える。 |
-| SNAT のサーバのエッジを、結んだら自分の行から消す | §3.2 の 5。エージェントのないクライアントが見えなくなる。 |
-| アドレスで突き合ったサーバのエッジを変換から外す | 同じクライアントが直接と VIP 越しの両方でつなぐと、VIP 越しの依存が消える。 |
-| 変換を通した行の `port` を仮想ポートにする | 「5432 番の postgres を誰が使うか」にサーバのポートで答えられなくなる。代わりに Prometheus のクライアント側の `server.port` もバックエンドのポートにして揃える。 |
-| 変換の表をユーザが PostgreSQL に直接書く | `shawk` の表は内部のもので、移行で形が変わりうる。設定に書けない変換は第 2 段階で学ぶ。必要になれば、設定の外から書ける表を後で足す。 |
-| `dependencies` ビューを `dependencies_between('-infinity', 'infinity')` で定義する | 定義は 1 か所になるが、関数の返す型を変える移行のたびに、ビューとそれに依存するビューをすべて作り直すことになる。今までどおり 2 か所に書き、テストで両者が同じ行を返すことを確かめる。 |
+| Virtual addresses as ranges | The server side looks the client edge up by client, virtual address and port, so it needs the virtual address itself; and the addresses of a range, such as ClusterIPs, have different backends each. |
+| The union of the two periods for a matched row | A former backend would look current (§3.2, 4). |
+| Dropping the own row of a server edge from a source once matched | The clients without an agent behind the relay would disappear (§3.2, 6). |
+| Precedence of a match by address per edge | It depends on the period asked for, and a relay replaced by one without an agent hides the current dependency (§10). |
+| The virtual port as the `port` of a matched row | *Who uses postgres on 5432* would not be answered by the port of the server; the client side in Prometheus takes the port of the backend instead. |
+| Users writing `shawk.translations` themselves | The tables of `shawk` are internal and may change in a migration; what cannot be written down is learned in phase 2. A table writable from outside the configuration can come later. |
+| `dependencies` defined as `dependencies_between('-infinity', 'infinity')` | One definition, but every migration that changes the result of the function would have to drop and create the view and those on it. The two are kept apart, and tests check that they return the same rows. |
 
-## 5. 互換性と移行
+## 6. Compatibility, migration and documents
 
-- **移行 12：** 表 `shawk.translations` を足し、`dependencies_between` を作り直し、`dependencies` に列を足す。表が増えるので `grants.sql` を流し直す。
-- **上げる順：** エージェントは変わらない。前の版のコネクタは表を書かないので、変換がない間の突き合わせは前と同じ。コネクタが前の版のスキーマに書く表は変えていない。
-- **契約：** `dependencies` と `dependencies_between` の末尾に 3 列。変換を設定すると、片側の行が `both` の行になる（SNAT のサーバ側の行は残る）。
-- **複数のコネクタ：** 変換は `peer_cidrs` と同じく、最後に書いたコネクタの設定になる。すべてのコネクタに同じ変換を書く。
+- **Migration 12:** the table `shawk.translations`; `dependencies_between`
+  dropped and created again; `dependencies` with three columns more. Run
+  `grants.sql` again. A view or a `BEGIN ATOMIC` function of a user that
+  depends on `dependencies_between` must be dropped before and created
+  after.
+- **Order of upgrades:** the agent does not change. A connector of the
+  previous version writes no translations, so the views match as before;
+  the tables it writes are unchanged.
+- **Contract:** three columns more at the end of `dependencies` and
+  `dependencies_between`. With translations, one-sided rows become `both`
+  rows, and observations may be NULL on the rows of translations.
+- **Documents:** `docs/design.md` §5.2 (names of peers), §5.4 (new), §6.1,
+  §6.2, §7, §10; README; CHANGELOG; the commented example in
+  `packaging/collector/config.yaml`.
 
-## 6. テスト
+## 7. Tests
 
-- **コネクタ：** `translate_test.go`（設定の解析と検証、YAML からの読み込み、パッケージの設定例、クライアント側とサーバ側の名前、ポートの置き換え、範囲のキャッシュ、仮想アドレスにサービスがあるときの優先、集約するエージェントとの組み合わせ、バックエンドの選び方）。
-- **PostgreSQL：** `translate_pg_test.go`（DNAT と SNAT、ポートの変換、期間が重ならないバックエンドとクライアント、退役したバックエンド、結んだ行が覆わない期間の行、サービス単位のビューと `known_dependencies`、ビューと関数の一致、変換の差し替え、同時の書き込み、優先、共有アドレスのスコープ、LVS の DR）。条件を 1 つずつ外すと失敗することを確かめた。
-- **e2e：** `test/e2e/run.sh` で、app の名前空間の iptables が仮想アドレスを db の別のポートに変換する（kube-proxy がクライアントのホストで Service を変換するのと同じ）。この環境のカーネルには IPv6 がないので、IPv6 の部分を外した写しで通ることを確かめた。
-- **性能：** 合成データで測った（§9）。
+- **Connector:** `translate_test.go`: parsing and checks, the YAML of the
+  collector and the packaged example, the names of both sides, the port of
+  the backend, the range cache, the precedence of a relay with an agent and
+  of a listener on an unspecified address, folding agents and their
+  warnings, the choice among backends, the server side behind a relay that
+  an agent holds.
+- **PostgreSQL:** `translate_pg_test.go`: DNAT and SNAT, port
+  translation, periods that do not overlap, former backends, the own rows
+  of matched edges and their periods, services, map and
+  `known_dependencies`, the view against the function, a changed
+  configuration, concurrent writes (also under REPEATABLE READ), the
+  precedence of a match by address over periods, shared addresses, LVS
+  direct routing, stopped agents and disappearing dependencies, failovers,
+  edges with their times out of order. Each condition was removed in turn
+  to check that a test fails.
+- **e2e:** `test/e2e/run.sh`: iptables in the namespace of app translates a
+  virtual address to another port of db, as kube-proxy does for a Service
+  on the host of its client.
+- **Performance** (a million synthetic edges, PostgreSQL 16, `work_mem`
+  4 MB, no JIT): without translations, the view and the function take the
+  time of their previous definitions within noise (all history 3.3 s; 6
+  hours 0.39–0.47 s). With 20 translations, a thousand clients each and
+  100,000 matched pairs, 6 hours take 1.3–1.5 s; what is added grows with
+  the pairs. Matching by address keeps its FULL JOIN, and the edges near
+  translations are read through the indexes of edges (`edges_client`,
+  `edges_server`; a range of backends by its bounds, `>=` and the
+  broadcast address with the mask of a host). A first version that joined
+  the pairs back with all edges was twice as slow without translations,
+  and with misestimated CTEs chose nested loops that did not finish in
+  10 minutes.
 
-## 7. 段階
+## 8. Phases
 
-1. **第 1 段階（このブランチ）：** §3.1〜§3.4、文書、CHANGELOG。
-2. **第 2 段階：** §3.5。カーネルとエージェントの変更で、VM テストが要る。
-3. **第 3 段階：** §3.6。第 2 段階の経路を使う。
+1. **Phase 1 (this branch):** §3.1–§3.4, documents, CHANGELOG.
+2. **Phase 2:** §3.5; kernel and agent, tested in the virtual machines.
+3. **Phase 3:** §3.6, by the path of phase 2.
 
-## 8. 決めてほしいこと
+## 9. Decisions
 
-1. 第 1 段階だけで最初の PR にしてよいか。勧めるのは、よい（第 2、第 3 段階は BPF とエージェントの変更で、別に検証が要る）。
-2. SNAT のサーバのエッジを、結んだ行のほかに自分の行として残すか。勧めるのは残す（実装済み）。
-3. 変換を通した行の `port` と、Prometheus のクライアント側の `server.port` をバックエンドのポートにするか。勧めるのは、する（実装済み）。
-4. 第 2 段階で conntrack を既定で追うか（例えば `-learn-translations`）。勧めるのは既定で有効（NAT しないホストでは何も記録しない）。
+1. Phase 1 alone makes the first pull request. Recommended: yes (phases 2
+   and 3 change BPF and the agent, and need their own verification).
+2. A server edge from a source keeps a row of its own besides its matched
+   rows. Recommended: yes (implemented).
+3. The `port` of a matched row, and the `server.port` of the client side
+   in Prometheus, are those of the backend. Recommended: yes (implemented).
+4. Whether phase 2 traces conntrack by default (e.g. `-learn-translations`).
+   Recommended: yes; hosts that do not translate record nothing.
 
-## 9. 実装で決めたこと
+Open: 1 and 4.
 
-- **突き合わせの形：** アドレスでの突き合わせは前と同じ FULL JOIN のまま残し、変換を通した組だけを別に作って足す。変換に関わるエッジは `shawk.edges` の索引（`edges_client`、`edges_server`）で引く。範囲のバックエンドは索引の範囲（`>=` と、ホストのマスクにしたブロードキャストアドレスの `<=`）で引く。期間と送信元とポートの条件は、組を作る前にサーバのエッジに当てる。
-- **性能（100 万エッジ、PostgreSQL 16、`work_mem` 4 MB、JIT なし）：** 変換がないとき、全列を返す時間は前の定義と誤差の範囲で同じ（全期間 4.0〜4.6 秒、6 時間 0.45〜0.54 秒）。20 の変換に 1000 のクライアントがつなぎ、10 万の組ができる重い場合で、6 時間の `dependencies_between` が 1.3 秒（前の定義は 0.46 秒で、7 万の片側の行を返していた）。増える分は変換を通した組の数に比例する。最初の形（組をクライアントとサーバのエッジに結び直す）は変換がなくても 2 倍遅く、CTE の行数の見積もりが外れて入れ子ループを選ぶと 10 分で終わらなかったので、作り直した。
-- **コネクタ：** 範囲のバックエンドのキャッシュは読み込みと期限切れのたびに捨てる（書き込み間隔ごと）。学んだばかりのエンドポイントは次の書き込み間隔から名前に使う。候補が並んだときは、サービス名、ポートの順で決める。
-- **変換の書き込み：** `peer_cidrs` と同じ時（起動時と、失敗したら次の書き込み間隔）に書く。どちらかが失敗したら両方を書き直す。どちらの書き込みもトランザクションの勧告ロックで順に行う。ロックがないと、違う設定を同時に書いた 2 つのコネクタの行が混ざる（DNAT の変換に別のコネクタの送信元が加わって SNAT になる）。`peer_cidrs` の書き込みにも同じ問題があったので直した。
-- **敵対的レビューで直したこと：** (1) 変換で結んだエッジが、結んだ行の期間の外でも自分の行を失っていた。期間を指定すると、余裕の 15 分の中で結ばれて指定の外にある行のせいで、エッジがどこにも出なくなった（§3.2 の 5）。(2) `-fold-external=all` のクライアントのエージェントがバックエンドのアドレスを集約すると、変換で名付けたサーバ側の系列が `shawk_peer_agent="false"` になり、両側で数えられた。(3) 同時の書き込み（上）。(4) 並んだ候補の中で、エージェントの有無が map の順で決まっていた。(5) ポートの違うバックエンドの間で、クライアント側の `server.port` が報告のたびに変わった。(6) 変換を通した接続では、バックエンドのエージェントがクライアントを集約しても警告が出なかった。LVS の DR ではバックエンドが仮想アドレスを持つので、仮想アドレスをバックエンドに書く（`docs/design.md` §5.4、テストあり）。
-- **2 回目の敵対的レビューで直したこと：** (1) 変換で結んだ行は、片側のエッジが止まった時点で終わるのに両側の観測時刻を持つので、片側のエージェントが止まると、もう一方が観測を続けているかぎり「消えた依存」の警報になった。行より長く続くエッジの側の観測時刻は NULL にする（その側は行の終わりについて何も言えない）。(2) アドレスでの一致を優先する規則がエッジ単位で、期間を指定すると窓の中のサーバのエッジで決まったので、窓の幅で今の依存が消えた。アドレスで一致するサーバのエッジの期間だけ変換を外し、その行はそのサーバのエッジの期間にする。コネクタも、仮想アドレスで最近ソケットで観測したサービスだけを優先する（未指定アドレスのリスナや何日も前のサーバのエッジでは変換を外さない。docker-proxy のリスナがあっても DNAT されるとき、PostgreSQL と名前が揃う）。(3) 送信元のある変換で、中継の送信元のアドレスをエージェントのあるホストが持つと（IPVS の director、SNAT する Kubernetes のノード）、サーバ側が `shawk_peer_agent="true"` になり、エージェントのないクライアントの接続がどこでも数えられなかった。(4) 結んだ行が覆わない部分が一瞬でもあると、エッジの全期間の行が出て、片側の依存が今も続いているように見えた。自分の行はエッジの始まりから、残った最後の部分の終わりまでにする（始まりをエッジの始まりにするのは、エージェントが止まった側の相手が新しい依存に見えないため）。(5) は (2) と同じ。(6) first_seen が last_seen より後のエッジでビューが失敗した。(7) `-fold-external=all` のクライアントのエージェントが仮想アドレスを集約するとき、警告がバックエンドのアドレスを足すよう勧めていた。仮想アドレスを示す。疑いとして挙がったもののうち、設定の書き込みは READ COMMITTED で行い（既定が REPEATABLE READ のデータベースでは失敗していた）、`peer_cidrs` と変換を 1 つのトランザクションで書く。送信元のある変換の行数（クライアント数 × バックエンド数）は §10 に書いた。
+## 10. Adversarial reviews and responses
+
+**First review (2026-11-02).**
+
+1. A matched edge lost its own row also over the time its matched rows do
+   not cover, and in a period, a match within the margin of 15 minutes but
+   outside the period hid the edge entirely. Fixed: own rows (§3.2, 6).
+2. A server edge named through a translation was counted on both sides
+   when the agent of the client folds the address of the backend
+   (`-fold-external=all`). Fixed (§3.3).
+3. Two connectors writing different translations at once left a mix, so
+   that a DNAT translation got the sources of another and became SNAT;
+   `peer_cidrs` had the same flaw. Fixed: advisory lock.
+4. `shawk.peer.agent` of a client edge depended on the order of maps among
+   tied backends. Fixed: ties by host.
+5. The `server.port` of the client side moved with every report between
+   backends on different ports. Fixed: choice among current backends.
+6. No warning when the agent of a backend folds a client reached through a
+   translation. Fixed.
+7. LVS direct routing needs the virtual address as the backend; documented
+   and tested.
+
+**Second review (2026-11-03).**
+
+1. A matched row ends with the edge of one side but carried the
+   observation of both, so that a stopped agent raised a *disappeared*
+   alert. Fixed: NULL observations (§3.2, 7).
+2. The precedence of a match by address was decided per edge, and in a
+   period by the server edges in it, so that widening the period dropped a
+   current dependency; the connector gave precedence to any endpoint at the
+   virtual address. Fixed: per period (§3.2, 3), and only a service
+   observed on a socket recently in the connector (§3.3).
+3. Behind sources, the server side had `shawk.peer.agent` true when an
+   agent holds the address of the relay, so that the connections of
+   clients without an agent were counted nowhere. Fixed (§3.3).
+4. The own row of a matched edge spanned the whole edge for any gap, so
+   that a failover made a one-sided dependency look current. Fixed: it ends
+   with the last part left.
+5. The connector named a client edge after docker-proxy, listening on
+   every address of the host, while PostgreSQL matched it through the
+   translation. Fixed with 2.
+6. The view failed on an edge with `first_seen` after `last_seen`. Fixed.
+7. The warning about an agent that folds the virtual address named the
+   backend. Fixed.
+
+Also from the second review: the configuration is written in READ
+COMMITTED (under a database default of REPEATABLE READ the write failed)
+and in one transaction with `peer_cidrs`; the number of rows behind sources
+is documented (§4). Left as they are: the range cache may be one write
+interval old, and an agent whose clock is ahead anchors the window of the
+choice among backends, as it does for the other names.
