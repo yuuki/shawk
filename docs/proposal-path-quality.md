@@ -1,11 +1,12 @@
 # Passive path quality: design proposal
 
-Status: proposal (2026-11-02), not implemented; no issue yet. The
-decisions of §9 are made. It answers
+Status: phase 1 (§3.1–§3.3) implemented (2026-11-03); phases 2 and 3
+proposed; no issue yet. The decisions of §9 are made. It answers
 whether shawk should do what Pingmesh [1] does: not its active probing,
 but its measurements, taken on the connections that hosts open anyway.
-It was revised after an adversarial review (§10). The sections of
-`docs/design.md` that would change are listed in §6.
+It was revised after an adversarial review (§10); what the implementation
+of phase 1 changed or left out is in §11. The sections of
+`docs/design.md` that change are listed in §6.
 
 ## 1. Problem
 
@@ -685,6 +686,27 @@ evidence.
 | Series arithmetic: a histogram without buckets still has `_bucket{le="+Inf"}`, so buckets add 10 series, not 12 | valid | Corrected; §6 notes the same omission in §5.3 of the design. |
 | Zones: IPv4-mapped prefixes would never match; duplicates and empty names; a zone holding the whole network | valid | §3.4 (parsing, folded peers). |
 | Missing pieces: §4.2, §4.3 and §5.3 of the design, OTLP names, where the alerts live, `_OTHER`, `shawk flows -json`, the collector example | valid | Added to §3, §6 and §7. |
+
+## 11. Implementation of phase 1 (2026-11-03)
+
+Phase 1 follows §3.1–§3.3, with the differences below. They come from a
+review of this proposal against the code before the implementation, and
+from the implementation itself.
+
+| finding | response |
+|---|---|
+| `count_conn()` also counts passive opens (`on_passive_open()`, and their recount), whose `retrans_base` holds the SYN-ACKs they retransmitted (phase 3) | `SS_HANDSHAKE` is set at SYN_SENT→ESTABLISHED only; `count_conn()` adds the SYN retransmissions and the duration only with it. |
+| The active opens without a duration (`TCP_REPAIR`, `TCP_FASTOPEN_CONNECT`) still count their SYN retransmissions, so one flag cannot tell both | A second flag, `SS_HS_TIME`, marks the duration pending. They count in `conns`, not in the buckets, so the number of handshakes is that of the durations. |
+| At SYN_SENT→ESTABLISHED, a connect with `TCP_FASTOPEN_CONNECT` that was deferred to its first write cannot be told from one that sent its SYN at once, without a cookie (`inet->defer_connect` is a bitfield before 6.6 and a flag after) | Every connect with the option has no duration, as §3.1 says of the deferred ones. |
+| A simultaneous open (SYN_SENT→SYN_RECV→ESTABLISHED) has no handshake (§3.1), but the proposal does not say what its failure is | Reasons are decided at SYN_SENT→CLOSE only; a failed simultaneous open is `_OTHER`. |
+| The stale `ECONNRESET` of `connect(AF_UNSPEC)` survives only until `tcp_connect_init()` clears `sk_err` when it builds a SYN | Nothing beyond the order of §3.1 (no segment sent first) is needed; a test closes a socket after `connect(AF_UNSPEC)` and a new connect, which is `aborted`. |
+| A duration truncated to microseconds would put 100.4 µs in the bucket of 100 µs | It is rounded up, so that the bounds hold as inclusive upper bounds. |
+| The tests of §7 need `ip`, `tc` and `nft`, which the virtual machines of `test/vm` do not have (their initramfs holds the test binary alone) | The tests run on loopback in network namespaces: a listener with a full accept queue drops SYNs, and raw sockets read a SYN and answer it with an ICMP error (port unreachable, host and network unreachable, host unknown, administratively prohibited), as a router or a firewall would. Not tested: ARP without an answer, netem, ICMPv6 (`EACCES`) and `ss -K`. |
+| The timer of a retransmission may expire up to a tick before 1 s, and a failed blocking connect clears `total_retrans` (`tcp_disconnect()` in `inet_stream_connect()`) | The test of a lost SYN accepts 0.9 s; the tests read `TCP_INFO` after non-blocking connects. |
+| The connector needs the buckets of its inputs for phase 2 only | Phase 1 keeps them in the input state, checks the bounds and resets histograms as a whole; outputs have no buckets until the family of sites. |
+| The new series of a reason emits 0 first (§3.3), but the proposal does not say when a reason whose first value is a baseline (after a restart of the connector) creates its series | At its first increase, like a new reason: a baseline creates none. |
+| "SYN retransmissions per attempt" (§3.5) has no denominator | The handshakes with a duration plus the failures, both of the client side; `shawk:dependency_connections:rate5m` also counts the server side of clients without an agent, which has no SYN retransmissions. |
+| The claims of sizes (storage 104→112 bytes, flow statistics 56→136 bytes, 2.6 MB for the two maps), of the `.rodata` zero value and of the fields on 5.14 | Confirmed: `make compat` passes against Rocky Linux 9, and every program loads on Linux 6.18. |
 
 ## References
 
