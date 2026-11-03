@@ -172,17 +172,16 @@ func ResourceAttributes(s string) map[string]string {
 //
 //  1. OTEL_SERVICE_NAME in the environment of the process,
 //  2. service.name in OTEL_RESOURCE_ATTRIBUTES,
-//  3. the workload of the pod of Kubernetes of the process
-//     (Container.Workload),
+//  3. the service of the pod of Kubernetes of the process, from its
+//     annotations, its labels, then its owner (Container.Workload),
 //  4. the base name of the executable, or the unit with FallbackUnit,
 //  5. comm,
 //  6. the unit, then UnknownService, for sockets whose owner is unknown.
 //
 // service.namespace in OTEL_RESOURCE_ATTRIBUTES gives the namespace, else
-// the namespace of the pod. The order follows OBI, so that both name a
-// service the same way: OBI names the processes of a pod after the
-// workload and namespace of the pod, and those of other containers after
-// their executable. Containers apart from Kubernetes are told apart by
+// the namespace of the service of the pod. The order follows OBI, so that
+// both name a service the same way: OBI names the processes of a pod from
+// its metadata, and those of other containers after their executable. Containers apart from Kubernetes are told apart by
 // their unit, or named after it with FallbackUnit.
 func ServiceName(env map[string]string, exe, comm, unit string, workload Service, fb Fallback) Service {
 	var s Service
