@@ -345,19 +345,17 @@ type fakeStore struct {
 	prunes   int
 	err      error
 	migrated int
-	version  int // of the schema; SchemaVersion() if zero
-	cidrs    []namedPrefix
-	trans    []translation
-	refresh  int
+	// behind is how many versions the schema is behind the connector.
+	behind  int
+	cidrs   []namedPrefix
+	trans   []translation
+	refresh int
 }
 
 func (s *fakeStore) schemaVersion(context.Context) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.version == 0 {
-		return SchemaVersion(), nil
-	}
-	return s.version, nil
+	return SchemaVersion() - s.behind, nil
 }
 
 func (s *fakeStore) syncConfig(_ context.Context, cidrs []namedPrefix, ts []translation) error {

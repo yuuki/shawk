@@ -187,7 +187,7 @@ func TestPGPruneWaitsForMigration(t *testing.T) {
 	}
 	h := newHostChanges("h")
 	h.setHost("m", "h", "k", "v", time.Now())
-	err = pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error { return writeHost(ctx, tx, h, true) })
+	err = pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error { return writeHost(ctx, tx, h) })
 	if !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
 		t.Errorf("write during a migration: %v", err)
 	}

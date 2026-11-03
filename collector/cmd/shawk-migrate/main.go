@@ -21,7 +21,7 @@ func main() {
 		dsn     = flag.String("dsn", os.Getenv("SHAWK_POSTGRES_DSN"), "PostgreSQL connection string (default $SHAWK_POSTGRES_DSN)")
 		dsnFile = flag.String("dsn-file", "", "file that holds the connection string")
 		list    = flag.Bool("list", false, "print the bundled migrations and exit")
-		print   = flag.String("print", "", "print the SQL of a bundled migration, e.g. 0001_init.sql, and exit")
+		print   = flag.String("print", "", "print the SQL of a bundled migration, e.g. 0001_schema.sql, and exit")
 		timeout = flag.Duration("timeout", time.Minute, "timeout")
 	)
 	flag.Parse()

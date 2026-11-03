@@ -289,7 +289,7 @@ func TestUnknownListenerNotLearned(t *testing.T) {
 func TestSchemaVersionChecked(t *testing.T) {
 	cfg := createDefaultConfig()
 	cfg.Postgres.DSN = "postgres://unused"
-	st := &fakeStore{version: SchemaVersion() - 1}
+	st := &fakeStore{behind: 1}
 	c, err := newConnector(connectortest.NewNopSettings(Type), cfg, new(consumertest.MetricsSink))
 	if err != nil {
 		t.Fatal(err)
@@ -303,7 +303,7 @@ func TestSchemaVersionChecked(t *testing.T) {
 		t.Error("writes proceed on an older schema")
 	}
 	st.mu.Lock()
-	st.version = SchemaVersion()
+	st.behind = 0
 	st.mu.Unlock()
 	if !c.prepare(context.Background()) {
 		t.Error("writes wait on a current schema")

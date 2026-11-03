@@ -107,9 +107,6 @@ func (c *shawkConnector) Start(ctx context.Context, _ component.Host) error {
 	if err != nil {
 		return err
 	}
-	if ps, ok := st.(*pgStore); ok {
-		ps.warn = func(msg string) { c.log.Warn(msg) }
-	}
 	c.store = st
 
 	loopCtx, cancel := context.WithCancel(context.Background())

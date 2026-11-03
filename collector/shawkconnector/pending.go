@@ -63,8 +63,8 @@ type sessionRow struct {
 	// steps, so that the drops of a run are compared with those of the same
 	// run; zero if unknown.
 	countersStarted time.Time
-	// peerFold and peerInternal are what the agent folds and the ranges it
-	// keeps exact; peerFold is empty if unknown.
+	// peerFold and peerInternal are what the agent folds (foldNone, foldIn
+	// or foldAll) and the ranges it keeps exact, nil if it does not tell.
 	peerFold     string
 	peerInternal []netip.Prefix
 }

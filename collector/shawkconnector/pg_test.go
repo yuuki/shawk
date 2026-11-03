@@ -59,7 +59,7 @@ func TestPGMigrate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(applied) == 0 || applied[0] != "0001_init.sql" {
+	if len(applied) == 0 || applied[0] != "0001_schema.sql" {
 		t.Errorf("applied = %v", applied)
 	}
 	applied, err = Migrate(ctx, conn)
@@ -70,6 +70,23 @@ func TestPGMigrate(t *testing.T) {
 	conn.QueryRow(ctx, `SELECT max(version) FROM shawk.schema_migrations`).Scan(&v)
 	if v != SchemaVersion() {
 		t.Errorf("schema version %d, want %d", v, SchemaVersion())
+	}
+}
+
+// TestPGMigrateDevelopmentSchema: a database whose history of migrations
+// is not that of the bundled migrations, as one created before they were
+// consolidated, is refused rather than taken as up to date.
+func TestPGMigrateDevelopmentSchema(t *testing.T) {
+	_, conn := testDB(t)
+	ctx := context.Background()
+	if _, err := conn.Exec(ctx, `CREATE SCHEMA shawk;
+CREATE TABLE shawk.schema_migrations (version integer PRIMARY KEY, name text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now());
+INSERT INTO shawk.schema_migrations (version, name) VALUES (1, '0001_init.sql'), (2, '0002_client_endpoints.sql')`); err != nil {
+		t.Fatal(err)
+	}
+	applied, err := Migrate(ctx, conn)
+	if err == nil || !strings.Contains(err.Error(), "drop the schemas shawk and shawk_v1") {
+		t.Errorf("Migrate = %v, %v; want an error that tells to recreate the schema", applied, err)
 	}
 }
 
