@@ -1,161 +1,105 @@
 # Packaging examples
 
-Examples of how to deploy shawk and use its two contracts: the PostgreSQL
-views of the schema `shawk_v1` and the metrics in Prometheus. They are
-tested (`make test`) but meant to be adapted.
+Example deployment of shawk. The files are tested (`make test`) but meant
+to be adapted. Their comments explain each setting; this page gives the
+order of the steps and what the files leave out.
 
-| Path | What |
+| path | what |
 |---|---|
-| `systemd/shawk-agent.service`, `systemd/agent.env` | The agent on every host, as root with only the capabilities it needs and sandboxed; options in `/etc/shawk/agent.env`. |
-| `systemd/shawk-collector.service`, `systemd/collector.env` | The collector built with `make collector`, as the user `shawk-collector`, sandboxed; secrets in `/etc/shawk/collector.env`. |
-| `collector/config.yaml` | Collector configuration: the `otlp/shawk` receiver for agents, the shawk connector, Prometheus and OBI pipelines. |
-| `postgres/setup.sql`, `postgres/grants.sql` | Roles (`shawk_owner`, `shawk_connector`, `shawk_grafana`), database and privileges. |
-| `prometheus/prometheus.yml` | Settings Prometheus needs for the OTLP push of the collector. |
-| `prometheus/web.yml` | Web configuration of Prometheus: TLS, and users with passwords, so that only its clients can push. |
-| `prometheus/shawk-rules.yml` | Recording rules that count each dependency once (connections, failures and their reasons, bytes, RTT, time to connect, retransmissions), and alerts. |
-| `grafana/provisioning/` | Data sources (uids `shawk-postgres`, `shawk-prometheus`), the dashboard provider and SQL alert rules. |
-| `grafana/dashboards/` | Dashboards: fleet, dependency map, dependency details, changes, application layer (OBI). |
+| `systemd/` | units of the agent and the collector, and their environment files |
+| `collector/config.yaml` | the collector: `otlp/shawk` for agents, `otlp` for OBI, the shawk connector, exporters to Prometheus and a trace store |
+| `postgres/` | roles (`shawk_owner`, `shawk_connector`, `shawk_grafana`), database and privileges |
+| `prometheus/` | settings for the OTLP push, TLS and users (`web.yml`), recording rules and alerts (`shawk-rules.yml`) |
+| `grafana/` | data sources (uids `shawk-postgres`, `shawk-prometheus`), dashboards and alert rules |
 
-Setting up PostgreSQL:
+## PostgreSQL
 
 ```sh
-psql -v ON_ERROR_STOP=1 -f packaging/postgres/setup.sql                        # as a superuser; asks for the passwords
-shawk-migrate -dsn 'postgres://shawk_owner:...@db/shawk?sslmode=verify-full'   # make shawk-migrate
+psql -v ON_ERROR_STOP=1 -f packaging/postgres/setup.sql                        # as a superuser, in a terminal
+shawk-migrate -dsn 'postgres://shawk_owner:...@db/shawk?sslmode=verify-full'
 psql -v ON_ERROR_STOP=1 -d shawk -U shawk_owner -f packaging/postgres/grants.sql
 ```
 
-`setup.sql` creates the roles without passwords; then psql asks for the
-password of each role, twice, and sends it hashed, so that it is in neither
-the script, the command line nor the server log. Run it in a terminal. A
-role without a password cannot log in with one: if psql stops at a password
-that did not match, set the passwords left in psql, e.g.
-`\password shawk_grafana`.
+`setup.sql` asks for the password of each role. Run `shawk-migrate` and
+`grants.sql` again whenever an upgrade brings new migrations.
 
-`grants.sql` runs after `shawk-migrate`, and again after an upgrade that
-brings new migrations; it also sets default privileges for the tables that
-later migrations create. `shawk-migrate` and the connector refuse a
-database with the schema of v0.8.0 or of a development build before
-`0001_schema.sql`. Dropping the schemas `shawk` and `shawk_v1` (`DROP
-SCHEMA shawk, shawk_v1 CASCADE`, which also drops views of your own on
-them) deletes the history they hold, so back them up first if you need it
-(`pg_dump -n shawk -n shawk_v1`); then migrate and run `grants.sql` again.
+Use `sslmode=verify-full` in every connection string: with
+`sslmode=require` any certificate is accepted, so whoever can intercept the
+connection gets the password.
 
-`setup.sql` gives the sessions of `shawk_grafana` read-only transactions
-and a statement timeout of 30 seconds. These are defaults, not limits: a
-session can lift them (`SET statement_timeout = 0`, `BEGIN READ WRITE`),
-and anyone who can view the dashboards can send SQL of their own through
-the data source. What holds are the privileges: `shawk_grafana` reads
-`shawk_v1` only, and neither it nor `shawk_connector` may create objects
-of their own in the database: `setup.sql` revokes from `PUBLIC` the
-creation of tables and functions in the schema `public` (which PostgreSQL
-14 grants it) and of large objects, and `grants.sql` that of temporary
-tables.
-
-A session can still run a long query. To bound what Grafana uses, set
-limits that its sessions cannot change, as a superuser, for example:
+The read-only transactions and statement timeout that `setup.sql` sets for
+`shawk_grafana` can be lifted by the session, and anyone who can view the
+dashboards can send SQL through the data source. To bound what Grafana
+uses, set limits as a superuser, and cancel long queries periodically as a
+member of `pg_signal_backend`:
 
 ```sql
--- No fewer than the maxOpenConns of the data source times the Grafana servers.
-ALTER ROLE shawk_grafana CONNECTION LIMIT 10;
--- Temporary files of a sort or a hash per session; only a superuser can change it.
+ALTER ROLE shawk_grafana CONNECTION LIMIT 10;   -- at least maxOpenConns × Grafana servers
 ALTER ROLE shawk_grafana SET temp_file_limit = '1GB';
-```
 
-and cancel the queries that run longer than the timeout would allow, e.g.
-every minute as a member of `pg_signal_backend`:
-
-```sql
 SELECT pg_cancel_backend(pid) FROM pg_stat_activity
 WHERE usename = 'shawk_grafana' AND state = 'active' AND now() - query_start > interval '1 minute';
 ```
 
-Prometheus must run with `--web.enable-otlp-receiver`, and with the web
-configuration of `prometheus/web.yml` (`--web.config.file`). The OTLP
-receiver writes whatever series it is sent: without that configuration,
-anyone who can reach Prometheus can push `shawk_agent_up` or any other
-series, bypassing the client certificates the collector requires, and
-silence the alerts on agents. `web.yml` serves every endpoint of
-Prometheus over TLS, to the users of `basic_auth_users` only; replace the
-placeholders with bcrypt hashes of their passwords
-(`htpasswd -nBC 12 '' | tr -d ':\n'`), or Prometheus refuses to start.
-Prometheus does not tell readers from writers, so every user can also
-push: give each client its own user.
+A database created by v0.8.0 or a development build before
+`0001_schema.sql` is refused. Back it up if you need its history
+(`pg_dump -n shawk -n shawk_v1`), drop it (`DROP SCHEMA shawk, shawk_v1
+CASCADE`, which also drops your own views on them), then migrate and run
+`grants.sql` again.
 
-* The collector verifies Prometheus with
-  `/etc/shawk/tls/prometheus-ca.crt` and sends the header `Authorization`
-  from the variable `SHAWK_PROMETHEUS_AUTHORIZATION` (`otlp_http/prometheus`
-  in `collector/config.yaml`). The unit reads it from
-  `/etc/shawk/collector.env`, which the packages install readable by root
-  only; the container image takes it with `docker run --env-file`. Its
-  value is `Basic` and the base64 of the user and password:
+## Prometheus
 
-  ```sh
-  printf 'Basic %s\n' "$(printf '%s' 'shawk-collector:PASSWORD' | base64 -w0)"
-  ```
+Run Prometheus with `--web.enable-otlp-receiver` and
+`--web.config.file=web.yml`. Without `web.yml`, anyone who can reach
+Prometheus can push series, including `shawk_agent_up`, and silence the
+agent alerts. Replace the placeholders in `web.yml` with bcrypt hashes and
+give each client its own user.
 
-  Without it, Prometheus refuses the metrics and the collector logs the
-  error (HTTP status 401).
-* Grafana logs in as `grafana`, with the password in
-  `$SHAWK_GRAFANA_PROMETHEUS_PASSWORD`, and verifies Prometheus with
-  `/etc/grafana/tls/prometheus-ca.crt` (`grafana/provisioning/datasources/shawk.yaml`).
-* People, and Prometheus itself if it scrapes itself (`basic_auth` and
-  `tls_config` in the scrape configuration), log in as users of their own.
+## Collector
 
-Prometheus can require client certificates instead of passwords
-(`client_auth_type` and `client_ca_file` in `web.yml`), but then of every
-client, Grafana and browsers included; the collector presents its own with
-`tls.cert_file` and `tls.key_file` instead of the header. To let only the
-collector push, put a proxy in front of Prometheus that passes
-`/api/v1/otlp/` from the collector alone.
-
-The trace exporter `otlp_grpc/traces` verifies the trace store with
-`/etc/shawk/tls/tempo-ca.crt` and presents the client certificate
-`/etc/shawk/tls/collector-client.crt`, which the store should require (in
-Tempo, `tls.client_ca_file` of the `otlp` receiver of the distributor).
-
-The release packages `shawk-collector` install the collector as the
-systemd service `shawk-collector` running as the user `shawk-collector`,
-with its configuration in `/etc/shawk/collector.yaml`. Write the connection
-string of the role `shawk_connector` to `/etc/shawk/postgres-dsn`, readable
-by that user only:
+The `shawk-collector` packages install `/etc/shawk/collector.yaml` and run
+the collector as the user `shawk-collector`. Write the connection string of
+`shawk_connector` to a file only that user can read:
 
 ```sh
 sudo install -m 0640 -g shawk-collector /dev/stdin /etc/shawk/postgres-dsn <<<'postgres://shawk_connector:...@db/shawk?sslmode=verify-full&sslrootcert=/etc/shawk/tls/postgres-ca.crt'
 ```
 
-With `sslmode=verify-full`, the connector and `shawk-migrate` check that the
-certificate of PostgreSQL is signed by the CA in the file that `sslrootcert`
-names (without `sslrootcert`, by a CA of the system) and names the host of
-the connection string. With `sslmode=require` they accept any certificate,
-so whoever can intercept the connection can pose as the server and be sent
-the password. The Grafana data source names its CA with `sslRootCertFile`.
+Set `SHAWK_PROMETHEUS_AUTHORIZATION` in `/etc/shawk/collector.env` (the
+container image takes it with `docker run --env-file`).
 
-Both receivers of the example configuration require TLS with client
-certificates, each from its own CA: `otlp/shawk` accepts those of
-`agents-ca.crt`, `otlp` those of `obi-ca.crt`. Issue the certificates of
-OBI from another CA than those of the agents: OBI often runs on hosts or in
-containers trusted less than the agents, and with a certificate of their CA
-it could send to `otlp/shawk` as an agent. The collector does not start
-without `obi-ca.crt`; one that receives no OBI can leave out the receiver
-`otlp` and the pipelines `metrics/obi` and `traces/obi` instead. The
-certificate and key of the collector and the two CAs in `/etc/shawk/tls/`
-must be readable by the user of the collector (`shawk-collector`; uid
-65532 in the container image), e.g. the key with mode 0640 and group
-`shawk-collector`. Agents present theirs with `-otlp-cert-file` and
-`-otlp-key-file` (`systemd/agent.env`); OBI with the variables of the
-OpenTelemetry SDK:
+TLS files in `/etc/shawk/tls/`, readable by `shawk-collector` (uid 65532 in
+the image):
+
+- `collector.crt` and `collector.key`, the server certificate of both
+  receivers, and `collector-client.crt` and `collector-client.key`, which
+  the trace store should require;
+- `agents-ca.crt`, which issues the agents' client certificates. Each
+  certificate must name its host as `hostname` prints it;
+- `obi-ca.crt`, a different CA, for OBI. The collector does not start
+  without it; if you do not use OBI, remove the receiver `otlp` and the
+  pipelines `metrics/obi` and `traces/obi` instead;
+- `prometheus-ca.crt`, `tempo-ca.crt` and `postgres-ca.crt`, which verify
+  the servers the collector writes to.
+
+OBI sends with the variables of the OpenTelemetry SDK:
 
 ```sh
-# /etc/obi/app.env
 OTEL_EXPORTER_OTLP_ENDPOINT=https://collector.example:4318
 OTEL_EXPORTER_OTLP_CERTIFICATE=/etc/obi/tls/collector-ca.crt
 OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE=/etc/obi/tls/obi.crt
 OTEL_EXPORTER_OTLP_CLIENT_KEY=/etc/obi/tls/obi.key
 ```
 
-A connector that does not migrate (`migrate: false`, as in the example)
-waits until the schema is at least its own version, and warns when the
-schema is newer than itself: a schema written by a newer connector may not
-suit an older one. When upgrading, run `shawk-migrate` and then
-`grants.sql` before or while upgrading the collectors, and upgrade all of
-them.
+## Grafana
+
+Set `SHAWK_GRAFANA_PROMETHEUS_PASSWORD` and put the CA of Prometheus at
+`/etc/grafana/tls/prometheus-ca.crt`, then adjust the URLs and credentials
+in `grafana/provisioning/datasources/shawk.yaml`.
+
+## Upgrading
+
+The connector of the example does not migrate (`migrate: false`). It waits
+until the schema is at least its own version, and warns when the schema is
+newer. Run `shawk-migrate` and `grants.sql` before or while upgrading the
+collectors, and upgrade all of them, along with the agents.
