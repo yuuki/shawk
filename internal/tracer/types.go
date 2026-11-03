@@ -204,6 +204,10 @@ type Snapshot struct {
 	// learned, or not kept while their connections are open, because the
 	// in-kernel tables were full.
 	TranslationDrops uint64
+	// CgroupEventDrops is the cumulative number of cgroups created whose
+	// event the kernel dropped because the ring buffer was full: their
+	// paths are not learned (#126).
+	CgroupEventDrops uint64
 }
 
 func addrFrom16(b [16]uint8) netip.Addr {

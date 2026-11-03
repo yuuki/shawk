@@ -84,6 +84,7 @@ type Agent struct {
 	failures    uint64
 	drops       uint64
 	xlatDrops   uint64
+	cgroupDrops uint64
 }
 
 // Run starts the agent and blocks until ctx is canceled.
@@ -260,6 +261,7 @@ func (a *Agent) tick(ctx context.Context) error {
 func (a *Agent) observe(snap *tracer.Snapshot, start, end time.Time) {
 	a.drops = snap.Drops
 	a.xlatDrops = snap.TranslationDrops
+	a.cgroupDrops = snap.CgroupEventDrops
 	a.idents.beginInterval()
 	pids := make([]uint32, 0, len(snap.Flows)+len(snap.Listeners))
 	for i := range snap.Flows {
@@ -352,12 +354,14 @@ func (a *Agent) request(now time.Time) ([]*colmetricspb.ExportMetricsServiceRequ
 	}
 	segStart := a.segment.Start(now)
 	st := otlp.AgentStatus{
-		Started:        a.started,
-		SegmentStart:   segStart,
-		NetNSScope:     a.netnsScope(),
-		UDPTraced:      a.tracer.UDPEnabled(),
-		FlowsDropped:   a.drops,
-		ExportFailures: a.failures,
+		Started:             a.started,
+		SegmentStart:        segStart,
+		NetNSScope:          a.netnsScope(),
+		UDPTraced:           a.tracer.UDPEnabled(),
+		FlowsDropped:        a.drops,
+		CgroupEventsDropped: a.cgroupDrops,
+		ContainerReadsDrops: a.cgroups.ReadsDropped(),
+		ExportFailures:      a.failures,
 
 		TranslationsTraced:  a.tracer.TranslationsTraced(),
 		TranslationsDropped: a.xlatDrops,

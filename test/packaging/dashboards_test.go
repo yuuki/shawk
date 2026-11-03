@@ -142,6 +142,37 @@ func TestDashboards(t *testing.T) {
 	}
 }
 
+// The Node Graph refers to the arrowhead of an edge by the id of the edge,
+// unescaped, in url(#...): the spaces of the ids of shawk_v1.graph_edges
+// (client -> server) make the reference invalid and the arrowhead
+// disappear. Edges queries hash them.
+func TestNodeGraphEdgeIDs(t *testing.T) {
+	hashed := regexp.MustCompile(`(?m)^SELECT md5\(\w+\.id\) AS id,`)
+	files, _ := filepath.Glob(filepath.Join(grafana, "dashboards/*.json"))
+	n := 0
+	for _, f := range files {
+		walk(loadJSON(t, f), func(p map[string]any) {
+			if p["type"] != "nodeGraph" {
+				return
+			}
+			targets, _ := p["targets"].([]any)
+			for _, q := range targets {
+				q, _ := q.(map[string]any)
+				if q["refId"] != "edges" {
+					continue
+				}
+				n++
+				if sql, _ := q["rawSql"].(string); !hashed.MatchString(sql) {
+					t.Errorf("%s: panel %v: the edges query must select md5(id) AS id:\n%s", f, p["title"], sql)
+				}
+			}
+		})
+	}
+	if n == 0 {
+		t.Error("no edges query of a node graph")
+	}
+}
+
 func TestAlertRules(t *testing.T) {
 	datasources := provisionedDatasources(t)
 	b, err := os.ReadFile(filepath.Join(grafana, "provisioning/alerting/shawk-rules.yaml"))

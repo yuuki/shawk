@@ -454,7 +454,12 @@ after twice as long each time, up to an hour:
   that a cron job accumulates under one name. Since the cgroup of a
   short-lived job is often removed before the end of the interval,
   `tp_btf/cgroup_mkdir` reports the path of every cgroup when it is created,
-  and the agent keeps it for an hour.
+  and the agent keeps it for an hour. The events go through a ring buffer
+  of 256 KiB, which holds 496 of them; those the kernel drops when it is
+  full, during a burst of new cgroups while the agent does not read, are
+  counted in `shawk.agent.cgroup_events.dropped` (alert
+  `ShawkCgroupEventsDropped`), and the flows of such a cgroup are named by
+  its id if it is removed before the end of the interval.
 - A container is named after what stays the same when it is recreated, not
   after its id: `k8s/<namespace>/<workload>/<container>` for a container of
   a pod of Kubernetes, `docker/<project>/<service>` for Docker Compose,
@@ -474,7 +479,14 @@ after twice as long each time, up to an hour:
   (`/run/containers/storage`). The APIs of the runtimes are on Unix
   sockets, which the agent's unit does not allow. The state is read when
   the cgroup is created, so that a container removed within an interval
-  keeps its name, and kept for an hour after its last use.
+  keeps its name, and kept for an hour after its last use. A worker reads
+  it, not the goroutine that drains the events of `cgroup_mkdir`, which
+  would leave them to the kernel to drop while it reads several MB of
+  `containers.json`; at most 4096 reads wait, and a container whose read
+  did not fit, counted in `shawk.agent.container_reads.dropped` (alert
+  `ShawkContainerReadsDropped`), is read when its flows are exported. Reads of the same
+  container are shared, and the cache is not held while files are read,
+  so that the export does not wait for them.
 - Docker merges the labels of the image into those of the container, so an
   image could claim to be any pod or Compose service. The labels of a pod
   are believed only with the name cri-dockerd gives the container
@@ -611,7 +623,8 @@ and `shawk.translation.backend.port`; they come after the listeners and
 before the edges of an interval, so that the connector knows them when it
 names the edges of the same host. The agent itself sends `shawk.agent.up` (with
 `shawk.netns.scope`), `shawk.agent.segment.start`, `shawk.agent.udp.traced`,
-`shawk.agent.flows.dropped`, `shawk.agent.export.failures`,
+`shawk.agent.flows.dropped`, `shawk.agent.cgroup_events.dropped`,
+`shawk.agent.container_reads.dropped`, `shawk.agent.export.failures`,
 `shawk.agent.translations.traced` and `shawk.agent.translations.dropped`,
 and with
 `-bpf-stats` the run count and time of each BPF program. The resource

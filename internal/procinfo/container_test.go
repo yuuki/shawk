@@ -6,7 +6,9 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 const (
@@ -158,7 +160,7 @@ func TestCgroupContainer(t *testing.T) {
 	}
 }
 
-func writeFile(t *testing.T, root, path, data string) {
+func writeFile(t testing.TB, root, path, data string) {
 	t.Helper()
 	p := filepath.Join(root, path)
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
@@ -314,6 +316,7 @@ func TestResolverUnit(t *testing.T) {
 	writeFile(t, root, "/var/lib/docker/containers/"+id1+"/config.v2.json", `{"Name": "/web", "Config": {}}`)
 	r := &Resolver{containers: newContainers(root), paths: map[uint64]string{}, learned: map[uint64]learnedPath{}}
 	r.Learn(7, "/system.slice/docker-"+id1+".scope")
+	r.reads.Wait()
 	// The state was read when the cgroup was created.
 	os.RemoveAll(filepath.Join(root, "var/lib/docker/containers", id1))
 	unit, ctr := r.Unit(7)
@@ -336,4 +339,132 @@ func TestResolverUnit(t *testing.T) {
 	if unit, ctr := r.Unit(10); unit != "docker-abababababab" || ctr.ID != id3 {
 		t.Errorf("Unit(10) = %q, %+v", unit, ctr)
 	}
+}
+
+// A lookup does not wait for the read of another container, and waits for
+// the read of the same one instead of reading it again (#126).
+func TestLookupInFlight(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "/var/lib/docker/containers/"+id1+"/config.v2.json", `{"Name": "/web", "Config": {}}`)
+	c := newContainers(root)
+	if got, _ := c.Lookup(RuntimeDocker, id1); got.Unit() != "docker/web" {
+		t.Fatalf("Lookup = %+v", got)
+	}
+	// A slow read of id2 is in flight.
+	rd := &containerRead{done: make(chan struct{})}
+	c.mu.Lock()
+	c.reading[id2] = rd
+	c.mu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if got, _ := c.Lookup(RuntimeDocker, id1); got.Unit() != "docker/web" {
+			t.Errorf("Lookup of the cached container = %+v", got)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the lookup of a cached container waited for the read of another")
+	}
+	joined := make(chan *Container)
+	go func() {
+		got, _ := c.Lookup(RuntimeDocker, id2)
+		joined <- got
+	}()
+	want := &Container{Runtime: RuntimeDocker, ID: id2, Name: "db"}
+	rd.c, rd.found = want, true
+	close(rd.done)
+	if got := <-joined; got != want {
+		t.Errorf("Lookup during the read = %+v, want the result of the read", got)
+	}
+}
+
+func TestLookupConcurrent(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "/var/lib/docker/containers/"+id1+"/config.v2.json", `{"Name": "/web", "Config": {}}`)
+	writeFile(t, root, "/var/lib/containers/storage/overlay-containers/containers.json",
+		`[{"id": "`+id2+`", "names": ["redis"]}]`)
+	c := newContainers(root)
+	var wg sync.WaitGroup
+	for i := range 50 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			id, want := id1, "docker/web"
+			if i%2 == 1 {
+				id, want = id2, "podman/redis"
+			}
+			if got, found := c.Lookup("", id); !found || got.Unit() != want {
+				t.Errorf("Lookup(%s) = %+v, %v", id, got, found)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// Learn does not wait for the reads it queues, and drops those that do not
+// fit in the queue rather than blocking.
+func TestLearnQueue(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "/var/lib/docker/containers/"+id1+"/config.v2.json", `{"Name": "/web", "Config": {}}`)
+	r := &Resolver{containers: newContainers(root), paths: map[uint64]string{}, learned: map[uint64]learnedPath{}}
+	// The worker starts after the burst, as if it were reading a large file.
+	r.readerOnce.Do(func() { r.pending = make(chan string, maxPendingReads) })
+	for i := range 3 * maxPendingReads {
+		r.Learn(uint64(100+i), "/system.slice/docker-"+id1+".scope")
+	}
+	if got := r.ReadsDropped(); got != 2*maxPendingReads {
+		t.Errorf("ReadsDropped = %d, want %d", got, 2*maxPendingReads)
+	}
+	go r.readQueued()
+	r.reads.Wait()
+	if unit, _ := r.Unit(100); unit != "docker/web" {
+		t.Errorf("Unit(100) = %q", unit)
+	}
+	if got := r.CgroupPath(uint64(100 + 3*maxPendingReads - 1)); got != "/system.slice/docker-"+id1+".scope" {
+		t.Errorf("the last path = %q", got)
+	}
+}
+
+// BenchmarkLearn learns a burst of cgroups of containers of Podman on a
+// host whose containers.json lists 5000 containers (#126). Learn only
+// queues the reads, which a worker does; compare with the read itself in
+// BenchmarkLookupPodman.
+func BenchmarkLearn(b *testing.B) {
+	root, ids := podmanHost(b, 5000)
+	r := &Resolver{containers: newContainers(root), paths: map[uint64]string{}, learned: map[uint64]learnedPath{}}
+	b.ResetTimer()
+	for i := range b.N {
+		r.Learn(uint64(i), "/machine.slice/libpod-"+ids[i%len(ids)]+".scope")
+	}
+	b.StopTimer()
+	r.reads.Wait()
+}
+
+func BenchmarkLookupPodman(b *testing.B) {
+	root, ids := podmanHost(b, 5000)
+	b.ResetTimer()
+	for i := range b.N {
+		// A new reader each time: the list is read as when it changed.
+		newContainers(root).Lookup(RuntimePodman, ids[i%len(ids)])
+	}
+}
+
+func podmanHost(b *testing.B, n int) (string, []string) {
+	root := b.TempDir()
+	var list strings.Builder
+	ids := make([]string, n)
+	list.WriteString("[")
+	for i := range n {
+		ids[i] = fmt.Sprintf("%064x", i+1)
+		if i > 0 {
+			list.WriteString(",")
+		}
+		fmt.Fprintf(&list, `{"id": %q, "names": ["c%d"], "image": %q, "layer": %q, "metadata": %q}`,
+			ids[i], i, strings.Repeat("a", 64), strings.Repeat("b", 64), strings.Repeat("m", 400))
+	}
+	list.WriteString("]")
+	writeFile(b, root, "/var/lib/containers/storage/overlay-containers/containers.json", list.String())
+	return root, ids
 }

@@ -22,6 +22,24 @@
   is named after the backend, and a server edge of a DNAT after its client.
   The systemd unit of the agent allows `perf_event_open`, which kprobes
   need: a unit copied from an older package learns no translations.
+* The losses of new cgroups are visible (#126): the new counter
+  `shawk.agent.container_reads.dropped`
+  (`shawk_agent_container_reads_dropped_total`) tells how many containers
+  of new cgroups were not queued to be read because the queue was full,
+  and the new Prometheus alerts `ShawkCgroupEventsDropped` (warning) and
+  `ShawkContainerReadsDropped` (info) fire when either counter increases.
+  A test of the kernel creates a burst of 3000 cgroups: a reader that
+  keeps up gets all of them, one that stalls gets the 496 that the ring
+  buffer holds, and the drops of the others are counted.
+* The state of a container is read on a worker instead of the goroutine
+  that drains the events of new cgroups (#126), which the kernel dropped
+  while it read the files of the runtimes, such as several MB of
+  `containers.json` on a busy host of Podman or CRI-O: the cgroups of a
+  burst of new containers lost their paths. The export no longer waits
+  for these reads either. The new counter
+  `shawk.agent.cgroup_events.dropped`
+  (`shawk_agent_cgroup_events_dropped_total`) tells how many new cgroups
+  the kernel did not report because the agent read too slowly.
 * Dependencies through relays without an agent that rewrite addresses
   (#107): load balancers, keepalived or LVS virtual addresses, TCP
   proxies. `translations` in the configuration of the connector gives
@@ -52,6 +70,12 @@
   database that defaults to REPEATABLE READ failed the write. The
   configuration of a connector (`peer_cidrs` and the translations) is
   written in one transaction in READ COMMITTED, one connector at a time.
+* Fixed: the edges of the dependency map dashboard had no arrowheads in
+  Grafana 12.2 and 13.3, so the direction of a dependency could not be
+  seen. The Node Graph refers to the arrowhead of an edge by its id,
+  unescaped, in `url(#...)`, which the spaces of the ids of
+  `shawk_v1.graph_edges` (`client -> server`) made invalid. The dashboard
+  shows the md5 of the id instead; `shawk_v1` is unchanged.
 * A container keeps its name when it is recreated (#104). `shawk.unit` of a
   process in a container was `docker-<id>`, `podman-<id>`,
   `cri-containerd-<id>` or `crio-<id>`, so every redeploy added rows to

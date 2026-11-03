@@ -121,6 +121,7 @@ type Tracer struct {
 	flowBusy       *ebpf.Variable
 	listenDrops    *ebpf.Variable
 	storageFails   *ebpf.Variable
+	cgroupDrops    *ebpf.Variable
 	adopted        *ebpf.Variable
 	selfTgid       *ebpf.Variable
 	ownerScan      *ebpf.Variable
@@ -338,6 +339,7 @@ func (t *Tracer) loadCore(spec *ebpf.CollectionSpec) error {
 	t.flowBusy = coll.Variables[bpfVarFlowBusy]
 	t.listenDrops = coll.Variables[bpfVarListenPortDrops]
 	t.storageFails = coll.Variables[bpfVarStorageFails]
+	t.cgroupDrops = coll.Variables[bpfVarCgroupEventDrops]
 	t.adopted = coll.Variables[bpfVarAdoptedUnowned]
 	t.selfTgid = coll.Variables[bpfVarSelfTgid]
 	t.ownerScan = coll.Variables[bpfVarOwnerScan]
@@ -578,6 +580,7 @@ func (t *Tracer) Collect() (*Snapshot, error) {
 	}
 	t.warnOnIncrease(t.listenDrops, "more listening ports than the in-kernel tables hold; connections that predate the agent and UDP sockets on the others may get the wrong direction", "capacity", t.listenPorts.MaxEntries())
 	t.warnOnIncrease(t.storageFails, "no socket storage for some TCP connections; they are counted from the next walk on, without their connection and earlier traffic")
+	t.warnOnIncrease(t.cgroupDrops, "some new cgroups were not reported because the agent did not read the events fast enough; flows of short-lived ones among them are named by cgroup id")
 	var adopted uint64
 	if err := t.adopted.Get(&adopted); err != nil {
 		return nil, err
@@ -619,7 +622,7 @@ func (t *Tracer) Collect() (*Snapshot, error) {
 	counters := []struct {
 		v   *ebpf.Variable
 		dst *uint64
-	}{{t.flowDrops, &snap.Drops}, {t.flowBusy, &snap.Contended}}
+	}{{t.flowDrops, &snap.Drops}, {t.flowBusy, &snap.Contended}, {t.cgroupDrops, &snap.CgroupEventDrops}}
 	if t.xlatDrops != nil {
 		t.warnOnIncrease(t.xlatDrops, "some translations of addresses were not learned, or not kept while their connections are open, because their in-kernel tables were full; raise -max-flows",
 			"translations", t.xlats.MaxEntries(), "connections", xlatConnsPerFlow*t.xlats.MaxEntries())
