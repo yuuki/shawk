@@ -1,5 +1,18 @@
 ## Unreleased
 
+* Fixed: on kernels whose TCP iterator skips sockets, the walks of the
+  agent missed some connections. That is Linux before 6.17 without its
+  backport to the stable releases of 6.1, 6.6 and 6.12: 5.15, RHEL 9 and
+  10. The iterator skips the established sockets of the first bucket of the
+  established hash that holds any of a namespace, when that bucket follows
+  the last listening bucket of the namespace, and does so at every walk
+  while the listeners stay. A connection that predated the agent was then
+  never adopted, and the others were never counted as open, nor their
+  traffic and RTT accounted before they closed. This made
+  `TestTCPAdoptedDirection` fail now and then on Rocky Linux 9. The walk of
+  the processes now adopts and accounts the connections that processes
+  hold and that the latest walk missed, and runs at every interval while
+  it finds some; the agent warns about it.
 * Pods are named from their labels and annotations, as OBI names them
   (#124): `service.name` is the annotation
   `resource.opentelemetry.io/service.name`, then the labels

@@ -91,7 +91,7 @@ type bpfShawkSockState struct {
 	RetransBase uint32
 	Pid         uint32
 	Flags       uint32
-	Pad         uint32
+	Walked      uint32
 }
 
 type bpfShawkUdpState struct {
@@ -130,6 +130,7 @@ const (
 	bpfVarFlowDrops              = "flow_drops"
 	bpfVarFoldMode               = "fold_mode"
 	bpfVarInitialScan            = "initial_scan"
+	bpfVarIterSkips              = "iter_skips"
 	bpfVarLearnSelf              = "learn_self"
 	bpfVarListenPortDrops        = "listen_port_drops"
 	bpfVarOwnerScan              = "owner_scan"
@@ -138,6 +139,7 @@ const (
 	bpfVarTargetNetns            = "target_netns"
 	bpfVarUnusedCgroupEvent      = "unused_cgroup_event"
 	bpfVarUnusedIterRec          = "unused_iter_rec"
+	bpfVarWalkGen                = "walk_gen"
 )
 
 // loadBpf returns the embedded CollectionSpec for bpf.
@@ -221,6 +223,7 @@ type bpfVariableSpecs struct {
 	FlowDrops         *ebpf.VariableSpec `ebpf:"flow_drops"`
 	FoldMode          *ebpf.VariableSpec `ebpf:"fold_mode"`
 	InitialScan       *ebpf.VariableSpec `ebpf:"initial_scan"`
+	IterSkips         *ebpf.VariableSpec `ebpf:"iter_skips"`
 	LearnSelf         *ebpf.VariableSpec `ebpf:"learn_self"`
 	ListenPortDrops   *ebpf.VariableSpec `ebpf:"listen_port_drops"`
 	OwnerScan         *ebpf.VariableSpec `ebpf:"owner_scan"`
@@ -229,6 +232,7 @@ type bpfVariableSpecs struct {
 	TargetNetns       *ebpf.VariableSpec `ebpf:"target_netns"`
 	UnusedCgroupEvent *ebpf.VariableSpec `ebpf:"unused_cgroup_event"`
 	UnusedIterRec     *ebpf.VariableSpec `ebpf:"unused_iter_rec"`
+	WalkGen           *ebpf.VariableSpec `ebpf:"walk_gen"`
 }
 
 // bpfObjects contains all objects after they have been loaded into the kernel.
@@ -291,6 +295,7 @@ type bpfVariables struct {
 	FlowDrops         *ebpf.Variable `ebpf:"flow_drops"`
 	FoldMode          *ebpf.Variable `ebpf:"fold_mode"`
 	InitialScan       *ebpf.Variable `ebpf:"initial_scan"`
+	IterSkips         *ebpf.Variable `ebpf:"iter_skips"`
 	LearnSelf         *ebpf.Variable `ebpf:"learn_self"`
 	ListenPortDrops   *ebpf.Variable `ebpf:"listen_port_drops"`
 	OwnerScan         *ebpf.Variable `ebpf:"owner_scan"`
@@ -299,6 +304,7 @@ type bpfVariables struct {
 	TargetNetns       *ebpf.Variable `ebpf:"target_netns"`
 	UnusedCgroupEvent *ebpf.Variable `ebpf:"unused_cgroup_event"`
 	UnusedIterRec     *ebpf.Variable `ebpf:"unused_iter_rec"`
+	WalkGen           *ebpf.Variable `ebpf:"walk_gen"`
 }
 
 // bpfPrograms contains all programs after they have been loaded into the kernel.
