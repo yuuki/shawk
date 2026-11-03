@@ -173,9 +173,11 @@ type Tracer struct {
 	conntrackSpec   *ebpf.CollectionSpec
 	conntrackTried  time.Time
 	conntrackLogged bool
-	xlats           *ebpf.Map
-	xlatDrops       *ebpf.Variable
-	xlatLast        map[bpfShawkXlatKey]bpfShawkXlatStats
+	// conntrackBackoff is the wait before the next load after one failed.
+	conntrackBackoff time.Duration
+	xlats            *ebpf.Map
+	xlatDrops        *ebpf.Variable
+	xlatLast         map[bpfShawkXlatKey]bpfShawkXlatStats
 }
 
 type sockAddrKey struct {
@@ -613,8 +615,8 @@ func (t *Tracer) Collect() (*Snapshot, error) {
 		dst *uint64
 	}{{t.flowDrops, &snap.Drops}, {t.flowBusy, &snap.Contended}}
 	if t.xlatDrops != nil {
-		t.warnOnIncrease(t.xlatDrops, "some translations of addresses were not learned, or not kept while their connections are open, because their in-kernel tables were full",
-			"capacity", t.xlats.MaxEntries())
+		t.warnOnIncrease(t.xlatDrops, "some translations of addresses were not learned, or not kept while their connections are open, because their in-kernel tables were full; raise -max-flows",
+			"translations", t.xlats.MaxEntries(), "connections", xlatConnsPerFlow*t.xlats.MaxEntries())
 		counters = append(counters, struct {
 			v   *ebpf.Variable
 			dst *uint64

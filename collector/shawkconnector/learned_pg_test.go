@@ -279,3 +279,39 @@ func TestPGLearnedHosts(t *testing.T) {
 		t.Errorf("hosts after the retention: %q", got)
 	}
 }
+
+// TestPGLearnedSidecar: a sidecar REDIRECTs the connections of its pod to
+// itself and connects to the server from the address of the pod. The
+// server edge matches the client edge of the application by address, which
+// comes first: the application depends on the server, and the inbound edge
+// of the sidecar has no client edge of its own.
+func TestPGLearnedSidecar(t *testing.T) {
+	c, sink, conn := pgConnectorWith(t, nil)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	long := now.Add(-time.Hour)
+	for _, a := range []tAgent{
+		{host: "db-01", addrs: []string{"10.0.1.10"}, time: now, edges: []tEdge{{role: "server", proto: "tcp",
+			local: "10.0.1.10", peer: "10.0.0.11", port: 5432, svc: "postgres", comm: "postgres", opened: 1, first: long}}},
+		{host: "app-01", addrs: []string{"127.0.0.1", "10.0.0.11"}, time: now,
+			edges: []tEdge{
+				{role: "client", proto: "tcp", local: "10.0.0.11", peer: "10.0.1.10", port: 5432, svc: "app", comm: "app",
+					opened: 1, first: long},
+				{role: "server", proto: "tcp", local: "127.0.0.1", peer: "10.0.0.11", port: 15001, svc: "envoy", comm: "envoy",
+					opened: 1, first: long},
+				{role: "client", proto: "tcp", local: "10.0.0.11", peer: "10.0.1.10", port: 5432, svc: "envoy", comm: "envoy",
+					opened: 1, first: long},
+			},
+			translations: []tTranslation{{client: "10.0.0.11", virtual: "10.0.1.10", vport: 5432, backend: "127.0.0.1",
+				bport: 15001, first: long}}},
+	} {
+		consume(t, c, sink, a)
+	}
+	c.flush(ctx)
+	q := func(s string, args ...any) []string { return queryStrings(t, conn, s, args...) }
+	checkDeps(t, q, []string{
+		"- - 10.0.0.11 app-01 envoy 127.0.0.1 15001 server - - -",
+		"app-01 app 10.0.0.11 db-01 postgres 10.0.1.10 5432 both - - -",
+		"app-01 envoy 10.0.0.11 db-01 postgres 10.0.1.10 5432 both - - -",
+	})
+}

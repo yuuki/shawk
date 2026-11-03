@@ -91,26 +91,45 @@ func learnTimed[K comparable, V comparable](m map[K]map[V]time.Time, k K, v V, t
 }
 
 // learnedOf returns the backends of the learned translations of a client
-// edge of host, in its scope: a loopback client address in the host and
-// network namespace of the translation, a shared one on its host. r.mu is
-// held.
+// edge of host, in its scope (a loopback client address in the host and
+// network namespace of the translation, a shared one on its host), among
+// those seen within backendWindow of the most recently seen one: a
+// published port re-pointed to another container leaves the former one,
+// whose address may now be another service's. r.mu is held.
 func (r *resolver) learnedOf(host string, id *edgeID, now time.Time) []learnedBackend {
 	k := learnedClientKey{id.proto, id.local, id.peer, id.port}
+	local, db := r.localLearned[k], r.dbLearned[k]
+	if len(local) == 0 && len(db) == 0 {
+		return nil
+	}
 	sameHost := r.sameHostAddr(id.local, now)
-	var out []learnedBackend
-	add := func(b learnedBackend) {
+	seen := map[learnedBackend]time.Time{}
+	var newest time.Time
+	add := func(b learnedBackend, at time.Time) {
 		switch {
 		case id.local.IsLoopback() && (b.host != host || b.netns != id.netns):
 		case sameHost && b.host != host:
 		default:
-			out = append(out, b)
+			if at.After(seen[b]) {
+				seen[b] = at
+			}
+			if at.After(newest) {
+				newest = at
+			}
 		}
 	}
-	for b := range r.localLearned[k] {
-		add(b)
+	for b, at := range local {
+		add(b, at)
 	}
-	for b := range r.dbLearned[k] {
-		add(b)
+	age := r.dbAge(now)
+	for b, at := range db {
+		add(b, at.Add(age))
+	}
+	var out []learnedBackend
+	for b, at := range seen {
+		if !at.Before(newest.Add(-backendWindow)) {
+			out = append(out, b)
+		}
 	}
 	return out
 }
@@ -146,40 +165,65 @@ func (r *resolver) learnedServer(host string, id *edgeID, now time.Time) (candid
 // learnedClientName finds the client service of a server edge of host
 // through the learned translations that keep the address of the client:
 // the service whose client edge to the virtual address and port has the
-// address of the client. A backend or a client at a loopback or shared
-// address is matched on the host that translated the connections only.
-// r.mu is held.
+// address of the client, among the translations seen within backendWindow
+// of the most recently seen one. A backend or a client at a loopback or
+// shared address is matched on the host that translated the connections
+// only. r.mu is held.
 func (r *resolver) learnedClientName(host string, id *edgeID, now time.Time) string {
-	k := learnedServerKey{id.proto, id.local, id.port, id.peer}
-	serverHost := r.sameHostAddr(id.local, now) || r.sameHostAddr(id.peer, now)
-	clientHost := r.sameHostAddr(id.peer, now)
-	age := r.dbAge(now)
 	var best chooser
-	consider := func(lc learnedClient) {
-		switch {
-		case (id.local.IsLoopback() || id.peer.IsLoopback()) && (lc.host != host || lc.netns != id.netns):
-			return
-		case serverHost && lc.host != host:
-			return
-		}
+	best.host = host
+	age := r.dbAge(now)
+	clientHost := r.sameHostAddr(id.peer, now)
+	for _, lc := range r.learnedClientsOf(host, id, now) {
 		c := chooser{host: lc.host, sameHostOnly: clientHost}
 		ck := clientKey{id.peer, lc.virtual, lc.vport, id.proto}
 		c.add(r.localClients[ck], r.dbClients[ck], age, 0)
-		if c.best.service == "" {
-			return
-		}
-		best.host = host
-		if best.better(c.best, 0) {
+		if c.best.service != "" && best.better(c.best, 0) {
 			best.best = c.best
 		}
 	}
-	for lc := range r.localLearnedServers[k] {
-		consider(lc)
-	}
-	for lc := range r.dbLearnedServers[k] {
-		consider(lc)
-	}
 	return best.best.service
+}
+
+// learnedClientsOf returns the client ends of the learned DNAT whose
+// backend is the local address and port of a server edge of host, from its
+// peer, in its scope, among those seen within backendWindow of the most
+// recently seen one. r.mu is held.
+func (r *resolver) learnedClientsOf(host string, id *edgeID, now time.Time) []learnedClient {
+	k := learnedServerKey{id.proto, id.local, id.port, id.peer}
+	local, db := r.localLearnedServers[k], r.dbLearnedServers[k]
+	if len(local) == 0 && len(db) == 0 {
+		return nil
+	}
+	loopback := id.local.IsLoopback() || id.peer.IsLoopback()
+	serverHost := loopback || r.sameHostAddr(id.local, now) || r.sameHostAddr(id.peer, now)
+	seen := map[learnedClient]time.Time{}
+	var newest time.Time
+	add := func(lc learnedClient, at time.Time) {
+		if (loopback && (lc.host != host || lc.netns != id.netns)) || (serverHost && lc.host != host) {
+			return
+		}
+		if at.After(seen[lc]) {
+			seen[lc] = at
+		}
+		if at.After(newest) {
+			newest = at
+		}
+	}
+	for lc, at := range local {
+		add(lc, at)
+	}
+	age := r.dbAge(now)
+	for lc, at := range db {
+		add(lc, at.Add(age))
+	}
+	var out []learnedClient
+	for lc, at := range seen {
+		if !at.Before(newest.Add(-backendWindow)) {
+			out = append(out, lc)
+		}
+	}
+	return out
 }
 
 // loadLearned builds the maps of the learned translations read from

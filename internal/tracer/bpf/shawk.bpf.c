@@ -1788,6 +1788,8 @@ int shawk_ct_confirm(struct pt_regs *ctx)
 	struct shawk_xlat_stats zero = {}, *st;
 	struct shawk_xlat_conn conn = {};
 	struct shawk_xlat_conn *old;
+	/* An int: before Linux 6.4 the result is not sign-extended (see flow_get()). */
+	int err;
 	__u64 ct;
 
 	ct = BPF_CORE_READ(skb, _nfct) & NFCT_PTRMASK_;
@@ -1805,19 +1807,22 @@ int shawk_ct_confirm(struct pt_regs *ctx)
 		}
 	}
 	conn.gen = st->gen;
-	old = bpf_map_lookup_elem(&xlat_conns, &ct);
-	if (old) {
-		/*
-		 * The same entry confirmed twice, as an unconfirmed entry shared by
-		 * clones of a packet (a bridged broadcast) may be, is counted once.
-		 */
-		if (old->gen == conn.gen && same_xlat(&old->key, &conn.key))
+	/*
+	 * The entry is inserted first, so that two CPUs confirming the same
+	 * entry at once count it once: an unconfirmed entry shared by clones of
+	 * a packet (a bridged broadcast) may be confirmed twice.
+	 */
+	err = bpf_map_update_elem(&xlat_conns, &ct, &conn, BPF_NOEXIST);
+	if (err == -EEXIST) {
+		old = bpf_map_lookup_elem(&xlat_conns, &ct);
+		if (!old || (old->gen == conn.gen && same_xlat(&old->key, &conn.key)))
 			return 0;
 		/* Left by a destroy that was missed; the memory is another entry now. */
 		xlat_release(old);
+		err = bpf_map_update_elem(&xlat_conns, &ct, &conn, BPF_ANY);
 	}
 	__sync_fetch_and_add(&st->conns, 1);
-	if (bpf_map_update_elem(&xlat_conns, &ct, &conn, BPF_ANY))
+	if (err)
 		__sync_fetch_and_add(&xlat_drops, 1);
 	else
 		__sync_fetch_and_add(&st->live, 1);

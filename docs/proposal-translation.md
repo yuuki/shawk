@@ -199,8 +199,13 @@ connectors:
   balancers), docker-proxy (phase 3), proxies and load balancers that
   terminate the connection (phase 1).
 - Transparent proxies that REDIRECT to themselves (the sidecars of Istio
-  and Linkerd) are learned like any translation: the client depends on the
-  proxy, one hop (§9, 8).
+  and Linkerd) are learned like any translation (§9, 8). A sidecar
+  connects to the server from the address of its pod, so the server edge
+  matches the client edge of the application by address, which comes
+  first: the application depends on the server, and the inbound edge of
+  the sidecar keeps a row of its own. Where the server is not reached at
+  the address the application connected to (a ClusterIP), the application
+  depends on the sidecar.
 
 #### 3.5.2 Kernel
 
@@ -301,7 +306,10 @@ connection that conntrack tracks, whatever made the translation:
   agent learns translations under the unit. Reading the table of conntrack
   over netlink would need `CAP_NET_ADMIN` in every namespace.
 - **Not seen:** entries confirmed before the agent started, until their
-  client opens a new connection.
+  client opens a new connection: after a restart of the agent, a pool of
+  long-lived connections through a translation is matched until its
+  learned row ends, and then shows as a client row and a server row,
+  until a new connection.
 
 #### 3.5.3 Tracer and agent
 
@@ -661,11 +669,12 @@ connection that conntrack tracks, whatever made the translation:
    the destinations and clients on the Internet are not learned (§3.5.2,
    filters); without it, the table grows with them, up to `-max-flows`.
 8. Transparent proxies that REDIRECT to themselves (sidecars): learned as
-   any translation, so that the client depends on the proxy. Recommended:
-   yes, one hop as elsewhere; the alternative is to drop translations to a
-   loopback backend, which loses REDIRECT to local services as well.
-   PostgreSQL then shows the sidecar on its port, while Prometheus names
-   the service observed on a socket at the port the client connected to.
+   any translation. Recommended: yes; the alternative is to drop
+   translations to a loopback backend, which loses REDIRECT to local
+   services as well. A sidecar that connects from the address of its pod
+   to the address the application connected to leaves the application
+   depending on the server (a match by address first, §3.5.1); through a
+   ClusterIP, the application depends on the sidecar, one hop.
 
 Open: 4–8.
 
@@ -704,6 +713,30 @@ Not taken: the destroy program would have resolved its CO-RE relocations
 against vmlinux only on kernels with `destroy_conntrack`. cilium/ebpf
 v0.22 relocates against the BTF of every loaded module, whatever the
 attach target.
+
+**First review of the implementation of phase 2 (2026-11-03).**
+
+1. The connector named a client edge after any backend learned in the
+   idle TTL: a published port re-pointed to another container, whose former
+   address became another service, named the client after that service.
+   Fixed: the learned backends seen within 5 minutes of the most recent
+   one, as for endpoints; the same for the clients of a server edge.
+2. Decision 8 said that a client depends on its sidecar; the match by
+   address of the connection of the sidecar comes first. Documented, with
+   a test.
+3. Two CPUs that confirm the same entry at once counted it twice, and its
+   translation stayed live for good. Fixed: the entry is inserted first
+   (`BPF_NOEXIST`). A race, not reproduced by a test; the tests in the
+   virtual machines check that nothing else changed.
+4. A load that keeps failing with nf_conntrack loaded created the large
+   maps every minute. Fixed: the wait doubles up to an hour.
+5. A server edge through a learned DNAT whose virtual address the agent of
+   the client folds was taken as counted by the client. Fixed: as for
+   static translations.
+6. A key deleted as idle that got a connection between the walk and the
+   delete lost it. Fixed: it is taken out with its values and put back.
+   Also: the warning of a full table names both capacities, and the
+   learned rows are looked up only when there are some.
 
 **First review (2026-11-02).**
 

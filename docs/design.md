@@ -1128,8 +1128,13 @@ parses. shawk runs beside it instead:
   matched, nor one through IPVS without `conntrack=1` or a datapath
   without netfilter conntrack (the kube-proxy replacement of Cilium), nor,
   until their client opens another, the connections confirmed before the
-  agent started. A sidecar proxy that REDIRECTs (Istio, Linkerd) is a
-  dependency of its client. The connections to a published port on
+  agent started (after a restart of the agent, a pool of long-lived
+  connections then shows on both sides apart until a new connection). A
+  sidecar proxy that REDIRECTs (Istio, Linkerd) is a dependency of its
+  client when the server is reached at another address (a ClusterIP); when
+  the sidecar connects from the address of its pod to the address the
+  application connected to, the application depends on the server, and the
+  inbound edge of the sidecar has a row of its own. The connections to a published port on
   loopback go through `docker-proxy`, a service of its own. Learned SNAT
   of clients that a host forwards from other hosts (a NodePort) leaves
   those without an agent uncounted in Prometheus. Behind

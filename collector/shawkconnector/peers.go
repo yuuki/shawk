@@ -476,7 +476,8 @@ func (r *resolver) peer(host string, id *edgeID, now time.Time) peer {
 					r.foldsPeer(a, c.host, id.local, false, now) {
 					p.foldedBy, p.foldedByName = c.host, a.name
 				}
-			} else if c, ok := r.learnedServer(host, id, now); learned && ok {
+			} else if !learned {
+			} else if c, ok := r.learnedServer(host, id, now); ok {
 				p = peer{name: c.service, agent: c.agent}
 				if c.port != id.port {
 					p.port = c.port
@@ -806,7 +807,8 @@ func (r *resolver) behindRelay(id *edgeID) bool {
 	return false
 }
 
-// foldedVirtual returns a virtual address of a translation without sources
+// foldedVirtual returns a virtual address of a translation without sources,
+// static or learned (DNAT),
 // through which the client of a server edge reaches it, and that the agent a
 // of the client, on the host client, folds. r.mu is held.
 func (r *resolver) foldedVirtual(a agentHost, client string, id *edgeID, now time.Time) (netip.Addr, bool) {
@@ -818,6 +820,15 @@ func (r *resolver) foldedVirtual(a agentHost, client string, id *edgeID, now tim
 		for _, v := range t.clientEnds(id.local, id.port) {
 			if r.foldsPeer(a, client, v.Addr(), true, now) {
 				return v.Addr(), true
+			}
+		}
+	}
+	// Through a learned DNAT the client connects to its virtual address.
+	k := learnedServerKey{id.proto, id.local, id.port, id.peer}
+	for _, m := range []map[learnedClient]time.Time{r.localLearnedServers[k], r.dbLearnedServers[k]} {
+		for lc := range m {
+			if r.foldsPeer(a, client, lc.virtual, true, now) {
+				return lc.virtual, true
 			}
 		}
 	}

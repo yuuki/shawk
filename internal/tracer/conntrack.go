@@ -44,9 +44,14 @@ var conntrackPrograms = []struct {
 // nf_conntrack is loaded.
 var conntrackMaps = []string{bpfMapXlats, bpfMapXlatConns}
 
-// conntrackRetry is how often loading the conntrack programs is tried
-// again after it failed, e.g. before nf_conntrack is loaded.
-const conntrackRetry = time.Minute
+// conntrackRetry is how often nf_conntrack is looked for until it is
+// loaded. A load that fails with the module there is tried again after
+// twice as long each time, up to conntrackMaxRetry: every attempt creates
+// the maps, which are large, and relocates against the BTF of the modules.
+const (
+	conntrackRetry    = time.Minute
+	conntrackMaxRetry = time.Hour
+)
 
 // conntrackModule exists while nf_conntrack is loaded or built in;
 // replaced in tests.
@@ -83,7 +88,11 @@ func (t *Tracer) tryConntrack(now time.Time) {
 	if !t.opts.LearnTranslations || t.xlats != nil || t.conntrackSpec == nil {
 		return
 	}
-	if !t.conntrackTried.IsZero() && now.Sub(t.conntrackTried) < conntrackRetry {
+	wait := t.conntrackBackoff
+	if wait == 0 {
+		wait = conntrackRetry
+	}
+	if !t.conntrackTried.IsZero() && now.Sub(t.conntrackTried) < wait {
 		return
 	}
 	t.conntrackTried = now
@@ -94,15 +103,19 @@ func (t *Tracer) tryConntrack(now time.Time) {
 		}
 		return
 	}
-	if err := t.loadConntrack(); err != nil {
+	if err := loadConntrack(t); err != nil {
+		t.conntrackBackoff = min(max(2*t.conntrackBackoff, conntrackRetry), conntrackMaxRetry)
 		if !t.conntrackLogged {
 			t.conntrackLogged = true
-			t.log.Warn("translations of addresses are not learned from conntrack; retrying every minute", "error", err)
+			t.log.Warn("translations of addresses are not learned from conntrack; retrying, at most every hour", "error", err)
 		}
 		return
 	}
 	t.log.Info("learning translations of addresses from conntrack")
 }
+
+// loadConntrack is (*Tracer).loadConntrack; replaced in tests.
+var loadConntrack = (*Tracer).loadConntrack
 
 // loadConntrack loads the conntrack programs, sharing the maps of the core
 // collection, and attaches them.
@@ -168,9 +181,10 @@ func (t *Tracer) loadConntrack() error {
 // collectTranslations returns the translations active since the last call:
 // those with a new conntrack entry, and those with a live one. A key idle
 // for a whole interval is deleted, so that the table holds the translations
-// in use. A confirmation between the read of an idle key and its delete is
-// lost with the key; an entry counted in the deleted key, if the key is
-// added again, has another generation and leaves the new count alone.
+// in use. It is taken out with its values and put back if a confirmation
+// came in since the walk; one that lands between the two, and adds the key
+// again, keeps it with another generation, and the entries counted in the
+// former generation are lost from the live count.
 func (t *Tracer) collectTranslations() ([]Translation, error) {
 	if t.xlats == nil {
 		return nil, nil
@@ -195,15 +209,36 @@ func (t *Tracer) collectTranslations() ([]Translation, error) {
 	if err := it.Err(); err != nil {
 		return nil, fmt.Errorf("reading translations: %w", err)
 	}
+	if afterTranslationWalk != nil {
+		afterTranslationWalk()
+	}
 	for i := range idle {
-		if err := t.xlats.Delete(&idle[i]); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+		k := &idle[i]
+		prev := seen[*k]
+		delete(seen, *k)
+		if err := t.xlats.LookupAndDelete(k, &val); err != nil {
+			if errors.Is(err, ebpf.ErrKeyNotExist) {
+				continue
+			}
 			return nil, fmt.Errorf("deleting a translation: %w", err)
 		}
-		delete(seen, idle[i])
+		if val.Gen == prev.Gen && val.Conns == prev.Conns && val.Live <= 0 {
+			continue
+		}
+		// A connection came in since the walk.
+		if err := t.xlats.Update(k, &val, ebpf.UpdateNoExist); err != nil && !errors.Is(err, ebpf.ErrKeyExist) {
+			return nil, fmt.Errorf("putting a translation back: %w", err)
+		}
+		seen[*k] = val
+		out = append(out, convertTranslation(k))
 	}
 	t.xlatLast = seen
 	return out, nil
 }
+
+// afterTranslationWalk, if set, runs between the walk of the translations
+// and the deletes of the idle ones; set in tests.
+var afterTranslationWalk func()
 
 func convertTranslation(k *bpfShawkXlatKey) Translation {
 	return Translation{

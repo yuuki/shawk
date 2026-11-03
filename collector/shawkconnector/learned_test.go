@@ -3,6 +3,7 @@ package shawkconnector
 import (
 	"fmt"
 	"maps"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -145,5 +146,52 @@ func TestTranslationNameReserved(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "may not start with ~") {
 		t.Errorf("err = %v", err)
+	}
+}
+
+// TestLearnedStaleBackend: a published port re-pointed to another
+// container; the former address, now another service, is not the peer.
+func TestLearnedStaleBackend(t *testing.T) {
+	c, _, sink, now := testConnector(t, nil)
+	ts := t0.Add(15 * time.Second)
+	h2 := func(ts time.Time, backend string, edges ...tEdge) tAgent {
+		return tAgent{host: "h2", addrs: []string{"10.0.0.2", "172.17.0.5", "172.17.0.6"}, time: ts, edges: edges,
+			translations: []tTranslation{{client: "10.0.0.11", virtual: "10.0.0.2", vport: 8080, backend: backend, bport: 80}}}
+	}
+	consume(t, c, sink, h2(ts, "172.17.0.5", tEdge{role: "server", proto: "tcp", local: "172.17.0.5", peer: "10.0.0.11", port: 80,
+		svc: "web", comm: "web", opened: 1}))
+	*now = t0.Add(10 * time.Minute)
+	ts = ts.Add(10 * time.Minute)
+	consume(t, c, sink, h2(ts, "172.17.0.6",
+		tEdge{role: "server", proto: "tcp", local: "172.17.0.6", peer: "10.0.0.11", port: 80, svc: "web", comm: "web", opened: 1},
+		tEdge{role: "server", proto: "tcp", local: "172.17.0.5", peer: "10.0.0.99", port: 80, svc: "api", comm: "api", opened: 1}))
+	out := consume(t, c, sink, tAgent{host: "k", addrs: []string{"10.0.0.11"}, time: ts,
+		edges: []tEdge{{role: "client", proto: "tcp", local: "10.0.0.11", peer: "10.0.0.2", port: 8080,
+			svc: "curl", comm: "curl", opened: 1}}})
+	// The values of the first interval of the series do not matter here.
+	got := slices.Collect(maps.Keys(peersOf(out, "curl", roleClient)))
+	if !slices.Equal(got, []string{"web:80"}) {
+		t.Errorf("client peers = %v, want web:80", got)
+	}
+}
+
+// TestLearnedFoldedVirtual: the agent of the client folds the virtual
+// address of a DNAT that another host learned; the server side counts the
+// connections, which the client side counts as external.
+func TestLearnedFoldedVirtual(t *testing.T) {
+	c, _, sink, _ := testConnector(t, nil)
+	ts := t0.Add(15 * time.Second)
+	consume(t, c, sink, tAgent{host: "lb", addrs: []string{"10.0.2.1"}, time: ts,
+		translations: []tTranslation{{client: "10.0.0.11", virtual: "192.0.2.10", vport: 80, backend: "10.0.1.20", bport: 80}}})
+	consume(t, c, sink, tAgent{host: "app", addrs: []string{"10.0.0.11"}, time: ts, fold: foldAll, internal: []string{"10.0.0.0/8"},
+		edges: []tEdge{{role: "client", proto: "tcp", local: "10.0.0.11", peer: "0.0.0.0", folded: true, port: 80,
+			svc: "app", comm: "app", opened: 1}}})
+	out := consume(t, c, sink, tAgent{host: "web-01", addrs: []string{"10.0.1.20"}, time: ts,
+		edges: []tEdge{{role: "server", proto: "tcp", local: "10.0.1.20", peer: "10.0.0.11", port: 80,
+			svc: "web", comm: "web", opened: 4}}})
+	for _, s := range find(out, metricConnOpened, "web", "*", roleServer, "") {
+		if s.agent {
+			t.Errorf("server side %s:%d has shawk.peer.agent, but the client folds the virtual address", s.peer, s.port)
+		}
 	}
 }
