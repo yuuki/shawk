@@ -3,6 +3,7 @@ package shawkconnector
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/netip"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"go.opentelemetry.io/collector/confmap"
 	"go.yaml.in/yaml/v3"
 )
@@ -183,19 +185,45 @@ func collectSQL(path string, v any, out map[string]string) {
 	}
 }
 
-// expandMacros replaces the Grafana macros and variables the queries use.
+// dashboardVars are the values of the dashboard variables the queries are
+// run with.
+var dashboardVars = map[string][]string{
+	"service":   {"postgres", "shop/app"},
+	"src":       {"shop/app"},
+	"dst":       {"postgres"},
+	"direction": {"both"},
+	"depth":     {"2"},
+}
+
+var sqlstringVar = regexp.MustCompile(`\$\{(\w+):sqlstring\}`)
+
+// expandVars replaces ${name:sqlstring} of the variables in vars like
+// Grafana does: each value in single quotes, with ' doubled and " escaped
+// by a backslash, and the values separated by commas.
+func expandVars(sql string, vars map[string][]string) string {
+	escape := strings.NewReplacer("'", "''", `"`, `\"`)
+	return sqlstringVar.ReplaceAllStringFunc(sql, func(s string) string {
+		values, ok := vars[sqlstringVar.FindStringSubmatch(s)[1]]
+		if !ok {
+			return s
+		}
+		quoted := make([]string, len(values))
+		for i, v := range values {
+			quoted[i] = "'" + escape.Replace(v) + "'"
+		}
+		return strings.Join(quoted, ",")
+	})
+}
+
+// expandMacros replaces the Grafana macros the queries use, and their
+// variables with the values of dashboardVars.
 func expandMacros(sql string, from, to time.Time) string {
 	ts := func(t time.Time) string { return "'" + t.UTC().Format(time.RFC3339) + "'::timestamptz" }
 	r := strings.NewReplacer(
 		"$__timeFrom()", ts(from),
 		"$__timeTo()", ts(to),
-		"${service:singlequote}", "'postgres', 'shop/app'",
-		"${src:singlequote}", "'shop/app'",
-		"${dst:singlequote}", "'postgres'",
-		"'$direction'", "'both'",
-		"$depth", "2",
 	)
-	sql = r.Replace(sql)
+	sql = r.Replace(expandVars(sql, dashboardVars))
 	sql = regexp.MustCompile(`\$__timeFilter\((\w+)\)`).ReplaceAllString(sql, "$1 BETWEEN "+ts(from)+" AND "+ts(to))
 	sql = regexp.MustCompile(`\$__timeGroupAlias\((\w+), '1h'\)`).ReplaceAllString(sql, "date_bin('1 hour', $1, 'epoch') AS time")
 	return sql
@@ -445,8 +473,7 @@ func TestPGDetailsFilterPeerCIDRs(t *testing.T) {
 		t.Fatal("no query")
 	}
 	now := time.Now()
-	sql := expandMacros(strings.NewReplacer("${src:singlequote}", "'web'", "${dst:singlequote}", "'office-lan'").Replace(q),
-		now.Add(-6*time.Hour), now)
+	sql := expandMacros(expandVars(q, map[string][]string{"src": {"web"}, "dst": {"office-lan"}}), now.Add(-6*time.Hour), now)
 	if got := queryStrings(t, conn, sql); len(got) != 1 {
 		t.Errorf("rows = %v", got)
 	}
@@ -499,8 +526,7 @@ func TestPGMapWalkHubs(t *testing.T) {
 	}
 	q := packagedSQL(t)["shawk-map.json/shawk / Dependency map/Dependencies of $service/nodes#0"]
 	now := time.Now()
-	sql := strings.Replace(expandMacros(strings.ReplaceAll(q, "$depth", "5"), now.Add(-6*time.Hour), now),
-		"'postgres', 'shop/app'", "'s1'", 1)
+	sql := expandMacros(expandVars(q, map[string][]string{"service": {"s1"}, "depth": {"5"}}), now.Add(-6*time.Hour), now)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	start := time.Now()
@@ -520,5 +546,61 @@ func TestPGMapWalkHubs(t *testing.T) {
 	t.Logf("%d nodes in %s", n, d)
 	if d > 3*time.Second || n != 302 {
 		t.Errorf("%d nodes in %s", n, d)
+	}
+}
+
+// TestPGMapCraftedVariables: the values of the variables of the map, which
+// a link can set (?var-service=, ?var-direction=, ?var-depth=), stay
+// values: a quote does not end a string, and a depth that is not a number
+// fails the query.
+func TestPGMapCraftedVariables(t *testing.T) {
+	_, conn := migratedDB(t)
+	f := fixture{t, conn}
+	f.host("db-01", "postgres")
+	f.host("app-01", "app")
+	f.conn2("app-01", "app", "10.0.0.11", "db-01", "postgres", "10.0.0.10", 5432, "now()-interval '1 hour'", "now()")
+	all := packagedSQL(t)
+	const nodes = "shawk-map.json/shawk / Dependency map/Dependencies of $service/nodes#0"
+	queries := []string{nodes,
+		"shawk-map.json/shawk / Dependency map/Dependencies of $service/edges#0",
+		"shawk-map.json/shawk / Dependency map/Edges/A#0"}
+	now := time.Now()
+	// run runs a query with the values of vars, or else those of a walk
+	// from postgres, and returns the first column.
+	run := func(name string, vars map[string][]string) ([]string, error) {
+		sql := expandVars(expandVars(all[name], vars), map[string][]string{"service": {"postgres"}, "direction": {"both"}, "depth": {"2"}})
+		rows, err := conn.Query(context.Background(), expandMacros(sql, now.Add(-6*time.Hour), now))
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		var out []string
+		for rows.Next() {
+			vals, err := rows.Values()
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, fmt.Sprint(vals[0]))
+		}
+		return out, rows.Err()
+	}
+	if got, err := run(nodes, nil); err != nil || !slices.Equal(got, []string{"app", "postgres"}) {
+		t.Fatalf("nodes = %v, %v; want app and postgres", got, err)
+	}
+	// Quoted, the values name neither a direction nor a service.
+	if got, err := run(nodes, map[string][]string{"direction": {"downstream' OR 'x' = 'x"}}); err != nil || !slices.Equal(got, []string{"postgres"}) {
+		t.Errorf("crafted direction: nodes = %v, %v; want postgres", got, err)
+	}
+	if got, err := run(nodes, map[string][]string{"service": {`postgres' OR "x" = 'x`}}); err != nil || len(got) != 0 {
+		t.Errorf("crafted service: nodes = %v, %v; want none", got, err)
+	}
+	for _, depth := range []string{"1 OR true", "(SELECT 9)", "1) SELECT 1 --", "1; SELECT 1"} {
+		for _, name := range queries {
+			got, err := run(name, map[string][]string{"depth": {depth}})
+			var pgErr *pgconn.PgError
+			if !errors.As(err, &pgErr) || pgErr.Code != "22P02" {
+				t.Errorf("%s: depth %q: %v, %v; want invalid input syntax for type integer", name, depth, got, err)
+			}
+		}
 	}
 }
