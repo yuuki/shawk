@@ -34,13 +34,19 @@ type Resource struct {
 // AgentStatus are the metrics of the agent itself.
 type AgentStatus struct {
 	// Started is when the agent started; its counters start then.
-	Started        time.Time
-	SegmentStart   time.Time
-	NetNSScope     string // "all" or the inode of the traced namespace
-	UDPTraced      bool
-	FlowsDropped   uint64 // cumulative
-	ExportFailures uint64 // cumulative
-	BPFPrograms    []BPFProgram
+	Started      time.Time
+	SegmentStart time.Time
+	NetNSScope   string // "all" or the inode of the traced namespace
+	UDPTraced    bool
+	FlowsDropped uint64 // cumulative
+	// CgroupEventsDropped counts the cgroups created whose event the
+	// kernel dropped (cumulative).
+	CgroupEventsDropped uint64
+	// ContainerReadsDrops counts the reads of the state of containers of
+	// new cgroups not queued because the queue was full (cumulative).
+	ContainerReadsDrops uint64
+	ExportFailures      uint64 // cumulative
+	BPFPrograms         []BPFProgram
 }
 
 // BPFProgram is the run time statistic of a BPF program.
@@ -210,6 +216,8 @@ func addAgent(b *builder, st *AgentStatus) {
 	}
 	b.gauge(MetricAgentUDPTraced, "", udp, nil)
 	b.sum(MetricAgentFlowsDropped, "{update}", true, st.Started, st.FlowsDropped, nil)
+	b.sum(MetricAgentCgroupsDropped, "{event}", true, st.Started, st.CgroupEventsDropped, nil)
+	b.sum(MetricAgentReadsDropped, "{read}", true, st.Started, st.ContainerReadsDrops, nil)
 	b.sum(MetricAgentExportFailures, "{request}", true, st.Started, st.ExportFailures, nil)
 	for _, p := range st.BPFPrograms {
 		attrs := []*commonpb.KeyValue{str(AttrBPFProgram, p.Name)}

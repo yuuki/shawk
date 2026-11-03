@@ -385,10 +385,25 @@ type Containers struct {
 	// root is prepended to the paths of the state; replaced in tests.
 	root string
 
-	mu         sync.Mutex
-	cache      map[string]containerEntry
-	podman     podmanIndex
+	// mu guards cache and reading only: files are read without it, so that
+	// a lookup of a cached container does not wait for a read (#126).
+	mu      sync.Mutex
+	cache   map[string]containerEntry
+	reading map[string]*containerRead
+
+	podmanMu sync.Mutex // guards podman, read again when its lists change
+	podman   podmanIndex
+
+	dockerOnce sync.Once
 	dockerRoot string
+}
+
+// containerRead is a read of the state of a container in flight, which
+// lookups of the same id wait for instead of reading it again.
+type containerRead struct {
+	done  chan struct{}
+	c     *Container
+	found bool
 }
 
 type containerEntry struct {
@@ -418,22 +433,36 @@ type fileStamp struct {
 func NewContainers() *Containers { return newContainers("") }
 
 func newContainers(root string) *Containers {
-	return &Containers{root: root, cache: map[string]containerEntry{}}
+	return &Containers{root: root, cache: map[string]containerEntry{}, reading: map[string]*containerRead{}}
 }
 
 // Lookup returns the container of a runtime with an id. runtime is "" when
 // the cgroup does not tell it; every runtime is tried then. found is false
 // when its state cannot be read; the container then has only its id.
+// Lookups of the same id share one read; the files are read without
+// holding the cache, so that lookups of other containers do not wait.
 func (c *Containers) Lookup(runtime, id string) (ctr *Container, found bool) {
 	now := time.Now()
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if e, ok := c.cache[id]; ok && (e.found || now.Sub(e.read) < missTTL) {
 		e.used = now
 		c.cache[id] = e
+		c.mu.Unlock()
 		return e.c, e.found
 	}
-	ctr, found = c.read(runtime, id)
+	if rd, ok := c.reading[id]; ok {
+		c.mu.Unlock()
+		<-rd.done
+		return rd.c, rd.found
+	}
+	rd := &containerRead{done: make(chan struct{})}
+	c.reading[id] = rd
+	c.mu.Unlock()
+
+	rd.c, rd.found = c.read(runtime, id)
+
+	c.mu.Lock()
+	delete(c.reading, id)
 	if len(c.cache) >= maxContainers {
 		for k, e := range c.cache {
 			if now.Sub(e.used) > containerTTL || !e.found {
@@ -444,8 +473,10 @@ func (c *Containers) Lookup(runtime, id string) (ctr *Container, found bool) {
 			clear(c.cache)
 		}
 	}
-	c.cache[id] = containerEntry{c: ctr, found: found, read: now, used: now}
-	return ctr, found
+	c.cache[id] = containerEntry{c: rd.c, found: rd.found, read: now, used: now}
+	c.mu.Unlock()
+	close(rd.done)
+	return rd.c, rd.found
 }
 
 // expire forgets the containers not looked up for containerTTL.
@@ -505,17 +536,16 @@ func (c *Containers) readFile(path string) []byte {
 // dockerDataRoot returns the data root of Docker: data-root in
 // /etc/docker/daemon.json, or /var/lib/docker.
 func (c *Containers) dockerDataRoot() string {
-	if c.dockerRoot != "" {
-		return c.dockerRoot
-	}
-	c.dockerRoot = "/var/lib/docker"
-	var cfg struct {
-		DataRoot string `json:"data-root"`
-	}
-	if b := c.readFile("/etc/docker/daemon.json"); b != nil && json.Unmarshal(b, &cfg) == nil &&
-		filepath.IsAbs(cfg.DataRoot) {
-		c.dockerRoot = filepath.Clean(cfg.DataRoot)
-	}
+	c.dockerOnce.Do(func() {
+		c.dockerRoot = "/var/lib/docker"
+		var cfg struct {
+			DataRoot string `json:"data-root"`
+		}
+		if b := c.readFile("/etc/docker/daemon.json"); b != nil && json.Unmarshal(b, &cfg) == nil &&
+			filepath.IsAbs(cfg.DataRoot) {
+			c.dockerRoot = filepath.Clean(cfg.DataRoot)
+		}
+	})
 	return c.dockerRoot
 }
 
@@ -632,6 +662,8 @@ var storageRoots = []string{"/var/lib/containers/storage", "/run/containers/stor
 // by id: containers.json lists the containers, volatile-containers.json
 // those removed when they stop (podman run --rm).
 func (c *Containers) podmanNames() map[string]string {
+	c.podmanMu.Lock()
+	defer c.podmanMu.Unlock()
 	ix := &c.podman
 	stamps := map[string]fileStamp{}
 	for _, root := range storageRoots {
