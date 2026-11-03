@@ -3,9 +3,8 @@
 Status: phase 1 (§3.1–§3.4, static translations in the configuration of
 the connector) is implemented (2026-11-02, branch
 `claude/translations-107`, pull request #130). Phase 2 (§3.5, translations
-learned from conntrack) is designed in detail (2026-11-03, branch
-`claude/learned-translations-107`) and not implemented yet; phase 3 (§3.6,
-docker-proxy) is not. It answers issue #107. The design is in
+learned from conntrack) is implemented (2026-11-03, branch
+`claude/learned-translations-107`); phase 3 (§3.6, docker-proxy) is not. It answers issue #107. The design is in
 `docs/design.md` §5.4, §6, §7 and §10. Two adversarial reviews changed the
 implementation of phase 1 (§10).
 
@@ -469,16 +468,22 @@ connection that conntrack tracks, whatever made the translation:
   only, so a translation used only by long-lived connections that do not
   fit may end early.
 - **Agent:** one walk of `xlats` (at most `-max-flows` keys) per interval.
-- **PostgreSQL:** learned rows are joined with the client and the server
-  edges by hash; without learned rows the views take the time of migration
-  12. To be measured with a million edges and 100,000 learned rows
-  (§7).
+- **PostgreSQL** (a million synthetic edges, 1,000 hosts, PostgreSQL 16,
+  `work_mem` 4 MB, no JIT): without learned rows, the view and the function
+  take the time of migration 12 within noise (all history 2.1–2.3 s, 6
+  hours 0.37–0.42 s). With 100,000 learned rows that match 100,000 pairs
+  (12,500 of them in the 6 hours), all history takes 4.9–5.1 s and 6 hours
+  0.70–0.73 s. `direct` is computed per pair through the index of server
+  edges: a first version computed it per client edge in a CTE that the
+  planner inlined into a nested loop over every pair, and did not finish
+  in 10 minutes.
 
 #### 3.5.8 Compatibility
 
 - Migration 13 adds the table and replaces `dependencies_between`,
-  `dependencies` and `shawk.prune` in place; `grants.sql` need not be run
-  again (the views keep their owners and grants).
+  `dependencies` and `shawk.prune` in place; run `grants.sql` again, so
+  that the connector role writes the new table (the views keep their
+  grants).
 - The unit of the agent allows `perf_event_open`; a unit copied from an
   older package learns no translations and logs why.
 - A configuration with a translation whose name starts with `~` is

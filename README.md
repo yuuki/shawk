@@ -62,7 +62,8 @@ See [docs/design.md](docs/design.md) for the design.
   `CAP_DAC_READ_SEARCH` (to read `/proc` of other processes). UDP tracing
   additionally needs BPF trampolines (fentry), available on x86_64 and on
   arm64 since Linux 6.0 (not on Rocky Linux 9 on arm64); without them only
-  TCP is traced.
+  TCP is traced. Learning translations of addresses from conntrack needs
+  kprobes (`CONFIG_KPROBES`), which the unit allows with `perf_event_open`.
 * PostgreSQL 14 or later.
 * Prometheus 3 with the OTLP receiver (`--web.enable-otlp-receiver`), or
   another store that accepts OTLP metrics.
@@ -95,10 +96,11 @@ Run the agent on every host you want to observe:
 | `-otlp-protocol` | `grpc` (default) or `http/protobuf` |
 | `-otlp-ca-file` | CA bundle that verifies the collector |
 | `-otlp-cert-file`, `-otlp-key-file` | client certificate for a collector that requires one (the example configuration does) |
-| `-max-series-per-request` | dependencies and listeners per request (1000); a request also stays below 3 MiB, and a busy host sends several per interval |
+| `-max-series-per-request` | dependencies, listeners and translations per request (1000); a request also stays below 3 MiB, and a busy host sends several per interval |
 | `-service-name-fallback` | name of a service without `OTEL_SERVICE_NAME`: `exe` (executable name, as OBI) or `unit` (systemd unit, or the name of the container); a container of Kubernetes is named after the workload of its pod either way |
 | `-interval`, `-idle-ttl` | export interval (15 s, at most 1 min) and how long a dependency is sent after its last activity (15 min) |
 | `-netns`, `-max-flows`, `-bpf-stats` | network namespaces to trace, capacity of the in-kernel flow table (also sizing the tables of listening ports), BPF run time statistics |
+| `-learn-translations` | learn the translations of addresses the host makes (Docker published ports and masquerade, kube-proxy, IPVS, any DNAT or SNAT) from conntrack, once nf_conntrack is loaded (default `true`); see [the design](docs/design.md#37-translations-of-addresses-learned-from-conntrack) |
 | `-internal-peers`, `-fold-external` | address ranges whose peers are kept exact (`private`: the ranges not routed on the Internet), and which flows fold the other peers into one dependency per local endpoint: `in` (the clients of local servers, default), `all` or `none`; see [the design](docs/design.md#36-folding-external-peers) |
 
 Services that share an executable on a host (`ruby`, `python`, `java`,
@@ -142,7 +144,9 @@ that count each dependency once; `packaging/grafana/` has data sources,
 dashboards and alert rules.
 
 Connections through a load balancer, a virtual address or a proxy without an
-agent end at its address, on one side only, unless `translations` in the
+agent end at its address, on one side only, unless the agent of the host
+that translates the addresses learns the translation from conntrack (Docker
+published ports, kube-proxy, IPVS, NAT rules), or `translations` in the
 configuration of the connector describes it: its virtual addresses, its
 backends and, if it replaces the addresses of the clients, the addresses the
 backends see them at ([design §5.4](docs/design.md#54-translations-of-addresses)).

@@ -269,29 +269,6 @@ lp AS (
     AND s.last_seen >= since - interval '15 minutes' AND s.first_seen <= until + interval '15 minutes'
   GROUP BY lc.id, s.id
 ),
--- direct of the client edges matched through learned translations, as for
--- static ones.
-ld AS (
-  SELECT c.id AS cid,
-         (SELECT range_agg(tstzrange(least(s.first_seen, s.last_seen) - interval '2 minutes',
-                                     greatest(s.first_seen, s.last_seen) + interval '2 minutes', '[]'))
-          FROM shawk.edges s
-          WHERE s.role = 'server' AND s.proto = c.proto AND s.local_addr = c.remote_addr AND s.port = c.port
-            AND s.remote_addr = c.local_addr
-            AND s.last_seen >= since - interval '15 minutes' AND s.first_seen <= until + interval '15 minutes'
-            AND CASE WHEN s.remote_addr << inet '127.0.0.0/8' OR s.remote_addr = inet '::1'
-                        THEN s.host_id || '/' || s.netns::text
-                      WHEN s.local_addr IN (SELECT addr FROM shared) OR s.remote_addr IN (SELECT addr FROM shared)
-                        THEN s.host_id
-                      ELSE '' END
-              = CASE WHEN c.remote_addr << inet '127.0.0.0/8' OR c.remote_addr = inet '::1'
-                        THEN c.host_id || '/' || c.netns::text
-                      WHEN c.local_addr IN (SELECT addr FROM shared) OR c.remote_addr IN (SELECT addr FROM shared)
-                        THEN c.host_id
-                      ELSE '' END) AS direct
-  FROM (SELECT DISTINCT cid FROM lp) x
-  JOIN shawk.edges c ON c.id = x.cid
-),
 -- The client and server edges a translation may match: on the port of the
 -- backend or the port of the client edge, with times that overlap; through
 -- a translation without sources, with the address of the client. p_first
@@ -328,14 +305,30 @@ pairs AS (
     AND sb.first_seen <= cv.last_seen + interval '2 minutes'
   UNION ALL
   SELECT c.id, c.host_id, hc.hostname, pc.service_name, pc.unit, c.local_addr, c.remote_addr, c.port,
-         c.first_seen, c.last_seen, ld.direct,
+         c.first_seen, c.last_seen,
+         -- direct, as for the client edges of static translations.
+         (SELECT range_agg(tstzrange(least(d.first_seen, d.last_seen) - interval '2 minutes',
+                                     greatest(d.first_seen, d.last_seen) + interval '2 minutes', '[]'))
+          FROM shawk.edges d
+          WHERE d.role = 'server' AND d.proto = c.proto AND d.local_addr = c.remote_addr AND d.port = c.port
+            AND d.remote_addr = c.local_addr
+            AND d.last_seen >= since - interval '15 minutes' AND d.first_seen <= until + interval '15 minutes'
+            AND CASE WHEN d.remote_addr << inet '127.0.0.0/8' OR d.remote_addr = inet '::1'
+                        THEN d.host_id || '/' || d.netns::text
+                      WHEN d.local_addr IN (SELECT addr FROM shared) OR d.remote_addr IN (SELECT addr FROM shared)
+                        THEN d.host_id
+                      ELSE '' END
+              = CASE WHEN c.remote_addr << inet '127.0.0.0/8' OR c.remote_addr = inet '::1'
+                        THEN c.host_id || '/' || c.netns::text
+                      WHEN c.local_addr IN (SELECT addr FROM shared) OR c.remote_addr IN (SELECT addr FROM shared)
+                        THEN c.host_id
+                      ELSE '' END),
          s.id, s.host_id, hs.hostname, ps.service_name, ps.unit, s.local_addr, s.port,
          s.first_seen, s.last_seen,
          c.proto, '~learned'::text, s.remote_addr <> c.local_addr,
          least(greatest(c.first_seen, s.first_seen, lp.l_first), least(c.last_seen, s.last_seen, lp.l_last)),
          greatest(greatest(c.first_seen, s.first_seen, lp.l_first), least(c.last_seen, s.last_seen, lp.l_last))
   FROM lp
-  JOIN ld ON ld.cid = lp.cid
   JOIN shawk.edges c ON c.id = lp.cid
   JOIN shawk.processes pc ON pc.id = c.process_id
   JOIN shawk.hosts hc ON hc.id = c.host_id
@@ -597,28 +590,6 @@ lp AS (
     AND lc.c_first <= s.last_seen + interval '2 minutes'
   GROUP BY lc.id, s.id
 ),
--- direct of the client edges matched through learned translations, as for
--- static ones.
-ld AS (
-  SELECT c.id AS cid,
-         (SELECT range_agg(tstzrange(least(s.first_seen, s.last_seen) - interval '2 minutes',
-                                     greatest(s.first_seen, s.last_seen) + interval '2 minutes', '[]'))
-          FROM shawk.edges s
-          WHERE s.role = 'server' AND s.proto = c.proto AND s.local_addr = c.remote_addr AND s.port = c.port
-            AND s.remote_addr = c.local_addr
-            AND CASE WHEN s.remote_addr << inet '127.0.0.0/8' OR s.remote_addr = inet '::1'
-                        THEN s.host_id || '/' || s.netns::text
-                      WHEN s.local_addr IN (SELECT addr FROM shared) OR s.remote_addr IN (SELECT addr FROM shared)
-                        THEN s.host_id
-                      ELSE '' END
-              = CASE WHEN c.remote_addr << inet '127.0.0.0/8' OR c.remote_addr = inet '::1'
-                        THEN c.host_id || '/' || c.netns::text
-                      WHEN c.local_addr IN (SELECT addr FROM shared) OR c.remote_addr IN (SELECT addr FROM shared)
-                        THEN c.host_id
-                      ELSE '' END) AS direct
-  FROM (SELECT DISTINCT cid FROM lp) x
-  JOIN shawk.edges c ON c.id = x.cid
-),
 -- The client and server edges a translation may match: on the port of the
 -- backend or the port of the client edge, with times that overlap; through
 -- a translation without sources, with the address of the client. p_first
@@ -655,14 +626,29 @@ pairs AS (
     AND sb.first_seen <= cv.last_seen + interval '2 minutes'
   UNION ALL
   SELECT c.id, c.host_id, hc.hostname, pc.service_name, pc.unit, c.local_addr, c.remote_addr, c.port,
-         c.first_seen, c.last_seen, ld.direct,
+         c.first_seen, c.last_seen,
+         -- direct, as for the client edges of static translations.
+         (SELECT range_agg(tstzrange(least(d.first_seen, d.last_seen) - interval '2 minutes',
+                                     greatest(d.first_seen, d.last_seen) + interval '2 minutes', '[]'))
+          FROM shawk.edges d
+          WHERE d.role = 'server' AND d.proto = c.proto AND d.local_addr = c.remote_addr AND d.port = c.port
+            AND d.remote_addr = c.local_addr
+            AND CASE WHEN d.remote_addr << inet '127.0.0.0/8' OR d.remote_addr = inet '::1'
+                        THEN d.host_id || '/' || d.netns::text
+                      WHEN d.local_addr IN (SELECT addr FROM shared) OR d.remote_addr IN (SELECT addr FROM shared)
+                        THEN d.host_id
+                      ELSE '' END
+              = CASE WHEN c.remote_addr << inet '127.0.0.0/8' OR c.remote_addr = inet '::1'
+                        THEN c.host_id || '/' || c.netns::text
+                      WHEN c.local_addr IN (SELECT addr FROM shared) OR c.remote_addr IN (SELECT addr FROM shared)
+                        THEN c.host_id
+                      ELSE '' END),
          s.id, s.host_id, hs.hostname, ps.service_name, ps.unit, s.local_addr, s.port,
          s.first_seen, s.last_seen,
          c.proto, '~learned'::text, s.remote_addr <> c.local_addr,
          least(greatest(c.first_seen, s.first_seen, lp.l_first), least(c.last_seen, s.last_seen, lp.l_last)),
          greatest(greatest(c.first_seen, s.first_seen, lp.l_first), least(c.last_seen, s.last_seen, lp.l_last))
   FROM lp
-  JOIN ld ON ld.cid = lp.cid
   JOIN shawk.edges c ON c.id = lp.cid
   JOIN shawk.processes pc ON pc.id = c.process_id
   JOIN shawk.hosts hc ON hc.id = c.host_id
