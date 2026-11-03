@@ -1,11 +1,15 @@
 ## Unreleased
 
 **Upgrading from v0.8.0.** The PostgreSQL schema is now one migration,
-`0001_schema.sql`, and `shawk-migrate` (or the connector with
-`postgres.migrate`) refuses a database created by v0.8.0 or an earlier
-development version: drop the schemas `shawk` and `shawk_v1`, then run
-`shawk-migrate` and `grants.sql` again. Upgrade the agents and the
-connectors together.
+`0001_schema.sql`. `shawk-migrate` and the connector, whether it migrates
+or not, refuse a database created by v0.8.0 or an earlier development
+version, which must be created again. Dropping its schemas deletes the
+history they hold: back them up first if you need it (`pg_dump -n shawk -n
+shawk_v1`), then `DROP SCHEMA shawk, shawk_v1 CASCADE` (which also drops
+views of your own on them), and run `shawk-migrate` and `grants.sql`
+again. Upgrade the agents and the connectors together. External peers are
+now folded by default, and the Prometheus `job` of processes in pods
+changes; see below.
 
 ### Added
 
@@ -17,7 +21,10 @@ connectors together.
   (the application gave up first) or `_OTHER`. The agent sends them on TCP
   client edges as `shawk.tcp.handshake` (a histogram from 100 µs to 3 s),
   `shawk.tcp.syn_retransmits` and `shawk.connection.failed.by_reason`
-  (with `error.type`); the connector forwards them per dependency, with the
+  (with `error.type`); the connector forwards them per dependency as
+  `shawk_tcp_handshake_seconds_sum` and `_count`,
+  `shawk_tcp_syn_retransmits_total` and
+  `shawk_connection_failed_by_reason_total{error_type}`, with the
   recording rules `shawk:dependency_handshake_seconds_sum:rate5m`,
   `…_count:rate5m`, `shawk:dependency_syn_retransmits:rate5m` and
   `shawk:dependency_connection_failures_by_reason:rate5m`, and panels in
@@ -43,9 +50,15 @@ connectors together.
   to a virtual address with the server edges at its backends, over the
   period both were active in; the last columns `virtual_addr`,
   `virtual_port` and `translation` (`~learned` for a learned one) tell
-  what the client connected to. In Prometheus, a client edge to a virtual
-  address is named after the backend, and a server edge behind a relay
-  that keeps the addresses of the clients after the client.
+  what the client connected to; on these rows, the observation of a side
+  whose edge outlives the row is NULL, so that a stopped agent does not
+  make a dependency disappear. In Prometheus, the peer of a client edge to
+  a virtual address is the service at a backend, with the `server.port` of
+  the backend (on hosts with Docker or kube-proxy, where translations are
+  learned by default, the `server_port` of such series changes), and the
+  peer of a server edge behind a relay that keeps the addresses of the
+  clients is the client service. A translation of the configuration may
+  not have a name starting with `~`.
 * **Folding of external peers** (#96): the kernel folds the peers outside
   the internal ranges of the host into one dependency per local endpoint,
   so that the clients of an internet-facing server do not fill the flow
@@ -57,7 +70,11 @@ connectors together.
   `shawk.peer.folded=true`; the connector stores its peer as the network
   `0.0.0.0/0` or `::/0` and names it `~external`, and warns when an agent
   folds a host that runs an agent, or the peers of a range of
-  `peer_cidrs`.
+  `peer_cidrs`. Folding is on by default, so the address of each external
+  client of a local server is no longer recorded: set `-fold-external=none`
+  where it is needed. A fleet that uses public addresses internally must
+  add them to `-internal-peers`, and so must one whose `peer_cidrs` name
+  public ranges, whose peers are otherwise named `~external`.
 * **Partly observed periods**: the periods in which an agent dropped flows
   (`shawk.partial_observations`, `shawk_v1.partly_observed()`), so that the
   absence of a dependency over them is not taken for disuse. The fleet,
@@ -89,11 +106,13 @@ connectors together.
   (`~kernel:nfs`, `~kernel:iscsi`, …, `~kernel:nfsd`), instead of the kernel
   worker that opened them.
 * **Losses of new cgroups are visible** (#126):
-  `shawk.agent.cgroup_events.dropped` counts the new cgroups the kernel did
-  not report because the agent read too slowly, and
-  `shawk.agent.container_reads.dropped` the containers not queued to be
-  read; the Prometheus alerts `ShawkCgroupEventsDropped` and
-  `ShawkContainerReadsDropped` fire when they increase.
+  `shawk.agent.cgroup_events.dropped`
+  (`shawk_agent_cgroup_events_dropped_total`) counts the new cgroups the
+  kernel did not report because the agent read too slowly, and
+  `shawk.agent.container_reads.dropped`
+  (`shawk_agent_container_reads_dropped_total`) the containers not queued
+  to be read; the Prometheus alerts `ShawkCgroupEventsDropped` (warning)
+  and `ShawkContainerReadsDropped` (info) fire when they increase.
 * The systemd units are sandboxed: the agent keeps only `CAP_BPF`,
   `CAP_PERFMON`, `CAP_SYS_ADMIN`, `CAP_SYS_PTRACE` and
   `CAP_DAC_READ_SEARCH`, and both units filter system calls and address
@@ -105,18 +124,27 @@ connectors together.
   (`THIRD_PARTY_NOTICES`).
 * The BPF programs are tested on the kernels of Rocky Linux 9.6 (x86_64,
   aarch64) and upstream 5.14 and 5.15 in virtual machines
-  (`make vm-test`, which needs `xz`), and on an arm64 runner.
+  (`make vm-test`, which needs `xz` for Rocky Linux and `dpkg-deb` for the
+  upstream kernels), and on an arm64 runner.
 
 ### Changed
 
-* The PostgreSQL schema is one migration (see above). The whole-history
-  views `dependencies`, `graph_edges`, `graph_nodes` and
-  `dependency_changes` are the functions over a period called over all
-  time, with the same columns; the internal view
-  `shawk.service_dependencies` is gone. `shawk_v1.agents.peer_fold` is
-  never NULL.
-* `shawk` exits with 1 when a command fails and with 2 on usage errors (2
-  for both before).
+* The PostgreSQL schema is one migration (see above). Its tables, views
+  and functions are those of the migrations it replaces, with
+  `shawk.schema_history()` for connectors that do not migrate;
+  `shawk_v1.agents.peer_fold` is never NULL.
+* **The Prometheus `job` of processes in pods** is `<namespace>/<name>`, as
+  OBI names them (#104, #124): the name is the workload of the pod as
+  above, or `OTEL_SERVICE_NAME` when the process sets it, and the namespace
+  that of the pod unless `OTEL_RESOURCE_ATTRIBUTES` sets one. The `job` of
+  a pod changes from the executable (or `billing`, with
+  `OTEL_SERVICE_NAME=billing`) to `<namespace>/<workload>` (or
+  `<namespace>/billing`); pods of Helm charts are named after their labels,
+  e.g. `ingress-nginx/ingress-nginx` rather than
+  `ingress-nginx/ingress-nginx-controller`. Dashboards and alerts that
+  select pods by `job` need the new names.
+* `shawk` exits with 2 on usage errors, including every invalid value of
+  a flag, and with 1 when a command fails (2 for both before).
 * The state of a container is read on a worker rather than on the
   goroutine that drains the events of new cgroups, so that a burst of new
   containers on a busy host of Podman or CRI-O does not make the kernel

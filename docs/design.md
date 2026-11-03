@@ -73,7 +73,7 @@ are internal; agent and connector are released together.
 `shawk flows` shows the bundled flows of the local host live, for
 debugging, without a collector: their connections, failures by reason,
 mean handshake, SYN retransmissions, open connections and bytes, or with
-`-json` the flows as JSON lines.
+`-json` one JSON line per interval with its flows and drops.
 
 ## 3. Tracing
 
@@ -406,8 +406,9 @@ module nf_conntrack (`scripts/fetch-module-btf.sh`); for example
 different offset in 5.14. A field that moved is read through flavors, of
 which the kernel must have one: `defer_connect` is a bitfield of
 `inet_sock` before 6.6 and in RHEL 9, and bit 19 of `inet_flags` since,
-which `TestDeferConnectBit` compares with the BTF of the running kernel and
-of `SHAWK_TARGET_BTF`. `TestKernelCompatibility` also compares the
+which `TestDeferConnectBit` compares with the BTF of the running kernel and,
+when `go test` runs with `SHAWK_TARGET_BTF` set (`make compat` runs
+`TestKernelCompatibility` only), of that kernel. `TestKernelCompatibility` also compares the
 parameters of the kernel functions and BTF tracepoints the programs attach
 to with those `BPF_PROG` declares in the source, which the verifier does
 not check for arguments read through `BPF_CORE_READ`;
@@ -533,7 +534,11 @@ after twice as long each time, up to an hour:
   times as many live entries (about 140 bytes each, 9 MiB at the
   default), allocated once nf_conntrack is loaded (on most hosts of RHEL
   9, whose firewalld loads it, and on hosts with Docker or kube-proxy);
-  what does not fit is counted in `shawk.agent.translations.dropped`.
+  what does not fit is counted in `shawk.agent.translations.dropped`. A
+  host that keeps more live translated entries (`nf_conntrack_count`)
+  needs a larger `-max-flows`: an entry that does not fit counts at its
+  confirmation only, so a translation used only by long-lived connections
+  that do not fit may end early.
 - The kprobes of a module that is unloaded and loaded again are not
   attached again; restart the agent then (a module that NAT rules use
   cannot be unloaded). The agent logs why the programs could not be
@@ -790,8 +795,9 @@ replaced.
   reasons of failure it carries. Listeners come first, then translations, then
   server edges, then client edges, so that the connector knows the services
   and translations of the host before it names the peers of its clients; the
-  example pipeline into the connector has no batch processor, which would
-  not keep this order (`packaging/collector/config.yaml`). The last request
+  example pipeline passes the requests of the agents to the connector as
+  they come, without a batch processor (`packaging/collector/config.yaml`).
+  The last request
   carries the metrics of the agent and closes the interval; after a failed
   request the rest of the interval is not sent. Every request has its own
   timeout (two thirds of the interval), which starts once the interval is
@@ -875,7 +881,9 @@ between shows as not observed.
 
 A connector that does not migrate checks at start that the schema is not
 older than it (`shawk.schema_version()`), and waits until it is; it warns
-when the schema is newer than itself. Writes and `shawk.prune()` hold a
+when the schema is newer than itself. It also checks the history of
+migrations (`shawk.schema_history()`) as `shawk-migrate` does, and does not
+write to a schema created before the migrations were consolidated (§6). Writes and `shawk.prune()` hold a
 shared advisory lock that migrations hold exclusively, so that a migration
 waits for them and they wait for it.
 
@@ -1020,12 +1028,12 @@ the service. `service.instance.id` is the host name, and `host.id` and
 - An error of the pipeline after the connector (Prometheus down) is logged
   and not returned to the agent: the request was taken for PostgreSQL.
 - An output series without input is sent until `idle_ttl` and then dropped.
-- This state requires the data of a host to reach the same connector. With
-  several connectors, a collector in front must route each host to one of
-  them, e.g. with the loadbalancing exporter. Routing by resource is not
-  enough: the resource changes with `host.ip`, `service.version` and
-  `shawk.peer.internal`, so a host may move between connectors, which then
-  count its outputs twice (#128).
+- This state requires the data of a host to reach the same connector, so
+  run one connector for the agents of a fleet. Spreading hosts over several
+  connectors, e.g. with the loadbalancing exporter routing by resource, is
+  not reliable yet: the resource of a host changes with `host.ip`,
+  `service.version` and `shawk.peer.internal`, so a host may move between
+  connectors, which then count its outputs twice (#128).
 - The metrics of the agents are forwarded under `job="shawk-agent"`.
 
 | Prometheus name | |
@@ -1072,8 +1080,8 @@ translations:
 ```
 
 Virtual addresses are addresses, not ranges, since the server side looks a
-client edge up by its virtual address; backends and sources (without a port)
-may be ranges. A virtual address and port belongs to one translation at most
+client edge up by its virtual address; backends, with or without a port,
+and sources, which take no port, may be ranges. A virtual address and port belongs to one translation at most
 (a virtual address without a port overlaps every port), and a backend with a
 port needs virtual addresses with a port. Once at start (as soon as the
 schema is ready), the connector writes `peer_cidrs` and the translations to
@@ -1181,9 +1189,10 @@ should have the same: the last one to write wins.
 PostgreSQL 14 or later (multiranges). The schema is bundled with the
 connector as SQL migrations (`collector/shawkconnector/migrations`, from
 `0001_schema.sql` on), applied by `shawk-migrate` or by the connector with
-`postgres.migrate`. Both refuse a database whose schema comes from v0.8.0
-or from a development build before `0001_schema.sql`, with an error that
-says to drop the schemas `shawk` and `shawk_v1` and migrate again.
+`postgres.migrate`. They, and a connector that does not migrate, refuse a
+database whose schema comes from v0.8.0 or from a development build before
+`0001_schema.sql`, with an error that says to drop the schemas `shawk` and
+`shawk_v1` (which deletes the history they hold) and migrate again.
 
 A database is set up with `packaging/postgres/setup.sql` (roles and
 database), then `shawk-migrate`, then `grants.sql` (privileges). Run
@@ -1304,7 +1313,8 @@ retransmissions per connection attempt and the failures by reason of a
 dependency, next to its RTT and retransmissions. The attempts are the
 handshakes and the failures by reason, both of the client side; the ratio
 is a plain number, above 1 when connects time out, and connects with
-`TCP_FASTOPEN_CONNECT`, which have no handshake, raise it.
+`TCP_FASTOPEN_CONNECT`, whose handshakes have no duration and are not
+counted among the attempts, raise it.
 
 The panels of OBI use a minimal interval of a minute: OBI exports every 60
 seconds by default, and a rate over a shorter range would hold one sample.

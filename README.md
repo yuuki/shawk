@@ -138,7 +138,8 @@ psql -v ON_ERROR_STOP=1 -d shawk -U shawk_owner -f packaging/postgres/grants.sql
 ```
 
 Run `shawk-migrate` and then `grants.sql` again when an upgrade brings new
-migrations.
+migrations. A database created by v0.8.0 must be created again: see the
+[CHANGELOG](CHANGELOG.md) and [packaging/](packaging/README.md).
 
 `packaging/collector/config.yaml` receives the agents on `otlp/shawk`
 (port 4327 for gRPC, 4328 for HTTP) and OBI on `otlp` (4317, 4318), both
@@ -232,7 +233,7 @@ shawk:dependency_connection_failures_by_reason:rate5m{dst="postgres", error_type
 ```
 
 `shawk flows` shows the bundled flows of the local host live, without a
-collector, for debugging (`-json` prints JSON lines).
+collector, for debugging (`-json` prints a JSON line per interval).
 
 ## Development
 
@@ -243,7 +244,8 @@ make test       # unit tests of all modules; BPF tests run as root,
                 # PostgreSQL tests with SHAWK_TEST_POSTGRES_DSN=postgres://...
 make test-root  # load the BPF programs into the running kernel (sudo)
 make vm-test    # the tests of test-root in a QEMU virtual machine with
-                # KERNEL=rocky9 (default), 5.14 or 5.15 and ARCH=x86_64 or aarch64
+                # KERNEL=rocky9 (default), 5.14 (x86_64 only) or 5.15 and
+                # ARCH=x86_64 or aarch64
 make e2e        # multi-host test with network namespaces, a collector and
                 # PostgreSQL (sudo, SHAWK_E2E_POSTGRES_DSN)
 make compat     # check the BPF programs against the BTF of the Rocky Linux 9
