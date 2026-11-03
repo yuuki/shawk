@@ -484,8 +484,13 @@ about agents whose peers are folded that way (§5.2).
     with `annotation.`;
   - containerd keeps the labels only in its metadata store (bolt), out of
     reach, and on the bundle of the sandbox only the annotations that
-    `pod_annotations` of the runtime handler lets through (e.g.
-    `pod_annotations = ["resource.opentelemetry.io/*"]`).
+    `pod_annotations` of the runtime handler lets through. With
+    `pod_annotations = ["resource.opentelemetry.io/*",
+    "kubernetes.io/config.source"]` in
+    `[plugins."io.containerd.cri.v1.runtime".containerd.runtimes.runc]`
+    (containerd 2), the annotations that name a service and those that
+    tell a static pod reach the agent; the pods of Helm charts and of Jobs
+    still differ from OBI, as their labels do not.
 
   The top owner of the pod follows OBI (`ownersFrom` in
   `pkg/kube/kubecache/meta/types.go`) when the labels tell it: a pod with
@@ -499,8 +504,8 @@ about agents whose peers are folded that way (§5.2).
   name in lower case (kubelet's default without `--hostname-override`).
   Otherwise the owner is the workload guessed from the name of the pod.
   The `job` of a pod differs from that of OBI when the runtime does not
-  keep the label or annotation that names it (containerd, unless
-  `pod_annotations` lets the annotation through), when the guess from the
+  keep the label or annotation that names it or tells its owner
+  (containerd, unless `pod_annotations` lets the annotation through), when the guess from the
   name is not the owner (a ReplicaSet or a pod without owner whose name
   ends like a generated one, a Deployment whose long name was cut in the
   names of its pods), or when the value of an annotation has characters that

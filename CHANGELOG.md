@@ -9,7 +9,9 @@
   `app.kubernetes.io/part-of`, then the namespace of the pod. The agent
   reads them from the sandbox of the pod kept by CRI-O and cri-dockerd;
   containerd keeps only the annotations its `pod_annotations` lets
-  through. The owner follows OBI too: the pods of a Job are named after
+  through: add `resource.opentelemetry.io/*` and
+  `kubernetes.io/config.source` to it to name pods by annotation and
+  static pods as OBI does. The owner follows OBI too: the pods of a Job are named after
   the Job cut at its last `-` (`data-load` becomes `data`), and static
   pods after their Node. The Prometheus `job` of pods of Helm charts
   changes accordingly (`ingress-nginx/ingress-nginx-controller` becomes
