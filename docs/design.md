@@ -1265,7 +1265,11 @@ names in PostgreSQL and Prometheus match.
 | `dependencies_between(since, until)`, `graph_edges_between`, `graph_nodes_between`, `dependency_changes_between` | the same for the dependencies active in a period. They take the edges active in the period with a margin of 15 minutes before matching them, so a recent window does not scan the history (about 0.3 s instead of 3 s with a million edges) and both sides of a connection are matched at the edges of the period; the dashboards and alerts use them. A dependency appeared in a period when it was first seen in it and is not in `known_dependencies` from before it: one that comes back on new edges (a new container, an hourly job) did not appear |
 
 The connector role writes `shawk` and reads `shawk_v1`; Grafana reads
-`shawk_v1` only (`packaging/postgres`).
+`shawk_v1` only (`packaging/postgres`). Neither may create objects in the
+database: tables or functions in `public`, temporary tables or large
+objects. The read-only transactions and the statement timeout that
+`setup.sql` gives Grafana are defaults that a session can change; the
+privileges are what hold.
 
 ## 7. Counting each dependency once
 

@@ -373,8 +373,10 @@ func keys(m map[string]int) []string {
 	return out
 }
 
-// TestPGGrantsAsOwner runs the documented setup: the schema applied and
-// grants.sql run by the owner of the database, not by a superuser.
+// TestPGGrantsAsOwner runs the documented setup: what setup.sql runs in the
+// database as a superuser, then the schema applied and grants.sql run by
+// the owner of the database, not by a superuser. Neither the connector nor
+// Grafana may then create objects in the database.
 func TestPGGrantsAsOwner(t *testing.T) {
 	_, conn := testDB(t)
 	ctx := context.Background()
@@ -383,17 +385,30 @@ func TestPGGrantsAsOwner(t *testing.T) {
 	conn.QueryRow(ctx, "SELECT current_database()").Scan(&db)
 	execAll(t, conn,
 		"CREATE ROLE "+owner+" NOLOGIN",
-		"GRANT CREATE ON DATABASE "+db+" TO "+owner,
+		"ALTER DATABASE "+db+" OWNER TO "+owner,
 		`DO $$ BEGIN
 		   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'shawk_connector') THEN CREATE ROLE shawk_connector NOLOGIN; END IF;
 		   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'shawk_grafana') THEN CREATE ROLE shawk_grafana NOLOGIN; END IF;
-		 END $$`)
+		 END $$`,
+		// The schema public as PostgreSQL 14 has it: the superuser owns it
+		// and every role may create objects in it.
+		"ALTER SCHEMA public OWNER TO CURRENT_USER",
+		"GRANT CREATE ON SCHEMA public TO PUBLIC")
 	t.Cleanup(func() {
 		conn.Exec(ctx, "RESET ROLE")
+		conn.Exec(ctx, "ALTER DATABASE "+db+" OWNER TO CURRENT_USER")
 		conn.Exec(ctx, "DROP OWNED BY "+owner+" CASCADE")
 		conn.Exec(ctx, "DROP ROLE "+owner)
 	})
-	execAll(t, conn, "SET ROLE "+owner)
+	setup, err := os.ReadFile(filepath.Join(packaging, "postgres/setup.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, inDB, ok := strings.Cut(string(setup), "\n\\connect shawk\n")
+	if !ok {
+		t.Fatal("setup.sql does not connect to the database shawk")
+	}
+	execAll(t, conn, inDB, "SET ROLE "+owner)
 	if _, err := Migrate(ctx, conn); err != nil {
 		t.Fatalf("migrating as the owner: %v", err)
 	}
@@ -430,6 +445,21 @@ func TestPGGrantsAsOwner(t *testing.T) {
 		t.Error("Grafana can read the tables")
 	}
 	execAll(t, conn, "RESET ROLE")
+	// Neither role may create objects of its own, even in a transaction
+	// that is not read-only: no table or function in public, no temporary
+	// table, no large object.
+	for _, role := range []string{"shawk_connector", "shawk_grafana"} {
+		var public, temp, largeObjects bool
+		if err := conn.QueryRow(ctx, `SELECT has_schema_privilege($1, 'public', 'CREATE'),
+		    has_database_privilege($1, current_database(), 'TEMPORARY'),
+		    has_function_privilege($1, 'lo_creat(integer)', 'EXECUTE') OR has_function_privilege($1, 'lo_create(oid)', 'EXECUTE')
+		      OR has_function_privilege($1, 'lo_from_bytea(oid, bytea)', 'EXECUTE')`, role).Scan(&public, &temp, &largeObjects); err != nil {
+			t.Fatal(err)
+		}
+		if public || temp || largeObjects {
+			t.Errorf("%s may create objects in public: %v, temporary tables: %v, large objects: %v", role, public, temp, largeObjects)
+		}
+	}
 }
 
 // TestPGDetailsFilterPeerCIDRs: the dependency details panel finds the
