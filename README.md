@@ -90,7 +90,7 @@ Run the agent on every host you want to observe:
 
 | flag | |
 |---|---|
-| `-otlp-endpoint` | URL of the `otlp/shawk` receiver of the collector; `http://` disables TLS (default `$OTEL_EXPORTER_OTLP_ENDPOINT`, else `http://localhost:4327`, or `http://localhost:4328` with `http/protobuf`) |
+| `-otlp-endpoint` | URL of the `otlp/shawk` receiver of the collector; `http://` disables TLS, and the agent warns when its host is not `localhost` or a loopback address (default `$OTEL_EXPORTER_OTLP_ENDPOINT`, else `http://localhost:4327`, or `http://localhost:4328` with `http/protobuf`) |
 | `-otlp-protocol` | `grpc` or `http/protobuf` (default `$OTEL_EXPORTER_OTLP_PROTOCOL`, else `grpc`) |
 | `-otlp-ca-file` | CA bundle that verifies the collector |
 | `-otlp-cert-file`, `-otlp-key-file` | client certificate for a collector that requires one (the example configuration does) |

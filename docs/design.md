@@ -818,7 +818,15 @@ replaced.
   collected.
 - **TLS.** An `https://` endpoint verifies the collector (`-otlp-ca-file`)
   and may present a client certificate (`-otlp-cert-file`,
-  `-otlp-key-file`) to a receiver that requires one. With
+  `-otlp-key-file`) to a receiver that requires one. An `http://`
+  endpoint sends the dependencies of the host, the executables and
+  services of its processes, its name and its machine id unencrypted; the
+  agent warns at start when the host of the endpoint is neither
+  `localhost` nor a loopback address. Over HTTP/protobuf the agent does
+  not follow redirects: a 3xx response fails the request
+  (`shawk.agent.export.failures`), so that a collector, or anything in
+  the path, cannot send the export to another address, or from
+  `https://` to `http://`. With
   `host_identity: certificate` the connector accepts the metrics of a
   host only from an agent whose verified certificate names its
   `host.name` (a DNS name, or the common name of a certificate without
