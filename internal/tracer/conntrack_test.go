@@ -9,6 +9,7 @@ import (
 	"os"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -517,7 +518,9 @@ func pinThread(t *testing.T, cpu int) (unpin func()) {
 // and SLUB keeps a freed object on the lists of the CPU that freed it: the
 // new entries are made from each CPU in turn, as a connection makes its
 // entry on the CPU that sends its SYN. Made from one CPU only, they may
-// never reuse it.
+// never reuse it. On a host that tracks its own connections, as a runner
+// of CI with Docker, an entry of the host may reuse it first, even while
+// the test waits for the namespace to go.
 func TestTranslationsMissedDestroy(t *testing.T) {
 	run, ns := natNetNS(t)
 	tr := startTracer(t, Options{LearnTranslations: true})
@@ -528,39 +531,75 @@ func TestTranslationsMissedDestroy(t *testing.T) {
 	collect(t, tr)
 	c := dialFrom(t, run, "tcp4", "10.99.0.1", "10.200.0.1:6432")
 	var stale []uint64
+	var staleVal bpfShawkXlatConn
 	var key uint64
 	var val bpfShawkXlatConn
 	it := tr.xlatConnsMap.Iterate()
 	for it.Next(&key, &val) {
 		if val.Key.Netns == ns {
 			stale = append(stale, key)
+			staleVal = val
 		}
 	}
 	if len(stale) != 1 {
 		t.Fatalf("%d live entries of the namespace, want 1", len(stale))
 	}
+	// released tells whether the entry is gone, or now holds a translation
+	// that reused its memory.
+	released := func() bool {
+		var v bpfShawkXlatConn
+		err := tr.xlatConnsMap.Lookup(stale[0], &v)
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return true
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v != staleVal
+	}
 	// The entry goes with its namespace, unseen.
-	tr.conntrackLinks[1].Close()
+	if err := tr.conntrackLinks[1].Close(); err != nil {
+		t.Fatalf("detaching the destroy program: %v", err)
+	}
 	c.Close()
 	closeLn()
 	unix.Unmount(netnsPath(t, ns), unix.MNT_DETACH)
 	time.Sleep(2 * time.Second)
-	if err := tr.xlatConnsMap.Lookup(stale[0], &val); err != nil {
-		t.Fatalf("the entry is gone although its destroy was missed: %v", err)
+	if released() {
+		// A host that tracks its own connections, as one with Docker, makes
+		// entries that may reuse the memory first.
+		if host := hostConntrackCount(t); host == 0 {
+			t.Fatal("the entry is gone although its destroy was missed, and the host tracks no connection that could reuse its memory")
+		} else {
+			t.Logf("released during the wait, by an entry outside the test: the host tracks %d connections", host)
+		}
+	} else {
+		releaseByReuse(t, released)
 	}
+	// The translation is idle: it is reported once more, and then deleted.
+	collect(t, tr)
+	snap := collect(t, tr)
+	for _, x := range snap.Translations {
+		if x.NetNS == ns {
+			t.Errorf("translation after the release: %+v", x)
+		}
+	}
+}
 
-	// Connections without NAT in a namespace that tracks them; their entries
-	// stay (TIME_WAIT) while the test runs.
-	run2, _ := natNetNS(t)
-	listenIn(t, run2, "10.99.0.2:5435")
+// releaseByReuse makes connections without NAT in a namespace that tracks
+// them until released tells that the entry of a missed destroy is released.
+// Their entries stay (TIME_WAIT) while the test runs.
+func releaseByReuse(t *testing.T, released func() bool) {
+	t.Helper()
+	run, _ := natNetNS(t)
+	listenIn(t, run, "10.99.0.2:5435")
 	cpus := allowedCPUs(t)
-	released := false
 	n := 5000 * len(cpus)
-	for i := 0; i < n && !released; i++ {
+	for i := range n {
 		cpu := cpus[i%len(cpus)]
 		var d net.Conn
 		var err error
-		run2(func() {
+		run(func() {
 			defer pinThread(t, cpu)()
 			d, err = net.Dial("tcp4", "10.99.0.2:5435")
 		})
@@ -568,17 +607,25 @@ func TestTranslationsMissedDestroy(t *testing.T) {
 			t.Fatal(err)
 		}
 		d.Close()
-		released = errors.Is(tr.xlatConnsMap.Lookup(stale[0], &val), ebpf.ErrKeyNotExist)
-		if released {
+		if released() {
 			t.Logf("released after %d connections, by one from CPU %d", i+1, cpu)
+			return
 		}
 	}
-	if !released {
-		t.Fatalf("the entry of a missed destroy was not released by any of %d entries made from CPUs %v", n, cpus)
+	t.Fatalf("the entry of a missed destroy was not released by any of %d entries made from CPUs %v", n, cpus)
+}
+
+// hostConntrackCount returns the number of connections that conntrack
+// tracks in the network namespace of the test.
+func hostConntrackCount(t *testing.T) int {
+	t.Helper()
+	b, err := os.ReadFile("/proc/sys/net/netfilter/nf_conntrack_count")
+	if err != nil {
+		t.Fatal(err)
 	}
-	// The translation is idle: it is reported once more, and then deleted.
-	collect(t, tr)
-	if snap := collect(t, tr); len(snap.Translations) != 0 {
-		t.Errorf("translations after the release: %+v", snap.Translations)
+	n, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil {
+		t.Fatal(err)
 	}
+	return n
 }
