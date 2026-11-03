@@ -29,6 +29,8 @@ type tEdge struct {
 	// folded marks the peer as folded (shawk.peer.folded); peer is then
 	// 0.0.0.0 or ::.
 	folded bool
+	// netns is the network namespace, 4026531840 if empty.
+	netns string
 }
 
 type tListener struct {
@@ -142,7 +144,11 @@ func (ta tAgent) metrics() pmetric.Metrics {
 			a.PutStr(attrLocalAddr, e.local)
 			a.PutStr(attrPeerAddr, e.peer)
 			a.PutInt(attrServerPort, e.port)
-			a.PutStr(attrNetNS, "4026531840")
+			netns := e.netns
+			if netns == "" {
+				netns = "4026531840"
+			}
+			a.PutStr(attrNetNS, netns)
 			if e.folded {
 				a.PutBool(attrPeerFolded, true)
 			}

@@ -1618,8 +1618,8 @@ int shawk_iter_task_file(struct bpf_iter__task_file *ctx)
  * A kprobe is skipped while another BPF program or a map update of a system
  * call runs on the CPU, e.g. when a softirq frees an entry then. An entry
  * whose destroy was missed is found again when its memory, which conntrack
- * reuses, is confirmed as another entry: its former key is decremented
- * then. A key that user space deleted, while an entry counted in it was
+ * reuses, is confirmed as another entry, translated or not: its former key
+ * is decremented then. A key that user space deleted, while an entry counted in it was
  * still alive, and that was added again has another generation, which that
  * entry does not decrement.
  *
@@ -1793,9 +1793,21 @@ int shawk_ct_confirm(struct pt_regs *ctx)
 	__u64 ct;
 
 	ct = BPF_CORE_READ(skb, _nfct) & NFCT_PTRMASK_;
-	if (!ct || xlat_key((const struct nf_conn *)ct, &conn.key) ||
-	    !netns_ok(conn.key.netns) || xlat_folded(&conn.key))
+	if (!ct)
 		return 0;
+	if (xlat_key((const struct nf_conn *)ct, &conn.key) ||
+	    !netns_ok(conn.key.netns) || xlat_folded(&conn.key)) {
+		/*
+		 * Most entries translate nothing; one at the address of an entry
+		 * whose destroy was missed releases it all the same.
+		 */
+		old = bpf_map_lookup_elem(&xlat_conns, &ct);
+		if (old) {
+			xlat_release(old);
+			bpf_map_delete_elem(&xlat_conns, &ct);
+		}
+		return 0;
+	}
 	st = bpf_map_lookup_elem(&xlats, &conn.key);
 	if (!st) {
 		zero.gen = bpf_ktime_get_ns();

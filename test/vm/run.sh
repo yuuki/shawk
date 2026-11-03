@@ -144,12 +144,13 @@ if [[ -n "$modules" ]]; then
 	done
 	no_nfs=0
 fi
-# conntrack and nf_tables with NAT (TestTranslations), unless the kernel
+# conntrack and nf_tables with NAT, and veth (TestTranslations*), unless the kernel
 # has no package of modules (a kernel given by its path).
 no_conntrack=1
 nf=(lib/libcrc32c net/ipv4/netfilter/nf_defrag_ipv4 net/ipv6/netfilter/nf_defrag_ipv6
 	net/netfilter/nf_conntrack net/netfilter/nf_nat net/netfilter/nfnetlink net/netfilter/nf_tables
-	net/netfilter/nft_chain_nat net/netfilter/nft_nat)
+	net/netfilter/nft_chain_nat net/netfilter/nft_nat net/netfilter/nft_masq net/netfilter/nft_redir
+	drivers/net/veth)
 if [[ -n "$nfmodules" ]]; then
 	mkdir -p "$WORK/nf" "$initrd/vm/modules"
 	case "$nfmodules" in

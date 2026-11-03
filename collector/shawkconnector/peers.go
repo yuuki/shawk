@@ -157,6 +157,11 @@ type resolver struct {
 	dbLearnedServers    map[learnedServerKey]map[learnedClient]time.Time
 	localLearned        map[learnedClientKey]map[learnedBackend]time.Time
 	localLearnedServers map[learnedServerKey]map[learnedClient]time.Time
+	// localServed are the services of the server edges this connector saw,
+	// by their client address, server address and port: whether a client
+	// reached a relay with an agent at a virtual address, as direct tells
+	// in PostgreSQL.
+	localServed map[clientKey]map[endpoint]time.Time
 
 	// rangeCache holds the best service on the endpoints within a range of
 	// backends, found by a scan of the endpoints, until the next load or
@@ -200,6 +205,7 @@ func newResolver(cidrs []namedPrefix, translations []translation) *resolver {
 		dbLearnedServers:    map[learnedServerKey]map[learnedClient]time.Time{},
 		localLearned:        map[learnedClientKey]map[learnedBackend]time.Time{},
 		localLearnedServers: map[learnedServerKey]map[learnedClient]time.Time{},
+		localServed:         map[clientKey]map[endpoint]time.Time{},
 	}
 }
 
@@ -322,6 +328,10 @@ func (r *resolver) learn(b *hostBatch, now time.Time) {
 		case roleServer:
 			learnInto(r.localEndpoints, endpointKey{e.id.local, e.id.port, e.id.proto},
 				endpoint{host: b.key, service: e.id.job(), exact: true}, now)
+			if !e.id.folded {
+				learnInto(r.localServed, clientKey{e.id.peer, e.id.local, e.id.port, e.id.proto},
+					endpoint{host: b.key, service: e.id.job(), exact: true}, now)
+			}
 		case roleClient:
 			if e.id.folded {
 				// Not a server address: no server edge has it as its local
@@ -379,6 +389,7 @@ func (r *resolver) expire(t, now time.Time) {
 	expireLearned(r.localClients, t)
 	expireLearned(r.localLearned, t)
 	expireLearned(r.localLearnedServers, t)
+	expireLearned(r.localServed, t)
 	expireLearned(r.localAddrs, now.Add(-aliveWindow))
 	for h, a := range r.localAgents {
 		if a.seen.Before(now.Add(-aliveWindow)) {
@@ -468,7 +479,17 @@ func (r *resolver) peer(host string, id *edgeID, now time.Time) peer {
 			// days ago replaced by a relay without an agent.
 			c.exactSince = now.Add(-aliveWindow)
 		}
-		c.add(r.localEndpoints[k], r.dbEndpoints[k], r.dbAge(now), 0)
+		if learned {
+			// Through a learned translation, only a service whose server edge
+			// from this client this connector saw recently comes first, as a
+			// match by address does in PostgreSQL: a container that reaches a
+			// published port of its host goes through docker-proxy, which
+			// serves the address, while the clients of other hosts go to the
+			// container.
+			c.add(r.localServed[clientKey{id.local, id.peer, id.port, id.proto}], nil, 0, 0)
+		} else {
+			c.add(r.localEndpoints[k], r.dbEndpoints[k], r.dbAge(now), 0)
+		}
 		p.name = c.best.service
 		if p.name == "" {
 			if c, t, ok := r.translatedServer(id, now); ok {

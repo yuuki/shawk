@@ -40,7 +40,9 @@ DECLARE
   -- Without grants.sql run again after this migration, the role of the
   -- connector may not read the learned translations: the retention goes on
   -- without them, and keeps the hosts.
-  learned boolean := has_table_privilege('shawk.learned_translations', 'SELECT, DELETE');
+  -- (has_table_privilege with a list is true if any of them is held.)
+  learned boolean := has_table_privilege('shawk.learned_translations', 'SELECT')
+                     AND has_table_privilege('shawk.learned_translations', 'DELETE');
 BEGIN
   PERFORM pg_advisory_xact_lock_shared(1936220535);  -- 0x73686177, see Migrate
 
@@ -246,8 +248,9 @@ lc AS (
   JOIN shawk.edges c
     ON  c.role = 'client' AND c.proto = l.proto AND c.remote_addr = l.virtual_addr AND c.port = l.virtual_port
     AND c.local_addr = l.client_addr
-  WHERE l.last_seen >= since - interval '15 minutes' AND l.first_seen <= until + interval '15 minutes'
-    AND CASE WHEN c.local_addr << inet '127.0.0.0/8' OR c.local_addr = inet '::1'
+  -- Every learned row of the edges in the period, not only those in it, so
+  -- that a pair has the span of its rows, as in the view.
+  WHERE CASE WHEN c.local_addr << inet '127.0.0.0/8' OR c.local_addr = inet '::1'
                THEN c.host_id = l.host_id AND c.netns = l.netns
              WHEN c.local_addr IN (SELECT addr FROM shared) THEN c.host_id = l.host_id
              ELSE true END

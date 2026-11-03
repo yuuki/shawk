@@ -2,6 +2,7 @@ package shawkconnector
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -382,4 +383,237 @@ func TestPGLearnedWithoutGrants(t *testing.T) {
 	if got := queryStrings(t, conn, `SELECT count(*) FROM shawk.learned_translations`); !slices.Equal(got, []string{"1"}) {
 		t.Errorf("learned translations once granted = %q", got)
 	}
+}
+
+// TestPGLearnedSelectOnly: a role that may read the learned translations
+// but not write them writes its hosts without them, and the retention goes
+// on (has_table_privilege with a list is true if any of them is held).
+func TestPGLearnedSelectOnly(t *testing.T) {
+	c, _, conn := pgConnectorWith(t, nil)
+	ctx := context.Background()
+	if _, err := conn.Exec(ctx, `DO $$ BEGIN
+	    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'shawk_connector') THEN CREATE ROLE shawk_connector NOLOGIN; END IF;
+	    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'shawk_grafana') THEN CREATE ROLE shawk_grafana NOLOGIN; END IF;
+	  END $$`); err != nil {
+		t.Fatal(err)
+	}
+	grants, err := os.ReadFile(filepath.Join(packaging, "postgres/grants.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	execAll(t, conn, string(grants), `REVOKE ALL ON shawk.learned_translations FROM shawk_connector`,
+		`GRANT SELECT ON shawk.learned_translations TO shawk_connector`)
+	t.Cleanup(func() { conn.Exec(ctx, "DROP OWNED BY shawk_connector, shawk_grafana") })
+	st, err := newPGStore(ctx, c.cfg.Postgres.DSN+"?options=-c%20role%3Dshawk_connector")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+	now := time.Now().UTC().Truncate(time.Second)
+	h := newHostChanges(hostKey("", "app-01"))
+	h.setHost("", "app-01", "5.14", "test", now)
+	h.addProcess(procKey{"app.service", "app", "app"}, "/usr/bin/app", span{now, now})
+	h.addEdge(edgeRowKey{role: "client", proto: "tcp", local: addrOf("10.0.0.11"), peer: addrOf("10.96.0.10"), port: 5432,
+		netns: 1, procKey: procKey{"app.service", "app", "app"}}, span{now, now})
+	h.addTranslation(translationID{proto: "tcp", netns: 1, client: addrOf("10.0.0.11"), virtual: addrOf("10.96.0.10"),
+		vport: 5432, source: addrOf("10.0.0.11"), backend: addrOf("10.0.1.10"), bport: 6432}, span{now, now})
+	if err := st.write(ctx, h); err != nil {
+		t.Errorf("writing the host with SELECT only on learned_translations: %v", err)
+	}
+	if _, err := st.prune(ctx, time.Hour, 100); err != nil {
+		t.Errorf("retention with SELECT only on learned_translations: %v", err)
+	}
+}
+
+// TestPGLearnedWindowFirstSeen: two directors in turn; in the last hour the
+// function combines the rows of both, as the view does, though the row of
+// the first one ended before the period.
+func TestPGLearnedWindowFirstSeen(t *testing.T) {
+	c, sink, conn := pgConnectorWith(t, nil)
+	now := time.Now().UTC().Truncate(time.Second)
+	long, failover := now.Add(-4*time.Hour), now.Add(-2*time.Hour)
+	vip := func(first, last time.Time) tTranslation {
+		return tTranslation{client: "10.0.0.11", virtual: "10.0.100.1", vport: 5432, backend: "10.0.1.10", bport: 5432,
+			first: first, last: last}
+	}
+	for _, a := range []tAgent{
+		{host: "lb1", addrs: []string{"10.0.2.1"}, time: now, translations: []tTranslation{vip(long, failover)}},
+		{host: "lb2", addrs: []string{"10.0.2.2"}, time: now, translations: []tTranslation{vip(failover, now)}},
+		{host: "db-01", addrs: []string{"10.0.1.10"}, time: now, edges: []tEdge{{role: "server", proto: "tcp",
+			local: "10.0.1.10", peer: "10.0.0.11", port: 5432, svc: "postgres", comm: "postgres", opened: 1, first: long}}},
+		{host: "app-01", addrs: []string{"10.0.0.11"}, time: now, edges: []tEdge{{role: "client", proto: "tcp",
+			local: "10.0.0.11", peer: "10.0.100.1", port: 5432, svc: "app", comm: "app", opened: 1, first: long}}},
+	} {
+		consume(t, c, sink, a)
+	}
+	c.flush(context.Background())
+	view := queryStrings(t, conn, `SELECT first_seen FROM shawk_v1.dependencies WHERE server_host = 'db-01'`)
+	fn := queryStrings(t, conn, `SELECT first_seen FROM shawk_v1.dependencies_between(now() - interval '1 hour', now()) WHERE server_host = 'db-01'`)
+	if !slices.Equal(view, fn) {
+		t.Errorf("first_seen: view %q, function over the last hour %q", view, fn)
+	}
+}
+
+// TestPGLearnedDockerProxyHairpin: the same in PostgreSQL: app depends on
+// web through the learned translation.
+func TestPGLearnedDockerProxyHairpin(t *testing.T) {
+	c, sink, conn := pgConnectorWith(t, nil)
+	now := time.Now().UTC().Truncate(time.Second)
+	hour := now.Add(-time.Hour)
+	for _, a := range []tAgent{
+		{host: "dk", addrs: []string{"10.0.0.5", "172.17.0.1", "172.17.0.2", "172.17.0.3"}, time: now,
+			edges: []tEdge{
+				{role: "server", proto: "tcp", local: "10.0.0.5", peer: "172.17.0.2", port: 8080, svc: "docker-proxy",
+					comm: "docker-proxy", opened: 1, first: hour},
+				{role: "server", proto: "tcp", local: "172.17.0.3", peer: "10.0.0.11", port: 80, svc: "web", comm: "web", opened: 1, first: hour},
+			},
+			translations: []tTranslation{{client: "10.0.0.11", virtual: "10.0.0.5", vport: 8080, backend: "172.17.0.3", bport: 80, first: hour}}},
+		{host: "app", addrs: []string{"10.0.0.11"}, time: now,
+			edges: []tEdge{{role: "client", proto: "tcp", local: "10.0.0.11", peer: "10.0.0.5", port: 8080, svc: "app", comm: "app",
+				opened: 1, first: hour}}},
+	} {
+		consume(t, c, sink, a)
+	}
+	c.flush(context.Background())
+	got := queryStrings(t, conn, `SELECT coalesce(server_service, '-'), port FROM shawk_v1.dependencies WHERE client_service = 'app'`)
+	if !slices.Equal(got, []string{"web 80"}) {
+		t.Errorf("app depends on %q", got)
+	}
+}
+
+// TestPGLearnedLoopbackScope: a loopback client and a loopback backend are
+// matched in the host and the network namespace of the learned row only.
+func TestPGLearnedLoopbackScope(t *testing.T) {
+	c, sink, conn := pgConnectorWith(t, nil)
+	now := time.Now().UTC().Truncate(time.Second)
+	hour := now.Add(-time.Hour)
+	client := func(svc, netns string) tEdge {
+		return tEdge{role: "client", proto: "tcp", local: "127.0.0.1", peer: "10.96.0.30", port: 80, svc: svc, comm: svc,
+			opened: 1, first: hour, netns: netns}
+	}
+	server := func(svc, netns string) tEdge {
+		return tEdge{role: "server", proto: "tcp", local: "127.0.0.1", peer: "127.0.0.1", port: 8080, svc: svc, comm: svc,
+			opened: 1, first: hour, netns: netns}
+	}
+	for _, a := range []tAgent{
+		{host: "h1", addrs: []string{"127.0.0.1", "10.0.0.11"}, time: now,
+			edges: []tEdge{client("a", "100"), client("b", "200"), server("proxy", "100"), server("other", "200")},
+			translations: []tTranslation{{client: "127.0.0.1", virtual: "10.96.0.30", vport: 80, backend: "127.0.0.1", bport: 8080,
+				netns: "100", first: hour}}},
+		{host: "h2", addrs: []string{"127.0.0.1", "10.0.0.12"}, time: now, edges: []tEdge{client("c", "100")}},
+	} {
+		consume(t, c, sink, a)
+	}
+	c.flush(context.Background())
+	checkDeps(t, func(s string, args ...any) []string { return queryStrings(t, conn, s, args...) }, []string{
+		"- - 127.0.0.1 h1 other 127.0.0.1 8080 server - - -",
+		"h1 a 127.0.0.1 h1 proxy 127.0.0.1 8080 both 10.96.0.30 80 ~learned",
+		"h1 b 127.0.0.1 - - 10.96.0.30 80 client - - -",
+		"h2 c 127.0.0.1 - - 10.96.0.30 80 client - - -",
+	})
+}
+
+// TestPGLearnedSharedBackend: a backend at an address several hosts hold
+// (a container bridge) is matched on the host of the learned row only.
+func TestPGLearnedSharedBackend(t *testing.T) {
+	c, sink, conn := pgConnectorWith(t, nil)
+	now := time.Now().UTC().Truncate(time.Second)
+	hour := now.Add(-time.Hour)
+	server := func(host, addr, svc string, xs ...tTranslation) tAgent {
+		return tAgent{host: host, addrs: []string{"127.0.0.1", addr, "172.17.0.1", "172.17.0.5"}, time: now,
+			edges: []tEdge{{role: "server", proto: "tcp", local: "172.17.0.5", peer: "10.0.0.11", port: 80, svc: svc, comm: svc,
+				opened: 1, first: hour}},
+			translations: xs}
+	}
+	for _, a := range []tAgent{
+		server("h1", "10.0.0.1", "web", tTranslation{client: "10.0.0.11", virtual: "10.0.0.1", vport: 8080,
+			backend: "172.17.0.5", bport: 80, first: hour}),
+		server("h2", "10.0.0.2", "billing"),
+		{host: "app", addrs: []string{"10.0.0.11"}, time: now, edges: []tEdge{{role: "client", proto: "tcp", local: "10.0.0.11",
+			peer: "10.0.0.1", port: 8080, svc: "app", comm: "app", opened: 1, first: hour}}},
+	} {
+		consume(t, c, sink, a)
+	}
+	c.flush(context.Background())
+	execAll(t, conn, `UPDATE shawk.host_addrs SET first_seen = first_seen - interval '1 hour'`)
+	checkDeps(t, func(s string, args ...any) []string { return queryStrings(t, conn, s, args...) }, []string{
+		"- - 10.0.0.11 h2 billing 172.17.0.5 80 server - - -",
+		"app app 10.0.0.11 h1 web 172.17.0.5 80 both 10.0.0.1 8080 ~learned",
+	})
+}
+
+// TestPGLearnedOverlaps: a pair needs the client edge, the server edge and
+// the learned row to overlap each other; a ClusterIP or a pod address used
+// again later does not pair an old edge with a new one over the time in
+// between.
+func TestPGLearnedOverlaps(t *testing.T) {
+	c, sink, conn := pgConnectorWith(t, nil)
+	now := time.Now().UTC().Truncate(time.Second)
+	h := func(n int) time.Time { return now.Add(-time.Duration(n) * time.Hour) }
+	type period struct{ first, last time.Time }
+	var app []tEdge
+	var xs []tTranslation
+	var agents []tAgent
+	// Each case: the periods of the client edge, the server edge and the
+	// learned row, which do not all overlap.
+	for i, k := range []struct{ c, s, l period }{
+		{period{h(10), now}, period{h(2), now}, period{h(10), h(9)}}, // the server edge starts after the row
+		{period{h(10), now}, period{h(10), h(9)}, period{h(2), now}}, // the row starts after the server edge
+		{period{h(10), h(8)}, period{h(10), now}, period{h(2), now}}, // the row starts after the client edge
+		{period{h(10), h(8)}, period{h(2), now}, period{h(10), now}}, // the server edge starts after the client edge
+		{period{h(2), now}, period{h(10), h(8)}, period{h(10), now}}, // the client edge starts after the server edge
+	} {
+		virtual, backend := fmt.Sprintf("10.96.0.%d", 40+i), fmt.Sprintf("10.0.1.%d", 40+i)
+		app = append(app, tEdge{role: "client", proto: "tcp", local: "10.0.0.11", peer: virtual, port: 80, svc: "app", comm: "app",
+			opened: 1, first: k.c.first, last: k.c.last})
+		xs = append(xs, tTranslation{client: "10.0.0.11", virtual: virtual, vport: 80, backend: backend, bport: 80,
+			first: k.l.first, last: k.l.last})
+		agents = append(agents, tAgent{host: fmt.Sprintf("s%d", i), addrs: []string{backend}, time: now,
+			edges: []tEdge{{role: "server", proto: "tcp", local: backend, peer: "10.0.0.11", port: 80, svc: "web", comm: "web",
+				opened: 1, first: k.s.first, last: k.s.last}}})
+	}
+	agents = append(agents, tAgent{host: "app", addrs: []string{"10.0.0.11"}, time: now, edges: app, translations: xs})
+	for _, a := range agents {
+		consume(t, c, sink, a)
+	}
+	c.flush(context.Background())
+	var want []string
+	for i := range 5 {
+		want = append(want, fmt.Sprintf("- - 10.0.0.11 s%d web 10.0.1.%d 80 server - - -", i, 40+i))
+	}
+	for i := range 5 {
+		want = append(want, fmt.Sprintf("app app 10.0.0.11 - - 10.96.0.%d 80 client - - -", 40+i))
+	}
+	checkDeps(t, func(s string, args ...any) []string { return queryStrings(t, conn, s, args...) }, want)
+}
+
+// TestPGLearnedStaticAnyPort: a static translation of a virtual address
+// without a port comes before the learned rows of every port of it.
+func TestPGLearnedStaticAnyPort(t *testing.T) {
+	c, sink, conn := pgConnectorWith(t, func(cfg *Config) {
+		cfg.Translations = map[string]TranslationConfig{
+			"vip": {Virtual: []string{"10.0.100.5"}, Backends: []string{"10.0.1.50"}},
+		}
+	})
+	now := time.Now().UTC().Truncate(time.Second)
+	hour := now.Add(-time.Hour)
+	server := func(host, addr string) tAgent {
+		return tAgent{host: host, addrs: []string{addr}, time: now,
+			edges: []tEdge{{role: "server", proto: "tcp", local: addr, peer: "10.0.0.11", port: 443, svc: host, comm: host,
+				opened: 1, first: hour}}}
+	}
+	for _, a := range []tAgent{server("db50", "10.0.1.50"), server("db60", "10.0.1.60"),
+		{host: "app", addrs: []string{"10.0.0.11"}, time: now,
+			edges: []tEdge{{role: "client", proto: "tcp", local: "10.0.0.11", peer: "10.0.100.5", port: 443, svc: "app", comm: "app",
+				opened: 1, first: hour}},
+			translations: []tTranslation{{client: "10.0.0.11", virtual: "10.0.100.5", vport: 443, backend: "10.0.1.60", bport: 443,
+				first: hour}}},
+	} {
+		consume(t, c, sink, a)
+	}
+	c.flush(context.Background())
+	checkDeps(t, func(s string, args ...any) []string { return queryStrings(t, conn, s, args...) }, []string{
+		"- - 10.0.0.11 db60 db60 10.0.1.60 443 server - - -",
+		"app app 10.0.0.11 db50 db50 10.0.1.50 443 both 10.0.100.5 443 vip",
+	})
 }

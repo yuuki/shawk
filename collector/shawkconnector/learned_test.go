@@ -237,3 +237,147 @@ func TestTranslationInputBounds(t *testing.T) {
 		}
 	}
 }
+
+// TestLearnedDockerProxyHairpin: on a Docker host with the userland proxy
+// (the default), a container that reaches the published port at the
+// address of its host goes through docker-proxy, whose server edge at
+// 10.0.0.5:8080 is exact and recent. A remote client of the same port is
+// DNATed to the container, which the host learns; it is named after the
+// container, as PostgreSQL matches it (docker-proxy served other clients).
+func TestLearnedDockerProxyHairpin(t *testing.T) {
+	c, _, sink, _ := testConnector(t, nil)
+	ts := t0.Add(15 * time.Second)
+	consume(t, c, sink, tAgent{host: "dk", addrs: []string{"10.0.0.5", "172.17.0.1", "172.17.0.2", "172.17.0.3"}, time: ts,
+		edges: []tEdge{
+			{role: "server", proto: "tcp", local: "10.0.0.5", peer: "172.17.0.2", port: 8080, svc: "docker-proxy",
+				comm: "docker-proxy", opened: 1},
+			{role: "server", proto: "tcp", local: "172.17.0.3", peer: "10.0.0.11", port: 80, svc: "web", comm: "web", opened: 1},
+		},
+		translations: []tTranslation{{client: "10.0.0.11", virtual: "10.0.0.5", vport: 8080, backend: "172.17.0.3", bport: 80}}})
+	out := consume(t, c, sink, tAgent{host: "app", addrs: []string{"10.0.0.11"}, time: ts,
+		edges: []tEdge{{role: "client", proto: "tcp", local: "10.0.0.11", peer: "10.0.0.5", port: 8080, svc: "app", comm: "app", opened: 1}}})
+	got := slices.Collect(maps.Keys(peersOf(out, "app", roleClient)))
+	if !slices.Equal(got, []string{"web:80"}) {
+		t.Errorf("client peers = %v, want web:80, as PostgreSQL matches it", got)
+	}
+	// A client that docker-proxy served (its translation once, docker-proxy
+	// since) is named after docker-proxy, as a match by address comes first.
+	consume(t, c, sink, tAgent{host: "dk", addrs: []string{"10.0.0.5", "172.17.0.1", "172.17.0.2", "172.17.0.3"}, time: ts,
+		edges: []tEdge{{role: "server", proto: "tcp", local: "10.0.0.5", peer: "10.0.0.12", port: 8080, svc: "docker-proxy",
+			comm: "docker-proxy", opened: 1}},
+		translations: []tTranslation{{client: "10.0.0.12", virtual: "10.0.0.5", vport: 8080, backend: "172.17.0.3", bport: 80}}})
+	out = consume(t, c, sink, tAgent{host: "app2", addrs: []string{"10.0.0.12"}, time: ts,
+		edges: []tEdge{{role: "client", proto: "tcp", local: "10.0.0.12", peer: "10.0.0.5", port: 8080, svc: "app2", comm: "app2", opened: 1}}})
+	if got := slices.Collect(maps.Keys(peersOf(out, "app2", roleClient))); !slices.Equal(got, []string{"docker-proxy:8080"}) {
+		t.Errorf("client peers of the client docker-proxy served = %v", got)
+	}
+}
+
+// TestLearnedServerScope: a server edge at a shared or loopback backend is
+// named after the client of a learned DNAT only on the host, and in the
+// namespace, of the translation.
+func TestLearnedServerScope(t *testing.T) {
+	c, _, sink, _ := testConnector(t, nil)
+	ts := t0.Add(15 * time.Second)
+	consume(t, c, sink, tAgent{host: "app", addrs: []string{"10.0.0.11"}, time: ts,
+		edges: []tEdge{
+			{role: "client", proto: "tcp", local: "10.0.0.11", peer: "10.0.0.2", port: 8080, svc: "curl", comm: "curl", opened: 1},
+			{role: "client", proto: "tcp", local: "10.0.0.11", peer: "10.96.0.20", port: 80, svc: "curl", comm: "curl", opened: 1},
+		}})
+	bridge := func(host, addr string, xs ...tTranslation) tAgent {
+		return tAgent{host: host, addrs: []string{"127.0.0.1", addr, "172.17.0.1", "172.17.0.5"}, time: ts, translations: xs}
+	}
+	consume(t, c, sink, bridge("h2", "10.0.0.2",
+		tTranslation{client: "10.0.0.11", virtual: "10.0.0.2", vport: 8080, backend: "172.17.0.5", bport: 80},
+		tTranslation{client: "10.0.0.11", virtual: "10.96.0.20", vport: 80, backend: "127.0.0.1", bport: 15001, netns: "100"}))
+	consume(t, c, sink, bridge("h4", "10.0.0.4"))
+	next := ts
+	serve := func(host, addr, local string, port int64, netns, svc string) []series {
+		a := bridge(host, addr)
+		next = next.Add(15 * time.Second)
+		a.time = next
+		a.edges = []tEdge{{role: "server", proto: "tcp", local: local, peer: "10.0.0.11", port: port, svc: svc, comm: svc,
+			opened: 1, netns: netns}}
+		return consume(t, c, sink, a)
+	}
+	for _, k := range []struct {
+		host, addr, local string
+		port              int64
+		netns, want       string
+	}{
+		{"h2", "10.0.0.2", "172.17.0.5", 80, "", "curl"},
+		{"h4", "10.0.0.4", "172.17.0.5", 80, "", "~unresolved"},
+		{"h2", "10.0.0.2", "127.0.0.1", 15001, "100", "curl"},
+		{"h2", "10.0.0.2", "127.0.0.1", 15001, "200", "~unresolved"},
+	} {
+		svc := fmt.Sprintf("srv%d", k.port) + k.netns + k.host
+		out := serve(k.host, k.addr, k.local, k.port, k.netns, svc)
+		got := slices.Collect(maps.Keys(peersOf(out, svc, roleServer)))
+		if want := []string{fmt.Sprintf("%s:%d", k.want, k.port)}; !slices.Equal(got, want) {
+			t.Errorf("server edge at %s:%d on %s in %q: peers = %v, want %v", k.local, k.port, k.host, k.netns, got, want)
+		}
+	}
+}
+
+// TestLearnedSharedClient: a client at a shared address (a container
+// bridge) is named through the learned translations of its own host only.
+func TestLearnedSharedClient(t *testing.T) {
+	c, _, sink, _ := testConnector(t, nil)
+	ts := t0.Add(15 * time.Second)
+	consume(t, c, sink, tAgent{host: "db", addrs: []string{"10.0.1.70"}, time: ts,
+		edges: []tEdge{{role: "server", proto: "tcp", local: "10.0.1.70", peer: "10.0.0.1", port: 80, svc: "web", comm: "web", opened: 1}}})
+	host := func(name, addr string, xs ...tTranslation) tAgent {
+		return tAgent{host: name, addrs: []string{"127.0.0.1", addr, "172.17.0.1", "172.17.0.2"}, time: ts,
+			edges: []tEdge{{role: "client", proto: "tcp", local: "172.17.0.2", peer: "10.96.0.50", port: 80,
+				svc: "c-" + name, comm: "c", opened: 1}},
+			translations: xs}
+	}
+	out := consume(t, c, sink, host("h1", "10.0.0.1", tTranslation{client: "172.17.0.2", virtual: "10.96.0.50", vport: 80,
+		source: "10.0.0.1", backend: "10.0.1.70", bport: 80}))
+	if got := slices.Collect(maps.Keys(peersOf(out, "c-h1", roleClient))); !slices.Equal(got, []string{"web:80"}) {
+		t.Errorf("client on h1 = %v, want web:80", got)
+	}
+	out = consume(t, c, sink, host("h2", "10.0.0.2"))
+	if got := slices.Collect(maps.Keys(peersOf(out, "c-h2", roleClient))); !slices.Equal(got, []string{"~unresolved:80"}) {
+		t.Errorf("client on h2 = %v, want ~unresolved:80", got)
+	}
+}
+
+// TestLearnedSharedClientServer: the server edge of a learned DNAT from a
+// shared address (a container of the host that translates, to a service of
+// the host) is named after a client on that host only, not after one at the
+// same address on another host.
+func TestLearnedSharedClientServer(t *testing.T) {
+	c, _, sink, _ := testConnector(t, nil)
+	ts := t0.Add(15 * time.Second)
+	host := func(name, addr string, edges []tEdge, xs ...tTranslation) tAgent {
+		return tAgent{host: name, addrs: []string{"127.0.0.1", addr, "172.17.0.1", "172.17.0.2"}, time: ts, edges: edges, translations: xs}
+	}
+	consume(t, c, sink, host("h2", "10.0.0.2", []tEdge{{role: "client", proto: "tcp", local: "172.17.0.2", peer: "10.96.0.60",
+		port: 80, svc: "b", comm: "b", opened: 1}}))
+	out := consume(t, c, sink, host("h1", "10.0.0.1",
+		[]tEdge{{role: "server", proto: "tcp", local: "10.0.0.1", peer: "172.17.0.2", port: 9000, svc: "web", comm: "web", opened: 1}},
+		tTranslation{client: "172.17.0.2", virtual: "10.96.0.60", vport: 80, backend: "10.0.0.1", bport: 9000}))
+	if got := slices.Collect(maps.Keys(peersOf(out, "web", roleServer))); !slices.Equal(got, []string{"~unresolved:9000"}) {
+		t.Errorf("server peers = %v, want ~unresolved:9000, not the client of another host", got)
+	}
+}
+
+// TestLearnedSNATNoFoldWarning: behind a learned SNAT the backend sees the
+// source, not the client: that its agent would fold the address of the
+// client is no warning.
+func TestLearnedSNATNoFoldWarning(t *testing.T) {
+	c, _, sink, _ := testConnector(t, nil)
+	logs := observe(c)
+	ts := t0.Add(15 * time.Second)
+	consume(t, c, sink, tAgent{host: "db-01", addrs: []string{"192.0.2.10"}, time: ts, fold: foldIn, internal: []string{"10.0.0.0/8"},
+		edges: []tEdge{{role: "server", proto: "tcp", local: "192.0.2.10", peer: "10.0.0.1", port: 5432,
+			svc: "postgres", comm: "postgres", opened: 1}}})
+	consume(t, c, sink, tAgent{host: "h1", addrs: []string{"10.0.0.1", "172.17.0.2"}, time: ts,
+		edges: []tEdge{{role: "client", proto: "tcp", local: "172.17.0.2", peer: "10.96.0.70", port: 5432, svc: "a", comm: "a", opened: 1}},
+		translations: []tTranslation{{client: "172.17.0.2", virtual: "10.96.0.70", vport: 5432, source: "10.0.0.1",
+			backend: "192.0.2.10", bport: 5432}}})
+	if got := foldWarnings(logs); len(got) != 0 {
+		t.Errorf("warnings = %q", got)
+	}
+}

@@ -178,6 +178,10 @@ type Tracer struct {
 	xlats            *ebpf.Map
 	xlatDrops        *ebpf.Variable
 	xlatLast         map[bpfShawkXlatKey]bpfShawkXlatStats
+	// conntrackLinks are the links of conntrackPrograms, in their order, and
+	// xlatConnsMap the entries counted live; for tests.
+	conntrackLinks []link.Link
+	xlatConnsMap   *ebpf.Map
 }
 
 type sockAddrKey struct {

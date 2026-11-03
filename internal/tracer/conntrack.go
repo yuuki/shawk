@@ -169,6 +169,8 @@ func (t *Tracer) loadConntrack() error {
 	}
 	t.colls = append(t.colls, coll)
 	t.links = append(t.links, links...)
+	t.conntrackLinks = links
+	t.xlatConnsMap = coll.Maps[bpfMapXlatConns]
 	for name, p := range coll.Programs {
 		t.progs[name] = p
 	}

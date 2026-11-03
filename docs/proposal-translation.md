@@ -194,7 +194,7 @@ connectors:
   of its host to a published port of another host) is matched for neither
   hop, since the client edge and the server edge share no address with the
   same row. Chaining rows is left for later.
-- Not covered: IPVS without `conntrack=1` (§9, 5), datapaths without
+- Not covered: IPVS without `conntrack=1` (§9, 5; #139), datapaths without
   netfilter conntrack (the kube-proxy replacement of Cilium, eBPF load
   balancers), docker-proxy (phase 3), proxies and load balancers that
   terminate the connection (phase 1).
@@ -260,9 +260,10 @@ connection that conntrack tracks, whatever made the translation:
     learned with the next one).
   - A missed destroy leaves the entry in `xlat_conns`. conntrack reuses the
     memory of entries (`SLAB_TYPESAFE_BY_RCU`), so the address is soon
-    confirmed again: the confirm program then finds the stale entry,
-    decrements the key it holds and replaces it. Until then that key looks
-    live.
+    confirmed again as another entry, translated or not: the confirm
+    program then finds the stale entry, decrements the key it holds and
+    removes or replaces it, at the cost of one lookup per new entry. Until
+    then that key looks live.
   - The same entry confirmed twice (an unconfirmed entry shared by clones
     of a packet, a bridged broadcast) has the same key and generation, and
     is counted once, in `conns` too.
@@ -431,9 +432,12 @@ connection that conntrack tracks, whatever made the translation:
      `shawk.peer.agent` of its host. A backend at a loopback or a shared
      address (a container bridge) is looked up on the host of the row only
      (and for loopback, the endpoint must be on that host): another host
-     has a container at the same address. As with static translations, only
-     a service observed recently on a socket at the virtual address comes
-     first. If the source is the client (DNAT) and the agent of the backend
+     has a container at the same address. A service at the virtual address
+     comes first only if this connector saw its server edge from this
+     client recently, as a match by address comes first in PostgreSQL: a
+     container that reaches a published port of its host goes through
+     docker-proxy, which serves the address, while the clients of other
+     hosts go to the container. If the source is the client (DNAT) and the agent of the backend
      folds the address of the client, the warning of §3.3 applies.
   2. A server edge whose client is not found by address and that matches
      learned rows with the source equal to the client (DNAT) in the scope
@@ -469,10 +473,11 @@ connection that conntrack tracks, whatever made the translation:
 #### 3.5.7 Performance
 
 - **Kernel:** two kprobes per connection tracked by conntrack, not per
-  packet; one hash lookup and update per confirmation of a translated
-  entry, one failed delete per destroyed entry that was not translated.
-  `xlat_conns` takes about 140 bytes per slot (9 MiB at the default 65,536
-  slots), allocated only on hosts where nf_conntrack is loaded. A host that
+  packet; one hash lookup per confirmation, and an update per confirmation
+  of a translated entry; one lookup per destroyed entry. `xlat_conns` takes
+  about 140 bytes per slot (9 MiB at the default 65,536 slots), allocated
+  once nf_conntrack is loaded: that is most hosts of RHEL 9, whose
+  firewalld loads it, and every host with Docker or kube-proxy. A host that
   keeps more live translated entries (`nf_conntrack_count`) needs a larger
   `-max-flows`; the entries that do not fit count at their confirmation
   only, so a translation used only by long-lived connections that do not
@@ -505,32 +510,42 @@ connection that conntrack tracks, whatever made the translation:
 
 #### 3.5.9 Tests
 
-- **Tracer** (`make test-root`, the virtual machines): network namespaces
-  with veth pairs and NAT rules written over netlink (nftables, through a
-  library used by the tests only), since the virtual machines have no
-  iptables: DNAT in OUTPUT and in PREROUTING (forwarded), SNAT
-  (masquerade), REDIRECT; the key, `live` while a connection is open and
-  after it closes (a short timeout of the namespace), no translation
-  without NAT, the netns filter and the fold filter, the module loaded
-  after the tracer starts. The virtual machines load the modules of
-  nf_conntrack and nf_tables (Rocky Linux 9: kernel-modules-core; upstream:
-  the modules package of the mainline build).
+- **Tracer** (`make test-root`, the virtual machines): network namespaces,
+  veth pairs and NAT rules written over netlink (nftables), since the
+  virtual machines have no iptables: DNAT in OUTPUT (IPv4 and IPv6), SNAT
+  in POSTROUTING; a host that forwards between a client and a container
+  (DNAT in PREROUTING over TCP and UDP, confirmed in POSTROUTING, REDIRECT
+  confirmed in INPUT, MASQUERADE); `live` while connections are open and
+  after their entries go, a connection opened and closed within an
+  interval, no translation without NAT, the netns filter and the fold
+  filter, the module loaded after the tracer starts and the backoff of
+  failed loads, a missed destroy released by the next entry at its
+  address, a key that gets a connection while it is deleted as idle, and
+  an error reading the translations that keeps the flows. The virtual
+  machines load the modules of nf_conntrack, nf_tables with NAT,
+  masquerade and redirect, and veth (Rocky Linux 9: kernel-modules-core;
+  upstream: the modules package of the mainline build).
 - **Compatibility:** `TestKernelCompatibility` checks the kprobe targets,
   their parameters and the CO-RE relocations of the programs against the
   BTF of the Rocky Linux 9.6 kernel and of its module nf_conntrack
   (`scripts/fetch-module-btf.sh`); the virtual machines of upstream 5.14
   and 5.15 attach the destroy program to `destroy_conntrack`.
-- **Packaging:** the agent learns translations under the packaged unit.
+- **Packaging:** under the packaged unit, the agent learns a REDIRECT of
+  OUTPUT and sends it (`test/packaging/agent-unit.sh`).
 - **Agent and OTLP:** the series, their order in the requests, the idle
   TTL, the golden request.
-- **Connector:** parsing, the skip of unchanged spans, the names of both
-  sides (DNAT, SNAT, scopes, the precedence of static translations and of
-  a service at the virtual address), the warnings.
-- **PostgreSQL:** each rule of §3.5.5 with a test that fails without it;
-  the view against the function; prune.
-- **e2e:** the case of phase 1 (DNAT in the namespace of app) without
-  `translations` in the configuration: the dependency is matched through
-  the learned translation.
+- **Connector:** parsing and bounds, the skip of unchanged spans, the names
+  of both sides (DNAT, SNAT, the scopes of loopback and shared clients and
+  backends, the precedence of static translations and of a service that
+  served the client at the virtual address, former backends), the
+  warnings, the privileges on the table.
+- **PostgreSQL:** each condition of the matching of §3.5.5 has a test that
+  fails without it (21 mutations of migration 13); the view against the
+  function, also over a period that leaves out a row of the pair; prune,
+  also without the privileges.
+- **e2e:** the case of phase 1 (DNAT in the namespace of app) without a
+  translation in the configuration, matched through the learned one, and a
+  second port with a static translation, which comes first.
 
 ### 3.6 Phase 3: docker-proxy
 
@@ -648,37 +663,36 @@ connection that conntrack tracks, whatever made the translation:
 
 ## 9. Decisions
 
-1. Phase 1 alone makes the first pull request. Recommended: yes (phases 2
-   and 3 change BPF and the agent, and need their own verification).
-   Done: #130.
-2. A server edge from a source keeps a row of its own besides its matched
-   rows. Recommended: yes (implemented).
-3. The `port` of a matched row, and the `server.port` of the client side
-   in Prometheus, are those of the backend. Recommended: yes (implemented).
-4. Whether phase 2 traces conntrack by default (`-learn-translations`).
-   Recommended: yes; hosts that do not translate record nothing, and the
-   programs load only once nf_conntrack is loaded. To be confirmed.
-5. IPVS without `net.ipv4.vs.conntrack=1` (an LVS director configured by
-   hand): it would need a third kprobe on `ip_vs_conn_new` of the module
-   ip_vs. Recommended: not in phase 2 (kube-proxy sets the sysctl; such a
-   director is written as a static translation); a follow-up issue.
-6. A static translation of a virtual address takes precedence over learned
-   rows for it. Recommended: yes (the operator wrote it; the views stay
-   as in phase 1 where it exists).
-7. Learned SNAT is learned too (masquerade, not only DNAT). Recommended:
-   yes: a container that reaches another host leaves with the address of
-   its host, the most common case on hosts with containers. With folding,
-   the destinations and clients on the Internet are not learned (§3.5.2,
-   filters); without it, the table grows with them, up to `-max-flows`.
-8. Transparent proxies that REDIRECT to themselves (sidecars): learned as
-   any translation. Recommended: yes; the alternative is to drop
-   translations to a loopback backend, which loses REDIRECT to local
-   services as well. A sidecar that connects from the address of its pod
-   to the address the application connected to leaves the application
-   depending on the server (a match by address first, §3.5.1); through a
-   ClusterIP, the application depends on the sidecar, one hop.
+All decided as recommended (2026-11-03).
 
-Open: 4–8.
+1. Phase 1 alone makes the first pull request: yes (phases 2 and 3 change
+   BPF and the agent, and need their own verification). Done: #130.
+2. A server edge from a source keeps a row of its own besides its matched
+   rows: yes.
+3. The `port` of a matched row, and the `server.port` of the client side
+   in Prometheus, are those of the backend: yes.
+4. Phase 2 traces conntrack by default: yes, `-learn-translations`
+   defaults to `true`; hosts that do not translate record nothing, and the
+   programs load only once nf_conntrack is loaded.
+5. IPVS without `net.ipv4.vs.conntrack=1` (an LVS director configured by
+   hand), which would need a kprobe on `ip_vs_conn_new` of the module
+   ip_vs: not in phase 2 (kube-proxy sets the sysctl; such a director is
+   written as a static translation); follow-up issue #139.
+6. A static translation of a virtual address takes precedence over learned
+   rows for it: yes (the operator wrote it; the views stay as in phase 1
+   where it exists).
+7. Learned SNAT is learned too (masquerade, not only DNAT): yes; a
+   container that reaches another host leaves with the address of its
+   host, the most common case on hosts with containers. With folding, the
+   destinations and clients on the Internet are not learned (§3.5.2,
+   filters); without it, the table grows with them, up to `-max-flows`.
+8. Transparent proxies that REDIRECT to themselves (sidecars) are learned
+   as any translation: yes; dropping translations to a loopback backend
+   would lose REDIRECT to local services as well. A sidecar that connects
+   from the address of its pod to the address the application connected
+   to leaves the application depending on the server (a match by address
+   first, §3.5.1); through a ClusterIP, the application depends on the
+   sidecar, one hop.
 
 ## 10. Adversarial reviews and responses
 
@@ -758,6 +772,31 @@ attach target.
    Fixed: it is logged, and the snapshot keeps its flows.
 5. The documents said the load is retried every minute. Fixed.
 6. A network namespace out of range was accepted. Fixed.
+
+**Third review of the implementation of phase 2 (2026-11-03).**
+
+1. With docker-proxy (the default of Docker), a container that reaches a
+   published port of its host goes through docker-proxy, whose server edge
+   at the address of the host is recent; the connector named the clients
+   of other hosts, whose connections the host DNATs to the container,
+   after docker-proxy, while PostgreSQL matched them with the container.
+   Fixed: through a learned translation, a service at the virtual address
+   comes first only if its server edge from this client was seen.
+2. `has_table_privilege` with a list of privileges is true if any is held:
+   a role that may only read the table failed the writes of its hosts and
+   the retention. Fixed: one call per privilege.
+3. A missed destroy was released only by a translated entry at its
+   address; most entries translate nothing. Fixed: any entry confirmed at
+   that address releases it; tested in the virtual machines by detaching
+   the destroy program.
+4. Over a period that left out the row of the first of two directors, the
+   function started the matched row at the failover, the view before.
+   Fixed: the function takes every learned row of the edges in the period.
+5. Many conditions of the matching, and of the names, survived their
+   removal, and the tests of the tracer covered OUTPUT and POSTROUTING on
+   loopback only, while this section said more. Fixed: tests of each
+   condition and of a host that forwards, UDP, REDIRECT, MASQUERADE and
+   IPv6; the test of the unit checks a learned translation.
 
 **First review (2026-11-02).**
 

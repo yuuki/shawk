@@ -427,8 +427,9 @@ after twice as long each time, up to an hour:
   trampolines, and run once per connection, not per packet.
 - A kprobe is skipped while another BPF program, or a map update of a
   system call, runs on the CPU. A missed destroy leaves its entry in
-  `xlat_conns` until conntrack reuses its memory for another entry, whose
-  confirmation releases it; until then the translation looks live.
+  `xlat_conns` until conntrack reuses its memory for another entry,
+  translated or not, whose confirmation releases it; until then the
+  translation looks live.
 - `-netns` restricts the translations to a network namespace. With
   folding (§3.6), a translation whose source, client or backend is
   outside the internal ranges is not learned, nor with `all` one whose
@@ -438,8 +439,9 @@ after twice as long each time, up to an hour:
   is new, has a new entry or a live one; one idle for an interval is
   deleted. `xlats` holds `-max-flows` translations and `xlat_conns` four
   times as many live entries (about 140 bytes each, 9 MiB at the
-  default), allocated only once nf_conntrack is loaded; what does not fit
-  is counted in `shawk.agent.translations.dropped`.
+  default), allocated once nf_conntrack is loaded (on most hosts of RHEL
+  9, whose firewalld loads it, and on hosts with Docker or kube-proxy);
+  what does not fit is counted in `shawk.agent.translations.dropped`.
 - `-learn-translations=false` turns it off.
 
 ## 4. The agent
@@ -959,9 +961,14 @@ connector should have the same.
   whole row, observations NULL on the side that outlives the row. The
   `translation` of such a row is `~learned`; a name of the configuration
   may not start with `~`. In the names of peers, a client edge is named
-  after the best service at the backends of its learned rows, with the
-  port of the backend (a backend at a loopback or shared address on the
-  host of the row only), and a server edge of a DNAT after the client
+  after the best service at the backends of its learned rows seen within
+  5 minutes of the most recent one, with the port of the backend (a
+  backend at a loopback or shared address on the host of the row only),
+  unless the connector saw the server edge of a service at the virtual
+  address from this client recently, as a match by address comes first:
+  docker-proxy serves the containers of its host that reach a published
+  port at the address of the host, while the clients of other hosts are
+  DNATed to the container. A server edge of a DNAT is named after the client
   whose client edge has the virtual address and port, as through a static
   translation without sources. A server edge behind a learned SNAT keeps
   its name and `shawk.peer.agent`: it bundles every client its source
@@ -1126,7 +1133,7 @@ parses. shawk runs beside it instead:
   translates learns it from conntrack (§5.4, §3.7). Learned translations
   cover one hop: a connection translated on two hosts (a container behind
   the masquerade of its host to a published port of another host) is not
-  matched, nor one through IPVS without `conntrack=1` or a datapath
+  matched, nor one through IPVS without `conntrack=1` (#139) or a datapath
   without netfilter conntrack (the kube-proxy replacement of Cilium), nor,
   until their client opens another, the connections confirmed before the
   agent started (after a restart of the agent, a pool of long-lived

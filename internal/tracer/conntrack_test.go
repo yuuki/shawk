@@ -2,6 +2,7 @@ package tracer
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cilium/ebpf"
 	"golang.org/x/sys/unix"
 )
 
@@ -41,7 +43,7 @@ func natNetNS(t *testing.T) (func(f func()), uint32) {
 	run(func() {
 		addLoopbackAddr(t, netip.MustParsePrefix("10.99.0.1/24"))
 		addLoopbackAddr(t, netip.MustParsePrefix("10.200.0.1/24"))
-		err := nftNAT([]nftChain{
+		err := nftNAT(unix.NFPROTO_IPV4, []nftChain{
 			{name: "out", hook: unix.NF_INET_LOCAL_OUT, priority: -100, rules: [][]byte{
 				nftRule(nftTCPTo(netip.MustParseAddrPort("10.200.0.1:6432")),
 					nftNatTo(unix.NFT_NAT_DNAT, netip.MustParseAddrPort("10.99.0.2:5435"))),
@@ -288,11 +290,12 @@ type nftChain struct {
 const nftTable = "shawktest"
 
 // nftNAT creates the table of the tests with chains of type nat in the
-// network namespace of the thread, in one batch of nf_tables.
-func nftNAT(chains []nftChain) error {
+// network namespace of the thread, for the family NFPROTO_IPV4 or
+// NFPROTO_IPV6, in one batch of nf_tables.
+func nftNAT(family uint8, chains []nftChain) error {
 	var msgs [][]byte
 	msgs = append(msgs, nfMsg(unix.NFNL_MSG_BATCH_BEGIN, unix.AF_UNSPEC, unix.NFNL_SUBSYS_NFTABLES, 0, nil))
-	msgs = append(msgs, nfMsg(nftType(unix.NFT_MSG_NEWTABLE), unix.NFPROTO_IPV4, 0,
+	msgs = append(msgs, nfMsg(nftType(unix.NFT_MSG_NEWTABLE), family, 0,
 		unix.NLM_F_CREATE|unix.NLM_F_ACK, rtAttr(unix.NFTA_TABLE_NAME, cstr(nftTable))))
 	for _, c := range chains {
 		hook := append(rtAttr(unix.NFTA_HOOK_HOOKNUM, be32(c.hook)), rtAttr(unix.NFTA_HOOK_PRIORITY, be32(uint32(c.priority)))...)
@@ -300,12 +303,12 @@ func nftNAT(chains []nftChain) error {
 		body = append(body, rtAttr(unix.NFTA_CHAIN_NAME, cstr(c.name))...)
 		body = append(body, rtAttr(unix.NFTA_CHAIN_HOOK|unix.NLA_F_NESTED, hook)...)
 		body = append(body, rtAttr(unix.NFTA_CHAIN_TYPE, cstr("nat"))...)
-		msgs = append(msgs, nfMsg(nftType(unix.NFT_MSG_NEWCHAIN), unix.NFPROTO_IPV4, 0, unix.NLM_F_CREATE|unix.NLM_F_ACK, body))
+		msgs = append(msgs, nfMsg(nftType(unix.NFT_MSG_NEWCHAIN), family, 0, unix.NLM_F_CREATE|unix.NLM_F_ACK, body))
 		for _, exprs := range c.rules {
 			body := rtAttr(unix.NFTA_RULE_TABLE, cstr(nftTable))
 			body = append(body, rtAttr(unix.NFTA_RULE_CHAIN, cstr(c.name))...)
 			body = append(body, rtAttr(unix.NFTA_RULE_EXPRESSIONS|unix.NLA_F_NESTED, exprs)...)
-			msgs = append(msgs, nfMsg(nftType(unix.NFT_MSG_NEWRULE), unix.NFPROTO_IPV4, 0,
+			msgs = append(msgs, nfMsg(nftType(unix.NFT_MSG_NEWRULE), family, 0,
 				unix.NLM_F_CREATE|unix.NLM_F_APPEND|unix.NLM_F_ACK, body))
 		}
 	}
@@ -327,7 +330,11 @@ func nftRule(exprs ...[][]byte) []byte {
 }
 
 func nftExpr(name string, data []byte) []byte {
-	return append(rtAttr(unix.NFTA_EXPR_NAME, cstr(name)), rtAttr(unix.NFTA_EXPR_DATA|unix.NLA_F_NESTED, data)...)
+	e := rtAttr(unix.NFTA_EXPR_NAME, cstr(name))
+	if data == nil {
+		return e
+	}
+	return append(e, rtAttr(unix.NFTA_EXPR_DATA|unix.NLA_F_NESTED, data)...)
 }
 
 func nftCmp(value []byte) []byte {
@@ -345,19 +352,37 @@ func nftPayload(base, offset, length uint32) []byte {
 		rtAttr(unix.NFTA_PAYLOAD_LEN, be32(length))))
 }
 
-// nftTCPTo matches TCP to an IPv4 address and port.
-func nftTCPTo(ap netip.AddrPort) [][]byte {
-	addr := ap.Addr().As4()
+// nftTCPTo matches TCP to an address and port.
+func nftTCPTo(ap netip.AddrPort) [][]byte { return nftTo(unix.IPPROTO_TCP, ap) }
+
+// nftTo matches TCP or UDP to an IPv4 or IPv6 address and port.
+func nftTo(proto uint8, ap netip.AddrPort) [][]byte {
+	addr := ap.Addr().AsSlice()
+	offset := uint32(16) // daddr of IPv4
+	if ap.Addr().Is6() {
+		offset = 24
+	}
 	return [][]byte{
 		nftExpr("meta", slices.Concat(rtAttr(unix.NFTA_META_DREG, be32(unix.NFT_REG_1)),
 			rtAttr(unix.NFTA_META_KEY, be32(unix.NFT_META_L4PROTO)))),
-		nftCmp([]byte{unix.IPPROTO_TCP}),
-		nftPayload(unix.NFT_PAYLOAD_NETWORK_HEADER, 16, 4),
-		nftCmp(addr[:]),
+		nftCmp([]byte{proto}),
+		nftPayload(unix.NFT_PAYLOAD_NETWORK_HEADER, offset, uint32(len(addr))),
+		nftCmp(addr),
 		nftPayload(unix.NFT_PAYLOAD_TRANSPORT_HEADER, 2, 2),
 		nftCmp(binary.BigEndian.AppendUint16(nil, ap.Port())),
 	}
 }
+
+// nftRedir redirects to a port of the host (REDIRECT).
+func nftRedir(port uint16) [][]byte {
+	return [][]byte{
+		nftImmediate(unix.NFT_REG_1, binary.BigEndian.AppendUint16(nil, port)),
+		nftExpr("redir", rtAttr(unix.NFTA_REDIR_REG_PROTO_MIN, be32(unix.NFT_REG_1))),
+	}
+}
+
+// nftMasq replaces the source with the address of the outgoing interface.
+func nftMasq() [][]byte { return [][]byte{nftExpr("masq", nil)} }
 
 func nftImmediate(reg uint32, value []byte) []byte {
 	return nftExpr("immediate", slices.Concat(
@@ -365,13 +390,16 @@ func nftImmediate(reg uint32, value []byte) []byte {
 		rtAttr(unix.NFTA_IMMEDIATE_DATA|unix.NLA_F_NESTED, rtAttr(unix.NFTA_DATA_VALUE, value))))
 }
 
-// nftNatTo translates to an IPv4 address, and to a port unless it is 0.
+// nftNatTo translates to an address, and to a port unless it is 0.
 func nftNatTo(typ uint32, to netip.AddrPort) [][]byte {
-	addr := to.Addr().As4()
-	exprs := [][]byte{nftImmediate(unix.NFT_REG_1, addr[:])}
+	family := uint32(unix.NFPROTO_IPV4)
+	if to.Addr().Is6() {
+		family = unix.NFPROTO_IPV6
+	}
+	exprs := [][]byte{nftImmediate(unix.NFT_REG_1, to.Addr().AsSlice())}
 	nat := slices.Concat(
 		rtAttr(unix.NFTA_NAT_TYPE, be32(typ)),
-		rtAttr(unix.NFTA_NAT_FAMILY, be32(unix.NFPROTO_IPV4)),
+		rtAttr(unix.NFTA_NAT_FAMILY, be32(family)),
 		rtAttr(unix.NFTA_NAT_REG_ADDR_MIN, be32(unix.NFT_REG_1)))
 	if to.Port() != 0 {
 		exprs = append(exprs, nftImmediate(unix.NFT_REG_2, binary.BigEndian.AppendUint16(nil, to.Port())))
@@ -442,4 +470,68 @@ func nfnetlink(msgs [][]byte) error {
 		}
 	}
 	return nil
+}
+
+// TestTranslationsMissedDestroy checks that an entry whose destroy the
+// programs missed is released when conntrack reuses its memory for another
+// entry, also one that translates nothing. The destroy program is detached
+// while the entry goes, and new entries are made until one reuses its
+// address.
+func TestTranslationsMissedDestroy(t *testing.T) {
+	run, ns := natNetNS(t)
+	tr := startTracer(t, Options{LearnTranslations: true})
+	if !tr.TranslationsTraced() {
+		skipUnavailable(t, "translations are not learned from conntrack")
+	}
+	closeLn := listenIn(t, run, "10.99.0.2:5435")
+	collect(t, tr)
+	c := dialFrom(t, run, "tcp4", "10.99.0.1", "10.200.0.1:6432")
+	var stale []uint64
+	var key uint64
+	var val bpfShawkXlatConn
+	it := tr.xlatConnsMap.Iterate()
+	for it.Next(&key, &val) {
+		if val.Key.Netns == ns {
+			stale = append(stale, key)
+		}
+	}
+	if len(stale) != 1 {
+		t.Fatalf("%d live entries of the namespace, want 1", len(stale))
+	}
+	// The entry goes with its namespace, unseen.
+	tr.conntrackLinks[1].Close()
+	c.Close()
+	closeLn()
+	unix.Unmount(netnsPath(t, ns), unix.MNT_DETACH)
+	time.Sleep(2 * time.Second)
+	if err := tr.xlatConnsMap.Lookup(stale[0], &val); err != nil {
+		t.Fatalf("the entry is gone although its destroy was missed: %v", err)
+	}
+
+	// Connections without NAT in a namespace that tracks them; their entries
+	// stay (TIME_WAIT) while the test runs.
+	run2, _ := natNetNS(t)
+	listenIn(t, run2, "10.99.0.2:5435")
+	released := false
+	for i := 0; i < 5000 && !released; i++ {
+		var d net.Conn
+		var err error
+		run2(func() { d, err = net.Dial("tcp4", "10.99.0.2:5435") })
+		if err != nil {
+			t.Fatal(err)
+		}
+		d.Close()
+		released = errors.Is(tr.xlatConnsMap.Lookup(stale[0], &val), ebpf.ErrKeyNotExist)
+		if released {
+			t.Logf("released after %d connections", i+1)
+		}
+	}
+	if !released {
+		t.Fatal("the entry of a missed destroy was not released by the entry that reused its address")
+	}
+	// The translation is idle: it is reported once more, and then deleted.
+	collect(t, tr)
+	if snap := collect(t, tr); len(snap.Translations) != 0 {
+		t.Errorf("translations after the release: %+v", snap.Translations)
+	}
 }

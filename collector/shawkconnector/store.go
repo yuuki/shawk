@@ -67,7 +67,10 @@ func (s *pgStore) learnedAllowed(ctx context.Context) bool {
 		return s.learnedOK
 	}
 	var ok bool
-	err := s.pool.QueryRow(ctx, `SELECT has_table_privilege('shawk.learned_translations', 'SELECT, INSERT, UPDATE')`).Scan(&ok)
+	// has_table_privilege with a list is true if any of them is held.
+	err := s.pool.QueryRow(ctx, `SELECT has_table_privilege('shawk.learned_translations', 'SELECT')
+  AND has_table_privilege('shawk.learned_translations', 'INSERT')
+  AND has_table_privilege('shawk.learned_translations', 'UPDATE')`).Scan(&ok)
 	if err != nil {
 		return s.learnedOK
 	}
