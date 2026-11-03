@@ -149,9 +149,11 @@ type Tracer struct {
 	// from once nf_conntrack is loaded, and conntrackTried the last
 	// attempt. xlats is nil until they are loaded; xlatLast holds the
 	// counts of each translation at the last read.
-	conntrackSpec   *ebpf.CollectionSpec
-	conntrackTried  time.Time
-	conntrackLogged bool
+	conntrackSpec  *ebpf.CollectionSpec
+	conntrackTried time.Time
+	// conntrackMissingLogged and conntrackFailLogged tell that the absence
+	// of nf_conntrack, and a failure to load the programs, were logged.
+	conntrackMissingLogged, conntrackFailLogged bool
 	// conntrackBackoff is the wait before the next load after one failed.
 	conntrackBackoff time.Duration
 	xlats            *ebpf.Map
