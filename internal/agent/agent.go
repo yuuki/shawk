@@ -128,6 +128,11 @@ func Run(ctx context.Context, cfg Config) error {
 		return err
 	}
 	defer exp.Close()
+	if cfg.Exporter.CleartextRemote() {
+		cfg.Logger.Warn("the OTLP endpoint is not a loopback address and does not use TLS: the dependencies of the host, "+
+			"the executables and services of its processes, its name and its machine id are sent unencrypted; use https://",
+			"endpoint", cfg.Exporter.Endpoint)
+	}
 
 	cgroups := procinfo.NewResolver()
 	// The addresses of the host are internal from the first flow on, also
