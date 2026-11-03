@@ -1069,6 +1069,24 @@ Prometheus needs `--web.enable-otlp-receiver`,
 `otlp.promote_resource_attributes: [host.id, host.name]` and an
 out-of-order window of 30 minutes; counters stay cumulative.
 
+The OTLP receiver of Prometheus writes whatever series it is sent: anyone
+who could push to it could write `shawk_agent_up` and silence
+`ShawkAgentDown`, bypassing the client certificates that the collector
+requires of agents. The push is therefore encrypted and authenticated. In
+the example, the collector verifies Prometheus with a CA and sends an
+`Authorization` header with the `headers` of its exporter (it has the core
+components only, without the `basicauth` extension), taken from the
+variable `SHAWK_PROMETHEUS_AUTHORIZATION` so that its configuration holds
+no secret. Prometheus serves its endpoints over TLS to the users of its
+web configuration only (`--web.config.file`,
+`packaging/prometheus/web.yml`). That configuration applies to every
+endpoint and does not tell readers from writers: Grafana and people need a
+user too, and every user can push. The example uses passwords rather than
+client certificates, which every client would then need, browsers
+included; letting only the collector push takes a proxy in front of
+Prometheus. The trace exporter uses TLS too, with a client certificate
+that the trace store can require.
+
 ### 5.4 Translations of addresses
 
 A relay without an agent may rewrite the addresses of the connections it
