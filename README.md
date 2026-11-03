@@ -35,10 +35,10 @@ See [docs/design.md](docs/design.md) for the design.
 
 ## How it fits together
 
-```
- every host: eBPF ─ shawk agent ── OTLP ──→ collector with the shawk connector ─┬─→ PostgreSQL ─┐
-                                                                               └─→ Prometheus ─┴─→ Grafana
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/architecture-dark.svg">
+  <img alt="On every host, eBPF programs in the kernel trace the sockets of all processes, and the shawk agent sends the bundled flows as OTLP metrics every 15 seconds to an OpenTelemetry Collector with the shawk connector. The connector writes dependencies, listeners and observation segments to PostgreSQL and metrics per service without addresses to Prometheus; Grafana shows both. OBI can send application-layer metrics to the same collector." src="docs/images/architecture-light.svg">
+</picture>
 
 | component | what it does |
 |---|---|
