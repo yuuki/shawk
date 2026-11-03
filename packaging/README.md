@@ -7,10 +7,11 @@ tested (`make test`) but meant to be adapted.
 | Path | What |
 |---|---|
 | `systemd/shawk-agent.service`, `systemd/agent.env` | The agent on every host, as root with only the capabilities it needs and sandboxed; options in `/etc/shawk/agent.env`. |
-| `systemd/shawk-collector.service` | The collector built with `make collector`, as the user `shawk-collector`, sandboxed. |
+| `systemd/shawk-collector.service`, `systemd/collector.env` | The collector built with `make collector`, as the user `shawk-collector`, sandboxed; secrets in `/etc/shawk/collector.env`. |
 | `collector/config.yaml` | Collector configuration: the `otlp/shawk` receiver for agents, the shawk connector, Prometheus and OBI pipelines. |
 | `postgres/setup.sql`, `postgres/grants.sql` | Roles (`shawk_owner`, `shawk_connector`, `shawk_grafana`), database and privileges. |
 | `prometheus/prometheus.yml` | Settings Prometheus needs for the OTLP push of the collector. |
+| `prometheus/web.yml` | Web configuration of Prometheus: TLS, and users with passwords, so that only its clients can push. |
 | `prometheus/shawk-rules.yml` | Recording rules that count each dependency once (connections, failures and their reasons, bytes, RTT, time to connect, retransmissions), and alerts. |
 | `grafana/provisioning/` | Data sources (uids `shawk-postgres`, `shawk-prometheus`), the dashboard provider and SQL alert rules. |
 | `grafana/dashboards/` | Dashboards: fleet, dependency map, dependency details, changes, application layer (OBI). |
@@ -68,7 +69,49 @@ SELECT pg_cancel_backend(pid) FROM pg_stat_activity
 WHERE usename = 'shawk_grafana' AND state = 'active' AND now() - query_start > interval '1 minute';
 ```
 
-Prometheus must run with `--web.enable-otlp-receiver`.
+Prometheus must run with `--web.enable-otlp-receiver`, and with the web
+configuration of `prometheus/web.yml` (`--web.config.file`). The OTLP
+receiver writes whatever series it is sent: without that configuration,
+anyone who can reach Prometheus can push `shawk_agent_up` or any other
+series, bypassing the client certificates the collector requires, and
+silence the alerts on agents. `web.yml` serves every endpoint of
+Prometheus over TLS, to the users of `basic_auth_users` only; replace the
+placeholders with bcrypt hashes of their passwords
+(`htpasswd -nBC 12 '' | tr -d ':\n'`), or Prometheus refuses to start.
+Prometheus does not tell readers from writers, so every user can also
+push: give each client its own user.
+
+* The collector verifies Prometheus with
+  `/etc/shawk/tls/prometheus-ca.crt` and sends the header `Authorization`
+  from the variable `SHAWK_PROMETHEUS_AUTHORIZATION` (`otlp_http/prometheus`
+  in `collector/config.yaml`). The unit reads it from
+  `/etc/shawk/collector.env`, which the packages install readable by root
+  only; the container image takes it with `docker run --env-file`. Its
+  value is `Basic` and the base64 of the user and password:
+
+  ```sh
+  printf 'Basic %s\n' "$(printf '%s' 'shawk-collector:PASSWORD' | base64 -w0)"
+  ```
+
+  Without it, Prometheus refuses the metrics and the collector logs the
+  error (HTTP status 401).
+* Grafana logs in as `grafana`, with the password in
+  `$SHAWK_GRAFANA_PROMETHEUS_PASSWORD`, and verifies Prometheus with
+  `/etc/grafana/tls/prometheus-ca.crt` (`grafana/provisioning/datasources/shawk.yaml`).
+* People, and Prometheus itself if it scrapes itself (`basic_auth` and
+  `tls_config` in the scrape configuration), log in as users of their own.
+
+Prometheus can require client certificates instead of passwords
+(`client_auth_type` and `client_ca_file` in `web.yml`), but then of every
+client, Grafana and browsers included; the collector presents its own with
+`tls.cert_file` and `tls.key_file` instead of the header. To let only the
+collector push, put a proxy in front of Prometheus that passes
+`/api/v1/otlp/` from the collector alone.
+
+The trace exporter `otlp_grpc/traces` verifies the trace store with
+`/etc/shawk/tls/tempo-ca.crt` and presents the client certificate
+`/etc/shawk/tls/collector-client.crt`, which the store should require (in
+Tempo, `tls.client_ca_file` of the `otlp` receiver of the distributor).
 
 The release packages `shawk-collector` install the collector as the
 systemd service `shawk-collector` running as the user `shawk-collector`,
