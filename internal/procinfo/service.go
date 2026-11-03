@@ -62,9 +62,10 @@ func (s Service) Job() string {
 // maxEnviron bounds how much of the environment of a process is read.
 const maxEnviron = 1 << 20
 
-// environTimeout bounds a read of /proc/PID/environ, which takes the lock
-// of the memory map of the process and can block while the process is
-// stuck, e.g. on a hung network file system.
+// environTimeout bounds the wait for a read of /proc/PID/environ, which
+// takes the lock of the memory map of the process and can block while the
+// process is stuck: for a while on a hung network file system, or for good
+// on a FUSE file system that its user stalls.
 const environTimeout = 200 * time.Millisecond
 
 // environBackoff is how long the environment of a process whose read timed
@@ -72,10 +73,56 @@ const environTimeout = 200 * time.Millisecond
 // answer once is likely slow again.
 const environBackoff = 5 * time.Minute
 
-// slowEnviron are the PIDs whose environment is not read: the zero time
-// while a read that timed out is still running, then the time until which
-// it backs off.
-var slowEnviron sync.Map
+// MaxEnvironReads bounds the reads of environments outstanding at once.
+// A read that hangs holds a goroutine and a file descriptor until it
+// returns, which may be never, and a user can make one hang per process
+// it starts. Once this many are outstanding, no read starts: the
+// processes are not read in time, as if their read had timed out. A read
+// returns within microseconds unless it hangs, so the slots are held by
+// reads that hang; the agent reads 8 processes at once, so 24 reads may
+// hang before one of its readers finds no slot. 32 goroutines and file
+// descriptors cost little, and more processes hanging at once point to a
+// stall of the host, e.g. of a file system that many processes map, which
+// reading more processes would only add readers to.
+const MaxEnvironReads = 32
+
+// maxSlowEnviron bounds the PIDs that back off. The agent can time out 40
+// reads in an interval (8 readers for a second, 200 ms each), 800 in the
+// 5 minutes of a backoff with intervals of 15 s, more with shorter ones. A
+// read that returns while this many PIDs back off does not back off.
+const maxSlowEnviron = 4096
+
+// environReads tracks the reads of environments.
+var environReads = struct {
+	sync.Mutex
+	// running counts the reads started that have not returned, and stuck
+	// those of them that timed out.
+	running, stuck int
+	// skipped counts the reads not started because MaxEnvironReads were
+	// running.
+	skipped uint64
+	// slow holds the PIDs whose environment is not read: the zero time
+	// while a read that timed out is running, then the time until which
+	// the process backs off.
+	slow map[uint32]time.Time
+}{slow: map[uint32]time.Time{}}
+
+// EnvironReads tells how many reads of environments hang.
+type EnvironReads struct {
+	// Stuck counts the reads that timed out and have not returned.
+	Stuck int
+	// Skipped counts the reads not started, since the agent started,
+	// because MaxEnvironReads were outstanding.
+	Skipped uint64
+}
+
+// StuckEnvironReads returns how many reads of environments hang.
+func StuckEnvironReads() EnvironReads {
+	e := &environReads
+	e.Lock()
+	defer e.Unlock()
+	return EnvironReads{Stuck: e.stuck, Skipped: e.skipped}
+}
 
 // OTelEnv returns the variables of the environment of a process whose names
 // start with OTEL_. Other variables, which may hold secrets, are discarded
@@ -85,35 +132,99 @@ func OTelEnv(pid uint32) (env map[string]string, ok bool) {
 	if pid == 0 {
 		return nil, true
 	}
-	if v, slow := slowEnviron.Load(pid); slow {
-		if t := v.(time.Time); t.IsZero() || time.Now().Before(t) {
-			return nil, false
-		}
-		slowEnviron.Delete(pid)
-	}
-	done := make(chan map[string]string, 1)
-	go func() {
-		done <- readEnviron(pid)
-	}()
-	select {
-	case env := <-done:
-		return env, true
-	case <-time.After(environTimeout):
-		slowEnviron.Store(pid, time.Time{})
-		go func() {
-			<-done
-			now := time.Now()
-			slowEnviron.Store(pid, now.Add(environBackoff))
-			// Forget the PIDs whose backoff ended, which may have exited.
-			slowEnviron.Range(func(k, v any) bool {
-				if t := v.(time.Time); !t.IsZero() && now.After(t) {
-					slowEnviron.Delete(k)
-				}
-				return true
-			})
-		}()
+	r := startEnvironRead(pid)
+	if r == nil {
 		return nil, false
 	}
+	go r.run()
+	timeout := time.NewTimer(environTimeout)
+	defer timeout.Stop()
+	select {
+	case env := <-r.done:
+		return env, true
+	case <-timeout.C:
+	}
+	if !r.abandon() {
+		// The read returned as it timed out.
+		return <-r.done, true
+	}
+	return nil, false
+}
+
+// environRead is a read of the environment of a process, which holds one
+// of MaxEnvironReads until it returns.
+type environRead struct {
+	pid uint32
+	// done receives the environment, unless the read was abandoned.
+	done chan map[string]string
+	// Guarded by environReads.
+	returned, abandoned bool
+}
+
+// startEnvironRead returns a read of the environment of pid, or nil if the
+// process backs off or MaxEnvironReads are outstanding.
+func startEnvironRead(pid uint32) *environRead {
+	e := &environReads
+	e.Lock()
+	defer e.Unlock()
+	if t, slow := e.slow[pid]; slow {
+		if t.IsZero() || time.Now().Before(t) {
+			return nil
+		}
+		delete(e.slow, pid)
+	}
+	if e.running >= MaxEnvironReads {
+		e.skipped++
+		return nil
+	}
+	e.running++
+	return &environRead{pid: pid, done: make(chan map[string]string, 1)}
+}
+
+// run reads the environment, then releases the slot of the read. The
+// process of a read that was abandoned backs off.
+func (r *environRead) run() {
+	env := readEnviron(r.pid)
+	e := &environReads
+	e.Lock()
+	defer e.Unlock()
+	e.running--
+	r.returned = true
+	if !r.abandoned {
+		r.done <- env
+		return
+	}
+	e.stuck--
+	now := time.Now()
+	// Forget the PIDs whose backoff ended, which may have exited.
+	for pid, t := range e.slow {
+		if !t.IsZero() && now.After(t) {
+			delete(e.slow, pid)
+		}
+	}
+	// At most maxSlowEnviron PIDs back off, and at most MaxEnvironReads
+	// more wait for their read.
+	if len(e.slow) < maxSlowEnviron {
+		e.slow[r.pid] = now.Add(environBackoff)
+	} else {
+		delete(e.slow, r.pid)
+	}
+}
+
+// abandon stops waiting for the read, unless it has returned: the process
+// is not read again while the read runs. It reports whether the read was
+// abandoned.
+func (r *environRead) abandon() bool {
+	e := &environReads
+	e.Lock()
+	defer e.Unlock()
+	if r.returned {
+		return false
+	}
+	r.abandoned = true
+	e.stuck++
+	e.slow[r.pid] = time.Time{}
+	return true
 }
 
 // readEnviron reads the OTEL_ variables of a process; replaced in tests.
