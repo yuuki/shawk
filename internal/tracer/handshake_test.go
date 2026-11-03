@@ -579,7 +579,29 @@ func TestConnectFailureLocal(t *testing.T) {
 	tr, run := handshakeTracer(t, 0)
 	var srv netip.AddrPort
 	run(func() {
-		srv = echoServer(t, "tcp4", "127.0.0.1:0").Addr().(*net.TCPAddr).AddrPort()
+		// A server that tells when its side of a connection is closed.
+		lc := net.ListenConfig{}
+		lc.SetMultipathTCP(false)
+		ln, err := lc.Listen(t.Context(), "tcp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { ln.Close() })
+		closed := make(chan struct{}, 2)
+		go func() {
+			for {
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				go func() {
+					io.Copy(io.Discard, c)
+					c.Close()
+					closed <- struct{}{}
+				}()
+			}
+		}()
+		srv = ln.Addr().(*net.TCPAddr).AddrPort()
 		// A range of one port, which one connection to the server holds.
 		port := 40000
 		if int(srv.Port()) == port {
@@ -596,6 +618,16 @@ func TestConnectFailureLocal(t *testing.T) {
 			t.Fatalf("connect without a free port: %v", err)
 		}
 		a.disconnect(t)
+		// The next connection has the same addresses and ports, and the
+		// reset that closes the server side of a is processed apart from
+		// connect(2), possibly after the SYN of the next one: the SYN then
+		// gets a challenge ACK from the server side of a, and is
+		// retransmitted.
+		select {
+		case <-closed:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the server side of the first connection is still open")
+		}
 		if err := newSock(t, netip.Addr{}, false, nil).connect(srv); err != nil {
 			t.Fatal(err)
 		}
