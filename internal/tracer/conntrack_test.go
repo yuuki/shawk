@@ -472,11 +472,52 @@ func nfnetlink(msgs [][]byte) error {
 	return nil
 }
 
+// allowedCPUs returns the CPUs that the thread of the test may run on.
+func allowedCPUs(t *testing.T) []int {
+	t.Helper()
+	var set unix.CPUSet
+	if err := unix.SchedGetaffinity(0, &set); err != nil {
+		t.Fatal(err)
+	}
+	var cpus []int
+	for c := 0; len(cpus) < set.Count(); c++ {
+		if set.IsSet(c) {
+			cpus = append(cpus, c)
+		}
+	}
+	return cpus
+}
+
+// pinThread runs the thread of the caller, which must be locked to it, on
+// cpu only, until the returned function restores its CPUs.
+func pinThread(t *testing.T, cpu int) (unpin func()) {
+	t.Helper()
+	var orig, one unix.CPUSet
+	if err := unix.SchedGetaffinity(0, &orig); err != nil {
+		t.Fatal(err)
+	}
+	one.Set(cpu)
+	if err := unix.SchedSetaffinity(0, &one); err != nil {
+		t.Fatalf("running on CPU %d: %v", cpu, err)
+	}
+	return func() {
+		if err := unix.SchedSetaffinity(0, &orig); err != nil {
+			t.Errorf("restoring the CPUs of the thread: %v", err)
+		}
+	}
+}
+
 // TestTranslationsMissedDestroy checks that an entry whose destroy the
 // programs missed is released when conntrack reuses its memory for another
 // entry, also one that translates nothing. The destroy program is detached
 // while the entry goes, and new entries are made until one reuses its
 // address.
+//
+// The entry is freed by the worker that destroys its namespace, on any CPU,
+// and SLUB keeps a freed object on the lists of the CPU that freed it: the
+// new entries are made from each CPU in turn, as a connection makes its
+// entry on the CPU that sends its SYN. Made from one CPU only, they may
+// never reuse it.
 func TestTranslationsMissedDestroy(t *testing.T) {
 	run, ns := natNetNS(t)
 	tr := startTracer(t, Options{LearnTranslations: true})
@@ -512,22 +553,28 @@ func TestTranslationsMissedDestroy(t *testing.T) {
 	// stay (TIME_WAIT) while the test runs.
 	run2, _ := natNetNS(t)
 	listenIn(t, run2, "10.99.0.2:5435")
+	cpus := allowedCPUs(t)
 	released := false
-	for i := 0; i < 5000 && !released; i++ {
+	n := 5000 * len(cpus)
+	for i := 0; i < n && !released; i++ {
+		cpu := cpus[i%len(cpus)]
 		var d net.Conn
 		var err error
-		run2(func() { d, err = net.Dial("tcp4", "10.99.0.2:5435") })
+		run2(func() {
+			defer pinThread(t, cpu)()
+			d, err = net.Dial("tcp4", "10.99.0.2:5435")
+		})
 		if err != nil {
 			t.Fatal(err)
 		}
 		d.Close()
 		released = errors.Is(tr.xlatConnsMap.Lookup(stale[0], &val), ebpf.ErrKeyNotExist)
 		if released {
-			t.Logf("released after %d connections", i+1)
+			t.Logf("released after %d connections, by one from CPU %d", i+1, cpu)
 		}
 	}
 	if !released {
-		t.Fatal("the entry of a missed destroy was not released by the entry that reused its address")
+		t.Fatalf("the entry of a missed destroy was not released by any of %d entries made from CPUs %v", n, cpus)
 	}
 	// The translation is idle: it is reported once more, and then deleted.
 	collect(t, tr)
