@@ -443,43 +443,72 @@ about agents whose peers are folded that way (§5.2).
   containerd without a name (`ctr run`). A container in a container
   (Docker in Docker, kind) keeps its state in the outer container, out of
   reach, and is named after the outer one.
-- The workload of a pod is the name of the pod without the suffixes
-  Kubernetes appends to the pods it creates (`web-5d8f7c9b6-x7z2k` and
-  `node-exporter-x7z2k` become `web` and `node-exporter`, `db-0` becomes
-  `db`). The API server cuts the prefix of a generated name to 58
-  characters before the 5 random ones, so a generated name of 63
-  characters without `-` before the last 5 is cut at its last `-`, after
-  the part of the hash or of the minutes of a CronJob that is left; the
-  name is the same for every pod of the workload, but may lack the end of
-  a long name of a workload. The owner of a pod is known only to the API
-  server, which the agent does not ask, so a pod named by hand that ends
-  like a generated name loses that end too.
+- The workload of a pod, in its unit, is the name of the pod without the
+  suffixes Kubernetes appends to the pods it creates
+  (`web-5d8f7c9b6-x7z2k` and `node-exporter-x7z2k` become `web` and
+  `node-exporter`, `db-0` becomes `db`). The API server cuts the prefix of
+  a generated name to 58 characters before the 5 random ones, so a
+  generated name of 63 characters without `-` before the last 5 is cut at
+  its last `-`, after the part of the hash or of the minutes of a CronJob
+  that is left; the name is the same for every pod of the workload, but
+  may lack the end of a long name of a workload. A pod named by hand that
+  ends like a generated name loses that end too.
 - `service.name` follows the order of OBI: `OTEL_SERVICE_NAME`, then
   `service.name` in `OTEL_RESOURCE_ATTRIBUTES` of the process (only the
   `OTEL_` variables of `/proc/PID/environ` are read; the rest is discarded
-  as soon as it is read), then the workload of the pod of Kubernetes of
+  as soon as it is read), then the service of the pod of Kubernetes of
   the process, then the base name of the executable, then comm, then the
   unit, then `~unknown` (a socket whose owner is not known).
   `-service-name-fallback=unit` uses the unit instead of the executable.
   `service.namespace` is read from `OTEL_RESOURCE_ATTRIBUTES`, else it is
-  the namespace of the pod, also for a process that names its service
-  with `OTEL_SERVICE_NAME`, as OBI does.
-- OBI names the processes of other containers after their executable, as
-  the agent does, but it names a pod from the metadata the API server
-  gives it, which the agent cannot see: the annotation
+  the namespace of the service of the pod, also for a process that names
+  its service with `OTEL_SERVICE_NAME`, as OBI does.
+- The service of a pod is named as OBI names it from the metadata the API
+  server gives it (`pkg/kube/store.go`): the annotation
   `resource.opentelemetry.io/service.name`, then the labels
-  `app.kubernetes.io/instance` and `app.kubernetes.io/name`, then the
-  owner of the pod (the namespace from the annotation
-  `resource.opentelemetry.io/service.namespace` or the label
-  `app.kubernetes.io/part-of`). The `job` of a pod is the same in both
-  only when the pod has none of them and the name of its owner is what
-  the agent guesses; a chart of Helm usually sets these labels (the
-  controller of ingress-nginx is `ingress-nginx/ingress-nginx` in OBI and
-  `ingress-nginx/ingress-nginx-controller` here). A pod that sets
-  `OTEL_SERVICE_NAME` has the same `job` in both. Containers of Docker or
-  Podman that run the same executable share a service name unless they
-  set `OTEL_SERVICE_NAME`, as with OBI, but PostgreSQL tells them apart by
-  unit; `-service-name-fallback=unit` names them after their unit.
+  `app.kubernetes.io/instance` and `app.kubernetes.io/name`, then the top
+  owner of the pod; its namespace is the annotation
+  `resource.opentelemetry.io/service.namespace`, then the label
+  `app.kubernetes.io/part-of`, then the namespace of the pod. A key the
+  pod has with an empty value ends the search, as in OBI. The agent does
+  not ask the API server; it reads the labels and annotations where the
+  runtime keeps them on disk, from the sandbox of the pod, which it
+  believes only if it names the same pod:
+  - CRI-O keeps them in JSON in the annotations `io.kubernetes.cri-o.Labels`
+    and `io.kubernetes.cri-o.Annotations` of the bundle of the sandbox
+    (`io.kubernetes.cri-o.SandboxID`), saved in its directory under
+    `/var/lib/containers/storage` even without an infra container;
+  - cri-dockerd keeps them on the labels of the sandbox
+    (`k8s_POD_<pod>_<namespace>_<uid>_<attempt>`, the label
+    `io.kubernetes.sandbox.id` of the container), the annotations prefixed
+    with `annotation.`;
+  - containerd keeps the labels only in its metadata store (bolt), out of
+    reach, and on the bundle of the sandbox only the annotations that
+    `pod_annotations` of the runtime handler lets through (e.g.
+    `pod_annotations = ["resource.opentelemetry.io/*"]`).
+
+  The top owner of the pod follows OBI (`ownersFrom` in
+  `pkg/kube/kubecache/meta/types.go`) when the labels tell it: a pod with
+  `pod-template-hash` is owned by the Deployment named before
+  `-<hash>-` in the name of the pod; a pod with
+  `batch.kubernetes.io/job-name` or `job-name` is owned by the CronJob
+  OBI makes of every Job by cutting its name at its last `-` (`data-load`
+  becomes `data`, `backup-29340000` becomes `backup`); a static pod
+  (annotation `kubernetes.io/config.source` other than `api`) is owned by
+  its Node, whose name ends the name of the pod and is taken from the host
+  name in lower case (kubelet's default without `--hostname-override`).
+  Otherwise the owner is the workload guessed from the name of the pod.
+  The `job` of a pod differs from that of OBI when the runtime does not
+  keep the label or annotation that names it (containerd, unless
+  `pod_annotations` lets the annotation through), when the guess from the
+  name is not the owner (a ReplicaSet or a pod without owner whose name
+  ends like a generated one, a Deployment whose long name was cut in the
+  names of its pods), or when the value of an annotation has characters that
+  are replaced with `_`. A pod that sets `OTEL_SERVICE_NAME` has the same
+  `job` in both. Containers of Docker or Podman that run the same
+  executable share a service name unless they set `OTEL_SERVICE_NAME`, as
+  with OBI, but PostgreSQL tells them apart by unit;
+  `-service-name-fallback=unit` names them after their unit.
 - Sockets of the kernel (§3.2) are named after their service port, the
   one thing that stays the same across reconnections: `~kernel:nfs` (2049),
   `~kernel:rpcbind` (111), `~kernel:smb` (139, 445), `~kernel:iscsi`

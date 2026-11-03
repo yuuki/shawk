@@ -337,3 +337,148 @@ func TestResolverUnit(t *testing.T) {
 		t.Errorf("Unit(10) = %q, %+v", unit, ctr)
 	}
 }
+
+func TestContainerWorkload(t *testing.T) {
+	defer func(f func() string) { nodeName = f }(nodeName)
+	nodeName = func() string { return "node-1" }
+	pod := func(name string, labels, annotations map[string]string) *Container {
+		return &Container{Runtime: RuntimeCRIO, ID: id1, PodNamespace: "shop", PodName: name,
+			Pod: newPodMeta(labels, annotations)}
+	}
+	for _, tc := range []struct {
+		name string
+		c    *Container
+		want Service
+	}{
+		{"no metadata", pod("cart-5d8f7c9b6-x7z2k", nil, nil), Service{"cart", "shop"}},
+		{"Helm chart", pod("ingress-nginx-controller-5d8f7c9b6-x7z2k", map[string]string{
+			"app.kubernetes.io/instance": "ingress-nginx", "app.kubernetes.io/name": "ingress-nginx",
+			"app.kubernetes.io/part-of": "ingress-nginx", "pod-template-hash": "5d8f7c9b6",
+		}, nil), Service{"ingress-nginx", "ingress-nginx"}},
+		{"instance before name", pod("x-0", map[string]string{
+			"app.kubernetes.io/instance": "prod-db", "app.kubernetes.io/name": "postgresql"}, nil),
+			Service{"prod-db", "shop"}},
+		{"name", pod("x-0", map[string]string{"app.kubernetes.io/name": "postgresql"}, nil),
+			Service{"postgresql", "shop"}},
+		{"annotation before labels", pod("x-0", map[string]string{"app.kubernetes.io/name": "postgresql"},
+			map[string]string{annotationServiceName: "orders", annotationServiceNamespace: "eu"}),
+			Service{"orders", "eu"}},
+		{"empty annotation ends the search", pod("x-0", map[string]string{"app.kubernetes.io/name": "postgresql"},
+			map[string]string{annotationServiceName: ""}), Service{"x", "shop"}},
+		{"Deployment", pod("web-api-7c6b5d4f8b-9mzqk", map[string]string{"pod-template-hash": "7c6b5d4f8b"}, nil),
+			Service{"web-api", "shop"}},
+		{"Job owned by a CronJob", pod("backup-29340000-tq8wz", map[string]string{
+			"batch.kubernetes.io/job-name": "backup-29340000", "job-name": "backup-29340000"}, nil),
+			Service{"backup", "shop"}},
+		{"Job", pod("data-load-tq8wz", map[string]string{"job-name": "data-load"}, nil), Service{"data", "shop"}},
+		{"Job without -", pod("migrate-tq8wz", map[string]string{"job-name": "migrate"}, nil), Service{"migrate", "shop"}},
+		{"static pod", pod("kube-apiserver-node-1", map[string]string{"component": "kube-apiserver"},
+			map[string]string{annotationConfigSource: "file"}), Service{"node-1", "shop"}},
+		{"static pod of another node", pod("etcd-node-2", map[string]string{},
+			map[string]string{annotationConfigSource: "file"}), Service{"etcd-node", "shop"}}, // guessed from the name
+		{"pod of the API server", pod("web-node-1", map[string]string{},
+			map[string]string{annotationConfigSource: "api"}), Service{"web-node", "shop"}},
+		{"unsafe annotation", pod("x-0", nil, map[string]string{annotationServiceName: "a/b c"}),
+			Service{"a_b_c", "shop"}},
+		{"not a pod", &Container{Runtime: RuntimeDocker, ID: id1, Name: "web"}, Service{}},
+	} {
+		if got := tc.c.Workload(); got != tc.want {
+			t.Errorf("%s: Workload = %+v, want %+v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestNewPodMeta(t *testing.T) {
+	if m := newPodMeta(nil, map[string]string{"io.kubernetes.cri.sandbox-name": "x"}); m != nil {
+		t.Errorf("newPodMeta without keys = %+v", m)
+	}
+	m := newPodMeta(map[string]string{"app.kubernetes.io/name": "a", "other": "b"}, nil)
+	if len(m.Labels) != 1 || m.Annotations != nil {
+		t.Errorf("newPodMeta = %+v", m)
+	}
+}
+
+// cri-dockerd keeps the labels and annotations of a pod on its sandbox.
+func TestContainersCRIDockerdPodMeta(t *testing.T) {
+	root := t.TempDir()
+	sandbox := id2
+	writeFile(t, root, "/var/lib/docker/containers/"+sandbox+"/config.v2.json", `{
+		"Name": "/k8s_POD_cart-5d8f7c9b6-x7z2k_shop_0f1e2d3c_0",
+		"Config": {"Labels": {"io.kubernetes.pod.name": "cart-5d8f7c9b6-x7z2k",
+			"io.kubernetes.pod.namespace": "shop", "io.kubernetes.docker.type": "podsandbox",
+			"app.kubernetes.io/name": "cart-app",
+			"annotation.resource.opentelemetry.io/service.namespace": "store"}}}`)
+	container := `{
+		"Name": "/k8s_app_cart-5d8f7c9b6-x7z2k_shop_%s_0",
+		"Config": {"Labels": {"io.kubernetes.pod.name": "cart-5d8f7c9b6-x7z2k",
+			"io.kubernetes.pod.namespace": "shop", "io.kubernetes.container.name": "app",
+			"io.kubernetes.sandbox.id": "` + sandbox + `"}}}`
+	writeFile(t, root, "/var/lib/docker/containers/"+id1+"/config.v2.json", fmt.Sprintf(container, "0f1e2d3c"))
+	c := newContainers(root)
+	if got, _ := c.Lookup(RuntimeDocker, id1); got.Workload() != (Service{"cart-app", "store"}) {
+		t.Errorf("Workload of the container = %+v", got.Workload())
+	}
+	if got, _ := c.Lookup(RuntimeDocker, sandbox); got.Workload() != (Service{"cart-app", "store"}) {
+		t.Errorf("Workload of the sandbox = %+v", got.Workload())
+	}
+	// The sandbox of another pod is not believed.
+	id3 := strings.Repeat("ab", 32)
+	writeFile(t, root, "/var/lib/docker/containers/"+id3+"/config.v2.json", fmt.Sprintf(container, "other"))
+	if got, _ := c.Lookup(RuntimeDocker, id3); got.Pod != nil || got.Workload() != (Service{"cart", "shop"}) {
+		t.Errorf("Workload with the sandbox of another pod = %+v", got.Workload())
+	}
+}
+
+// CRI-O keeps the labels and annotations of a pod in JSON on the bundle of
+// its sandbox.
+func TestContainersCRIOPodMeta(t *testing.T) {
+	root := t.TempDir()
+	sandbox := id2
+	writeFile(t, root, "/var/lib/containers/storage/overlay-containers/"+sandbox+"/userdata/config.json", `{
+		"annotations": {"io.kubernetes.pod.name": "data-load-tq8wz", "io.kubernetes.pod.namespace": "batch",
+			"io.kubernetes.container.name": "POD", "io.kubernetes.cri-o.SandboxID": "`+sandbox+`",
+			"io.kubernetes.cri-o.Labels": "{\"io.kubernetes.pod.name\":\"data-load-tq8wz\",\"io.kubernetes.pod.namespace\":\"batch\",\"job-name\":\"data-load\"}",
+			"io.kubernetes.cri-o.Annotations": "{\"resource.opentelemetry.io/service.namespace\":\"etl\"}"}}`)
+	writeFile(t, root, "/run/containers/storage/overlay-containers/"+id1+"/userdata/config.json", `{
+		"annotations": {"io.kubernetes.pod.name": "data-load-tq8wz", "io.kubernetes.pod.namespace": "batch",
+			"io.kubernetes.container.name": "load", "io.kubernetes.cri-o.SandboxID": "`+sandbox+`",
+			"io.kubernetes.cri-o.Labels": "{\"io.kubernetes.pod.name\":\"data-load-tq8wz\",\"io.kubernetes.pod.namespace\":\"batch\"}"}}`)
+	c := newContainers(root)
+	for _, id := range []string{id1, sandbox} {
+		if got, _ := c.Lookup(RuntimeCRIO, id); got.Workload() != (Service{"data", "etl"}) {
+			t.Errorf("Workload of %s = %+v", got.ContainerName, got.Workload())
+		}
+	}
+	// Without its sandbox, the owner is guessed from the name.
+	id3 := strings.Repeat("ab", 32)
+	writeFile(t, root, "/run/containers/storage/overlay-containers/"+id3+"/userdata/config.json", `{
+		"annotations": {"io.kubernetes.pod.name": "data-load-tq8wz", "io.kubernetes.pod.namespace": "batch",
+			"io.kubernetes.cri-o.SandboxID": "`+strings.Repeat("cd", 32)+`"}}`)
+	if got, _ := c.Lookup(RuntimeCRIO, id3); got.Pod != nil || got.Workload() != (Service{"data-load", "batch"}) {
+		t.Errorf("Workload without a sandbox = %+v", got.Workload())
+	}
+}
+
+// containerd keeps the annotations of a pod that pod_annotations lets
+// through on the bundle of its sandbox, and not its labels.
+func TestContainersContainerdPodMeta(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, containerdTasks+"/k8s.io/"+id2+"/config.json", `{
+		"annotations": {"io.kubernetes.cri.container-type": "sandbox",
+			"io.kubernetes.cri.sandbox-name": "web-5d8f7c9b6-x7z2k",
+			"io.kubernetes.cri.sandbox-namespace": "default",
+			"resource.opentelemetry.io/service.name": "frontend"}}`)
+	writeFile(t, root, containerdTasks+"/k8s.io/"+id1+"/config.json", `{
+		"annotations": {"io.kubernetes.cri.container-type": "container",
+			"io.kubernetes.cri.sandbox-id": "`+id2+`",
+			"io.kubernetes.cri.sandbox-name": "web-5d8f7c9b6-x7z2k",
+			"io.kubernetes.cri.sandbox-namespace": "default",
+			"io.kubernetes.cri.container-name": "nginx"}}`)
+	c := newContainers(root)
+	for _, id := range []string{id1, id2} {
+		got, _ := c.Lookup(RuntimeContainerd, id)
+		if got.Workload() != (Service{"frontend", "default"}) || got.Pod.Labels != nil {
+			t.Errorf("Workload of %s = %+v, %+v", got.ContainerName, got.Workload(), got.Pod)
+		}
+	}
+}

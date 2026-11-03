@@ -1,5 +1,20 @@
 ## Unreleased
 
+* Pods are named from their labels and annotations, as OBI names them
+  (#124): `service.name` is the annotation
+  `resource.opentelemetry.io/service.name`, then the labels
+  `app.kubernetes.io/instance` and `app.kubernetes.io/name`, then the
+  owner of the pod, and `service.namespace` the annotation
+  `resource.opentelemetry.io/service.namespace`, then the label
+  `app.kubernetes.io/part-of`, then the namespace of the pod. The agent
+  reads them from the sandbox of the pod kept by CRI-O and cri-dockerd;
+  containerd keeps only the annotations its `pod_annotations` lets
+  through. The owner follows OBI too: the pods of a Job are named after
+  the Job cut at its last `-` (`data-load` becomes `data`), and static
+  pods after their Node. The Prometheus `job` of pods of Helm charts
+  changes accordingly (`ingress-nginx/ingress-nginx-controller` becomes
+  `ingress-nginx/ingress-nginx`); their unit does not change.
+
 * Dependencies through relays without an agent that rewrite addresses
   (#107): load balancers, keepalived or LVS virtual addresses, TCP
   proxies. `translations` in the configuration of the connector gives
