@@ -55,7 +55,7 @@ func TestRequest(t *testing.T) {
 	started := t0.Add(-time.Hour)
 	req := s.Request(res, AgentStatus{
 		Started: started, SegmentStart: started, NetNSScope: "all", UDPTraced: true,
-		FlowsDropped: 7, ExportFailures: 2,
+		FlowsDropped: 7, CgroupEventsDropped: 3, ContainerReadsDrops: 4, ExportFailures: 2,
 	}, end)
 
 	if n := len(req.ResourceMetrics); n != 1 {
@@ -166,6 +166,12 @@ func TestRequest(t *testing.T) {
 	}
 	if p := sumPoints(MetricAgentFlowsDropped); p[0].GetAsInt() != 7 || p[0].StartTimeUnixNano != uint64(started.UnixNano()) {
 		t.Errorf("flows.dropped = %v", p)
+	}
+	if p := sumPoints(MetricAgentCgroupsDropped); p[0].GetAsInt() != 3 || p[0].StartTimeUnixNano != uint64(started.UnixNano()) {
+		t.Errorf("cgroup_events.dropped = %v", p)
+	}
+	if p := sumPoints(MetricAgentReadsDropped); p[0].GetAsInt() != 4 {
+		t.Errorf("container_reads.dropped = %v", p)
 	}
 	if p := sumPoints(MetricAgentExportFailures); p[0].GetAsInt() != 2 {
 		t.Errorf("export.failures = %v", p)

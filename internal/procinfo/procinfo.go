@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -23,6 +24,9 @@ const (
 	// cgroup are resolved at the end of their interval at the latest.
 	learnedTTL = time.Hour
 	maxLearned = 100000
+	// maxPendingReads bounds the containers of new cgroups waiting to have
+	// their state read (see Learn).
+	maxPendingReads = 4096
 )
 
 // Resolver maps cgroup ids to cgroup paths and units.
@@ -34,6 +38,12 @@ type Resolver struct {
 	paths    map[uint64]string
 	learned  map[uint64]learnedPath
 	lastScan time.Time
+
+	// The paths of new cgroups of containers whose state a worker reads.
+	readerOnce sync.Once
+	pending    chan string
+	reads      sync.WaitGroup // queued reads, waited for in tests
+	dropped    atomic.Uint64  // reads not queued because the queue was full
 }
 
 type learnedPath struct {
@@ -54,8 +64,15 @@ func NewResolver() *Resolver {
 
 // Learn records the path of a cgroup reported when it was created, so that
 // it can be resolved after the cgroup is removed. The state of the
-// container of the cgroup is read then too, while the runtime still has
-// it: a container removed within an interval keeps its name.
+// container of the cgroup is read soon after too, while the runtime still
+// has it: a container removed within an interval keeps its name.
+//
+// Learn is called on the goroutine that drains the events of the kernel,
+// which drops new ones while it waits, so it does not read files: a worker
+// reads the state of the container (#126). When too many reads are queued,
+// as when a node starts many pods at once, the new ones are not queued;
+// such a container is read when its flows are exported, and loses its
+// name only if it is removed before.
 func (r *Resolver) Learn(id uint64, path string) {
 	r.mu.Lock()
 	if len(r.learned) >= maxLearned {
@@ -67,9 +84,37 @@ func (r *Resolver) Learn(id uint64, path string) {
 	r.learned[id] = learnedPath{path: path, at: time.Now()}
 	r.mu.Unlock()
 	if r.containers != nil && len(cgroupContainers(path)) > 0 {
-		r.unit(path)
+		r.queueRead(path)
 	}
 }
+
+// queueRead queues the read of the state of the containers of a cgroup
+// path, unless the queue is full.
+func (r *Resolver) queueRead(path string) {
+	r.readerOnce.Do(func() {
+		r.pending = make(chan string, maxPendingReads)
+		go r.readQueued()
+	})
+	r.reads.Add(1)
+	select {
+	case r.pending <- path:
+	default:
+		r.dropped.Add(1)
+		r.reads.Done()
+	}
+}
+
+// readQueued reads the state of the containers of the queued paths.
+func (r *Resolver) readQueued() {
+	for p := range r.pending {
+		r.unit(p)
+		r.reads.Done()
+	}
+}
+
+// ReadsDropped returns how many reads of the state of containers of new
+// cgroups were not queued because the queue was full (cumulative).
+func (r *Resolver) ReadsDropped() uint64 { return r.dropped.Load() }
 
 // Unit returns the unit of the cgroup id (see Unit), and its container if
 // it is one. The unit of a container is named after its state, which the

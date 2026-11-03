@@ -286,6 +286,10 @@ type Snapshot struct {
 	// Contended is the part of Drops that the kernel refused because
 	// another update on the same CPU held the lock of their bucket (#119).
 	Contended uint64
+	// CgroupEventDrops is the cumulative number of cgroups created whose
+	// event the kernel dropped because the ring buffer was full: their
+	// paths are not learned (#126).
+	CgroupEventDrops uint64
 }
 
 func addrFrom16(b [16]uint8) netip.Addr {
