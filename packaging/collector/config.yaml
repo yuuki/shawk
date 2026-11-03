@@ -4,8 +4,11 @@
 #
 # Both receivers require TLS with client certificates: what they receive is
 # written to PostgreSQL or Prometheus, where a forged shawk_agent_up would
-# silence alerts. The files must be readable by the user of the collector
-# (shawk-collector; 65532 in the container image).
+# silence alerts. Each receiver trusts its own CA, so that a certificate of
+# OBI, which often runs on hosts or in containers trusted less than the
+# agents, is refused by the receiver of agents. The files must be readable
+# by the user of the collector (shawk-collector; 65532 in the container
+# image).
 receivers:
   # shawk agents only (-otlp-cert-file and -otlp-key-file). A request of an
   # agent stays below 3 MiB; the limits leave room. gRPC only: the connector
@@ -16,21 +19,25 @@ receivers:
       grpc:
         endpoint: 0.0.0.0:4327
         max_recv_msg_size_mib: 16
-        tls: &shawk_tls
+        tls:
           cert_file: /etc/shawk/tls/collector.crt
           key_file: /etc/shawk/tls/collector.key
           client_ca_file: /etc/shawk/tls/agents-ca.crt
   # OBI and other instrumentation, with the variables of the OpenTelemetry
   # SDK: OTEL_EXPORTER_OTLP_ENDPOINT=https://..., OTEL_EXPORTER_OTLP_CERTIFICATE,
   # OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE and OTEL_EXPORTER_OTLP_CLIENT_KEY.
+  # Their certificates come from another CA than those of the agents.
   otlp:
     protocols:
       grpc:
         endpoint: 0.0.0.0:4317
-        tls: *shawk_tls
+        tls: &obi_tls
+          cert_file: /etc/shawk/tls/collector.crt
+          key_file: /etc/shawk/tls/collector.key
+          client_ca_file: /etc/shawk/tls/obi-ca.crt
       http:
         endpoint: 0.0.0.0:4318
-        tls: *shawk_tls
+        tls: *obi_tls
 
 connectors:
   shawk:
