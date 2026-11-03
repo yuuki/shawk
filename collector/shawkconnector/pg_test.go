@@ -733,4 +733,23 @@ func TestPGSchemaVersion(t *testing.T) {
 	if v, err := st2.schemaVersion(ctx); err != nil || v != 0 {
 		t.Errorf("schemaVersion of an empty database = %d, %v", v, err)
 	}
+	// A schema created before the migrations were consolidated, which has a
+	// higher version, is refused rather than taken for a newer one: it has
+	// no shawk.schema_history(), or its history has other migrations.
+	for name, stmts := range map[string][]string{
+		"without the history": {`UPDATE shawk.schema_migrations SET version = 13, name = '0013_learned_translations.sql'`,
+			`DROP FUNCTION shawk.schema_history()`},
+		"with another history": {`UPDATE shawk.schema_migrations SET name = '0001_init.sql'`},
+	} {
+		dsn, conn := migratedDB(t)
+		execAll(t, conn, stmts...)
+		st, err := newPGStore(ctx, dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if v, err := st.schemaVersion(ctx); !errors.Is(err, errDevelopmentSchema) {
+			t.Errorf("schemaVersion of a schema %s = %d, %v", name, v, err)
+		}
+		st.close()
+	}
 }

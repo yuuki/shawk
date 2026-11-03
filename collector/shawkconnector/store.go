@@ -28,7 +28,8 @@ type store interface {
 	// in the last learnedTTL.
 	peers(ctx context.Context, learnedTTL time.Duration) (peerRows, error)
 	// schemaVersion returns the version of the schema, 0 if it has not
-	// been created.
+	// been created, and errDevelopmentSchema for a schema created before
+	// the migrations were consolidated.
 	schemaVersion(ctx context.Context) (int, error)
 	// syncConfig replaces the named address ranges of peers and the
 	// translations of addresses.
@@ -455,7 +456,35 @@ func (s *pgStore) schemaVersion(ctx context.Context) (int, error) {
 		// No such function or schema: the schema has not been created.
 		return 0, nil
 	}
-	return v, err
+	if err != nil {
+		return 0, err
+	}
+	// The role of the connector may not read shawk.schema_migrations; the
+	// history is read through a function, which the schemas created before
+	// the migrations were consolidated do not have.
+	var history []appliedMigration
+	rows, err := s.pool.Query(ctx, `SELECT version, name FROM shawk.schema_history()`)
+	if err == nil {
+		history, err = pgx.CollectRows(rows, func(row pgx.CollectableRow) (appliedMigration, error) {
+			var m appliedMigration
+			err := row.Scan(&m.version, &m.name)
+			return m, err
+		})
+	}
+	if errors.As(err, &pgErr) && pgErr.Code == "42883" {
+		return 0, errDevelopmentSchema
+	}
+	if err != nil {
+		return 0, err
+	}
+	ms, err := Migrations()
+	if err != nil {
+		return 0, err
+	}
+	if _, err := checkHistory(history, ms); err != nil {
+		return 0, err
+	}
+	return v, nil
 }
 
 // configLock is the key of the advisory lock that serializes the writes of

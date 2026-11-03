@@ -105,7 +105,7 @@ func TestPGTranslations(t *testing.T) {
 		"~unresolved postgres 5432",
 	}
 	for _, q := range []string{
-		`SELECT client_service, server_service, port FROM shawk.service_dependencies_between('-infinity', 'infinity')`,
+		`SELECT client_service, server_service, port FROM shawk.service_dependencies`,
 		`SELECT client_service, server_service, port FROM shawk.service_dependencies_between(now() - interval '6 hours', now())`,
 	} {
 		if got := queryStrings(t, conn, q); !slices.Equal(got, wantSvc) {
@@ -469,7 +469,7 @@ func TestPGTranslationPrecedencePeriods(t *testing.T) {
 		from string
 		want []string
 	}{
-		{"shawk.service_dependencies_between('-infinity', 'infinity')", []string{"app haproxy false", "app postgres true"}},
+		{"shawk.service_dependencies", []string{"app haproxy false", "app postgres true"}},
 		{"shawk.service_dependencies_between(now() - interval '1 day', now())", []string{"app postgres true"}},
 		{"shawk.service_dependencies_between(now() - interval '3 days', now())", []string{"app haproxy false", "app postgres true"}},
 	} {

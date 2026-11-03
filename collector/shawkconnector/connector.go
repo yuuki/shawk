@@ -173,6 +173,10 @@ func (c *shawkConnector) prepareSchemaOnly(ctx context.Context) bool {
 		}
 	} else {
 		v, err := c.store.schemaVersion(ctx)
+		if errors.Is(err, errDevelopmentSchema) {
+			c.log.Error("the PostgreSQL schema cannot be used; writes wait until it is created again", zap.Error(err))
+			return false
+		}
 		if err != nil {
 			c.log.Error("reading the version of the PostgreSQL schema; writes wait until it succeeds", zap.Error(err))
 			return false

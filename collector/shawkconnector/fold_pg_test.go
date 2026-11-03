@@ -59,7 +59,7 @@ func TestPGFoldedEdges(t *testing.T) {
 	// matched: each names the other ~external.
 	wantSvc := []string{"app ~external 443", "nginx ~external 443", "~external nginx 443"}
 	for _, q := range []string{
-		`SELECT client_service, server_service, port FROM shawk.service_dependencies_between('-infinity', 'infinity')`,
+		`SELECT client_service, server_service, port FROM shawk.service_dependencies`,
 		`SELECT client_service, server_service, port FROM shawk.service_dependencies_between(now() - interval '1 hour', now())`,
 	} {
 		if got := queryStrings(t, conn, q); !slices.Equal(got, wantSvc) {
