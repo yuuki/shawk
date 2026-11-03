@@ -716,10 +716,10 @@ blocker.
 
 | finding | validity | response |
 |---|---|---|
-| Before 6.11 (RHEL 9 too), the error report of the first subflow of an MPTCP connection takes its `sk_err` (`__mptcp_error_report()` calls `sock_error()`) before `tcp_done()`, so an ICMP error reads as `timeout` | valid (from the sources; 6.18 reports after `tcp_done()`) | `fail_reason()` reads the `sk_err` of the MPTCP socket, where the report moved it. `TestConnectFailureMPTCP` checks it on the kernels of CI before 6.11. |
+| Before 6.11 (RHEL 9 too), the error report of the first subflow of an MPTCP connection takes its `sk_err` (`__mptcp_error_report()` calls `sock_error()`) before `tcp_done()`, so an ICMP error reads as `timeout` | valid (from the sources; 6.18 reports after `tcp_done()`) | `fail_reason()` reads the `sk_err` of the MPTCP socket, where the report moved it. `TestConnectFailureMPTCP` checks it on the kernels of CI without `tcp_done_with_error()`: 5.14 and Rocky Linux 9 (the 5.15 of CI has its backport). |
 | A connect with `TCP_FASTOPEN_CONNECT` that fails before it is deferred, e.g. without a free local port, is `aborted` | confirmed (6.18) | The rule of §3.1 tests `defer_connect` instead of `fastopen_connect`: a bitfield before 6.6 and in RHEL 9, bit 19 of `inet_flags` since, read through flavors that `TestKernelCompatibility` requires one of. The durations still leave out every connect with the option, since a non-blocking first write clears `defer_connect` before the SYN-ACK. |
 | A SYN that an LSM denies on output (SELinux returns `ECONNREFUSED` to `tcp_connect()`) is `aborted` | valid (from the sources) | Documented in §10 of the design; `snd_nxt == snd_una` would tell it, but could not be tested here. |
-| The error is reported before `tcp_done()` on every kernel before 6.11, not only on 5.14 and RHEL 9 | valid | The comments and the design say so. |
+| The error is reported before `tcp_done()` on every kernel without `tcp_done_with_error()`, not only on 5.14 and RHEL 9 | valid | The comments and the design say so; a second review found the backports to stable (5.15.165, 6.1.110, 6.6.50). |
 | The tests of ICMP errors could read `SO_ERROR` between the report and `tcp_done()` on kernels before 6.11 | valid (reasoned) | The tests wait 20 ms after the wakeup. Not covered: ICMPv6 (`EACCES`), the fallback on `sk_err_soft`, and the count of a handshake by a walk. |
 | The failures by reason do not add up to `shawk_connection_failed_total`: a new series of a reason emits 0 first, while that of the failures starts with its whole value | valid | The comment of the rules and §5.3 of the design say so; `shawk.connection.failed` is unchanged. |
 | A step back of the clock of an agent by less than 2 minutes makes the first value of a new reason a baseline (`isNew()`) | confirmed by the reviewer | Accepted: new edges behave the same, and such steps are rare. |
@@ -729,6 +729,23 @@ blocker.
 | An input of handshakes with other bounds loses its sum and count too, so changing the bounds needs the connectors upgraded first | by design (§3.3) | Noted. |
 | The bound of series in §5.3 of the design, the row of `_OTHER`, the encoding of buckets (fixed64, not varints) and the changelog were off | valid | Corrected. |
 | Missing tests: the start of a reason when its edge comes back, unknown reasons, a restart of the agent | valid | Added. |
+
+After the fixes, two other subagents reviewed the pull request again: the
+kernel side with the same sources and the stable tags, and with the tests
+in virtual machines of 5.14.21, 5.15.224 and Rocky Linux 9; and the
+pipeline with tests of their own. They found the fixes right, and:
+
+| finding | validity | response |
+|---|---|---|
+| `TestHandshakeWithoutDuration` failed in CI (aarch64, emulated): its server closed without reading what the client sent, which resets the connection, and the client could see the reset before reading | confirmed (4 of 10 runs on Rocky Linux 9) | The server reads first. |
+| `tcp_done_with_error()` was backported to stable (5.15.165, 6.1.110, 6.6.50), so "before 6.11" was wrong, and the 5.15 of CI does not exercise the fallback for MPTCP | confirmed (`TestConnectFailureMPTCP` fails without the fallback on 5.14.21 and Rocky Linux 9, passes on 5.15.224) | The comments, the design and this table name the kernels without `tcp_done_with_error()`. |
+| On kernels without it, an application that connects an MPTCP socket again without reading `SO_ERROR` leaves the error on the MPTCP socket, which a later aborted connect would read as its reason | reasoned only | Accepted: it takes an application that ignores two errors. |
+| Bit 19 of `inet_flags` is written in the BPF source, and nothing checks it | valid | `TestDeferConnectBit` compares it with the BTF of the running kernel and of `SHAWK_TARGET_BTF`. |
+| The test of SYN retransmissions per attempt gave its value for the wrong denominators too | confirmed | It has a fixture of its own: a client of an agent of the previous version, and a dependency without failures. |
+| The refused upstream made the check of the client without an agent in the e2e test pass on the client side, and it was in the requests of puma | confirmed | The check requires a server series with `shawk.peer.agent` false; a client of its own makes the refused connects. |
+| Nothing tied the reasons of the connector to those of the agent | valid | The golden request carries every reason, which the test of the connector compares with those it knows. |
+| SYN retransmissions per attempt exceed 1 when connects time out, which a percentage misreads | valid | A plain number. |
+| The screenshot of the dependency details in the README predates the new panels | valid | Left for the next screenshots. |
 
 ## References
 

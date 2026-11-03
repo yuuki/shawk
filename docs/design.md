@@ -174,8 +174,8 @@ failure, the `error.type` of the agent, is decided at SYN_SENT→CLOSE:
 | `sk_err` `ECONNREFUSED` | `refused`: a reset (no listener), or an ICMP port unreachable, which iptables and nft send to reject by default |
 | `sk_err` `ETIMEDOUT` | `timeout`: no answer to any SYN |
 | `sk_err` `EHOSTUNREACH`, `ENETUNREACH`, `EHOSTDOWN`, `ENONET`, `EACCES` | `unreachable`: an ICMP error from a router or a firewall (firewalld's administratively prohibited is `EACCES` over IPv6), or no answer to ARP/ND |
-| no `sk_err`, the first subflow of an MPTCP connection | the reason of the `sk_err` of the MPTCP socket, to which kernels before 6.11 move the error before `tcp_done()` |
-| no `sk_err`, the socket not held by a process (`sk_lock.owned`) | the reason of `sk_err_soft`, else `timeout`: a timer or an ICMP error closed it, but user space already took the error, which kernels before 6.11 (RHEL 9 among them) report before `tcp_done()` |
+| no `sk_err`, the first subflow of an MPTCP connection whose MPTCP socket has an `sk_err` | its reason: kernels without `tcp_done_with_error()` move the error there before `tcp_done()` |
+| no `sk_err`, the socket not held by a process (`sk_lock.owned`) | the reason of `sk_err_soft`, else `timeout`: a timer or an ICMP error closed it, but user space already took the error, which kernels without `tcp_done_with_error()` report before `tcp_done()`: 5.14 and RHEL 9, and others before 6.11 or before its backports (5.15.165, 6.1.110, 6.6.50) |
 | no `sk_err` | `aborted`: the application closed the socket first, usually after its own connect timeout |
 | another `sk_err` (`ECONNABORTED` from `ss -K`, ...) | `_OTHER`: the kernel counts it in the failures only, and the agent sends the failures without another reason as `_OTHER` |
 
@@ -1206,8 +1206,8 @@ parses. shawk runs beside it instead:
   below a second turns losses into `aborted`. An ICMP error processed
   while `connect(2)` holds the socket only sets the soft error, and the
   socket fails at the next SYN, a second later with one retransmission.
-  The fallback for the error taken by user space on kernels before 6.11
-  covers that race only in part. A SYN that an LSM denies on output
+  The fallback for the error taken by user space on kernels without
+  `tcp_done_with_error()` covers that race only in part. A SYN that an LSM denies on output
   (SELinux returns `ECONNREFUSED` to `tcp_connect()`) is `aborted`, and so
   is a connect deferred by `TCP_FASTOPEN_CONNECT` whose first write fails
   to send the SYN. UDP has no handshake, and QUIC sets up its

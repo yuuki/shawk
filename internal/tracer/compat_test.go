@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 
@@ -367,6 +368,57 @@ func TestCommittedObject(t *testing.T) {
 		if fm.Type != cm.Type || fm.KeySize != cm.KeySize || fm.ValueSize != cm.ValueSize ||
 			fm.MaxEntries != cm.MaxEntries || fm.Flags != cm.Flags || fmt.Sprint(fm.Contents) != fmt.Sprint(cm.Contents) {
 			t.Errorf("%s: map %s differs", stale, name)
+		}
+	}
+}
+
+// TestDeferConnectBit checks the bit of inet_sock.inet_flags that
+// connect_deferred() of the BPF programs reads (INET_FLAGS_DEFER_CONNECT_),
+// in the BTF of the running kernel and of SHAWK_TARGET_BTF: it is a value
+// of an anonymous enum, which CO-RE cannot relocate. Kernels before 6.6,
+// RHEL 9 among them, have neither inet_flags nor the value.
+func TestDeferConnectBit(t *testing.T) {
+	const bit = 19
+	specs := map[string]func() (*btf.Spec, error){"the running kernel": btf.LoadKernelSpec}
+	if path := os.Getenv("SHAWK_TARGET_BTF"); path != "" {
+		specs[path] = func() (*btf.Spec, error) {
+			f, err := os.Open(path)
+			if err != nil {
+				return nil, err
+			}
+			defer f.Close()
+			return btf.LoadSpecFromReader(f)
+		}
+	}
+	for name, load := range specs {
+		spec, err := load()
+		if err != nil {
+			skipUnavailable(t, "BTF of %s: %v", name, err)
+			continue
+		}
+		var inet *btf.Struct
+		if err := spec.TypeByName("inet_sock", &inet); err != nil {
+			t.Fatalf("%s: inet_sock: %v", name, err)
+		}
+		flags := slices.ContainsFunc(inet.Members, func(m btf.Member) bool { return m.Name == "inet_flags" })
+		value, found := uint64(0), false
+		for typ, err := range spec.All() {
+			if err != nil {
+				t.Fatalf("%s: %v", name, err)
+			}
+			if e, ok := typ.(*btf.Enum); ok {
+				for _, v := range e.Values {
+					if v.Name == "INET_FLAGS_DEFER_CONNECT" {
+						value, found = v.Value, true
+					}
+				}
+			}
+		}
+		switch {
+		case found && value != bit:
+			t.Errorf("%s: INET_FLAGS_DEFER_CONNECT is %d, the BPF programs read bit %d", name, value, bit)
+		case flags != found:
+			t.Errorf("%s: inet_sock.inet_flags exists: %v, INET_FLAGS_DEFER_CONNECT exists: %v", name, flags, found)
 		}
 	}
 }

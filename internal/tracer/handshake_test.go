@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"os"
@@ -107,7 +108,8 @@ func (s *testSock) wait(t *testing.T, timeout time.Duration) error {
 		}
 		break
 	}
-	// Kernels before 6.11 wake the socket up before tcp_done(), and reading
+	// Kernels without tcp_done_with_error() (5.14, RHEL 9, and others before
+	// 6.11 or its backports) wake the socket up before tcp_done(), and reading
 	// SO_ERROR before the tracepoint would take its error (fail_reason()).
 	time.Sleep(20 * time.Millisecond)
 	errno, err := unix.GetsockoptInt(s.fd, unix.SOL_SOCKET, unix.SO_ERROR)
@@ -471,7 +473,8 @@ func TestConnectFailureReasons(t *testing.T) {
 }
 
 // TestConnectFailureMPTCP checks the reason of an MPTCP connect that an
-// ICMP error fails, which kernels before 6.11 move from the first subflow
+// ICMP error fails, which kernels without tcp_done_with_error() (5.14, RHEL
+// 9) move from the first subflow
 // to the MPTCP socket before the subflow closes.
 func TestConnectFailureMPTCP(t *testing.T) {
 	tr, run := handshakeTracer(t, 0)
@@ -649,6 +652,10 @@ func TestHandshakeWithoutDuration(t *testing.T) {
 				if err != nil {
 					return
 				}
+				// A close with unread data resets the connection, which
+				// the client may see before it reads.
+				c.SetReadDeadline(time.Now().Add(5 * time.Second))
+				io.ReadFull(c, make([]byte, len("hello")))
 				c.Write([]byte("x"))
 				c.Close()
 			}

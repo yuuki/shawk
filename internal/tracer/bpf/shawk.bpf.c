@@ -854,6 +854,7 @@ struct inet_sock___flags {
 /*
  * The bit of inet_sock.inet_flags that replaces defer_connect since Linux
  * 6.6, INET_FLAGS_DEFER_CONNECT; an anonymous enum cannot be relocated.
+ * TestDeferConnectBit compares it with the BTF of the kernel.
  */
 #define INET_FLAGS_DEFER_CONNECT_ 19
 
@@ -890,14 +891,15 @@ static __always_inline bool connect_deferred(struct sock *sk)
  *   a router or a firewall, or no answer to ARP/ND (EHOSTUNREACH and the
  *   others of errno_reason(); ICMPv6 administratively prohibited gives
  *   EACCES).
- * - Kernels before 6.11 (tcp_done_with_error()), RHEL 9 among them, report
- *   the error in tcp_write_err() and tcp_v4_err()/tcp_v6_err() before
- *   tcp_done(). For the first subflow of an MPTCP connection, the report
+ * - Kernels without tcp_done_with_error() (before 6.11, and stable releases
+ *   before its backport, such as 5.15.165, 6.1.110 and 6.6.50), RHEL 9 and
+ *   5.14 among them, report the error in tcp_write_err() and
+ *   tcp_v4_err()/tcp_v6_err() before tcp_done(). For the first subflow of an MPTCP connection, the report
  *   moves the error to the MPTCP socket at once (__mptcp_error_report()
  *   takes it with sock_error()), where it is read instead.
  * - No error, on a socket that no process holds: a timer or an ICMP error
  *   closed it, but user space already took the error, which SO_ERROR does
- *   without the socket lock once the error is reported (before 6.11). The
+ *   without the socket lock once the error is reported (above). The
  *   soft error of an ICMP error tells which, if any; otherwise the timer.
  * - No error, on a socket that a process holds: the application closed it
  *   or disconnected it first, usually after its own connect timeout.
