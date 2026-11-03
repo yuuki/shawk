@@ -4,8 +4,11 @@
 #
 # Both receivers require TLS with client certificates: what they receive is
 # written to PostgreSQL or Prometheus, where a forged shawk_agent_up would
-# silence alerts. The files must be readable by the user of the collector
-# (shawk-collector; 65532 in the container image).
+# silence alerts. Each receiver trusts its own CA, so that a certificate of
+# OBI, which often runs on hosts or in containers trusted less than the
+# agents, is refused by the receiver of agents. The files must be readable
+# by the user of the collector (shawk-collector; 65532 in the container
+# image).
 receivers:
   # shawk agents only (-otlp-cert-file and -otlp-key-file). A request of an
   # agent stays below 3 MiB; the limits leave room. gRPC only: the connector
@@ -16,32 +19,41 @@ receivers:
       grpc:
         endpoint: 0.0.0.0:4327
         max_recv_msg_size_mib: 16
-        tls: &shawk_tls
+        tls:
           cert_file: /etc/shawk/tls/collector.crt
           key_file: /etc/shawk/tls/collector.key
           client_ca_file: /etc/shawk/tls/agents-ca.crt
   # OBI and other instrumentation, with the variables of the OpenTelemetry
   # SDK: OTEL_EXPORTER_OTLP_ENDPOINT=https://..., OTEL_EXPORTER_OTLP_CERTIFICATE,
   # OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE and OTEL_EXPORTER_OTLP_CLIENT_KEY.
+  # Their certificates come from another CA than those of the agents.
   otlp:
     protocols:
       grpc:
         endpoint: 0.0.0.0:4317
-        tls: *shawk_tls
+        tls: &obi_tls
+          cert_file: /etc/shawk/tls/collector.crt
+          key_file: /etc/shawk/tls/collector.key
+          client_ca_file: /etc/shawk/tls/obi-ca.crt
       http:
         endpoint: 0.0.0.0:4318
-        tls: *shawk_tls
+        tls: *obi_tls
 
 connectors:
   shawk:
     postgres:
-      # A connection string of the role shawk_connector, e.g.
-      # postgres://shawk_connector:PASSWORD@db.example:5432/shawk?sslmode=require
+      # A connection string of the role shawk_connector that verifies the
+      # certificate of the server against the CA in sslrootcert (without
+      # sslrootcert, the CAs of the system), e.g.
+      # postgres://shawk_connector:PASSWORD@db.example:5432/shawk?sslmode=verify-full&sslrootcert=/etc/shawk/tls/postgres-ca.crt
       dsn_file: /etc/shawk/postgres-dsn
       migrate: false          # apply the schema with shawk-migrate
     write_interval: 1m
     idle_ttl: 15m
     max_peers: 50
+    # Local services per host with a job of their own in Prometheus; the
+    # others share the job ~other. PostgreSQL keeps them all.
+    max_services: 200
     peer_cidrs:
       office-lan: 192.168.10.0/24
     # Relays without an agent that rewrite addresses: load balancers,
@@ -78,15 +90,29 @@ processors:
   batch: {}
 
 exporters:
+  # Prometheus started with --web.enable-otlp-receiver and the web
+  # configuration of packaging/prometheus/web.yml: over TLS, as a user of
+  # its basic_auth_users. Whoever can push to Prometheus can write
+  # shawk_agent_up and silence the alerts on agents. The header, "Basic "
+  # and the base64 of user:password, comes from the environment
+  # (/etc/shawk/collector.env), not from this file. A Prometheus that
+  # requires client certificates instead takes tls.cert_file and
+  # tls.key_file here.
   otlp_http/prometheus:
-    # Prometheus started with --web.enable-otlp-receiver.
-    endpoint: http://prometheus.example:9090/api/v1/otlp
+    endpoint: https://prometheus.example:9090/api/v1/otlp
     tls:
-      insecure: true
-  otlp_grpc/traces:           # Tempo or another trace store
+      ca_file: /etc/shawk/tls/prometheus-ca.crt
+    headers:
+      Authorization: ${env:SHAWK_PROMETHEUS_AUTHORIZATION}
+  # Tempo or another trace store, over TLS with the client certificate of
+  # the collector, which the store should require: in Tempo,
+  # tls.client_ca_file of the otlp receiver of the distributor.
+  otlp_grpc/traces:
     endpoint: tempo.example:4317
     tls:
-      insecure: true
+      ca_file: /etc/shawk/tls/tempo-ca.crt
+      cert_file: /etc/shawk/tls/collector-client.crt
+      key_file: /etc/shawk/tls/collector-client.key
 
 service:
   pipelines:

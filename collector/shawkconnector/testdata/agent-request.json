@@ -4079,7 +4079,7 @@
                       {
                         "key":  "shawk.bpf.program",
                         "value":  {
-                          "stringValue":  "shawk_tcp_state"
+                          "stringValue":  "shawk_inet_sock_set_state"
                         }
                       }
                     ],
@@ -4102,7 +4102,7 @@
                       {
                         "key":  "shawk.bpf.program",
                         "value":  {
-                          "stringValue":  "shawk_tcp_state"
+                          "stringValue":  "shawk_inet_sock_set_state"
                         }
                       }
                     ],

@@ -142,6 +142,54 @@ func TestDashboards(t *testing.T) {
 	}
 }
 
+// grafanaInterpolation matches what Grafana interpolates in a query, like
+// its variableRegex: $name, [[name]], [[name:format]], ${name},
+// ${name.field} and ${name:format}.
+var grafanaInterpolation = regexp.MustCompile(`\$(\w+)|\[\[(\w+?)(?::(\w+))?\]\]|\$\{(\w+)(?:\.([^:^\}]+))?(?::([^\}]+))?\}`)
+
+// A link sets any value of a variable (?var-name=), even one that is not
+// among its options, and the queries run as whoever opens it. The SQL of
+// the dashboards interpolates variables only with the sqlstring format,
+// which quotes each value and doubles its quotes; a number is cast from
+// that string, e.g. ${depth:sqlstring}::int, so that a value that is not a
+// number fails the query. Without a format, the PostgreSQL data source
+// inserts a single value unquoted, which outside quotes is SQL; the
+// singlequote format escapes a quote with a backslash, which PostgreSQL
+// reads as a backslash (standard_conforming_strings), so that the quote
+// ends the string. Macros ($__timeFrom() etc.) are not variables.
+func TestDashboardSQLVariables(t *testing.T) {
+	sqlstring := regexp.MustCompile(`^\$\{\w+:sqlstring\}$`)
+	files, _ := filepath.Glob(filepath.Join(grafana, "dashboards/*.json"))
+	n := 0
+	for _, f := range files {
+		walk(loadJSON(t, f), func(o map[string]any) {
+			var queries []string
+			if s, ok := o["rawSql"].(string); ok {
+				queries = append(queries, s)
+			}
+			// The options of a variable from PostgreSQL.
+			if ds, ok := o["datasource"].(map[string]any); ok && ds["type"] == "grafana-postgresql-datasource" {
+				for _, k := range []string{"query", "definition"} {
+					if s, ok := o[k].(string); ok {
+						queries = append(queries, s)
+					}
+				}
+			}
+			for _, sql := range queries {
+				n++
+				for _, m := range grafanaInterpolation.FindAllString(sql, -1) {
+					if !strings.HasPrefix(m, "$__") && !sqlstring.MatchString(m) {
+						t.Errorf("%s: %s is interpolated without the sqlstring format:\n%s", f, m, sql)
+					}
+				}
+			}
+		})
+	}
+	if n < 15 {
+		t.Errorf("only %d SQL queries found", n)
+	}
+}
+
 // The Node Graph refers to the arrowhead of an edge by the id of the edge,
 // unescaped, in url(#...): the spaces of the ids of shawk_v1.graph_edges
 // (client -> server) make the reference invalid and the arrowhead

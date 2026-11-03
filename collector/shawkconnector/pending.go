@@ -14,6 +14,17 @@ type span struct {
 	first, last time.Time
 }
 
+// notAfter returns s with its times no later than t.
+func (s span) notAfter(t time.Time) span {
+	if s.first.After(t) {
+		s.first = t
+	}
+	if s.last.After(t) {
+		s.last = t
+	}
+	return s
+}
+
 // merge widens s to cover o. Zero times are ignored.
 func (s *span) merge(o span) {
 	if !o.first.IsZero() && (s.first.IsZero() || o.first.Before(s.first)) {
@@ -204,6 +215,16 @@ type changes struct {
 // long before a request is still sent in it.
 const minAgentIdleTTL = 2 * time.Minute
 
+// maxClockAhead is how far ahead of the clock of the connector the times
+// of observations may be written. Edges, listeners and translations keep
+// the times of the agent, and a later time is written as now plus this:
+// otherwise a time far in the future, which an agent may send, would stay
+// the last_seen of its row (greatest()), be taken for the most recently
+// seen endpoint by every connector, and never reach the retention. Clocks
+// are alerted on beyond a minute of skew; PostgreSQL matches the two sides
+// of a connection within 2 minutes.
+const maxClockAhead = 2 * time.Minute
+
 // sessionFloor is the earliest start of a session of a host the connector
 // can vouch for, by the clock of the agent. An agent sends the edges active
 // within its idle TTL; older ones reached an earlier instance of the
@@ -248,9 +269,11 @@ func (c *changes) host(key string) *hostChanges {
 // Whether a host is alive is judged by the clock of the connector: the
 // heartbeat and the last seen times of the host and its addresses are the
 // time of receipt, and the difference to the time of the request is kept
-// as the clock skew of the agent. Edges, listeners and processes keep the
-// times of the agent, which observed them.
+// as the clock skew of the agent. Edges, listeners, translations and
+// processes keep the times of the agent, which observed them, up to
+// maxClockAhead after now.
 func (c *changes) add(b *hostBatch, now time.Time) {
+	latest := now.Add(maxClockAhead)
 	var skew time.Duration
 	if !b.time.IsZero() {
 		skew = now.Sub(b.time)
@@ -308,6 +331,7 @@ func (c *changes) add(b *hostBatch, now time.Time) {
 		if s.first.IsZero() {
 			s.first = s.last
 		}
+		s = s.notAfter(latest)
 		pk := procKey{e.id.unit, e.id.comm, e.id.job()}
 		k := edgeRowKey{role: e.id.role, proto: e.id.proto, local: e.id.local, peer: e.id.peer, folded: e.id.folded,
 			port: e.id.port, netns: e.id.netns, procKey: pk}
@@ -336,6 +360,7 @@ func (c *changes) add(b *hostBatch, now time.Time) {
 		if s.first.IsZero() {
 			s.first = s.last
 		}
+		s = s.notAfter(latest)
 		k := listenerRowKey{proto: l.id.proto, addr: l.id.addr, port: l.id.port, netns: l.id.netns}
 		if l.id.unit != "" || l.id.comm != "" {
 			k.procKey = procKey{l.id.unit, l.id.comm, l.id.job()}
@@ -369,6 +394,7 @@ func (c *changes) add(b *hostBatch, now time.Time) {
 		if s.first.IsZero() {
 			s.first = s.last
 		}
+		s = s.notAfter(latest)
 		acc, ok := xlats[x.id]
 		changed := !ok || s.first.Before(acc.first) || s.last.After(acc.last)
 		acc.span.merge(s)

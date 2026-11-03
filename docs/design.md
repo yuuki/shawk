@@ -610,6 +610,16 @@ after twice as long each time, up to an hour:
   containerd without a name (`ctr run`). A container in a container
   (Docker in Docker, kind) keeps its state in the outer container, out of
   reach, and is named after the outer one.
+- Only the outermost container of a cgroup, and only one the runtimes of
+  the host made, is named after the state they keep. A user to whom a unit
+  delegates its cgroups (`user@1000.service`, or a service with
+  `Delegate=yes` and `User=`), or a container allowed to write its own,
+  can make a cgroup named after any container of the host, whose id
+  `/proc/PID/cgroup` shows to everyone. The runtimes of the host make
+  theirs in slices or at the root, never in a unit, so a container in a
+  unit is named by id after the unit
+  (`user@1000.service/podman-0123456789ab`), and one in another container
+  after the outer one.
 - The workload of a pod, in its unit, is the name of the pod without the
   suffixes Kubernetes appends to the pods it creates
   (`web-5d8f7c9b6-x7z2k` and `node-exporter-x7z2k` become `web` and
@@ -715,12 +725,20 @@ after twice as long each time, up to an hour:
   them apart.
 - `/proc` is read for the processes of an interval several at once, within
   one second per interval. A read of the environment takes the lock of the
-  memory map of the process, which a stuck process may hold; it gives up
-  after 200 ms, and a process whose read timed out is not read again for 5
-  minutes after the read returns. The command name in `/proc` must match
-  that of the flow, so that a PID reused by another process since is not
-  trusted. When a process exits before `/proc` is read, or is not read in
-  time, the latest identity seen for the same unit and comm is used.
+  memory map of the process, which a stuck process may hold, for good if
+  its memory is mapped from a FUSE file system that its user stalls. The
+  agent stops waiting after 200 ms, and a process whose read timed out is
+  not read again until 5 minutes after the read returns; at most 4096
+  processes back off at once. A read that hangs holds a goroutine and a
+  file descriptor until it returns, and a user can make one hang per
+  process, so at most 32 reads are outstanding at once. The agent reads 8
+  processes at once, so the other processes are read as before while up
+  to 24 reads hang; once 32 hang, no environment is read until one
+  returns. The agent logs how many hang at most every 10 minutes. The
+  command name in `/proc` must match that of the flow, so that a PID
+  reused by another process since is not trusted. When a process exits
+  before `/proc` is read, or is not read in time, the latest identity seen
+  for the same unit and comm is used.
 - The host is identified by `host.id` (`/etc/machine-id`, else
   `/var/lib/dbus/machine-id`) and `host.name`. In PostgreSQL a host is the
   hash of both, so that VMs cloned with the same machine id stay apart.
@@ -808,7 +826,15 @@ replaced.
   collected.
 - **TLS.** An `https://` endpoint verifies the collector (`-otlp-ca-file`)
   and may present a client certificate (`-otlp-cert-file`,
-  `-otlp-key-file`) to a receiver that requires one. With
+  `-otlp-key-file`) to a receiver that requires one. An `http://`
+  endpoint sends the dependencies of the host, the executables and
+  services of its processes, its name and its machine id unencrypted; the
+  agent warns at start when the host of the endpoint is neither
+  `localhost` nor a loopback address. Over HTTP/protobuf the agent does
+  not follow redirects: a 3xx response fails the request
+  (`shawk.agent.export.failures`), so that a collector, or anything in
+  the path, cannot send the export to another address, or from
+  `https://` to `http://`. With
   `host_identity: certificate` the connector accepts the metrics of a
   host only from an agent whose verified certificate names its
   `host.name` (a DNS name, or the common name of a certificate without
@@ -817,7 +843,11 @@ replaced.
   certificate on over gRPC only, and requests over HTTP are refused. A
   refused request fails for the agent (`shawk.agent.export.failures`).
   With `none`, the default, the connector believes the `host.name` and
-  `host.id` of every request.
+  `host.id` of every request. The example configuration trusts another CA
+  on the receiver of OBI (`otlp`, `obi-ca.crt`) than on that of agents
+  (`otlp/shawk`, `agents-ca.crt`): OBI often runs on hosts or in
+  containers trusted less than the agents, and its certificates must not
+  send as an agent, even for the host they name.
 - **Cumulative.** Counters are totals since the series started, so a failed
   request is made up for by the next one. Requests are not retried.
 - **Idle TTL.** A series with no activity (connections, bytes, datagrams or
@@ -857,11 +887,15 @@ in between; an agent whose last requests never arrive emits nothing and
 does not count as alive. Liveness is thus judged by the clock
 of the connector; the difference to the clock of the agent is kept as
 `clock_skew`, shown on the fleet dashboard and alerted on beyond a minute.
-Edges, listeners and processes keep the times of the agent that observed
-them. While the database is down, changes accumulate (in proportion
-to the number of edges, not to time, up to `max_pending_rows`, §5.5) and
-are written when it returns, and the connector writes what is pending when
-it stops. Rows that PostgreSQL
+Edges, listeners, translations and processes keep the times of the agent
+that observed them, but no later than 2 minutes ahead of the connector: a
+later time, from a clock further ahead or made up by an agent, is written
+as 2 minutes ahead, so that it does not stay the `last_seen` of its row
+(`greatest()`), win the choice of the most recently seen endpoint (§5.2)
+and escape the retention. While the database is down, changes accumulate
+(in proportion to the number of edges, not to time, up to
+`max_pending_rows`, §5.5) and are written when it returns, and the
+connector writes what is pending when it stops. Rows that PostgreSQL
 rejects as invalid data are dropped rather than kept for the next write,
 which would fail again (IPv6 zones are stripped from addresses before);
 the edges and listeners agents still send are then written again.
@@ -953,6 +987,15 @@ holder stopped reporting it earlier has moved. Among several services on an
 endpoint, one on the same host wins, then one observed on a socket (a server
 edge or a listener on that address) over one inferred from a listener on an
 unspecified address, then the most recently seen, then the first by name.
+An address that one live host holds alone is that host's: the services and
+clients that other hosts report at it are left out, even on the host of the
+edge, and so are those at the backends of translations (§5.4). The
+connector cannot check that a host holds the addresses it reports, but an
+agent reports in `host.ip` the addresses of its listeners and of its
+recent edges, so two hosts that both have sockets at an address both hold
+it, and the address is shared. What another host reports at the address is
+then a socket it no longer has, such as an idle server edge at a virtual
+address that moved to another host, or a socket its agent made up (§10).
 Names are the best guess at the time of aggregation; PostgreSQL is the
 truth of attribution. A new server may show as `~unresolved` until its
 listener is written (up to one write interval), and a new client on the
@@ -996,13 +1039,27 @@ the service. `service.instance.id` is the host name, and `host.id` and
 `host.name` are promoted to labels by Prometheus.
 
 - Series are bounded by host × local service × peer service × port × role,
-  and for failures by reason × the six values of `error.type` (others are
-  output as `_OTHER`);
-  replicas and changing IPs of peers do not add series. Per host, local
-  service and role, at most `max_peers` (50) peer names are used; the rest
-  are folded into `~other`. `keep_peer_address` keeps
-  `network.peer.address` when it is really needed; for a folded peer it is
-  the network (`0.0.0.0/0`, `::/0`).
+  for bytes and datagrams × the two values of `network.io.direction`
+  (`transmit` and `receive`; others are output as `_OTHER`), and for
+  failures by reason × the six values of `error.type` (others are output as
+  `_OTHER`);
+  replicas and changing IPs of peers do not add series. Per host, at most
+  `max_services` (200) local services are used, and per host, local
+  service and role, at most `max_peers` (50) peer names; the rest are
+  folded into `~other`, in the order they come. The services beyond
+  `max_services` make the job `~other`, whose peers `max_peers` bounds as
+  those of one service; PostgreSQL keeps them apart. A service or a peer
+  unused for `idle_ttl` leaves its place to another. The default of
+  `max_services` leaves room for the 110 pods that Kubernetes runs on a
+  node by default, besides the services of the node. `keep_peer_address`
+  keeps `network.peer.address` when it is really needed; for a folded peer
+  it is the network (`0.0.0.0/0`, `::/0`).
+- Agents choose the names of their services and hosts, so the values of
+  `service.name` and `service.namespace` of a local service, `host.name`
+  (and so `instance`), `host.id` and the `service.version` of the agents are
+  cut to 255 bytes, at the start of a character, as agents cut the names of
+  services (§4.1), and `service.peer.name`, which may have a namespace, to
+  511 bytes. PostgreSQL keeps them whole.
 - Inputs are cumulative per peer address; outputs merge several of them.
   The connector keeps the last value of every input series and adds the
   increase to the output, treating a decrease or a new start time as a
@@ -1048,7 +1105,17 @@ the service. `service.instance.id` is the host name, and `host.id` and
   not reliable yet: the resource of a host changes with `host.ip`,
   `service.version` and `shawk.peer.internal`, so a host may move between
   connectors, which then count its outputs twice (#128).
-- The metrics of the agents are forwarded under `job="shawk-agent"`.
+- The metrics of the agents are forwarded under `job="shawk-agent"`: those
+  of §4.2 but `shawk.agent.segment.start`, which is written to PostgreSQL
+  only. Each is made anew with the type and unit the agents send, one point
+  (one per program for the run counts and times of `-bpf-stats`), and the
+  attribute it has with the values the agents send: `shawk.netns.scope` of
+  `shawk.agent.up` (`all` or the inode of a network namespace), and
+  `shawk.bpf.program` (a BPF program of the agent). Other metrics, points
+  and values are dropped, and other attributes left out, so that an agent
+  cannot make series of its own choosing; the connector logs what it drops
+  at most once a minute, with its number. A connector older than its agents
+  drops the metrics they added.
 
 | Prometheus name | |
 |---|---|
@@ -1069,6 +1136,24 @@ retransmits, three of RTT, three of handshakes and SYN retransmits.
 Prometheus needs `--web.enable-otlp-receiver`,
 `otlp.promote_resource_attributes: [host.id, host.name]` and an
 out-of-order window of 30 minutes; counters stay cumulative.
+
+The OTLP receiver of Prometheus writes whatever series it is sent: anyone
+who could push to it could write `shawk_agent_up` and silence
+`ShawkAgentDown`, bypassing the client certificates that the collector
+requires of agents. The push is therefore encrypted and authenticated. In
+the example, the collector verifies Prometheus with a CA and sends an
+`Authorization` header with the `headers` of its exporter (it has the core
+components only, without the `basicauth` extension), taken from the
+variable `SHAWK_PROMETHEUS_AUTHORIZATION` so that its configuration holds
+no secret. Prometheus serves its endpoints over TLS to the users of its
+web configuration only (`--web.config.file`,
+`packaging/prometheus/web.yml`). That configuration applies to every
+endpoint and does not tell readers from writers: Grafana and people need a
+user too, and every user can push. The example uses passwords rather than
+client certificates, which every client would then need, browsers
+included; letting only the collector push takes a proxy in front of
+Prometheus. The trace exporter uses TLS too, with a client certificate
+that the trace store can require.
 
 ### 5.4 Translations of addresses
 
@@ -1137,7 +1222,9 @@ should have the same: the last one to write wins.
   socket at the virtual address and port within the alive window (a relay
   that runs an agent); a listener on an unspecified address of the host
   that holds the address, which the translation may bypass, does not
-  count. Among the backends seen within 5 minutes of the most recently
+  count, nor does a service that a host reports at the address of a
+  backend that another live host holds alone (§5.2). Among the backends
+  seen within 5 minutes of the most recently
   seen one, one observed on a socket wins, then one whose agent records
   the server side, then the first by service, port and host, so that the
   choice does not change with every report of the backends. The services
@@ -1306,7 +1393,7 @@ names in PostgreSQL and Prometheus match.
 | `graph_nodes`, `graph_edges` | the dependency map between services in the format of the Grafana Node Graph; a peer without a service is named by `peer_class` |
 | `peer_class(addr)` | the name of a peer without a known service, as in `service.peer.name`: the narrowest range of `peer_cidrs`, `~unresolved` for an address not routed on the Internet, `~external` otherwise, including the networks of folded peers |
 | `dependency_changes` | dependencies between services that appeared, or disappeared while a host that saw them kept observing for 15 minutes |
-| `service_endpoints` | addresses and ports services accept connections on: the last known listeners of each host (unspecified addresses expanded to the addresses of the host) and its server edges, for hosts that reported in the last 30 days, except addresses another host took over since; used by the connector |
+| `service_endpoints` | addresses and ports services accept connections on: the last known listeners of each host (unspecified addresses expanded to the addresses of the host) and its server edges, for hosts that reported in the last 30 days, except addresses another host took over since; used by the connector, which leaves out the endpoints of a host at an address that another live host holds alone (§5.2) |
 | `client_endpoints` | the client sides of connections in the last hour (client address, server address, port, client service); used by the connector to name the peer of a server edge |
 | `agent_addrs` | addresses of hosts whose agent closed an interval in the last 5 minutes, with what the agent traces and folds; used by the connector |
 | `agents` | the latest segment of every host and whether its agent is alive; the last columns, `peer_fold` and `peer_internal`, tell what the agent folds and the ranges it keeps exact (§6.1) |
@@ -1315,7 +1402,11 @@ names in PostgreSQL and Prometheus match.
 | `dependencies_between(since, until)`, `graph_edges_between`, `graph_nodes_between`, `dependency_changes_between` | the same for the dependencies active in a period. They take the edges active in the period with a margin of 15 minutes before matching them, so a recent window does not scan the history (about 0.3 s instead of 3 s with a million edges) and both sides of a connection are matched at the edges of the period; the dashboards and alerts use them. A dependency appeared in a period when it was first seen in it and is not in `known_dependencies` from before it: one that comes back on new edges (a new container, an hourly job) did not appear |
 
 The connector role writes `shawk` and reads `shawk_v1`; Grafana reads
-`shawk_v1` only (`packaging/postgres`).
+`shawk_v1` only (`packaging/postgres`). Neither may create objects in the
+database: tables or functions in `public`, temporary tables or large
+objects. The read-only transactions and the statement timeout that
+`setup.sql` gives Grafana are defaults that a session can change; the
+privileges are what hold.
 
 ## 7. Counting each dependency once
 
@@ -1393,9 +1484,11 @@ parses. shawk runs beside it instead:
   `application_service_graph` features) of selected services and sends to
   the `otlp` receiver of the same collector, with a client certificate
   (`OTEL_EXPORTER_OTLP_CERTIFICATE`, `OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE`,
-  `OTEL_EXPORTER_OTLP_CLIENT_KEY`); its network and statistics features
-  stay disabled, since shawk observes the same per process. Its metrics
-  are not batched in the collector: they carry the clock of their host.
+  `OTEL_EXPORTER_OTLP_CLIENT_KEY`) from another CA than those of the
+  agents, which the receiver of agents refuses (§4.3); its network and
+  statistics features stay disabled, since shawk observes the same per
+  process. Its metrics are not batched in the collector: they carry the
+  clock of their host.
 - Both name services the same way and both set the resource `service.name`,
   so `job` matches; dashboards use one `$service` variable for both.
 - `host.id` is the machine id in both. Cloned VMs should regenerate it
@@ -1525,9 +1618,33 @@ parses. shawk runs beside it instead:
   One accepted by a listener created with a backlog of 0 whose listener is
   gone is recorded as outgoing.
 - **Clocks**: first and last seen times of dependencies come from the clock
-  of each host, and the start of a segment too; heartbeats from the clock
-  of the connector, compared with the clock of PostgreSQL. Keep clocks
-  synchronized (chrony); `clock_skew` shows hosts that are not.
+  of each host, no later than 2 minutes ahead of the connector (§5.1), and
+  the start of a segment too; heartbeats from the clock of the connector,
+  compared with the clock of PostgreSQL. Keep clocks synchronized
+  (chrony); `clock_skew` shows hosts that are not.
+- **Agents report the addresses of their hosts.** The connector cannot
+  check that a host holds the addresses of its `host.ip`, nor that it has
+  the sockets it reports: `host_identity: certificate` ties the requests
+  to a host, not to addresses. A service or a client that a host reports
+  at an address that another live host holds alone does not name peers
+  (§5.2), so an agent cannot name the peers of a host whose agent runs
+  after a service of its own. An agent can still:
+  - name the peers at an address that no live agent holds, that of a host
+    without an agent or whose agent stopped more than 5 minutes ago, as
+    when the address moves to its host;
+  - declare the address of another host in its `host.ip`, which makes the
+    address shared: on other hosts its peers are then named after their
+    address range, with `shawk.peer.agent` false, so that the servers of a
+    client at it count its connections too (§7), and in PostgreSQL, once
+    both hosts held it for 10 minutes, its edges match within each host
+    only;
+  - write edges at the address of another host, which
+    `shawk_v1.dependencies` matches by address with the edges of their
+    peers, beside those of the host that holds it;
+  - send times up to 2 minutes ahead of the connector (§5.1).
+
+  `shawk_v1.agent_addrs` and `shawk_v1.service_endpoints` show the hosts
+  that report an address and the services they report at it.
 - **The initial network namespace only** (`-netns self` on a host): the
   connections of containers in other namespaces are not traced, and those
   that leave with the addresses of the host look traced to their peers,

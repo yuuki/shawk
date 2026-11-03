@@ -141,8 +141,14 @@ type hostBatch struct {
 	peerFold     string
 	peerInternal []netip.Prefix
 
-	// agent holds the metrics of the agent itself to forward.
-	agent pmetric.MetricSlice
+	// agent holds the metrics of the agent itself to forward, and
+	// agentPoints their points by name (see addAgentMetric).
+	agent       pmetric.MetricSlice
+	agentPoints map[string]pmetric.NumberDataPointSlice
+	// agentDropped counts the metrics and points of the agent that are not
+	// forwarded, and agentDroppedName names one of them.
+	agentDropped     int
+	agentDroppedName string
 	// final tells that the request closes an interval of the agent: it is
 	// the last of the requests of the interval, which carries the metrics
 	// of the agent.
@@ -182,6 +188,7 @@ func parseResource(rm pmetric.ResourceMetrics) (*hostBatch, error) {
 		listeners:    map[listenerID]*listenerInput{},
 		translations: map[translationID]*translationInput{},
 		agent:        pmetric.NewMetricSlice(),
+		agentPoints:  map[string]pmetric.NumberDataPointSlice{},
 	}
 	if b.hostname == "" {
 		return nil, errors.New("the resource has no host.name")
@@ -240,6 +247,8 @@ func (b *hostBatch) addMetric(m pmetric.Metric) {
 			k := valueKey{metric: name}
 			switch name {
 			case metricNetworkIO, metricUDPDatagrams:
+				// Another direction than the agents send is output as
+				// _OTHER (outDirection).
 				k.dir = getString(dp.Attributes(), attrIODirection)
 			case metricConnFailedByReason:
 				if k.errType = getString(dp.Attributes(), attrErrorType); k.errType == "" {
@@ -331,7 +340,116 @@ func (b *hostBatch) addMetric(m pmetric.Metric) {
 				}
 			}
 		}
-		m.CopyTo(b.agent.AppendEmpty())
+		b.addAgentMetric(m)
+	}
+}
+
+// agentMetric describes a metric of the agent that is forwarded.
+type agentMetric struct {
+	gauge bool // a gauge, or a cumulative monotonic sum
+	unit  string
+	// attr is the attribute of the points, if any, and valid tells which
+	// of its values the agent sends.
+	attr  string
+	valid func(string) bool
+	// perValue tells that the metric has a point per value of attr; the
+	// others have one point.
+	perValue bool
+}
+
+// agentMetrics are the metrics of the agent that are forwarded, as the
+// agent sends them (addAgent in internal/otlp), which must be kept in sync.
+// shawk.agent.segment.start is written to PostgreSQL only.
+var agentMetrics = map[string]agentMetric{
+	metricAgentUp:                  {gauge: true, attr: attrNetNSScope, valid: netnsScope},
+	metricAgentUDPTraced:           {gauge: true},
+	metricAgentFlowsDropped:        {unit: "{update}"},
+	metricAgentCgroupsDropped:      {unit: "{event}"},
+	metricAgentReadsDropped:        {unit: "{read}"},
+	metricAgentExportFailures:      {unit: "{request}"},
+	metricAgentTranslationsTraced:  {gauge: true},
+	metricAgentTranslationsDropped: {unit: "{translation}"},
+	metricAgentBPFRunCount:         {unit: "{run}", attr: attrBPFProgram, valid: isBPFProgram, perValue: true},
+	metricAgentBPFRunTime:          {unit: "s", attr: attrBPFProgram, valid: isBPFProgram, perValue: true},
+}
+
+func isBPFProgram(s string) bool { return bpfPrograms[s] }
+
+// addAgentMetric keeps a metric of the agent to forward. It is made anew
+// from its description in agentMetrics, with the time and value of each
+// point and the attribute it may have; other attributes are left out. A
+// metric the agent does not send, or of another type, a point with a value
+// of the attribute the agent does not send, and a point beyond one per
+// metric, or per value of its attribute, are dropped: an agent cannot make
+// series in Prometheus other than those of the agents.
+func (b *hostBatch) addAgentMetric(m pmetric.Metric) {
+	name := m.Name()
+	desc, ok := agentMetrics[name]
+	var dps pmetric.NumberDataPointSlice
+	switch {
+	case ok && desc.gauge && m.Type() == pmetric.MetricTypeGauge:
+		dps = m.Gauge().DataPoints()
+	case ok && !desc.gauge && m.Type() == pmetric.MetricTypeSum:
+		dps = m.Sum().DataPoints()
+	default:
+		b.dropAgent(name)
+		return
+	}
+	for i := range dps.Len() {
+		dp := dps.At(i)
+		var v string
+		if desc.attr != "" {
+			v = getString(dp.Attributes(), desc.attr)
+		}
+		out, kept := b.agentPoints[name]
+		if (desc.attr != "" && !desc.valid(v)) || dp.ValueType() == pmetric.NumberDataPointValueTypeEmpty ||
+			(kept && (!desc.perValue || hasValue(out, desc.attr, v))) {
+			b.dropAgent(name)
+			continue
+		}
+		if !kept {
+			om := b.agent.AppendEmpty()
+			om.SetName(name)
+			om.SetUnit(desc.unit)
+			if desc.gauge {
+				out = om.SetEmptyGauge().DataPoints()
+			} else {
+				sum := om.SetEmptySum()
+				sum.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
+				sum.SetIsMonotonic(true)
+				out = sum.DataPoints()
+			}
+			b.agentPoints[name] = out
+		}
+		p := out.AppendEmpty()
+		p.SetStartTimestamp(dp.StartTimestamp())
+		p.SetTimestamp(dp.Timestamp())
+		if dp.ValueType() == pmetric.NumberDataPointValueTypeInt {
+			p.SetIntValue(dp.IntValue())
+		} else {
+			p.SetDoubleValue(dp.DoubleValue())
+		}
+		if desc.attr != "" {
+			p.Attributes().PutStr(desc.attr, v)
+		}
+	}
+}
+
+// hasValue tells whether one of the points has the value v of attr.
+func hasValue(dps pmetric.NumberDataPointSlice, attr, v string) bool {
+	for i := range dps.Len() {
+		if getString(dps.At(i).Attributes(), attr) == v {
+			return true
+		}
+	}
+	return false
+}
+
+// dropAgent counts a metric or a point of the agent that is not forwarded.
+func (b *hostBatch) dropAgent(name string) {
+	b.agentDropped++
+	if b.agentDroppedName == "" {
+		b.agentDroppedName = cutLabel(name, maxLabelValue)
 	}
 }
 

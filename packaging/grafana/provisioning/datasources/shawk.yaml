@@ -1,14 +1,23 @@
 # Data sources of the shawk dashboards and alerts. The dashboards refer to
-# them by uid. Adjust the URLs, the database and the credentials.
+# them by uid. Adjust the URLs, the database, the credentials and the CA of
+# PostgreSQL.
 apiVersion: 1
 datasources:
   - name: shawk Prometheus
     uid: shawk-prometheus
     type: prometheus
     access: proxy
-    url: http://prometheus:9090
+    # Over TLS, as the user grafana of the web configuration of Prometheus
+    # (packaging/prometheus/web.yml).
+    url: https://prometheus:9090
+    basicAuth: true
+    basicAuthUser: grafana
     jsonData:
       timeInterval: 15s
+      tlsAuthWithCACert: true
+    secureJsonData:
+      basicAuthPassword: $SHAWK_GRAFANA_PROMETHEUS_PASSWORD
+      tlsCACert: $__file{/etc/grafana/tls/prometheus-ca.crt}
 
   - name: shawk PostgreSQL
     uid: shawk-postgres
@@ -19,7 +28,11 @@ datasources:
     user: shawk_grafana
     jsonData:
       database: shawk
-      sslmode: require
+      # Verify that the certificate of the server is signed by the CA in
+      # sslRootCertFile and names the host of url.
+      sslmode: verify-full
+      tlsConfigurationMethod: file-path
+      sslRootCertFile: /etc/grafana/shawk-postgres-ca.crt
       postgresVersion: 1400
       timescaledb: false
       maxOpenConns: 10

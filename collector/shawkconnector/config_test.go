@@ -18,6 +18,7 @@ func TestConfigValidate(t *testing.T) {
 		"no write interval": func(c *Config) { c.WriteInterval = 0 },
 		"short ttl":         func(c *Config) { c.IdleTTL = time.Second },
 		"no peers":          func(c *Config) { c.MaxPeers = 0 },
+		"no services":       func(c *Config) { c.MaxServices = 0 },
 		"bad cidr":          func(c *Config) { c.PeerCIDRs = map[string]string{"x": "10.0.0.0/33"} },
 		"reserved name":     func(c *Config) { c.PeerCIDRs = map[string]string{"~other": "10.0.0.0/8"} },
 		"short retention":   func(c *Config) { c.Retention = time.Hour },

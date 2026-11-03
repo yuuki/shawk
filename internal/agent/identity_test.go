@@ -1,6 +1,9 @@
 package agent
 
 import (
+	"bytes"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -155,5 +158,41 @@ func TestLatestIdentityOfContainers(t *testing.T) {
 	}
 	if got := r.resolve(300, "node", "docker/web", nil, now); got.ContainerID != "" {
 		t.Errorf("resolve without a container = %+v", got)
+	}
+}
+
+// The reads of environments that hang are logged at most every
+// stuckLogEvery, with the reads skipped since the last line.
+func TestLogStuckReads(t *testing.T) {
+	now := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
+	a := newTestAgent(&fakeSource{}, &fakeExporter{}, 0, now)
+	var buf bytes.Buffer
+	a.log = slog.New(slog.NewTextHandler(&buf, nil))
+	var stuck procinfo.EnvironReads
+	a.idents.stuck = func() procinfo.EnvironReads { return stuck }
+	lines := func() []string { return strings.Split(strings.TrimSpace(buf.String()), "\n") }
+
+	a.logStuckReads(now)
+	if buf.Len() != 0 {
+		t.Errorf("logged without reads that hang: %s", buf.String())
+	}
+	stuck = procinfo.EnvironReads{Stuck: 3}
+	a.logStuckReads(now)
+	if l := lines(); len(l) != 1 || !strings.Contains(l[0], "stuck=3 slots=32 skipped=0") {
+		t.Errorf("first line: %q", l)
+	}
+	stuck = procinfo.EnvironReads{Stuck: procinfo.MaxEnvironReads, Skipped: 100}
+	a.logStuckReads(now.Add(time.Minute))
+	if l := lines(); len(l) != 1 {
+		t.Errorf("logged again within %s: %q", stuckLogEvery, l)
+	}
+	a.logStuckReads(now.Add(stuckLogEvery))
+	if l := lines(); len(l) != 2 || !strings.Contains(l[1], "stuck=32 slots=32 skipped=100") {
+		t.Errorf("second line: %q", l)
+	}
+	stuck.Skipped = 150
+	a.logStuckReads(now.Add(2 * stuckLogEvery))
+	if l := lines(); len(l) != 3 || !strings.Contains(l[2], "skipped=50") {
+		t.Errorf("third line: %q", l)
 	}
 }

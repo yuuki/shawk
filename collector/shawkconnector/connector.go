@@ -50,6 +50,10 @@ type shawkConnector struct {
 	// Requests refused by host_identity, logged at most once a minute.
 	refused        int
 	lastRefusedLog time.Time
+	// Metrics and points of agents that are not forwarded, logged at most
+	// once a minute.
+	agentDropped        int
+	lastAgentDroppedLog time.Time
 	// Requests of hosts refused by max_hosts, and series and input series
 	// dropped by max_series_per_host, logged at most once a minute each.
 	hostsRefused                 int
@@ -82,7 +86,7 @@ func newConnector(set connector.Settings, cfg *Config, next consumer.Metrics) (*
 	now := time.Now()
 	res := newResolver(cidrs, translations)
 	res.maxInferred = cfg.MaxSeriesPerHost
-	agg := newAggregator(cfg.IdleTTL, cfg.MaxPeers, cfg.KeepPeerAddress, now)
+	agg := newAggregator(cfg.IdleTTL, cfg.MaxPeers, cfg.MaxServices, cfg.KeepPeerAddress, now)
 	agg.maxInputs = maxValuesPerEdge * cfg.MaxSeriesPerHost
 	return &shawkConnector{
 		cfg:      cfg,
@@ -425,6 +429,9 @@ func (c *shawkConnector) ConsumeMetrics(ctx context.Context, md pmetric.Metrics)
 		if b.invalid > 0 {
 			c.log.Warn("ignoring invalid data points", zap.String("host", b.hostname), zap.Int("count", b.invalid))
 		}
+		if b.agentDropped > 0 {
+			c.droppedAgentMetrics(b, now)
+		}
 		c.resolver.learn(b, now)
 		c.mu.Lock()
 		c.foldedCIDRs(b, now)
@@ -526,6 +533,24 @@ func (c *shawkConnector) refuse(b *hostBatch, err error, now time.Time) {
 	c.mu.Unlock()
 	c.log.Warn("refusing the metrics of a host that the client certificate does not name (host_identity)",
 		zap.String("host", b.hostname), zap.Int("refused", n), zap.Error(err))
+}
+
+// droppedAgentMetrics logs the metrics and points of an agent that are not
+// forwarded (see addAgentMetric), at most once a minute, with their number
+// since the last time.
+func (c *shawkConnector) droppedAgentMetrics(b *hostBatch, now time.Time) {
+	c.mu.Lock()
+	c.agentDropped += b.agentDropped
+	n := c.agentDropped
+	if !c.lastAgentDroppedLog.IsZero() && now.Sub(c.lastAgentDroppedLog) < time.Minute {
+		c.mu.Unlock()
+		return
+	}
+	c.lastAgentDroppedLog, c.agentDropped = now, 0
+	c.mu.Unlock()
+	c.log.Warn("dropping metrics or points of agents that the connector does not know, as of newer agents or forged ones; "+
+		"they are not forwarded",
+		zap.String("host", b.hostname), zap.String("metric", b.agentDroppedName), zap.Int("dropped", n))
 }
 
 // foldWarnInterval is how often a host is logged by foldedAgentPeer and

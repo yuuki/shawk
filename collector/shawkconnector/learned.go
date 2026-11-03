@@ -136,15 +136,16 @@ func (r *resolver) learnedOf(host string, id *edgeID, now time.Time) []learnedBa
 
 // learnedServer finds the service at a backend of the learned translations
 // of a client edge of host. A backend at a loopback or shared address is
-// looked up on the host that translated the connections only. The dnat of
-// the candidate tells that its backend sees the address of the client.
-// r.mu is held.
+// looked up on the host that translated the connections only, and one at an
+// address that a live host holds alone on that host only (holderOf). The
+// dnat of the candidate tells that its backend sees the address of the
+// client. r.mu is held.
 func (r *resolver) learnedServer(host string, id *edgeID, now time.Time) (candidate, bool) {
 	age := r.dbAge(now)
 	var cs []candidate
 	for _, b := range r.learnedOf(host, id, now) {
 		k := endpointKey{b.backend, b.bport, id.proto}
-		found := appendCandidates(nil, r.localEndpoints[k], r.dbEndpoints[k], age, b.bport)
+		found := appendCandidates(nil, r.localEndpoints[k], r.dbEndpoints[k], age, b.bport, r.holderOf(b.backend, now))
 		onHost := r.sameHostAddr(b.backend, now)
 		for _, f := range found {
 			if onHost && f.host != b.host {
@@ -168,14 +169,15 @@ func (r *resolver) learnedServer(host string, id *edgeID, now time.Time) (candid
 // address of the client, among the translations seen within backendWindow
 // of the most recently seen one. A backend or a client at a loopback or
 // shared address is matched on the host that translated the connections
-// only. r.mu is held.
-func (r *resolver) learnedClientName(host string, id *edgeID, now time.Time) string {
+// only, and a client at an address that holder, a live host, holds alone
+// on that host only (holderOf). r.mu is held.
+func (r *resolver) learnedClientName(host string, id *edgeID, holder string, now time.Time) string {
 	var best chooser
 	best.host = host
 	age := r.dbAge(now)
 	clientHost := r.sameHostAddr(id.peer, now)
 	for _, lc := range r.learnedClientsOf(host, id, now) {
-		c := chooser{host: lc.host, sameHostOnly: clientHost}
+		c := chooser{host: lc.host, sameHostOnly: clientHost, holder: holder}
 		ck := clientKey{id.peer, lc.virtual, lc.vport, id.proto}
 		c.add(r.localClients[ck], r.dbClients[ck], age, 0)
 		if c.best.service != "" && best.better(c.best, 0) {

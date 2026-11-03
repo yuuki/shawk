@@ -8,6 +8,8 @@ Wants=network-online.target
 Type=simple
 User=shawk-collector
 Group=shawk-collector
+# Secrets the configuration refers to, e.g. SHAWK_PROMETHEUS_AUTHORIZATION
+EnvironmentFile=-/etc/shawk/collector.env
 ExecStart=/usr/bin/shawk-collector --config /etc/shawk/collector.yaml
 Restart=on-failure
 RestartSec=5s
