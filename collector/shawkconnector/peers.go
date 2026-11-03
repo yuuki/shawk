@@ -409,6 +409,8 @@ func (r *resolver) expire(t, now time.Time) {
 // A loopback peer is on the host itself. So is a peer whose address several
 // live hosts hold at once, such as the address of a container bridge, when
 // the host holds it too; such an address is never resolved to another host.
+// A peer whose address one live host holds alone is resolved to that host
+// only (see holderOf).
 //
 // A folded peer, every peer outside the internal ranges of the agent, is
 // named after its network and has no agent.
@@ -431,6 +433,9 @@ func (r *resolver) peer(host string, id *edgeID, now time.Time) peer {
 	loopback := id.peer.IsLoopback()
 	local := loopback || (shared && holders[host])
 	sameHostOnly := loopback || shared
+	// rules choose among the services and clients seen at the address of
+	// the peer.
+	rules := chooser{host: host, sameHostOnly: sameHostOnly}
 
 	var p peer
 	// covers tells whether the agent of the peer records the other side,
@@ -447,6 +452,7 @@ func (r *resolver) peer(host string, id *edgeID, now time.Time) peer {
 		covers = p.agent
 	case len(holders) == 1:
 		for h := range holders {
+			rules.holder = h
 			if a, ok := r.agent(h, now); ok {
 				p.agent = a.covers(id.proto)
 				covers = p.agent
@@ -469,7 +475,7 @@ func (r *resolver) peer(host string, id *edgeID, now time.Time) peer {
 	}
 	if id.role == roleClient {
 		k := endpointKey{id.peer, id.port, id.proto}
-		c := chooser{host: host, sameHostOnly: sameHostOnly}
+		c := rules
 		learned := r.virtualOf(id) == nil && len(r.learnedOf(host, id, now)) > 0
 		if r.virtualOf(id) != nil || learned {
 			// At a virtual address, only a service observed on a socket at it
@@ -518,9 +524,11 @@ func (r *resolver) peer(host string, id *edgeID, now time.Time) peer {
 		}
 	} else {
 		k := clientKey{id.peer, id.local, id.port, id.proto}
-		p.name = best(host, r.localClients[k], r.dbClients[k], r.dbAge(now), sameHostOnly)
+		c := rules
+		c.add(r.localClients[k], r.dbClients[k], r.dbAge(now), 0)
+		p.name = c.best.service
 		if p.name == "" {
-			if p.name = r.translatedClient(host, id, sameHostOnly, now); p.name != "" {
+			if p.name = r.translatedClient(rules, id, now); p.name != "" {
 				// The client connected to the virtual address, which its agent
 				// keeps exact, whatever it does with the address of this host.
 				p.agent = covers
@@ -531,7 +539,7 @@ func (r *resolver) peer(host string, id *edgeID, now time.Time) peer {
 				// them, so this side counts the connections.
 				p.agent = false
 				p.foldedBy, p.foldedByName, p.foldsServer, p.foldedVirtual = "", "", false, netip.Addr{}
-			} else if p.name = r.learnedClientName(host, id, now); p.name != "" {
+			} else if p.name = r.learnedClientName(host, id, rules.holder, now); p.name != "" {
 				// As through a static translation without sources. A learned
 				// SNAT keeps its name: the source forwards several clients.
 				p.agent = covers
@@ -598,6 +606,30 @@ func (r *resolver) holders(a netip.Addr, now time.Time) map[string]bool {
 	return out
 }
 
+// holderOf returns the live host that alone holds a non-loopback address
+// now, or "" if no live host or several hosts hold it. The services and
+// clients that other hosts report at such an address do not name peers.
+// The connector cannot check that a host holds the addresses its agent
+// reports, but an agent reports in host.ip the addresses of its listeners
+// and of its recent edges, so two hosts that both have sockets at an address
+// both hold it, and the address is shared. What another host reports at
+// the address is then a socket it no longer has, such as an idle server
+// edge at a virtual address that moved to another host, or a socket its
+// agent made up. r.mu is held.
+func (r *resolver) holderOf(a netip.Addr, now time.Time) string {
+	if a.IsLoopback() {
+		return ""
+	}
+	hs := r.holders(a, now)
+	if len(hs) != 1 {
+		return ""
+	}
+	for h := range hs {
+		return h
+	}
+	return ""
+}
+
 // agent returns the latest known agent of a host, if it is alive.
 func (r *resolver) agent(host string, now time.Time) (agentHost, bool) {
 	a, ok := r.localAgents[host]
@@ -622,6 +654,10 @@ type chooser struct {
 	host string
 	// sameHostOnly leaves out the endpoints of other hosts.
 	sameHostOnly bool
+	// holder, if set, is the live host that alone holds the address of the
+	// endpoints (holderOf): the endpoints of every other host are left
+	// out, even those of host.
+	holder string
 	// exactSince, if set, leaves out the endpoints inferred from listeners
 	// on unspecified addresses and those last seen before it.
 	exactSince time.Time
@@ -650,7 +686,7 @@ func (c *chooser) better(e endpoint, port uint16) bool {
 
 // consider takes e, seen on port, if it is better.
 func (c *chooser) consider(e endpoint, port uint16) {
-	if c.sameHostOnly && e.host != c.host {
+	if c.sameHostOnly && e.host != c.host || c.holder != "" && e.host != c.holder {
 		return
 	}
 	if !c.exactSince.IsZero() && (!e.exact || e.lastSeen.Before(c.exactSince)) {
@@ -674,13 +710,6 @@ func (c *chooser) add(local map[endpoint]time.Time, db []endpoint, dbAge time.Du
 	}
 }
 
-// best returns the service of the best candidate.
-func best(host string, local map[endpoint]time.Time, db []endpoint, dbAge time.Duration, sameHostOnly bool) string {
-	c := chooser{host: host, sameHostOnly: sameHostOnly}
-	c.add(local, db, dbAge, 0)
-	return c.best.service
-}
-
 // candidate is a service on an endpoint at a backend of a translation, on
 // the port of the backend. agent tells whether the agent of its host
 // records the server side.
@@ -701,15 +730,21 @@ const backendWindow = aliveWindow
 
 // appendCandidates appends the endpoints the connector has seen, with the
 // time it saw them, and those read from PostgreSQL, whose times are dbAge
-// older.
-func appendCandidates(cs []candidate, local map[endpoint]time.Time, db []endpoint, dbAge time.Duration, port uint16) []candidate {
+// older. If holder is set, the live host that alone holds the address of the
+// endpoints (holderOf), the endpoints of other hosts are left out.
+func appendCandidates(cs []candidate, local map[endpoint]time.Time, db []endpoint, dbAge time.Duration, port uint16,
+	holder string) []candidate {
 	for e, at := range local {
-		e.lastSeen = at
-		cs = append(cs, candidate{endpoint: e, port: port})
+		if holder == "" || e.host == holder {
+			e.lastSeen = at
+			cs = append(cs, candidate{endpoint: e, port: port})
+		}
 	}
 	for _, e := range db {
-		e.lastSeen = e.lastSeen.Add(dbAge)
-		cs = append(cs, candidate{endpoint: e, port: port})
+		if holder == "" || e.host == holder {
+			e.lastSeen = e.lastSeen.Add(dbAge)
+			cs = append(cs, candidate{endpoint: e, port: port})
+		}
 	}
 	return cs
 }
@@ -769,10 +804,10 @@ func (r *resolver) translatedServer(id *edgeID, now time.Time) (candidate, *tran
 		}
 		if b.prefix.IsSingleIP() {
 			k := endpointKey{b.prefix.Addr(), port, id.proto}
-			cs = appendCandidates(cs, r.localEndpoints[k], r.dbEndpoints[k], age, port)
+			cs = appendCandidates(cs, r.localEndpoints[k], r.dbEndpoints[k], age, port, r.holderOf(k.addr, now))
 			continue
 		}
-		cs = append(cs, r.inRange(b.prefix, port, id.proto, age)...)
+		cs = append(cs, r.inRange(b.prefix, port, id.proto, age, now)...)
 	}
 	for i := range cs {
 		if a, ok := r.agent(cs[i].host, now); ok {
@@ -783,10 +818,11 @@ func (r *resolver) translatedServer(id *edgeID, now time.Time) (candidate, *tran
 	return c, t, ok
 }
 
-// inRange returns the services on the endpoints within a range on a port.
-// It scans the endpoints, so the result is kept until the next load or
-// expiry. r.mu is held.
-func (r *resolver) inRange(p netip.Prefix, port uint16, proto string, dbAge time.Duration) []candidate {
+// inRange returns the services on the endpoints within a range on a port,
+// without those of hosts at an address that another host alone holds
+// (holderOf). It scans the endpoints, so the result is kept until the next
+// load or expiry. r.mu is held.
+func (r *resolver) inRange(p netip.Prefix, port uint16, proto string, dbAge time.Duration, now time.Time) []candidate {
 	k := rangeKey{p, port, proto}
 	r.rangeMu.Lock()
 	defer r.rangeMu.Unlock()
@@ -796,12 +832,12 @@ func (r *resolver) inRange(p netip.Prefix, port uint16, proto string, dbAge time
 	var cs []candidate
 	for ek, es := range r.localEndpoints {
 		if ek.port == port && ek.proto == proto && p.Contains(ek.addr) {
-			cs = appendCandidates(cs, es, nil, 0, port)
+			cs = appendCandidates(cs, es, nil, 0, port, r.holderOf(ek.addr, now))
 		}
 	}
 	for ek, es := range r.dbEndpoints {
 		if ek.port == port && ek.proto == proto && p.Contains(ek.addr) {
-			cs = appendCandidates(cs, nil, es, dbAge, port)
+			cs = appendCandidates(cs, nil, es, dbAge, port, r.holderOf(ek.addr, now))
 		}
 	}
 	// The slice is shared: callers append to a copy.
@@ -866,10 +902,10 @@ func (r *resolver) foldedVirtual(a agentHost, client string, id *edgeID, now tim
 // translatedClient finds the client service of a server edge at a backend
 // of a translation that keeps the address of the client: the service whose
 // client edge to a virtual address of the translation has the address of
-// the client, on a port that reaches the port of the server edge. r.mu is
-// held.
-func (r *resolver) translatedClient(host string, id *edgeID, sameHostOnly bool, now time.Time) string {
-	c := chooser{host: host, sameHostOnly: sameHostOnly}
+// the client, on a port that reaches the port of the server edge, chosen by
+// the rules of the address of the client. r.mu is held.
+func (r *resolver) translatedClient(rules chooser, id *edgeID, now time.Time) string {
+	c := rules
 	age := r.dbAge(now)
 	for i := range r.translations {
 		t := &r.translations[i]

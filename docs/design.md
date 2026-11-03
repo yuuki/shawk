@@ -887,9 +887,14 @@ in between; an agent whose last requests never arrive emits nothing and
 does not count as alive. Liveness is thus judged by the clock
 of the connector; the difference to the clock of the agent is kept as
 `clock_skew`, shown on the fleet dashboard and alerted on beyond a minute.
-Edges, listeners and processes keep the times of the agent that observed
-them. While the database is down, changes accumulate (in proportion
-to the number of edges, not to time) and are written when it returns, and
+Edges, listeners, translations and processes keep the times of the agent
+that observed them, but no later than 2 minutes ahead of the connector: a
+later time, from a clock further ahead or made up by an agent, is written
+as 2 minutes ahead, so that it does not stay the `last_seen` of its row
+(`greatest()`), win the choice of the most recently seen endpoint (§5.2)
+and escape the retention. While the database is down, changes accumulate
+(in proportion to the number of edges, not to time) and are written when
+it returns, and
 the connector writes what is pending when it stops. Rows that PostgreSQL
 rejects as invalid data are dropped rather than kept for the next write,
 which would fail again (IPv6 zones are stripped from addresses before);
@@ -982,6 +987,15 @@ holder stopped reporting it earlier has moved. Among several services on an
 endpoint, one on the same host wins, then one observed on a socket (a server
 edge or a listener on that address) over one inferred from a listener on an
 unspecified address, then the most recently seen, then the first by name.
+An address that one live host holds alone is that host's: the services and
+clients that other hosts report at it are left out, even on the host of the
+edge, and so are those at the backends of translations (§5.4). The
+connector cannot check that a host holds the addresses it reports, but an
+agent reports in `host.ip` the addresses of its listeners and of its
+recent edges, so two hosts that both have sockets at an address both hold
+it, and the address is shared. What another host reports at the address is
+then a socket it no longer has, such as an idle server edge at a virtual
+address that moved to another host, or a socket its agent made up (§10).
 Names are the best guess at the time of aggregation; PostgreSQL is the
 truth of attribution. A new server may show as `~unresolved` until its
 listener is written (up to one write interval), and a new client on the
@@ -1166,7 +1180,9 @@ should have the same: the last one to write wins.
   socket at the virtual address and port within the alive window (a relay
   that runs an agent); a listener on an unspecified address of the host
   that holds the address, which the translation may bypass, does not
-  count. Among the backends seen within 5 minutes of the most recently
+  count, nor does a service that a host reports at the address of a
+  backend that another live host holds alone (§5.2). Among the backends
+  seen within 5 minutes of the most recently
   seen one, one observed on a socket wins, then one whose agent records
   the server side, then the first by service, port and host, so that the
   choice does not change with every report of the backends. The services
@@ -1286,7 +1302,7 @@ names in PostgreSQL and Prometheus match.
 | `graph_nodes`, `graph_edges` | the dependency map between services in the format of the Grafana Node Graph; a peer without a service is named by `peer_class` |
 | `peer_class(addr)` | the name of a peer without a known service, as in `service.peer.name`: the narrowest range of `peer_cidrs`, `~unresolved` for an address not routed on the Internet, `~external` otherwise, including the networks of folded peers |
 | `dependency_changes` | dependencies between services that appeared, or disappeared while a host that saw them kept observing for 15 minutes |
-| `service_endpoints` | addresses and ports services accept connections on: the last known listeners of each host (unspecified addresses expanded to the addresses of the host) and its server edges, for hosts that reported in the last 30 days, except addresses another host took over since; used by the connector |
+| `service_endpoints` | addresses and ports services accept connections on: the last known listeners of each host (unspecified addresses expanded to the addresses of the host) and its server edges, for hosts that reported in the last 30 days, except addresses another host took over since; used by the connector, which leaves out the endpoints of a host at an address that another live host holds alone (§5.2) |
 | `client_endpoints` | the client sides of connections in the last hour (client address, server address, port, client service); used by the connector to name the peer of a server edge |
 | `agent_addrs` | addresses of hosts whose agent closed an interval in the last 5 minutes, with what the agent traces and folds; used by the connector |
 | `agents` | the latest segment of every host and whether its agent is alive; the last columns, `peer_fold` and `peer_internal`, tell what the agent folds and the ranges it keeps exact (§6.1) |
@@ -1511,9 +1527,33 @@ parses. shawk runs beside it instead:
   One accepted by a listener created with a backlog of 0 whose listener is
   gone is recorded as outgoing.
 - **Clocks**: first and last seen times of dependencies come from the clock
-  of each host, and the start of a segment too; heartbeats from the clock
-  of the connector, compared with the clock of PostgreSQL. Keep clocks
-  synchronized (chrony); `clock_skew` shows hosts that are not.
+  of each host, no later than 2 minutes ahead of the connector (§5.1), and
+  the start of a segment too; heartbeats from the clock of the connector,
+  compared with the clock of PostgreSQL. Keep clocks synchronized
+  (chrony); `clock_skew` shows hosts that are not.
+- **Agents report the addresses of their hosts.** The connector cannot
+  check that a host holds the addresses of its `host.ip`, nor that it has
+  the sockets it reports: `host_identity: certificate` ties the requests
+  to a host, not to addresses. A service or a client that a host reports
+  at an address that another live host holds alone does not name peers
+  (§5.2), so an agent cannot name the peers of a host whose agent runs
+  after a service of its own. An agent can still:
+  - name the peers at an address that no live agent holds, that of a host
+    without an agent or whose agent stopped more than 5 minutes ago, as
+    when the address moves to its host;
+  - declare the address of another host in its `host.ip`, which makes the
+    address shared: on other hosts its peers are then named after their
+    address range, with `shawk.peer.agent` false, so that the servers of a
+    client at it count its connections too (§7), and in PostgreSQL, once
+    both hosts held it for 10 minutes, its edges match within each host
+    only;
+  - write edges at the address of another host, which
+    `shawk_v1.dependencies` matches by address with the edges of their
+    peers, beside those of the host that holds it;
+  - send times up to 2 minutes ahead of the connector (§5.1).
+
+  `shawk_v1.agent_addrs` and `shawk_v1.service_endpoints` show the hosts
+  that report an address and the services they report at it.
 - **The initial network namespace only** (`-netns self` on a host): the
   connections of containers in other namespaces are not traced, and those
   that leave with the addresses of the host look traced to their peers,
