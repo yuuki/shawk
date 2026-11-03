@@ -29,6 +29,7 @@ const (
 	MetricAgentSegmentStart   = "shawk.agent.segment.start"
 	MetricAgentUDPTraced      = "shawk.agent.udp.traced"
 	MetricAgentFlowsDropped   = "shawk.agent.flows.dropped"
+	MetricAgentCgroupsDropped = "shawk.agent.cgroup_events.dropped"
 	MetricAgentExportFailures = "shawk.agent.export.failures"
 	MetricAgentBPFRunCount    = "shawk.agent.bpf.run_count"
 	MetricAgentBPFRunTime     = "shawk.agent.bpf.run_time"
