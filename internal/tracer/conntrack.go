@@ -82,7 +82,8 @@ func (t *Tracer) TranslationsTraced() bool {
 
 // tryConntrack loads and attaches the conntrack programs if they are not,
 // nf_conntrack is loaded, and the last attempt is older than
-// conntrackRetry. The first failure is logged. t.mu is held, or t is not
+// conntrackRetry. That nf_conntrack is not loaded, and the first failure to
+// load the programs, are logged once each. t.mu is held, or t is not
 // shared yet.
 func (t *Tracer) tryConntrack(now time.Time) {
 	if !t.opts.LearnTranslations || t.xlats != nil || t.conntrackSpec == nil {
@@ -97,16 +98,16 @@ func (t *Tracer) tryConntrack(now time.Time) {
 	}
 	t.conntrackTried = now
 	if _, err := os.Stat(conntrackModule); err != nil {
-		if !t.conntrackLogged {
-			t.conntrackLogged = true
+		if !t.conntrackMissingLogged {
+			t.conntrackMissingLogged = true
 			t.log.Info("nf_conntrack is not loaded; translations of addresses are learned once it is")
 		}
 		return
 	}
 	if err := loadConntrack(t); err != nil {
 		t.conntrackBackoff = min(max(2*t.conntrackBackoff, conntrackRetry), conntrackMaxRetry)
-		if !t.conntrackLogged {
-			t.conntrackLogged = true
+		if !t.conntrackFailLogged {
+			t.conntrackFailLogged = true
 			t.log.Warn("translations of addresses are not learned from conntrack; retrying, at most every hour", "error", err)
 		}
 		return

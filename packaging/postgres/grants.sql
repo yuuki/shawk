@@ -1,6 +1,6 @@
 -- Privileges of the roles of shawk. Run in the database shawk as its owner
--- (shawk_owner) after shawk-migrate, and again after a migration adds
--- tables or views:
+-- (shawk_owner) after shawk-migrate, and again whenever shawk-migrate
+-- applies new migrations:
 --
 --   psql -v ON_ERROR_STOP=1 -d shawk -U shawk_owner -f grants.sql
 
@@ -21,8 +21,8 @@ GRANT USAGE ON SCHEMA shawk_v1 TO shawk_grafana;
 GRANT SELECT ON ALL TABLES IN SCHEMA shawk_v1 TO shawk_grafana;
 
 -- Tables and views of later migrations, which shawk-migrate creates as the
--- owner, get the same privileges; run this file again after a migration all
--- the same, for the objects it does not create itself.
+-- owner, get the same privileges; run this file again after new
+-- migrations all the same, for the objects they do not create themselves.
 ALTER DEFAULT PRIVILEGES IN SCHEMA shawk GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO shawk_connector;
 ALTER DEFAULT PRIVILEGES IN SCHEMA shawk GRANT USAGE ON SEQUENCES TO shawk_connector;
 ALTER DEFAULT PRIVILEGES IN SCHEMA shawk_v1 GRANT SELECT ON TABLES TO shawk_connector, shawk_grafana;

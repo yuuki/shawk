@@ -107,9 +107,6 @@ func (c *shawkConnector) Start(ctx context.Context, _ component.Host) error {
 	if err != nil {
 		return err
 	}
-	if ps, ok := st.(*pgStore); ok {
-		ps.warn = func(msg string) { c.log.Warn(msg) }
-	}
 	c.store = st
 
 	loopCtx, cancel := context.WithCancel(context.Background())
@@ -176,6 +173,10 @@ func (c *shawkConnector) prepareSchemaOnly(ctx context.Context) bool {
 		}
 	} else {
 		v, err := c.store.schemaVersion(ctx)
+		if errors.Is(err, errDevelopmentSchema) {
+			c.log.Error("the PostgreSQL schema cannot be used; writes wait until it is created again", zap.Error(err))
+			return false
+		}
 		if err != nil {
 			c.log.Error("reading the version of the PostgreSQL schema; writes wait until it succeeds", zap.Error(err))
 			return false

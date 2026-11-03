@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/netip"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -28,8 +27,9 @@ type store interface {
 	// connections, the addresses of agents, and the translations learned
 	// in the last learnedTTL.
 	peers(ctx context.Context, learnedTTL time.Duration) (peerRows, error)
-	// schemaVersion returns the version of the schema, 0 if it predates
-	// the function that tells it.
+	// schemaVersion returns the version of the schema, 0 if it has not
+	// been created, and errDevelopmentSchema for a schema created before
+	// the migrations were consolidated.
 	schemaVersion(ctx context.Context) (int, error)
 	// syncConfig replaces the named address ranges of peers and the
 	// translations of addresses.
@@ -42,43 +42,6 @@ type store interface {
 
 type pgStore struct {
 	pool *pgxpool.Pool
-	// warn logs a problem of the configuration of the database; nil drops it.
-	warn func(msg string)
-
-	// learnedMu guards learnedOK, whether the role may write and read
-	// shawk.learned_translations, as checked at learnedChecked: without
-	// grants.sql run again after migration 13, the writes of the hosts and
-	// the names of peers would fail as a whole.
-	learnedMu      sync.Mutex
-	learnedOK      bool
-	learnedChecked time.Time
-}
-
-// learnedRecheck is how often the privileges on learned_translations are
-// checked again, so that running grants.sql takes effect.
-const learnedRecheck = 10 * time.Minute
-
-// learnedAllowed tells whether the role may write and read the learned
-// translations, checking at most every learnedRecheck.
-func (s *pgStore) learnedAllowed(ctx context.Context) bool {
-	s.learnedMu.Lock()
-	defer s.learnedMu.Unlock()
-	if !s.learnedChecked.IsZero() && time.Since(s.learnedChecked) < learnedRecheck {
-		return s.learnedOK
-	}
-	var ok bool
-	// has_table_privilege with a list is true if any of them is held.
-	err := s.pool.QueryRow(ctx, `SELECT has_table_privilege('shawk.learned_translations', 'SELECT')
-  AND has_table_privilege('shawk.learned_translations', 'INSERT')
-  AND has_table_privilege('shawk.learned_translations', 'UPDATE')`).Scan(&ok)
-	if err != nil {
-		return s.learnedOK
-	}
-	if !ok && s.warn != nil && (s.learnedOK || s.learnedChecked.IsZero()) {
-		s.warn("the role of the connector may not write shawk.learned_translations; run grants.sql again after the migration: translations learned by agents are not written nor used")
-	}
-	s.learnedOK, s.learnedChecked = ok, time.Now()
-	return ok
 }
 
 // newPGStore returns a store backed by PostgreSQL. It connects lazily, so
@@ -112,13 +75,11 @@ func (s *pgStore) migrate(ctx context.Context) ([]string, error) {
 }
 
 func (s *pgStore) write(ctx context.Context, h *hostChanges) error {
-	learned := len(h.translations) > 0 && s.learnedAllowed(ctx)
-	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error { return writeHost(ctx, tx, h, learned) })
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error { return writeHost(ctx, tx, h) })
 }
 
-// writeHost writes the changes of a host; its learned translations only if
-// learned is set.
-func writeHost(ctx context.Context, tx pgx.Tx, h *hostChanges, learned bool) error {
+// writeHost writes the changes of a host.
+func writeHost(ctx context.Context, tx pgx.Tx, h *hostChanges) error {
 	// Writes wait for a migration in progress, which holds this lock, so
 	// that they do not deadlock with it. The lock is taken before the batch:
 	// preparing its statements already locks the tables they write.
@@ -232,7 +193,7 @@ ON CONFLICT (host_id, role, proto, local_addr, remote_addr, port, netns, process
 	if len(h.listeners) > 0 {
 		queueListeners(b, h)
 	}
-	if learned {
+	if len(h.translations) > 0 {
 		queueTranslations(b, h)
 	}
 	return tx.SendBatch(ctx, b).Close()
@@ -252,14 +213,10 @@ ON CONFLICT (host_id, role, proto, local_addr, remote_addr, port, netns, process
 // requests) to the new heartbeat. A heartbeat written by another connector
 // may be ahead by the clock of that connector; the two ends are then
 // ordered rather than the drops skipped. The drops of a run not seen before
-// are recorded from the start of the session, unless a session written
-// without the start of the counters (by a connector of the previous
-// version) ran since the run started and counted no more: its drops are
-// those of the run so far, as after an upgrade of the connector. Without
-// the start of the counters, as from an agent that does not send it, the
-// session itself stands for the run. A period that meets the
-// latest period of the host extends it. Times are by the clock of the
-// connector, like heartbeats.
+// are recorded from the start of the session. Without the start of the
+// counters, as from an agent that does not send it, the session itself
+// stands for the run. A period that meets the latest period of the host
+// extends it. Times are by the clock of the connector, like heartbeats.
 //
 // The upsert of the host before has locked its row, so that the writes of a
 // host wait for each other and each compares with the one before.
@@ -310,8 +267,7 @@ WITH u AS (
 d AS (
   SELECT u.started, u.beat, u.dropped,
          least(u.started + make_interval(secs => u.skew), u.beat) AS start,
-         coalesce(base.dropped, legacy.dropped_flows) AS base_dropped,
-         coalesce(base.beat, legacy.last_heartbeat) AS base_beat
+         base.dropped AS base_dropped, base.beat AS base_beat
   FROM u
   CROSS JOIN LATERAL (
     SELECT max(s.dropped_flows) AS dropped, max(s.last_heartbeat) AS beat
@@ -319,13 +275,6 @@ d AS (
     WHERE s.host_id = $1
       AND CASE WHEN u.run IS NULL THEN s.started_at = u.started ELSE s.counters_started = u.run END
   ) base
-  LEFT JOIN LATERAL (
-    SELECT s.dropped_flows, s.last_heartbeat
-    FROM shawk.agent_sessions s
-    WHERE s.host_id = $1 AND s.counters_started IS NULL
-      AND s.last_heartbeat >= u.run + make_interval(secs => u.skew) AND s.dropped_flows <= u.dropped
-    ORDER BY s.last_heartbeat DESC LIMIT 1
-  ) legacy ON base.dropped IS NULL AND u.run IS NOT NULL
 ),
 e AS (
   SELECT started, beat, dropped - coalesce(base_dropped, 0) AS n,
@@ -359,13 +308,12 @@ ON CONFLICT (host_id, started_at, period_start) DO UPDATE SET
   dropped_flows = o.dropped_flows + excluded.dropped_flows`,
 			h.key, starts, beats, dropped, skews, runs)
 	}
-	// What the agent folds is kept as of the latest heartbeat, unless the
-	// session row does not tell it.
+	// What the agent traces and folds is kept as of the latest heartbeat.
 	b.Queue(`
 INSERT INTO shawk.agent_sessions AS s (host_id, started_at, last_heartbeat, udp_traced, netns_scope, dropped_flows, clock_skew,
                                        peer_fold, peer_internal, counters_started)
 SELECT $1, u.started, u.beat, u.udp, u.scope, u.dropped, make_interval(secs => u.skew),
-       nullif(u.fold, ''), CASE WHEN u.fold <> '' THEN string_to_array(u.internal, ',')::cidr[] END, u.run
+       coalesce(nullif(u.fold, ''), 'none'), string_to_array(u.internal, ',')::cidr[], u.run
 FROM unnest($2::timestamptz[], $3::timestamptz[], $4::boolean[], $5::text[], $6::bigint[], $7::float8[],
             $8::text[], $9::text[], $10::timestamptz[])
   AS u(started, beat, udp, scope, dropped, skew, fold, internal, run)
@@ -373,10 +321,8 @@ ON CONFLICT (host_id, started_at) DO UPDATE SET
   clock_skew       = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat THEN excluded.clock_skew ELSE s.clock_skew END,
   udp_traced       = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat THEN excluded.udp_traced ELSE s.udp_traced END,
   netns_scope      = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat THEN excluded.netns_scope ELSE s.netns_scope END,
-  peer_fold        = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat AND excluded.peer_fold IS NOT NULL
-                          THEN excluded.peer_fold ELSE s.peer_fold END,
-  peer_internal    = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat AND excluded.peer_fold IS NOT NULL
-                          THEN excluded.peer_internal ELSE s.peer_internal END,
+  peer_fold        = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat THEN excluded.peer_fold ELSE s.peer_fold END,
+  peer_internal    = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat THEN excluded.peer_internal ELSE s.peer_internal END,
   counters_started = coalesce(s.counters_started, excluded.counters_started),
   dropped_flows    = greatest(s.dropped_flows, excluded.dropped_flows),
   last_heartbeat   = greatest(s.last_heartbeat, excluded.last_heartbeat)`,
@@ -507,10 +453,38 @@ func (s *pgStore) schemaVersion(ctx context.Context) (int, error) {
 	err := s.pool.QueryRow(ctx, `SELECT shawk.schema_version()`).Scan(&v)
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && (pgErr.Code == "42883" || pgErr.Code == "3F000") {
-		// No such function or schema: older than the check.
+		// No such function or schema: the schema has not been created.
 		return 0, nil
 	}
-	return v, err
+	if err != nil {
+		return 0, err
+	}
+	// The role of the connector may not read shawk.schema_migrations; the
+	// history is read through a function, which the schemas created before
+	// the migrations were consolidated do not have.
+	var history []appliedMigration
+	rows, err := s.pool.Query(ctx, `SELECT version, name FROM shawk.schema_history()`)
+	if err == nil {
+		history, err = pgx.CollectRows(rows, func(row pgx.CollectableRow) (appliedMigration, error) {
+			var m appliedMigration
+			err := row.Scan(&m.version, &m.name)
+			return m, err
+		})
+	}
+	if errors.As(err, &pgErr) && pgErr.Code == "42883" {
+		return 0, errDevelopmentSchema
+	}
+	if err != nil {
+		return 0, err
+	}
+	ms, err := Migrations()
+	if err != nil {
+		return 0, err
+	}
+	if _, err := checkHistory(history, ms); err != nil {
+		return 0, err
+	}
+	return v, nil
 }
 
 // configLock is the key of the advisory lock that serializes the writes of
@@ -620,7 +594,7 @@ WHERE masklen(server_addr) = CASE family(server_addr) WHEN 4 THEN 32 ELSE 128 EN
 		return out, err
 	}
 	err = queryRows(ctx, s.pool, `SELECT host(addr), host_id, last_seen, last_heartbeat, udp_traced, host,
-  coalesce(peer_fold, ''), peer_internal::text[]
+  peer_fold, peer_internal::text[]
 FROM shawk_v1.agent_addrs`,
 		func(rows pgx.Rows) error {
 			var addr string
@@ -639,13 +613,13 @@ FROM shawk_v1.agent_addrs`,
 			}
 			return nil
 		})
-	if err != nil || !s.learnedAllowed(ctx) {
+	if err != nil {
 		return out, err
 	}
-	err = queryRows(ctx, s.pool, fmt.Sprintf(`SELECT host_id, proto, netns, host(client_addr), host(virtual_addr), virtual_port,
+	err = queryRows(ctx, s.pool, `SELECT host_id, proto, netns, host(client_addr), host(virtual_addr), virtual_port,
   host(source_addr), host(backend_addr), backend_port, last_seen
 FROM shawk.learned_translations
-WHERE last_seen > now() - make_interval(secs => %f)`, learnedTTL.Seconds()),
+WHERE last_seen > now() - make_interval(secs => $1)`,
 		func(rows pgx.Rows) error {
 			var r learnedRow
 			var client, virtual, source, backend string
@@ -667,7 +641,7 @@ WHERE last_seen > now() - make_interval(secs => %f)`, learnedTTL.Seconds()),
 			r.id.client, r.id.virtual, r.id.source, r.id.backend = addrs[0], addrs[1], addrs[2], addrs[3]
 			out.learned = append(out.learned, r)
 			return nil
-		})
+		}, learnedTTL.Seconds())
 	return out, err
 }
 
@@ -682,8 +656,8 @@ func parsePrefixes(ss []string) []netip.Prefix {
 	return out
 }
 
-func queryRows(ctx context.Context, pool *pgxpool.Pool, sql string, scan func(pgx.Rows) error) error {
-	rows, err := pool.Query(ctx, sql)
+func queryRows(ctx context.Context, pool *pgxpool.Pool, sql string, scan func(pgx.Rows) error, args ...any) error {
+	rows, err := pool.Query(ctx, sql, args...)
 	if err != nil {
 		return err
 	}

@@ -1,274 +1,195 @@
 ## Unreleased
 
-* The time to connect and why connects fail, per dependency, measured
-  passively on the connections that hosts open (phase 1 of
-  `docs/proposal-path-quality.md`). The state change program of TCP now
-  measures the handshake of every active open from `connect(2)` to the
-  SYN-ACK, the SYNs it retransmitted, and the reason of a failure:
-  `refused`, `timeout`, `unreachable`, `local` (no SYN sent, e.g. no free
-  local port), `aborted` (the application gave up first) or `_OTHER`.
-  The agent sends them on TCP client edges as the new metrics
-  `shawk.tcp.handshake` (a histogram with buckets from 100 µs to 3 s),
-  `shawk.tcp.syn_retransmits` and `shawk.connection.failed.by_reason`
-  (with `error.type`), and `shawk flows` shows them. The connector
-  forwards them per dependency as `shawk_tcp_handshake_seconds_sum` and
-  `_count`, `shawk_tcp_syn_retransmits_total` and
-  `shawk_connection_failed_by_reason_total{error_type}`, with the new
-  recording rules `shawk:dependency_handshake_seconds_sum:rate5m`,
-  `shawk:dependency_handshake_seconds_count:rate5m`,
-  `shawk:dependency_syn_retransmits:rate5m` and
-  `shawk:dependency_connection_failures_by_reason:rate5m`, and panels in
-  the dependency details dashboard. No existing metric, label or table
-  changes (`shawk flows` gains three columns), and the agents and
-  connectors can be upgraded in either order: a connector of the
-  previous version ignores the new metrics, and the edges of agents of the
-  previous version have none of the new series. The flow tables of the
-  agent take 2.6 MB more with the default `-max-flows`.
-* Translations of addresses learned from conntrack (#107, phase 2). The
-  agent of a host that translates addresses learns its translations with
-  two kprobes on the module nf_conntrack, once it is loaded: Docker
-  published ports and the masquerade of containers, kube-proxy (iptables,
-  nftables, IPVS with `net.ipv4.vs.conntrack=1`), REDIRECT and any DNAT or
-  SNAT rule. Translations used by open connections stay in use while they
-  are open. It sends them as `shawk.translation.first_seen` and
-  `last_seen`, and `shawk.agent.translations.traced` and `dropped`; the
-  new flag `-learn-translations` (default `true`) turns it off. With
-  folding, translations of clients and servers outside the internal ranges
-  are not learned. The connector writes them to the new table
-  `shawk.learned_translations` (migration 13, which replaces
-  `dependencies_between`, `dependencies` and `shawk.prune` in place; run
-  `grants.sql` again, which now also sets default privileges for the
-  tables of later migrations; until then the connector leaves the learned
-  translations out and warns), and the views match edges through them like static
-  translations, which come first; the `translation` of such a row is
-  `~learned`, and a translation of the configuration may no longer have a
-  name starting with `~`. In Prometheus, a client edge to a virtual address
-  is named after the backend, and a server edge of a DNAT after its client.
-  The systemd unit of the agent allows `perf_event_open`, which kprobes
-  need: a unit copied from an older package learns no translations.
-* Fixed: on kernels whose TCP iterator skips sockets, the walks of the
-  agent missed some connections. That is Linux before 6.17 without its
-  backport to the stable releases of 6.1, 6.6 and 6.12: 5.15, RHEL 9 and
-  10. The iterator skips the established sockets of the first bucket of the
-  established hash that holds any of a namespace, when that bucket follows
-  the last listening bucket of the namespace, and does so at every walk
-  while the listeners stay. A connection that predated the agent was then
-  never adopted, and the others were never counted as open, nor their
-  traffic and RTT accounted before they closed. This made
-  `TestTCPAdoptedDirection` fail now and then on Rocky Linux 9. The walk of
-  the processes now adopts and accounts the connections that processes
-  hold and that the latest walk missed, and runs at every interval while
-  it finds some; the agent warns about it.
-* Pods are named from their labels and annotations, as OBI names them
-  (#124): `service.name` is the annotation
-  `resource.opentelemetry.io/service.name`, then the labels
-  `app.kubernetes.io/instance` and `app.kubernetes.io/name`, then the
-  owner of the pod, and `service.namespace` the annotation
-  `resource.opentelemetry.io/service.namespace`, then the label
-  `app.kubernetes.io/part-of`, then the namespace of the pod. The agent
-  reads them from the sandbox of the pod kept by CRI-O and cri-dockerd;
-  containerd keeps only the annotations its `pod_annotations` lets
-  through: add `resource.opentelemetry.io/*` and
-  `kubernetes.io/config.source` to it to name pods by annotation and
-  static pods as OBI does. The owner follows OBI too: the pods of a Job
-  are named after the Job cut at its last `-` (`data-load` becomes
-  `data`), and static pods after their Node. The Prometheus `job` of pods of Helm charts
-  changes accordingly (`ingress-nginx/ingress-nginx-controller` becomes
-  `ingress-nginx/ingress-nginx`); their unit does not change.
+**Upgrading from v0.8.0.** The PostgreSQL schema is now one migration,
+`0001_schema.sql`. `shawk-migrate` and the connector, whether it migrates
+or not, refuse a database created by v0.8.0 or an earlier development
+version, which must be created again. Dropping its schemas deletes the
+history they hold: back them up first if you need it (`pg_dump -n shawk -n
+shawk_v1`), then `DROP SCHEMA shawk, shawk_v1 CASCADE` (which also drops
+views of your own on them), and run `shawk-migrate` and `grants.sql`
+again. Upgrade the agents and the connectors together. External peers are
+now folded by default, and the Prometheus `job` of processes in pods
+changes; see below.
 
-* The losses of new cgroups are visible (#126): the new counter
-  `shawk.agent.container_reads.dropped`
-  (`shawk_agent_container_reads_dropped_total`) tells how many containers
-  of new cgroups were not queued to be read because the queue was full,
-  and the new Prometheus alerts `ShawkCgroupEventsDropped` (warning) and
-  `ShawkContainerReadsDropped` (info) fire when either counter increases.
-  A test of the kernel creates 3000 cgroups: a reader that keeps up gets
-  all of them in batches that the ring buffer holds, one that stalls gets
-  the 496 that it holds of a burst, and the drops of the others are
-  counted.
-* The state of a container is read on a worker instead of the goroutine
-  that drains the events of new cgroups (#126), which the kernel dropped
-  while it read the files of the runtimes, such as several MB of
-  `containers.json` on a busy host of Podman or CRI-O: the cgroups of a
-  burst of new containers lost their paths. The export no longer waits
-  for these reads either. The new counter
-  `shawk.agent.cgroup_events.dropped`
-  (`shawk_agent_cgroup_events_dropped_total`) tells how many new cgroups
-  the kernel did not report because the agent read too slowly.
-* Dependencies through relays without an agent that rewrite addresses
-  (#107): load balancers, keepalived or LVS virtual addresses, TCP
-  proxies. `translations` in the configuration of the connector gives
-  their virtual addresses, their backends and, for a relay that replaces
-  the addresses of the clients, the addresses the backends see them at;
-  the connector writes them to the new table `shawk.translations`
-  (migration 12; run `grants.sql` again). `shawk_v1.dependencies` and
-  `dependencies_between` match a client edge to a virtual address with
-  the server edges at its backends, over the period both were active in,
-  with the address and port of the server; the new last columns
-  `virtual_addr`, `virtual_port` and `translation` tell what the client
-  connected to. A server edge from the addresses of a relay keeps a row of
-  its own too, since clients without an agent may be behind the relay, and
-  so does another matched edge over a time its matched rows do not cover.
-  On these rows, the observation of a side whose edge outlives the row is
-  NULL, so that a stopped agent does not make a dependency disappear.
-  `dependencies_between` is dropped and created again with the new
-  columns: drop a view or a `BEGIN ATOMIC` function of yours that depends
-  on it before the migration, and create it again after. In Prometheus, the peer of a client edge to a virtual address is
-  the service at a backend, with the `server.port` of the backend, and the
+### Added
+
+* **Time to connect and why connects fail**, per dependency, measured
+  passively on the connections that hosts open. The kernel measures every
+  active open of TCP from `connect(2)` to the SYN-ACK, the SYNs it
+  retransmitted, and the reason of a failure: `refused`, `timeout`,
+  `unreachable`, `local` (no SYN sent, e.g. no free local port), `aborted`
+  (the application gave up first) or `_OTHER`. The agent sends them on TCP
+  client edges as `shawk.tcp.handshake` (a histogram from 100 µs to 3 s),
+  `shawk.tcp.syn_retransmits` and `shawk.connection.failed.by_reason`
+  (with `error.type`); the connector forwards them per dependency as
+  `shawk_tcp_handshake_seconds_sum` and `_count`,
+  `shawk_tcp_syn_retransmits_total` and
+  `shawk_connection_failed_by_reason_total{error_type}`, with the
+  recording rules `shawk:dependency_handshake_seconds_sum:rate5m`,
+  `…_count:rate5m`, `shawk:dependency_syn_retransmits:rate5m` and
+  `shawk:dependency_connection_failures_by_reason:rate5m`, and panels in
+  the dependency details dashboard. `shawk flows` shows them. The flow
+  tables of the agent take 2.6 MB more with the default `-max-flows`.
+* **Dependencies through translations of addresses** (#107):
+  * relays without an agent (load balancers, keepalived or LVS virtual
+    addresses, TCP proxies) described by `translations` in the
+    configuration of the connector: their virtual addresses, backends and,
+    for a relay that replaces the addresses of the clients, the addresses
+    the backends see them at (`shawk.translations`);
+  * translations learned from conntrack by the agent of the host that makes
+    them, with two kprobes on nf_conntrack once it is loaded: Docker
+    published ports and masquerade, kube-proxy (iptables, nftables, IPVS
+    with `net.ipv4.vs.conntrack=1`), REDIRECT and any DNAT or SNAT rule
+    (`-learn-translations`, default `true`; `shawk.translation.first_seen`
+    and `last_seen`, `shawk.agent.translations.traced` and `dropped`;
+    `shawk.learned_translations`). Translations used by open connections
+    stay in use while they are open. The systemd unit allows
+    `perf_event_open`, which kprobes need.
+
+  `shawk_v1.dependencies` and `dependencies_between()` match a client edge
+  to a virtual address with the server edges at its backends, over the
+  period both were active in; the last columns `virtual_addr`,
+  `virtual_port` and `translation` (`~learned` for a learned one) tell
+  what the client connected to; on these rows, the observation of a side
+  whose edge outlives the row is NULL, so that a stopped agent does not
+  make a dependency disappear. In Prometheus, the peer of a client edge to
+  a virtual address is the service at a backend, with the `server.port` of
+  the backend (on hosts with Docker or kube-proxy, where translations are
+  learned by default, the `server_port` of such series changes), and the
   peer of a server edge behind a relay that keeps the addresses of the
-  clients is the client service. The backends of Kubernetes services and
-  Docker published ports change too often to be written down; learning
-  the translations from conntrack on the hosts that make them is proposed
-  in `docs/proposal-translation.md`.
-* Fixed: connectors that started at the same time with different
-  `peer_cidrs` could leave the ranges of both in PostgreSQL, and a
-  database that defaults to REPEATABLE READ failed the write. The
-  configuration of a connector (`peer_cidrs` and the translations) is
-  written in one transaction in READ COMMITTED, one connector at a time.
-* Fixed: the edges of the dependency map dashboard had no arrowheads in
-  Grafana 12.2 and 13.3, so the direction of a dependency could not be
-  seen. The Node Graph refers to the arrowhead of an edge by its id,
-  unescaped, in `url(#...)`, which the spaces of the ids of
-  `shawk_v1.graph_edges` (`client -> server`) made invalid. The dashboard
-  shows the md5 of the id instead; `shawk_v1` is unchanged.
-* A container keeps its name when it is recreated (#104). `shawk.unit` of a
-  process in a container was `docker-<id>`, `podman-<id>`,
-  `cri-containerd-<id>` or `crio-<id>`, so every redeploy added rows to
-  `shawk.processes` and split the history of a container. It is now
-  `k8s/<namespace>/<workload>/<container>` for a pod of Kubernetes,
-  `docker/<project>/<service>` for Docker Compose, and `docker/<name>`,
-  `podman/<name>` or `containerd/<name>` otherwise, read from the state
-  the runtime keeps on disk when the cgroup is created; the id is the new
-  attribute `container.id`, which the connector reads to keep the series
-  of the replicas of a unit apart. Upgrade the connectors before the
-  agents: a connector of the previous version takes the series of the
-  containers of one unit for one series, and counts the connections of
-  only one of them. The cgroupfs drivers of Docker and kubelet
-  (`/docker/<id>`, `/kubepods/.../pod<uid>/<id>`) are recognized; their
-  processes were named after the raw id. A container whose state cannot
-  be read, such as a rootless one, is named `<runtime>-<12 hex digits>`
-  (`containerd-` rather than `cri-containerd-`), or `container-<12 hex
-  digits>` when the cgroup does not tell the runtime; a container in a
-  container is named after the outer one. The labels of a pod or of
-  Compose that Docker copies from the image name a container only with
-  the name cri-dockerd or Compose gives it. The processes of a pod of
-  Kubernetes are named after the workload of the pod (the name of the pod
-  without the suffixes Kubernetes generates) unless they set
-  `OTEL_SERVICE_NAME`, and get the namespace of the pod as
-  `service.namespace` unless `OTEL_RESOURCE_ATTRIBUTES` sets one, also
-  when they set `OTEL_SERVICE_NAME`: the Prometheus `job` of a pod changes
-  from the executable (or `billing`) to `<namespace>/<workload>` (or
-  `<namespace>/billing`), as OBI names them. OBI prefers the labels
-  `app.kubernetes.io/instance` and `app.kubernetes.io/name` of the pod,
-  which the agent cannot see, so the `job` of pods with these labels may
-  differ from that of OBI. The existing rows of `shawk.processes` of
-  containers keep their old units.
-* The kernel folds the peers outside the internal ranges of the host into
-  one dependency per local endpoint (#96). On an internet-facing host, the
-  clients of a local server on the Internet no longer make one flow, one
-  series and one edge in PostgreSQL per address, which filled the flow
-  table (and dropped the flows of other dependencies), the requests of the
-  agent and `shawk.edges`. `-internal-peers` lists the ranges whose peers
-  are kept exact (default `private`: RFC 1918, CGNAT, loopback, link-local
-  and IPv6 ULA; loopback and the addresses of the host are always kept);
-  `-fold-external` folds the external peers of incoming flows (`in`, the
-  default), of all flows (`all`) or of none (`none`). A folded edge carries
-  `shawk.peer.folded=true` with `network.peer.address` 0.0.0.0 or ::, and
-  the connector writes its peer to PostgreSQL as the network 0.0.0.0/0 or
-  ::/0 and names it `~external` (or after a range of `peer_cidrs` holding
-  the whole network); `keep_peer_address` outputs the network. The address
-  of each external client is no longer recorded; set `-fold-external=none`
+  clients is the client service. A translation of the configuration may
+  not have a name starting with `~`.
+* **Folding of external peers** (#96): the kernel folds the peers outside
+  the internal ranges of the host into one dependency per local endpoint,
+  so that the clients of an internet-facing server do not fill the flow
+  table, the requests and `shawk.edges`. `-internal-peers` lists the ranges
+  kept exact (default `private`: RFC 1918, CGNAT, loopback, link-local and
+  IPv6 ULA; the addresses of the host are always kept), and
+  `-fold-external` which flows fold their external peers (`in`, the
+  default, `all` or `none`). A folded edge carries
+  `shawk.peer.folded=true`; the connector stores its peer as the network
+  `0.0.0.0/0` or `::/0` and names it `~external`, and warns when an agent
+  folds a host that runs an agent, or the peers of a range of
+  `peer_cidrs`. Folding is on by default, so the address of each external
+  client of a local server is no longer recorded: set `-fold-external=none`
   where it is needed. A fleet that uses public addresses internally must
   add them to `-internal-peers`, and so must one whose `peer_cidrs` name
-  public ranges, whose peers are otherwise named `~external`. The connector
-  logs a warning, at most once an hour per host, when an agent folds a
-  client (or, with `all`, a server) that runs an agent, whose connections
-  then do not match (not when both agents fold the other side), and, at
-  most once an hour per configuration, when agents fold the peers of a
-  range of `peer_cidrs`. An IPv6 range of `-internal-peers` that overlaps
-  `::ffff:0:0/96`, such as `::/0`, is refused. Upgrade the connectors
-  before the agents: a connector of the previous version keeps a folded
-  peer as the address 0.0.0.0 or ::, which it names `~unresolved`.
-* The periods in which an agent dropped flows are recorded (migration 11):
-  the new table `shawk.partial_observations` and the function
-  `shawk_v1.partly_observed(since, until)`, so that the absence of a
-  dependency over them is not taken for disuse. The fleet, dependency
-  details and changes dashboards annotate them, and the fleet dashboard
-  lists them. The drops of each run of an agent are compared with what
-  PostgreSQL holds for the run, so several connectors and restarts record
-  them once (`shawk.agent_sessions.counters_started`). `shawk_v1.agents`
-  and `shawk_v1.agent_addrs` gain the columns `peer_fold` and
-  `peer_internal` at their end. Connectors of the previous version keep
-  writing during an upgrade, but do not record these periods.
-  Run `grants.sql` again after the migration.
-* The systemd units are sandboxed: the agent keeps only the capabilities it
-  needs (`CAP_BPF`, `CAP_PERFMON`, `CAP_SYS_ADMIN`, `CAP_SYS_PTRACE`,
-  `CAP_DAC_READ_SEARCH`) and both units filter system calls and address
-  families. `ProtectHome=yes` replaces `read-only`: the binary and the TLS
-  files of the agent must not be under `/home` or `/root`; override it with a
-  drop-in otherwise.
+  public ranges, whose peers are otherwise named `~external`.
+* **Partly observed periods**: the periods in which an agent dropped flows
+  (`shawk.partial_observations`, `shawk_v1.partly_observed()`), so that the
+  absence of a dependency over them is not taken for disuse. The fleet,
+  dependency details and changes dashboards annotate them.
+  `shawk_v1.agents` and `agent_addrs` tell what each agent folds
+  (`peer_fold`, `peer_internal`).
+* **Every known owner of a listener** (`shawk.listener_owners`), so that the
+  history of a listener is kept when it changes hands.
+* **Containers keep their names when they are recreated** (#104):
+  `shawk.unit` of a process in a container is
+  `k8s/<namespace>/<workload>/<container>`, `docker/<project>/<service>`
+  for Docker Compose, or `docker/<name>`, `podman/<name>` and
+  `containerd/<name>`, read from the state the runtime keeps on disk; the
+  id is `container.id`, which keeps the series of replicas apart. A
+  container whose state cannot be read is named `<runtime>-<12 hex
+  digits>`.
+* **Pods are named as OBI names them** (#124): `service.name` is the
+  annotation `resource.opentelemetry.io/service.name`, then the labels
+  `app.kubernetes.io/instance` and `app.kubernetes.io/name`, then the
+  owner of the pod (a Job cut at its last `-`, a static pod after its
+  Node); `service.namespace` is the annotation
+  `resource.opentelemetry.io/service.namespace`, then the label
+  `app.kubernetes.io/part-of`, then the namespace of the pod. The agent
+  reads them from the sandbox kept by CRI-O and cri-dockerd; containerd
+  keeps only the annotations its `pod_annotations` lets through (add
+  `resource.opentelemetry.io/*` and `kubernetes.io/config.source`).
+* **Sockets of the kernel** (the clients of NFS, iSCSI, CIFS and Ceph,
+  nfsd) belong to the kernel and are named after their port
+  (`~kernel:nfs`, `~kernel:iscsi`, …, `~kernel:nfsd`), instead of the kernel
+  worker that opened them.
+* **Losses of new cgroups are visible** (#126):
+  `shawk.agent.cgroup_events.dropped`
+  (`shawk_agent_cgroup_events_dropped_total`) counts the new cgroups the
+  kernel did not report because the agent read too slowly, and
+  `shawk.agent.container_reads.dropped`
+  (`shawk_agent_container_reads_dropped_total`) the containers not queued
+  to be read; the Prometheus alerts `ShawkCgroupEventsDropped` (warning)
+  and `ShawkContainerReadsDropped` (info) fire when they increase.
+* The systemd units are sandboxed: the agent keeps only `CAP_BPF`,
+  `CAP_PERFMON`, `CAP_SYS_ADMIN`, `CAP_SYS_PTRACE` and
+  `CAP_DAC_READ_SEARCH`, and both units filter system calls and address
+  families. With `ProtectHome=yes`, the binary and the TLS files of the
+  agent must not be under `/home` or `/root`.
 * The release archive of the agent contains its systemd unit and
-  `agent.env`; deb packages have their copyright in
-  `/usr/share/doc/<package>/copyright`; archives, packages and the collector
-  image ship the licenses of the Go modules linked into the binaries
+  `agent.env`; archives, packages and the collector image ship the
+  licenses of the Go modules linked into the binaries
   (`THIRD_PARTY_NOTICES`).
+* The BPF programs are tested on the kernels of Rocky Linux 9.6 (x86_64,
+  aarch64) and upstream 5.14 and 5.15 in virtual machines
+  (`make vm-test`, which needs `xz` for Rocky Linux and `dpkg-deb` for the
+  upstream kernels), and on an arm64 runner.
+
+### Changed
+
+* The PostgreSQL schema is one migration (see above). Its tables, views
+  and functions are those of the migrations it replaces, with
+  `shawk.schema_history()` for connectors that do not migrate;
+  `shawk_v1.agents.peer_fold` is never NULL.
+* **The Prometheus `job` of processes in pods** is `<namespace>/<name>`, as
+  OBI names them (#104, #124): the name is the workload of the pod as
+  above, or `OTEL_SERVICE_NAME` when the process sets it, and the namespace
+  that of the pod unless `OTEL_RESOURCE_ATTRIBUTES` sets one. The `job` of
+  a pod changes from the executable (or `billing`, with
+  `OTEL_SERVICE_NAME=billing`) to `<namespace>/<workload>` (or
+  `<namespace>/billing`); pods of Helm charts are named after their labels,
+  e.g. `ingress-nginx/ingress-nginx` rather than
+  `ingress-nginx/ingress-nginx-controller`. Dashboards and alerts that
+  select pods by `job` need the new names.
+* `shawk` exits with 2 on usage errors, including every invalid value of
+  a flag, and with 1 when a command fails (2 for both before).
+* The state of a container is read on a worker rather than on the
+  goroutine that drains the events of new cgroups, so that a burst of new
+  containers on a busy host of Podman or CRI-O does not make the kernel
+  drop events (#126); the export no longer waits for these reads.
 * `make build` and `make collector` set the version without the `v` of the
   tag (`0.8.0`), like the release.
-* The BPF programs are tested on the kernels of Rocky Linux 9.6 (x86_64 and
-  aarch64) and upstream 5.14 and 5.15 in virtual machines (`make vm-test`),
-  and on an arm64 runner. On Rocky Linux 9 on aarch64, which has no BPF
-  trampolines, UDP is not traced.
-* Fixed: on kernels before 6.4, such as RHEL 9 and upstream 5.14, two
-  CPUs that created the same flow at once could lose a connection or its
-  bytes, counted in `shawk.agent.flows.dropped` as if the flow table were
-  full (#119): the `-EEXIST` of the CPU that lost the race was not
-  recognized, since the map operation returns it in 32 bits. A connection
-  whose count fails is now counted by its next walk or its close. The agent
-  warns when updates are dropped because another update of the same bucket
-  was in progress on the same CPU (`-EBUSY`), not because the table was
-  full.
-* Fixed: UDP direction (#99). A connected client socket on a port the
-  kernel chose that existed before the agent started and receives before
-  it sends again is no longer recorded as a server of its own port, and
-  the connected per-client sockets of a QUIC server started since the last
-  walk are servers.
-* Fixed: a UDP GSO send or GRO receive counted as one datagram, a peeked
-  empty datagram counted twice, and IPv6 datagrams with extension headers
-  were not counted.
-* Fixed: a child of a TCP Fast Open listener reset or closed before its
-  handshake completed was not counted, with the data of its SYN.
-* Fixed: a listener replaced by another process of the same cgroup was
-  attributed to the former process until the next periodic owner scan
-  (up to a minute).
-* The new table `shawk.listener_owners` keeps every known owner of a
-  listener, so its history is kept when it changes hands (migration 10, from
-  the migration on). `shawk.listeners` is unchanged, so connectors of the
-  previous version keep writing during an upgrade. Run `grants.sql` again
-  after the migration.
-* Fixed: when the main thread of the agent was in another network namespace
-  than the thread walking the sockets, one namespace was walked twice and
+
+### Fixed
+
+* On kernels whose TCP iterator skips sockets (Linux before 6.17 without
+  its backport to 6.1, 6.6 and 6.12: 5.15, RHEL 9 and 10), the walks of the
+  agent missed the established sockets of a bucket that follows the last
+  listening bucket of a namespace: connections that predated the agent
+  were never adopted, and others not counted as open. The walk of the
+  processes now adopts and accounts the connections that the latest walk
+  missed, and the agent warns about it.
+* On kernels before 6.4 (RHEL 9, 5.14), two CPUs that created the same flow
+  at once could lose a connection or its bytes, counted as dropped flows
+  (#119). The agent warns when updates are dropped because another update
+  of the same bucket was in progress on the same CPU, not because the table
+  was full.
+* UDP direction (#99): a connected client socket on a port the kernel
+  chose, which existed before the agent and receives before it sends, is
+  no longer a server of its own port; the per-client sockets of a QUIC
+  server are servers. A GSO send or GRO receive counts its datagrams, a
+  peeked empty datagram counts once, and IPv6 datagrams with extension
+  headers are counted.
+* MPTCP clients: a connection opened before the agent is accounted, and the
+  subflows of the path manager belong to the process holding the MPTCP
+  socket and count once.
+* A child of a TCP Fast Open listener reset or closed before its handshake
+  completed is counted, with the data of its SYN.
+* A listener replaced by another process of the same cgroup was attributed
+  to the former process until the next periodic owner scan (up to a
+  minute).
+* When the main thread of the agent was in another network namespace than
+  the thread walking the sockets, one namespace was walked twice and
   another not at all.
-* Sockets of the kernel (the clients of NFS, iSCSI, CIFS and Ceph, nfsd)
-  belong to the kernel: their service is named after their port
-  (`~kernel:nfs`, `~kernel:iscsi`, `~kernel:smb`, `~kernel:ceph`, ...,
-  `~kernel` for other ports), and the servers of the kernel apart from its
-  clients (`~kernel:nfsd`, `~kernel:ksmbd`, `~kernel:iscsi-target`,
-  `~kernel:nvmet-tcp`).
-  Previously a connection opened before the agent started was never
-  accounted, and a new one was named after the kernel worker that opened it
-  (`kworker/u8:2`), which changes at every reconnection: a new row in
-  `shawk.processes`, another `service.name` and Prometheus `job`, and a
-  dependency that seemed to disappear and reappear in `dependency_changes`.
-  A listener that no process holds, such as that of nfsd, no longer makes
-  the agent walk the processes for every connection it accepts.
-* Fixed: MPTCP clients. An outgoing MPTCP connection opened before the
-  agent started was never accounted; the subflows that the path manager
-  adds (MP_JOIN) were attributed to a kernel worker and counted as further
-  connections, on both sides. Subflows now belong to the process holding
-  the MPTCP socket, and a connection counts once. A failed dial of Go with
-  MPTCP still counts two attempts, since Go tries again with TCP.
-* The virtual machine tests load the NFS client modules of Rocky Linux 9
-  (`kernel-modules-core`), and `test/vm/run.sh` needs `xz`.
+* Connectors that started at the same time with different `peer_cidrs`
+  could leave the ranges of both in PostgreSQL, and a database defaulting
+  to REPEATABLE READ failed the write: the configuration is written in one
+  transaction in READ COMMITTED, one connector at a time.
+* The edges of the dependency map dashboard had no arrowheads in Grafana
+  12.2 and 13.3: the dashboard shows the md5 of the edge ids, which hold
+  spaces.
 
 ## [v0.8.0](https://github.com/yuuki/shawk/compare/v0.7.1...v0.8.0) (2026-11-01)
 

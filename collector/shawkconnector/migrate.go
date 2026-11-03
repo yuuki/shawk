@@ -3,6 +3,7 @@ package shawkconnector
 import (
 	"context"
 	"embed"
+	"errors"
 	"fmt"
 	"io/fs"
 	"sort"
@@ -69,8 +70,8 @@ CREATE TABLE IF NOT EXISTS shawk.schema_migrations (
 )`); err != nil {
 		return nil, err
 	}
-	var current int
-	if err := conn.QueryRow(ctx, `SELECT coalesce(max(version), 0) FROM shawk.schema_migrations`).Scan(&current); err != nil {
+	current, err := appliedVersion(ctx, conn, ms)
+	if err != nil {
 		return nil, err
 	}
 	var applied []string
@@ -91,6 +92,56 @@ CREATE TABLE IF NOT EXISTS shawk.schema_migrations (
 		applied = append(applied, m.Name)
 	}
 	return applied, nil
+}
+
+// errDevelopmentSchema is returned for a database whose schema was created
+// before the migrations were consolidated into 0001_schema.sql: by shawk
+// v0.8.0 or a development version.
+var errDevelopmentSchema = errors.New("the schema was created by shawk v0.8.0 or a development version " +
+	"before the migrations were consolidated; back it up if needed, drop the schemas shawk and shawk_v1, " +
+	"migrate again and run grants.sql again")
+
+// appliedMigration is a row of the history of migrations.
+type appliedMigration struct {
+	version int
+	name    string
+}
+
+// appliedVersion returns the latest migration applied to the database.
+func appliedVersion(ctx context.Context, conn *pgx.Conn, ms []Migration) (int, error) {
+	rows, err := conn.Query(ctx, `SELECT version, name FROM shawk.schema_migrations ORDER BY version`)
+	if err != nil {
+		return 0, err
+	}
+	history, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (appliedMigration, error) {
+		var m appliedMigration
+		err := row.Scan(&m.version, &m.name)
+		return m, err
+	})
+	if err != nil {
+		return 0, err
+	}
+	return checkHistory(history, ms)
+}
+
+// checkHistory returns the latest version of a history of migrations. It
+// fails if the history holds a migration under the name of another one of
+// the same version, as a schema created before the migrations were
+// consolidated does: migrating it would leave it as it is, without the
+// tables and views this connector writes and reads.
+func checkHistory(history []appliedMigration, ms []Migration) (int, error) {
+	names := make(map[int]string, len(ms))
+	for _, m := range ms {
+		names[m.Version] = m.Name
+	}
+	current := 0
+	for _, h := range history {
+		if want, ok := names[h.version]; ok && want != h.name {
+			return 0, fmt.Errorf("migration %d of the database is %s, not %s: %w", h.version, h.name, want, errDevelopmentSchema)
+		}
+		current = max(current, h.version)
+	}
+	return current, nil
 }
 
 // SchemaVersion is the version of the schema this connector writes.

@@ -147,9 +147,10 @@ func TestHandshakeOutputsOfPartialRequests(t *testing.T) {
 	}
 }
 
-// TestHandshakeOutputsOfOldAgents checks that the edges of agents that
-// predate the measurement of handshakes produce none of their outputs.
-func TestHandshakeOutputsOfOldAgents(t *testing.T) {
+// TestHandshakeOutputsWithoutHandshakes checks that edges without
+// handshakes, SYN retransmits and reasons of failure, as from an agent that
+// does not send them, produce none of their outputs.
+func TestHandshakeOutputsWithoutHandshakes(t *testing.T) {
 	c, _, sink, now := testConnector(t, nil)
 	*now = now.Add(15 * time.Second)
 	out := consume(t, c, sink, tAgent{host: "app-01", addrs: []string{"10.0.0.11"}, time: *now, edges: []tEdge{{

@@ -23,9 +23,8 @@ func TestUsage(t *testing.T) {
 	if code := Main([]string{"nope"}, &out, &errOut); code != 2 {
 		t.Errorf("exit code of an unknown command = %d", code)
 	}
-	// The query commands were removed with the ledger.
-	if code := Main([]string{"who-uses", "db-01"}, &out, &errOut); code != 2 {
-		t.Errorf("exit code of who-uses = %d", code)
+	if code := Main([]string{"version", "extra"}, &out, &errOut); code != 2 {
+		t.Errorf("exit code of version with an argument = %d", code)
 	}
 	if code := Main([]string{"version"}, &out, &errOut); code != 0 {
 		t.Errorf("exit code of version = %d", code)
@@ -42,11 +41,25 @@ func TestAgentFlags(t *testing.T) {
 		{"agent", "-netns", "nope"},
 		{"agent", "-log-level", "loud"},
 		{"agent", "extra"},
+		{"agent", "-no-such-flag"},
+		{"agent", "-interval", "2m"},
+		{"agent", "-idle-ttl", "1m"},
+		{"agent", "-otlp-endpoint", "localhost:4327"},
+		{"agent", "-otlp-protocol", "carrier-pigeon"},
+		{"agent", "-otlp-cert-file", "client.crt", "-otlp-key-file", "client.key"}, // without https://
 		{"flows", "extra"},
+		{"flows", "-interval", "0"},
+		{"flows", "-count", "-1"},
 	} {
 		if code := Main(args, &out, &errOut); code != 2 {
 			t.Errorf("exit code of %v = %d", args, code)
 		}
+	}
+	// A valid command line whose command fails is not a usage error: the CA
+	// file is read when the agent starts.
+	if code := Main([]string{"agent", "-otlp-endpoint", "https://localhost:4327", "-otlp-ca-file", "/nonexistent/ca.pem"},
+		&out, &errOut); code != 1 {
+		t.Errorf("exit code of an agent whose CA file is missing = %d", code)
 	}
 }
 

@@ -23,6 +23,15 @@ shawk-migrate -dsn 'postgres://shawk_owner:...@db/shawk'          # make shawk-m
 psql -v ON_ERROR_STOP=1 -d shawk -U shawk_owner -f packaging/postgres/grants.sql
 ```
 
+`grants.sql` runs after `shawk-migrate`, and again after an upgrade that
+brings new migrations; it also sets default privileges for the tables that
+later migrations create. `shawk-migrate` and the connector refuse a
+database with the schema of v0.8.0 or of a development build before
+`0001_schema.sql`. Dropping the schemas `shawk` and `shawk_v1` (`DROP
+SCHEMA shawk, shawk_v1 CASCADE`, which also drops views of your own on
+them) deletes the history they hold, so back them up first if you need it
+(`pg_dump -n shawk -n shawk_v1`); then migrate and run `grants.sql` again.
+
 Prometheus must run with `--web.enable-otlp-receiver`.
 
 The release packages `shawk-collector` install the collector as the
@@ -51,7 +60,9 @@ OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE=/etc/obi/tls/obi.crt
 OTEL_EXPORTER_OTLP_CLIENT_KEY=/etc/obi/tls/obi.key
 ```
 
-A connector that does not migrate (`migrate: false`) waits until the schema
-is at least its own version: run `shawk-migrate`, then `grants.sql` again,
-before or while upgrading the collectors. The schema written by a newer
-connector may not suit an older one; upgrade them together.
+A connector that does not migrate (`migrate: false`, as in the example)
+waits until the schema is at least its own version, and warns when the
+schema is newer than itself: a schema written by a newer connector may not
+suit an older one. When upgrading, run `shawk-migrate` and then
+`grants.sql` before or while upgrading the collectors, and upgrade all of
+them.

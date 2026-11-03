@@ -40,52 +40,81 @@ Commands:
 Run 'shawk <command> -h' for the flags of a command.
 `
 
-// Main runs the command line and returns the exit status.
+// Exit statuses of Main.
+const (
+	exitOK    = 0
+	exitError = 1 // the command failed
+	exitUsage = 2 // the command line is invalid
+)
+
+// command runs a command with its arguments.
+type command func(ctx context.Context, args []string, stdout, stderr io.Writer) error
+
+var commands = map[string]command{
+	"agent": runAgent,
+	"flows": runFlows,
+	"version": func(_ context.Context, args []string, stdout, stderr io.Writer) error {
+		fs := flag.NewFlagSet("version", flag.ContinueOnError)
+		fs.Usage = func() { fmt.Fprintln(stderr, "Usage: shawk version") }
+		if err := parseFlags(fs, args, stderr); err != nil {
+			return err
+		}
+		fmt.Fprintln(stdout, "shawk", version.Version)
+		return nil
+	},
+}
+
+// Main runs the command line and returns the exit status: 0 on success, 1
+// when the command fails and 2 when the command line is invalid.
 func Main(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
 		fmt.Fprint(stderr, usage)
-		return 2
-	}
-	cmds := map[string]func(context.Context, []string, io.Writer) error{
-		"agent": runAgent,
-		"flows": runFlows,
-		"version": func(context.Context, []string, io.Writer) error {
-			fmt.Fprintln(stdout, "shawk", version.Version)
-			return nil
-		},
+		return exitUsage
 	}
 	name := args[0]
 	if name == "-h" || name == "--help" || name == "help" {
 		fmt.Fprint(stdout, usage)
-		return 0
+		return exitOK
 	}
-	cmd, ok := cmds[name]
+	cmd, ok := commands[name]
 	if !ok {
 		fmt.Fprintf(stderr, "shawk: unknown command %q\n\n%s", name, usage)
-		return 2
+		return exitUsage
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	err := cmd(ctx, args[1:], stdout)
+	err := cmd(ctx, args[1:], stdout, stderr)
 	switch {
-	case err == nil:
-		return 0
-	case errors.Is(err, flag.ErrHelp):
-		return 0
+	case err == nil, errors.Is(err, flag.ErrHelp):
+		return exitOK
+	case errors.Is(err, errFlags):
+		// The flag package has already reported the error with the usage.
+		return exitUsage
 	case errors.Is(err, errUsage):
 		fmt.Fprintf(stderr, "shawk %s: %v\n", name, err)
-		return 2
+		return exitUsage
 	}
 	fmt.Fprintf(stderr, "shawk %s: %v\n", name, err)
-	return 2
+	return exitError
 }
 
-var errUsage = errors.New("usage error")
+var (
+	// errUsage is wrapped by the errors of invalid values of flags and
+	// arguments.
+	errUsage = errors.New("usage error")
+	// errFlags is returned for flags that cannot be parsed, which the flag
+	// package reports itself.
+	errFlags = errors.New("invalid flags")
+)
 
-func parseFlags(fs *flag.FlagSet, args []string) error {
-	fs.SetOutput(os.Stderr)
+// parseFlags parses the flags of a command, which takes no arguments.
+func parseFlags(fs *flag.FlagSet, args []string, stderr io.Writer) error {
+	fs.SetOutput(stderr)
 	if err := fs.Parse(args); err != nil {
-		return err
+		if errors.Is(err, flag.ErrHelp) {
+			return err
+		}
+		return fmt.Errorf("%w: %v", errFlags, err)
 	}
 	if fs.NArg() > 0 {
 		return fmt.Errorf("%w: unexpected argument %q", errUsage, fs.Arg(0))
@@ -93,7 +122,7 @@ func parseFlags(fs *flag.FlagSet, args []string) error {
 	return nil
 }
 
-func runAgent(ctx context.Context, args []string, _ io.Writer) error {
+func runAgent(ctx context.Context, args []string, _, stderr io.Writer) error {
 	fs := flag.NewFlagSet("agent", flag.ContinueOnError)
 	var (
 		endpoint = fs.String("otlp-endpoint", os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
@@ -119,14 +148,14 @@ func runAgent(ctx context.Context, args []string, _ io.Writer) error {
 			"learn the translations of addresses the host makes (DNAT, SNAT, IPVS) from conntrack, so that dependencies through them are matched")
 		logLevel = fs.String("log-level", "info", "log level: debug, info, warn or error")
 	)
-	if err := parseFlags(fs, args); err != nil {
+	if err := parseFlags(fs, args, stderr); err != nil {
 		return err
 	}
 	var lvl slog.Level
 	if err := lvl.UnmarshalText([]byte(*logLevel)); err != nil {
 		return fmt.Errorf("%w: -log-level: %v", errUsage, err)
 	}
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl}))
+	logger := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: lvl}))
 	ns, err := agent.ParseNetNS(*netns)
 	if err != nil {
 		return fmt.Errorf("%w: %v", errUsage, err)
@@ -149,7 +178,7 @@ func runAgent(ctx context.Context, args []string, _ io.Writer) error {
 	if *perReq < 1 {
 		return fmt.Errorf("%w: -max-series-per-request must be positive", errUsage)
 	}
-	return agent.Run(ctx, agent.Config{
+	cfg := agent.Config{
 		Exporter: otlp.ExporterConfig{Endpoint: *endpoint, Protocol: *protocol, CAFile: *caFile,
 			CertFile: *certFile, KeyFile: *keyFile},
 		MaxSeriesPerRequest: *perReq,
@@ -163,7 +192,11 @@ func runAgent(ctx context.Context, args []string, _ io.Writer) error {
 		BPFStats:            *bpfStats,
 		LearnTranslations:   *learn,
 		Logger:              logger,
-	})
+	}
+	if err := cfg.Validate(); err != nil {
+		return fmt.Errorf("%w: %v", errUsage, err)
+	}
+	return agent.Run(ctx, cfg)
 }
 
 func envOr(name, def string) string {
@@ -173,7 +206,7 @@ func envOr(name, def string) string {
 	return def
 }
 
-func runFlows(ctx context.Context, args []string, w io.Writer) error {
+func runFlows(ctx context.Context, args []string, w, stderr io.Writer) error {
 	fs := flag.NewFlagSet("flows", flag.ContinueOnError)
 	var (
 		interval = fs.Duration("interval", 2*time.Second, "refresh interval")
@@ -181,8 +214,14 @@ func runFlows(ctx context.Context, args []string, w io.Writer) error {
 		netns    = fs.String("netns", "all", `network namespaces to trace: "all", "self" or an inode number`)
 		asJSON   = fs.Bool("json", false, "output JSON lines")
 	)
-	if err := parseFlags(fs, args); err != nil {
+	if err := parseFlags(fs, args, stderr); err != nil {
 		return err
+	}
+	if *interval <= 0 {
+		return fmt.Errorf("%w: -interval must be positive", errUsage)
+	}
+	if *count < 0 {
+		return fmt.Errorf("%w: -count must not be negative", errUsage)
 	}
 	ns, err := agent.ParseNetNS(*netns)
 	if err != nil {
@@ -194,7 +233,7 @@ func runFlows(ctx context.Context, args []string, w io.Writer) error {
 	}
 	defer tr.Close()
 	if !tr.UDPEnabled() {
-		fmt.Fprintln(os.Stderr, "warning: UDP is not traced: its programs could not be loaded (they need BPF trampolines, fentry)")
+		fmt.Fprintln(stderr, "warning: UDP is not traced: its programs could not be loaded (they need BPF trampolines, fentry)")
 	}
 	ticker := time.NewTicker(*interval)
 	defer ticker.Stop()

@@ -319,11 +319,10 @@ func TestPGLearnedSidecar(t *testing.T) {
 	})
 }
 
-// TestPGLearnedWithoutGrants: after migration 13 without grants.sql run
-// again, the role of the connector writes the hosts and names peers without
-// the learned translations, and the retention goes on; once granted, they
-// are written.
-func TestPGLearnedWithoutGrants(t *testing.T) {
+// TestPGLearnedAsConnectorRole: with the privileges of grants.sql, the role
+// of the connector writes the learned translations, reads them to name
+// peers, and deletes them with the retention.
+func TestPGLearnedAsConnectorRole(t *testing.T) {
 	c, _, conn := pgConnectorWith(t, nil)
 	ctx := context.Background()
 	if _, err := conn.Exec(ctx, `DO $$ BEGIN
@@ -336,7 +335,7 @@ func TestPGLearnedWithoutGrants(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	execAll(t, conn, string(grants), `REVOKE ALL ON shawk.learned_translations FROM shawk_connector`)
+	execAll(t, conn, string(grants))
 	t.Cleanup(func() { conn.Exec(ctx, "DROP OWNED BY shawk_connector, shawk_grafana") })
 	dsn := c.cfg.Postgres.DSN + "?options=-c%20role%3Dshawk_connector"
 	st, err := newPGStore(ctx, dsn)
@@ -344,84 +343,32 @@ func TestPGLearnedWithoutGrants(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.close()
-	var warned []string
-	st.(*pgStore).warn = func(msg string) { warned = append(warned, msg) }
 
-	now := time.Now().UTC().Truncate(time.Second)
-	write := func() error {
-		h := newHostChanges(hostKey("", "app-01"))
-		h.setHost("", "app-01", "5.14", "test", now)
-		h.addProcess(procKey{"app.service", "app", "app"}, "/usr/bin/app", span{now, now})
-		h.addEdge(edgeRowKey{role: "client", proto: "tcp", local: addrOf("10.0.0.11"), peer: addrOf("10.96.0.10"), port: 5432,
-			netns: 1, procKey: procKey{"app.service", "app", "app"}}, span{now, now})
-		h.addTranslation(translationID{proto: "tcp", netns: 1, client: addrOf("10.0.0.11"), virtual: addrOf("10.96.0.10"),
-			vport: 5432, source: addrOf("10.0.0.11"), backend: addrOf("10.0.1.10"), bport: 6432}, span{now, now})
-		return st.write(ctx, h)
-	}
-	if err := write(); err != nil {
-		t.Fatalf("writing without the grant: %v", err)
-	}
-	if _, err := st.peers(ctx, time.Hour); err != nil {
-		t.Errorf("reading the names of peers without the grant: %v", err)
-	}
-	if _, err := st.prune(ctx, time.Hour, 100); err != nil {
-		t.Errorf("retention without the grant: %v", err)
-	}
-	if len(warned) != 1 {
-		t.Errorf("warnings = %q", warned)
-	}
-	got := queryStrings(t, conn, `SELECT (SELECT count(*) FROM shawk.edges), (SELECT count(*) FROM shawk.learned_translations)`)
-	if !slices.Equal(got, []string{"1 0"}) {
-		t.Errorf("edges and learned translations = %q", got)
-	}
-
-	execAll(t, conn, string(grants))
-	st.(*pgStore).learnedChecked = time.Time{}
-	if err := write(); err != nil {
-		t.Fatal(err)
-	}
-	if got := queryStrings(t, conn, `SELECT count(*) FROM shawk.learned_translations`); !slices.Equal(got, []string{"1"}) {
-		t.Errorf("learned translations once granted = %q", got)
-	}
-}
-
-// TestPGLearnedSelectOnly: a role that may read the learned translations
-// but not write them writes its hosts without them, and the retention goes
-// on (has_table_privilege with a list is true if any of them is held).
-func TestPGLearnedSelectOnly(t *testing.T) {
-	c, _, conn := pgConnectorWith(t, nil)
-	ctx := context.Background()
-	if _, err := conn.Exec(ctx, `DO $$ BEGIN
-	    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'shawk_connector') THEN CREATE ROLE shawk_connector NOLOGIN; END IF;
-	    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'shawk_grafana') THEN CREATE ROLE shawk_grafana NOLOGIN; END IF;
-	  END $$`); err != nil {
-		t.Fatal(err)
-	}
-	grants, err := os.ReadFile(filepath.Join(packaging, "postgres/grants.sql"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	execAll(t, conn, string(grants), `REVOKE ALL ON shawk.learned_translations FROM shawk_connector`,
-		`GRANT SELECT ON shawk.learned_translations TO shawk_connector`)
-	t.Cleanup(func() { conn.Exec(ctx, "DROP OWNED BY shawk_connector, shawk_grafana") })
-	st, err := newPGStore(ctx, c.cfg.Postgres.DSN+"?options=-c%20role%3Dshawk_connector")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.close()
-	now := time.Now().UTC().Truncate(time.Second)
+	then := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Second)
 	h := newHostChanges(hostKey("", "app-01"))
-	h.setHost("", "app-01", "5.14", "test", now)
-	h.addProcess(procKey{"app.service", "app", "app"}, "/usr/bin/app", span{now, now})
+	h.setHost("", "app-01", "5.14", "test", then)
+	h.addProcess(procKey{"app.service", "app", "app"}, "/usr/bin/app", span{then, then})
 	h.addEdge(edgeRowKey{role: "client", proto: "tcp", local: addrOf("10.0.0.11"), peer: addrOf("10.96.0.10"), port: 5432,
-		netns: 1, procKey: procKey{"app.service", "app", "app"}}, span{now, now})
+		netns: 1, procKey: procKey{"app.service", "app", "app"}}, span{then, then})
 	h.addTranslation(translationID{proto: "tcp", netns: 1, client: addrOf("10.0.0.11"), virtual: addrOf("10.96.0.10"),
-		vport: 5432, source: addrOf("10.0.0.11"), backend: addrOf("10.0.1.10"), bport: 6432}, span{now, now})
+		vport: 5432, source: addrOf("10.0.0.11"), backend: addrOf("10.0.1.10"), bport: 6432}, span{then, then})
 	if err := st.write(ctx, h); err != nil {
-		t.Errorf("writing the host with SELECT only on learned_translations: %v", err)
+		t.Fatal(err)
+	}
+	rows, err := st.peers(ctx, 3*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows.learned) != 1 {
+		t.Errorf("learned translations read = %d, want 1", len(rows.learned))
 	}
 	if _, err := st.prune(ctx, time.Hour, 100); err != nil {
-		t.Errorf("retention with SELECT only on learned_translations: %v", err)
+		t.Fatal(err)
+	}
+	got := queryStrings(t, conn, `SELECT (SELECT count(*) FROM shawk.edges), (SELECT count(*) FROM shawk.learned_translations),
+  (SELECT count(*) FROM shawk.hosts)`)
+	if !slices.Equal(got, []string{"0 0 0"}) {
+		t.Errorf("edges, learned translations and hosts after the retention = %q", got)
 	}
 }
 

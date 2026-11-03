@@ -87,8 +87,8 @@ type Agent struct {
 	cgroupDrops uint64
 }
 
-// Run starts the agent and blocks until ctx is canceled.
-func Run(ctx context.Context, cfg Config) error {
+// withDefaults returns cfg with the defaults of the fields left unset.
+func (cfg Config) withDefaults() Config {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
@@ -98,6 +98,13 @@ func Run(ctx context.Context, cfg Config) error {
 	if cfg.IdleTTL <= 0 {
 		cfg.IdleTTL = 15 * time.Minute
 	}
+	return cfg
+}
+
+// Validate checks the settings of an agent, with the defaults of those left
+// unset, and of its exporter, without reading files or touching the host.
+func (cfg Config) Validate() error {
+	cfg = cfg.withDefaults()
 	if cfg.Interval > MaxInterval {
 		// The connector counts an agent alive, and an address held by two
 		// hosts at once, within windows of a few minutes.
@@ -105,6 +112,15 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	if cfg.IdleTTL < 2*time.Minute || cfg.IdleTTL < 4*cfg.Interval {
 		return fmt.Errorf("the idle TTL %s must be at least 2m and 4 intervals", cfg.IdleTTL)
+	}
+	return cfg.Exporter.Validate()
+}
+
+// Run starts the agent and blocks until ctx is canceled.
+func Run(ctx context.Context, cfg Config) error {
+	cfg = cfg.withDefaults()
+	if err := cfg.Validate(); err != nil {
+		return err
 	}
 	exp, err := otlp.NewExporter(cfg.Exporter)
 	if err != nil {

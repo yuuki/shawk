@@ -259,7 +259,7 @@ func TestPGPartialObservationsConcurrent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := writeHost(ctx, tx, sessionChanges("h1", base, m(-60), m(-2), 5, m(-60), 0), true); err != nil {
+	if err := writeHost(ctx, tx, sessionChanges("h1", base, m(-60), m(-2), 5, m(-60), 0)); err != nil {
 		t.Fatal(err)
 	}
 	done := make(chan error, 1)
@@ -325,10 +325,9 @@ func TestPGPartialObservationsConnector(t *testing.T) {
 	}
 }
 
-// TestPGAgentsFoldUpgrade: sessions written by a connector of the previous
-// version keep NULL in the new columns, and a later heartbeat that does not
-// tell what the agent folds keeps what was known.
-func TestPGAgentsFoldUpgrade(t *testing.T) {
+// TestPGAgentsFold: a session keeps what its agent folds as of its latest
+// heartbeat, and shawk_v1.agents tells it.
+func TestPGAgentsFold(t *testing.T) {
 	dsn, conn := migratedDB(t)
 	ctx := context.Background()
 	st, err := newPGStore(ctx, dsn)
@@ -337,13 +336,6 @@ func TestPGAgentsFoldUpgrade(t *testing.T) {
 	}
 	defer st.close()
 	now := time.Now().UTC().Truncate(time.Second)
-	// The upsert of the previous version.
-	execAll(t, conn, `INSERT INTO shawk.hosts VALUES ('h1','m','h1','k','v',now(),now())`,
-		`INSERT INTO shawk.agent_sessions AS s (host_id, started_at, last_heartbeat, udp_traced, netns_scope, dropped_flows, clock_skew)
-		 VALUES ('h1', now() - interval '1 hour', now() - interval '2 minutes', true, 'all', 0, '0')`)
-	if got := queryStrings(t, conn, `SELECT peer_fold IS NULL, peer_internal IS NULL FROM shawk_v1.agents`); !slices.Equal(got, []string{"true true"}) {
-		t.Errorf("agents = %q", got)
-	}
 	write := func(beat time.Time, s sessionRow) {
 		t.Helper()
 		h := newHostChanges("h1")
@@ -354,14 +346,23 @@ func TestPGAgentsFoldUpgrade(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	session := func() []string {
+		t.Helper()
+		return queryStrings(t, conn, `SELECT peer_fold, array_to_string(peer_internal, ',') FROM shawk.agent_sessions
+		  WHERE started_at = $1`, now.Add(-2*time.Hour))
+	}
 	internal := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8"), netip.MustParsePrefix("fc00::/7")}
 	write(now.Add(-time.Minute), sessionRow{peerFold: foldIn, peerInternal: internal})
-	write(now, sessionRow{})                                                          // does not tell
-	write(now.Add(-30*time.Second), sessionRow{peerFold: foldAll, peerInternal: nil}) // older
-	got := queryStrings(t, conn, `SELECT peer_fold, array_to_string(peer_internal, ',') FROM shawk.agent_sessions
-	  WHERE started_at = $1`, now.Add(-2*time.Hour))
-	if !slices.Equal(got, []string{"in 10.0.0.0/8,fc00::/7"}) {
+	write(now.Add(-90*time.Second), sessionRow{peerFold: foldAll}) // older
+	if got := session(); !slices.Equal(got, []string{"in 10.0.0.0/8,fc00::/7"}) {
 		t.Errorf("session = %q", got)
+	}
+	write(now, sessionRow{peerFold: foldNone})
+	if got := session(); !slices.Equal(got, []string{"none <nil>"}) {
+		t.Errorf("session after a newer heartbeat = %q", got)
+	}
+	if got := queryStrings(t, conn, `SELECT peer_fold, peer_internal IS NULL FROM shawk_v1.agents`); !slices.Equal(got, []string{"none true"}) {
+		t.Errorf("agents = %q", got)
 	}
 }
 
@@ -418,30 +419,4 @@ func TestPGPartialObservationsRuns(t *testing.T) {
 			t.Errorf("recorded %s dropped flows, want 7 (2 at start, then 5); periods = %q", got, periods(t, conn, base))
 		}
 	})
-}
-
-// TestPGPartialObservationsUpgrade: a session written by a connector of the
-// previous version has no start of the counters. A run that continues it
-// after an upgrade of the connector compares with it, rather than recording
-// every drop it counted since it started.
-func TestPGPartialObservationsUpgrade(t *testing.T) {
-	dsn, conn := migratedDB(t)
-	base := time.Now().UTC().Truncate(time.Minute)
-	_, write := partialStore(t, dsn, base)
-	execAll(t, conn, `INSERT INTO shawk.hosts VALUES ('h1', 'm', 'h1', 'k', 'v', now(), now())`)
-	if _, err := conn.Exec(context.Background(), `INSERT INTO shawk.agent_sessions
-	  (host_id, started_at, last_heartbeat, udp_traced, netns_scope, dropped_flows, clock_skew)
-	  VALUES ('h1', $1, $2, true, 'all', 100000, '0')`, base.Add(-48*time.Hour), base.Add(-3*time.Minute)); err != nil {
-		t.Fatal(err)
-	}
-	m := func(n int) time.Duration { return time.Duration(n) * time.Minute }
-	// The upgraded connector writes the same run under its floor.
-	write("h1", m(-4), m(-1), 100000, -48*time.Hour, 0)
-	if got := periods(t, conn, base); len(got) != 0 {
-		t.Errorf("periods after the upgrade = %q, want none", got)
-	}
-	write("h1", m(-4), m(0), 100005, -48*time.Hour, 0)
-	if got := periods(t, conn, base); !slices.Equal(got, []string{"h1 -4 -1 0 5"}) {
-		t.Errorf("periods = %q, want the 5 drops since the upgrade", got)
-	}
 }

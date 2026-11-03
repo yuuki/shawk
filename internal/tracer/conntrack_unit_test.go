@@ -1,8 +1,12 @@
 package tracer
 
 import (
+	"bytes"
 	"errors"
 	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -36,6 +40,32 @@ func TestConntrackBackoff(t *testing.T) {
 		if calls[i] != want[i] {
 			t.Fatalf("loads at %v, want %v", calls, want)
 		}
+	}
+}
+
+// TestConntrackLogs checks that the agent logs that nf_conntrack is not
+// loaded, and then once that the programs fail to load when it is, rather
+// than staying silent after the first message.
+func TestConntrackLogs(t *testing.T) {
+	defer func(m string, f func(*Tracer) error) { conntrackModule, loadConntrack = m, f }(conntrackModule, loadConntrack)
+	conntrackModule = filepath.Join(t.TempDir(), "nf_conntrack")
+	loadConntrack = func(*Tracer) error { return errors.New("perf_event_open: operation not permitted") }
+	var logs bytes.Buffer
+	tr := &Tracer{opts: Options{LearnTranslations: true}, conntrackSpec: &ebpf.CollectionSpec{},
+		log: slog.New(slog.NewTextHandler(&logs, nil))}
+	t0 := time.Unix(1e9, 0)
+	tr.tryConntrack(t0)
+	if err := os.Mkdir(conntrackModule, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 10 {
+		tr.tryConntrack(t0.Add(time.Duration(i+1) * time.Hour))
+	}
+	if n := strings.Count(logs.String(), "nf_conntrack is not loaded"); n != 1 {
+		t.Errorf("logged %d times that nf_conntrack is not loaded:\n%s", n, &logs)
+	}
+	if n := strings.Count(logs.String(), "operation not permitted"); n != 1 {
+		t.Errorf("logged %d times that the programs failed to load:\n%s", n, &logs)
 	}
 }
 

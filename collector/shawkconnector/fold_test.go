@@ -28,8 +28,7 @@ func webAgent(ts time.Time) tAgent {
 			{role: "server", proto: "tcp", local: "203.0.113.10", peer: "0.0.0.0", folded: true, port: 443, svc: "nginx", comm: "nginx", opened: 100},
 			{role: "server", proto: "tcp", local: "2001:db8::10", peer: "::", folded: true, port: 443, svc: "nginx", comm: "nginx", opened: 10},
 			{role: "client", proto: "tcp", local: "203.0.113.10", peer: "0.0.0.0", folded: true, port: 443, svc: "nginx", comm: "nginx", opened: 3},
-			// An agent of the previous version sends a peer 0.0.0.0 as an
-			// address.
+			// Without shawk.peer.folded, a peer 0.0.0.0 is an address.
 			{role: "server", proto: "tcp", local: "203.0.113.10", peer: "0.0.0.0", port: 8080, svc: "nginx", comm: "nginx", opened: 1},
 		}}
 }
@@ -62,14 +61,14 @@ func TestParseFoldedEdges(t *testing.T) {
 		t.Errorf("fold %q, internal %v", b.peerFold, b.peerInternal)
 	}
 
-	// An agent of the previous version folds nothing and does not tell its
+	// An agent that does not send shawk.peer.fold folds nothing, and has no
 	// internal ranges.
 	b, err = parseResource(tAgent{host: "old-01", time: t0, dropped: 3, droppedSince: t0.Add(-time.Hour)}.metrics().ResourceMetrics().At(0))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if b.peerFold != foldNone || b.peerInternal != nil {
-		t.Errorf("previous agent: fold %q, internal %v", b.peerFold, b.peerInternal)
+		t.Errorf("agent without fold: fold %q, internal %v", b.peerFold, b.peerInternal)
 	}
 	if b.dropped != 3 || !b.droppedSince.Equal(t0.Add(-time.Hour)) {
 		t.Errorf("dropped %d since %v", b.dropped, b.droppedSince)
