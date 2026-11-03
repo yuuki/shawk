@@ -161,6 +161,18 @@ __u64 storage_fails = 0;
 __u64 adopted_unowned = 0;
 /* Listening ports that did not fit in listen_ports or udp_listen_ports. */
 __u64 listen_port_drops = 0;
+/*
+ * Set by user space before each walk of iter/tcp that accounts traffic, so
+ * that iter/task_file can tell the TCP connections that the walk did not
+ * visit (see account_skipped()); zero during the walk at startup.
+ */
+volatile __u32 walk_gen = 0;
+/*
+ * TCP connections that a walk of iter/tcp did not visit and iter/task_file
+ * accounted or adopted instead. An increase makes user space walk the
+ * processes at every interval while the walks keep missing them.
+ */
+__u64 iter_skips = 0;
 
 /* Per-socket state attached to TCP sockets. */
 struct shawk_sock_state {
@@ -172,6 +184,8 @@ struct shawk_sock_state {
 	__u32 pid;
 	__u32 flags;
 	__u32 hs_us; /* duration of the handshake, with SS_HS_TIME */
+	__u32 walked; /* walk_gen of the last walk that visited the connection */
+	__u32 _pad;
 };
 
 struct {
@@ -1035,6 +1049,8 @@ static __always_inline void on_active_open(struct sock *sk)
 	ss->pid = tgid;
 	ss->flags = flags | (tgid == self_tgid ? SS_IGNORE : 0);
 	ss->hs_us = 0;
+	/* The next walk accounts it first (see account_skipped()). */
+	ss->walked = walk_gen;
 }
 
 /*
@@ -1091,6 +1107,7 @@ static __always_inline struct shawk_sock_state *on_passive_open(struct sock *sk)
 	}
 	ss->key = key;
 	established_base(ss, tp, false);
+	ss->walked = walk_gen;
 	ss->pid = 0;
 	ss->flags = SS_READY;
 	/* An additional MPTCP subflow is not another connection. */
@@ -1295,12 +1312,53 @@ static __always_inline void adopt_tcp(struct tcp_sock *tp, struct sock *sk,
 	if (!ss)
 		return;
 	ss->key = key;
-	/* Only traffic after the adoption is accounted. */
+	/* Only traffic after the adoption is accounted, from the next walk. */
 	reset_base(ss, sk, tp, state);
+	ss->walked = walk_gen;
 	ss->pid = pid;
 	ss->flags = flags;
 	if (!(flags & SS_READY))
 		__sync_fetch_and_add(&adopted_unowned, 1);
+}
+
+/*
+ * Accounts what a walk accounts for a TCP connection that is ready: the
+ * traffic since the last walk, that it is open, a sample of its RTT, and
+ * its connection if counting it failed when it was established. On kernels
+ * whose TCP iterator does not lock sockets (before 5.19), and for the
+ * connections that iter/task_file accounts, one that closes meanwhile may
+ * rarely have its last traffic counted twice.
+ */
+static __always_inline void account_walk(struct shawk_sock_state *ss,
+					 struct sock *sk, struct tcp_sock *tp,
+					 int state, __u64 msk)
+{
+	struct shawk_tcp_counters d;
+	struct shawk_flow_stats *fs;
+	__u32 srtt;
+
+	/*
+	 * Visited even if its flow does not fit, which iter/task_file would
+	 * not change (see account_skipped()).
+	 */
+	ss->walked = walk_gen;
+	fs = flow_get(&ss->key);
+	if (!fs)
+		return;
+	if (ss->flags & SS_RECOUNT)
+		count_conn(ss);
+	if (take_tcp_delta(ss, sk, tp, state, &d))
+		add_tcp_delta(fs, &d);
+	/* An MPTCP connection is open once, whatever its subflows. */
+	if (!msk || subflow_counts_open(sk, msk))
+		__sync_fetch_and_add(&fs->open_conns, 1);
+	srtt = BPF_CORE_READ(tp, srtt_us) >> 3;
+	if (srtt) {
+		__sync_fetch_and_add(&fs->rtt_sum_us, srtt);
+		__sync_fetch_and_add(&fs->rtt_samples, 1);
+	}
+	if (!fs->pid && ss->pid)
+		fs->pid = ss->pid;
 }
 
 /*
@@ -1313,12 +1371,10 @@ int shawk_iter_tcp(struct bpf_iter__tcp *ctx)
 	struct sock_common *skc = ctx->sk_common;
 	struct seq_file *seq = ctx->meta->seq;
 	struct shawk_sock_state *ss;
-	struct shawk_flow_stats *fs;
-	struct shawk_tcp_counters d;
 	struct tcp_sock *tp;
 	struct sock *sk;
 	__u16 family, lport;
-	__u32 netns, srtt;
+	__u32 netns;
 	bool join;
 	__u64 msk;
 	__u8 state;
@@ -1362,29 +1418,7 @@ int shawk_iter_tcp(struct bpf_iter__tcp *ctx)
 	msk = subflow_msk(sk, &join);
 	if (!resolve_subflow(ss, msk) || initial_scan)
 		return 0;
-
-	fs = flow_get(&ss->key);
-	if (!fs)
-		return 0;
-	/*
-	 * A connection whose count failed when it was established. On kernels
-	 * whose TCP iterator does not lock sockets (before 5.19), one that
-	 * closes during the walk may rarely be counted twice.
-	 */
-	if (ss->flags & SS_RECOUNT)
-		count_conn(ss);
-	if (take_tcp_delta(ss, sk, tp, state, &d))
-		add_tcp_delta(fs, &d);
-	/* An MPTCP connection is open once, whatever its subflows. */
-	if (!msk || subflow_counts_open(sk, msk))
-		__sync_fetch_and_add(&fs->open_conns, 1);
-	srtt = BPF_CORE_READ(tp, srtt_us) >> 3;
-	if (srtt) {
-		__sync_fetch_and_add(&fs->rtt_sum_us, srtt);
-		__sync_fetch_and_add(&fs->rtt_samples, 1);
-	}
-	if (!fs->pid && ss->pid)
-		fs->pid = ss->pid;
+	account_walk(ss, sk, tp, state, msk);
 	return 0;
 }
 
@@ -1734,6 +1768,66 @@ int BPF_PROG(shawk_cgroup_mkdir, struct cgroup *cgrp, const char *path)
 /* ------------------------------------------------------------- owners --- */
 
 /*
+ * The TCP iterator of Linux before 6.17 (fixed in the stable releases of
+ * 6.1, 6.6 and 6.12, but not in those of 5.15, nor in RHEL 9 and 10)
+ * skips sockets: tcp_seek_last_pos() leaves its offset at -1 when it runs
+ * out of listening sockets of the namespace before the last bucket of the
+ * listening hash, and then skips the established sockets of the first
+ * bucket of the established hash that holds any of the namespace, if its
+ * index is that of the last listening bucket holding one plus one. The
+ * buckets of a socket do not change, so every walk skips those sockets as
+ * long as the listeners of the namespace stay: a connection that predates
+ * the tracer would never be adopted, and the others would be counted as
+ * open, and have their traffic and RTT accounted, at no walk.
+ *
+ * iter/task_file stands in for the walk for the connections that a process
+ * holds. The connections the kernel holds, the subflows of MPTCP and the
+ * children not yet accepted have no file: they are left to the walk.
+ */
+
+/*
+ * Adopts a connection that a process holds and that the walks did not
+ * adopt, as the walk would. Returns its storage, which waits for its owner
+ * unless it was accepted by a listener.
+ */
+static __always_inline struct shawk_sock_state *
+adopt_skipped(struct sock *sk, __u32 netns, __u16 port, __u8 state)
+{
+	struct tcp_sock *tp;
+
+	/* As the walk: time-wait and request sockets are not full sockets. */
+	if (state == TCP_SYN_SENT || state == TCP_SYN_RECV || state == TCP_CLOSE)
+		return NULL;
+	tp = bpf_skc_to_tcp_sock(sk);
+	if (!tp)
+		return NULL;
+	adopt_tcp(tp, sk, netns, port, state);
+	__sync_fetch_and_add(&iter_skips, 1);
+	return bpf_sk_storage_get(&sock_states, tp, NULL, 0);
+}
+
+/*
+ * Accounts a ready connection that the last walk did not visit, as the walk
+ * would. A connection opened or adopted since the walk started carries
+ * walk_gen already, and the walk at startup accounts nothing.
+ */
+static __always_inline void account_skipped(struct shawk_sock_state *ss,
+					    struct sock *sk, __u8 state)
+{
+	struct tcp_sock *tp;
+
+	if (!walk_gen || ss->walked == walk_gen || (ss->flags & SS_IGNORE))
+		return;
+	if (state == TCP_SYN_SENT || state == TCP_SYN_RECV || state == TCP_CLOSE)
+		return;
+	tp = bpf_skc_to_tcp_sock(sk);
+	if (!tp)
+		return;
+	account_walk(ss, sk, tp, state, 0);
+	__sync_fetch_and_add(&iter_skips, 1);
+}
+
+/*
  * Walks the file descriptors of all processes to find the owners of
  * adopted outgoing TCP connections, of MPTCP connections and of listening
  * sockets.
@@ -1785,8 +1879,14 @@ int shawk_iter_task_file(struct bpf_iter__task_file *ctx)
 		if (state == TCP_LISTEN)
 			break;
 		ss = bpf_sk_storage_get(&sock_states, sk, NULL, 0);
-		if (!ss || (ss->flags & SS_READY))
+		if (!ss) {
+			ss = adopt_skipped(sk, netns, port, state);
+			if (!ss)
+				return 0;
+		} else if (ss->flags & SS_READY) {
+			account_skipped(ss, sk, state);
 			return 0;
+		}
 		BPF_CORE_READ_STR_INTO(&rec.comm, task, group_leader, comm);
 		__builtin_memcpy(ss->key.comm, rec.comm, sizeof(rec.comm));
 		ss->key.cgroup_id = task_cgroup_id(task);

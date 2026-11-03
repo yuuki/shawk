@@ -119,7 +119,32 @@ Pingmesh, taken passively on the connections that hosts open anyway
 | SYN_RECV→* | **passive open**; counts an incoming connection. It usually goes to ESTABLISHED; a child created by a TCP Fast Open SYN, which carries data and is accepted at once, may also be closed or reset before the handshake completes. Other children that leave SYN_RECV for CLOSE failed to be created (e.g. without a route to the client) and are not counted. On a socket that went through SYN_SENT it ends a simultaneous open instead, e.g. of a socket connected to itself, which stays outgoing. |
 | *→CLOSE | account the remaining bytes of the connection, if any |
 | `iter/tcp` (every interval) | account byte deltas of long-lived connections, sample RTT, count open connections, list listening sockets, **adopt** connections established before the agent started |
-| `iter/task_file` | find the owners of adopted connections, of MPTCP connections and of listening sockets |
+| `iter/task_file` | find the owners of adopted connections, of MPTCP connections and of listening sockets; stand in for `iter/tcp` for the connections its walk skipped (below) |
+
+**Connections the TCP iterator skips.** Before Linux 6.17, the TCP
+iterator skips sockets. The fix was backported to the stable releases of
+6.1, 6.6 and 6.12, but not to those of 5.15, nor to RHEL 9 and 10.
+`tcp_seek_last_pos()` leaves its offset at -1 when the listening sockets of
+the namespace run out before the last bucket of the listening hash. It then
+skips the established sockets of the first bucket of the established hash
+that holds any of the namespace, when that bucket's index is the index of
+the last listening bucket that holds one, plus one. The buckets of a socket
+do not change, so every walk skips them for as long as the listeners of
+the namespace stay. A connection that predates the agent would then never
+be adopted, and no walk would count the others as open or account their
+traffic and RTT. Whether a namespace hits it depends on the hashes of its
+sockets, which change with its addresses and ports.
+
+Every walk therefore has a generation, which the connections it accounts
+record, as do those opened or adopted while it runs. `iter/task_file`
+adopts a connection that a process holds and that has no state yet. It
+also accounts, as the walk would, a ready connection that the latest walk
+did not account. Once an owner scan finds such connections, the agent
+walks the processes at every interval, until a scan finds none (the agent
+warns). Connections of the kernel, MPTCP subflows and children not yet
+accepted have no file and stay skipped. Like walks on kernels before 5.19,
+`iter/task_file` does not lock the socket, so the last traffic of a skipped
+connection that closes during the scan may rarely be counted twice.
 
 A socket iterator walks only the network namespace of the thread that opens
 it, so the agent opens the TCP and UDP iterators inside every network
@@ -1340,6 +1365,12 @@ parses. shawk runs beside it instead:
   addresses internally must list them in `-internal-peers`, or the two
   sides of the connections between its hosts do not match; the connector
   warns about it, except when both agents fold the other side.
+- **Connections the TCP iterator skips** on kernels before 6.17 without its
+  backport (5.15, RHEL 9 and 10; §3.2) are found only by an owner scan:
+  every minute, or sooner when connections are adopted or listeners
+  change. Until then, they are not counted as open, and their traffic is
+  accounted when they close or are found. Connections of the kernel, MPTCP
+  subflows and children not yet accepted are not found.
 - **Handshakes** are measured on the connections that are opened only: a
   path without new connections, such as one of connection pools, is not,
   which active probing would add. A SYN counts as lost when it was

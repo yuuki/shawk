@@ -126,7 +126,16 @@ type Tracer struct {
 	selfTgid       *ebpf.Variable
 	ownerScan      *ebpf.Variable
 	ownerScans     uint32
-	internalPeers  *ebpf.Map
+	walkGen        *ebpf.Variable
+	walks          uint32
+	iterSkips      *ebpf.Variable
+	// lastSkips is iter_skips after the last owner scan, and skipping tells
+	// that the scan found connections that the walk had missed (see
+	// account_skipped() of the BPF programs): the processes are then walked
+	// at every interval, until a scan finds none.
+	lastSkips     uint64
+	skipping      bool
+	internalPeers *ebpf.Map
 	// configuredPeers are the keys of internalPeers from the options, and
 	// localPeers those of the addresses of the host (SetLocalAddrs).
 	configuredPeers map[bpfShawkPeerPrefix]bool
@@ -343,6 +352,8 @@ func (t *Tracer) loadCore(spec *ebpf.CollectionSpec) error {
 	t.adopted = coll.Variables[bpfVarAdoptedUnowned]
 	t.selfTgid = coll.Variables[bpfVarSelfTgid]
 	t.ownerScan = coll.Variables[bpfVarOwnerScan]
+	t.walkGen = coll.Variables[bpfVarWalkGen]
+	t.iterSkips = coll.Variables[bpfVarIterSkips]
 	t.internalPeers = coll.Maps[bpfMapInternalPeers]
 	// The ranges are in place before the programs see the first flow.
 	t.configuredPeers = map[bpfShawkPeerPrefix]bool{}
@@ -573,7 +584,12 @@ func (t *Tracer) Collect() (*Snapshot, error) {
 	defer t.mu.Unlock()
 
 	// Walking sockets accounts the traffic of long-lived connections into the
-	// current interval and refreshes the listening ports.
+	// current interval and refreshes the listening ports. Each walk has a
+	// generation of its own, which the connections it accounts record.
+	t.walks++
+	if err := t.walkGen.Set(t.walks); err != nil {
+		return nil, err
+	}
 	listeners, inos, err := t.scanSockets()
 	if err != nil {
 		return nil, err
@@ -585,7 +601,8 @@ func (t *Tracer) Collect() (*Snapshot, error) {
 	if err := t.adopted.Get(&adopted); err != nil {
 		return nil, err
 	}
-	if adopted != t.lastAdopted || t.ownerMissing || time.Since(t.lastOwnScan) >= t.opts.OwnerScanInterval ||
+	t.warnOnIncrease(t.iterSkips, "the TCP iterator of the kernel skipped some connections, which the walk of the processes accounts at every interval instead; Linux 6.17 fixes the iterator")
+	if adopted != t.lastAdopted || t.ownerMissing || t.skipping || time.Since(t.lastOwnScan) >= t.opts.OwnerScanInterval ||
 		t.hasNewListener(listeners, inos) {
 		if err := t.refreshOwners(listeners, inos); err != nil {
 			return nil, err
@@ -977,6 +994,12 @@ func (t *Tracer) refreshOwners(listeners []Listener, inos []uint64) error {
 	if err := t.scanOwners(); err != nil {
 		return err
 	}
+	var skips uint64
+	if err := t.iterSkips.Get(&skips); err != nil {
+		return err
+	}
+	t.skipping = skips != t.lastSkips
+	t.lastSkips = skips
 	t.ownerless = map[sockAddrKey]bool{}
 	t.kernel = map[sockAddrKey]bool{}
 	for i := range listeners {

@@ -98,6 +98,8 @@ type bpfShawkSockState struct {
 	Pid         uint32
 	Flags       uint32
 	HsUs        uint32
+	Walked      uint32
+	Pad         uint32
 }
 
 type bpfShawkUdpState struct {
@@ -166,6 +168,7 @@ const (
 	bpfVarFlowDrops              = "flow_drops"
 	bpfVarFoldMode               = "fold_mode"
 	bpfVarInitialScan            = "initial_scan"
+	bpfVarIterSkips              = "iter_skips"
 	bpfVarLearnSelf              = "learn_self"
 	bpfVarListenPortDrops        = "listen_port_drops"
 	bpfVarOwnerScan              = "owner_scan"
@@ -177,6 +180,7 @@ const (
 	bpfVarUnusedXlatConn         = "unused_xlat_conn"
 	bpfVarUnusedXlatKey          = "unused_xlat_key"
 	bpfVarUnusedXlatStats        = "unused_xlat_stats"
+	bpfVarWalkGen                = "walk_gen"
 	bpfVarXlatDrops              = "xlat_drops"
 )
 
@@ -265,6 +269,7 @@ type bpfVariableSpecs struct {
 	FlowDrops         *ebpf.VariableSpec `ebpf:"flow_drops"`
 	FoldMode          *ebpf.VariableSpec `ebpf:"fold_mode"`
 	InitialScan       *ebpf.VariableSpec `ebpf:"initial_scan"`
+	IterSkips         *ebpf.VariableSpec `ebpf:"iter_skips"`
 	LearnSelf         *ebpf.VariableSpec `ebpf:"learn_self"`
 	ListenPortDrops   *ebpf.VariableSpec `ebpf:"listen_port_drops"`
 	OwnerScan         *ebpf.VariableSpec `ebpf:"owner_scan"`
@@ -276,6 +281,7 @@ type bpfVariableSpecs struct {
 	UnusedXlatConn    *ebpf.VariableSpec `ebpf:"unused_xlat_conn"`
 	UnusedXlatKey     *ebpf.VariableSpec `ebpf:"unused_xlat_key"`
 	UnusedXlatStats   *ebpf.VariableSpec `ebpf:"unused_xlat_stats"`
+	WalkGen           *ebpf.VariableSpec `ebpf:"walk_gen"`
 	XlatDrops         *ebpf.VariableSpec `ebpf:"xlat_drops"`
 }
 
@@ -343,6 +349,7 @@ type bpfVariables struct {
 	FlowDrops         *ebpf.Variable `ebpf:"flow_drops"`
 	FoldMode          *ebpf.Variable `ebpf:"fold_mode"`
 	InitialScan       *ebpf.Variable `ebpf:"initial_scan"`
+	IterSkips         *ebpf.Variable `ebpf:"iter_skips"`
 	LearnSelf         *ebpf.Variable `ebpf:"learn_self"`
 	ListenPortDrops   *ebpf.Variable `ebpf:"listen_port_drops"`
 	OwnerScan         *ebpf.Variable `ebpf:"owner_scan"`
@@ -354,6 +361,7 @@ type bpfVariables struct {
 	UnusedXlatConn    *ebpf.Variable `ebpf:"unused_xlat_conn"`
 	UnusedXlatKey     *ebpf.Variable `ebpf:"unused_xlat_key"`
 	UnusedXlatStats   *ebpf.Variable `ebpf:"unused_xlat_stats"`
+	WalkGen           *ebpf.Variable `ebpf:"walk_gen"`
 	XlatDrops         *ebpf.Variable `ebpf:"xlat_drops"`
 }
 
