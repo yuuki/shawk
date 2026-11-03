@@ -557,7 +557,7 @@ func TestRejectedRowsAreDropped(t *testing.T) {
 
 // TestDataErrorForgetsAcceptedSpans: after changes are dropped, the edges
 // the agent still sends are written again, and the next session of the
-// host starts after the loss.
+// host starts after the dropped one, so that it does not cover the loss.
 func TestDataErrorForgetsAcceptedSpans(t *testing.T) {
 	c, st, sink, now := testConnector(t, nil)
 	edge := tEdge{role: "client", proto: "tcp", local: "10.0.0.11", peer: "10.0.0.10", port: 5432,

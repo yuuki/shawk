@@ -92,8 +92,9 @@ func TestBaselineWithClockSkew(t *testing.T) {
 }
 
 // TestClockStepBack: after the clock of an agent steps back, its host keeps
-// emitting its increments, and inputs that expire meanwhile are not counted
-// again in full.
+// emitting outputs: the first point after the step is a baseline, the
+// increments after it are counted, and inputs that expire meanwhile are not
+// counted again in full.
 func TestClockStepBack(t *testing.T) {
 	c, _, sink, now := testConnector(t, nil)
 	ahead := 9 * time.Hour
@@ -130,8 +131,9 @@ func TestClockStepBack(t *testing.T) {
 }
 
 // TestHostMovesToAnotherConnector: a connector that runs for longer than the
-// series of a host routed to it takes their values as a baseline rather than
-// counting them as new.
+// series of a host routed to it takes the values of series that started
+// before the host reached it as a baseline rather than counting them as new;
+// a series that started in the last interval is counted in full.
 func TestHostMovesToAnotherConnector(t *testing.T) {
 	c, _, sink, now := testConnector(t, nil) // started an hour before t0
 	*now = t0.Add(30 * time.Minute)

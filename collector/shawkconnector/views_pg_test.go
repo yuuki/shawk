@@ -7,8 +7,9 @@ import (
 )
 
 // TestPGUnobservedClockAhead: with an agent clock ahead of the connector, a
-// young session whose start is after its heartbeat by the clock of the
-// connector does not make unobserved() fail.
+// young session whose start, by the clock of the agent, is after its
+// heartbeat, by the clock of the connector, is converted with the clock
+// skew: the host was not observed until the session started.
 func TestPGUnobservedClockAhead(t *testing.T) {
 	_, conn := migratedDB(t)
 	execAll(t, conn,
@@ -80,7 +81,7 @@ func TestPGAgentAddrsCoverage(t *testing.T) {
 }
 
 // TestPGReturningDependencyIsNotNew: a dependency idle for a while that comes
-// back on new edges, e.g. from a new container, did not appear.
+// back on new edges, e.g. from a new container, is not reported as appeared.
 func TestPGReturningDependencyIsNotNew(t *testing.T) {
 	_, conn := migratedDB(t)
 	f := fixture{t, conn}
