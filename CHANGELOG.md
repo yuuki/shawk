@@ -173,6 +173,14 @@ changes; see below.
   size of a request, which the collector refused, and the rest of every
   interval was not sent. They are cut to 255 bytes, and a series too
   large for a request is left out and logged.
+* **A user can no longer name their processes after another container.**
+  A user to whom systemd delegates cgroups (`user@1000.service`) could
+  make one named after a container of the host, and the agent named the
+  user's flows after that container, its pod and its service. Only the
+  outermost container of a cgroup, outside any unit, is named after the
+  state of the runtimes of the host; a container in a unit is named by id
+  after the unit (`user@1000.service/podman-0123456789ab` for a rootless
+  container, `podman-0123456789ab` before).
 
 ### Fixed
 

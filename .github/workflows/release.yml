@@ -4,32 +4,81 @@ on:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
 
-permissions:
-  contents: write
-  packages: write  # the image of the collector on ghcr.io
+# Each job gets only what it needs: the tests, which run scripts with sudo
+# and fetch tools, can only read the repository.
+permissions: {}
 
+# Actions are pinned by commit, so that moving a tag cannot change what runs
+# with the token that publishes the release.
 jobs:
   test:
     uses: ./.github/workflows/test.yml
+    permissions:
+      contents: read
   goreleaser:
     needs: test
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write      # the release and its assets
+      packages: write      # the image of the collector on ghcr.io, and its attestation
+      id-token: write      # the certificate that signs the attestations
+      attestations: write  # the attestations of build provenance
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
-      - uses: actions/setup-go@v6
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+          # The release is built from modules checked against go.sum, not
+          # from a cache that other runs write.
+          cache: false
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: goreleaser/goreleaser-action@v7
+      - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
         with:
-          version: "~> v2"
+          version: v2.19.0
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # The subjects of the attestations, from what goreleaser published: its
+      # checksums file, which lists the archives and packages of the release,
+      # and the image of the collector, by the digest of its index.
+      - name: Find the published artifacts
+        id: subjects
+        run: |
+          set -euo pipefail
+          checksums=$(jq -r '.[] | select(.type == "Checksum") | .path' dist/artifacts.json)
+          if [[ ! -f $checksums ]]; then
+            echo "::error::not one checksums file in dist/artifacts.json: $checksums"
+            exit 1
+          fi
+          image=$(jq -r '[.[] | select(.type == "Docker Image") | "\(.name | sub(":[^:/]+$"; ""))@\(.extra.Digest)"] | unique | .[]' dist/artifacts.json)
+          if [[ ! $image =~ ^([^@[:space:]]+)@(sha256:[0-9a-f]{64})$ ]]; then
+            echo "::error::not one image in dist/artifacts.json: $image"
+            exit 1
+          fi
+          {
+            echo "checksums=$checksums"
+            echo "image=${BASH_REMATCH[1]}"
+            echo "digest=${BASH_REMATCH[2]}"
+          } >> "$GITHUB_OUTPUT"
+      # Verify with: gh attestation verify FILE --repo yuuki/shawk
+      - name: Attest the provenance of the archives and packages
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: ${{ steps.subjects.outputs.checksums }}
+      # Verify with: gh attestation verify oci://ghcr.io/yuuki/shawk-collector:VERSION --repo yuuki/shawk
+      - name: Attest the provenance of the image
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.subjects.outputs.image }}
+          subject-digest: ${{ steps.subjects.outputs.digest }}
+          push-to-registry: true
+          # Storage records are only for repositories of organizations.
+          create-storage-record: false
