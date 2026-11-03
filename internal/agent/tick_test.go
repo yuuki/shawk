@@ -35,6 +35,7 @@ func (f *fakeSource) Collect() (*tracer.Snapshot, error) {
 }
 
 func (f *fakeSource) UDPEnabled() bool                            { return true }
+func (f *fakeSource) TranslationsTraced() bool                    { return true }
 func (f *fakeSource) ProgramStats() ([]tracer.ProgramStat, error) { return nil, nil }
 
 // fakeExporter records the requests and fails the next fail ones.

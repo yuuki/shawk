@@ -195,8 +195,13 @@ connectors:
   of its host to a published port of another host) is matched for neither
   hop, since the client edge and the server edge share no address with the
   same row. Chaining rows is left for later.
-- Not covered: IPVS without `conntrack=1` (§9, 5), docker-proxy (phase 3),
-  proxies and load balancers that terminate the connection (phase 1).
+- Not covered: IPVS without `conntrack=1` (§9, 5), datapaths without
+  netfilter conntrack (the kube-proxy replacement of Cilium, eBPF load
+  balancers), docker-proxy (phase 3), proxies and load balancers that
+  terminate the connection (phase 1).
+- Transparent proxies that REDIRECT to themselves (the sidecars of Istio
+  and Linkerd) are learned like any translation: the client depends on the
+  proxy, one hop (§9, 8).
 
 #### 3.5.2 Kernel
 
@@ -212,8 +217,11 @@ connection that conntrack tracks, whatever made the translation:
   has only since 6.0 (not in RHEL 9); the functions run once per
   connection, not per packet, so the cost of a kprobe (about 100 ns on
   x86_64) is small next to that of creating the entry. One program serves
-  every kernel. The arguments are read with CO-RE through the BTF of the
-  module, which cilium/ebpf searches when the types are not in vmlinux.
+  every kernel. The object is shared by x86_64 and arm64, so the register
+  of the first argument is found by CO-RE (`di` or `regs[0]` of
+  `struct pt_regs`). The fields of `struct nf_conn` are read with CO-RE;
+  cilium/ebpf relocates against the BTF of vmlinux and of every loaded
+  module, whatever the attach target.
 - **What is a translation.** At confirmation the entry holds the original
   tuple (client C:c → virtual V:Pv) and the reply tuple (backend B:Pb →
   source S:s). It is a translation if V ≠ B or Pv ≠ Pb (DNAT, REDIRECT,
@@ -226,18 +234,37 @@ connection that conntrack tracks, whatever made the translation:
   and the protocol. The ports of the client (c) and of the source (s) are
   ephemeral and dropped, as in flows. IPv4 addresses are IPv4-mapped.
 - **Maps:**
-  - `xlats` (hash, key → `{conns, live}`, capacity `-max-flows`):
-    `conns` counts the confirmed entries since the key was added, `live`
-    the entries alive now that the programs saw confirmed.
-  - `xlat_conns` (hash, the address of the entry → 1, capacity four times
-    `-max-flows`, preallocated, as tracing programs before 6.1 require):
-    the entries counted in `live`. The confirm program inserts the entry
-    and increments `live`; the destroy program deletes it and, if it was
-    there, recomputes the key from the tuples, which do not change after
-    confirmation, and decrements `live`. An entry that does not fit is
-    counted in `conns` but not in `live`, and in `xlat_drops`.
+  - `xlats` (hash, key → `{conns, live, gen}`, capacity `-max-flows`):
+    `conns` counts the entries confirmed since the key was added, `live`
+    the entries alive now that the programs saw confirmed, and `gen` is
+    the time the key was added, which tells it from a former key deleted by
+    user space.
+  - `xlat_conns` (hash, the address of the entry → `{key, gen}`, capacity
+    four times `-max-flows`, preallocated, as tracing programs before 6.1
+    require; about 140 bytes a slot, 9 MiB at the default): the entries
+    counted in `live`. The confirm program inserts the entry, with the key
+    and its generation, and increments `conns` and `live`; the destroy
+    program deletes it and decrements `live` of its key if the key still
+    has that generation. An entry that does not fit is counted in `conns`
+    but not in `live`, and in `xlat_drops`.
   - The maps are not flipped like flows: `live` must persist across
     intervals.
+- **Missed probes.** A kprobe is skipped while another BPF program, or a
+  map update by a system call (`bpf_disable_instrumentation`), runs on the
+  CPU, e.g. when a softirq frees an entry during an update of the agent.
+  - A missed confirmation: the connection is not learned (its key is
+    learned with the next one).
+  - A missed destroy leaves the entry in `xlat_conns`. conntrack reuses the
+    memory of entries (`SLAB_TYPESAFE_BY_RCU`), so the address is soon
+    confirmed again: the confirm program then finds the stale entry,
+    decrements the key it holds and replaces it. Until then that key looks
+    live.
+  - The same entry confirmed twice (an unconfirmed entry shared by clones
+    of a packet, a bridged broadcast) has the same key and generation, and
+    is counted once, in `conns` too.
+  - The losers of a race at confirmation (parallel DNS queries with the
+    same tuple) are confirmed, counted, and destroyed at once; they count
+    in `conns`, which only tells that the key is in use.
 - **Why `live`.** A connection is confirmed once. A client that keeps a
   pool of long-lived connections to a virtual address opens no new ones,
   and a translation seen only at confirmation would end minutes after the
@@ -250,12 +277,15 @@ connection that conntrack tracks, whatever made the translation:
   still bounded by the edges.
 - **Filters**, in the confirm program: the network namespace of
   `-netns`; with folding (`-fold-external` `in` or `all`, §3.6 of the
-  design), a translation whose source is outside the internal ranges is
-  dropped, since the server sees the source as its peer and folds it, so
-  that the edges have no address to match; with `all`, also one whose
-  virtual address is outside them, which the client folds. This keeps the
-  clients of the Internet out of the table of an internet-facing host
-  that publishes a port.
+  design), a translation whose source, client or backend is outside the
+  internal ranges (which hold the addresses of the host) is dropped: the
+  server sees the source as its peer and folds it, and a client or a server
+  outside the ranges is taken to run no agent, so that no edge would match;
+  with `all`, also one whose virtual address is outside them, which the
+  client folds. This keeps out of the table the clients of the Internet of
+  a published port or a NodePort (whose source is the address of the
+  node when kube-proxy masquerades), and the destinations on the Internet
+  of a masquerade.
 - **Attaching.** nf_conntrack is a module on most distributions, loaded
   when a rule needs it, which may be after the agent starts (Docker, a
   first `iptables -t nat`). The programs are a collection of their own,
@@ -266,21 +296,25 @@ connection that conntrack tracks, whatever made the translation:
   re-armed; the agent must then be restarted (documented, rare: a module
   in use by NAT rules cannot be unloaded).
 - **Capabilities.** kprobes need `CAP_PERFMON` and `CAP_BPF`, which the
-  unit already grants; reading the table of conntrack over netlink would
-  need `CAP_NET_ADMIN` in every namespace.
+  unit already grants, and the system call `perf_event_open`, which the
+  seccomp filter of the unit must allow (`SystemCallFilter`; it is not in
+  `@system-service`). `test/packaging/agent-unit.sh` checks that the
+  agent learns translations under the unit. Reading the table of conntrack
+  over netlink would need `CAP_NET_ADMIN` in every namespace.
 - **Not seen:** entries confirmed before the agent started, until their
-  client opens a new connection; a missed destroy (none is known) would
-  keep a translation live until the agent restarts.
+  client opens a new connection.
 
 #### 3.5.3 Tracer and agent
 
 - `tracer.Options.LearnTranslations` loads the programs. `Collect` reads
-  `xlats` after the flows: a key is active in the interval if `conns`
-  changed since the last read or `live > 0`. A key neither for a whole
-  interval is deleted from the map, and from the last values the tracer
-  keeps. A confirmation between the read and the delete of an idle key
-  is lost (the window is the duration of one syscall, on a key idle for an
-  interval), so that connection is not learned.
+  `xlats` after the flows: a key is active in the interval if it is new,
+  has another generation, `conns` changed since the last read, or
+  `live > 0`. A key neither for a whole interval is deleted from the map,
+  and from the last values the tracer keeps. A confirmation between the
+  read of an idle key and its delete (the walk of the map and the deletes
+  after it) is lost with the key: that connection is not learned, nor
+  kept live, and if the key is added again its other generation keeps the
+  destroy of that entry from decrementing the new count.
 - `Snapshot.Translations` holds the active keys (`Translation`: transport,
   netns, client, virtual and its port, source, backend and its port);
   `Snapshot.TranslationDrops` the cumulative `xlat_drops`.
@@ -299,7 +333,10 @@ connection that conntrack tracks, whatever made the translation:
   before the edges in the requests of an interval, so that the connector
   knows the translations of a host before it names the edges of the same
   host (kube-proxy translates on the host of the client). They count
-  towards `-max-series-per-request`.
+  towards `-max-series-per-request`. Through a batch processor of the
+  collector, or for translations of another host, the order is not kept:
+  a client edge may then be named without its translation for an
+  interval.
 - Of the agent: `shawk.agent.translations.traced` (0 or 1) and
   `shawk.agent.translations.dropped` (cumulative), forwarded to Prometheus
   with the other metrics of the agent.
@@ -355,9 +392,11 @@ connection that conntrack tracks, whatever made the translation:
      rows covers (the least first and the greatest last seen), so that a
      former backend ends with its rows, as with static translations it
      ends with its edges (§3.2, 4).
-  4. A client edge to a virtual address of a static translation is matched
-     through the static translation only: the configuration, written by
-     an operator, comes first.
+  4. A client edge whose server address and port are a virtual address of
+     a static translation (with that port, or without a port) is matched
+     through the static translation only: the configuration, written by an
+     operator, comes first. A static 10.0.100.1:5432 leaves a learned
+     translation of 10.0.100.1:80 alone.
   5. As with static translations: a match by address takes precedence
      over its periods (§3.2, 3); edges keep rows of their own for the
      parts their matched rows leave (§3.2, 6); a server edge from a source
@@ -366,51 +405,69 @@ connection that conntrack tracks, whatever made the translation:
      the agent started); observations are NULL on the side whose edge
      outlives the row (§3.2, 7).
   6. `virtual_addr` and `virtual_port` are those of the client edge, and
-     `translation` is `~learned` (a name of the configuration cannot start
-     with `~`).
+     `translation` is `~learned`. The connector rejects names of the
+     configuration that start with `~`, which phase 1 accepted (§3.5.8).
 - **Contract:** the result of `dependencies_between` keeps its columns, so
   the function is replaced in place (`CREATE OR REPLACE`), and so is the
   view; the functions and views on them follow unchanged.
 - **Names of peers** (Prometheus), besides §3.3; the resolver keeps the
   learned translations this connector saw in the idle TTL, and those that
-  PostgreSQL has with `last_seen` in the idle TTL, read with the endpoints:
+  PostgreSQL has with `last_seen` in the idle TTL, read with the endpoints.
+  Static translations come first, as in PostgreSQL: learned rows are used
+  only for an edge that no static translation names or marks as behind a
+  relay.
   1. A client edge whose virtual address has no static translation and
      matches learned rows in the scope of rule 1 is named after the best
      service at their backends (§3.3), with the port of the backend and
-     `shawk.peer.agent` of its host; as with static translations, only a
-     service observed recently on a socket at the virtual address comes
-     first. If the source is the client (DNAT) and the agent of the
-     backend folds the address of the client, the warning of §3.3 applies.
+     `shawk.peer.agent` of its host. A backend at a loopback or a shared
+     address (a container bridge) is looked up on the host of the row only
+     (and for loopback, the endpoint must be on that host): another host
+     has a container at the same address. As with static translations, only
+     a service observed recently on a socket at the virtual address comes
+     first. If the source is the client (DNAT) and the agent of the backend
+     folds the address of the client, the warning of §3.3 applies.
   2. A server edge whose client is not found by address and that matches
-     learned rows in the scope of rule 2 is named after the best client
-     service whose client edge has the client, virtual address and port of
-     a row. If the source is the client (DNAT), the edge counts as a
-     translation without sources does (`shawk.peer.agent` of the client).
-     If the source is another address (SNAT), only the name changes:
-     `shawk.peer.agent` stays that of the host that holds the source. That
-     host translated the connections, and its agent sees the clients on
-     it, which count them; unlike a relay of a static translation, whose
-     host records none of them (§3.3), this keeps the counts of §7 for the
-     common case of containers that leave with the address of their host.
+     learned rows with the source equal to the client (DNAT) in the scope
+     of rule 2 is named after the best client service whose client edge has
+     the client, virtual address and port of a row, and counts as a
+     translation without sources does (`shawk.peer.agent` of the client). A
+     client at a loopback or shared address is looked up on the host of the
+     row only.
+  3. A server edge behind a learned SNAT (the source is another address
+     than the client) keeps its name and `shawk.peer.agent` as before phase
+     2: it bundles every client the source forwards or masquerades, so a
+     name after one of them would move between them and attribute the
+     others to it. Its host translated the connections, and its agent sees
+     the clients on it, which count them; unlike a relay of a static
+     translation, whose host records none of them (§3.3), this keeps the
+     counts of §7 for the common case of containers that leave with the
+     address of their host.
 
 #### 3.5.6 Counting (§7 of the design)
 
 - DNAT: as §3.4.
-- SNAT learned on the host of the clients (masquerade of containers): the
-  clients count; the server side does not (`shawk_peer_agent="true"`, as
-  before phase 2). SNAT of clients forwarded by a host (a NodePort of
-  kube-proxy for clients of other hosts): as before phase 2, the server
-  side has `shawk_peer_agent` of the host that translated them, and
-  clients without an agent are counted on neither side; they keep their
-  rows in PostgreSQL (rule 5).
+- SNAT learned (names 3): as before phase 2. The server edge has
+  `shawk_peer_agent` of the host of the source, which translated the
+  connections: true if it runs an agent. Containers on that host that leave
+  with its address are counted by their client edges. Clients that it
+  forwards from other hosts (a NodePort of kube-proxy with
+  `externalTrafficPolicy: Cluster`) and that run no agent are counted on
+  neither side, as before; they keep their rows in PostgreSQL (rule 5).
+  Learned rows would tell them apart, which is left for later.
+- A relay of a static translation with sources keeps §3.4, even if its host
+  also learns the translations (names, static first).
 
 #### 3.5.7 Performance
 
 - **Kernel:** two kprobes per connection tracked by conntrack, not per
   packet; one hash lookup and update per confirmation of a translated
   entry, one failed delete per destroyed entry that was not translated.
-  `xlat_conns` takes about 64 bytes per slot (4 MiB at the default 65,536
-  slots), allocated only on hosts where nf_conntrack is loaded.
+  `xlat_conns` takes about 140 bytes per slot (9 MiB at the default 65,536
+  slots), allocated only on hosts where nf_conntrack is loaded. A host that
+  keeps more live translated entries (`nf_conntrack_count`) needs a larger
+  `-max-flows`; the entries that do not fit count at their confirmation
+  only, so a translation used only by long-lived connections that do not
+  fit may end early.
 - **Agent:** one walk of `xlats` (at most `-max-flows` keys) per interval.
 - **PostgreSQL:** learned rows are joined with the client and the server
   edges by hash; without learned rows the views take the time of migration
@@ -422,6 +479,10 @@ connection that conntrack tracks, whatever made the translation:
 - Migration 13 adds the table and replaces `dependencies_between`,
   `dependencies` and `shawk.prune` in place; `grants.sql` need not be run
   again (the views keep their owners and grants).
+- The unit of the agent allows `perf_event_open`; a unit copied from an
+  older package learns no translations and logs why.
+- A configuration with a translation whose name starts with `~` is
+  rejected.
 - Any order of upgrades: an agent of the previous version sends no
   translations; a connector of the previous version ignores them; the
   views of migration 13 without learned rows return what migration 12
@@ -439,9 +500,12 @@ connection that conntrack tracks, whatever made the translation:
   after the tracer starts. The virtual machines load the modules of
   nf_conntrack and nf_tables (Rocky Linux 9: kernel-modules-core; upstream:
   the modules package of the mainline build).
-- **Compatibility:** `TestKernelCompatibility` checks the kprobe targets
-  and the CO-RE relocations of the programs against the BTF of the Rocky
-  Linux 9.6 kernel and of its module nf_conntrack.
+- **Compatibility:** `TestKernelCompatibility` checks the kprobe targets,
+  their parameters and the CO-RE relocations of the programs against the
+  BTF of the Rocky Linux 9.6 kernel and of its module nf_conntrack
+  (`scripts/fetch-module-btf.sh`); the virtual machines of upstream 5.14
+  and 5.15 attach the destroy program to `destroy_conntrack`.
+- **Packaging:** the agent learns translations under the packaged unit.
 - **Agent and OTLP:** the series, their order in the requests, the idle
   TTL, the golden request.
 - **Connector:** parsing, the skip of unchanged spans, the names of both
@@ -473,7 +537,9 @@ connection that conntrack tracks, whatever made the translation:
 - Translations are static in phase 1: Kubernetes services and Docker
   published ports need phase 2, and docker-proxy phase 3.
 - Phase 2 learns one hop (§3.5.1): a connection translated on two hosts is
-  not matched; nor is one through IPVS without `conntrack=1`; nor, until
+  not matched (the cheap next step for hosts with containers: join a pure
+  SNAT row, whose virtual address is its backend, with the DNAT row of the
+  next host by the source, virtual address and port); nor is one through IPVS without `conntrack=1`; nor, until
   their client opens another, are connections confirmed before the agent
   started.
 - Learned SNAT of clients forwarded from other hosts leaves those without
@@ -504,7 +570,7 @@ connection that conntrack tracks, whatever made the translation:
 | Reading the table of conntrack over netlink, or `/proc/net/nf_conntrack` | `CAP_NET_ADMIN` in every namespace, a walk of every entry at every interval, and the procfs file is often compiled out. |
 | A learned translation seen only at confirmation | Long-lived connections would lose their match minutes after they opened (§3.5.2, why `live`). |
 | Learned rows not bounding the matched period | A client pinned to one backend by long-lived connections would look current on every backend it ever reached. |
-| Learned SNAT named as a relay (`shawk.peer.agent` false) | Containers that leave with the address of their host would be counted twice, where they are counted once before phase 2 (§3.5.5, names 2). |
+| Learned SNAT named as a relay (`shawk.peer.agent` false) | Containers that leave with the address of their host would be counted twice, where they are counted once before phase 2 (§3.5.5, names 3). |
 | A translation name per host that translates | Two directors in turn would make two rows of one dependency; the host is in `shawk.learned_translations`. |
 | `dependencies` defined as `dependencies_between('-infinity', 'infinity')` | One definition, but every migration that changes the result of the function would have to drop and create the view and those on it. The two are kept apart, and tests check that they return the same rows. |
 
@@ -586,12 +652,53 @@ connection that conntrack tracks, whatever made the translation:
    as in phase 1 where it exists).
 7. Learned SNAT is learned too (masquerade, not only DNAT). Recommended:
    yes: a container that reaches another host leaves with the address of
-   its host, the most common case on hosts with containers; the table
-   grows like the client edges of the containers.
+   its host, the most common case on hosts with containers. With folding,
+   the destinations and clients on the Internet are not learned (§3.5.2,
+   filters); without it, the table grows with them, up to `-max-flows`.
+8. Transparent proxies that REDIRECT to themselves (sidecars): learned as
+   any translation, so that the client depends on the proxy. Recommended:
+   yes, one hop as elsewhere; the alternative is to drop translations to a
+   loopback backend, which loses REDIRECT to local services as well.
+   PostgreSQL then shows the sidecar on its port, while Prometheus names
+   the service observed on a socket at the port the client connected to.
 
-Open: 4–7.
+Open: 4–8.
 
 ## 10. Adversarial reviews and responses
+
+**Review of the design of phase 2 (2026-11-03).**
+
+1. The seccomp filter of the unit did not allow `perf_event_open`, so the
+   kprobes never attached under it. Fixed: the unit allows it, and the
+   test of the unit checks that translations are learned (§3.5.2).
+2. Missed probes are known (a kprobe is skipped while a map update of a
+   system call runs on the CPU), and a missed destroy, with the memory of
+   entries reused, corrupted the count of another key. Fixed: the entry
+   keeps its key, and a stale entry is released when its address is
+   confirmed again (§3.5.2).
+3. The connector looked a loopback or shared backend up on any host
+   (another host's container at 172.17.0.5, a sidecar on 127.0.0.1).
+   Fixed: on the host of the row (§3.5.5, names).
+4. A key deleted by user space and added again was decremented by the
+   destroy of an entry counted in the former key. Fixed: generations.
+5. With folding, the clients of the Internet of a NodePort (source: the
+   node) and the destinations of a masquerade were still learned. Fixed:
+   the client and the backend are filtered too.
+6. Learned SNAT would have overridden the relay of a static translation
+   in the connector (agentless clients counted nowhere). Fixed: static
+   translations first in the connector too.
+7. Transparent proxies were not discussed. Decision 8.
+8. A server edge behind learned SNAT was named after one of its clients.
+   Fixed: its name is kept (§3.5.5, names 3).
+9. Also: `conns` counted an entry confirmed twice; names starting with
+   `~` were not rejected; the order of the series is not kept through a
+   batch processor; rule 4 now says which port; the datapaths without
+   conntrack and the two-hop step are noted.
+
+Not taken: the destroy program would have resolved its CO-RE relocations
+against vmlinux only on kernels with `destroy_conntrack`. cilium/ebpf
+v0.22 relocates against the BTF of every loaded module, whatever the
+attach target.
 
 **First review (2026-11-02).**
 

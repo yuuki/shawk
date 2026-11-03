@@ -344,6 +344,238 @@
               }
             },
             {
+              "name":  "shawk.translation.first_seen",
+              "unit":  "s",
+              "gauge":  {
+                "dataPoints":  [
+                  {
+                    "attributes":  [
+                      {
+                        "key":  "network.transport",
+                        "value":  {
+                          "stringValue":  "tcp"
+                        }
+                      },
+                      {
+                        "key":  "shawk.netns",
+                        "value":  {
+                          "stringValue":  "4026531840"
+                        }
+                      },
+                      {
+                        "key":  "shawk.translation.client.address",
+                        "value":  {
+                          "stringValue":  "10.0.0.11"
+                        }
+                      },
+                      {
+                        "key":  "shawk.translation.virtual.address",
+                        "value":  {
+                          "stringValue":  "10.96.0.10"
+                        }
+                      },
+                      {
+                        "key":  "shawk.translation.virtual.port",
+                        "value":  {
+                          "intValue":  "5432"
+                        }
+                      },
+                      {
+                        "key":  "shawk.translation.source.address",
+                        "value":  {
+                          "stringValue":  "10.0.0.11"
+                        }
+                      },
+                      {
+                        "key":  "shawk.translation.backend.address",
+                        "value":  {
+                          "stringValue":  "10.244.1.7"
+                        }
+                      },
+                      {
+                        "key":  "shawk.translation.backend.port",
+                        "value":  {
+                          "intValue":  "6432"
+                        }
+                      }
+                    ],
+                    "timeUnixNano":  "1793448015000000000",
+                    "asInt":  "1793448015"
+                  },
+                  {
+                    "attributes":  [
+                      {
+                        "key":  "network.transport",
+                        "value":  {
+                          "stringValue":  "udp"
+                        }
+                      },
+                      {
+                        "key":  "shawk.netns",
+                        "value":  {
+                          "stringValue":  "4026531840"
+                        }
+                      },
+                      {
+                        "key":  "shawk.translation.client.address",
+                        "value":  {
+                          "stringValue":  "172.17.0.2"
+                        }
+                      },
+                      {
+                        "key":  "shawk.translation.virtual.address",
+                        "value":  {
+                          "stringValue":  "10.0.0.53"
+                        }
+                      },
+                      {
+                        "key":  "shawk.translation.virtual.port",
+                        "value":  {
+                          "intValue":  "53"
+                        }
+                      },
+                      {
+                        "key":  "shawk.translation.source.address",
+                        "value":  {
+                          "stringValue":  "10.0.0.11"
+                        }
+                      },
+                      {
+                        "key":  "shawk.translation.backend.address",
+                        "value":  {
+                          "stringValue":  "10.0.0.53"
+                        }
+                      },
+                      {
+                        "key":  "shawk.translation.backend.port",
+                        "value":  {
+                          "intValue":  "53"
+                        }
+                      }
+                    ],
+                    "timeUnixNano":  "1793448015000000000",
+                    "asInt":  "1793448015"
+                  }
+                ]
+              }
+            },
+            {
+              "name":  "shawk.translation.last_seen",
+              "unit":  "s",
+              "gauge":  {
+                "dataPoints":  [
+                  {
+                    "attributes":  [
+                      {
+                        "key":  "network.transport",
+                        "value":  {
+                          "stringValue":  "tcp"
+                        }
+                      },
+                      {
+                        "key":  "shawk.netns",
+                        "value":  {
+                          "stringValue":  "4026531840"
+                        }
+                      },
+                      {
+                        "key":  "shawk.translation.client.address",
+                        "value":  {
+                          "stringValue":  "10.0.0.11"
+                        }
+                      },
+                      {
+                        "key":  "shawk.translation.virtual.address",
+                        "value":  {
+                          "stringValue":  "10.96.0.10"
+                        }
+                      },
+                      {
+                        "key":  "shawk.translation.virtual.port",
+                        "value":  {
+                          "intValue":  "5432"
+                        }
+                      },
+                      {
+                        "key":  "shawk.translation.source.address",
+                        "value":  {
+                          "stringValue":  "10.0.0.11"
+                        }
+                      },
+                      {
+                        "key":  "shawk.translation.backend.address",
+                        "value":  {
+                          "stringValue":  "10.244.1.7"
+                        }
+                      },
+                      {
+                        "key":  "shawk.translation.backend.port",
+                        "value":  {
+                          "intValue":  "6432"
+                        }
+                      }
+                    ],
+                    "timeUnixNano":  "1793448015000000000",
+                    "asInt":  "1793448015"
+                  },
+                  {
+                    "attributes":  [
+                      {
+                        "key":  "network.transport",
+                        "value":  {
+                          "stringValue":  "udp"
+                        }
+                      },
+                      {
+                        "key":  "shawk.netns",
+                        "value":  {
+                          "stringValue":  "4026531840"
+                        }
+                      },
+                      {
+                        "key":  "shawk.translation.client.address",
+                        "value":  {
+                          "stringValue":  "172.17.0.2"
+                        }
+                      },
+                      {
+                        "key":  "shawk.translation.virtual.address",
+                        "value":  {
+                          "stringValue":  "10.0.0.53"
+                        }
+                      },
+                      {
+                        "key":  "shawk.translation.virtual.port",
+                        "value":  {
+                          "intValue":  "53"
+                        }
+                      },
+                      {
+                        "key":  "shawk.translation.source.address",
+                        "value":  {
+                          "stringValue":  "10.0.0.11"
+                        }
+                      },
+                      {
+                        "key":  "shawk.translation.backend.address",
+                        "value":  {
+                          "stringValue":  "10.0.0.53"
+                        }
+                      },
+                      {
+                        "key":  "shawk.translation.backend.port",
+                        "value":  {
+                          "intValue":  "53"
+                        }
+                      }
+                    ],
+                    "timeUnixNano":  "1793448015000000000",
+                    "asInt":  "1793448015"
+                  }
+                ]
+              }
+            },
+            {
               "name":  "shawk.connection.opened",
               "unit":  "{connection}",
               "sum":  {
@@ -3052,6 +3284,32 @@
                     "startTimeUnixNano":  "1793444400000000000",
                     "timeUnixNano":  "1793448015000000000",
                     "asInt":  "1"
+                  }
+                ],
+                "aggregationTemporality":  "AGGREGATION_TEMPORALITY_CUMULATIVE",
+                "isMonotonic":  true
+              }
+            },
+            {
+              "name":  "shawk.agent.translations.traced",
+              "gauge":  {
+                "dataPoints":  [
+                  {
+                    "timeUnixNano":  "1793448015000000000",
+                    "asInt":  "1"
+                  }
+                ]
+              }
+            },
+            {
+              "name":  "shawk.agent.translations.dropped",
+              "unit":  "{translation}",
+              "sum":  {
+                "dataPoints":  [
+                  {
+                    "startTimeUnixNano":  "1793444400000000000",
+                    "timeUnixNano":  "1793448015000000000",
+                    "asInt":  "2"
                   }
                 ],
                 "aggregationTemporality":  "AGGREGATION_TEMPORALITY_CUMULATIVE",

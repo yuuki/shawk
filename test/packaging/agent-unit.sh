@@ -74,6 +74,8 @@ sed -e "s|^ExecStart=/usr/bin/shawk |ExecStart=$BIN |" \
 	-e 's|^EnvironmentFile=.*|Environment="SHAWK_AGENT_OPTS=-otlp-endpoint http://127.0.0.1:4327 -interval 1s"|' \
 	"$ROOT/packaging/systemd/shawk-agent.service" >"/run/systemd/system/$UNIT"
 grep -q "^ExecStart=$BIN " "/run/systemd/system/$UNIT" || fail "ExecStart was not replaced"
+# Translations are learned once nf_conntrack is loaded, as NAT rules load it.
+modprobe nf_conntrack
 systemctl daemon-reload
 systemctl start "$UNIT"
 
@@ -81,6 +83,10 @@ started() { journal | grep -q 'msg="agent started"'; }
 wait_for "the agent did not start" started
 journal | grep 'msg="agent started"'
 journal | grep -q 'msg="agent started".* udp=true' || fail "UDP tracing is not available in the sandbox"
+# The kprobes on nf_conntrack, loaded before the agent started, attach with
+# perf_event_open.
+journal | grep -q 'msg="learning translations of addresses from conntrack"' ||
+	fail "translations are not learned from conntrack in the sandbox"
 
 # Traffic of another process over TCP and UDP.
 python3 - "$TCP_PORT" "$UDP_PORT" <<'PY'

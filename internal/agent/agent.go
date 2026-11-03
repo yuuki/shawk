@@ -37,12 +37,15 @@ type Config struct {
 	// edge per local endpoint (tracer.FoldMode).
 	Fold          tracer.FoldMode
 	InternalPeers []netip.Prefix
-	// MaxSeriesPerRequest bounds the edges and listeners in one request;
+	// MaxSeriesPerRequest bounds the edges, listeners and translations in one request;
 	// a host with more sends several requests per interval.
 	MaxSeriesPerRequest int
 	ServiceFallback     procinfo.Fallback
 	BPFStats            bool // enable and send the run time statistics of the BPF programs
-	Logger              *slog.Logger
+	// LearnTranslations learns the translations of addresses the host
+	// makes from conntrack, and sends them.
+	LearnTranslations bool
+	Logger            *slog.Logger
 
 	traceSelf bool // trace the agent's own flows; for tests
 }
@@ -54,6 +57,7 @@ const MaxInterval = time.Minute
 type source interface {
 	Collect() (*tracer.Snapshot, error)
 	UDPEnabled() bool
+	TranslationsTraced() bool
 	ProgramStats() ([]tracer.ProgramStat, error)
 }
 
@@ -79,6 +83,7 @@ type Agent struct {
 	lastCollect time.Time
 	failures    uint64
 	drops       uint64
+	xlatDrops   uint64
 }
 
 // Run starts the agent and blocks until ctx is canceled.
@@ -114,14 +119,15 @@ func Run(ctx context.Context, cfg Config) error {
 		cfg.Logger.Warn("listing the addresses of the host, whose peers are not folded", "error", err)
 	}
 	tr, err := tracer.New(tracer.Options{
-		NetNS:         cfg.NetNS,
-		MaxFlows:      cfg.MaxFlows,
-		OnCgroup:      cgroups.Learn,
-		TraceSelf:     cfg.traceSelf,
-		Fold:          cfg.Fold,
-		InternalPeers: cfg.InternalPeers,
-		LocalAddrs:    local,
-		Logger:        cfg.Logger,
+		NetNS:             cfg.NetNS,
+		MaxFlows:          cfg.MaxFlows,
+		OnCgroup:          cgroups.Learn,
+		TraceSelf:         cfg.traceSelf,
+		Fold:              cfg.Fold,
+		InternalPeers:     cfg.InternalPeers,
+		LocalAddrs:        local,
+		LearnTranslations: cfg.LearnTranslations,
+		Logger:            cfg.Logger,
 	})
 	if err != nil {
 		return fmt.Errorf("starting tracer: %w", err)
@@ -158,7 +164,8 @@ func Run(ctx context.Context, cfg Config) error {
 		InternalPeers: cfg.InternalPeers,
 	}, time.Now())
 	a.log.Info("agent started", "endpoint", cfg.Exporter.Endpoint, "protocol", cfg.Exporter.Protocol,
-		"interval", cfg.Interval, "idle_ttl", cfg.IdleTTL, "udp", tr.UDPEnabled())
+		"interval", cfg.Interval, "idle_ttl", cfg.IdleTTL, "udp", tr.UDPEnabled(),
+		"learn_translations", cfg.LearnTranslations)
 
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()
@@ -252,6 +259,7 @@ func (a *Agent) tick(ctx context.Context) error {
 // observe accounts a snapshot of the interval (start, end] to the series.
 func (a *Agent) observe(snap *tracer.Snapshot, start, end time.Time) {
 	a.drops = snap.Drops
+	a.xlatDrops = snap.TranslationDrops
 	a.idents.beginInterval()
 	pids := make([]uint32, 0, len(snap.Flows)+len(snap.Listeners))
 	for i := range snap.Flows {
@@ -290,6 +298,18 @@ func (a *Agent) observe(snap *tracer.Snapshot, start, end time.Time) {
 			RTTSumUs:   f.RTTSumUs,
 			RTTSamples: f.RTTSamples,
 		}, start, end)
+	}
+	for _, x := range snap.Translations {
+		a.state.AddTranslation(otlp.TranslationKey{
+			Proto:       x.Proto.String(),
+			NetNS:       x.NetNS,
+			Client:      x.Client,
+			Virtual:     x.Virtual,
+			VirtualPort: x.VirtualPort,
+			Source:      x.Source,
+			Backend:     x.Backend,
+			BackendPort: x.BackendPort,
+		}, end)
 	}
 	for _, l := range snap.Listeners {
 		a.state.AddListener(otlp.ListenerKey{
@@ -338,6 +358,9 @@ func (a *Agent) request(now time.Time) ([]*colmetricspb.ExportMetricsServiceRequ
 		UDPTraced:      a.tracer.UDPEnabled(),
 		FlowsDropped:   a.drops,
 		ExportFailures: a.failures,
+
+		TranslationsTraced:  a.tracer.TranslationsTraced(),
+		TranslationsDropped: a.xlatDrops,
 	}
 	if a.cfg.BPFStats {
 		if stats, err := a.tracer.ProgramStats(); err == nil {
