@@ -193,8 +193,10 @@ eval instant at 20m ` + a("ShawkExportFailures") + `
 }
 
 // TestSYNRetransmitRatio evaluates the panel of SYN retransmissions per
-// attempt of the dependency details dashboard, whose denominator is a union
-// of handshakes and failures by reason.
+// attempt of the dependency details dashboard. Its denominator is the union
+// of the handshakes and the failures by reason, which the agents that send
+// the retransmissions send too: app-03, of the previous version, sends
+// failures only, and the dependency on redis-server has no failures.
 func TestSYNRetransmitRatio(t *testing.T) {
 	records, _ := loadRules(t)
 	d := loadJSON(t, grafana+"/dashboards/shawk-dependency.json")
@@ -211,10 +213,23 @@ func TestSYNRetransmitRatio(t *testing.T) {
 	// All clients and servers: the recording rules are inlined, which takes
 	// no matchers.
 	expr = strings.ReplaceAll(expr, `{src=~"$src", dst=~"$dst"}`, "")
-	// 0.2 SYNs/s over 2 handshakes/s and 0.5 failures/s.
-	script := series + `
+	pg := `job="shop/app", shawk_role="client", service_peer_name="postgres", shawk_peer_agent="true", server_port="5432", network_transport="tcp"`
+	redis := `job="shop/app", instance="app-01", shawk_role="client", service_peer_name="redis-server", shawk_peer_agent="true", server_port="6379", network_transport="tcp"`
+	script := `
+load 1m
+  shawk_tcp_handshake_seconds_count{instance="app-01", ` + pg + `} 0+120x10
+  shawk_tcp_syn_retransmits_total{instance="app-01", ` + pg + `} 0+30x10
+  shawk_connection_failed_by_reason_total{instance="app-01", ` + pg + `, error_type="timeout"} 0+30x10
+  shawk_connection_failed_total{instance="app-01", ` + pg + `} 0+30x10
+  shawk_connection_failed_total{instance="app-03", ` + pg + `} 0+60x10
+  shawk_tcp_handshake_seconds_count{` + redis + `} 0+60x10
+  shawk_tcp_syn_retransmits_total{` + redis + `} 0+6x10
+
+# 0.5 SYNs/s over 2 handshakes/s and 0.5 failures/s of app-01; 0.1 SYNs/s
+# over 1 handshake/s.
 eval instant at 10m ` + inline(expr, records) + `
-  {src="shop/app", dst="postgres", server_port="5432"} 0.08
+  {src="shop/app", dst="postgres", server_port="5432"} 0.2
+  {src="shop/app", dst="redis-server", server_port="6379"} 0.1
 `
 	promqltest.RunTest(t, script, promqltest.NewTestEngine(t, false, 0, promqltest.DefaultMaxSamplesPerQuery))
 }

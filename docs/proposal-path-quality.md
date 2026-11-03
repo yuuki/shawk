@@ -724,7 +724,7 @@ blocker.
 | The failures by reason do not add up to `shawk_connection_failed_total`: a new series of a reason emits 0 first, while that of the failures starts with its whole value | valid | The comment of the rules and §5.3 of the design say so; `shawk.connection.failed` is unchanged. |
 | A step back of the clock of an agent by less than 2 minutes makes the first value of a new reason a baseline (`isNew()`) | confirmed by the reviewer | Accepted: new edges behave the same, and such steps are rare. |
 | The SYN retransmissions per attempt of the dashboard divided by failures that agents of the previous version count without SYN retransmissions | valid | The attempts are the handshakes and the failures by reason, both sent with the retransmissions (`TestSYNRetransmitRatio`). Connects with `TCP_FASTOPEN_CONNECT`, without a handshake, still raise the ratio. |
-| The checks of the e2e test pass with values of 0 | valid | They require values above 0. |
+| The checks of the e2e test pass with values of 0 | valid | Those of handshakes and of refused connects require values above 0; that of SYN retransmissions requires the series only, since the e2e test loses no SYN. |
 | The connector outputs any `error.type`, so an agent could make a series per value | valid | Unknown values are output as `_OTHER`. |
 | An input of handshakes with other bounds loses its sum and count too, so changing the bounds needs the connectors upgraded first | by design (§3.3) | Noted. |
 | The bound of series in §5.3 of the design, the row of `_OTHER`, the encoding of buckets (fixed64, not varints) and the changelog were off | valid | Corrected. |

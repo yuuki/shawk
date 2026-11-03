@@ -317,22 +317,32 @@ check "dependency map" \
 puma postgres
 ~unresolved haproxy"
 
-# The forwarded metrics name the peers and carry no addresses.
-grep -q 'service.peer.name: Str(postgres)' "$WORK/collector.log" || fail "no series of puma to postgres"
-grep -q 'service.peer.name: Str(haproxy)' "$WORK/collector.log" || fail "no series of puma's server side"
-grep -q 'shawk.peer.agent: Bool(true)' "$WORK/collector.log" || fail "no series of a peer with an agent"
-grep -q 'service.peer.name: Str(~unresolved)' "$WORK/collector.log" || fail "no series of the client without an agent"
-if grep -q 'network.peer.address' "$WORK/collector.log"; then fail "peer addresses forwarded"; fi
-# forwarded METRIC PATTERN: whether the collector forwarded a data point of
-# METRIC whose attributes hold PATTERN, with a value or a count above 0.
+# forwarded METRIC PATTERN...: whether the collector forwarded a data point
+# of METRIC whose attributes hold every PATTERN, with a value or a count
+# above 0.
 forwarded() {
-	awk -v metric="$1" -v pat="$2" '
+	PATTERNS="$(printf '%s\n' "${@:2}")" awk -v metric="$1" '
+		BEGIN { n = split(ENVIRON["PATTERNS"], pat, "\n") }
 		/-> Name: / { name = $NF }
 		/DataPoints #/ { attrs = "" }
 		/^ *-> / { attrs = attrs $0 "\n" }
-		/^(Value|Count): / && name == metric && index(attrs, pat) && $NF + 0 > 0 { found = 1 }
+		/^(Value|Count): / && name == metric && $NF + 0 > 0 {
+			ok = 1
+			for (i = 1; i <= n; i++) if (!index(attrs, pat[i])) ok = 0
+			if (ok) found = 1
+		}
 		END { exit !found }' "$WORK/collector.log"
 }
+
+# The forwarded metrics name the peers and carry no addresses. Clients
+# connect to a port where nothing listens too, which is ~unresolved on the
+# client side.
+grep -q 'service.peer.name: Str(postgres)' "$WORK/collector.log" || fail "no series of puma to postgres"
+grep -q 'service.peer.name: Str(haproxy)' "$WORK/collector.log" || fail "no series of puma's server side"
+grep -q 'shawk.peer.agent: Bool(true)' "$WORK/collector.log" || fail "no series of a peer with an agent"
+forwarded shawk.connection.opened 'service.peer.name: Str(~unresolved)' 'shawk.peer.agent: Bool(false)' 'shawk.role: Str(server)' ||
+	fail "no series of the client without an agent"
+if grep -q 'network.peer.address' "$WORK/collector.log"; then fail "peer addresses forwarded"; fi
 # The handshakes of the active opens, and the failures to the port where
 # nothing listens by reason. A new series of a reason emits 0 first.
 poll 30 forwarded shawk.tcp.handshake 'service.peer.name: Str(postgres)' || fail "no handshakes of puma to postgres forwarded"

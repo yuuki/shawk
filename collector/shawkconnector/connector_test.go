@@ -97,7 +97,7 @@ func TestGoldenRequest(t *testing.T) {
 	}
 	for k, v := range map[valueKey]float64{
 		{metric: metricConnOpened}:                                  3,
-		{metric: metricConnFailed}:                                  2,
+		{metric: metricConnFailed}:                                  7,
 		{metric: metricConnCount}:                                   2,
 		{metric: metricRetransmits}:                                 4,
 		{metric: metricNetworkIO, dir: "transmit"}:                  100,
@@ -105,7 +105,7 @@ func TestGoldenRequest(t *testing.T) {
 		{metric: metricRTT}:                                         0.0015,
 		{metric: metricHandshake}:                                   1.2006,
 		{metric: metricSynRetransmits}:                              3,
-		{metric: metricConnFailedByReason, errType: "timeout"}:      1,
+		{metric: metricConnFailedByReason, errType: "timeout"}:      2,
 		{metric: metricConnFailedByReason, errType: errorTypeOther}: 1,
 	} {
 		if p, ok := client.values[k]; !ok || math.Abs(p.value-v) > 1e-9 || p.start.AsTime() != t0 {
@@ -118,6 +118,16 @@ func TestGoldenRequest(t *testing.T) {
 	if p := client.values[valueKey{metric: metricHandshake}]; p.count != 3 ||
 		!slices.Equal(p.buckets, []uint64{0, 0, 2, 0, 0, 0, 0, 0, 0, 1, 0}) {
 		t.Errorf("handshakes = %+v", p)
+	}
+	// The agent sends every reason the connector knows, and no other.
+	reasons := map[string]bool{}
+	for k := range client.values {
+		if k.metric == metricConnFailedByReason {
+			reasons[k.errType] = true
+		}
+	}
+	if !maps.Equal(reasons, errorTypes) {
+		t.Errorf("reasons of the agent = %v, the connector knows %v", reasons, errorTypes)
 	}
 	// Server edges have none of the metrics of active opens.
 	for _, e := range hb.edges {

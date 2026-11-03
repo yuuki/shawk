@@ -536,7 +536,8 @@
             "drawStyle": "line",
             "fillOpacity": 10
           },
-          "unit": "percentunit"
+          "unit": "none",
+          "decimals": 2
         },
         "overrides": []
       },
@@ -554,7 +555,7 @@
           "sort": "desc"
         }
       },
-      "description": "SYNs that the client side retransmitted per connection attempt, established or failed: a SYN or its SYN-ACK was lost, or dropped by a firewall, a network policy or a server whose accept queue is full. The attempts are the handshakes and the failures by reason, which agents send with the retransmissions; connects with TCP_FASTOPEN_CONNECT have no handshake and raise the ratio."
+      "description": "SYNs that the client side retransmitted per connection attempt (a connect that times out retransmits several), established or failed: a SYN or its SYN-ACK was lost, or dropped by a firewall, a network policy or a server whose accept queue is full. The attempts are the handshakes and the failures by reason, which agents send with the retransmissions; connects with TCP_FASTOPEN_CONNECT have no handshake and raise the ratio."
     },
     {
       "id": 12,
