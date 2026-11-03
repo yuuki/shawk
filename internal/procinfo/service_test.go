@@ -4,7 +4,10 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -108,6 +111,24 @@ func TestServiceName(t *testing.T) {
 	}
 }
 
+// The environment of a process, which any user sets, cannot make a name
+// longer than 255 bytes; it is cut at the start of a character.
+func TestServiceNameTruncated(t *testing.T) {
+	long := strings.Repeat("a", 254) + "é" + strings.Repeat("b", 128<<10)
+	got := ServiceName(map[string]string{
+		"OTEL_SERVICE_NAME":        long,
+		"OTEL_RESOURCE_ATTRIBUTES": "service.namespace=" + long,
+	}, "/usr/bin/ruby", "ruby", "", Service{}, FallbackExe)
+	want := strings.Repeat("a", 254)
+	if got.Name != want || got.Namespace != want {
+		t.Errorf("ServiceName = %d and %d bytes, want %q", len(got.Name), len(got.Namespace), want)
+	}
+	short := strings.Repeat("a", 253) + "é"
+	if got := ServiceName(map[string]string{"OTEL_SERVICE_NAME": short}, "", "", "", Service{}, FallbackExe); got.Name != short {
+		t.Errorf("ServiceName = %q, want %q", got.Name, short)
+	}
+}
+
 func TestKernelServiceName(t *testing.T) {
 	// The client and the server side; one name when they are the same.
 	for port, want := range map[uint16][2]string{
@@ -176,13 +197,73 @@ func TestMachineID(t *testing.T) {
 	}
 }
 
-func TestOTelEnvTimeout(t *testing.T) {
-	release := make(chan struct{})
-	readEnviron = func(uint32) map[string]string {
-		<-release
+// blockEnviron replaces the reader of environments for a test: the reads
+// of PIDs from 1000 on block until released, the others return
+// OTEL_SERVICE_NAME=ok. At the end of the test all reads are released and
+// forgotten.
+func blockEnviron(t *testing.T) *blockedEnviron {
+	b := &blockedEnviron{release: make(chan struct{})}
+	readEnviron = func(pid uint32) map[string]string {
+		if pid < 1000 {
+			return map[string]string{"OTEL_SERVICE_NAME": "ok"}
+		}
+		b.blocked.Add(1)
+		defer b.blocked.Add(-1)
+		<-b.release
 		return map[string]string{"OTEL_SERVICE_NAME": "late"}
 	}
-	t.Cleanup(func() { readEnviron = readOTelEnv })
+	t.Cleanup(func() {
+		b.releaseAll()
+		waitEnviron(t, "the reads to return", func() bool { return environReads.running == 0 })
+		readEnviron = readOTelEnv
+		e := &environReads
+		e.Lock()
+		e.slow = map[uint32]time.Time{}
+		e.Unlock()
+	})
+	return b
+}
+
+type blockedEnviron struct {
+	release chan struct{}
+	once    sync.Once
+	blocked atomic.Int32 // the reads blocked
+}
+
+// releaseOne lets one blocked read return.
+func (b *blockedEnviron) releaseOne() { b.release <- struct{}{} }
+
+// releaseAll lets the blocked reads return, and those to come.
+func (b *blockedEnviron) releaseAll() { b.once.Do(func() { close(b.release) }) }
+
+// waitEnviron waits until cond holds, with environReads locked.
+func waitEnviron(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	for i := 0; ; i++ {
+		environReads.Lock()
+		ok := cond()
+		environReads.Unlock()
+		if ok {
+			return
+		}
+		if i > 300 {
+			t.Fatalf("waiting for %s", what)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// slowUntil returns until when the process pid backs off, and whether it
+// does.
+func slowUntil(pid uint32) (time.Time, bool) {
+	environReads.Lock()
+	defer environReads.Unlock()
+	t, ok := environReads.slow[pid]
+	return t, ok
+}
+
+func TestOTelEnvTimeout(t *testing.T) {
+	b := blockEnviron(t)
 	if env, ok := OTelEnv(4242); ok || env != nil {
 		t.Fatalf("a blocked read returned %v, %v", env, ok)
 	}
@@ -191,27 +272,148 @@ func TestOTelEnvTimeout(t *testing.T) {
 	if _, ok := OTelEnv(4242); ok || time.Since(start) > environTimeout/2 {
 		t.Errorf("a stuck process was read again")
 	}
-	close(release)
+	b.releaseAll()
 	// Once the read returns, the process backs off for a while.
-	for i := 0; ; i++ {
-		if v, _ := slowEnviron.Load(uint32(4242)); v != nil && !v.(time.Time).IsZero() {
-			break
-		}
-		if i > 100 {
-			t.Fatal("the process does not back off")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	readEnviron = func(uint32) map[string]string { return map[string]string{"OTEL_SERVICE_NAME": "ok"} }
+	waitEnviron(t, "the backoff", func() bool { return !environReads.slow[4242].IsZero() })
 	if _, ok := OTelEnv(4242); ok {
 		t.Error("a slow process was read again within its backoff")
 	}
 	// After the backoff it is read again.
-	slowEnviron.Store(uint32(4242), time.Now().Add(-time.Second))
-	if env, ok := OTelEnv(4242); !ok || env["OTEL_SERVICE_NAME"] != "ok" {
+	environReads.Lock()
+	environReads.slow[4242] = time.Now().Add(-time.Second)
+	environReads.Unlock()
+	if env, ok := OTelEnv(4242); !ok || env["OTEL_SERVICE_NAME"] != "late" {
 		t.Errorf("after the backoff: %v, %v", env, ok)
 	}
-	if _, slow := slowEnviron.Load(uint32(4242)); slow {
+	if _, slow := slowUntil(4242); slow {
 		t.Error("the backoff is kept after it ended")
 	}
+}
+
+// Reads that hang are bounded: once MaxEnvironReads are outstanding, no
+// read starts and the processes are not read in time; a read that returns
+// releases its slot.
+func TestOTelEnvBoundsStuckReads(t *testing.T) {
+	b := blockEnviron(t)
+	before := StuckEnvironReads()
+	goroutines := runtime.NumGoroutine()
+	// Many processes that hang are read at once, as the readers of the
+	// agent do.
+	const hung = 10 * MaxEnvironReads
+	var wg sync.WaitGroup
+	var notRead atomic.Int32
+	start := time.Now()
+	for pid := uint32(1000); pid < 1000+hung; pid++ {
+		wg.Go(func() {
+			if _, ok := OTelEnv(pid); !ok {
+				notRead.Add(1)
+			}
+		})
+	}
+	wg.Wait()
+	if d := time.Since(start); d > 10*environTimeout {
+		t.Errorf("reading %d stuck processes took %s", hung, d)
+	}
+	if got := notRead.Load(); got != hung {
+		t.Errorf("%d of %d stuck processes read in time", hung-got, hung)
+	}
+	waitEnviron(t, "the reads to block", func() bool { return b.blocked.Load() >= MaxEnvironReads })
+	if got := b.blocked.Load(); got != MaxEnvironReads {
+		t.Errorf("%d reads blocked, want %d", got, MaxEnvironReads)
+	}
+	s := StuckEnvironReads()
+	if s.Stuck != MaxEnvironReads || s.Skipped-before.Skipped != hung-MaxEnvironReads {
+		t.Errorf("StuckEnvironReads = %+v, want %d stuck and %d more skipped", s, MaxEnvironReads, hung-MaxEnvironReads)
+	}
+	// One goroutine per stuck read is left, whatever the number of
+	// processes that hang.
+	waitGoroutines(t, goroutines+MaxEnvironReads)
+
+	// While all slots are held, a process that does not hang is not read
+	// either.
+	if env, ok := OTelEnv(1); ok || env != nil {
+		t.Errorf("a process was read with all slots held: %v, %v", env, ok)
+	}
+	if got := StuckEnvironReads().Skipped - s.Skipped; got != 1 {
+		t.Errorf("%d reads skipped, want 1", got)
+	}
+	// A read that returns releases its slot, and its process backs off.
+	b.releaseOne()
+	waitEnviron(t, "a slot", func() bool { return environReads.running == MaxEnvironReads-1 })
+	if got := StuckEnvironReads().Stuck; got != MaxEnvironReads-1 {
+		t.Errorf("%d reads stuck after one returned, want %d", got, MaxEnvironReads-1)
+	}
+	if env, ok := OTelEnv(1); !ok || env["OTEL_SERVICE_NAME"] != "ok" {
+		t.Errorf("a process read with a slot free: %v, %v", env, ok)
+	}
+	// Once all return, all slots are free and the goroutines gone.
+	b.releaseAll()
+	waitEnviron(t, "all slots", func() bool { return environReads.running == 0 })
+	if got := StuckEnvironReads().Stuck; got != 0 {
+		t.Errorf("%d reads stuck after all returned", got)
+	}
+	waitGoroutines(t, goroutines)
+	for pid := uint32(1); pid < 1+2*MaxEnvironReads; pid++ {
+		if env, ok := OTelEnv(pid); !ok || env["OTEL_SERVICE_NAME"] != "ok" {
+			t.Fatalf("process %d after the reads returned: %v, %v", pid, env, ok)
+		}
+	}
+	// The processes whose read timed out back off; the others were not read.
+	slow := 0
+	for pid := uint32(1000); pid < 1000+hung; pid++ {
+		if until, ok := slowUntil(pid); ok && !until.IsZero() {
+			slow++
+		}
+	}
+	if slow != MaxEnvironReads {
+		t.Errorf("%d processes back off, want %d", slow, MaxEnvironReads)
+	}
+}
+
+// waitGoroutines waits until at most n goroutines run.
+func waitGoroutines(t *testing.T, n int) {
+	t.Helper()
+	for i := 0; runtime.NumGoroutine() > n; i++ {
+		if i > 300 {
+			t.Fatalf("%d goroutines, want at most %d", runtime.NumGoroutine(), n)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// The PIDs that back off are bounded: a read that returns while
+// maxSlowEnviron back off does not back off, and the PIDs whose backoff
+// ended are forgotten when a read returns.
+func TestOTelEnvBoundsBackoff(t *testing.T) {
+	b := blockEnviron(t)
+	e := &environReads
+	e.Lock()
+	for pid := range uint32(maxSlowEnviron) {
+		e.slow[100000+pid] = time.Now().Add(time.Hour)
+	}
+	e.Unlock()
+	if _, ok := OTelEnv(4242); ok {
+		t.Fatal("a blocked read returned")
+	}
+	b.releaseOne()
+	waitEnviron(t, "the read to return", func() bool { return e.running == 0 })
+	if _, slow := slowUntil(4242); slow {
+		t.Error("a process backs off beyond maxSlowEnviron")
+	}
+	waitEnviron(t, "the backoffs", func() bool { return len(e.slow) == maxSlowEnviron })
+
+	e.Lock()
+	for pid := range e.slow {
+		e.slow[pid] = time.Now().Add(-time.Second)
+	}
+	e.Unlock()
+	if _, ok := OTelEnv(4243); ok {
+		t.Fatal("a blocked read returned")
+	}
+	b.releaseOne()
+	waitEnviron(t, "the read to return", func() bool { return e.running == 0 })
+	if until, slow := slowUntil(4243); !slow || until.Before(time.Now()) {
+		t.Errorf("the process does not back off: %v, %v", until, slow)
+	}
+	waitEnviron(t, "the ended backoffs to be forgotten", func() bool { return len(e.slow) == 1 })
 }

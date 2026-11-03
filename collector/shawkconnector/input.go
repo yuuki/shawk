@@ -341,9 +341,11 @@ func numberValue(dp pmetric.NumberDataPoint) float64 {
 	return dp.DoubleValue()
 }
 
+// getString returns a string attribute, made acceptable to PostgreSQL
+// (see cleanString): a value it refuses would drop the changes of the host.
 func getString(m pcommon.Map, k string) string {
 	if v, ok := m.Get(k); ok {
-		return v.AsString()
+		return cleanString(v.AsString())
 	}
 	return ""
 }

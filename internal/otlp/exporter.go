@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -86,6 +87,22 @@ func (cfg ExporterConfig) endpoint() (*url.URL, error) {
 	return u, nil
 }
 
+// CleartextRemote reports whether a valid configuration sends to another
+// host without TLS: the endpoint uses http:// and its host is neither
+// localhost nor a loopback address.
+func (cfg ExporterConfig) CleartextRemote() bool {
+	u, err := cfg.endpoint()
+	if err != nil || u.Scheme != "http" {
+		return false
+	}
+	host := strings.TrimSuffix(u.Hostname(), ".")
+	if strings.EqualFold(host, "localhost") {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip == nil || !ip.IsLoopback()
+}
+
 // NewExporter returns an exporter. It does not connect yet.
 func NewExporter(cfg ExporterConfig) (Exporter, error) {
 	u, err := cfg.endpoint()
@@ -132,7 +149,12 @@ func NewExporter(cfg ExporterConfig) (Exporter, error) {
 		}
 		tr := http.DefaultTransport.(*http.Transport).Clone()
 		tr.TLSClientConfig = tlsConf
-		return &httpExporter{url: u.String(), client: &http.Client{Transport: tr}}, nil
+		// Redirects are not followed: a 307 or 308 would send the request,
+		// with its body, to another address, maybe without TLS.
+		client := &http.Client{Transport: tr, CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}}
+		return &httpExporter{url: u.String(), client: client}, nil
 	}
 	panic("unreachable: the protocol was validated")
 }
@@ -183,12 +205,11 @@ func (e *httpExporter) Export(ctx context.Context, req *colmetricspb.ExportMetri
 	if err != nil {
 		return err
 	}
+	if resp.StatusCode/100 == 3 {
+		return fmt.Errorf("%s: %s to %q: redirects are not followed", e.url, resp.Status, clip(resp.Header.Get("Location")))
+	}
 	if resp.StatusCode/100 != 2 {
-		msg := strings.TrimSpace(string(data))
-		if len(msg) > 200 {
-			msg = msg[:200]
-		}
-		return fmt.Errorf("%s: %s %s", e.url, resp.Status, msg)
+		return fmt.Errorf("%s: %s %s", e.url, resp.Status, clip(strings.TrimSpace(string(data))))
 	}
 	var r colmetricspb.ExportMetricsServiceResponse
 	if resp.Header.Get("Content-Type") == "application/x-protobuf" && len(data) > 0 {
@@ -202,6 +223,14 @@ func (e *httpExporter) Export(ctx context.Context, req *colmetricspb.ExportMetri
 func (e *httpExporter) Close() error {
 	e.client.CloseIdleConnections()
 	return nil
+}
+
+// clip bounds a string from the collector in an error.
+func clip(s string) string {
+	if len(s) > 200 {
+		return s[:200]
+	}
+	return s
 }
 
 // ErrRejected is returned when the collector rejects some data points.

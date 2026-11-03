@@ -4,41 +4,48 @@
 #
 # Both receivers require TLS with client certificates: what they receive is
 # written to PostgreSQL or Prometheus, where a forged shawk_agent_up would
-# silence alerts. The files must be readable by the user of the collector
-# (shawk-collector; 65532 in the container image).
+# silence alerts. Each receiver trusts its own CA, so that a certificate of
+# OBI, which often runs on hosts or in containers trusted less than the
+# agents, is refused by the receiver of agents. The files must be readable
+# by the user of the collector (shawk-collector; 65532 in the container
+# image).
 receivers:
   # shawk agents only (-otlp-cert-file and -otlp-key-file). A request of an
-  # agent stays below 3 MiB; the limits leave room.
+  # agent stays below 3 MiB; the limits leave room. gRPC only: the connector
+  # checks the client certificate of every request (host_identity), which
+  # the receiver passes on over gRPC, not over HTTP.
   otlp/shawk:
     protocols:
       grpc:
         endpoint: 0.0.0.0:4327
         max_recv_msg_size_mib: 16
-        tls: &shawk_tls
+        tls:
           cert_file: /etc/shawk/tls/collector.crt
           key_file: /etc/shawk/tls/collector.key
           client_ca_file: /etc/shawk/tls/agents-ca.crt
-      http:
-        endpoint: 0.0.0.0:4328
-        max_request_body_size: 16777216
-        tls: *shawk_tls
   # OBI and other instrumentation, with the variables of the OpenTelemetry
   # SDK: OTEL_EXPORTER_OTLP_ENDPOINT=https://..., OTEL_EXPORTER_OTLP_CERTIFICATE,
   # OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE and OTEL_EXPORTER_OTLP_CLIENT_KEY.
+  # Their certificates come from another CA than those of the agents.
   otlp:
     protocols:
       grpc:
         endpoint: 0.0.0.0:4317
-        tls: *shawk_tls
+        tls: &obi_tls
+          cert_file: /etc/shawk/tls/collector.crt
+          key_file: /etc/shawk/tls/collector.key
+          client_ca_file: /etc/shawk/tls/obi-ca.crt
       http:
         endpoint: 0.0.0.0:4318
-        tls: *shawk_tls
+        tls: *obi_tls
 
 connectors:
   shawk:
     postgres:
-      # A connection string of the role shawk_connector, e.g.
-      # postgres://shawk_connector:PASSWORD@db.example:5432/shawk?sslmode=require
+      # A connection string of the role shawk_connector that verifies the
+      # certificate of the server against the CA in sslrootcert (without
+      # sslrootcert, the CAs of the system), e.g.
+      # postgres://shawk_connector:PASSWORD@db.example:5432/shawk?sslmode=verify-full&sslrootcert=/etc/shawk/tls/postgres-ca.crt
       dsn_file: /etc/shawk/postgres-dsn
       migrate: false          # apply the schema with shawk-migrate
     write_interval: 1m
@@ -60,6 +67,10 @@ connectors:
     #     backends: [10.0.1.0/24:8080]
     #     sources: [10.0.100.250]            # what the backends see the clients at
     keep_peer_address: false
+    # The certificate of an agent must name its host as `hostname` prints
+    # it (a DNS name, or the common name of a certificate without DNS
+    # names): an agent cannot write as another host.
+    host_identity: certificate
     retention: 26280h         # 3 years; 0 keeps rows forever
 
 processors:

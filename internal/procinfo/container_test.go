@@ -141,7 +141,10 @@ func TestCgroupContainer(t *testing.T) {
 		{"/system.slice/" + id1, containerRef{}, false},
 		{"/system.slice/nginx.service", containerRef{}, false},
 	} {
-		refs := cgroupContainers(tc.path)
+		refs, under := cgroupContainers(tc.path)
+		if under != "" {
+			t.Errorf("cgroupContainers(%q) is under %q", tc.path, under)
+		}
 		var got containerRef
 		if len(refs) > 0 {
 			got = refs[0]
@@ -152,11 +155,37 @@ func TestCgroupContainer(t *testing.T) {
 	}
 	nested := "/system.slice/docker-" + id1 + ".scope/docker/" + id2
 	want := []containerRef{{RuntimeDocker, id2}, {RuntimeDocker, id1}}
-	if got := cgroupContainers(nested); !slices.Equal(got, want) {
+	if got, _ := cgroupContainers(nested); !slices.Equal(got, want) {
 		t.Errorf("cgroupContainers(%q) = %+v, want %+v", nested, got, want)
 	}
 	if got := Unit(nested); got != "docker-0123456789ab" {
 		t.Errorf("Unit(%q) = %q", nested, got)
+	}
+}
+
+// A unit above a container delegated its cgroups to a user, who may name
+// one after any container of the host.
+func TestCgroupContainerUnder(t *testing.T) {
+	for _, tc := range []struct {
+		path, under, unit string
+	}{
+		{"/user.slice/user-1000.slice/user@1000.service/user.slice/libpod-" + id1 + ".scope/container",
+			"user@1000.service", "user@1000.service/podman-0123456789ab"},
+		{"/user.slice/user-1000.slice/user@1000.service/app.slice/docker-" + id1 + ".scope",
+			"user@1000.service", "user@1000.service/docker-0123456789ab"},
+		{"/user.slice/user-1000.slice/user@1000.service/app.slice/foo.service/docker-" + id1 + ".scope",
+			"user@1000.service/foo.service", "user@1000.service/foo.service/docker-0123456789ab"},
+		{"/system.slice/runner.service/docker/" + id1, "runner.service", "runner.service/docker-0123456789ab"},
+		{"/user.slice/user-1000.slice/session-3.scope/docker-" + id1 + ".scope",
+			"user-1000.slice/session.scope", "user-1000.slice/session.scope/docker-0123456789ab"},
+	} {
+		refs, under := cgroupContainers(tc.path)
+		if len(refs) != 1 || refs[0].id != id1 || under != tc.under {
+			t.Errorf("cgroupContainers(%q) = %+v, %q, want under %q", tc.path, refs, under, tc.under)
+		}
+		if got := Unit(tc.path); got != tc.unit {
+			t.Errorf("Unit(%q) = %q, want %q", tc.path, got, tc.unit)
+		}
 	}
 }
 
@@ -338,6 +367,32 @@ func TestResolverUnit(t *testing.T) {
 	r.Learn(10, "/system.slice/docker-"+id3+".scope/docker/"+id2)
 	if unit, ctr := r.Unit(10); unit != "docker-abababababab" || ctr.ID != id3 {
 		t.Errorf("Unit(10) = %q, %+v", unit, ctr)
+	}
+}
+
+// A user, or a container allowed to write its cgroups, can make a cgroup
+// named after a container of the host: the process in it is not named
+// after that container.
+func TestResolverUnitForged(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "/var/lib/docker/containers/"+id1+"/config.v2.json", `{"Name": "/db", "Config": {}}`)
+	r := &Resolver{containers: newContainers(root), paths: map[uint64]string{}, learned: map[uint64]learnedPath{}}
+	for i, tc := range []struct{ path, unit, id string }{
+		{"/user.slice/user-1000.slice/user@1000.service/app.slice/docker-" + id1 + ".scope",
+			"user@1000.service/docker-0123456789ab", id1},
+		{"/system.slice/runner.service/docker-" + id1 + ".scope", "runner.service/docker-0123456789ab", id1},
+		// Inside the container id2, which has no state: named after it.
+		{"/system.slice/docker-" + id2 + ".scope/docker-" + id1 + ".scope", "docker-fedcba987654", id2},
+		// The container of the host itself.
+		{"/system.slice/docker-" + id1 + ".scope", "docker/db", id1},
+	} {
+		id := uint64(20 + i)
+		r.Learn(id, tc.path)
+		r.reads.Wait()
+		unit, ctr := r.Unit(id)
+		if unit != tc.unit || ctr == nil || ctr.ID != tc.id {
+			t.Errorf("Unit(%q) = %q, %+v, want %q", tc.path, unit, ctr, tc.unit)
+		}
 	}
 }
 

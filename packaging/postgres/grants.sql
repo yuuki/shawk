@@ -5,6 +5,11 @@
 --   psql -v ON_ERROR_STOP=1 -d shawk -U shawk_owner -f grants.sql
 
 REVOKE ALL ON SCHEMA shawk, shawk_v1 FROM PUBLIC;
+-- Only the owner creates temporary tables, which every role may by
+-- default; setup.sql revokes the other objects.
+DO $$ BEGIN
+  EXECUTE format('REVOKE TEMPORARY ON DATABASE %I FROM PUBLIC', current_database());
+END $$;
 
 -- The connector upserts the tables, deletes rows older than its retention
 -- and reads the views that name peers.
@@ -15,8 +20,9 @@ REVOKE ALL ON shawk.schema_migrations FROM shawk_connector;
 GRANT USAGE ON ALL SEQUENCES IN SCHEMA shawk TO shawk_connector;
 GRANT SELECT ON ALL TABLES IN SCHEMA shawk_v1 TO shawk_connector;
 
--- Grafana reads the contract only (setup.sql makes it read-only with a
--- time limit).
+-- Grafana reads the contract only. These grants are what hold: the
+-- read-only transactions and the time limit of setup.sql are defaults that
+-- a session can change.
 GRANT USAGE ON SCHEMA shawk_v1 TO shawk_grafana;
 GRANT SELECT ON ALL TABLES IN SCHEMA shawk_v1 TO shawk_grafana;
 
