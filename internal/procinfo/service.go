@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // Fallback selects the name of a process that does not name its service in
@@ -179,10 +180,11 @@ func ResourceAttributes(s string) map[string]string {
 //  6. the unit, then UnknownService, for sockets whose owner is unknown.
 //
 // service.namespace in OTEL_RESOURCE_ATTRIBUTES gives the namespace, else
-// the namespace of the service of the pod. The order follows OBI, so that
-// both name a service the same way: OBI names the processes of a pod from
-// its metadata, and those of other containers after their executable. Containers apart from Kubernetes are told apart by
-// their unit, or named after it with FallbackUnit.
+// the namespace of the service of the pod. Both are cut to 255 bytes. The
+// order follows OBI, so that both name a service the same way: OBI names
+// the processes of a pod from its metadata, and those of other containers
+// after their executable. Containers apart from Kubernetes are told apart
+// by their unit, or named after it with FallbackUnit.
 func ServiceName(env map[string]string, exe, comm, unit string, workload Service, fb Fallback) Service {
 	var s Service
 	attrs := ResourceAttributes(env["OTEL_RESOURCE_ATTRIBUTES"])
@@ -212,7 +214,28 @@ func ServiceName(env map[string]string, exe, comm, unit string, workload Service
 	if s.Name == "" {
 		s.Name = UnknownService
 	}
+	s.Name, s.Namespace = truncateName(s.Name), truncateName(s.Namespace)
 	return s
+}
+
+// maxServiceName bounds the length of the name and namespace of a service.
+// They come from the environment of the process, which any user sets: one
+// of 128 KiB, repeated in every data point of the series of the process,
+// would make a request too large for the collector, and stop the export of
+// the host.
+const maxServiceName = 255
+
+// truncateName cuts a name to maxServiceName bytes, at the start of a
+// character.
+func truncateName(s string) string {
+	if len(s) <= maxServiceName {
+		return s
+	}
+	n := maxServiceName
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }
 
 // UnknownService names the service of a socket whose process and unit are

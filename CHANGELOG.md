@@ -167,6 +167,12 @@ changes; see below.
   over gRPC only, so the example configuration no longer receives agents
   over HTTP (port 4328). The connector replaces NUL and invalid UTF-8 in
   the strings of agents, which PostgreSQL refuses.
+* **A user can no longer stop the export of a host.** `service.name` and
+  `service.namespace`, from the environment of any process, were sent
+  whole; with 128 KiB each, the series of one connection exceeded the
+  size of a request, which the collector refused, and the rest of every
+  interval was not sent. They are cut to 255 bytes, and a series too
+  large for a request is left out and logged.
 * **A user can no longer name their processes after another container.**
   A user to whom systemd delegates cgroups (`user@1000.service`) could
   make one named after a container of the host, and the agent named the

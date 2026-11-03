@@ -292,6 +292,40 @@ func TestRequestsByteLimit(t *testing.T) {
 	}
 }
 
+// A series too large for a request alone is left out rather than sent in a
+// request the receiver refuses, which would stop the rest of the interval.
+func TestRequestsOversizedSeries(t *testing.T) {
+	s := NewState(15 * time.Minute)
+	big := clientEdge()
+	big.Service = strings.Repeat("x", 512<<10)
+	s.AddEdge(big, EdgeStats{Conns: 1}, t0, t0)
+	small := clientEdge()
+	small.PeerAddr = netip.MustParseAddr("10.0.0.99")
+	s.AddEdge(small, EdgeStats{Conns: 1}, t0, t0)
+	st := AgentStatus{Started: t0, SegmentStart: t0, NetNSScope: "all"}
+	reqs := s.Requests(Resource{Hostname: "h"}, st, t0, 1000)
+	if s.Oversized() != 1 {
+		t.Errorf("Oversized = %d, want 1", s.Oversized())
+	}
+	edges, up := 0, false
+	for i, req := range reqs {
+		if n := proto.Size(req); n > MaxRequestBytes {
+			t.Errorf("request %d has %d bytes, more than %d", i, n, MaxRequestBytes)
+		}
+		for _, m := range req.ResourceMetrics[0].ScopeMetrics[0].Metrics {
+			switch m.Name {
+			case MetricEdgeLast:
+				edges += len(m.GetGauge().DataPoints)
+			case MetricAgentUp:
+				up = true
+			}
+		}
+	}
+	if edges != 1 || !up {
+		t.Errorf("%d edges sent, agent up %v; want 1 and true", edges, up)
+	}
+}
+
 // Listeners come first and server edges before client edges, so that the
 // connector knows the services of the host when it names the peers of
 // client edges.

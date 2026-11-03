@@ -108,6 +108,24 @@ func TestServiceName(t *testing.T) {
 	}
 }
 
+// The environment of a process, which any user sets, cannot make a name
+// longer than 255 bytes; it is cut at the start of a character.
+func TestServiceNameTruncated(t *testing.T) {
+	long := strings.Repeat("a", 254) + "é" + strings.Repeat("b", 128<<10)
+	got := ServiceName(map[string]string{
+		"OTEL_SERVICE_NAME":        long,
+		"OTEL_RESOURCE_ATTRIBUTES": "service.namespace=" + long,
+	}, "/usr/bin/ruby", "ruby", "", Service{}, FallbackExe)
+	want := strings.Repeat("a", 254)
+	if got.Name != want || got.Namespace != want {
+		t.Errorf("ServiceName = %d and %d bytes, want %q", len(got.Name), len(got.Namespace), want)
+	}
+	short := strings.Repeat("a", 253) + "é"
+	if got := ServiceName(map[string]string{"OTEL_SERVICE_NAME": short}, "", "", "", Service{}, FallbackExe); got.Name != short {
+		t.Errorf("ServiceName = %q, want %q", got.Name, short)
+	}
+}
+
 func TestKernelServiceName(t *testing.T) {
 	// The client and the server side; one name when they are the same.
 	for port, want := range map[uint16][2]string{
