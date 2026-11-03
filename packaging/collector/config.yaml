@@ -63,6 +63,12 @@ connectors:
     # names): an agent cannot write as another host.
     host_identity: certificate
     retention: 26280h         # 3 years; 0 keeps rows forever
+    # Bounds of what the connector holds (docs/design.md, section 5.5), far
+    # above a large fleet. Lower max_hosts to the size of the fleet, with
+    # room, to bound the memory of the collector more tightly.
+    max_hosts: 10000
+    max_series_per_host: 100000   # edges, listeners, translations and addresses
+    max_pending_rows: 10000000    # kept while PostgreSQL cannot be written
 
 processors:
   memory_limiter:
