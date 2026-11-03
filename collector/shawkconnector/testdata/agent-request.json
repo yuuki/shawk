@@ -3059,6 +3059,21 @@
               }
             },
             {
+              "name":  "shawk.agent.container_reads.dropped",
+              "unit":  "{read}",
+              "sum":  {
+                "dataPoints":  [
+                  {
+                    "startTimeUnixNano":  "1793444400000000000",
+                    "timeUnixNano":  "1793448015000000000",
+                    "asInt":  "2"
+                  }
+                ],
+                "aggregationTemporality":  "AGGREGATION_TEMPORALITY_CUMULATIVE",
+                "isMonotonic":  true
+              }
+            },
+            {
               "name":  "shawk.agent.export.failures",
               "unit":  "{request}",
               "sum":  {

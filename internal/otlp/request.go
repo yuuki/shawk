@@ -42,6 +42,9 @@ type AgentStatus struct {
 	// CgroupEventsDropped counts the cgroups created whose event the
 	// kernel dropped (cumulative).
 	CgroupEventsDropped uint64
+	// ContainerReadsDrops counts the reads of the state of containers of
+	// new cgroups not queued because the queue was full (cumulative).
+	ContainerReadsDrops uint64
 	ExportFailures      uint64 // cumulative
 	BPFPrograms         []BPFProgram
 }
@@ -214,6 +217,7 @@ func addAgent(b *builder, st *AgentStatus) {
 	b.gauge(MetricAgentUDPTraced, "", udp, nil)
 	b.sum(MetricAgentFlowsDropped, "{update}", true, st.Started, st.FlowsDropped, nil)
 	b.sum(MetricAgentCgroupsDropped, "{event}", true, st.Started, st.CgroupEventsDropped, nil)
+	b.sum(MetricAgentReadsDropped, "{read}", true, st.Started, st.ContainerReadsDrops, nil)
 	b.sum(MetricAgentExportFailures, "{request}", true, st.Started, st.ExportFailures, nil)
 	for _, p := range st.BPFPrograms {
 		attrs := []*commonpb.KeyValue{str(AttrBPFProgram, p.Name)}

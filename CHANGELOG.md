@@ -1,5 +1,14 @@
 ## Unreleased
 
+* The losses of new cgroups are visible (#126): the new counter
+  `shawk.agent.container_reads.dropped`
+  (`shawk_agent_container_reads_dropped_total`) tells how many containers
+  of new cgroups were not queued to be read because the queue was full,
+  and the new Prometheus alerts `ShawkCgroupEventsDropped` (warning) and
+  `ShawkContainerReadsDropped` (info) fire when either counter increases.
+  A test of the kernel creates a burst of 3000 cgroups: a reader that
+  keeps up gets all of them, one that stalls gets the 496 that the ring
+  buffer holds, and the drops of the others are counted.
 * The state of a container is read on a worker instead of the goroutine
   that drains the events of new cgroups (#126), which the kernel dropped
   while it read the files of the runtimes, such as several MB of

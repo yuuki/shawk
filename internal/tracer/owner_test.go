@@ -8,8 +8,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -402,5 +404,95 @@ func testListenerReplaced(t *testing.T, overlap bool) {
 	}
 	if in == nil || in.Conns != 1 || in.PID != want {
 		t.Errorf("incoming flow = %+v, want the connection of %d", in, want)
+	}
+}
+
+// TestCgroupBurst creates a burst of cgroups, as a node starting many pods
+// does (#126). A reader that keeps up, as procinfo.Resolver.Learn, which
+// only records the path, gets the events of all of them; one that stops
+// reading, as Learn did while it read the state of containers, gets the
+// kernel to drop some, which CgroupEventDrops counts.
+func TestCgroupBurst(t *testing.T) {
+	requireRoot(t)
+	root := cgroup2Root()
+	if root == "" {
+		skipUnavailable(t, "cgroup v2 is not mounted")
+	}
+	const n = 3000
+	for _, stalled := range []bool{false, true} {
+		name := "a reader that keeps up"
+		if stalled {
+			name = "a reader that stalls"
+		}
+		t.Run(name, func(t *testing.T) {
+			parent := filepath.Join(root, fmt.Sprintf("shawktest-burst-%d", os.Getpid()))
+			prefix := "/" + filepath.Base(parent) + "/"
+			var (
+				mu   sync.Mutex
+				seen = map[string]bool{}
+			)
+			resume := make(chan struct{})
+			tr, err := New(Options{TraceSelf: true, OnCgroup: func(id uint64, path string) {
+				if stalled {
+					<-resume
+				}
+				if strings.HasPrefix(path, prefix) {
+					mu.Lock()
+					seen[path] = true
+					mu.Unlock()
+				}
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tr.Close()
+			var once sync.Once
+			release := func() { once.Do(func() { close(resume) }) }
+			defer release()
+			if err := os.Mkdir(parent, 0o755); err != nil {
+				skipUnavailable(t, "cannot create a cgroup: %v", err)
+			}
+			var dirs []string
+			defer func() {
+				for _, d := range slices.Backward(dirs) {
+					os.Remove(d)
+				}
+				os.Remove(parent)
+			}()
+			start := time.Now()
+			for i := range n {
+				d := filepath.Join(parent, fmt.Sprintf("c%d", i))
+				if err := os.Mkdir(d, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				dirs = append(dirs, d)
+			}
+			elapsed := time.Since(start)
+			release()
+			deadline := time.Now().Add(5 * time.Second)
+			var snap *Snapshot
+			for {
+				if snap, err = tr.Collect(); err != nil {
+					t.Fatal(err)
+				}
+				mu.Lock()
+				got := len(seen)
+				mu.Unlock()
+				if uint64(got)+snap.CgroupEventDrops >= n || time.Now().After(deadline) {
+					t.Logf("%d cgroups in %v: %d reported, %d dropped", n, elapsed, got, snap.CgroupEventDrops)
+					if uint64(got)+snap.CgroupEventDrops < n {
+						t.Errorf("%d cgroups neither reported nor counted as dropped", n-got-int(snap.CgroupEventDrops))
+					}
+					if stalled && snap.CgroupEventDrops == 0 {
+						t.Errorf("a stalled reader dropped no events of %d cgroups", n)
+					}
+					if !stalled && snap.CgroupEventDrops != 0 {
+						t.Errorf("a reader that keeps up dropped %d events", snap.CgroupEventDrops)
+					}
+					return
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+		})
 	}
 }
