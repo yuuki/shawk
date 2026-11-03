@@ -72,15 +72,29 @@ processors:
   batch: {}
 
 exporters:
+  # Prometheus started with --web.enable-otlp-receiver and the web
+  # configuration of packaging/prometheus/web.yml: over TLS, as a user of
+  # its basic_auth_users. Whoever can push to Prometheus can write
+  # shawk_agent_up and silence the alerts on agents. The header, "Basic "
+  # and the base64 of user:password, comes from the environment
+  # (/etc/shawk/collector.env), not from this file. A Prometheus that
+  # requires client certificates instead takes tls.cert_file and
+  # tls.key_file here.
   otlp_http/prometheus:
-    # Prometheus started with --web.enable-otlp-receiver.
-    endpoint: http://prometheus.example:9090/api/v1/otlp
+    endpoint: https://prometheus.example:9090/api/v1/otlp
     tls:
-      insecure: true
-  otlp_grpc/traces:           # Tempo or another trace store
+      ca_file: /etc/shawk/tls/prometheus-ca.crt
+    headers:
+      Authorization: ${env:SHAWK_PROMETHEUS_AUTHORIZATION}
+  # Tempo or another trace store, over TLS with the client certificate of
+  # the collector, which the store should require: in Tempo,
+  # tls.client_ca_file of the otlp receiver of the distributor.
+  otlp_grpc/traces:
     endpoint: tempo.example:4317
     tls:
-      insecure: true
+      ca_file: /etc/shawk/tls/tempo-ca.crt
+      cert_file: /etc/shawk/tls/collector-client.crt
+      key_file: /etc/shawk/tls/collector-client.key
 
 service:
   pipelines:

@@ -85,6 +85,42 @@ func TestPackagedCollectorConfig(t *testing.T) {
 			}
 		}
 	}
+	// The exporters push over TLS, verify the server and authenticate:
+	// whoever can push to Prometheus can write shawk_agent_up and silence
+	// the alerts on agents. Secrets come from the environment, which the
+	// unit of the collector reads from collector.env, not from this file.
+	env, err := os.ReadFile(filepath.Join(packaging, "systemd/collector.env"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, e := range doc.Exporters {
+		e, _ := e.(map[string]any)
+		endpoint, _ := e["endpoint"].(string)
+		if endpoint == "" {
+			continue // debug
+		}
+		tls, _ := e["tls"].(map[string]any)
+		typ, _, _ := strings.Cut(name, "/")
+		cleartext := strings.HasPrefix(endpoint, "http://") ||
+			(typ == "otlp_http" || typ == "otlphttp") && !strings.HasPrefix(endpoint, "https://")
+		if cleartext || tls["insecure"] == true || tls["insecure_skip_verify"] == true {
+			t.Errorf("%s: pushes in cleartext or to an unverified server: %v", name, e)
+		}
+		headers, _ := e["headers"].(map[string]any)
+		auth, _ := headers["Authorization"].(string)
+		if auth == "" && (tls["cert_file"] == nil || tls["key_file"] == nil) {
+			t.Errorf("%s: neither an Authorization header nor a client certificate: %v", name, e)
+		}
+		if auth == "" {
+			continue
+		}
+		m := regexp.MustCompile(`^\$\{env:(\w+)\}$`).FindStringSubmatch(auth)
+		if m == nil {
+			t.Errorf("%s: the Authorization header is not taken from the environment: %q", name, auth)
+		} else if !regexp.MustCompile(`(?m)^` + m[1] + `=`).Match(env) {
+			t.Errorf("%s: %s is not in collector.env", name, m[1])
+		}
+	}
 	for name, p := range doc.Service.Pipelines {
 		// Points of other sources carry the clocks of their hosts; batched,
 		// one host with a wrong clock makes Prometheus drop the others.

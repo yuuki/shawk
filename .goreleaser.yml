@@ -85,6 +85,7 @@ archives:
       - packaging/collector/*
       - packaging/postgres/*
       - packaging/systemd/shawk-collector.service
+      - packaging/systemd/collector.env
 
 changelog:
   disable: true
@@ -162,6 +163,14 @@ nfpms:
         # No secrets here: the connection string is in postgres.dsn_file,
         # which the administrator creates readable by shawk-collector only.
         type: config|noreplace
+      # Secrets the configuration refers to (the Authorization header of
+      # the push to Prometheus), readable by root only: systemd reads the
+      # file before it starts the collector.
+      - src: packaging/systemd/collector.env
+        dst: /etc/shawk/collector.env
+        type: config|noreplace
+        file_info:
+          mode: 0600
       - src: packaging/postgres/setup.sql
         dst: /usr/share/shawk-collector/postgres/setup.sql
       - src: packaging/postgres/grants.sql
