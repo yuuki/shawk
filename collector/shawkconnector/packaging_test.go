@@ -62,9 +62,12 @@ func TestPackagedCollectorConfig(t *testing.T) {
 		cfg.HostIdentity != hostIdentityCertificate {
 		t.Errorf("config = %+v", cfg)
 	}
-	// Both receivers require client certificates; the receiver of agents
-	// accepts the largest requests of an agent, over gRPC only, which
-	// passes the client certificate on to the connector (host_identity).
+	// Both receivers require client certificates, each from its own CA, so
+	// that a certificate of OBI is refused by the receiver of agents; the
+	// receiver of agents accepts the largest requests of an agent, over gRPC
+	// only, which passes the client certificate on to the connector
+	// (host_identity).
+	clientCAs := map[string][]any{}
 	for _, r := range []string{"otlp/shawk", "otlp"} {
 		protocols, _ := doc.Receivers[r].(map[string]any)["protocols"].(map[string]any)
 		for _, proto := range []string{"grpc", "http"} {
@@ -79,11 +82,19 @@ func TestPackagedCollectorConfig(t *testing.T) {
 			if tls["client_ca_file"] == nil || tls["cert_file"] == nil || tls["key_file"] == nil {
 				t.Errorf("%s %s: no TLS with client certificates: %v", r, proto, p)
 			}
+			clientCAs[r] = append(clientCAs[r], tls["client_ca_file"])
 			if r != "otlp/shawk" {
 				continue
 			}
 			if proto == "grpc" && p["max_recv_msg_size_mib"] != 16 {
 				t.Errorf("%s: max_recv_msg_size_mib = %v", r, p["max_recv_msg_size_mib"])
+			}
+		}
+	}
+	for _, agents := range clientCAs["otlp/shawk"] {
+		for _, obi := range clientCAs["otlp"] {
+			if agents != nil && agents == obi {
+				t.Errorf("otlp/shawk and otlp trust the same client CA %v: a certificate of OBI can send as an agent", agents)
 			}
 		}
 	}

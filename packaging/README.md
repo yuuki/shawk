@@ -45,12 +45,19 @@ sudo install -m 0640 -g shawk-collector /dev/stdin /etc/shawk/postgres-dsn <<<'p
 ```
 
 Both receivers of the example configuration require TLS with client
-certificates. The certificate, key and CA of the collector in
-`/etc/shawk/tls/` must be readable by the user of the collector
-(`shawk-collector`; uid 65532 in the container image), e.g. the key with
-mode 0640 and group `shawk-collector`. Agents present theirs with
-`-otlp-cert-file` and `-otlp-key-file` (`systemd/agent.env`); OBI with the
-variables of the OpenTelemetry SDK:
+certificates, each from its own CA: `otlp/shawk` accepts those of
+`agents-ca.crt`, `otlp` those of `obi-ca.crt`. Issue the certificates of
+OBI from another CA than those of the agents: OBI often runs on hosts or in
+containers trusted less than the agents, and with a certificate of their CA
+it could send to `otlp/shawk` as an agent. The collector does not start
+without `obi-ca.crt`; one that receives no OBI can leave out the receiver
+`otlp` and the pipelines `metrics/obi` and `traces/obi` instead. The
+certificate and key of the collector and the two CAs in `/etc/shawk/tls/`
+must be readable by the user of the collector (`shawk-collector`; uid
+65532 in the container image), e.g. the key with mode 0640 and group
+`shawk-collector`. Agents present theirs with `-otlp-cert-file` and
+`-otlp-key-file` (`systemd/agent.env`); OBI with the variables of the
+OpenTelemetry SDK:
 
 ```sh
 # /etc/obi/app.env

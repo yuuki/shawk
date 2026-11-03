@@ -843,7 +843,11 @@ replaced.
   certificate on over gRPC only, and requests over HTTP are refused. A
   refused request fails for the agent (`shawk.agent.export.failures`).
   With `none`, the default, the connector believes the `host.name` and
-  `host.id` of every request.
+  `host.id` of every request. The example configuration trusts another CA
+  on the receiver of OBI (`otlp`, `obi-ca.crt`) than on that of agents
+  (`otlp/shawk`, `agents-ca.crt`): OBI often runs on hosts or in
+  containers trusted less than the agents, and its certificates must not
+  send as an agent, even for the host they name.
 - **Cumulative.** Counters are totals since the series started, so a failed
   request is made up for by the next one. Requests are not retried.
 - **Idle TTL.** A series with no activity (connections, bytes, datagrams or
@@ -1369,9 +1373,11 @@ parses. shawk runs beside it instead:
   `application_service_graph` features) of selected services and sends to
   the `otlp` receiver of the same collector, with a client certificate
   (`OTEL_EXPORTER_OTLP_CERTIFICATE`, `OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE`,
-  `OTEL_EXPORTER_OTLP_CLIENT_KEY`); its network and statistics features
-  stay disabled, since shawk observes the same per process. Its metrics
-  are not batched in the collector: they carry the clock of their host.
+  `OTEL_EXPORTER_OTLP_CLIENT_KEY`) from another CA than those of the
+  agents, which the receiver of agents refuses (§4.3); its network and
+  statistics features stay disabled, since shawk observes the same per
+  process. Its metrics are not batched in the collector: they carry the
+  clock of their host.
 - Both name services the same way and both set the resource `service.name`,
   so `job` matches; dashboards use one `$service` variable for both.
 - `host.id` is the machine id in both. Cloned VMs should regenerate it
