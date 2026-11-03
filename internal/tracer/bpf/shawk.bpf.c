@@ -184,7 +184,7 @@ struct shawk_sock_state {
 	__u32 pid;
 	__u32 flags;
 	__u32 hs_us; /* duration of the handshake, with SS_HS_TIME */
-	__u32 walked; /* walk_gen of the last walk that accounted the connection */
+	__u32 walked; /* walk_gen of the last walk that visited the connection */
 	__u32 _pad;
 };
 
@@ -1337,10 +1337,14 @@ static __always_inline void account_walk(struct shawk_sock_state *ss,
 	struct shawk_flow_stats *fs;
 	__u32 srtt;
 
+	/*
+	 * Visited even if its flow does not fit, which iter/task_file would
+	 * not change (see account_skipped()).
+	 */
+	ss->walked = walk_gen;
 	fs = flow_get(&ss->key);
 	if (!fs)
 		return;
-	ss->walked = walk_gen;
 	if (ss->flags & SS_RECOUNT)
 		count_conn(ss);
 	if (take_tcp_delta(ss, sk, tp, state, &d))

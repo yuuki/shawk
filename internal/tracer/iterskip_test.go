@@ -1,10 +1,12 @@
 package tracer
 
 import (
+	"context"
 	"net"
 	"net/netip"
 	"strconv"
 	"testing"
+	"time"
 )
 
 // TestTCPIteratorSkips checks the connections that the TCP iterator of Linux
@@ -102,5 +104,68 @@ func TestTCPIteratorSkips(t *testing.T) {
 	}
 	if !tr.skipping {
 		t.Error("the processes are no longer walked at every interval while the iterator skips connections")
+	}
+}
+
+// TestTCPWalkFullFlowTable checks that a connection whose flow does not fit
+// in the flow table is not taken for one that the TCP iterator skipped: the
+// walk visited it, and the walk of the processes leaves it. With one flow,
+// the client or the server side of the connection does not fit at every
+// walk. The namespace has no listener, so the iterator skips none (see
+// TestTCPIteratorSkips).
+func TestTCPWalkFullFlowTable(t *testing.T) {
+	skipIfNoNetwork(t, "tcp4")
+	run, ns := newNetNS(t)
+	tr := startTracer(t, Options{NetNS: ns, MaxFlows: 1})
+	// The processes are walked at every interval.
+	tr.opts.OwnerScanInterval = time.Nanosecond
+	var conns []net.Conn
+	run(func() {
+		// Both sides are TCP sockets that the process holds.
+		var lc net.ListenConfig
+		lc.SetMultipathTCP(false)
+		ln, err := lc.Listen(context.Background(), "tcp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+		c, err := net.Dial("tcp4", ln.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { c.Close() })
+		s, err := ln.Accept()
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { s.Close() })
+		conns = append(conns, c, s)
+	})
+	states := tr.colls[0].Maps[bpfMapSockStates]
+	for i := range 3 {
+		snap, err := tr.Collect()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if snap.Drops == 0 {
+			t.Errorf("walk %d: both flows fit", i)
+		}
+		for _, c := range conns {
+			raw, err := c.(*net.TCPConn).SyscallConn()
+			if err != nil {
+				t.Fatal(err)
+			}
+			var ss bpfShawkSockState
+			raw.Control(func(fd uintptr) { err = states.Lookup(uint32(fd), &ss) })
+			if err != nil {
+				t.Fatalf("socket state of %v: %v", c.LocalAddr(), err)
+			}
+			if ss.Walked != tr.walks {
+				t.Errorf("walk %d: %v was last visited by walk %d, want %d", i, c.LocalAddr(), ss.Walked, tr.walks)
+			}
+		}
+		if tr.lastSkips != 0 || tr.skipping {
+			t.Errorf("walk %d: %d connections taken for skipped ones", i, tr.lastSkips)
+		}
 	}
 }
