@@ -2,6 +2,7 @@ package shawkconnector
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"go.opentelemetry.io/collector/connector/connectortest"
 	"go.opentelemetry.io/collector/consumer/consumertest"
 )
@@ -512,5 +514,223 @@ func TestPGLastKnownEndpoints(t *testing.T) {
 	want := []string{"10.0.0.5 5432 postgres", "10.0.0.7 8080 web-new", "10.0.0.8 9100 api"}
 	if !slices.Equal(got, want) {
 		t.Errorf("service_endpoints = %v, want %v", got, want)
+	}
+}
+
+func migratedDB(t *testing.T) (string, *pgx.Conn) {
+	t.Helper()
+	dsn, conn := testDB(t)
+	if _, err := Migrate(context.Background(), conn); err != nil {
+		t.Fatal(err)
+	}
+	return dsn, conn
+}
+
+func execAll(t *testing.T, conn *pgx.Conn, stmts ...string) {
+	t.Helper()
+	for _, q := range stmts {
+		if _, err := conn.Exec(context.Background(), q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+}
+
+// fixture writes rows of the schema directly. Times are SQL expressions.
+type fixture struct {
+	t    *testing.T
+	conn *pgx.Conn
+}
+
+// host adds a host observed until now, with a process per service.
+func (f fixture) host(id string, services ...string) {
+	f.t.Helper()
+	execAll(f.t, f.conn,
+		fmt.Sprintf(`INSERT INTO shawk.hosts VALUES ('%s','m','%s','k','v',now()-interval '30 days',now())`, id, id),
+		fmt.Sprintf(`INSERT INTO shawk.agent_sessions (host_id, started_at, last_heartbeat, udp_traced, netns_scope)
+		             VALUES ('%s', now()-interval '30 days', now(), true, 'all')`, id))
+	for _, svc := range services {
+		execAll(f.t, f.conn, fmt.Sprintf(`INSERT INTO shawk.processes (host_id, unit, comm, exe, service_name, first_seen, last_seen)
+			VALUES ('%s','%s.service','%s','','%s',now()-interval '30 days',now())`, id, svc, svc, svc))
+	}
+}
+
+// edge adds an edge of the process of svc on host.
+func (f fixture) edge(host, svc, role, local, remote string, port int, first, last string) {
+	f.t.Helper()
+	execAll(f.t, f.conn, fmt.Sprintf(`INSERT INTO shawk.edges (host_id, process_id, role, proto, local_addr, remote_addr, port, netns, first_seen, last_seen)
+		VALUES ('%s', (SELECT id FROM shawk.processes WHERE host_id = '%s' AND service_name = '%s'), '%s', 'tcp', '%s', '%s', %d, 1, %s, %s)`,
+		host, host, svc, role, local, remote, port, first, last))
+}
+
+// conn adds both sides of a connection from client to server.
+func (f fixture) conn2(clientHost, clientSvc, clientAddr, serverHost, serverSvc, serverAddr string, port int, first, last string) {
+	f.t.Helper()
+	f.edge(clientHost, clientSvc, "client", clientAddr, serverAddr, port, first, last)
+	f.edge(serverHost, serverSvc, "server", serverAddr, clientAddr, port, first, last)
+}
+
+// TestPGProcessesKeepTheirServices: processes of one unit with the same comm
+// and different OTEL_SERVICE_NAME are kept apart, each with its edges.
+func TestPGProcessesKeepTheirServices(t *testing.T) {
+	dsn, conn := migratedDB(t)
+	st, err := newPGStore(context.Background(), dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+	now := time.Now().UTC().Truncate(time.Second)
+	h := newHostChanges("h1")
+	h.setHost("m", "h1", "k", "v", now)
+	for i, svc := range []string{"billing", "mailer"} {
+		pk := procKey{"workers.service", "python3", svc}
+		at := now.Add(time.Duration(i) * time.Minute)
+		h.addProcess(pk, "/usr/bin/python3", span{at, at})
+		h.addEdge(edgeRowKey{role: "client", proto: "tcp", local: addrOf("10.0.0.1"), peer: addrOf("10.0.0." + []string{"5", "6"}[i]),
+			port: []uint16{5432, 25}[i], netns: 1, procKey: pk}, span{at, at})
+	}
+	if err := st.write(context.Background(), h); err != nil {
+		t.Fatal(err)
+	}
+	got := queryStrings(t, conn, `SELECT client_service, port FROM shawk_v1.dependencies`)
+	if !slices.Equal(got, []string{"billing 5432", "mailer 25"}) {
+		t.Errorf("dependencies = %v", got)
+	}
+}
+
+// TestPGAddressPeriods: an address that moves to another host and comes back
+// is not held by the first host in between: it does not count as shared,
+// and the host it moved to does not keep it.
+func TestPGAddressPeriods(t *testing.T) {
+	dsn, conn := migratedDB(t)
+	ctx := context.Background()
+	st, err := newPGStore(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+	now := time.Now().UTC().Truncate(time.Second)
+	day := 24 * time.Hour
+	write := func(host string, first, last time.Time) {
+		t.Helper()
+		h := newHostChanges(host)
+		h.setHost("m", host, "k", "v", last)
+		h.addAddr(addrOf("10.0.0.100"), span{first, last})
+		pk := procKey{"haproxy.service", "haproxy", "haproxy"}
+		h.addProcess(pk, "", span{first, last})
+		h.addListener(listenerRowKey{proto: "tcp", addr: addrOf("0.0.0.0"), port: 80, netns: 1, procKey: pk}, span{first, last})
+		if err := st.write(ctx, h); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The VIP is on lb1, fails over to lb2 and back.
+	write("lb1", now.Add(-20*day), now.Add(-10*day))
+	write("lb2", now.Add(-10*day+time.Hour), now.Add(-8*day))
+	write("lb1", now.Add(-8*day+time.Hour), now.Add(-time.Minute))
+	// Writes a minute apart continue the period.
+	write("lb1", now.Add(-time.Minute+15*time.Second), now)
+	got := queryStrings(t, conn, `SELECT host_id, count(*) FROM shawk.host_addrs GROUP BY host_id`)
+	if !slices.Equal(got, []string{"lb1 2", "lb2 1"}) {
+		t.Errorf("periods = %v", got)
+	}
+	if got := queryStrings(t, conn, `SELECT host(addr) FROM shawk.shared_addrs`); len(got) != 0 {
+		t.Errorf("shared_addrs = %v", got)
+	}
+	got = queryStrings(t, conn, `SELECT host, service FROM shawk_v1.service_endpoints WHERE addr = '10.0.0.100'`)
+	if !slices.Equal(got, []string{"lb1 haproxy"}) {
+		t.Errorf("service_endpoints = %v", got)
+	}
+}
+
+// TestPGPruneKeepsRefreshedRows: a row refreshed by a concurrent write while
+// prune waits for its lock is kept.
+func TestPGPruneKeepsRefreshedRows(t *testing.T) {
+	dsn, conn := migratedDB(t)
+	ctx := context.Background()
+	execAll(t, conn,
+		`INSERT INTO shawk.hosts VALUES ('h','m','h','k','v',now()-interval '400 days',now())`,
+		`INSERT INTO shawk.processes (host_id, unit, comm, exe, service_name, first_seen, last_seen)
+		 VALUES ('h','a.service','a','','a',now()-interval '400 days',now())`,
+		`INSERT INTO shawk.edges (host_id, process_id, role, proto, local_addr, remote_addr, port, netns, first_seen, last_seen)
+		 VALUES ('h',(SELECT id FROM shawk.processes),'client','tcp','10.0.0.1','10.0.0.2',80,1,
+		         now()-interval '400 days',now()-interval '400 days')`)
+	writer, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close(ctx)
+	tx, err := writer.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE shawk.edges SET last_seen = now()`); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		var n int64
+		done <- conn.QueryRow(ctx, `SELECT shawk.prune(now() - interval '365 days')`).Scan(&n)
+	}()
+	time.Sleep(300 * time.Millisecond) // prune waits for the row lock
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if got := queryStrings(t, conn, `SELECT count(*) FROM shawk.edges`); !slices.Equal(got, []string{"1"}) {
+		t.Errorf("edges after prune = %v; the refreshed edge was deleted", got)
+	}
+}
+
+// TestPGPruneWaitsForMigration: prune waits for the lock of migrations, like
+// writes, rather than taking the locks of tables in the reverse order of a
+// migration and deadlocking with it.
+func TestPGPruneWaitsForMigration(t *testing.T) {
+	dsn, conn := migratedDB(t)
+	ctx := context.Background()
+	other, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close(ctx)
+	if _, err := other.Exec(ctx, `SELECT pg_advisory_lock($1)`, int64(migrationLock)); err != nil {
+		t.Fatal(err)
+	}
+	execAll(t, conn, `SET lock_timeout = '300ms'`)
+	var n int64
+	err = conn.QueryRow(ctx, `SELECT shawk.prune(now() - interval '1 year')`).Scan(&n)
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
+		t.Errorf("prune during a migration: %v", err)
+	}
+	h := newHostChanges("h")
+	h.setHost("m", "h", "k", "v", time.Now())
+	err = pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error { return writeHost(ctx, tx, h) })
+	if !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
+		t.Errorf("write during a migration: %v", err)
+	}
+}
+
+// TestPGSchemaVersion: a connector that does not migrate reads the version
+// of the schema, 0 in a database without it.
+func TestPGSchemaVersion(t *testing.T) {
+	dsn, _ := migratedDB(t)
+	ctx := context.Background()
+	st, err := newPGStore(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+	if v, err := st.schemaVersion(ctx); err != nil || v != SchemaVersion() {
+		t.Errorf("schemaVersion = %d, %v", v, err)
+	}
+	empty, _ := testDB(t)
+	st2, err := newPGStore(ctx, empty)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st2.close()
+	if v, err := st2.schemaVersion(ctx); err != nil || v != 0 {
+		t.Errorf("schemaVersion of an empty database = %d, %v", v, err)
 	}
 }

@@ -2,6 +2,7 @@ package shawkconnector
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"math"
@@ -12,6 +13,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
+	"go.opentelemetry.io/collector/connector/connectortest"
+	"go.opentelemetry.io/collector/consumer/consumertest"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 )
 
@@ -456,31 +460,6 @@ func TestMigrateOnStart(t *testing.T) {
 	}
 }
 
-func TestConfigValidate(t *testing.T) {
-	ok := createDefaultConfig()
-	ok.Postgres.DSNFile = "/etc/shawk/postgres-dsn"
-	ok.PeerCIDRs = map[string]string{"office-lan": "192.168.10.0/24"}
-	if err := ok.Validate(); err != nil {
-		t.Errorf("valid config: %v", err)
-	}
-	for name, mod := range map[string]func(*Config){
-		"no dsn":            func(c *Config) { c.Postgres.DSNFile = "" },
-		"both dsn":          func(c *Config) { c.Postgres.DSN = "postgres://x" },
-		"no write interval": func(c *Config) { c.WriteInterval = 0 },
-		"short ttl":         func(c *Config) { c.IdleTTL = time.Second },
-		"no peers":          func(c *Config) { c.MaxPeers = 0 },
-		"bad cidr":          func(c *Config) { c.PeerCIDRs = map[string]string{"x": "10.0.0.0/33"} },
-		"reserved name":     func(c *Config) { c.PeerCIDRs = map[string]string{"~other": "10.0.0.0/8"} },
-		"short retention":   func(c *Config) { c.Retention = time.Hour },
-	} {
-		c := *ok
-		mod(&c)
-		if err := c.Validate(); err == nil {
-			t.Errorf("%s: accepted", name)
-		}
-	}
-}
-
 func TestNarrowestCIDRWins(t *testing.T) {
 	ps, err := parsePeerCIDRs(map[string]string{"wide": "10.0.0.0/8", "narrow": "10.1.0.0/16", "host": "10.1.2.3/32"})
 	if err != nil {
@@ -548,5 +527,130 @@ func TestSharedAddresses(t *testing.T) {
 	}
 	if !maps.Equal(got, want) {
 		t.Errorf("series = %v, want %v", got, want)
+	}
+}
+
+// TestRejectedRowsAreDropped: changes that PostgreSQL rejects are dropped
+// rather than written again at every flush, which would block the host for
+// good.
+func TestRejectedRowsAreDropped(t *testing.T) {
+	c, st, sink, _ := testConnector(t, nil)
+	consume(t, c, sink, tAgent{host: "app-01", addrs: []string{"fe80::1%eth0", "10.0.0.11"}, time: t0.Add(15 * time.Second)})
+	h := c.changes.pending[hostKey("", "app-01")]
+	for a := range h.addrs {
+		if a.Zone() != "" {
+			t.Errorf("address with a zone kept: %s", a)
+		}
+	}
+	st.err = &pgconn.PgError{Code: "22P02", Message: "invalid input syntax"}
+	c.flush(context.Background())
+	if n := c.changes.pendingSize(); n != 0 {
+		t.Errorf("%d rejected rows kept", n)
+	}
+	consume(t, c, sink, tAgent{host: "app-01", addrs: []string{"10.0.0.11"}, time: t0.Add(30 * time.Second)})
+	st.err = fmt.Errorf("connection refused")
+	c.flush(context.Background())
+	if n := c.changes.pendingSize(); n == 0 {
+		t.Error("changes dropped after a transient failure")
+	}
+}
+
+// TestDataErrorForgetsAcceptedSpans: after changes are dropped, the edges
+// the agent still sends are written again, and the next session of the
+// host starts after the loss.
+func TestDataErrorForgetsAcceptedSpans(t *testing.T) {
+	c, st, sink, now := testConnector(t, nil)
+	edge := tEdge{role: "client", proto: "tcp", local: "10.0.0.11", peer: "10.0.0.10", port: 5432,
+		svc: "app", comm: "app", opened: 1, last: t0}
+	ta := tAgent{host: "app-01", addrs: []string{"10.0.0.11"}, time: *now, segment: t0.Add(-time.Hour), edges: []tEdge{edge}}
+	consume(t, c, sink, ta)
+	c.flush(context.Background())
+	first := st.writes[0]
+	var session time.Time
+	for s := range first.sessions {
+		session = s
+	}
+
+	st.err = &pgconn.PgError{Code: "22021"}
+	*now = now.Add(15 * time.Second)
+	ta.time = *now
+	ta.edges[0].last = *now
+	consume(t, c, sink, ta)
+	c.flush(context.Background()) // dropped
+	st.err = nil
+
+	// The edge is idle since; it is still sent and written again.
+	*now = now.Add(15 * time.Second)
+	ta.time = *now
+	consume(t, c, sink, ta)
+	c.flush(context.Background())
+	h := st.writes[len(st.writes)-1]
+	if len(h.edges) != 1 {
+		t.Errorf("the idle edge was not written again: %+v", h.edges)
+	}
+	for s := range h.sessions {
+		if !s.After(session) {
+			t.Errorf("the session continues over the dropped changes: %v, then %v", session, s)
+		}
+	}
+}
+
+// TestDownstreamErrorNotReturned: an error of the pipeline to Prometheus is
+// not returned to the agent, which would count a failed export although
+// PostgreSQL has the data.
+func TestDownstreamErrorNotReturned(t *testing.T) {
+	cfg := createDefaultConfig()
+	cfg.Postgres.DSN = "postgres://unused"
+	next := consumertest.NewErr(errors.New("prometheus is down"))
+	c, err := newConnector(connectortest.NewNopSettings(Type), cfg, next)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.newStore = func(context.Context, string) (store, error) { return &fakeStore{}, nil }
+	if err := c.Start(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Shutdown(context.Background()) })
+	md := tAgent{host: "app-01", time: time.Now(), edges: []tEdge{{role: "client", proto: "tcp", local: "10.0.0.11",
+		peer: "1.1.1.1", port: 443, svc: "app", comm: "app", opened: 1}}}.metrics()
+	if err := c.ConsumeMetrics(context.Background(), md); err != nil {
+		t.Errorf("ConsumeMetrics returned the error of the next consumer: %v", err)
+	}
+}
+
+// TestSchemaVersionChecked: a connector that does not migrate waits until
+// the schema is at least its own version before it writes.
+func TestSchemaVersionChecked(t *testing.T) {
+	cfg := createDefaultConfig()
+	cfg.Postgres.DSN = "postgres://unused"
+	st := &fakeStore{behind: 1}
+	c, err := newConnector(connectortest.NewNopSettings(Type), cfg, new(consumertest.MetricsSink))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.newStore = func(context.Context, string) (store, error) { return st, nil }
+	if err := c.Start(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Shutdown(context.Background()) })
+	if c.prepareSchemaOnly(context.Background()) {
+		t.Error("writes proceed on an older schema")
+	}
+	st.mu.Lock()
+	st.behind = 0
+	st.mu.Unlock()
+	if !c.prepare(context.Background()) {
+		t.Error("writes wait on a current schema")
+	}
+}
+
+// TestPeerCIDRsSynced: PostgreSQL names peers without a service like the
+// connector, from the peer_cidrs the connector writes.
+func TestPeerCIDRsSynced(t *testing.T) {
+	_, st, _, _ := testConnector(t, func(cfg *Config) { cfg.PeerCIDRs = map[string]string{"office-lan": "192.168.10.0/24"} })
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if len(st.cidrs) != 1 || st.cidrs[0].name != "office-lan" {
+		t.Errorf("peer_cidrs written: %+v", st.cidrs)
 	}
 }

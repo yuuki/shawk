@@ -528,3 +528,44 @@ func consume(t *testing.T, c *shawkConnector, sink *consumertest.MetricsSink, ta
 }
 
 func addrOf(s string) netip.Addr { return netip.MustParseAddr(s) }
+
+// pointTimes returns the timestamps of the data points the sink received.
+func pointTimes(sink *consumertest.MetricsSink) []pcommon.Timestamp {
+	var out []pcommon.Timestamp
+	for _, md := range sink.AllMetrics() {
+		rms := md.ResourceMetrics()
+		for i := range rms.Len() {
+			sms := rms.At(i).ScopeMetrics()
+			for j := range sms.Len() {
+				ms := sms.At(j).Metrics()
+				for k := range ms.Len() {
+					m := ms.At(k)
+					switch m.Type() {
+					case pmetric.MetricTypeSum:
+						for l := range m.Sum().DataPoints().Len() {
+							out = append(out, m.Sum().DataPoints().At(l).Timestamp())
+						}
+					case pmetric.MetricTypeGauge:
+						for l := range m.Gauge().DataPoints().Len() {
+							out = append(out, m.Gauge().DataPoints().At(l).Timestamp())
+						}
+					case pmetric.MetricTypeHistogram:
+						for l := range m.Histogram().DataPoints().Len() {
+							out = append(out, m.Histogram().DataPoints().At(l).Timestamp())
+						}
+					}
+				}
+			}
+		}
+	}
+	return out
+}
+
+func opened(t *testing.T, out []series, job, peer, role string) float64 {
+	t.Helper()
+	s := find(out, metricConnOpened, job, peer, role, "")
+	if len(s) != 1 {
+		t.Fatalf("connection.opened of %s to %s = %v", job, peer, s)
+	}
+	return s[0].value
+}

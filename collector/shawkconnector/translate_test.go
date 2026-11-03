@@ -470,12 +470,12 @@ func TestTranslationBackendChoice(t *testing.T) {
 	}
 }
 
-// TestTranslationReview2: the server side behind a relay that replaces the
+// TestTranslationRelayEdgeCases: the server side behind a relay that replaces the
 // addresses of its clients counts them even when an agent holds the address
 // of the relay; at a virtual address, a listener on an unspecified address
 // or a server edge of days ago does not take precedence over the backends;
 // an agent that folds a virtual address is told to keep it exact.
-func TestTranslationReview2(t *testing.T) {
+func TestTranslationRelayEdgeCases(t *testing.T) {
 	c, st, sink, now := testConnector(t, func(cfg *Config) {
 		cfg.Translations = map[string]TranslationConfig{
 			"web-lb": {Virtual: []string{"10.0.100.2:80"}, Backends: []string{"10.0.1.20:8080"}, Sources: []string{"10.0.100.250"}},
