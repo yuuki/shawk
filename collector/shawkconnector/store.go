@@ -673,13 +673,20 @@ func (s *pgStore) prune(ctx context.Context, retention time.Duration, maxRows in
 
 func (s *pgStore) peers(ctx context.Context, learnedTTL, formerWindow time.Duration) (peerRows, error) {
 	var out peerRows
-	err := queryRows(ctx, s.pool, `SELECT host(addr), port, proto, host_id, service, last_seen, exact FROM shawk_v1.service_endpoints`,
+	// The endpoints name the peers of the outputs only, so the processes of
+	// Slurm jobs are named as Prometheus names them (process.peerName).
+	err := queryRows(ctx, s.pool, `SELECT host(addr), port, proto, host_id, service, last_seen, exact, slurm_job
+FROM shawk_v1.service_endpoints`,
 		func(rows pgx.Rows) error {
 			var addr string
 			var port int32
+			var job bool
 			var e endpointRow
-			if err := rows.Scan(&addr, &port, &e.key.proto, &e.host, &e.service, &e.lastSeen, &e.exact); err != nil {
+			if err := rows.Scan(&addr, &port, &e.key.proto, &e.host, &e.service, &e.lastSeen, &e.exact, &job); err != nil {
 				return err
+			}
+			if job {
+				e.service = slurmJobService
 			}
 			if a, err := netip.ParseAddr(addr); err == nil {
 				e.key.addr, e.key.port = a.Unmap(), uint16(port)
@@ -691,15 +698,19 @@ func (s *pgStore) peers(ctx context.Context, learnedTTL, formerWindow time.Durat
 		return out, err
 	}
 	// A folded server address, a network, is no server.
-	err = queryRows(ctx, s.pool, `SELECT host(client_addr), host(server_addr), port, proto, host_id, service, last_seen
+	err = queryRows(ctx, s.pool, `SELECT host(client_addr), host(server_addr), port, proto, host_id, service, last_seen, slurm_job
 FROM shawk_v1.client_endpoints
 WHERE masklen(server_addr) = CASE family(server_addr) WHEN 4 THEN 32 ELSE 128 END`,
 		func(rows pgx.Rows) error {
 			var client, server string
 			var port int32
+			var job bool
 			var c clientRow
-			if err := rows.Scan(&client, &server, &port, &c.key.proto, &c.host, &c.service, &c.lastSeen); err != nil {
+			if err := rows.Scan(&client, &server, &port, &c.key.proto, &c.host, &c.service, &c.lastSeen, &job); err != nil {
 				return err
+			}
+			if job {
+				c.service = slurmJobService
 			}
 			ca, err1 := netip.ParseAddr(client)
 			sa, err2 := netip.ParseAddr(server)
@@ -762,38 +773,7 @@ WHERE last_seen > now() - make_interval(secs => $1)`,
 			out.learned = append(out.learned, r)
 			return nil
 		}, learnedTTL.Seconds())
-	if err != nil {
-		return out, err
-	}
-	// The ports the processes of Slurm jobs served and connected to, over
-	// the times the views of endpoints look back, so that the endpoints of
-	// jobs name peers as the connector names them (peerRows.nameJobs).
-	out.jobs = map[jobEndpoint]bool{}
-	err = queryRows(ctx, s.pool, `SELECT DISTINCT p.host_id, x.role, x.proto, p.service_name, x.port
-FROM shawk.processes p
-CROSS JOIN LATERAL (
-  SELECT e.role, e.proto, e.port FROM shawk.edges e
-  WHERE e.process_id = p.id
-    AND e.last_seen > now() - CASE e.role WHEN 'server' THEN interval '7 days' ELSE interval '1 hour' END
-  UNION
-  SELECT 'server', l.proto, l.port FROM shawk.listeners l WHERE l.process_id = p.id
-) x
-WHERE p.unit LIKE 'slurm/%' AND p.last_seen > now() - interval '7 days'`,
-		func(rows pgx.Rows) error {
-			var k jobEndpoint
-			var port int32
-			if err := rows.Scan(&k.host, &k.role, &k.proto, &k.service, &port); err != nil {
-				return err
-			}
-			k.port = uint16(port)
-			out.jobs[k] = true
-			return nil
-		})
-	out.nameJobs()
-	if err != nil {
-		return out, err
-	}
-	if formerWindow == 0 {
+	if err != nil || formerWindow == 0 {
 		return out, err
 	}
 	out.former, err = s.formerHolders(ctx, formerWindow)

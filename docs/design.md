@@ -432,8 +432,8 @@ per packet.
   any process sets them and they repeat in every data point. The `OTEL_`
   variables of the processes of Slurm jobs are not read: any user could
   name a job `slurmctld`, so they are named after their executable onwards.
-  When the cgroup of a flow is not known, `/proc/PID/cgroup` tells whether
-  its process is in a job.
+  Nor is their environment read, so that reads that hang on a parallel
+  file system do not hold the slots of the other processes.
   PostgreSQL keeps these names; Prometheus has them under one `job` (§5.3).
 - The service of a pod is named as OBI names it from API server metadata
   (annotations, `app.kubernetes.io/*` labels, then the top owner; see
@@ -473,9 +473,14 @@ per packet.
   matches the flow is not trusted; a process that exits before it is read
   takes the latest identity seen for the same unit and comm, and for the
   processes of Slurm jobs, whose units every job of every user shares, the
-  same cgroup (step) too. What `/proc` tells of a PID now in another cgroup
-  than the flow, one of them a job's, is not used: the PID was reused by
-  another job, or `pam_slurm_adopt` moved the process.
+  same cgroup (step) too. The agent reads `/proc/PID/cgroup` with the
+  executable. What `/proc` tells of a PID now in another cgroup than the
+  flow, one of them a job's, is not used: the PID was reused by another
+  job, or `pam_slurm_adopt` moved the process; nor is a read during which
+  the cgroup changed. A flow whose cgroup path is not known (its event was
+  dropped) learns it from its process if the process is still in that
+  cgroup (same inode); otherwise a process now in a job is not taken for
+  it.
 - The host is identified by `host.id` (`/etc/machine-id`, else
   `/var/lib/dbus/machine-id`) and `host.name`. PostgreSQL keys a host by
   the hash of both, so VMs cloned with the same machine id stay apart.
@@ -734,9 +739,9 @@ the host name; `host.id` and `host.name` are promoted to labels.
   every executable of every job does not become a `job`. As peers they are
   `service.peer.name="slurm-job"` too, so both sides of a dependency
   between jobs match: the endpoints the connector learns from agents are
-  named so, and those read from PostgreSQL by the ports their processes
-  served and connected to (a service of the same name on the same port of
-  the host as a job is taken for the job). PostgreSQL keeps their names;
+  named so, and those read from PostgreSQL by the column `slurm_job` of
+  `shawk_v1.service_endpoints` and `client_endpoints`. PostgreSQL keeps
+  their names;
   the series from the agent are still keyed by executable, bounded by its
   idle TTL.
 - Inputs are cumulative per peer address and outputs merge several, so the
@@ -1056,8 +1061,8 @@ match.
 | `graph_nodes`, `graph_edges` | the dependency map between services in the format of the Grafana Node Graph; a peer without a service is named by `peer_class` |
 | `peer_class(addr)` | the name of a peer without a known service, as in `service.peer.name`: the narrowest range of `peer_cidrs`, `~unresolved` for an address not routed on the Internet, `~external` otherwise, including the networks of folded peers |
 | `dependency_changes` | dependencies between services that appeared, or disappeared while a host that saw them kept observing for 15 minutes |
-| `service_endpoints` | addresses and ports services accept connections on: the last known listeners of each host (unspecified addresses expanded to the host's addresses) and its server edges, for hosts that reported in the last 30 days, except addresses another host took over since; used by the connector (§5.2) |
-| `client_endpoints` | the client sides of connections in the last hour (client address, server address, port, client service); used by the connector to name the peer of a server edge |
+| `service_endpoints` | addresses and ports services accept connections on: the last known listeners of each host (unspecified addresses expanded to the host's addresses) and its server edges, for hosts that reported in the last 30 days, except addresses another host took over since; `slurm_job` if a process of a Slurm job serves it; used by the connector (§5.2) |
+| `client_endpoints` | the client sides of connections in the last hour (client address, server address, port, client service, `slurm_job` if the client is a process of a Slurm job); used by the connector to name the peer of a server edge |
 | `agent_addrs` | addresses of hosts whose agent closed an interval in the last 5 minutes, with what the agent traces and folds; used by the connector |
 | `agents` | the latest segment of every host and whether its agent is alive; the last columns, `peer_fold` and `peer_internal`, tell what the agent folds and the ranges it keeps exact |
 | `unobserved(since, until, tolerance)` | the periods in which each host was not observed; Grafana overlays them as annotations |

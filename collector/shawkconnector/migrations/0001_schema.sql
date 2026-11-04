@@ -1310,7 +1310,8 @@ $$;
 --
 -- exact tells whether the address was observed on a socket rather than
 -- inferred from a listener on an unspecified address; the connector prefers
--- exact endpoints.
+-- exact endpoints. slurm_job tells that a process of a Slurm job (unit
+-- slurm/*) serves it, which the connector names slurm-job as a peer.
 CREATE VIEW shawk_v1.service_endpoints AS
 WITH latest AS (
   SELECT host_id, max(last_seen) AS last_seen FROM shawk.listeners GROUP BY host_id
@@ -1323,14 +1324,15 @@ current_addrs AS (
   WHERE a.last_seen >= m.last_seen - shawk.alive_window()
 ),
 s AS (
-  SELECT l.addr, l.port, l.proto, l.host_id, p.service_name AS service, l.last_seen, true AS exact
+  SELECT l.addr, l.port, l.proto, l.host_id, p.service_name AS service, l.last_seen, true AS exact,
+         p.unit LIKE 'slurm/%' AS slurm_job
   FROM shawk.listeners l
   JOIN shawk.processes p ON p.id = l.process_id
   JOIN latest ON latest.host_id = l.host_id
   WHERE l.addr NOT IN (inet '0.0.0.0', inet '::')
     AND l.last_seen >= latest.last_seen - interval '1 hour'
   UNION ALL
-  SELECT a.addr, l.port, l.proto, l.host_id, p.service_name, l.last_seen, false
+  SELECT a.addr, l.port, l.proto, l.host_id, p.service_name, l.last_seen, false, p.unit LIKE 'slurm/%'
   FROM shawk.listeners l
   JOIN shawk.processes p ON p.id = l.process_id
   JOIN latest ON latest.host_id = l.host_id
@@ -1339,7 +1341,7 @@ s AS (
   WHERE l.addr IN (inet '0.0.0.0', inet '::')
     AND l.last_seen >= latest.last_seen - interval '1 hour'
   UNION ALL
-  SELECT e.local_addr, e.port, e.proto, e.host_id, p.service_name, e.last_seen, true
+  SELECT e.local_addr, e.port, e.proto, e.host_id, p.service_name, e.last_seen, true, p.unit LIKE 'slurm/%'
   FROM latest
   CROSS JOIN LATERAL (
     SELECT DISTINCT ON (e.local_addr, e.port, e.proto, e.process_id) e.*
@@ -1361,7 +1363,7 @@ moved AS (
     AND NOT (mine.addr << inet '127.0.0.0/8' OR mine.addr = inet '::1')
 )
 SELECT s.addr, s.port, s.proto, h.hostname AS host, s.host_id, s.service, max(s.last_seen) AS last_seen,
-       bool_or(s.exact) AS exact
+       bool_or(s.exact) AS exact, bool_or(s.slurm_job) AS slurm_job
 FROM s
 JOIN shawk.hosts h ON h.id = s.host_id
 LEFT JOIN moved ON moved.host_id = s.host_id AND moved.addr = s.addr
@@ -1371,10 +1373,12 @@ GROUP BY s.addr, s.port, s.proto, h.hostname, s.host_id, s.service;
 
 -- The client sides of recent connections, used by the shawk connector to
 -- name the peer of a server edge after the client service, when the client
--- host runs an agent.
+-- host runs an agent. slurm_job tells that the client is a process of a
+-- Slurm job (unit slurm/*).
 CREATE VIEW shawk_v1.client_endpoints AS
 SELECT e.local_addr AS client_addr, e.remote_addr AS server_addr, e.port, e.proto,
-       h.hostname AS host, e.host_id, p.service_name AS service, e.last_seen
+       h.hostname AS host, e.host_id, p.service_name AS service, e.last_seen,
+       p.unit LIKE 'slurm/%' AS slurm_job
 FROM shawk.edges e
 JOIN shawk.processes p ON p.id = e.process_id
 JOIN shawk.hosts h ON h.id = e.host_id

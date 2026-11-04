@@ -286,8 +286,6 @@ type peerRows struct {
 	clients   []clientRow
 	agents    []agentAddrRow
 	learned   []learnedRow
-	// jobs are the endpoints of the processes of Slurm jobs.
-	jobs map[jobEndpoint]bool
 	// former are read with peer_hosts only.
 	former []formerHolderRow
 }
@@ -296,31 +294,6 @@ type peerRows struct {
 type formerHolderRow struct {
 	addr netip.Addr
 	formerHolder
-}
-
-// jobEndpoint is the port a process of a Slurm job of a host served or
-// connected to, with the role and the service of the process, which tells
-// apart the rows of shawk_v1.service_endpoints and client_endpoints of jobs.
-type jobEndpoint struct {
-	host, role, proto, service string
-	port                       uint16
-}
-
-// nameJobs names the endpoints of the processes of Slurm jobs slurm-job, as
-// the connector names them when it learns them (process.peerName).
-func (rows *peerRows) nameJobs() {
-	for i := range rows.endpoints {
-		e := &rows.endpoints[i]
-		if rows.jobs[jobEndpoint{e.host, roleServer, e.key.proto, e.service, e.key.port}] {
-			e.service = slurmJobService
-		}
-	}
-	for i := range rows.clients {
-		c := &rows.clients[i]
-		if rows.jobs[jobEndpoint{c.host, roleClient, c.key.proto, c.service, c.key.port}] {
-			c.service = slurmJobService
-		}
-	}
 }
 
 // load replaces what was read from PostgreSQL at now.

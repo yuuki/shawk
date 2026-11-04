@@ -599,7 +599,9 @@ func TestPGProcessesKeepTheirServices(t *testing.T) {
 
 // TestPGSlurmJobPeers: the endpoints and clients of the processes of Slurm
 // jobs read from PostgreSQL are named slurm-job, as the peers the connector
-// learns, while PostgreSQL keeps the names of the processes (#173).
+// learns, while PostgreSQL keeps the names of the processes; a process of
+// the same name on the same port of the host, at another address, is not
+// a job's (#173).
 func TestPGSlurmJobPeers(t *testing.T) {
 	dsn, conn := migratedDB(t)
 	st, err := newPGStore(context.Background(), dsn)
@@ -611,20 +613,21 @@ func TestPGSlurmJobPeers(t *testing.T) {
 	h := newHostChanges("n1")
 	h.setHost("m1", "n1", "k", "v", now)
 	h.addAddr(addrOf("10.0.0.1"), span{now, now})
-	job := procKey{"slurm/step", "vasp_std", "vasp_std"}
+	h.addAddr(addrOf("10.0.1.1"), span{now, now})
+	job := procKey{"slurm/step", "python3", "python3"}
 	batch := procKey{"slurm/batch", "python3", "python3"}
-	sshd := procKey{"sshd.service", "sshd", "sshd"}
-	for _, pk := range []procKey{job, batch, sshd} {
-		h.addProcess(pk, "/usr/bin/"+pk.comm, span{now, now})
+	svc := procKey{"jupyter.service", "python3", "python3"}
+	for _, pk := range []procKey{job, batch, svc} {
+		h.addProcess(pk, "/usr/bin/python3", span{now, now})
 	}
-	h.addListener(listenerRowKey{proto: "tcp", addr: addrOf("0.0.0.0"), port: 40000, netns: 1, procKey: job}, span{now, now})
-	h.addListener(listenerRowKey{proto: "tcp", addr: addrOf("0.0.0.0"), port: 22, netns: 1, procKey: sshd}, span{now, now})
+	h.addListener(listenerRowKey{proto: "tcp", addr: addrOf("10.0.0.1"), port: 8888, netns: 1, procKey: job}, span{now, now})
+	h.addListener(listenerRowKey{proto: "tcp", addr: addrOf("10.0.1.1"), port: 8888, netns: 1, procKey: svc}, span{now, now})
 	h.addEdge(edgeRowKey{role: "server", proto: "tcp", local: addrOf("10.0.0.1"), peer: addrOf("10.0.0.2"), port: 40001,
 		netns: 1, procKey: job}, span{now, now})
-	h.addEdge(edgeRowKey{role: "client", proto: "tcp", local: addrOf("10.0.0.1"), peer: addrOf("10.0.0.2"), port: 8786,
+	h.addEdge(edgeRowKey{role: "client", proto: "tcp", local: addrOf("10.0.0.1"), peer: addrOf("10.0.0.2"), port: 5432,
 		netns: 1, procKey: batch}, span{now, now})
-	h.addEdge(edgeRowKey{role: "client", proto: "tcp", local: addrOf("10.0.0.1"), peer: addrOf("10.0.0.2"), port: 6817,
-		netns: 1, procKey: sshd}, span{now, now})
+	h.addEdge(edgeRowKey{role: "client", proto: "tcp", local: addrOf("10.0.0.1"), peer: addrOf("10.0.0.3"), port: 5432,
+		netns: 1, procKey: svc}, span{now, now})
 	if err := st.write(context.Background(), h); err != nil {
 		t.Fatal(err)
 	}
@@ -640,13 +643,13 @@ func TestPGSlurmJobPeers(t *testing.T) {
 		got = append(got, fmt.Sprint("client ", c.key.server, ":", c.key.port, " ", c.service))
 	}
 	slices.Sort(got)
-	want := []string{"client 10.0.0.2:6817 sshd", "client 10.0.0.2:8786 slurm-job",
-		"server 10.0.0.1:22 sshd", "server 10.0.0.1:40000 slurm-job", "server 10.0.0.1:40001 slurm-job"}
+	want := []string{"client 10.0.0.2:5432 slurm-job", "client 10.0.0.3:5432 python3",
+		"server 10.0.0.1:40001 slurm-job", "server 10.0.0.1:8888 slurm-job", "server 10.0.1.1:8888 python3"}
 	if !slices.Equal(got, want) {
 		t.Errorf("endpoints read = %q, want %q", got, want)
 	}
-	if got := queryStrings(t, conn, `SELECT service_name FROM shawk.processes ORDER BY 1`); !slices.Equal(got,
-		[]string{"python3", "sshd", "vasp_std"}) {
+	if got := queryStrings(t, conn, `SELECT unit, service_name FROM shawk.processes ORDER BY 1`); !slices.Equal(got,
+		[]string{"jupyter.service python3", "slurm/batch python3", "slurm/step python3"}) {
 		t.Errorf("processes = %q", got)
 	}
 }
