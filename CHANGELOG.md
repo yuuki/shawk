@@ -1,3 +1,30 @@
+## [v0.8.1](https://github.com/yuuki/shawk/compare/v0.8.0...v0.8.1) (2026-11-04)
+
+No change in behavior: the BPF programs run the same instructions.
+
+### Changed
+
+* The BPF programs build with clang 21 (#168): `make generate` failed
+  with `-Wdefault-const-init-var-unsafe`, which clang 21 enables by
+  default, because `BPF_CORE_READ()` declares its result with the type of
+  the field, which is const when the object is read through a pointer to
+  const. The helpers take the sockets and conntrack entries they read as
+  pointers to non-const. The committed object is still generated with
+  clang 18.1.3, as in CI.
+
+### Documentation
+
+* Re-evaluation of the kernel hooks on Rocky Linux 9.8 and Ubuntu 24.04
+  (aarch64) in `docs/research/kernel-hooks`, with the harness
+  `test/hookcost` and the raw results (#165): hooks on every TCP message,
+  on accept, and fentry, kprobes and cgroup_skb for UDP. `docs/design.md`
+  §3 and §10 give the measured costs as the reasons for the hooks.
+* The failure reason of a connect (`error.type`) races with user space on
+  every kernel, not only on those without `tcp_done_with_error()`: an
+  application that reads the error with `SO_ERROR` while the kernel
+  closes the socket takes it first, and the failure counts as `timeout`
+  (#166, `docs/design.md` §10).
+
 ## [v0.8.0](https://github.com/yuuki/shawk/compare/v0.7.1...v0.8.0) (2026-11-04)
 
 Rewritten from scratch.
