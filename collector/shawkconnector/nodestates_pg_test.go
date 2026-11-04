@@ -150,7 +150,7 @@ func TestPGUnobservedReasons(t *testing.T) {
 	got := queryStrings(t, conn, `
 SELECT round(extract(epoch FROM now() - gap_start) / 60)::int, round(extract(epoch FROM now() - gap_end) / 60)::int,
        coalesce(cause, '-'), coalesce(node_state, '-'), coalesce(reason, '-')
-FROM shawk_v1.unobserved_reasons(now() - interval '12 hours', now(), '0')`)
+FROM shawk_v1.unobserved_reasons(now() - interval '12 hours', now() - interval '1 minute', '0')`)
 	want := []string{
 		"600 570 - - -",
 		"570 475 power_saving IDLE+POWERED_DOWN -", // until 5 minutes after the last read
@@ -166,7 +166,7 @@ FROM shawk_v1.unobserved_reasons(now() - interval '12 hours', now(), '0')`)
 		t.Errorf("unobserved_reasons =\n%v\nwant\n%v", got, want)
 	}
 	// unobserved() is unchanged: one gap.
-	if got := queryStrings(t, conn, `SELECT host FROM shawk_v1.unobserved(now() - interval '12 hours', now(), '0')`); len(got) != 1 {
+	if got := queryStrings(t, conn, `SELECT host FROM shawk_v1.unobserved(now() - interval '12 hours', now() - interval '1 minute', '0')`); len(got) != 1 {
 		t.Errorf("unobserved = %v", got)
 	}
 }
