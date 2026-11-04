@@ -628,7 +628,7 @@ func TestPGSlurmJobPeers(t *testing.T) {
 	if err := st.write(context.Background(), h); err != nil {
 		t.Fatal(err)
 	}
-	rows, err := st.peers(context.Background(), time.Hour)
+	rows, err := st.peers(context.Background(), time.Hour, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

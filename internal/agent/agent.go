@@ -194,6 +194,13 @@ func Run(ctx context.Context, cfg Config) error {
 	a.log.Info("agent started", "endpoint", cfg.Exporter.Endpoint, "protocol", cfg.Exporter.Protocol,
 		"interval", cfg.Interval, "idle_ttl", cfg.IdleTTL, "udp", tr.UDPEnabled(),
 		"learn_translations", cfg.LearnTranslations)
+	// The programs are attached and the sockets that existed before were
+	// adopted, so connections from now on are traced: units ordered after
+	// the agent's start once it reports ready. Under Type=notify a failure
+	// above fails the start instead.
+	if err := notify("READY=1"); err != nil {
+		return fmt.Errorf("notifying systemd that the agent is ready: %w", err)
+	}
 
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()

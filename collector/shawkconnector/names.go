@@ -47,6 +47,17 @@ const (
 	metricAgentTranslationsDropped = "shawk.agent.translations.dropped"
 )
 
+// Names of the outputs per peer host (peer_hosts), which the connector
+// makes from the inputs of the same names without .host.
+const (
+	metricHostConnOpened         = "shawk.host.connection.opened"
+	metricHostConnFailedByReason = "shawk.host.connection.failed.by_reason"
+	metricHostHandshake          = "shawk.host.tcp.handshake"
+	metricHostSynRetransmits     = "shawk.host.tcp.syn_retransmits"
+	metricHostNetworkIO          = "shawk.host.network.io"
+	metricHostRetransmits        = "shawk.host.tcp.retransmits"
+)
+
 // Names of the attributes.
 const (
 	attrHostID            = "host.id"
@@ -59,6 +70,7 @@ const (
 	attrServiceInstanceID = "service.instance.id"
 	attrPeerService       = "service.peer.name"
 	attrPeerAgent         = "shawk.peer.agent"
+	attrPeerHost          = "shawk.peer.host"
 
 	attrExePath     = "process.executable.path"
 	attrCommand     = "process.command"
@@ -201,6 +213,14 @@ const (
 	peerUnresolved = "~unresolved" // a private address without a known service
 	peerExternal   = "~external"   // a public address
 	peerOther      = "~other"      // folded beyond max_peers
+)
+
+// Values of shawk.peer.host for peers whose host is not known (§1.3 of
+// docs/proposals/slurm-hpc-clusters.md).
+const (
+	hostUnknown  = "~unknown"  // an internal address
+	hostExternal = "~external" // a public address, or a folded peer
+	hostOther    = "~other"    // folded beyond max_peer_hosts
 )
 
 // serviceOther is the service.name of the outputs of the local services
