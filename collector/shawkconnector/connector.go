@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -43,6 +44,9 @@ type shawkConnector struct {
 	ports        *portRules
 
 	lastPrune, lastRefresh time.Time
+	// portRulesWarned is when rules of ports in PostgreSQL other than
+	// those of this connector were last logged.
+	portRulesWarned time.Time
 
 	// Errors of the pipeline after the connector, logged at most once a
 	// minute.
@@ -330,11 +334,36 @@ func (c *shawkConnector) refreshIfDue(ctx context.Context) {
 	}
 	rctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
+	c.checkPortRules(rctx)
 	if _, err := c.store.refreshDependencies(rctx); err != nil {
 		c.log.Error("updating the history of dependencies", zap.Error(err))
 		return
 	}
 	c.lastRefresh = c.now()
+}
+
+// checkPortRules logs, at most once an hour, that the rules of ports in
+// PostgreSQL are not those of this connector: another connector with
+// other port_agnostic_services or dynamic_ports wrote them since, e.g.
+// during a rolling update of the configuration. PostgreSQL aggregates the
+// dependencies by its rules, and the outputs of this connector by its own,
+// so the two disagree until every connector has the same configuration.
+func (c *shawkConnector) checkPortRules(ctx context.Context) {
+	if c.now().Sub(c.portRulesWarned) < foldWarnInterval {
+		return
+	}
+	got, err := c.store.portRuleKeys(ctx)
+	if err != nil {
+		c.log.Warn("reading the rules of ports from PostgreSQL", zap.Error(err))
+		return
+	}
+	if want := c.ports.keys(); !slices.Equal(got, want) {
+		c.log.Error("PostgreSQL has other port_agnostic_services or dynamic_ports than this connector, "+
+			"written by a connector with another configuration; dependencies on them are aggregated differently "+
+			"in PostgreSQL and in the outputs until every connector has the same configuration",
+			zap.Strings("postgres", got), zap.Strings("connector", want))
+		c.portRulesWarned = c.now()
+	}
 }
 
 // flush writes the pending changes, one transaction per host. The changes

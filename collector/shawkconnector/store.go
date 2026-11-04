@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"slices"
 	"strings"
 	"time"
 
@@ -34,6 +35,9 @@ type store interface {
 	// syncConfig replaces the named address ranges of peers, the
 	// translations of addresses and the rules of ports.
 	syncConfig(ctx context.Context, cidrs []namedPrefix, ts []translation, ports *portRules) error
+	// portRuleKeys reads the rules of ports in PostgreSQL, as keys() makes
+	// them.
+	portRuleKeys(ctx context.Context) ([]string, error)
 	// refreshDependencies brings the history of dependencies between
 	// services up to date.
 	refreshDependencies(ctx context.Context) (int64, error)
@@ -593,6 +597,24 @@ ON CONFLICT DO NOTHING`, []any{dnames, dprotos, daddrs, dfrom, dto}},
 		_, err := tx.Exec(ctx, `DELETE FROM shawk.known_dependencies_state`)
 		return err
 	})
+}
+
+func (s *pgStore) portRuleKeys(ctx context.Context) ([]string, error) {
+	var out []string
+	err := queryRows(ctx, s.pool, `
+SELECT 'service ' || service FROM shawk.port_agnostic_services
+UNION ALL
+SELECT format('dynamic_ports %s %s %s %s-%s', name, proto, addr, port_from, port_to) FROM shawk.dynamic_ports`,
+		func(rows pgx.Rows) error {
+			var k string
+			if err := rows.Scan(&k); err != nil {
+				return err
+			}
+			out = append(out, k)
+			return nil
+		})
+	slices.Sort(out)
+	return out, err
 }
 
 func (s *pgStore) refreshDependencies(ctx context.Context) (int64, error) {

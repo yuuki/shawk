@@ -676,10 +676,12 @@ the host name; `host.id` and `host.name` are promoted to labels.
   hosts). The server is the peer of a client edge, at its backend through
   a translation (§5.4), and the local process of a server edge;
   PostgreSQL applies the same rules (§6.1, §6.2) and keeps the ports of
-  the edges. Without them every
-  port is kept. Ports chosen by the kernel are not detected: a listener
-  is seen only while the iterator lists it, and a kernel-chosen port does
-  not make the servers on it one service.
+  the edges. Without them every port is kept. PostgreSQL holds the rules
+  of the connector that wrote them last, so connectors that share it need
+  the same ones; one that finds others there, e.g. during a rolling update
+  of the configuration, logs an error hourly. Ports chosen by the kernel
+  are not detected: a listener is seen only while the iterator lists it,
+  and a kernel-chosen port does not make the servers on it one service.
 - Inputs are cumulative per peer address and outputs merge several, so the
   connector adds the increases of each input to its output, treating a
   decrease or new start time as a reset; an output never decreases when an
@@ -893,12 +895,14 @@ dynamic_ports(name, proto, addr, port_from, port_to)  -- written by the connecto
 
 `known_dependencies` keeps every dependency between services ever seen,
 refreshed every 5 minutes (`shawk.refresh_known_dependencies()`). When the
-connector changes the rules of ports, the dependencies known on ports they
-cover are added on port 0 (`shawk.aggregate_known_dependencies()`; it has
-no addresses, so a range of `dynamic_ports` covers its ports on every host
-there), and the next refresh rebuilds the table from every edge kept, so
-that neither adding nor removing a rule makes a dependency seen before
-new. The session columns are described in §5.1. `service_name` has the
+connector changes the rules of ports, the next refresh rebuilds the table
+from every edge kept under the new rules, so that neither adding nor
+removing a rule makes a dependency seen before new, and the dependencies
+known on a service of `port_agnostic_services` are also added on port 0
+(`shawk.aggregate_known_dependencies()`), for those whose edges are gone.
+Ranges of `dynamic_ports` hold for addresses, which `known_dependencies`
+lacks, so they are left to the rebuild: a dependency known only outside a
+range would hide one new in it. The session columns are described in §5.1. `service_name` has the
 form of the `job` label (`namespace/name`), so names in PostgreSQL and
 Prometheus match.
 

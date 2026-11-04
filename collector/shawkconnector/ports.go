@@ -138,11 +138,31 @@ func parseDynamicPorts(name string, c DynamicPortsConfig) (dynamicPorts, error) 
 	return d, nil
 }
 
+// keys returns the rules as the rows of the tables, sorted, so that the
+// rules of two connectors compare.
+func (r *portRules) keys() []string {
+	var out []string
+	if r != nil {
+		for _, s := range r.services {
+			out = append(out, "service "+s)
+		}
+	}
+	for _, d := range r.dynamicPortsRows() {
+		out = append(out, d.key())
+	}
+	sort.Strings(out)
+	return out
+}
+
 // dynamicPortsRow is a row of shawk.dynamic_ports.
 type dynamicPortsRow struct {
 	name, proto string
 	prefix      netip.Prefix
 	from, to    uint16
+}
+
+func (d dynamicPortsRow) key() string {
+	return fmt.Sprintf("dynamic_ports %s %s %s %d-%d", d.name, d.proto, d.prefix, d.from, d.to)
 }
 
 // dynamicPortsRows returns the rows of shawk.dynamic_ports: a range for

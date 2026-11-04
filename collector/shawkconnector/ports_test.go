@@ -1,6 +1,7 @@
 package shawkconnector
 
 import (
+	"context"
 	"fmt"
 	"maps"
 	"os"
@@ -256,5 +257,41 @@ func TestPortAgnosticThroughTranslations(t *testing.T) {
 	// range, and keeps its port.
 	if want := map[string]float64{"postgres:0": 4, "web:0": 2, "~unresolved:443": 1}; !maps.Equal(got, want) {
 		t.Errorf("client outputs = %v, want %v", got, want)
+	}
+}
+
+// TestPortRulesMismatchLogged: a connector whose rules of ports are not
+// those PostgreSQL has, as during a rolling update of the configuration,
+// logs it at most once an hour; the same rules log nothing.
+func TestPortRulesMismatchLogged(t *testing.T) {
+	c, st, _, now := testConnector(t, func(cfg *Config) { cfg.PortAgnosticServices = []string{"srun"} })
+	logs := observe(c)
+	mismatches := func() int {
+		n := 0
+		for _, e := range logs.TakeAll() {
+			if _, ok := e.ContextMap()["postgres"]; ok {
+				n++
+			}
+		}
+		return n
+	}
+	c.refreshIfDue(context.Background())
+	if n := mismatches(); n != 0 {
+		t.Errorf("%d warnings with the same rules", n)
+	}
+	st.mu.Lock()
+	st.ruleKeys = []string{}
+	st.mu.Unlock()
+	*now = now.Add(refreshInterval)
+	c.refreshIfDue(context.Background())
+	*now = now.Add(refreshInterval)
+	c.refreshIfDue(context.Background())
+	if n := mismatches(); n != 1 {
+		t.Errorf("%d warnings with other rules, want 1", n)
+	}
+	*now = now.Add(time.Hour)
+	c.refreshIfDue(context.Background())
+	if n := mismatches(); n != 1 {
+		t.Errorf("%d warnings an hour later, want 1", n)
 	}
 }

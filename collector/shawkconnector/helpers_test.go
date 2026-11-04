@@ -346,11 +346,13 @@ type fakeStore struct {
 	err      error
 	migrated int
 	// behind is how many versions the schema is behind the connector.
-	behind  int
-	cidrs   []namedPrefix
-	ports   *portRules
-	trans   []translation
-	refresh int
+	behind int
+	cidrs  []namedPrefix
+	ports  *portRules
+	// ruleKeys replaces the rules of ports read back when not nil.
+	ruleKeys []string
+	trans    []translation
+	refresh  int
 }
 
 func (s *fakeStore) schemaVersion(context.Context) (int, error) {
@@ -364,6 +366,15 @@ func (s *fakeStore) syncConfig(_ context.Context, cidrs []namedPrefix, ts []tran
 	defer s.mu.Unlock()
 	s.cidrs, s.trans, s.ports = cidrs, ts, ports
 	return nil
+}
+
+func (s *fakeStore) portRuleKeys(context.Context) ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ruleKeys != nil {
+		return s.ruleKeys, nil
+	}
+	return s.ports.keys(), nil
 }
 
 func (s *fakeStore) refreshDependencies(context.Context) (int64, error) {

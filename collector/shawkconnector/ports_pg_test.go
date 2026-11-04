@@ -109,9 +109,10 @@ func TestPGPortAgnosticNotNew(t *testing.T) {
 }
 
 // TestPGPortRulesSynced: the connector writes its rules of ports, and the
-// dependencies known on their ports before become known on port 0, so that
-// configuring a rule does not make them new; without rules the tables are
-// emptied.
+// dependencies known before on services of port_agnostic_services become
+// known on port 0, so that configuring them does not make the
+// dependencies new; ranges of dynamic_ports, which hold for addresses, are
+// left to the refresh. Without rules the tables are emptied.
 func TestPGPortRulesSynced(t *testing.T) {
 	dsn, conn := migratedDB(t)
 	execAll(t, conn, `INSERT INTO shawk.known_dependencies VALUES
@@ -131,7 +132,7 @@ func TestPGPortRulesSynced(t *testing.T) {
 	got := queryStrings(t, conn, `SELECT client_service, server_service, port, proto,
 		round(extract(epoch FROM now() - first_seen) / 86400)::int, round(extract(epoch FROM now() - last_seen) / 86400)::int
 		FROM shawk.known_dependencies WHERE port = 0`)
-	if want := []string{"mpi mpi 0 tcp 3 1", "slurmctld srun 0 tcp 3 1"}; !slices.Equal(got, want) {
+	if want := []string{"slurmctld srun 0 tcp 3 1"}; !slices.Equal(got, want) {
 		t.Errorf("known on port 0 = %q, want %q", got, want)
 	}
 	st, err := newPGStore(context.Background(), dsn)
@@ -210,5 +211,58 @@ func TestPGPortRulesRemoved(t *testing.T) {
 	got := queryStrings(t, conn, `SELECT change, port FROM shawk_v1.dependency_changes_between(now() - interval '15 minutes', now())`)
 	if len(got) != 0 {
 		t.Errorf("changes = %q", got)
+	}
+}
+
+// TestPGDynamicPortsNewInRange: a dependency on a port of a range of
+// dynamic_ports known only on a host outside the range does not hide one
+// that is new in it, when the rule is configured after both were seen
+// apart.
+func TestPGDynamicPortsNewInRange(t *testing.T) {
+	dsn, conn := migratedDB(t)
+	f := fixture{t, conn}
+	f.host("node02", "mpi")
+	f.host("login01", "mpi")
+	f.host("node01", "mpi")
+	f.conn2("node02", "mpi", "10.1.0.2", "login01", "mpi", "10.2.0.1", 60010,
+		"now()-interval '2 days'", "now()-interval '2 days'+interval '1 minute'")
+	execAll(t, conn, `SELECT shawk.refresh_known_dependencies(interval '0')`)
+	portRulesFixture(t, dsn)
+	execAll(t, conn, `SELECT shawk.refresh_known_dependencies(interval '0')`)
+	if got := queryStrings(t, conn, `SELECT port FROM shawk.known_dependencies`); !slices.Equal(got, []string{"60010"}) {
+		t.Errorf("known ports = %q", got)
+	}
+	f.conn2("node02", "mpi", "10.1.0.2", "node01", "mpi", "10.1.0.1", 60010,
+		"now()-interval '2 minutes'", "now()-interval '1 minute'")
+	got := queryStrings(t, conn, `SELECT change, port FROM shawk_v1.dependency_changes_between(now() - interval '15 minutes', now())`)
+	if want := []string{"appeared 0"}; !slices.Equal(got, want) {
+		t.Errorf("changes = %q, want %q", got, want)
+	}
+}
+
+// TestPGPortRuleKeys: the rules of ports read back from PostgreSQL compare
+// equal to those the connector wrote, so that a connector with the same
+// configuration logs nothing.
+func TestPGPortRuleKeys(t *testing.T) {
+	dsn, _ := migratedDB(t)
+	ctx := context.Background()
+	st, err := newPGStore(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+	rules := must(parsePortRules([]string{"srun", "ns/salloc"}, map[string]DynamicPortsConfig{
+		"cluster": {Hosts: []string{"10.1.0.0/16", "2001:db8:0:1::/64", "10.2.0.7"}, Transport: "tcp", Ports: "60001-63000"},
+		"pmix":    {Ports: "50000-50010"},
+	}))
+	if err := st.syncConfig(ctx, nil, nil, rules); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.portRuleKeys(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := rules.keys(); !slices.Equal(got, want) {
+		t.Errorf("keys = %q, want %q", got, want)
 	}
 }
