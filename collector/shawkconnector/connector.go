@@ -61,11 +61,11 @@ type shawkConnector struct {
 
 	// Of the node_states_file and the maintenance_file, used by the loop
 	// only: when the states last written were read from Slurm, the
-	// maintenance windows last written, the errors last logged, and whether
-	// stale states were logged.
+	// maintenance windows last written and when, the errors last logged,
+	// and whether stale states were logged.
 	nodeStatesAt                  time.Time
 	windowsKey                    string
-	windowsSynced                 bool
+	windowsSynced                 time.Time
 	nodeStatesErr, maintenanceErr string
 	nodeStatesStale               bool
 	// unknownNodes are the nodes the inventory did not map, last logged.

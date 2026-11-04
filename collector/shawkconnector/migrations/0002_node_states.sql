@@ -97,17 +97,35 @@ WHERE greatest(w.starts_at, w.registered_at) < w.ends_at;
 -- Slurm until it becomes stale. A stale state, DOWN or DRAIN stop nothing:
 -- alerts on stopped agents exclude these hosts only. A MAINT reservation
 -- (which may be unlimited) stops them for 30 days at most, as the longest
--- window of the maintenance_file.
+-- window of the maintenance_file, counted from the first of the states
+-- with MAINT that follow each other, whatever their other flags and
+-- reasons. The states read in the last 31 days suffice to find it: the
+-- first of them follows one read before.
 CREATE VIEW shawk_v1.planned_stops AS
 SELECT w.hostname AS host, 'maintenance'::text AS cause, lower(w.period) AS since, upper(w.period) AS until, w.reason
 FROM shawk.maintenance_periods w
 WHERE w.period @> now()
 UNION ALL
-SELECT s.hostname, shawk.planned_state(s.state), s.first_seen, s.last_seen + shawk.node_state_max_age(), s.reason
-FROM (SELECT DISTINCT ON (hostname) * FROM shawk.node_states ORDER BY hostname, first_seen DESC) s
+SELECT s.hostname, s.cause, s.since, s.last_seen + shawk.node_state_max_age(), s.reason
+FROM (
+  SELECT DISTINCT ON (r.hostname) r.hostname, r.first_seen, r.cause, r.last_seen, r.reason,
+         CASE WHEN r.cause = 'maintenance'
+              THEN min(r.first_seen) FILTER (WHERE r.cause = 'maintenance') OVER (PARTITION BY r.hostname, r.run)
+              ELSE r.first_seen END AS since
+  FROM (
+    SELECT n.hostname, n.first_seen, n.last_seen, n.reason, shawk.planned_state(n.state) AS cause,
+           -- states with MAINT that follow each other share a run (with
+           -- the state before them, which the minimum leaves out)
+           count(*) FILTER (WHERE shawk.planned_state(n.state) IS DISTINCT FROM 'maintenance')
+             OVER (PARTITION BY n.hostname ORDER BY n.first_seen) AS run
+    FROM shawk.node_states n
+    WHERE n.last_seen > now() - interval '31 days'
+  ) r
+  ORDER BY r.hostname, r.first_seen DESC
+) s
 WHERE s.last_seen + shawk.node_state_max_age() > now()
-  AND shawk.planned_state(s.state) IS NOT NULL
-  AND (shawk.planned_state(s.state) <> 'maintenance' OR s.first_seen > now() - interval '30 days');
+  AND s.cause IS NOT NULL
+  AND (s.cause <> 'maintenance' OR s.since > now() - interval '30 days');
 
 -- The periods of unobserved(since, until, tolerance), cut by what Slurm and
 -- the maintenance windows tell about them: cause is maintenance or

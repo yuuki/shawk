@@ -173,10 +173,11 @@ FROM shawk_v1.unobserved_reasons(now() - interval '12 hours', now(), '0')`)
 
 // TestPGPlannedStops: hosts in a planned stop now, by the latest state if it
 // is fresh and planned (powering up too, but not once up), or a window in
-// progress; and the silent agent alert does not name them.
+// progress; MAINT for 30 days since it started, whatever the other flags
+// (longmaint); and the silent agent alert does not name them.
 func TestPGPlannedStops(t *testing.T) {
 	_, conn := migratedDB(t)
-	hosts := []string{"off", "stale", "down", "resuming", "booted", "maint", "maintflag", "nothing"}
+	hosts := []string{"off", "stale", "down", "resuming", "booted", "maint", "maintflag", "longmaint", "remaint", "nothing"}
 	for _, h := range hosts {
 		execAll(t, conn,
 			fmt.Sprintf(`INSERT INTO shawk.hosts VALUES ('%[1]s','m','%[1]s','k','v',now()-interval '30 days',now()-interval '2 days')`, h),
@@ -192,12 +193,17 @@ func TestPGPlannedStops(t *testing.T) {
 		   ('resuming', now()-interval '2 minutes', now()-interval '1 minute', '{ALLOCATED,POWERING_UP}'),
 		   ('booted', now()-interval '2 days', now()-interval '10 minutes', '{IDLE,POWERING_UP}'),
 		   ('booted', now()-interval '9 minutes', now()-interval '1 minute', '{IDLE}'),
-		   ('maintflag', now()-interval '1 hour', now(), '{DOWN,MAINT}')`,
+		   ('maintflag', now()-interval '1 hour', now(), '{DOWN,MAINT}'),
+		   ('longmaint', now()-interval '40 days', now()-interval '20 days', '{IDLE,MAINT}'),
+		   ('longmaint', now()-interval '20 days', now()-interval '1 minute', '{DOWN,MAINT}'),
+		   ('remaint', now()-interval '40 days', now()-interval '10 days', '{IDLE}'),
+		   ('remaint', now()-interval '10 days', now()-interval '1 minute', '{IDLE,MAINT}')`,
 		`INSERT INTO shawk.maintenance_windows VALUES
 		   ('maint', now()-interval '1 hour', now()+interval '1 hour', 'firmware', now()-interval '2 hours'),
 		   ('nothing', now()-interval '3 hours', now()-interval '1 hour', '', now()-interval '4 hours')`)
 	got := queryStrings(t, conn, `SELECT host, cause FROM shawk_v1.planned_stops`)
-	if !slices.Equal(got, []string{"maint maintenance", "maintflag maintenance", "off power_saving", "resuming power_saving"}) {
+	if !slices.Equal(got, []string{"maint maintenance", "maintflag maintenance", "off power_saving", "remaint maintenance",
+		"resuming power_saving"}) {
 		t.Errorf("planned_stops = %v", got)
 	}
 	q := packagedSQL(t)["shawk-rules.yaml/shawk-agents/shawk agent silent/A/A#0"]
@@ -212,7 +218,7 @@ func TestPGPlannedStops(t *testing.T) {
 	}
 	rows.Close()
 	slices.Sort(silent)
-	if !slices.Equal(silent, []string{"booted", "down", "nothing", "stale"}) {
+	if !slices.Equal(silent, []string{"booted", "down", "longmaint", "nothing", "stale"}) {
 		t.Errorf("silent agents = %v", silent)
 	}
 }

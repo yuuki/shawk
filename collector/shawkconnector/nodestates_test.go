@@ -264,4 +264,41 @@ func TestSyncNodeStatesByNode(t *testing.T) {
 	if n := logs.FilterMessageSnippet("does not map").Len(); n != 0 {
 		t.Errorf("unknown nodes logged again %d times", n)
 	}
+	// Once the inventory maps n9, the same reading is written with it.
+	if err := os.WriteFile(invFile, []byte("hosts: [{name: cn001.hpc.example, slurm_node: n1, addrs: [10.0.1.1]},"+
+		" {name: cn009.hpc.example, slurm_node: n9, addrs: [10.0.1.9]}]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c.prepare(context.Background())
+	if len(st.nodes) != 2 || st.nodes[1].host != "cn009.hpc.example" {
+		t.Errorf("after the inventory maps n9: %+v", st.nodes)
+	}
+	// Then it is not written again.
+	writes := len(st.nodeStates)
+	c.prepare(context.Background())
+	if len(st.nodeStates) != writes {
+		t.Errorf("written again although all nodes are mapped")
+	}
+}
+
+// TestMaintenanceResync: the maintenance windows are written again every
+// few minutes although the file did not change, so that what another
+// connector wrote from an older file is put right.
+func TestMaintenanceResync(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "maintenance.yaml")
+	if err := os.WriteFile(file, []byte("maintenance: []\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c, st, _, now := testConnector(t, func(cfg *Config) { cfg.MaintenanceFile = file })
+	ctx := context.Background()
+	*now = now.Add(time.Minute)
+	c.syncNodeStates(ctx)
+	if st.windowSyncs != 1 {
+		t.Errorf("after a minute: %d writes", st.windowSyncs)
+	}
+	*now = now.Add(maintenanceResync)
+	c.syncNodeStates(ctx)
+	if st.windowSyncs != 2 {
+		t.Errorf("after %s: %d writes", maintenanceResync, st.windowSyncs)
+	}
 }

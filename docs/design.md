@@ -932,8 +932,9 @@ The node states are generated, e.g. `scontrol show nodes --json | jq
 reason}]}'`. `NodeName` may be any alias, so the connector maps it to a host
 by `slurm_node` of the inventory (§5.6), when it reads the file, and writes
 the host: the state of a past gap stays with the host it had then. Nodes
-the inventory does not map are left out, with a warning when they change;
-without an inventory, the file names hosts (`host`).
+the inventory does not map are left out, with a warning when they change,
+and the reading is written again until they are mapped; without an
+inventory, the file names hosts (`host`).
 
 - **Times.** States are written as periods (`node_states`): a state read
   again within 5 minutes (`shawk.node_state_max_age()`) continues its
@@ -958,7 +959,8 @@ without an inventory, the file names hosts (`host`).
   connector with an older file, gets a new row from then, so the time in
   between is not planned and nothing is lost for good. The file is still
   the whole registry: it is replaced at once (renamed) and is the same for
-  every connector.
+  every connector. It is written when it changes and again every 5
+  minutes, so what a connector wrote from an older file is put right.
 - **What is planned.** Power saving (`POWERED_DOWN`, `POWERING_DOWN`,
   `POWERING_UP`) with no other flag than `IDLE`, `ALLOCATED`, `MIXED` (a
   job waits for a node that powers up), `CLOUD` and `POWER_DOWN`, so never
@@ -968,8 +970,11 @@ without an inventory, the file names hosts (`host`).
   up, when its agent is expected back, or at the `ResumeTimeout` of Slurm,
   when the node is `DOWN`; without it, a node that resumes would be alerted
   while it boots. Maintenance: a window of the file, or the flag `MAINT` of
-  a reservation of Slurm, which is registered with an end, for 30 days at
-  most.
+  a reservation of Slurm, which is registered with an end; alerts are
+  stopped for 30 days at most from the first of the states with `MAINT`
+  that follow each other, whatever their other flags and reasons.
+  `unobserved_reasons()` reports the state as Slurm had it, `MAINT`
+  included, without this bound.
 
 Slurm partitions and states are not labels of the metrics of shawk.
 

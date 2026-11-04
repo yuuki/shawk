@@ -19,6 +19,10 @@ import (
 // read again, as shawk.node_state_max_age() in PostgreSQL.
 const nodeStateMaxAge = 5 * time.Minute
 
+// maintenanceResync is how often the maintenance windows are written even
+// though the maintenance_file did not change.
+const maintenanceResync = 5 * time.Minute
+
 // maxGeneratedAhead is how far the time a node_states_file was generated
 // may be ahead of the connector: the file is generated on its host, and
 // only a step of the clock moves it ahead.
@@ -301,6 +305,7 @@ func (c *shawkConnector) syncNodeStates(ctx context.Context) {
 		}
 		// Nodes without a host are logged when they change: their states
 		// are not written, and they stop no alert.
+		leftOut := c.unknownNodes != ""
 		if key := strings.Join(unknown, " "); key != c.unknownNodes {
 			if key != "" {
 				c.log.Warn("nodes in node_states_file that the inventory does not map to hosts; their states are left out",
@@ -318,7 +323,10 @@ func (c *shawkConnector) syncNodeStates(ctx context.Context) {
 					zap.String("file", path), zap.Time("generated_at", ns.at), zap.Duration("max_age", nodeStateMaxAge))
 				c.nodeStatesStale = true
 			}
-		case ns.at.After(c.nodeStatesAt):
+		case ns.at.After(c.nodeStatesAt) || leftOut:
+			// After nodes were left out, the same reading is written again,
+			// so that they are once the inventory maps them; what was
+			// written changes nothing.
 			c.nodeStatesStale = false
 			if err := c.store.writeNodeStates(ctx, ns.at, ns.nodes); err != nil {
 				c.log.Warn("writing the node states to PostgreSQL", zap.Error(err))
@@ -338,11 +346,13 @@ func (c *shawkConnector) syncNodeStates(ctx context.Context) {
 		if c.fileError(&c.maintenanceErr, "maintenance_file", path, err) {
 			return
 		}
-		if key := windowsKey(ws); !c.windowsSynced || key != c.windowsKey {
+		// Written when they change, and again every few minutes, so that
+		// windows another connector wrote from an older file are put right.
+		if key := windowsKey(ws); key != c.windowsKey || now.Sub(c.windowsSynced) >= maintenanceResync {
 			if err := c.store.syncMaintenance(ctx, ws); err != nil {
 				c.log.Warn("writing the maintenance windows to PostgreSQL", zap.Error(err))
 			} else {
-				c.windowsKey, c.windowsSynced = key, true
+				c.windowsKey, c.windowsSynced = key, now
 			}
 		}
 	}
