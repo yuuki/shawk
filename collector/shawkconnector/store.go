@@ -38,6 +38,14 @@ type store interface {
 	// portRuleKeys reads the rules of ports in PostgreSQL, as keys() makes
 	// them.
 	portRuleKeys(ctx context.Context) ([]string, error)
+	// syncInventory writes the inventory read at readAt, unless PostgreSQL
+	// holds the same contents, and records when it was read.
+	syncInventory(ctx context.Context, inv *inventory, readAt time.Time) error
+	// inventoryFailed records that inventory_file could not be read, or
+	// was invalid, at failedAt; the inventory written before stays.
+	inventoryFailed(ctx context.Context, failedAt time.Time, msg string) error
+	// inventory reads the inventory last written, nil if there is none.
+	inventory(ctx context.Context) (*inventory, error)
 	// refreshDependencies brings the history of dependencies between
 	// services up to date.
 	refreshDependencies(ctx context.Context) (int64, error)
@@ -615,6 +623,116 @@ SELECT format('dynamic_ports %s %s %s %s-%s', name, proto, addr, port_from, port
 		})
 	slices.Sort(out)
 	return out, err
+}
+
+// inventoryLock is the key of the advisory lock that serializes the writes
+// of the inventory by several connectors.
+const inventoryLock = 0x73686169 // "shai"
+
+func (s *pgStore) syncInventory(ctx context.Context, inv *inventory, readAt time.Time) error {
+	return pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.ReadCommitted}, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, int64(inventoryLock)); err != nil {
+			return err
+		}
+		var digest *string
+		err := tx.QueryRow(ctx, `SELECT digest FROM shawk.inventory_state`).Scan(&digest)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		if digest == nil || *digest != inv.digest {
+			if err := replaceInventory(ctx, tx, inv); err != nil {
+				return err
+			}
+		}
+		_, err = tx.Exec(ctx, `
+INSERT INTO shawk.inventory_state (digest, read_at) VALUES ($1, $2)
+ON CONFLICT (singleton) DO UPDATE SET digest = excluded.digest, read_at = excluded.read_at, failed_at = NULL, error = NULL`,
+			inv.digest, readAt)
+		return err
+	})
+}
+
+// replaceInventory replaces the hosts and addresses of the inventory.
+func replaceInventory(ctx context.Context, tx pgx.Tx, inv *inventory) error {
+	var names, nodes, roleHosts, roles, addrs, addrHosts []string
+	var agents []bool
+	for _, h := range inv.hosts {
+		names = append(names, h.name)
+		nodes = append(nodes, h.slurmNode)
+		agents = append(agents, h.agent)
+		for _, r := range h.roles {
+			roleHosts = append(roleHosts, h.name)
+			roles = append(roles, r)
+		}
+		for _, a := range h.addrs {
+			addrs = append(addrs, a.String())
+			addrHosts = append(addrHosts, h.name)
+		}
+	}
+	b := &pgx.Batch{}
+	b.Queue(`DELETE FROM shawk.inventory_addrs`)
+	b.Queue(`DELETE FROM shawk.inventory_hosts`)
+	b.Queue(`
+INSERT INTO shawk.inventory_hosts (host, slurm_node, agent)
+SELECT u.host, nullif(u.node, ''), u.agent FROM unnest($1::text[], $2::text[], $3::boolean[]) AS u(host, node, agent)`,
+		names, nodes, agents)
+	b.Queue(`
+UPDATE shawk.inventory_hosts h SET roles = r.roles
+FROM (SELECT u.host, array_agg(u.role ORDER BY u.role COLLATE "C") AS roles
+      FROM unnest($1::text[], $2::text[]) AS u(host, role) GROUP BY u.host) r
+WHERE r.host = h.host`, roleHosts, roles)
+	b.Queue(`INSERT INTO shawk.inventory_addrs (addr, host) SELECT * FROM unnest($1::inet[], $2::text[])`, addrs, addrHosts)
+	return tx.SendBatch(ctx, b).Close()
+}
+
+func (s *pgStore) inventoryFailed(ctx context.Context, failedAt time.Time, msg string) error {
+	_, err := s.pool.Exec(ctx, `
+INSERT INTO shawk.inventory_state (failed_at, error) VALUES ($1, $2)
+ON CONFLICT (singleton) DO UPDATE SET failed_at = excluded.failed_at, error = excluded.error`, failedAt, msg)
+	return err
+}
+
+func (s *pgStore) inventory(ctx context.Context) (*inventory, error) {
+	var hosts []inventoryHost
+	err := queryRows(ctx, s.pool, `
+SELECT h.host, coalesce(h.slurm_node, ''), h.roles, h.agent,
+       coalesce(array_agg(host(a.addr) ORDER BY a.addr) FILTER (WHERE a.addr IS NOT NULL), '{}')
+FROM shawk.inventory_hosts h
+LEFT JOIN shawk.inventory_addrs a ON a.host = h.host
+GROUP BY h.host
+ORDER BY h.host`, func(rows pgx.Rows) error {
+		var h inventoryHost
+		var addrs []string
+		if err := rows.Scan(&h.name, &h.slurmNode, &h.roles, &h.agent, &addrs); err != nil {
+			return err
+		}
+		if len(h.roles) == 0 {
+			h.roles = nil
+		}
+		slices.Sort(h.roles)
+		for _, s := range addrs {
+			a, err := netip.ParseAddr(s)
+			if err != nil {
+				return err
+			}
+			h.addrs = append(h.addrs, a.Unmap())
+		}
+		hosts = append(hosts, h)
+		return nil
+	})
+	if err != nil || len(hosts) == 0 {
+		return nil, err
+	}
+	// The order of the database depends on its collation.
+	slices.SortFunc(hosts, func(a, b inventoryHost) int { return strings.Compare(a.name, b.name) })
+	inv := &inventory{hosts: hosts, byAddr: map[netip.Addr]string{}}
+	for _, h := range hosts {
+		for _, a := range h.addrs {
+			inv.byAddr[a] = h.name
+		}
+	}
+	inv.digest = inventoryDigest(hosts)
+	return inv, nil
 }
 
 func (s *pgStore) refreshDependencies(ctx context.Context) (int64, error) {

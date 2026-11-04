@@ -56,6 +56,11 @@ connectors:
     max_services: 200
     peer_cidrs:
       office-lan: 192.168.10.0/24
+    # The hosts expected in a static cluster, with all their addresses,
+    # roles and node names in Slurm, read every write_interval
+    # (docs/design.md, section 5.6). shawk_v1.never_observed() reports the
+    # hosts whose agent never reported.
+    # inventory_file: /etc/shawk/inventory.yaml
     # Relays without an agent that rewrite addresses: load balancers,
     # keepalived/LVS virtual addresses, TCP proxies. The client edges to
     # their virtual addresses are matched with the server edges of their

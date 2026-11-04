@@ -346,13 +346,19 @@ type fakeStore struct {
 	err      error
 	migrated int
 	// behind is how many versions the schema is behind the connector.
-	behind int
-	cidrs  []namedPrefix
-	ports  *portRules
+	behind  int
+	cidrs   []namedPrefix
+	ports   *portRules
+	trans   []translation
+	refresh int
 	// ruleKeys replaces the rules of ports read back when not nil.
 	ruleKeys []string
-	trans    []translation
-	refresh  int
+	// inv is the inventory written, invSyncs how many times it was
+	// written, and invFailed the failures recorded.
+	inv       *inventory
+	invSyncs  int
+	invFailed []string
+	invErr    error
 }
 
 func (s *fakeStore) schemaVersion(context.Context) (int, error) {
@@ -375,6 +381,30 @@ func (s *fakeStore) portRuleKeys(context.Context) ([]string, error) {
 		return s.ruleKeys, nil
 	}
 	return s.ports.keys(), nil
+}
+
+func (s *fakeStore) syncInventory(_ context.Context, inv *inventory, _ time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.invErr != nil {
+		return s.invErr
+	}
+	s.inv = inv
+	s.invSyncs++
+	return nil
+}
+
+func (s *fakeStore) inventoryFailed(_ context.Context, _ time.Time, msg string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.invFailed = append(s.invFailed, msg)
+	return nil
+}
+
+func (s *fakeStore) inventory(context.Context) (*inventory, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.inv, nil
 }
 
 func (s *fakeStore) refreshDependencies(context.Context) (int64, error) {

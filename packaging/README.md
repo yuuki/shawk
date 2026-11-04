@@ -12,6 +12,37 @@ order of the steps and what the files leave out.
 | `prometheus/` | settings for the OTLP push, TLS and users (`web.yml`), recording rules and alerts (`shawk-rules.yml`) |
 | `grafana/` | data sources (uids `shawk-postgres`, `shawk-prometheus`), dashboards and alert rules |
 
+## Agent
+
+`shawk-agent.service` is `Type=notify`: `systemctl start` returns, and
+units ordered after it start, once the agent has attached its BPF programs
+and adopted the sockets that already existed. A failure to attach fails
+the start. Connections that end before the programs are attached are not
+traced.
+
+On a Slurm node, where the first job may start seconds after a boot (e.g.
+when power saving resumes the node), order slurmd after the agent with two
+drop-ins:
+
+```ini
+# /etc/systemd/system/shawk-agent.service.d/slurmd.conf
+[Unit]
+Before=slurmd.service
+```
+
+```ini
+# /etc/systemd/system/slurmd.service.d/shawk-agent.conf
+[Unit]
+Wants=shawk-agent.service
+```
+
+Then run `systemctl daemon-reload`. slurmd waits for the agent, at most its
+`TimeoutStartSec` (90 seconds by default), and still starts if the agent
+fails, since `Wants=` does not require it; with `Requires=` instead, a
+node whose agent fails stays out of service. An agent older than the unit
+does not report ready, so systemd stops it at the timeout: upgrade the
+binary and the unit together, as the packages do.
+
 ## PostgreSQL
 
 ```sh

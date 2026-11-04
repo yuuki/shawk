@@ -521,9 +521,22 @@ func TestPGGrantsAsOwner(t *testing.T) {
 	if err := conn.QueryRow(ctx, "SELECT shawk.prune(now() - interval '3 years')").Scan(&n); err != nil {
 		t.Errorf("pruning as the connector: %v", err)
 	}
+	// The connector writes the inventory (store.go).
+	inv := must(parseInventory([]byte(testInventory)))
+	if err := pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error { return replaceInventory(ctx, tx, inv) }); err != nil {
+		t.Errorf("writing the inventory as the connector: %v", err)
+	}
+	if _, err := conn.Exec(ctx, `INSERT INTO shawk.inventory_state (digest, read_at) VALUES ('d', now())
+	    ON CONFLICT (singleton) DO UPDATE SET read_at = excluded.read_at`); err != nil {
+		t.Errorf("writing the state of the inventory as the connector: %v", err)
+	}
 	execAll(t, conn, "RESET ROLE", "SET ROLE shawk_grafana")
 	if err := conn.QueryRow(ctx, "SELECT count(*) FROM shawk_v1.dependencies_between(now() - interval '1 hour', now())").Scan(&n); err != nil || n != 1 {
 		t.Errorf("reading as Grafana: %d, %v", n, err)
+	}
+	if err := conn.QueryRow(ctx, `SELECT (SELECT count(*) FROM shawk_v1.never_observed()) + (SELECT count(*) FROM shawk_v1.inventory)
+	    + (SELECT count(*) FROM shawk_v1.inventory_addrs) + (SELECT count(*) FROM shawk_v1.inventory_status)`).Scan(&n); err != nil || n != 2+3+6+1 {
+		t.Errorf("reading the inventory as Grafana: %d, %v", n, err)
 	}
 	if _, err := conn.Exec(ctx, "SELECT count(*) FROM shawk.edges"); err == nil {
 		t.Error("Grafana can read the tables")

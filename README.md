@@ -69,6 +69,11 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now shawk-agent
 ```
 
+The unit is `Type=notify`: it becomes active once the BPF programs are
+attached, and fails if they cannot be. Order the services whose first
+connections should be traced after it, e.g. slurmd
+([packaging/](packaging/README.md#agent)).
+
 `shawk agent -h` lists the flags. Most deployments set only
 `-otlp-endpoint` and the TLS files (`-otlp-ca-file`, `-otlp-cert-file`,
 `-otlp-key-file`). Services that share an executable on a host (`ruby`,
