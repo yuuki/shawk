@@ -392,7 +392,7 @@ func (s *fakeStore) write(_ context.Context, h *hostChanges) error {
 	return nil
 }
 
-func (s *fakeStore) peers(context.Context, time.Duration) (peerRows, error) {
+func (s *fakeStore) peers(context.Context, time.Duration, time.Duration) (peerRows, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.rows, nil
@@ -447,6 +447,7 @@ func testConnector(t *testing.T, mod func(*Config)) (*shawkConnector, *fakeStore
 type series struct {
 	job, instance, metric, peer, role, dir string
 	errType                                string
+	peerHost                               string // shawk.peer.host
 	agent                                  bool
 	port                                   int64
 	value                                  float64
@@ -474,7 +475,7 @@ func flatten(md pmetric.Metrics) []series {
 					port, _ := getInt(a, attrServerPort)
 					agent, _ := a.Get(attrPeerAgent)
 					out = append(out, series{job: job, instance: inst, metric: m.Name(), peer: getString(a, attrPeerService),
-						agent: agent.Bool(), errType: getString(a, attrErrorType),
+						agent: agent.Bool(), errType: getString(a, attrErrorType), peerHost: getString(a, attrPeerHost),
 						role: getString(a, attrRole), dir: getString(a, attrIODirection), port: port, value: v, count: c})
 				}
 				switch m.Type() {

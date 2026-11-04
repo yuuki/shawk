@@ -70,6 +70,14 @@ connectors:
     #     backends: [10.0.1.0/24:8080]
     #     sources: [10.0.100.250]            # what the backends see the clients at
     keep_peer_address: false
+    # Metrics per peer host (shawk_host_*, with shawk_peer_host), besides
+    # the others, e.g. for an HPC cluster where the hosts of a service have
+    # different roles (docs/design.md, section 5.3). They multiply the
+    # series with the hosts each service talks to: measure before enabling
+    # them widely, and restrict them to some local services.
+    # peer_hosts: true
+    # max_peer_hosts: 500                   # per host, service, role and peer service
+    # peer_host_services: [slurmctld, prometheus]
     # The certificate of an agent must name its host as `hostname` prints
     # it (a DNS name, or the common name of a certificate without DNS
     # names): an agent cannot write as another host.

@@ -30,6 +30,16 @@ type Config struct {
 	// KeepPeerAddress keeps network.peer.address in the output. It raises
 	// the number of series with the number of peer addresses.
 	KeepPeerAddress bool `mapstructure:"keep_peer_address"`
+	// PeerHosts adds the family of outputs per peer host (shawk_host_*),
+	// which carry shawk.peer.host besides the attributes of the other
+	// outputs. The other outputs do not change.
+	PeerHosts bool `mapstructure:"peer_hosts"`
+	// MaxPeerHosts bounds the values of shawk.peer.host per host, local
+	// service, role and peer service; the others are folded into ~other.
+	MaxPeerHosts int `mapstructure:"max_peer_hosts"`
+	// PeerHostServices, if set, restricts the family per peer host to these
+	// local services ([namespace/]name, as service.peer.name names them).
+	PeerHostServices []string `mapstructure:"peer_host_services"`
 	// Retention is how long rows are kept in PostgreSQL after they were
 	// last seen; zero keeps them forever. The connector deletes older rows
 	// every hour.
@@ -94,6 +104,7 @@ func createDefaultConfig() *Config {
 		IdleTTL:          15 * time.Minute,
 		MaxPeers:         50,
 		MaxServices:      200,
+		MaxPeerHosts:     500,
 		Retention:        3 * 365 * 24 * time.Hour,
 		MaxHosts:         defaultMaxHosts,
 		MaxSeriesPerHost: defaultMaxSeriesPerHost,
@@ -124,6 +135,14 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxServices < 1 {
 		errs = append(errs, errors.New("max_services must be at least 1"))
+	}
+	if c.MaxPeerHosts < 1 {
+		errs = append(errs, errors.New("max_peer_hosts must be at least 1"))
+	}
+	for _, s := range c.PeerHostServices {
+		if s == "" {
+			errs = append(errs, errors.New("peer_host_services: empty service"))
+		}
 	}
 	if c.MaxHosts < 1 {
 		errs = append(errs, errors.New("max_hosts must be at least 1"))

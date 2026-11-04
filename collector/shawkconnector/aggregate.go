@@ -38,6 +38,26 @@ var outMetrics = map[string]outMetric{
 	metricHandshake:          {unit: "s", histogram: true},
 	metricSynRetransmits:     {unit: "{segment}"},
 	metricConnFailedByReason: {unit: "{connection}", sparse: true},
+
+	metricHostConnOpened:         {unit: "{connection}"},
+	metricHostConnFailedByReason: {unit: "{connection}", sparse: true},
+	metricHostHandshake:          {unit: "s", histogram: true},
+	metricHostSynRetransmits:     {unit: "{segment}"},
+	metricHostNetworkIO:          {unit: "By"},
+	metricHostRetransmits:        {unit: "{segment}"},
+}
+
+// hostMetrics are the outputs per peer host (peer_hosts) of the inputs
+// that have one: the connections, failures, handshakes and the traffic
+// that tell how a host reaches each of its peers. The agents send no
+// metrics of these names.
+var hostMetrics = map[string]string{
+	metricConnOpened:         metricHostConnOpened,
+	metricConnFailedByReason: metricHostConnFailedByReason,
+	metricHandshake:          metricHostHandshake,
+	metricSynRetransmits:     metricHostSynRetransmits,
+	metricNetworkIO:          metricHostNetworkIO,
+	metricRetransmits:        metricHostRetransmits,
 }
 
 // outMetricOrder is the order of the metrics in the output.
@@ -45,6 +65,8 @@ var outMetricOrder = []string{
 	metricConnOpened, metricConnFailed, metricConnCount, metricNetworkIO,
 	metricUDPDatagrams, metricRetransmits, metricRTT, metricHandshake,
 	metricSynRetransmits, metricConnFailedByReason,
+	metricHostConnOpened, metricHostConnFailedByReason, metricHostHandshake,
+	metricHostSynRetransmits, metricHostNetworkIO, metricHostRetransmits,
 }
 
 // inputKey identifies an input series within its host.
@@ -101,6 +123,7 @@ type outKey struct {
 	transport string
 	port      uint16
 	peerAddr  string // with keep_peer_address
+	peerHost  string // shawk.peer.host, of the outputs per peer host
 }
 
 type outSeries struct {
@@ -124,6 +147,13 @@ type gaugePoint struct {
 
 type peerGroup struct {
 	host, service, svcNS, role string
+}
+
+// peerHostGroup is a peer service of a peerGroup, whose hosts max_peer_hosts
+// bounds.
+type peerHostGroup struct {
+	peerGroup
+	peer string
 }
 
 // clockStepBack is how far the time of a request may be older than the
@@ -159,6 +189,15 @@ type aggregator struct {
 	// when they were last used.
 	peers map[peerGroup]map[string]time.Time
 
+	// peerHosts tells whether the outputs per peer host are made, for the
+	// local services peerHostServices ([namespace/]name; nil for all).
+	// peerHostsUsed are the values of shawk.peer.host in use per group,
+	// with when they were last used: at most maxPeerHosts.
+	peerHosts        bool
+	maxPeerHosts     int
+	peerHostServices map[string]bool
+	peerHostsUsed    map[peerHostGroup]map[string]time.Time
+
 	// maxInputs bounds the input series of a host (0: unbounded); dropped
 	// counts the new ones dropped beyond it, until they are taken.
 	maxInputs int
@@ -180,6 +219,47 @@ func newAggregator(ttl time.Duration, maxPeers, maxServices int, keepPeerAddr bo
 		hosts:        map[string]*hostOutputs{},
 		peers:        map[peerGroup]map[string]time.Time{},
 	}
+}
+
+// setPeerHosts makes the outputs per peer host, for the local services
+// services, or every local service if services is empty.
+func (a *aggregator) setPeerHosts(maxPeerHosts int, services []string) {
+	a.peerHosts, a.maxPeerHosts = true, maxPeerHosts
+	a.peerHostsUsed = map[peerHostGroup]map[string]time.Time{}
+	if len(services) > 0 {
+		a.peerHostServices = map[string]bool{}
+		for _, s := range services {
+			a.peerHostServices[s] = true
+		}
+	}
+}
+
+// peerHostsOf tells whether the outputs of a local service have outputs
+// per peer host.
+func (a *aggregator) peerHostsOf(k svcKey) bool {
+	if !a.peerHosts {
+		return false
+	}
+	if a.peerHostServices == nil {
+		return true
+	}
+	p := process{service: k.service, svcNS: k.svcNS}
+	return a.peerHostServices[p.job()]
+}
+
+// peerHost returns the value of shawk.peer.host to use, folding hosts
+// beyond max_peer_hosts into ~other.
+func (a *aggregator) peerHost(g peerHostGroup, name string, now time.Time) string {
+	m := a.peerHostsUsed[g]
+	if m == nil {
+		m = map[string]time.Time{}
+		a.peerHostsUsed[g] = m
+	}
+	if _, ok := m[name]; !ok && len(m) >= a.maxPeerHosts {
+		return hostOther
+	}
+	m[name] = now
+	return name
 }
 
 // peer returns the value of service.peer.name to use, folding peers beyond
@@ -250,7 +330,19 @@ func (a *aggregator) add(b *hostBatch, peerOf func(*edgeID) peer, now time.Time,
 			h.resources[sk] = r
 		}
 		p := peerOf(&e.id)
-		name := a.peer(peerGroup{b.key, sk.service, sk.svcNS, e.id.role}, cutLabel(p.name, maxPeerName), now)
+		g := peerGroup{b.key, sk.service, sk.svcNS, e.id.role}
+		name := a.peer(g, cutLabel(p.name, maxPeerName), now)
+		var peerHost string
+		if a.peerHostsOf(sk) {
+			peerHost = p.host
+			if p.self {
+				peerHost = b.hostname
+			}
+			if peerHost == "" {
+				peerHost = hostUnknown
+			}
+			peerHost = a.peerHost(peerHostGroup{g, name}, cutLabel(peerHost, maxLabelValue), now)
+		}
 		for vk, pt := range e.values {
 			m, ok := outMetrics[vk.metric]
 			if !ok {
@@ -272,28 +364,12 @@ func (a *aggregator) add(b *hostBatch, peerOf func(*edgeID) peer, now time.Time,
 			if a.keepPeerAddr {
 				key.peerAddr = e.id.peerString()
 			}
-			s := r.series[key]
-			if s == nil {
-				if m.sparse && dv == 0 {
-					continue
-				}
-				s = &outSeries{start: clampTime(toConnector(pt.start.AsTime()), a.started, now), pending: m.sparse}
-				r.series[key] = s
+			start := clampTime(toConnector(pt.start.AsTime()), a.started, now)
+			r.account(key, m, ik, pt, dv, dc, start, now)
+			if hm, ok := hostMetrics[vk.metric]; ok && peerHost != "" {
+				key.metric, key.peerHost = hm, peerHost
+				r.account(key, outMetrics[hm], ik, pt, dv, dc, start, now)
 			}
-			s.seen = now
-			if m.gauge {
-				if s.gauge == nil {
-					s.gauge = map[inputKey]gaugePoint{}
-				}
-				s.gauge[ik] = gaugePoint{pt.value, pt.time}
-				continue
-			}
-			if s.pending {
-				s.held += dv
-				continue
-			}
-			s.value += dv
-			s.count += dc
 		}
 	}
 
@@ -324,6 +400,33 @@ func (a *aggregator) add(b *hostBatch, peerOf func(*edgeID) peer, now time.Time,
 		restamp(b.agent, toConnector, now)
 		b.agent.MoveAndAppendTo(sm.Metrics())
 	}
+}
+
+// account adds the increase of an input, dv and dc, to the output series
+// key of the metric m, which starts at start if it is new.
+func (r *outResource) account(key outKey, m outMetric, ik inputKey, pt point, dv float64, dc uint64, start, now time.Time) {
+	s := r.series[key]
+	if s == nil {
+		if m.sparse && dv == 0 {
+			return
+		}
+		s = &outSeries{start: start, pending: m.sparse}
+		r.series[key] = s
+	}
+	s.seen = now
+	if m.gauge {
+		if s.gauge == nil {
+			s.gauge = map[inputKey]gaugePoint{}
+		}
+		s.gauge[ik] = gaugePoint{pt.value, pt.time}
+		return
+	}
+	if s.pending {
+		s.held += dv
+		return
+	}
+	s.value += dv
+	s.count += dc
 }
 
 // clampTime returns t within [lo, hi].
@@ -481,14 +584,20 @@ func (a *aggregator) expire(now time.Time) {
 			delete(a.hosts, host)
 		}
 	}
-	for g, m := range a.peers {
-		for p, t := range m {
-			if now.Sub(t) > a.ttl {
-				delete(m, p)
+	expireUsed(a.peers, a.ttl, now)
+	expireUsed(a.peerHostsUsed, a.ttl, now)
+}
+
+// expireUsed forgets the values of labels unused for ttl.
+func expireUsed[K comparable](used map[K]map[string]time.Time, ttl time.Duration, now time.Time) {
+	for g, m := range used {
+		for v, t := range m {
+			if now.Sub(t) > ttl {
+				delete(m, v)
 			}
 		}
 		if len(m) == 0 {
-			delete(a.peers, g)
+			delete(used, g)
 		}
 	}
 }
@@ -587,6 +696,9 @@ func (r *outResource) appendTo(k svcKey, h *hostOutputs, interval pcommon.Timest
 			}
 			if key.peerAddr != "" {
 				dpAttrs.PutStr(attrPeerAddr, key.peerAddr)
+			}
+			if key.peerHost != "" {
+				dpAttrs.PutStr(attrPeerHost, key.peerHost)
 			}
 		}
 	}

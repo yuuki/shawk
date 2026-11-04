@@ -86,8 +86,12 @@ func newConnector(set connector.Settings, cfg *Config, next consumer.Metrics) (*
 	now := time.Now()
 	res := newResolver(cidrs, translations)
 	res.maxInferred = cfg.MaxSeriesPerHost
+	res.peerHosts = cfg.PeerHosts
 	agg := newAggregator(cfg.IdleTTL, cfg.MaxPeers, cfg.MaxServices, cfg.KeepPeerAddress, now)
 	agg.maxInputs = maxValuesPerEdge * cfg.MaxSeriesPerHost
+	if cfg.PeerHosts {
+		agg.setPeerHosts(cfg.MaxPeerHosts, cfg.PeerHostServices)
+	}
 	return &shawkConnector{
 		cfg:      cfg,
 		log:      set.Logger,
@@ -163,7 +167,11 @@ func (c *shawkConnector) prepare(ctx context.Context) bool {
 		}
 	}
 	at := c.now()
-	rows, err := c.store.peers(ctx, c.cfg.IdleTTL)
+	var former time.Duration
+	if c.cfg.PeerHosts {
+		former = formerHolderWindow
+	}
+	rows, err := c.store.peers(ctx, c.cfg.IdleTTL, former)
 	if err != nil {
 		c.log.Warn("reading the names of peers from PostgreSQL", zap.Error(err))
 		return true
