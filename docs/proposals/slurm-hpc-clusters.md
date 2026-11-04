@@ -154,6 +154,9 @@ reasons that occurred.
 
 ### 2.1 Units (#173)
 
+Implemented (#185, design §4.1 and §5.3); see there for what differs from
+this section, such as the names of peers.
+
 - `Unit()` (`internal/procinfo/cgroup.go`) does not know the cgroups of
   Slurm, so the processes of jobs get the last element of the path:
   `task_0`, `task_1`, …, and slurmstepd `slurm`.
@@ -317,6 +320,8 @@ within the same step.
   the overlay), which also stabilizes `host_id` and OBI's `host.id`.
 - **In shawk.** A function computes the gaps over the sessions of all host
   ids with the same host name.
+- **Implemented:** `shawk_v1.unobserved_by_name()`, and the
+  guidance in `packaging/README.md`. The dashboards keep `unobserved()`.
 - **Not proposed.**
   - Changing the host key: it would need a migration of hosts, sessions and
     processes, and it affects Prometheus, OBI and `host_identity:

@@ -1287,6 +1287,41 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
   WHERE h.last_seen >= since;
 $$;
 
+-- The periods in [since, until] in which no host of a name was observed:
+-- unobserved() over the sessions of all the host ids with the same host
+-- name. A host whose machine id changes at every boot (a stateless node
+-- with an empty /etc/machine-id) becomes a new host id each time, and
+-- unobserved() reports the time after the last heartbeat of each old id as
+-- a gap although the name was observed throughout. Two machines that share
+-- a name hide each other's gaps here; unobserved() tells them apart.
+CREATE FUNCTION shawk_v1.unobserved_by_name(since timestamptz, until timestamptz,
+                                            tolerance interval DEFAULT '3 minutes')
+RETURNS TABLE (host text, gap_start timestamptz, gap_end timestamptz)
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+  WITH names AS (
+    SELECT h.hostname FROM shawk.hosts h GROUP BY h.hostname HAVING max(h.last_seen) >= since
+  ),
+  -- Only the sessions that meet [since, until], so that a short period does
+  -- not aggregate the sessions of the whole retention; an old host id whose
+  -- tolerance reaches into the period still counts.
+  observed AS (
+    SELECT h.hostname,
+           range_agg(tstzrange(least(s.started_at + s.clock_skew, s.last_heartbeat),
+                               s.last_heartbeat + tolerance)) AS observed
+    FROM shawk.agent_sessions s
+    JOIN shawk.hosts h ON h.id = s.host_id
+    WHERE s.last_heartbeat > since - tolerance
+      AND least(s.started_at + s.clock_skew, s.last_heartbeat) < until
+    GROUP BY h.hostname
+  )
+  SELECT n.hostname, lower(g), upper(g)
+  FROM names n
+  LEFT JOIN observed o ON o.hostname = n.hostname
+  CROSS JOIN LATERAL unnest(
+    tstzmultirange(tstzrange(since, until)) - coalesce(o.observed, '{}'::tstzmultirange)
+  ) AS g;
+$$;
+
 -- The periods in [since, until] in which a host was observed but its agent
 -- dropped flows, cut to [since, until], with the flow updates dropped in
 -- each. A dependency may be missing from such a period although it was
@@ -1365,7 +1400,8 @@ $$;
 --
 -- exact tells whether the address was observed on a socket rather than
 -- inferred from a listener on an unspecified address; the connector prefers
--- exact endpoints.
+-- exact endpoints. slurm_job tells that a process of a Slurm job (unit
+-- slurm/*) serves it, which the connector names slurm-job as a peer.
 CREATE VIEW shawk_v1.service_endpoints AS
 WITH latest AS (
   SELECT host_id, max(last_seen) AS last_seen FROM shawk.listeners GROUP BY host_id
@@ -1378,14 +1414,15 @@ current_addrs AS (
   WHERE a.last_seen >= m.last_seen - shawk.alive_window()
 ),
 s AS (
-  SELECT l.addr, l.port, l.proto, l.host_id, p.service_name AS service, l.last_seen, true AS exact
+  SELECT l.addr, l.port, l.proto, l.host_id, p.service_name AS service, l.last_seen, true AS exact,
+         p.unit LIKE 'slurm/%' AS slurm_job
   FROM shawk.listeners l
   JOIN shawk.processes p ON p.id = l.process_id
   JOIN latest ON latest.host_id = l.host_id
   WHERE l.addr NOT IN (inet '0.0.0.0', inet '::')
     AND l.last_seen >= latest.last_seen - interval '1 hour'
   UNION ALL
-  SELECT a.addr, l.port, l.proto, l.host_id, p.service_name, l.last_seen, false
+  SELECT a.addr, l.port, l.proto, l.host_id, p.service_name, l.last_seen, false, p.unit LIKE 'slurm/%'
   FROM shawk.listeners l
   JOIN shawk.processes p ON p.id = l.process_id
   JOIN latest ON latest.host_id = l.host_id
@@ -1394,7 +1431,7 @@ s AS (
   WHERE l.addr IN (inet '0.0.0.0', inet '::')
     AND l.last_seen >= latest.last_seen - interval '1 hour'
   UNION ALL
-  SELECT e.local_addr, e.port, e.proto, e.host_id, p.service_name, e.last_seen, true
+  SELECT e.local_addr, e.port, e.proto, e.host_id, p.service_name, e.last_seen, true, p.unit LIKE 'slurm/%'
   FROM latest
   CROSS JOIN LATERAL (
     SELECT DISTINCT ON (e.local_addr, e.port, e.proto, e.process_id) e.*
@@ -1416,7 +1453,7 @@ moved AS (
     AND NOT (mine.addr << inet '127.0.0.0/8' OR mine.addr = inet '::1')
 )
 SELECT s.addr, s.port, s.proto, h.hostname AS host, s.host_id, s.service, max(s.last_seen) AS last_seen,
-       bool_or(s.exact) AS exact
+       bool_or(s.exact) AS exact, bool_or(s.slurm_job) AS slurm_job
 FROM s
 JOIN shawk.hosts h ON h.id = s.host_id
 LEFT JOIN moved ON moved.host_id = s.host_id AND moved.addr = s.addr
@@ -1426,10 +1463,12 @@ GROUP BY s.addr, s.port, s.proto, h.hostname, s.host_id, s.service;
 
 -- The client sides of recent connections, used by the shawk connector to
 -- name the peer of a server edge after the client service, when the client
--- host runs an agent.
+-- host runs an agent. slurm_job tells that the client is a process of a
+-- Slurm job (unit slurm/*).
 CREATE VIEW shawk_v1.client_endpoints AS
 SELECT e.local_addr AS client_addr, e.remote_addr AS server_addr, e.port, e.proto,
-       h.hostname AS host, e.host_id, p.service_name AS service, e.last_seen
+       h.hostname AS host, e.host_id, p.service_name AS service, e.last_seen,
+       p.unit LIKE 'slurm/%' AS slurm_job
 FROM shawk.edges e
 JOIN shawk.processes p ON p.id = e.process_id
 JOIN shawk.hosts h ON h.id = e.host_id

@@ -128,9 +128,118 @@ Set `SHAWK_GRAFANA_PROMETHEUS_PASSWORD` and put the CA of Prometheus at
 `/etc/grafana/tls/prometheus-ca.crt`, then adjust the URLs and credentials
 in `grafana/provisioning/datasources/shawk.yaml`.
 
+## Stateless nodes: a stable machine id
+
+PostgreSQL keys a host by its machine id and host name, and the connector
+sends the machine id to Prometheus as `host_id`, as OBI does as `host.id`.
+A node that gets a new machine id at every boot becomes a new host each
+time, and `unobserved()` reports the time after the last heartbeat of each
+old id as not observed although the node was observed throughout. Nodes
+that boot a shared image without a disk (Warewulf, xCAT diskless or
+statelite, a root on tmpfs) get a new id at every boot when the image holds
+an empty or no `/etc/machine-id` and nothing below gives one; Slurm's power
+saving boots them often.
+
+At boot systemd takes the first of (machine-id(5)):
+
+1. `systemd.machine_id=` on the kernel command line (or `--machine-id=` of
+   systemd);
+2. the id in `/etc/machine-id`;
+3. if the file is empty or missing: `/var/lib/dbus/machine-id`,
+   `container_uuid` on the kernel command line, the DMI `product_uuid` or
+   the devicetree `vm,uuid` on KVM, the UUID of Xen, and finally a random
+   one, which is what bare metal gets.
+
+systemd then writes the id to `/etc/machine-id`, or mounts a temporary file
+over it when the root is read-only; on a root that is not kept, the id is
+lost at shutdown. A read-only root must hold the file, empty if the id
+comes from elsewhere: systemd fails to boot when it is missing.
+
+Give every node an id of its own: generate it once (`systemd-id128 new`),
+keep it with the node in the provisioning database, and pass it before
+systemd starts:
+
+- on the kernel command line of the node, `systemd.machine_id=` and the 32
+  hexadecimal digits: the kernel arguments of the node in Warewulf (`wwctl
+  node set --kernelargs`; keep the arguments the profile sets) or the
+  attribute `addkcmdline` of the node in xCAT. It takes precedence over the
+  file of the image;
+- or `/etc/machine-id` in the root the node boots, from a file per node: in
+  Warewulf, a template of an overlay of the node; Warewulf provisions all
+  of them with the image, and a system overlay is the one meant for files
+  of the boot. A file that is changed only after boot (a postscript of
+  xCAT, a runtime overlay that wwclient applies again) is too late for
+  that boot: systemd has established the id and the agent has started with
+  it.
+
+Do not put a valid id in the shared image instead, in `/etc/machine-id` or
+`/var/lib/dbus/machine-id`: every node would have the same one. shawk tells
+them apart by host name, but `host_id` and OBI's `host.id` would not.
+Newer versions of systemd also take `systemd.machine_id=firmware`, an id
+from the firmware; check that machine-id(5) of the installed version lists
+it.
+
+Check that `cat /etc/machine-id` is the same after a reboot. In PostgreSQL,
+names with many host ids are nodes whose id changed (or hosts reinstalled):
+
+```sql
+SELECT host, count(*) AS host_ids FROM shawk_v1.agents GROUP BY host HAVING count(*) > 1;
+```
+
+The host ids already recorded stay. `shawk_v1.unobserved_by_name()` takes
+the same arguments as `unobserved()` and computes the periods over the
+sessions of all the host ids of each name; the dashboards use
+`unobserved()`, and their annotations can call `unobserved_by_name()`
+instead where machine ids changed. It hides the gaps of two machines that
+share a name.
+
 ## Upgrading
 
 The connector of the example does not migrate (`migrate: false`). It waits
 until the schema is at least its own version, and warns when the schema is
 newer. Run `shawk-migrate` and `grants.sql` before or while upgrading the
 collectors, and upgrade all of them, along with the agents.
+
+## HPC clusters
+
+Notes for static clusters managed by Slurm. The design is in
+[docs/proposals/slurm-hpc-clusters.md](../docs/proposals/slurm-hpc-clusters.md)
+(#170); each subsection below is one topic.
+
+### What is observed
+
+shawk observes TCP and UDP sockets, so "not used" means "no TCP or UDP".
+RDMA verbs (InfiniBand, RoCE) bypass the sockets: the RDMA transports of
+MPI (UCX) and NCCL, Lustre o2ib, GPFS verbs and NFS over RDMA are not
+seen, even when their control connections over TCP are, while TCP over
+IPoIB is. A storage server used only over o2ib looks observed and unused.
+
+The fleet dashboard shows, below the observation periods, the traffic of
+the RDMA ports of each host (`shawk_agent_rdma_io_bytes_total`, from
+`/sys/class/infiniband/*/ports/*/counters`). It is a hint that a host used
+what shawk does not see, not a coverage guarantee: the counters cover the
+whole port, IPoIB included, and tell neither which hosts or jobs used RDMA
+nor, when flat, that nothing was missed. Hosts without readable port
+counters (software devices such as rxe and siw) have no series.
+
+The sockets of kernel clients (NFS, Lustre over TCP) belong to no process,
+so shawk tells which hosts use a file system, not which users or jobs. For
+usage by job, use the file systems, e.g. Lustre jobstats with
+`jobid_var=SLURM_JOB_ID`.
+
+### A stable machine id per node
+
+PostgreSQL keys a host by its machine id and host name, and the machine id
+is `host_id` in Prometheus. A stateless node whose machine id changes at
+every boot becomes a new host at each boot, and its old ids show gaps
+although the node was observed. Give every node a stable machine id when
+it is provisioned, e.g. `systemd.machine_id=` on the kernel command line or
+a file per node in the image overlay. See #178.
+
+### `SrunPortRange`
+
+Without `SrunPortRange`, srun and salloc listen on a random port at every
+run, and slurmctld and slurmstepd connect to it, so each run tends to show
+as a new dependency and `server_port` churns in Prometheus. Set it in
+`slurm.conf` (e.g. `SrunPortRange=60001-63000`; firewalls between the nodes
+usually need it anyway). How shawk aggregates these ports is #174.

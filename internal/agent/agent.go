@@ -79,6 +79,7 @@ type Agent struct {
 	idents   *identities
 	started  time.Time
 	res      otlp.Resource
+	rdma     *rdmaCounters
 
 	lastCollect time.Time
 	failures    uint64
@@ -202,6 +203,8 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("notifying systemd that the agent is ready: %w", err)
 	}
 
+	go a.rdma.run(ctx, cfg.Interval)
+
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()
 	for {
@@ -237,6 +240,7 @@ func newAgent(cfg Config, src source, exp otlp.Exporter, cgroups *procinfo.Resol
 		idents:      newIdentities(cfg.ServiceFallback, cfg.IdleTTL),
 		started:     now,
 		res:         res,
+		rdma:        newRDMACounters(rdmaClass),
 		lastCollect: now,
 	}
 }
@@ -320,14 +324,25 @@ func (a *Agent) observe(snap *tracer.Snapshot, start, end time.Time) {
 	a.xlatDrops = snap.TranslationDrops
 	a.cgroupDrops = snap.CgroupEventDrops
 	a.idents.beginInterval()
-	pids := make([]uint32, 0, len(snap.Flows)+len(snap.Listeners))
+	reqs := make([]procRequest, 0, len(snap.Flows)+len(snap.Listeners))
+	// The environment of the processes of Slurm jobs is not used.
+	env := map[uint64]bool{}
+	request := func(pid uint32, cgroupID uint64) {
+		e, ok := env[cgroupID]
+		if !ok {
+			unit, _ := a.cgroups.Unit(cgroupID)
+			e = !procinfo.SlurmJob(unit)
+			env[cgroupID] = e
+		}
+		reqs = append(reqs, procRequest{pid, e})
+	}
 	for i := range snap.Flows {
-		pids = append(pids, snap.Flows[i].PID)
+		request(snap.Flows[i].PID, snap.Flows[i].CgroupID)
 	}
 	for i := range snap.Listeners {
-		pids = append(pids, snap.Listeners[i].PID)
+		request(snap.Listeners[i].PID, snap.Listeners[i].CgroupID)
 	}
-	a.idents.prefetch(pids)
+	a.idents.prefetch(reqs)
 	a.state.BeginInterval()
 	for i := range snap.Flows {
 		f := &snap.Flows[i]
@@ -394,8 +409,16 @@ func (a *Agent) process(pid uint32, comm string, cgroupID uint64, port uint16, s
 	if tracer.KernelOwned(comm, cgroupID) {
 		return otlp.Process{Comm: comm, Service: procinfo.KernelServiceName(port, server)}
 	}
+	cg := flowCgroup{id: cgroupID, path: a.cgroups.CgroupPath(cgroupID)}
+	if cg.path == "" && cgroupID != 0 && pid != 0 {
+		// The path of the cgroup is not known, e.g. its event was dropped:
+		// the cgroup the process is in tells it, if it is the same.
+		if p := a.idents.read(pid, false).cgroup; a.cgroups.LearnOf(cgroupID, p) {
+			cg.path = p
+		}
+	}
 	unit, ctr := a.cgroups.Unit(cgroupID)
-	return a.idents.resolve(pid, comm, unit, ctr, now)
+	return a.idents.resolve(pid, comm, cg, unit, ctr, now)
 }
 
 // request builds the requests of the live series at now, and returns the
@@ -428,6 +451,7 @@ func (a *Agent) request(now time.Time) ([]*colmetricspb.ExportMetricsServiceRequ
 		TranslationsTraced:  a.tracer.TranslationsTraced(),
 		TranslationsDropped: a.xlatDrops,
 	}
+	st.RDMAData, st.RDMA = a.rdma.latest()
 	if a.cfg.BPFStats {
 		if stats, err := a.tracer.ProgramStats(); err == nil {
 			for _, s := range stats {

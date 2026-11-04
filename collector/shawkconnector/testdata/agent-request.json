@@ -4070,6 +4070,21 @@
               }
             },
             {
+              "name":  "shawk.agent.rdma.io",
+              "unit":  "By",
+              "sum":  {
+                "dataPoints":  [
+                  {
+                    "startTimeUnixNano":  "1793444400000000000",
+                    "timeUnixNano":  "1793448015000000000",
+                    "asInt":  "4294967296"
+                  }
+                ],
+                "aggregationTemporality":  "AGGREGATION_TEMPORALITY_CUMULATIVE",
+                "isMonotonic":  true
+              }
+            },
+            {
               "name":  "shawk.agent.bpf.run_count",
               "unit":  "{run}",
               "sum":  {

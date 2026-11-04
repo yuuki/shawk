@@ -153,3 +153,70 @@ func TestPGWindowEdgeSides(t *testing.T) {
 		t.Errorf("dependencies in the last 20 minutes = %v", got)
 	}
 }
+
+// TestPGUnobservedByName: the host ids of a name that changed its machine
+// id at every boot are observed together; unobserved() reports the time
+// after the last heartbeat of each old id.
+func TestPGUnobservedByName(t *testing.T) {
+	_, conn := migratedDB(t)
+	execAll(t, conn,
+		// n1 booted three times with a new machine id, and was down for 20
+		// minutes before its third boot. n2 kept its id; n3 has no session.
+		`INSERT INTO shawk.hosts VALUES
+		  ('n1a','m1','n1','k','v',now()-interval '3 hours',now()-interval '2 hours'),
+		  ('n1b','m2','n1','k','v',now()-interval '2 hours',now()-interval '80 minutes'),
+		  ('n1c','m3','n1','k','v',now()-interval '1 hour',now()),
+		  ('n2','m4','n2','k','v',now()-interval '3 hours',now()),
+		  ('n3','m5','n3','k','v',now()-interval '3 hours',now()),
+		  ('old','m6','old','k','v',now()-interval '30 days',now()-interval '29 days')`,
+		`INSERT INTO shawk.agent_sessions (host_id, started_at, last_heartbeat, udp_traced, netns_scope)
+		 VALUES ('n1a', now() - interval '3 hours', now() - interval '2 hours', true, 'all'),
+		        ('n1b', now() - interval '2 hours', now() - interval '80 minutes', true, 'all'),
+		        ('n1c', now() - interval '1 hour', now(), true, 'all'),
+		        ('n2', now() - interval '3 hours', now(), true, 'all'),
+		        ('old', now() - interval '30 days', now() - interval '29 days', true, 'all')`)
+	gaps := func(fn string) []string {
+		return queryStrings(t, conn, `SELECT host, round(extract(epoch FROM gap_start - now()) / 60)::int,
+			round(extract(epoch FROM gap_end - now()) / 60)::int
+			FROM shawk_v1.`+fn+`(now() - interval '150 minutes', now())`)
+	}
+	// n1 was not observed from the last heartbeat of n1b (plus the
+	// tolerance) until n1c started; n3 not at all; old is out of the period.
+	if got, want := gaps("unobserved_by_name"), []string{"n1 -77 -60", "n3 -150 0"}; !slices.Equal(got, want) {
+		t.Errorf("unobserved_by_name = %v, want %v", got, want)
+	}
+	// unobserved() is per host id: n1a and n1b were not observed after
+	// their last heartbeat, and n1b and n1c before their sessions.
+	if got, want := gaps("unobserved"), []string{"n1 -117 0", "n1 -150 -120", "n1 -150 -60", "n1 -77 0", "n3 -150 0"}; !slices.Equal(got, want) {
+		t.Errorf("unobserved = %v, want %v", got, want)
+	}
+}
+
+// TestPGUnobservedByNameBounds: a session of an old host id that ended
+// before the period counts with its tolerance, and a start is converted
+// with the clock skew.
+func TestPGUnobservedByNameBounds(t *testing.T) {
+	_, conn := migratedDB(t)
+	execAll(t, conn,
+		`INSERT INTO shawk.hosts VALUES
+		  ('a','m1','n','k','v',now()-interval '2 hours',now()-interval '61 minutes'),
+		  ('b','m2','n','k','v',now()-interval '59 minutes',now())`,
+		// a's heartbeat is a minute before the period, within the tolerance
+		// of 3 minutes; b started a minute into it by the clock of the
+		// connector, its clock 10 minutes ahead.
+		`INSERT INTO shawk.agent_sessions (host_id, started_at, last_heartbeat, udp_traced, netns_scope, clock_skew)
+		 VALUES ('a', now() - interval '2 hours', now() - interval '61 minutes', true, 'all', '0'),
+		        ('b', now() - interval '49 minutes', now(), true, 'all', interval '-10 minutes')`)
+	got := queryStrings(t, conn, `SELECT count(*) FROM shawk_v1.unobserved_by_name(now() - interval '1 hour', now())`)
+	if !slices.Equal(got, []string{"0"}) {
+		t.Errorf("unobserved_by_name = %v, want no gap", got)
+	}
+	// With a tolerance of a minute, a's observation ends at the start of the
+	// period, a minute before b's session starts.
+	got = queryStrings(t, conn, `SELECT round(extract(epoch FROM gap_start - now()) / 60)::int,
+		round(extract(epoch FROM gap_end - now()) / 60)::int
+		FROM shawk_v1.unobserved_by_name(now() - interval '1 hour', now() - interval '30 seconds', interval '1 minute')`)
+	if !slices.Equal(got, []string{"-60 -59"}) {
+		t.Errorf("unobserved_by_name with a tolerance of a minute = %v", got)
+	}
+}

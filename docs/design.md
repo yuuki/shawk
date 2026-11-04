@@ -35,6 +35,12 @@ Instrumentation) sees only the protocols it parses. shawk focuses on history
 and coverage, for any TCP/UDP protocol, on VMs and on-premises hosts (the
 primary target is Rocky Linux 9, kernel 5.14), and runs beside OBI (§9).
 
+What is observed is TCP and UDP sockets, so "not used" means "no TCP or
+UDP". RDMA verbs (InfiniBand, RoCE) bypass the sockets: in HPC clusters,
+where the main data paths use them (the RDMA transports of MPI and NCCL,
+Lustre o2ib, GPFS verbs, NFS over RDMA), a host may be observed throughout and still be used
+(§10).
+
 ## 2. Architecture
 
 ```
@@ -390,6 +396,20 @@ per packet.
   an interval keeps its name; reads that do not fit the queue are counted in
   `shawk.agent.container_reads.dropped` (alert `ShawkContainerReadsDropped`)
   and retried at export.
+- The processes of Slurm jobs (cgroup v2) are named by the structure of
+  `system.slice/slurmstepd.scope/<job>/<step>/...`, whatever names the job
+  directory (`job_<id>` before Slurm 26.05 or with `CgroupJobIdPaths=yes`,
+  the SLUID otherwise): `user/task_*` is `slurm/batch`, `slurm/step`
+  (`step_<n>`, `step_<n>+<component>`), `slurm/extern` (with
+  `task_special`, where `pam_slurm_adopt` puts the processes it adopts) or
+  `slurm/interactive` after the kind of step, and the directory of
+  slurmstepd in a step (`slurm`; `slurm_processes` in the documentation)
+  and `<scope>/system` are `slurmstepd`, as Slurm's `cgroup/v2` plugin
+  makes them. The scope is `slurmstepd.scope`, or `<node>_slurmstepd.scope`
+  with `--enable-multiple-slurmd`, recognized only under slices from the
+  root (`system.slice`, or the slice of `CgroupSlice`), where users cannot
+  make cgroups; other hierarchies, and cgroup v1, keep the rules above
+  (`internal/procinfo/cgroup.go`).
 - Container names are not trusted blindly. Docker merges image labels into
   container labels, so pod labels are believed only with the container name
   cri-dockerd gives, and Compose labels only with the name Compose gives.
@@ -415,7 +435,12 @@ per packet.
   not known). `-service-name-fallback=unit` uses the unit instead of the
   executable. `service.namespace` comes from `OTEL_RESOURCE_ATTRIBUTES`,
   else the namespace of the pod's service. Both are cut to 255 bytes, since
-  any process sets them and they repeat in every data point.
+  any process sets them and they repeat in every data point. The `OTEL_`
+  variables of the processes of Slurm jobs are not read: any user could
+  name a job `slurmctld`, so they are named after their executable onwards.
+  Nor is their environment read, so that reads that hang on a parallel
+  file system do not hold the slots of the other processes.
+  PostgreSQL keeps these names; Prometheus has them under one `job` (§5.3).
 - The service of a pod is named as OBI names it from API server metadata
   (annotations, `app.kubernetes.io/*` labels, then the top owner; see
   `internal/procinfo/container.go`). The agent does not ask the API server:
@@ -452,10 +477,23 @@ per packet.
   stuck process can hold forever (a stalled FUSE mapping), so reads time out
   and back off, and hung reads are bounded (`internal/procinfo/service.go`). A PID whose comm no longer
   matches the flow is not trusted; a process that exits before it is read
-  takes the latest identity seen for the same unit and comm.
+  takes the latest identity seen for the same unit and comm, and for the
+  processes of Slurm jobs, whose units every job of every user shares, the
+  same cgroup (step) too. The agent reads `/proc/PID/cgroup` with the
+  executable. What `/proc` tells of a PID now in another cgroup than the
+  flow, one of them a job's, is not used: the PID was reused by another
+  job, or `pam_slurm_adopt` moved the process; nor is a read during which
+  the cgroup changed. A flow whose cgroup path is not known (its event was
+  dropped) learns it from its process if the process is still in that
+  cgroup (same inode); otherwise a process now in a job is not taken for
+  it.
 - The host is identified by `host.id` (`/etc/machine-id`, else
   `/var/lib/dbus/machine-id`) and `host.name`. PostgreSQL keys a host by
   the hash of both, so VMs cloned with the same machine id stay apart.
+  A node whose machine id changes at every boot (a stateless node with an
+  empty `/etc/machine-id`) becomes a new host each time; provisioning gives
+  each node a stable one (`packaging/README.md`), and
+  `unobserved_by_name()` (§6.2) computes gaps over all the hosts of a name.
 
 ### 4.2 What is sent
 
@@ -495,7 +533,17 @@ metrics are `shawk.agent.up` (with `shawk.netns.scope`),
 `shawk.agent.container_reads.dropped` and
 `shawk.agent.translations.dropped`, `shawk.agent.translations.traced`,
 `shawk.agent.export.failures`, and with `-bpf-stats` per-program run counts
-and times. The resource carries `host.id`, `host.name`, `os.version`,
+and times. A host whose RDMA ports (InfiniBand, RoCE) have readable port
+counters also sends `shawk.agent.rdma.io`, the bytes its ports sent and
+received since the agent started, from
+`/sys/class/infiniband/*/ports/*/counters` (`port_xmit_data` and
+`port_rcv_data`, which count octets divided by 4). A read may query the
+device, so the counters are read every interval apart from the
+collection, and a device that does not answer delays only them. It goes
+to Prometheus only, as a hint that the host used what shawk does not
+observe (§10); its absence does not mean that the host has no RDMA
+(software devices such as rxe and siw have no port counters). The resource
+carries `host.id`, `host.name`, `os.version`,
 `service.name=shawk-agent` with `service.version`, `shawk.peer.fold`,
 `shawk.peer.internal`, and `host.ip`: the interface addresses of the traced
 namespaces plus the local addresses of recent series and open listeners,
@@ -706,6 +754,16 @@ the host name; `host.id` and `host.name` are promoted to labels.
   fold into `~other`, while PostgreSQL keeps them apart. Agent-chosen names
   are cut to 255 bytes (`service.peer.name` to 511). `keep_peer_address`
   keeps `network.peer.address` when really needed.
+- The processes of Slurm jobs (units `slurm/*`, §4.1) are forwarded under
+  `job="slurm-job"`, which takes one place of `max_services`, so that
+  every executable of every job does not become a `job`. As peers they are
+  `service.peer.name="slurm-job"` too, so both sides of a dependency
+  between jobs match: the endpoints the connector learns from agents are
+  named so, and those read from PostgreSQL by the column `slurm_job` of
+  `shawk_v1.service_endpoints` and `client_endpoints`. PostgreSQL keeps
+  their names;
+  the series from the agent are still keyed by executable, bounded by its
+  idle TTL.
 - Some servers listen on a port chosen anew at every run: srun and salloc
   without `SrunPortRange`, to which slurmctld and slurmstepd connect. Their
   dependencies have `server.port` 0, so that each run adds no series:
@@ -1047,11 +1105,12 @@ names in PostgreSQL and Prometheus match.
 | `graph_nodes`, `graph_edges` | the dependency map between services in the format of the Grafana Node Graph; a peer without a service is named by `peer_class`, and a dependency on a port of `port_agnostic_services` or `dynamic_ports` (§5.3) has port 0 |
 | `peer_class(addr)` | the name of a peer without a known service, as in `service.peer.name`: the narrowest range of `peer_cidrs`, `~unresolved` for an address not routed on the Internet, `~external` otherwise, including the networks of folded peers |
 | `dependency_changes` | dependencies between services that appeared, or disappeared while a host that saw them kept observing for 15 minutes; port 0 for those of `port_agnostic_services` and `dynamic_ports` (§5.3), so that a run of srun on a new port is not new |
-| `service_endpoints` | addresses and ports services accept connections on: the last known listeners of each host (unspecified addresses expanded to the host's addresses) and its server edges, for hosts that reported in the last 30 days, except addresses another host took over since; used by the connector (§5.2) |
-| `client_endpoints` | the client sides of connections in the last hour (client address, server address, port, client service); used by the connector to name the peer of a server edge |
+| `service_endpoints` | addresses and ports services accept connections on: the last known listeners of each host (unspecified addresses expanded to the host's addresses) and its server edges, for hosts that reported in the last 30 days, except addresses another host took over since; `slurm_job` if a process of a Slurm job serves it; used by the connector (§5.2) |
+| `client_endpoints` | the client sides of connections in the last hour (client address, server address, port, client service, `slurm_job` if the client is a process of a Slurm job); used by the connector to name the peer of a server edge |
 | `agent_addrs` | addresses of hosts whose agent closed an interval in the last 5 minutes, with what the agent traces and folds; used by the connector |
 | `agents` | the latest segment of every host and whether its agent is alive; the last columns, `peer_fold` and `peer_internal`, tell what the agent folds and the ranges it keeps exact |
 | `unobserved(since, until, tolerance)` | the periods in which each host was not observed; Grafana overlays them as annotations |
+| `unobserved_by_name(since, until, tolerance)` | the same over the sessions of all the host ids of each host name, for nodes whose machine id changed (§4.1), where `unobserved()` reports the time after the last heartbeat of each old id; two machines that share a name hide each other's gaps |
 | `never_observed()` | the hosts of the inventory (§5.6) expected to run an agent whose agent never reported within the retention (no host has their name): `host`, `slurm_node`, `roles`, and `seen_as`, the hosts whose agents reported an address of the host, as an agent whose `host.name` differs from the inventory would |
 | `inventory`, `inventory_addrs` | the hosts of the inventory with their addresses (`host`, `slurm_node`, `roles`, `agent`, `addrs`), and one row per address with its host: join an address on `addr` to name its host |
 | `inventory_status` | when the inventory was last read from a valid file (`read_at`, NULL if never), the latest failure since (`failed_at`, `error`), and how many hosts it has; no row before a connector with `inventory_file` read it |
@@ -1135,6 +1194,12 @@ time out, and `TCP_FASTOPEN_CONNECT` connects, which have no handshake,
 raise them. OBI panels use a minimum interval of a minute, since OBI
 exports every 60 seconds by default.
 
+Where the absence of a dependency is read (the changes dashboard, and the
+observation periods of the fleet dashboard), the panels say that only TCP
+and UDP are observed. The fleet dashboard shows the traffic of the RDMA
+ports of each host (`shawk.agent.rdma.io`) below the observation periods,
+as a hint only (§10).
+
 ## 9. OBI
 
 OBI cannot replace the tracer of shawk: its network flows and TCP statistics
@@ -1158,6 +1223,25 @@ only the protocols it parses. shawk runs beside it:
 
 ## 10. Limitations
 
+- **TCP and UDP only.** "Observed and not used" holds for TCP and UDP
+  sockets. RDMA verbs (InfiniBand, RoCE) bypass them, so the RDMA
+  transports of MPI (UCX) and NCCL, Lustre o2ib, GPFS verbs and NFS over
+  RDMA are not seen, even when their control connections over TCP are; TCP
+  over IPoIB is. In HPC clusters the main data paths use RDMA, so a storage
+  server used over o2ib looks observed and unused. The counters of RDMA
+  ports (§4.2) are a hint, not a coverage guarantee like `udp_traced`: they
+  cover a whole port, all its virtual lanes and IPoIB included, so an
+  increase tells neither which hosts nor which jobs used RDMA, and no
+  increase does not prove that no RDMA dependency was missed (a counter of
+  32 bits stops at its maximum). The sockets of kernel clients (NFS, Lustre
+  over TCP) belong to cgroup 0 and are named `~kernel` or after their port
+  (`~kernel:nfs`, §4.1): shawk tells which hosts use a file system, not
+  which users or jobs; usage by job is left to the file systems (Lustre
+  jobstats with `jobid_var=SLURM_JOB_ID`). Tracing RDMA connections is not
+  done; [rpingmesh](https://github.com/yuuki/rpingmesh) traces those of user
+  space from the commands of the uverbs device, and those of the kernel
+  from `ib_modify_qp`, which needs the BTF of `ib_core`. See
+  [proposals/slurm-hpc-clusters.md](proposals/slurm-hpc-clusters.md) §7.
 - **Relays that rewrite addresses** (NAT, IPVS, kube-proxy, cloud load
   balancers) hide the real peer, as discussed in §5.2 of the paper:
   dependencies end at the relay address and are seen on one side only,
@@ -1201,6 +1285,14 @@ only the protocols it parses. shawk runs beside it:
   `sk_user_data` (e.g. in a BPF sockmap) held by a process in another PID
   namespace is taken for the kernel's; run the agent in the host PID
   namespace.
+- **Machine ids that change at every boot** (§4.1) make a new host per
+  boot: `unobserved()` reports false gaps for the old ids, which
+  `unobserved_by_name()` does not, and `host_id` changes in Prometheus. The
+  host key stays the hash of the machine id and the name: keying by the
+  name would need a migration of the hosts, sessions and processes, and
+  would affect `host_id`, OBI's `host.id` and `host_identity: certificate`.
+  Host names are not rewritten either (a domain dropped to match a Slurm
+  `NodeName`): names could collide and certificates stop matching.
 - **Flow table capacity**: when more distinct flows than `-max-flows` occur
   in one interval, updates are dropped and counted in
   `shawk.agent.flows.dropped`, and the period is partly observed
