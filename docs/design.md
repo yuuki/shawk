@@ -523,10 +523,12 @@ which include containers.
   (`READY=1` on `NOTIFY_SOCKET`) once its programs are attached and the
   sockets that existed before were adopted; a failure to attach fails the
   start. Units ordered after the agent, such as slurmd on a node that
-  power saving resumes, then start traced. What happens before readiness
-  is not observed: connections that ended before are lost, and those still
-  open are adopted without their earlier traffic. The start of the agent,
-  and of its first segment, is taken once the programs are attached.
+  power saving resumes, then start traced. What happens before the
+  programs are attached is not observed: connections that ended before are
+  lost, and those still open are adopted without their earlier traffic.
+  The start of the agent, and of its first segment, is taken after the
+  first walk and the resolution of owners, a little after the programs
+  are attached.
 - Observation segments. `shawk.agent.segment.start` is the time from which
   every dependency active on the host has reached the connector: the start
   of the agent, or, after requests failed for longer than the idle TTL minus

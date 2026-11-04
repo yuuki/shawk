@@ -17,7 +17,8 @@ order of the steps and what the files leave out.
 `shawk-agent.service` is `Type=notify`: `systemctl start` returns, and
 units ordered after it start, once the agent has attached its BPF programs
 and adopted the sockets that already existed. A failure to attach fails
-the start. Connections that end before then are not traced.
+the start. Connections that end before the programs are attached are not
+traced.
 
 On a Slurm node, where the first job may start seconds after a boot (e.g.
 when power saving resumes the node), order slurmd after the agent with two
