@@ -91,6 +91,29 @@ OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE=/etc/obi/tls/obi.crt
 OTEL_EXPORTER_OTLP_CLIENT_KEY=/etc/obi/tls/obi.key
 ```
 
+## Slurm
+
+On a cluster managed by Slurm, nodes powered down by power saving or in
+maintenance are not alerted (`docs/design.md` §5.6). For PostgreSQL, set
+`node_states_file` in the connector and generate the file every minute
+on the host that runs it, with a cron job that replaces it at once:
+
+```sh
+scontrol show nodes --json \
+  | jq '{generated_at: (now | todate), nodes: [.nodes[] | {host: .name, state, reason}]}' \
+  > /etc/shawk/node-states.json.tmp && mv /etc/shawk/node-states.json.tmp /etc/shawk/node-states.json
+```
+
+Map `NodeName` to the host name of the agent there if they differ.
+Register maintenance windows, of hosts with or without Slurm, in
+`maintenance_file` before they start; replace it at once too, and give
+every connector the same one.
+
+For Prometheus, `ShawkAgentDown` joins the node states of a Slurm
+exporter: replace `slurm_node_state` and its labels in
+`prometheus/shawk-rules.yml` with those of the exporter in use. Silence
+the maintenance windows that are not `MAINT` reservations in Alertmanager.
+
 ## Grafana
 
 Set `SHAWK_GRAFANA_PROMETHEUS_PASSWORD` and put the CA of Prometheus at

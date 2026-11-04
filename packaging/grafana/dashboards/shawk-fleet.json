@@ -378,7 +378,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT host, gap_start, gap_end, gap_end - gap_start AS duration\nFROM shawk_v1.unobserved($__timeFrom(), $__timeTo())\nORDER BY gap_start DESC"
+          "rawSql": "SELECT host, gap_start, gap_end, gap_end - gap_start AS duration, cause, node_state, reason\nFROM shawk_v1.unobserved_reasons($__timeFrom(), $__timeTo())\nORDER BY gap_start DESC"
         }
       ],
       "options": {
@@ -389,7 +389,7 @@
         "defaults": {},
         "overrides": []
       },
-      "description": "Periods in which a host was not observed: absence of a dependency in a gap does not mean it was unused."
+      "description": "Periods in which a host was not observed: absence of a dependency in a gap does not mean it was unused. They are cut by what explains them: cause is maintenance or power_saving for a planned stop, empty otherwise; node_state and reason are those of Slurm (or of the maintenance window) at the time, from the node_states_file of the connector."
     },
     {
       "id": 11,

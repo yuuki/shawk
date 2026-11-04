@@ -86,6 +86,12 @@ connectors:
     max_hosts: 10000
     max_series_per_host: 100000   # edges, listeners, translations and addresses
     max_pending_rows: 10000000    # kept while PostgreSQL cannot be written
+    # States of nodes from Slurm, generated every minute by a cron job, and
+    # maintenance windows registered by hand; they tell why hosts were not
+    # observed and which stopped agents are planned (docs/design.md,
+    # section 5.6).
+    # node_states_file: /etc/shawk/node-states.json
+    # maintenance_file: /etc/shawk/maintenance.yaml
 
 processors:
   memory_limiter:

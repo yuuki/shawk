@@ -196,6 +196,51 @@ eval instant at 25m ` + a("ShawkCgroupEventsDropped") + `
 
 eval instant at 20m ` + a("ShawkContainerReadsDropped") + `
   {job="shawk-agent", host_name="app-03"} 7
+
+# The agents of Slurm nodes stop at 10m. Those powered down by power saving
+# or in a maintenance reservation are not alerted. DOWN, DRAIN and a node
+# that does not respond (cn09) are, and
+# so are a node whose state the exporter stopped reporting at 12m (cn07)
+# and a node that resumes from 15m (cn08); their series end with staleness
+# markers, as when a scrape no longer has them.
+load 1m
+  shawk_agent_up{job="shawk-agent", host_name="cn01"} 1x10
+  shawk_agent_up{job="shawk-agent", host_name="cn02"} 1x10
+  shawk_agent_up{job="shawk-agent", host_name="cn03"} 1x10
+  shawk_agent_up{job="shawk-agent", host_name="cn04"} 1x10
+  shawk_agent_up{job="shawk-agent", host_name="cn05"} 1x10
+  shawk_agent_up{job="shawk-agent", host_name="cn06"} 1x10
+  shawk_agent_up{job="shawk-agent", host_name="cn07"} 1x10
+  shawk_agent_up{job="shawk-agent", host_name="cn08"} 1x10
+  shawk_agent_up{job="shawk-agent", host_name="cn09"} 1x10
+  slurm_node_state{node="cn01", state="IDLE+POWERED_DOWN"} 1x30
+  slurm_node_state{node="cn02", state="idle+powering_down"} 1x30
+  slurm_node_state{node="cn03", state="DOWN+POWERED_DOWN"} 1x30
+  slurm_node_state{node="cn04", state="IDLE+DRAIN+POWERED_DOWN"} 1x30
+  slurm_node_state{node="cn05", state="DOWN+MAINT"} 1x30
+  slurm_node_state{node="cn06", state="IDLE"} 1x30
+  slurm_node_state{node="cn07", state="IDLE+POWERED_DOWN"} 1x12 stale
+  slurm_node_state{node="cn08", state="IDLE+POWERED_DOWN"} 1x15 stale
+  slurm_node_state{node="cn08", state="IDLE+POWERING_UP"} _x16 1x14
+  slurm_node_state{node="cn09", state="IDLE*+POWERED_DOWN"} 1x30
+
+# The series of the agents last 5 minutes. cn08 is still powered down.
+eval instant at 15m ` + a("ShawkAgentDown") + `
+  {host_name="app-02"} 1
+  {host_name="cn03"} 1
+  {host_name="cn04"} 1
+  {host_name="cn06"} 1
+  {host_name="cn07"} 1
+  {host_name="cn09"} 1
+
+eval instant at 18m ` + a("ShawkAgentDown") + `
+  {host_name="app-02"} 1
+  {host_name="cn03"} 1
+  {host_name="cn04"} 1
+  {host_name="cn06"} 1
+  {host_name="cn07"} 1
+  {host_name="cn08"} 1
+  {host_name="cn09"} 1
 `
 	promqltest.RunTest(t, script, promqltest.NewTestEngine(t, false, 0, promqltest.DefaultMaxSamplesPerQuery))
 	for name, e := range alerts {
