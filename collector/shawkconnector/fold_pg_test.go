@@ -96,7 +96,7 @@ func TestPGFoldedEdges(t *testing.T) {
 	if want := []string{"app-01 none -", "web-01 all {10.0.0.0/8}"}; !slices.Equal(got, want) {
 		t.Errorf("agents = %q, want %q", got, want)
 	}
-	rows, err := c.store.peers(ctx, time.Hour)
+	rows, err := c.store.peers(ctx, time.Hour, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

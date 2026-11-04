@@ -1,0 +1,615 @@
+{
+  "uid": "shawk-hosts",
+  "title": "shawk / Peer hosts",
+  "description": "Traffic and failures of dependencies per peer host, from the family per peer host (peer_hosts: true in the connector).",
+  "tags": [
+    "shawk"
+  ],
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "version": 1,
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "refresh": "1m",
+  "timezone": "",
+  "templating": {
+    "list": [
+      {
+        "name": "dst",
+        "label": "Server",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "shawk-prometheus"
+        },
+        "query": {
+          "query": "label_values({__name__=~\"shawk:host_dependency_connections:rate5m|shawk:host_dependency_connection_failures_by_reason:rate5m\"}, dst)",
+          "refId": "dst"
+        },
+        "definition": "label_values({__name__=~\"shawk:host_dependency_connections:rate5m|shawk:host_dependency_connection_failures_by_reason:rate5m\"}, dst)",
+        "refresh": 2,
+        "multi": true,
+        "includeAll": true,
+        "current": {},
+        "sort": 1
+      },
+      {
+        "name": "src",
+        "label": "Client",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "shawk-prometheus"
+        },
+        "query": {
+          "query": "label_values({__name__=~\"shawk:host_dependency_connections:rate5m|shawk:host_dependency_connection_failures_by_reason:rate5m\", dst=~\"$dst\"}, src)",
+          "refId": "src"
+        },
+        "definition": "label_values({__name__=~\"shawk:host_dependency_connections:rate5m|shawk:host_dependency_connection_failures_by_reason:rate5m\", dst=~\"$dst\"}, src)",
+        "refresh": 2,
+        "multi": true,
+        "includeAll": true,
+        "current": {},
+        "sort": 1
+      },
+      {
+        "name": "dst_host",
+        "label": "Server host",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "shawk-prometheus"
+        },
+        "query": {
+          "query": "label_values({__name__=~\"shawk:host_dependency_connections:rate5m|shawk:host_dependency_connection_failures_by_reason:rate5m\", dst=~\"$dst\", src=~\"$src\"}, dst_host)",
+          "refId": "dst_host"
+        },
+        "definition": "label_values({__name__=~\"shawk:host_dependency_connections:rate5m|shawk:host_dependency_connection_failures_by_reason:rate5m\", dst=~\"$dst\", src=~\"$src\"}, dst_host)",
+        "refresh": 2,
+        "multi": true,
+        "includeAll": true,
+        "current": {},
+        "sort": 1
+      }
+    ]
+  },
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      },
+      {
+        "name": "Unobserved",
+        "datasource": {
+          "type": "grafana-postgresql-datasource",
+          "uid": "shawk-postgres"
+        },
+        "enable": true,
+        "iconColor": "rgba(255, 96, 96, 0.4)",
+        "target": {
+          "refId": "Anno",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shawk-postgres"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT gap_start AS time, gap_end AS timeend, 'not observed: ' || host AS text, host AS tags\nFROM shawk_v1.unobserved($__timeFrom(), $__timeTo())"
+        }
+      },
+      {
+        "name": "Partly observed",
+        "datasource": {
+          "type": "grafana-postgresql-datasource",
+          "uid": "shawk-postgres"
+        },
+        "enable": true,
+        "iconColor": "rgba(255, 152, 48, 0.4)",
+        "target": {
+          "refId": "Anno",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shawk-postgres"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT gap_start AS time, gap_end AS timeend, 'partly observed: ' || host AS text, host AS tags\nFROM shawk_v1.partly_observed($__timeFrom(), $__timeTo())"
+        }
+      }
+    ]
+  },
+  "links": [
+    {
+      "asDropdown": true,
+      "includeVars": false,
+      "keepTime": true,
+      "tags": [
+        "shawk"
+      ],
+      "title": "shawk",
+      "type": "dashboards"
+    }
+  ],
+  "panels": [
+    {
+      "id": 1,
+      "type": "table",
+      "title": "Hosts towards the selected services",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "shawk-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 10
+      },
+      "targets": [
+        {
+          "refId": "connections",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "instant": true,
+          "format": "table",
+          "expr": "sum by (src_host, src, dst_host, dst, server_port) (shawk:host_dependency_connections:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})"
+        },
+        {
+          "refId": "failures",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "instant": true,
+          "format": "table",
+          "expr": "sum by (src_host, src, dst_host, dst, server_port) (shawk:host_dependency_connection_failures_by_reason:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            },
+            "renameByName": {
+              "Value #connections": "connections/s",
+              "Value #failures": "failures/s",
+              "src_host": "client host",
+              "src": "client",
+              "dst_host": "server host",
+              "dst": "server",
+              "server_port": "port"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "sort": [
+              {
+                "field": "failures/s",
+                "desc": true
+              }
+            ]
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      },
+      "description": "Connections and failed attempts per client host and server host, now. A peer whose host is not certain is ~unknown, a public one ~external, and hosts beyond max_peer_hosts ~other."
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Connection failures by peer host and reason",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "shawk-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 10,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (src_host, dst_host, dst, server_port, error_type) (shawk:host_dependency_connection_failures_by_reason:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})",
+          "range": true,
+          "legendFormat": "{{src_host}} → {{dst_host}} ({{dst}}:{{server_port}}) {{error_type}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Failed connection attempts by reason, observed on the client side only: which hosts are refused (refused) or do not answer (timeout)."
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Connection failure ratio by peer host",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "shawk-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 10,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (src_host, src, dst_host, dst, server_port) (shawk:host_dependency_connection_failures_by_reason:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})\n  / (sum by (src_host, src, dst_host, dst, server_port) (shawk:host_dependency_connection_failures_by_reason:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})\n     + (sum by (src_host, src, dst_host, dst, server_port) (shawk:host_dependency_connections:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"}) or 0 * sum by (src_host, src, dst_host, dst, server_port) (shawk:host_dependency_connection_failures_by_reason:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})))",
+          "range": true,
+          "legendFormat": "{{src_host}} ({{src}}) → {{dst_host}} ({{dst}}:{{server_port}})"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Failed attempts over all attempts; a host that accepts none, such as one that is down, shows 100%."
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Connections by peer host",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "shawk-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 18,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (src_host, src, dst_host, dst, server_port) (shawk:host_dependency_connections:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})",
+          "range": true,
+          "legendFormat": "{{src_host}} ({{src}}) → {{dst_host}} ({{dst}}:{{server_port}})"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Connections opened, from the client side, and from the server side when the client has no agent."
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Mean connect time by peer host",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "shawk-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 18,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (src_host, src, dst_host, dst, server_port) (shawk:host_dependency_handshake_seconds_sum:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})\n  / sum by (src_host, src, dst_host, dst, server_port) (shawk:host_dependency_handshake_seconds_count:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})",
+          "range": true,
+          "legendFormat": "{{src_host}} ({{src}}) → {{dst_host}} ({{dst}}:{{server_port}})"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "From connect(2) to the SYN-ACK, on the client side. A second or more follows a lost SYN."
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "SYN retransmissions by peer host",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "shawk-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 26,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (src_host, src, dst_host, dst, server_port) (shawk:host_dependency_syn_retransmits:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})",
+          "range": true,
+          "legendFormat": "{{src_host}} ({{src}}) → {{dst_host}} ({{dst}}:{{server_port}})"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "SYNs the clients retransmitted towards each host, for connections established or failed."
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Retransmitted segments by peer host",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "shawk-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 26,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (src_host, src, dst_host, dst, server_port, shawk_role) (shawk:host_dependency_retransmits:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})",
+          "range": true,
+          "legendFormat": "{{src_host}} → {{dst_host}} ({{dst}}:{{server_port}}) sent by {{shawk_role}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Segments each side retransmitted; shawk_role is the sender."
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Request and response bytes by peer host",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "shawk-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 34,
+        "w": 24,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (src_host, src, dst_host, dst, server_port) (shawk:host_dependency_request_bytes:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})",
+          "range": true,
+          "legendFormat": "request {{src_host}} ({{src}}) → {{dst_host}} ({{dst}}:{{server_port}})"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "expr": "sum by (src_host, src, dst_host, dst, server_port) (shawk:host_dependency_response_bytes:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})",
+          "legendFormat": "response {{src_host}} ({{src}}) → {{dst_host}} ({{dst}}:{{server_port}})"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "unit": "Bps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Bytes from the client to the server (request) and from the server to the client (response)."
+    }
+  ]
+}

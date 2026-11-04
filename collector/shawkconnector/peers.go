@@ -122,6 +122,11 @@ type peer struct {
 	// named through a translation whose backend has another port than the
 	// one the client connected to; 0 otherwise.
 	port uint16
+	// host is the host of the peer (shawk.peer.host), with peer_hosts only;
+	// self tells that the peer is on the host of the edge itself, whose name
+	// the request carries.
+	host string
+	self bool
 	// server is the address of the server, when the peer of a client edge
 	// is named through a translation; invalid otherwise.
 	server netip.Addr
@@ -178,6 +183,40 @@ type resolver struct {
 	// expiry.
 	rangeMu    sync.Mutex
 	rangeCache map[rangeKey][]candidate
+
+	// peerHosts tells whether peers are given a host (peer_hosts).
+	peerHosts bool
+	// inventory returns the host the inventory (#175) gives an address to,
+	// the first evidence of the host of a peer; nil without an inventory.
+	// It is called for every peer, so that the connector may replace the
+	// inventory it reads.
+	inventory func(netip.Addr) (string, bool)
+	// dbFormer are the latest hosts that held addresses alone, read from
+	// PostgreSQL with peer_hosts only.
+	dbFormer map[netip.Addr]formerHolder
+	dbNames  map[string]string // host id -> name, of dbFormer
+	// localHeld are the hosts this connector saw holding addresses, with
+	// when, with peer_hosts only, until they are written to PostgreSQL and
+	// read back into dbFormer (forgetHeld): while the database cannot be
+	// written or read, an address that moved to another host does not name
+	// its former holder again once the new one stops. localNames are the
+	// names of their hosts.
+	localHeld  map[netip.Addr]map[string]time.Time
+	localNames map[string]string
+}
+
+// formerHolderWindow is how long after a host last held an address the
+// address still names it, if no other host held it since: as long as
+// shawk_v1.service_endpoints names the services of a host that stopped.
+const formerHolderWindow = 30 * 24 * time.Hour
+
+// formerHolder is the latest host that held an address, within
+// formerHolderWindow, while no other host held it.
+type formerHolder struct {
+	host, name string
+	// lastSeen is when it last held the address, by the clock of the
+	// database.
+	lastSeen time.Time
 }
 
 // rangeKey is a range of addresses of backends, on a port.
@@ -217,6 +256,8 @@ func newResolver(cidrs []namedPrefix, translations []translation) *resolver {
 		localLearnedServers: map[learnedServerKey]map[learnedClient]time.Time{},
 		localServed:         map[clientKey]map[endpoint]time.Time{},
 		inferred:            map[string]int{},
+		localHeld:           map[netip.Addr]map[string]time.Time{},
+		localNames:          map[string]string{},
 	}
 }
 
@@ -248,6 +289,14 @@ type peerRows struct {
 	clients   []clientRow
 	agents    []agentAddrRow
 	learned   []learnedRow
+	// former are read with peer_hosts only.
+	former []formerHolderRow
+}
+
+// formerHolderRow is the latest host that held an address alone.
+type formerHolderRow struct {
+	addr netip.Addr
+	formerHolder
 }
 
 // load replaces what was read from PostgreSQL at now.
@@ -274,9 +323,16 @@ func (r *resolver) load(rows peerRows, now time.Time) {
 		}
 	}
 	learned, learnedServers := loadLearned(rows.learned)
+	former := make(map[netip.Addr]formerHolder, len(rows.former))
+	names := map[string]string{}
+	for _, f := range rows.former {
+		former[f.addr] = f.formerHolder
+		names[f.host] = f.name
+	}
 	r.mu.Lock()
 	r.loaded = now
 	r.dbEndpoints, r.dbClients, r.dbAddrs, r.dbAgents = eps, cls, addrs, agents
+	r.dbFormer, r.dbNames = former, names
 	r.dbLearned, r.dbLearnedServers = learned, learnedServers
 	r.clearRanges()
 	r.mu.Unlock()
@@ -383,6 +439,40 @@ func (r *resolver) learn(b *hostBatch, now time.Time) {
 	}
 	r.localAgents[b.key] = agentHost{seen: now, udpTraced: b.udpTraced, name: b.hostname,
 		fold: b.peerFold, internal: b.peerInternal}
+	if r.peerHosts {
+		for _, a := range b.addrs {
+			learnTimed(r.localHeld, a, b.key, now)
+		}
+		r.localNames[b.key] = b.hostname
+	}
+}
+
+// forgetHeld forgets the holders of addresses seen before t, once what was
+// seen then has been written to PostgreSQL and read back.
+func (r *resolver) forgetHeld(t time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	expireLearned(r.localHeld, t)
+	r.forgetNames()
+}
+
+// forgetNames forgets the names of hosts that hold no address in
+// localHeld. r.mu is held.
+func (r *resolver) forgetNames() {
+	if len(r.localNames) == 0 {
+		return
+	}
+	held := map[string]bool{}
+	for _, hs := range r.localHeld {
+		for h := range hs {
+			held[h] = true
+		}
+	}
+	for h := range r.localNames {
+		if !held[h] {
+			delete(r.localNames, h)
+		}
+	}
 }
 
 // infer learns an endpoint inferred from a listener on an unspecified
@@ -439,6 +529,8 @@ func (r *resolver) expire(t, now time.Time) {
 	expireLearned(r.localLearnedServers, t)
 	expireLearned(r.localServed, t)
 	expireLearned(r.localAddrs, now.Add(-aliveWindow))
+	expireLearned(r.localHeld, now.Add(-formerHolderWindow))
+	r.forgetNames()
 	for h, a := range r.localAgents {
 		if a.seen.Before(now.Add(-aliveWindow)) {
 			delete(r.localAgents, h)
@@ -472,7 +564,11 @@ func (r *resolver) expire(t, now time.Time) {
 // sources, the server sees the relay, which is named after its address.
 func (r *resolver) peer(host string, id *edgeID, now time.Time) peer {
 	if id.folded {
-		return peer{name: r.classifyFolded(id.peer)}
+		p := peer{name: r.classifyFolded(id.peer)}
+		if r.peerHosts {
+			p.host = hostExternal
+		}
+		return p
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -489,6 +585,9 @@ func (r *resolver) peer(host string, id *edgeID, now time.Time) peer {
 	// covers tells whether the agent of the peer records the other side,
 	// unless it folds this one.
 	var covers bool
+	// learned tells that a client edge goes through a learned translation,
+	// and named that a service at its peer address names it.
+	var learned, named bool
 	switch {
 	case local:
 		// The host itself runs an agent; before its first complete interval
@@ -524,7 +623,7 @@ func (r *resolver) peer(host string, id *edgeID, now time.Time) peer {
 	if id.role == roleClient {
 		k := endpointKey{id.peer, id.port, id.proto}
 		c := rules
-		learned := r.virtualOf(id) == nil && len(r.learnedOf(host, id, now)) > 0
+		learned = r.virtualOf(id) == nil && len(r.learnedOf(host, id, now)) > 0
 		if r.virtualOf(id) != nil || learned {
 			// At a virtual address, only a service observed on a socket at it
 			// recently, such as a relay that runs an agent, comes before the
@@ -545,6 +644,7 @@ func (r *resolver) peer(host string, id *edgeID, now time.Time) peer {
 			c.add(r.localEndpoints[k], r.dbEndpoints[k], r.dbAge(now), 0)
 		}
 		p.name = c.best.service
+		named = p.name != ""
 		if p.name == "" {
 			if c, t, ok := r.translatedServer(id, now); ok {
 				// The holder of the virtual address, if any, is not the server.
@@ -598,7 +698,148 @@ func (r *resolver) peer(host string, id *edgeID, now time.Time) peer {
 	if p.name == "" {
 		p.name = r.classify(id.peer)
 	}
+	if r.peerHosts {
+		if id.role == roleClient && !named && (r.virtualOf(id) != nil || learned) {
+			p.host, p.self = r.translatedHost(host, id, now)
+		} else {
+			p.host, p.self = r.addrHost(host, id.peer, now)
+		}
+	}
 	return p
+}
+
+// addrHost returns the host of a peer of host at an address, or whether it
+// is host itself (§1.3 of docs/proposals/slurm-hpc-clusters.md): a host
+// takes stronger evidence than a service, so a peer whose host is not
+// certain has none. The names of peer_cidrs are ranges, not hosts. r.mu is
+// held.
+func (r *resolver) addrHost(host string, a netip.Addr, now time.Time) (string, bool) {
+	if a.IsLoopback() {
+		return "", true
+	}
+	if r.inventory != nil {
+		if h, ok := r.inventory(a); ok {
+			return h, false
+		}
+	}
+	hs := r.holders(a, now)
+	switch {
+	case len(hs) > 1:
+		// A shared address, such as the gateway of a container bridge, is
+		// the host's own if it holds it too, as for the names of services.
+		if hs[host] {
+			return "", true
+		}
+		return hostUnknown, false
+	case len(hs) == 1:
+		for h := range hs {
+			if h == host {
+				return "", true
+			}
+			return r.hostName(h), false
+		}
+	}
+	// The latest holder, if its agent stopped since, so that failures
+	// towards a host that is down are named. An address that left a host
+	// whose agent is alive is no longer that host's.
+	if h, ok := r.formerHolder(a, now); ok && h != host {
+		if _, alive := r.agent(h, now); !alive {
+			return r.hostName(h), false
+		}
+	}
+	if isPrivate(a) {
+		return hostUnknown, false
+	}
+	return hostExternal, false
+}
+
+// formerHolder returns the latest host that held an address within
+// formerHolderWindow, from PostgreSQL and from what this connector saw
+// since its latest write, unless another host held it within shareWindow
+// of that. r.mu is held.
+func (r *resolver) formerHolder(a netip.Addr, now time.Time) (string, bool) {
+	held := map[string]time.Time{}
+	add := func(h string, t time.Time) {
+		if !t.Before(now.Add(-formerHolderWindow)) && t.After(held[h]) {
+			held[h] = t
+		}
+	}
+	if f, ok := r.dbFormer[a]; ok {
+		// Not aged as of the load like the other times read from
+		// PostgreSQL: the window ends 30 days after the host last held the
+		// address, also while the database cannot be read.
+		add(f.host, f.lastSeen)
+	}
+	for h, t := range r.localHeld[a] {
+		add(h, t)
+	}
+	var latest string
+	for h, t := range held {
+		if latest == "" || t.After(held[latest]) || t.Equal(held[latest]) && h < latest {
+			latest = h
+		}
+	}
+	if latest == "" {
+		return "", false
+	}
+	for h, t := range held {
+		if h != latest && !t.Before(held[latest].Add(-shareWindow)) {
+			return "", false
+		}
+	}
+	return latest, true
+}
+
+// translatedHost returns the host of the peer of a client edge of host to a
+// virtual address that no service of its own names. A connection reached
+// one backend, but which one is not known: pickBackend chooses a
+// representative to name the service. So the backend is the host of the
+// peer only when it is the only one: the only backend of a static
+// translation, a single address, or the only address learned translations
+// sent the client to. r.mu is held.
+func (r *resolver) translatedHost(host string, id *edgeID, now time.Time) (string, bool) {
+	if t := r.virtualOf(id); t != nil {
+		if len(t.backends) == 1 && t.backends[0].prefix.IsSingleIP() {
+			return r.addrHost(host, t.backends[0].prefix.Addr(), now)
+		}
+		return hostUnknown, false
+	}
+	bs := r.learnedOf(host, id, now)
+	if len(bs) == 0 {
+		return hostUnknown, false
+	}
+	b := bs[0]
+	for _, o := range bs[1:] {
+		if o.backend != b.backend || o.host != b.host {
+			return hostUnknown, false
+		}
+	}
+	if r.sameHostAddr(b.backend, now) {
+		// A backend at a loopback or shared address is on the host that
+		// translated the connections.
+		if b.host == host {
+			return "", true
+		}
+		return r.hostName(b.host), false
+	}
+	return r.addrHost(host, b.backend, now)
+}
+
+// hostName returns the name of a host, by its id. r.mu is held.
+func (r *resolver) hostName(h string) string {
+	if a, ok := r.localAgents[h]; ok && a.name != "" {
+		return a.name
+	}
+	if a, ok := r.dbAgents[h]; ok && a.name != "" {
+		return a.name
+	}
+	if n, ok := r.localNames[h]; ok {
+		return n
+	}
+	if n, ok := r.dbNames[h]; ok {
+		return n
+	}
+	return hostUnknown
 }
 
 // foldsPeer tells whether the agent a of the host peer folds this side, at
