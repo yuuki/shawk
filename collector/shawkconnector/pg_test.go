@@ -386,6 +386,7 @@ func TestPGReaderRole(t *testing.T) {
 		"SELECT count(*) FROM shawk_v1.agent_addrs",
 		"SELECT count(*) FROM shawk_v1.agents",
 		"SELECT count(*) FROM shawk_v1.unobserved(now() - interval '1 day', now())",
+		"SELECT count(*) FROM shawk_v1.unobserved_by_name(now() - interval '1 day', now())",
 		"SELECT count(*) FROM shawk_v1.partly_observed(now() - interval '1 day', now())",
 		"SELECT count(*) FROM shawk_v1.client_endpoints",
 		"SELECT count(*) FROM shawk_v1.dependencies_between(now() - interval '1 day', now())",
