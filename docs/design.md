@@ -879,10 +879,13 @@ hosts:
   cannot be read, is invalid (unknown fields included), larger than 16 MiB
   or has no hosts (as a failed generator may leave) keeps the inventory
   read before, from PostgreSQL if the connector has read none since it
-  started, and the failure is logged and recorded with its time
-  (`inventory_status`). Every connector should read the same file, as with
-  `peer_cidrs`. Without `inventory_file` the connector drops the inventory
-  from PostgreSQL at start.
+  started, and written again if writing it failed. The failure is logged
+  and recorded with its time (`inventory_status`); the record is shared, so
+  a connector that reads the file clears the failure of another. A file of
+  several YAML documents is invalid. Every connector should read the same
+  file, as with `peer_cidrs`: the last to write wins. A connector without
+  `inventory_file` leaves the inventory as it is; to drop it, delete the
+  rows of `shawk.inventory_hosts` and `shawk.inventory_state`.
 - **Generating it.** The connector does not talk to Slurm. A cron job may
   write the file from the provisioning database and `scontrol show nodes
   --json`, to a temporary file renamed over the old one, so that the
@@ -955,7 +958,7 @@ match.
 | `unobserved(since, until, tolerance)` | the periods in which each host was not observed; Grafana overlays them as annotations |
 | `never_observed()` | the hosts of the inventory (§5.6) expected to run an agent whose agent never reported within the retention (no host has their name): `host`, `slurm_node`, `roles`, and `seen_as`, the hosts whose agents reported an address of the host, as an agent whose `host.name` differs from the inventory would |
 | `inventory`, `inventory_addrs` | the hosts of the inventory with their addresses (`host`, `slurm_node`, `roles`, `agent`, `addrs`), and one row per address with its host: join an address on `addr` to name its host |
-| `inventory_status` | when the inventory was last read from a valid file (`read_at`), the latest failure since (`failed_at`, `error`), and how many hosts it has; no row without an inventory |
+| `inventory_status` | when the inventory was last read from a valid file (`read_at`, NULL if never), the latest failure since (`failed_at`, `error`), and how many hosts it has; no row before a connector with `inventory_file` read it |
 | `partly_observed(since, until)` | the periods in which each host was observed but its agent dropped flows, cut to `[since, until]`: `host`, `gap_start`, `gap_end`, `dropped_flows` (flow updates dropped). A dependency may be missing from them although it was used; Grafana overlays them as annotations |
 | `dependencies_between(since, until)`, `graph_edges_between`, `graph_nodes_between`, `dependency_changes_between` | the same for the dependencies active in a period. They take the edges active in the period with a margin of 15 minutes before matching, so a recent window does not scan the history (about 0.3 s instead of 3 s with a million edges) and both sides of a connection are matched at the edges of the period; the dashboards and alerts use them. A dependency appeared in a period when it was first seen in it and is not in `known_dependencies` from before it, so one that comes back on new edges (a new container, an hourly job) did not appear |
 

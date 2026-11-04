@@ -36,8 +36,7 @@ type store interface {
 	// translations of addresses.
 	syncConfig(ctx context.Context, cidrs []namedPrefix, ts []translation) error
 	// syncInventory writes the inventory read at readAt, unless PostgreSQL
-	// holds the same contents, and records when it was read; nil drops the
-	// inventory.
+	// holds the same contents, and records when it was read.
 	syncInventory(ctx context.Context, inv *inventory, readAt time.Time) error
 	// inventoryFailed records that inventory_file could not be read, or
 	// was invalid, at failedAt; the inventory written before stays.
@@ -557,13 +556,6 @@ func (s *pgStore) syncInventory(ctx context.Context, inv *inventory, readAt time
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, int64(inventoryLock)); err != nil {
 			return err
 		}
-		if inv == nil {
-			b := &pgx.Batch{}
-			b.Queue(`DELETE FROM shawk.inventory_addrs`)
-			b.Queue(`DELETE FROM shawk.inventory_hosts`)
-			b.Queue(`DELETE FROM shawk.inventory_state`)
-			return tx.SendBatch(ctx, b).Close()
-		}
 		var digest *string
 		err := tx.QueryRow(ctx, `SELECT digest FROM shawk.inventory_state`).Scan(&digest)
 		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
@@ -653,6 +645,8 @@ ORDER BY h.host`, func(rows pgx.Rows) error {
 	if err != nil || len(hosts) == 0 {
 		return nil, err
 	}
+	// The order of the database depends on its collation.
+	slices.SortFunc(hosts, func(a, b inventoryHost) int { return strings.Compare(a.name, b.name) })
 	inv := &inventory{hosts: hosts, byAddr: map[netip.Addr]string{}}
 	for _, h := range hosts {
 		for _, a := range h.addrs {

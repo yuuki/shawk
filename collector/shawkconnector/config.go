@@ -31,8 +31,8 @@ type Config struct {
 	// in the fleet, with all their addresses, roles and node names in
 	// Slurm (inventory.go). The connector reads it every write interval and
 	// writes it to PostgreSQL; while it cannot be read or is invalid, the
-	// contents last read stay. Unset, the connector drops the inventory
-	// from PostgreSQL at start.
+	// contents last read stay. Unset, the connector leaves the inventory in
+	// PostgreSQL as it is.
 	InventoryFile string `mapstructure:"inventory_file"`
 	// KeepPeerAddress keeps network.peer.address in the output. It raises
 	// the number of series with the number of peer addresses.

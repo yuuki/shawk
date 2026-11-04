@@ -45,9 +45,10 @@ type shawkConnector struct {
 	// inventory is the inventory last read from inventory_file, or from
 	// PostgreSQL while the file cannot be read; nil while none is known.
 	inventory atomic.Pointer[inventory]
-	// inventoryDropped tells that the inventory has been dropped from
-	// PostgreSQL, without an inventory_file.
-	inventoryDropped bool
+	// inventoryReadAt is when the inventory was read from the file, and
+	// inventoryUnwritten tells that writing it to PostgreSQL failed since.
+	inventoryReadAt    time.Time
+	inventoryUnwritten bool
 	// inventoryErr is the latest failure to read inventory_file, and when
 	// it was logged.
 	inventoryErr       string
