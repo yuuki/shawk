@@ -405,8 +405,15 @@ func (a *Agent) process(pid uint32, comm string, cgroupID uint64, port uint16, s
 	if tracer.KernelOwned(comm, cgroupID) {
 		return otlp.Process{Comm: comm, Service: procinfo.KernelServiceName(port, server)}
 	}
-	unit, ctr := a.cgroups.Unit(cgroupID)
 	cg := flowCgroup{id: cgroupID, path: a.cgroups.CgroupPath(cgroupID)}
+	if cg.path == "" && cgroupID != 0 && pid != 0 {
+		// The path of the cgroup is not known, e.g. its event was dropped:
+		// the cgroup the process is in tells it, if it is the same.
+		if p := a.idents.read(pid, false).cgroup; a.cgroups.LearnOf(cgroupID, p) {
+			cg.path = p
+		}
+	}
+	unit, ctr := a.cgroups.Unit(cgroupID)
 	return a.idents.resolve(pid, comm, cg, unit, ctr, now)
 }
 

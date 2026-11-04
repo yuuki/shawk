@@ -277,9 +277,11 @@ func TestIdentitiesOfSlurmJobs(t *testing.T) {
 }
 
 // A process moved into a job, e.g. by pam_slurm_adopt, with a socket of
-// its former cgroup, is not named by its environment; nor is a process of
-// a job whose cgroup the agent does not know, e.g. after its events were
-// dropped. The identity of the latter is not kept: its unit is not known.
+// its former cgroup, is not named by its environment, which is not read;
+// nor is a process of a job that took the PID of a flow whose cgroup the
+// agent does not know, e.g. after its events were dropped, taken for the
+// process of the flow (Agent.process learns the cgroup of the flow when
+// the process is still in it).
 func TestIdentitiesOfProcessesInJobs(t *testing.T) {
 	now := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
 	const extern = "/system.slice/slurmstepd.scope/job_1/step_extern/user/task_special"
@@ -287,25 +289,56 @@ func TestIdentitiesOfProcessesInJobs(t *testing.T) {
 	r.exe = func(uint32) string { return "/usr/bin/python3" }
 	r.comm = func(uint32) string { return "" }
 	r.cgroup = func(uint32) string { return extern }
+	envReads := 0
 	r.env = func(uint32) (map[string]string, bool) {
+		envReads++
 		return map[string]string{"OTEL_SERVICE_NAME": "slurmctld"}, true
 	}
 	r.beginInterval()
+	r.prefetch([]procRequest{{100, true}, {200, true}})
 	sshd := flowCgroup{11, "/system.slice/sshd.service"}
 	if got := r.resolve(100, "python3", sshd, "sshd.service", nil, now); got.Exe != "" || got.Service != "python3" {
 		t.Errorf("resolve of a process moved into a job = %+v", got)
 	}
-	if got := r.resolve(200, "python3", flowCgroup{id: 22}, "", nil, now); got.Exe != "/usr/bin/python3" || got.Service != "python3" {
+	if got := r.resolve(200, "python3", flowCgroup{id: 22}, "", nil, now); got.Exe != "" || got.Service != "python3" {
 		t.Errorf("resolve of a process of a job in an unknown cgroup = %+v", got)
 	}
-	if len(r.latest) != 0 {
-		t.Errorf("identities kept: %v", r.latest)
+	if envReads != 0 || len(r.latest) != 0 {
+		t.Errorf("%d environments read, identities kept: %v", envReads, r.latest)
 	}
 	// A process whose cgroup cannot be read is taken as it is.
 	r.cgroup = func(uint32) string { return "" }
 	r.beginInterval()
 	if got := r.resolve(300, "python3", sshd, "sshd.service", nil, now); got.Service != "slurmctld" {
 		t.Errorf("resolve of a process whose cgroup is not read = %+v", got)
+	}
+}
+
+// A PID reused while its environment was read, which its cgroup tells, is
+// incomplete: the flow keeps its latest identity, not the environment of
+// another process.
+func TestCgroupChangedWhileReading(t *testing.T) {
+	now := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
+	nginx := flowCgroup{11, "/system.slice/nginx.service"}
+	r := newIdentities(procinfo.FallbackExe, 15*time.Minute)
+	r.exe = func(uint32) string { return "/usr/sbin/nginx" }
+	r.comm = func(uint32) string { return "" }
+	r.cgroup = func(uint32) string { return nginx.path }
+	r.env = func(uint32) (map[string]string, bool) { return nil, true }
+	r.beginInterval()
+	want := r.resolve(100, "nginx", nginx, "nginx.service", nil, now)
+	reads := 0
+	r.cgroup = func(uint32) string {
+		reads++
+		if reads == 1 {
+			return nginx.path
+		}
+		return "/system.slice/other.service"
+	}
+	r.env = func(uint32) (map[string]string, bool) { return map[string]string{"OTEL_SERVICE_NAME": "other"}, true }
+	r.beginInterval()
+	if got := r.resolve(100, "nginx", nginx, "nginx.service", nil, now); got != want {
+		t.Errorf("resolve = %+v, want %+v", got, want)
 	}
 }
 

@@ -86,6 +86,22 @@ func (r *Resolver) Learn(id uint64, path string) {
 	}
 }
 
+// LearnOf records path as the path of the cgroup id if the directory of
+// path in the hierarchy is that cgroup, such as the cgroup a process of a
+// flow is in when the path of the cgroup of the flow is not known. It
+// reports whether it did.
+func (r *Resolver) LearnOf(id uint64, path string) bool {
+	if id == 0 || r.root == "" || !strings.HasPrefix(path, "/") || strings.Contains(path, "/..") {
+		return false
+	}
+	var st syscall.Stat_t
+	if syscall.Stat(r.root+path, &st) != nil || st.Ino != id {
+		return false
+	}
+	r.Learn(id, path)
+	return true
+}
+
 // queueRead queues the read of the state of the containers of a cgroup
 // path, unless the queue is full.
 func (r *Resolver) queueRead(path string) {
