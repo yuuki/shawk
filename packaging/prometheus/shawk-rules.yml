@@ -191,7 +191,7 @@ groups:
       # after 24 hours; the Grafana alert on shawk_v1.agents takes over then.
       #
       # Nodes that Slurm stopped as planned are not alerted (docs/design.md
-      # §5.6): powered down or powering down by power saving, with no flag
+      # §5.7): powered down or powering down by power saving, with no flag
       # but IDLE, CLOUD and POWER_DOWN besides (so never DOWN, DRAIN, FAIL
       # or not responding, IDLE*), or in a reservation with the flag MAINT,
       # which ends with the reservation. The states come from a Slurm

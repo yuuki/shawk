@@ -94,7 +94,7 @@ OTEL_EXPORTER_OTLP_CLIENT_KEY=/etc/obi/tls/obi.key
 ## Slurm
 
 On a cluster managed by Slurm, nodes powered down by power saving or in
-maintenance are not alerted (`docs/design.md` §5.6). For PostgreSQL, set
+maintenance are not alerted (`docs/design.md` §5.7). For PostgreSQL, set
 `node_states_file` in the connector and generate the file every minute
 on the host that runs it, with a cron job that replaces it at once:
 
