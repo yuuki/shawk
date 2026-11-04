@@ -217,19 +217,16 @@ func TestPeerHostEvidence(t *testing.T) {
 	}
 
 	// The inventory comes first.
-	r.inventory = fakeInventory{addrOf("10.0.2.5"): "nas-01", addrOf("10.0.2.3"): "node-03-ib"}
+	inv := map[netip.Addr]string{addrOf("10.0.2.5"): "nas-01", addrOf("10.0.2.3"): "node-03-ib"}
+	r.inventory = func(a netip.Addr) (string, bool) {
+		h, ok := inv[a]
+		return h, ok
+	}
 	for peer, want := range map[string]string{"10.0.2.5": "nas-01", "10.0.2.3": "node-03-ib", "10.0.2.1": "node-01"} {
 		if got := host("id-ctl-01", peer); got != want {
 			t.Errorf("with an inventory, host of %s = %s, want %s", peer, got, want)
 		}
 	}
-}
-
-type fakeInventory map[netip.Addr]string
-
-func (f fakeInventory) hostOf(a netip.Addr) (string, bool) {
-	h, ok := f[a]
-	return h, ok
 }
 
 // TestPeerHostTranslations: through a translation, the backend is the host

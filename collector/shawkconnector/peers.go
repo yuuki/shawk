@@ -183,20 +183,15 @@ type resolver struct {
 
 	// peerHosts tells whether peers are given a host (peer_hosts).
 	peerHosts bool
-	// inventory maps addresses to hosts, the first evidence of the host of
-	// a peer; nil without an inventory.
-	inventory hostInventory
+	// inventory returns the host the inventory (#175) gives an address to,
+	// the first evidence of the host of a peer; nil without an inventory.
+	// It is called for every peer, so that the connector may replace the
+	// inventory it reads.
+	inventory func(netip.Addr) (string, bool)
 	// dbFormer are the latest hosts that held addresses alone, read from
 	// PostgreSQL with peer_hosts only.
 	dbFormer map[netip.Addr]formerHolder
 	dbNames  map[string]string // host id -> name, of dbFormer
-}
-
-// hostInventory maps the addresses of hosts, those without an agent
-// included, to their names.
-type hostInventory interface {
-	// hostOf returns the host an address belongs to, if exactly one.
-	hostOf(a netip.Addr) (string, bool)
 }
 
 // formerHolderWindow is how long after a host last held an address the
@@ -671,7 +666,7 @@ func (r *resolver) addrHost(host string, a netip.Addr, now time.Time) (string, b
 		return "", true
 	}
 	if r.inventory != nil {
-		if h, ok := r.inventory.hostOf(a); ok {
+		if h, ok := r.inventory(a); ok {
 			return h, false
 		}
 	}
