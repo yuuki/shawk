@@ -96,7 +96,7 @@ Per flow and interval the kernel accumulates established connections,
 failed connection attempts, connections open at the end of the interval,
 bytes sent/received, UDP datagrams, retransmissions and smoothed RTT
 samples. These cover the edge weights of §2.4 of the paper, except TCP
-messages, which would need a hook on the data path; failures and
+messages, which would need a hook on the data path (§3.2); failures and
 retransmissions stand for errors, and open connections are added. For TCP
 active opens it also accumulates the handshake duration from `connect(2)`
 to the SYN-ACK in fixed buckets, the SYNs retransmitted, and the failures
@@ -116,13 +116,23 @@ proposed in [proposals/path-quality-zones.md](proposals/path-quality-zones.md).
 | `iter/task_file` | owners of adopted connections, MPTCP connections and listeners; stands in for `iter/tcp` where its walk skips connections (below) |
 
 Compared with the original kprobes (`tcp_v4_connect`, `inet_csk_accept`,
-`tcp_sendmsg`, `tcp_cleanup_rbuf`), this has no per-message cost: in the
+`tcp_sendmsg`, `tcp_cleanup_rbuf`), this costs nothing per message: in the
 paper the streaming method was cheapest for persistent connections and
-bundling paid on every message, while shawk pays per connection only. A
+bundling paid on every message, while shawk pays per state change, about
+0.11 to 0.16 µs each and 1.1 to 1.6 µs per connection on Rocky Linux 9.8
+and Linux 6.8 on arm64. Bundling every message costs 0.11 µs per message
+there with fentry and 0.3 µs with kprobes, 11 % and 27 % of a saturated
+loopback request-response, and would only add message counts
+([research/kernel-hooks](research/kernel-hooks/kernel_hooks.md)). A
 tracepoint assumes no kernel function signature (`inet_csk_accept` changed
-in 6.10), needs no BPF trampolines (kernels that restrict ftrace, arm64
-before 6.0), and the walks find connections that predate the agent
-(connection pools, gRPC channels). IPv6 and MPTCP are handled.
+in 6.10, and RHEL 9.8 has the change on 5.14), needs no BPF trampolines,
+and has socket local storage, which kprobes have not. A hook on accept
+would name the accepting task, but every rule of the owners below would
+stay (for `Accept=yes`, connections never accepted or adopted, listeners of
+the kernel). What the tracepoint does not see is left to the walks: the
+traffic and RTT of a connection between its state changes, and the
+connections that predate the agent (connection pools, gRPC channels).
+IPv6 and MPTCP are handled.
 
 Bytes are read from the cumulative counters of `struct tcp_sock`
 (`bytes_acked`, `bytes_received`, `total_retrans`) at close and at every
@@ -160,8 +170,9 @@ schedules differ between kernels (5.14 and RHEL 9 send at 0, 1, 3, 7 s;
 first write) have no duration; simultaneous opens, adopted connections,
 additional MPTCP subflows and the agent's own connections have no
 handshake. The failure reason, `error.type`, is decided at SYN_SENT→CLOSE
-(`fail_reason()` in shawk.bpf.c, which also covers kernels without
-`tcp_done_with_error()`, where user space may take the error first):
+(`fail_reason()` in shawk.bpf.c). A task that reads the error (`SO_ERROR`)
+while the kernel closes the socket takes it first, on every kernel, and the
+failure then counts as `timeout` (§10):
 
 | reason | meaning |
 |---|---|
@@ -225,8 +236,16 @@ decided per socket by its first datagram:
 * a connected socket on a port the kernel chose is a client even if it
   receives first: no client could have known its port.
 
-UDP needs BPF trampolines; without them the agent traces TCP and reports
-that UDP is not traced. Misattributions are listed in §10.
+fentry rather than kprobes: on arm64 a kprobe doubles the cost per datagram
+(0.29 rather than 0.15 µs), and only tracing programs have socket local
+storage for the direction. cgroup_skb costs less (0.06 µs) but runs outside
+the task, so the process of a flow would not be known, and it runs on every
+TCP packet too
+([research/kernel-hooks](research/kernel-hooks/kernel_hooks.md)). UDP thus
+needs BPF trampolines, which arm64 has since Linux 6.0 and RHEL 9 since
+kernel 5.14.0-621 (Rocky Linux 9.8, not 9.6); without them the agent
+traces TCP and reports that UDP is not traced. Misattributions are listed
+in §10.
 
 ### 3.4 Reading flows without losing updates
 
@@ -251,7 +270,7 @@ Linux 5.14 or later with BTF (`CONFIG_DEBUG_INFO_BTF`):
 | `bpf_sock_from_file`, `bpf_get_current_task_btf` | 5.11 |
 | cgroup pointer in `sock_cgroup_data` (else the owner of accepted connections is resolved in user space only) | 5.15, RHEL 9 |
 | TCP iterator that locks each socket (else rare double counting) | 5.19, RHEL 9 |
-| fentry (UDP only) | 5.5 on x86_64, 6.0 on arm64 (not in RHEL 9 on arm64) |
+| fentry (UDP only) | 5.5 on x86_64, 6.0 on arm64 (RHEL 9 on arm64: 5.14.0-621, in 9.8, not in 9.6) |
 | kprobes on the module nf_conntrack (translations, §3.7; `CONFIG_KPROBES`, the system call `perf_event_open`) | `__nf_conntrack_confirm`, and `nf_ct_destroy` since 5.19 and in RHEL 9, `destroy_conntrack` before |
 
 CI loads the programs on the Ubuntu runner kernels (6.8 to 7.0, x86_64 and
@@ -1036,9 +1055,13 @@ only the protocols it parses. shawk runs beside it:
   seen. A firewall that rejects with a reset or port unreachable gives
   `refused`, which reads as a service that is down; an application connect
   timeout below a second turns losses into `aborted`, as does a SYN an LSM
-  denies on output. On kernels without `tcp_done_with_error()` the fallback
-  covers the race with user space only in part (see `fail_reason()`). UDP
-  and QUIC have no kernel handshake.
+  denies on output. An application that reads the error while the kernel
+  closes the socket takes it first, on every kernel, and the failure is
+  counted as `timeout`: 0.01 to 0.05 % of the connects that an ICMP error
+  failed, for a client that waits in poll(2) or epoll, but up to 60 % of
+  all failures, resets included, for one that busy-polls the socket
+  ([research/kernel-hooks](research/kernel-hooks/kernel_hooks.md) §5,
+  #166). UDP and QUIC have no kernel handshake.
 - **Connections that predate the agent** are counted from the adoption on.
   One accepted by a listener with a backlog of 0 that is gone is recorded
   as outgoing.
