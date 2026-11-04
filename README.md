@@ -161,6 +161,9 @@ collector.
 
 ## Development
 
+With [mise](https://mise.jdx.dev), `mise install` sets up the Go version
+of `go.mod`; `mise run build` and `mise run test` wrap the make targets.
+
 ```bash
 make generate      # compile the BPF programs (clang, llvm-strip)
 make vet test      # BPF tests need root; PostgreSQL tests need SHAWK_TEST_POSTGRES_DSN

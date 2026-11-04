@@ -1,0 +1,12 @@
+# Development tool versions (https://mise.jdx.dev). Run `mise install`.
+[tools]
+# Follows the `go` directive in go.mod, so the version is defined in one place.
+go = "go.mod"
+
+[tasks.build]
+description = "build the shawk binary"
+run = "make build"
+
+[tasks.test]
+description = "vet and unit tests"
+run = "make vet test"
