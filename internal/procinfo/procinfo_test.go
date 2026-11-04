@@ -34,9 +34,51 @@ func TestUnit(t *testing.T) {
 		{"/system.slice/run-r0a1b2.scope", "run-r0a1b2.scope"},
 		{"/init.scope", "init.scope"},
 		{"/system.slice/crond.service", "crond.service"},
+
+		// Slurm, with the job directory named after the job id (before
+		// 26.05, or CgroupJobIdPaths=yes) or its SLUID.
+		{"/system.slice/slurmstepd.scope/job_42/step_batch/user/task_0", "slurm/batch"},
+		{"/system.slice/slurmstepd.scope/job_42/step_0/user/task_0", "slurm/step"},
+		{"/system.slice/slurmstepd.scope/job_42/step_12/user/task_3", "slurm/step"},
+		{"/system.slice/slurmstepd.scope/job_42/step_1.2/user/task_0", "slurm/step"},
+		{"/system.slice/slurmstepd.scope/job_42/step_extern/user/task_0", "slurm/extern"},
+		{"/system.slice/slurmstepd.scope/job_42/step_extern/user/task_special", "slurm/extern"},
+		{"/system.slice/slurmstepd.scope/job_42/step_interactive/user/task_0", "slurm/interactive"},
+		{"/system.slice/slurmstepd.scope/job_42/step_0/slurm", "slurmstepd"},
+		{"/system.slice/slurmstepd.scope/s5K1KKYAYG5D00/step_batch/user/task_0", "slurm/batch"},
+		{"/system.slice/slurmstepd.scope/s5K1KKYAYG5D00/step_0/user/task_1", "slurm/step"},
+		{"/system.slice/slurmstepd.scope/s5K1KKYAYG5D00/step_extern/user/task_special", "slurm/extern"},
+		{"/system.slice/slurmstepd.scope/s5K1KKYAYG5D00/step_interactive/user/task_0", "slurm/interactive"},
+		{"/system.slice/slurmstepd.scope/s5K1KKYAYG5D00/step_extern/slurm", "slurmstepd"},
+		{"/system.slice/slurmstepd.scope/s5K1KKYAYG5D00/step_0/slurm_processes", "slurmstepd"},
+		{"/system.slice/slurmstepd_node1.scope/job_42/step_0/user/task_0", "slurm/step"},
+		{"/system.slice/slurmstepd.scope/system", "slurmstepd"},
+		// Other hierarchies keep the names they had.
+		{"/system.slice/slurmstepd.scope", "slurmstepd.scope"},
+		{"/system.slice/slurmstepd.scope/job_42", "job_42"},
+		{"/system.slice/slurmstepd.scope/job_42/step_0", "step_0"},
+		{"/system.slice/slurmstepd.scope/job_42/step_0/user", "user"},
+		{"/system.slice/slurmstepd.scope/job_42/step_0/user/task_0/sub", "sub"},
+		{"/system.slice/slurmstepd.scope/job_42/step_x/user/task_0", "task_0"},
+		{"/system.slice/slurmstepd.scope/system/step_0/user/task_0", "task_0"},
+		{"/system.slice/slurmd.service", "slurmd.service"},
+		{"/user.slice/user-1000.slice/user@1000.service/system.slice/slurmstepd.scope/job_42/step_0/user/task_0",
+			"user@1000.service"},
+		{"/slurm/uid_1000/job_42/step_0/task_0", "task_0"},
 	} {
 		if got := Unit(tc.path); got != tc.want {
 			t.Errorf("Unit(%q) = %q, want %q", tc.path, got, tc.want)
+		}
+	}
+}
+
+func TestSlurmJob(t *testing.T) {
+	for unit, want := range map[string]bool{
+		"slurm/batch": true, "slurm/step": true, "slurm/extern": true, "slurm/interactive": true,
+		"slurmstepd": false, "slurmd.service": false, "task_0": false, "": false,
+	} {
+		if got := SlurmJob(unit); got != want {
+			t.Errorf("SlurmJob(%q) = %v, want %v", unit, got, want)
 		}
 	}
 }
