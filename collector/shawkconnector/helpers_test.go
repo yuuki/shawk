@@ -350,6 +350,12 @@ type fakeStore struct {
 	cidrs   []namedPrefix
 	trans   []translation
 	refresh int
+	// inv is the inventory written, invSyncs how many times it was
+	// written, and invFailed the failures recorded.
+	inv       *inventory
+	invSyncs  int
+	invFailed []string
+	invErr    error
 }
 
 func (s *fakeStore) schemaVersion(context.Context) (int, error) {
@@ -363,6 +369,30 @@ func (s *fakeStore) syncConfig(_ context.Context, cidrs []namedPrefix, ts []tran
 	defer s.mu.Unlock()
 	s.cidrs, s.trans = cidrs, ts
 	return nil
+}
+
+func (s *fakeStore) syncInventory(_ context.Context, inv *inventory, _ time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.invErr != nil {
+		return s.invErr
+	}
+	s.inv = inv
+	s.invSyncs++
+	return nil
+}
+
+func (s *fakeStore) inventoryFailed(_ context.Context, _ time.Time, msg string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.invFailed = append(s.invFailed, msg)
+	return nil
+}
+
+func (s *fakeStore) inventory(context.Context) (*inventory, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.inv, nil
 }
 
 func (s *fakeStore) refreshDependencies(context.Context) (int64, error) {

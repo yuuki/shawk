@@ -27,6 +27,13 @@ type Config struct {
 	// service, e.g. office-lan: 192.168.10.0/24. A value may list several
 	// prefixes separated by commas. The narrowest matching range wins.
 	PeerCIDRs map[string]string `mapstructure:"peer_cidrs"`
+	// InventoryFile is a file in YAML or JSON that lists the hosts expected
+	// in the fleet, with all their addresses, roles and node names in
+	// Slurm (inventory.go). The connector reads it every write interval and
+	// writes it to PostgreSQL; while it cannot be read or is invalid, the
+	// contents last read stay. Unset, the connector drops the inventory
+	// from PostgreSQL at start.
+	InventoryFile string `mapstructure:"inventory_file"`
 	// KeepPeerAddress keeps network.peer.address in the output. It raises
 	// the number of series with the number of peer addresses.
 	KeepPeerAddress bool `mapstructure:"keep_peer_address"`
