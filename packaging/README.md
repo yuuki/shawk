@@ -97,6 +97,71 @@ Set `SHAWK_GRAFANA_PROMETHEUS_PASSWORD` and put the CA of Prometheus at
 `/etc/grafana/tls/prometheus-ca.crt`, then adjust the URLs and credentials
 in `grafana/provisioning/datasources/shawk.yaml`.
 
+## Stateless nodes: a stable machine id
+
+PostgreSQL keys a host by its machine id and host name, and the connector
+sends the machine id to Prometheus as `host_id`, as OBI does as `host.id`.
+A node that gets a new machine id at every boot becomes a new host each
+time, and `unobserved()` reports the time after the last heartbeat of each
+old id as not observed although the node was observed throughout. Nodes
+that boot a shared image without a disk (Warewulf, xCAT diskless or
+statelite, a root on tmpfs) get a new id at every boot when the image holds
+an empty or no `/etc/machine-id` and nothing below gives one; Slurm's power
+saving boots them often.
+
+At boot systemd takes the first of (machine-id(5)):
+
+1. `systemd.machine_id=` on the kernel command line (or `--machine-id=` of
+   systemd);
+2. the id in `/etc/machine-id`;
+3. if the file is empty or missing: `/var/lib/dbus/machine-id`,
+   `container_uuid` on the kernel command line, the DMI `product_uuid` or
+   the devicetree `vm,uuid` on KVM, the UUID of Xen, and finally a random
+   one, which is what bare metal gets.
+
+systemd then writes the id to `/etc/machine-id`, or mounts a temporary file
+over it when the root is read-only; on a root that is not kept, the id is
+lost at shutdown. A read-only root must hold the file, empty if the id
+comes from elsewhere: systemd fails to boot when it is missing.
+
+Give every node an id of its own: generate it once (`systemd-id128 new`),
+keep it with the node in the provisioning database, and pass it before
+systemd starts:
+
+- on the kernel command line of the node, `systemd.machine_id=` and the 32
+  hexadecimal digits: the kernel arguments of the node in Warewulf (`wwctl
+  node set --kernelargs`; keep the arguments the profile sets) or the
+  attribute `addkcmdline` of the node in xCAT. It takes precedence over the
+  file of the image;
+- or `/etc/machine-id` in the root the node boots, from a file per node: in
+  Warewulf, a template of an overlay of the node; Warewulf provisions all
+  of them with the image, and a system overlay is the one meant for files
+  of the boot. A file that is changed only after boot (a postscript of
+  xCAT, a runtime overlay that wwclient applies again) is too late for
+  that boot: systemd has established the id and the agent has started with
+  it.
+
+Do not put a valid id in the shared image instead, in `/etc/machine-id` or
+`/var/lib/dbus/machine-id`: every node would have the same one. shawk tells
+them apart by host name, but `host_id` and OBI's `host.id` would not.
+Newer versions of systemd also take `systemd.machine_id=firmware`, an id
+from the firmware; check that machine-id(5) of the installed version lists
+it.
+
+Check that `cat /etc/machine-id` is the same after a reboot. In PostgreSQL,
+names with many host ids are nodes whose id changed (or hosts reinstalled):
+
+```sql
+SELECT host, count(*) AS host_ids FROM shawk_v1.agents GROUP BY host HAVING count(*) > 1;
+```
+
+The host ids already recorded stay. `shawk_v1.unobserved_by_name()` takes
+the same arguments as `unobserved()` and computes the periods over the
+sessions of all the host ids of each name; the dashboards use
+`unobserved()`, and their annotations can call `unobserved_by_name()`
+instead where machine ids changed. It hides the gaps of two machines that
+share a name.
+
 ## Upgrading
 
 The connector of the example does not migrate (`migrate: false`). It waits
