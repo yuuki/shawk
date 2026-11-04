@@ -385,23 +385,24 @@ func TestIdentitiesUsers(t *testing.T) {
 		t.Errorf("adopted process = %+v, want user 1001", got)
 	}
 
-	// The process exited and another one of another job, with the same
-	// comm, took its PID: its user is not that of the flow.
-	uids[100], cgroups[100], exes[100] = 1002, other, "/home/bob/a.out"
-	r.beginInterval()
-	if got := r.resolve(100, "a.out", flowCgroup{id: step}, "slurm/batch", nil, now.Add(time.Minute)); got.HasUserID {
-		t.Errorf("PID taken in another cgroup = %+v, want no user", got)
-	}
 	// The process exited: the identity is the latest of the step, without
 	// its user.
 	delete(exes, 100)
 	r.beginInterval()
-	got = r.resolve(100, "a.out", flowCgroup{id: step}, "slurm/batch", nil, now.Add(2*time.Minute))
+	got = r.resolve(100, "a.out", flowCgroup{id: step}, "slurm/batch", nil, now.Add(time.Minute))
 	if got.HasUserID || got.Exe != "/home/alice/a.out" {
 		t.Errorf("exited job process = %+v, want the latest identity without a user", got)
 	}
+	// Another process of another job, with the same comm, took the PID:
+	// its user is not that of the flow. (The path of its cgroup is not
+	// read here, so the rest of what /proc tells is taken as it is.)
+	uids[100], cgroups[100], exes[100] = 1002, other, "/home/bob/a.out"
+	r.beginInterval()
+	if got := r.resolve(100, "a.out", flowCgroup{id: step}, "slurm/batch", nil, now.Add(2*time.Minute)); got.HasUserID {
+		t.Errorf("PID taken in another cgroup = %+v, want no user", got)
+	}
 	// The user id cannot be read.
-	exes[100], cgroups[100] = "/home/alice/a.out", step
+	uids[100], exes[100], cgroups[100] = 1001, "/home/alice/a.out", step
 	delete(uids, 100)
 	r.beginInterval()
 	if got := r.resolve(100, "a.out", flowCgroup{id: step}, "slurm/batch", nil, now.Add(3*time.Minute)); got.HasUserID || got.Exe == "" {
