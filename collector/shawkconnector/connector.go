@@ -45,9 +45,10 @@ type shawkConnector struct {
 	// inventory is the inventory last read from inventory_file, or from
 	// PostgreSQL while the file cannot be read; nil while none is known.
 	inventory atomic.Pointer[inventory]
-	// inventoryDropped tells that the inventory has been dropped from
-	// PostgreSQL, without an inventory_file.
-	inventoryDropped bool
+	// inventoryReadAt is when the inventory was read from the file, and
+	// inventoryUnwritten tells that writing it to PostgreSQL failed since.
+	inventoryReadAt    time.Time
+	inventoryUnwritten bool
 	// inventoryErr is the latest failure to read inventory_file, and when
 	// it was logged.
 	inventoryErr       string
@@ -58,6 +59,9 @@ type shawkConnector struct {
 	inventoryWarned map[string]time.Time
 
 	lastPrune, lastRefresh time.Time
+	// written is when the latest write that took every pending change
+	// started: what was seen before it is in PostgreSQL.
+	written time.Time
 
 	// Of the node_states_file and the maintenance_file, used by the loop
 	// only: when the states last written were read from Slurm, the
@@ -114,8 +118,12 @@ func newConnector(set connector.Settings, cfg *Config, next consumer.Metrics) (*
 	now := time.Now()
 	res := newResolver(cidrs, translations)
 	res.maxInferred = cfg.MaxSeriesPerHost
+	res.peerHosts = cfg.PeerHosts
 	agg := newAggregator(cfg.IdleTTL, cfg.MaxPeers, cfg.MaxServices, cfg.KeepPeerAddress, now)
 	agg.maxInputs = maxValuesPerEdge * cfg.MaxSeriesPerHost
+	if cfg.PeerHosts {
+		agg.setPeerHosts(cfg.MaxPeerHosts, cfg.PeerHostServices)
+	}
 	return &shawkConnector{
 		cfg:      cfg,
 		log:      set.Logger,
@@ -197,12 +205,24 @@ func (c *shawkConnector) prepare(ctx context.Context) bool {
 	c.syncInventory(ctx)
 	c.syncNodeStates(ctx)
 	at := c.now()
-	rows, err := c.store.peers(ctx, c.cfg.IdleTTL)
+	var former time.Duration
+	if c.cfg.PeerHosts {
+		former = formerHolderWindow
+	}
+	rows, err := c.store.peers(ctx, c.cfg.IdleTTL, former)
 	if err != nil {
 		c.log.Warn("reading the names of peers from PostgreSQL", zap.Error(err))
 		return true
 	}
 	c.resolver.load(rows, at)
+	c.mu.Lock()
+	written := c.written
+	c.mu.Unlock()
+	if !written.IsZero() {
+		// The holders of addresses seen before the latest write are read
+		// back from PostgreSQL now.
+		c.resolver.forgetHeld(written)
+	}
 	return true
 }
 
@@ -269,9 +289,14 @@ func (c *shawkConnector) loop(ctx context.Context) {
 			// Writes and the reload of peers have their own deadlines, so
 			// that a slow write does not stop the names from being reloaded.
 			wctx, cancel := context.WithTimeout(ctx, c.cfg.WriteInterval)
+			started := c.now()
 			written := c.prepareSchemaOnly(wctx) && c.flush(wctx)
 			cancel()
-			if !written {
+			if written {
+				c.mu.Lock()
+				c.written = started
+				c.mu.Unlock()
+			} else {
 				c.boundPending()
 			}
 			rctx, cancel := context.WithTimeout(ctx, c.cfg.WriteInterval)

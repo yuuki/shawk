@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Runs the agent under the packaged systemd unit, with its sandbox, and
-# checks that it starts with UDP tracing, traces the TCP and UDP traffic of
-# another process, learns a translation of addresses from conntrack and
-# sends them to a collector.
+# checks that it reports ready once its programs are attached, starts with
+# UDP tracing, traces the TCP and UDP traffic of another process, learns a
+# translation of addresses from conntrack and sends them to a collector,
+# and that a failure to attach the programs fails the start.
 #
 # Requires root, systemd as PID 1 (e.g. a GitHub runner), python3, ss and
 # iptables with NAT.
@@ -14,6 +15,8 @@ COLLECTOR="$(realpath "${2:?usage: agent-unit.sh path/to/shawk path/to/shawk-col
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 WORK="$(mktemp -d)"
 UNIT=shawk-agent-unittest.service
+# The same unit, with bpf(2) denied.
+FAILING=shawk-agent-unittest-failing.service
 BIN=/usr/local/bin/shawk-unittest
 TCP_PORT=21438
 UDP_PORT=21437
@@ -24,9 +27,10 @@ PIDS=()
 
 cleanup() {
 	set +e
-	systemctl stop "$UNIT" 2>/dev/null
+	systemctl stop "$UNIT" "$FAILING" 2>/dev/null
 	iptables -t nat -D "${REDIRECT[@]}" 2>/dev/null
-	rm -f "/run/systemd/system/$UNIT" "$BIN"
+	rm -f "/run/systemd/system/$UNIT" "/run/systemd/system/$FAILING" "/run/systemd/system/$FAILING.d/nobpf.conf" "$BIN"
+	rmdir "/run/systemd/system/$FAILING.d" 2>/dev/null
 	systemctl daemon-reload
 	for pid in "${PIDS[@]}"; do kill "$pid" 2>/dev/null; done
 	wait 2>/dev/null
@@ -83,10 +87,14 @@ grep -q "^ExecStart=$BIN " "/run/systemd/system/$UNIT" || fail "ExecStart was no
 # Translations are learned once nf_conntrack is loaded, as NAT rules load it.
 modprobe nf_conntrack
 systemctl daemon-reload
-systemctl start "$UNIT"
+# Type=notify: start returns once the agent reported ready, i.e. once its
+# programs are attached and the existing sockets adopted.
+systemctl start "$UNIT" || fail "the agent did not start"
+systemctl is-active --quiet "$UNIT" || fail "the agent is not active once started"
 
+# The log line comes before READY=1, but journald may store it later.
 started() { journal | grep -q 'msg="agent started"'; }
-wait_for "the agent did not start" started
+wait_for "the agent did not log its start" started
 journal | grep 'msg="agent started"'
 journal | grep -q 'msg="agent started".* udp=true' || fail "UDP tracing is not available in the sandbox"
 # The kprobes on nf_conntrack, loaded before the agent started, attach with
@@ -128,4 +136,22 @@ if journal | grep -q 'level=ERROR'; then
 	fail "the agent reported errors"
 fi
 systemctl is-active --quiet "$UNIT" || fail "the agent stopped"
+
+# Without bpf(2) the programs are not attached, and the start fails instead
+# of leaving an active unit that traces nothing.
+cp "/run/systemd/system/$UNIT" "/run/systemd/system/$FAILING"
+mkdir -p "/run/systemd/system/$FAILING.d"
+printf '[Service]\nSystemCallFilter=~bpf\nRestart=no\n' >"/run/systemd/system/$FAILING.d/nobpf.conf"
+systemctl daemon-reload
+if systemctl start "$FAILING"; then
+	journalctl -u "$FAILING" -o cat --no-pager | tail -20 >&2
+	fail "the agent started without bpf(2)"
+fi
+systemctl is-failed --quiet "$FAILING" || fail "the unit without bpf(2) did not fail"
+# The agent exited with its error, rather than hanging until systemd gave
+# up waiting for READY=1.
+[ "$(systemctl show -p Result --value "$FAILING")" = exit-code ] ||
+	fail "the unit without bpf(2) failed with $(systemctl show -p Result --value "$FAILING"), not exit-code"
+journalctl -u "$FAILING" -o cat --no-pager | grep -q 'starting tracer' ||
+	fail "the agent without bpf(2) did not fail to start its tracer"
 echo "PASS"

@@ -111,11 +111,4 @@ hosts:
 		t.Errorf("failure not cleared: %q", got)
 	}
 
-	// Without an inventory_file, a connector drops the inventory.
-	if err := c.store.syncInventory(ctx, nil, time.Time{}); err != nil {
-		t.Fatal(err)
-	}
-	if got := queryStrings(t, conn, `SELECT (SELECT count(*) FROM shawk_v1.inventory) + (SELECT count(*) FROM shawk_v1.inventory_status)`); !slices.Equal(got, []string{"0"}) {
-		t.Errorf("inventory left: %q", got)
-	}
 }

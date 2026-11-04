@@ -92,6 +92,9 @@ func readInventory(path string) (*inventory, error) {
 	return parseInventory(b)
 }
 
+// errNoHosts refuses a file without hosts.
+var errNoHosts = errors.New("no hosts")
+
 // parseInventory parses and validates the contents of inventory_file.
 // Unknown fields are refused, so that a misspelt field is not taken as
 // absent.
@@ -101,14 +104,19 @@ func parseInventory(b []byte) (*inventory, error) {
 	dec.KnownFields(true)
 	if err := dec.Decode(&f); err != nil {
 		if errors.Is(err, io.EOF) {
-			return nil, errors.New("no hosts; unset inventory_file to drop the inventory")
+			return nil, errNoHosts
 		}
 		return nil, err
+	}
+	// Files concatenated by mistake would leave the hosts after the first
+	// document unchecked and dropped.
+	if err := dec.Decode(new(any)); !errors.Is(err, io.EOF) {
+		return nil, errors.New("more than one YAML document")
 	}
 	if len(f.Hosts) == 0 {
 		// A generator that failed may leave an empty list, which would
 		// drop the whole inventory.
-		return nil, errors.New("no hosts; unset inventory_file to drop the inventory")
+		return nil, errNoHosts
 	}
 	inv := &inventory{byAddr: map[netip.Addr]string{}}
 	names := map[string]bool{}
@@ -217,19 +225,12 @@ func inventoryDigest(hosts []inventoryHost) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// syncInventory reads inventory_file and writes it to PostgreSQL, or
-// drops the inventory from PostgreSQL once without an inventory_file. It
-// runs every write interval, once the schema is ready.
+// syncInventory reads inventory_file and writes it to PostgreSQL. It runs
+// every write interval, once the schema is ready. Without an
+// inventory_file it does nothing, so that a connector without one leaves
+// the inventory of the others.
 func (c *shawkConnector) syncInventory(ctx context.Context) {
 	if c.cfg.InventoryFile == "" {
-		if c.inventoryDropped {
-			return
-		}
-		if err := c.store.syncInventory(ctx, nil, time.Time{}); err != nil {
-			c.log.Warn("dropping the inventory from PostgreSQL", zap.Error(err))
-			return
-		}
-		c.inventoryDropped = true
 		return
 	}
 	at := c.now()
@@ -245,13 +246,25 @@ func (c *shawkConnector) syncInventory(ctx context.Context) {
 	c.inventory.Store(inv)
 	c.inventoryFromStore = false
 	c.inventoryErr = ""
-	if err := c.store.syncInventory(ctx, inv, at); err != nil {
+	c.inventoryReadAt = at
+	c.writeInventory(ctx, inv, at)
+}
+
+// writeInventory writes the inventory read at readAt, and remembers
+// whether it is written, so that it is written again while the file cannot
+// be read.
+func (c *shawkConnector) writeInventory(ctx context.Context, inv *inventory, readAt time.Time) {
+	if err := c.store.syncInventory(ctx, inv, readAt); err != nil {
 		c.log.Warn("writing the inventory to PostgreSQL", zap.Error(err))
+		c.inventoryUnwritten = true
+		return
 	}
+	c.inventoryUnwritten = false
 }
 
 // inventoryUnreadable keeps the inventory read before, from PostgreSQL if
-// the connector has read none since it started, and records the failure.
+// the connector has read none since it started, writes it if it could not
+// be written when it was read, and records the failure.
 // A failure is logged when it changes, and at most once an hour while it
 // lasts.
 func (c *shawkConnector) inventoryUnreadable(ctx context.Context, err error, at time.Time) {
@@ -260,6 +273,9 @@ func (c *shawkConnector) inventoryUnreadable(ctx context.Context, err error, at 
 		c.log.Error("reading inventory_file; the inventory read before stays", zap.String("file", c.cfg.InventoryFile),
 			zap.Error(err))
 		c.inventoryErr, c.lastInventoryLog = msg, at
+	}
+	if inv := c.inventory.Load(); inv != nil && c.inventoryUnwritten {
+		c.writeInventory(ctx, inv, c.inventoryReadAt)
 	}
 	if c.inventory.Load() == nil {
 		inv, err := c.store.inventory(ctx)

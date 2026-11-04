@@ -5,7 +5,11 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+# The agent reports ready (sd_notify READY=1, from its main process as
+# NotifyAccess=main by default allows) once its BPF programs are attached
+# and the sockets that existed before were adopted, so units ordered after
+# this one start traced, and a failure to attach fails the start.
+Type=notify
 # Set SHAWK_AGENT_OPTS, e.g. -otlp-endpoint https://collector.example:4327
 EnvironmentFile=-/etc/shawk/agent.env
 ExecStart=/usr/bin/shawk agent $SHAWK_AGENT_OPTS
@@ -43,8 +47,9 @@ ProtectClock=yes
 # The agent reads the host name once at start, and the UTS namespace is a
 # copy of the host's made at every start.
 ProtectHostname=yes
-# OTLP over TCP, and netlink for the addresses of the interfaces.
-RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK
+# OTLP over TCP, netlink for the addresses of the interfaces, and a Unix
+# socket to report ready to systemd (NOTIFY_SOCKET).
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
 RestrictNamespaces=net
 RestrictRealtime=yes
 RestrictSUIDSGID=yes

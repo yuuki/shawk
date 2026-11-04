@@ -25,6 +25,8 @@ func TestConfigValidate(t *testing.T) {
 		"no hosts":          func(c *Config) { c.MaxHosts = 0 },
 		"no series":         func(c *Config) { c.MaxSeriesPerHost = 0 },
 		"no pending rows":   func(c *Config) { c.MaxPendingRows = 0 },
+		"no peer hosts":     func(c *Config) { c.MaxPeerHosts = 0 },
+		"empty service":     func(c *Config) { c.PeerHostServices = []string{""} },
 	} {
 		c := *ok
 		mod(&c)

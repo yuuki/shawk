@@ -99,6 +99,7 @@ func TestParseInventoryInvalid(t *testing.T) {
 		{"zone", "hosts:\n  - name: a\n    addrs: ['fe80::1%eth0']", "zone"},
 		{"empty role", "hosts:\n  - name: a\n    roles: ['']", "empty"},
 		{"not YAML", "hosts: [", "yaml"},
+		{"two documents", "hosts:\n  - name: a\n---\nhosts:\n  - name: b", "more than one YAML document"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := parseInventory([]byte(tc.in))
@@ -186,17 +187,46 @@ func TestInventoryFromStore(t *testing.T) {
 	}
 }
 
-// TestInventoryUnset: without an inventory_file, the connector drops the
-// inventory from PostgreSQL once.
+// TestInventoryUnset: without an inventory_file, the connector leaves the
+// inventory of other connectors in PostgreSQL.
 func TestInventoryUnset(t *testing.T) {
 	c, st, _, _ := testConnector(t, nil)
 	st.inv = must(parseInventory([]byte(testInventory)))
-	st.invSyncs = 0
-	c.inventoryDropped = false
 	c.prepare(context.Background())
+	if st.inv == nil || st.invSyncs != 0 || len(st.invFailed) != 0 {
+		t.Errorf("inventory %+v, written %d times, failures %q", st.inv, st.invSyncs, st.invFailed)
+	}
+}
+
+// TestInventoryRetried: an inventory that could not be written is written
+// while the file cannot be read, with the time it was read.
+func TestInventoryRetried(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "inventory.yaml")
+	if err := os.WriteFile(path, []byte(testInventory), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, st, _, _ := testConnector(t, func(cfg *Config) { cfg.InventoryFile = path })
+	if err := os.WriteFile(path, []byte("hosts:\n  - name: login01\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st.invErr = errFake
 	c.prepare(context.Background())
-	if st.inv != nil || st.invSyncs != 1 {
-		t.Errorf("inventory %+v, dropped %d times", st.inv, st.invSyncs)
+	read := c.inventory.Load()
+	if len(read.hosts) != 1 || len(st.inv.hosts) != 3 {
+		t.Fatalf("read %d hosts, written %d", len(read.hosts), len(st.inv.hosts))
+	}
+	if err := os.WriteFile(path, []byte("hosts: ["), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st.invErr = nil
+	c.prepare(context.Background())
+	if st.inv != read || len(st.invFailed) != 1 {
+		t.Errorf("written %+v, failures %q", st.inv, st.invFailed)
+	}
+	syncs := st.invSyncs
+	c.prepare(context.Background())
+	if st.invSyncs != syncs {
+		t.Error("written again once written")
 	}
 }
 

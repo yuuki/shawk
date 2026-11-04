@@ -25,9 +25,10 @@ type store interface {
 	// deleted.
 	prune(ctx context.Context, retention time.Duration, maxRows int) (int64, error)
 	// peers reads the endpoints of services, the client sides of
-	// connections, the addresses of agents, and the translations learned
-	// in the last learnedTTL.
-	peers(ctx context.Context, learnedTTL time.Duration) (peerRows, error)
+	// connections, the addresses of agents, the translations learned in the
+	// last learnedTTL, and, unless formerWindow is zero, the latest hosts
+	// that held addresses alone within formerWindow.
+	peers(ctx context.Context, learnedTTL, formerWindow time.Duration) (peerRows, error)
 	// schemaVersion returns the version of the schema, 0 if it has not
 	// been created, and errDevelopmentSchema for a schema created before
 	// the migrations were consolidated.
@@ -36,8 +37,7 @@ type store interface {
 	// translations of addresses.
 	syncConfig(ctx context.Context, cidrs []namedPrefix, ts []translation) error
 	// syncInventory writes the inventory read at readAt, unless PostgreSQL
-	// holds the same contents, and records when it was read; nil drops the
-	// inventory.
+	// holds the same contents, and records when it was read.
 	syncInventory(ctx context.Context, inv *inventory, readAt time.Time) error
 	// inventoryFailed records that inventory_file could not be read, or
 	// was invalid, at failedAt; the inventory written before stays.
@@ -562,13 +562,6 @@ func (s *pgStore) syncInventory(ctx context.Context, inv *inventory, readAt time
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, int64(inventoryLock)); err != nil {
 			return err
 		}
-		if inv == nil {
-			b := &pgx.Batch{}
-			b.Queue(`DELETE FROM shawk.inventory_addrs`)
-			b.Queue(`DELETE FROM shawk.inventory_hosts`)
-			b.Queue(`DELETE FROM shawk.inventory_state`)
-			return tx.SendBatch(ctx, b).Close()
-		}
 		var digest *string
 		err := tx.QueryRow(ctx, `SELECT digest FROM shawk.inventory_state`).Scan(&digest)
 		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
@@ -658,6 +651,8 @@ ORDER BY h.host`, func(rows pgx.Rows) error {
 	if err != nil || len(hosts) == 0 {
 		return nil, err
 	}
+	// The order of the database depends on its collation.
+	slices.SortFunc(hosts, func(a, b inventoryHost) int { return strings.Compare(a.name, b.name) })
 	inv := &inventory{hosts: hosts, byAddr: map[netip.Addr]string{}}
 	for _, h := range hosts {
 		for _, a := range h.addrs {
@@ -791,7 +786,7 @@ FROM (SELECT now() - make_interval(secs => $1) AS c) t`,
 	return n, err
 }
 
-func (s *pgStore) peers(ctx context.Context, learnedTTL time.Duration) (peerRows, error) {
+func (s *pgStore) peers(ctx context.Context, learnedTTL, formerWindow time.Duration) (peerRows, error) {
 	var out peerRows
 	err := queryRows(ctx, s.pool, `SELECT host(addr), port, proto, host_id, service, last_seen, exact FROM shawk_v1.service_endpoints`,
 		func(rows pgx.Rows) error {
@@ -882,6 +877,51 @@ WHERE last_seen > now() - make_interval(secs => $1)`,
 			out.learned = append(out.learned, r)
 			return nil
 		}, learnedTTL.Seconds())
+	if err != nil || formerWindow == 0 {
+		return out, err
+	}
+	out.former, err = s.formerHolders(ctx, formerWindow)
+	return out, err
+}
+
+// formerHolders reads, for every address held within window, the host
+// whose latest period of holding it ended last, unless another host held it
+// after that period started (beyond shareWindow): an address that several
+// hosts held at once, such as the gateway of a container bridge, names
+// none. Loopback addresses are left out.
+func (s *pgStore) formerHolders(ctx context.Context, window time.Duration) ([]formerHolderRow, error) {
+	var out []formerHolderRow
+	err := queryRows(ctx, s.pool, `WITH p AS (
+  SELECT DISTINCT ON (addr, host_id) addr, host_id, first_seen, last_seen
+  FROM shawk.host_addrs
+  WHERE last_seen > now() - make_interval(secs => $1)
+    AND NOT (addr << inet '127.0.0.0/8' OR addr = inet '::1')
+  ORDER BY addr, host_id, last_seen DESC
+),
+latest AS (
+  SELECT DISTINCT ON (addr) addr, host_id, first_seen, last_seen
+  FROM p
+  ORDER BY addr, last_seen DESC, host_id
+)
+SELECT host(l.addr), l.host_id, h.hostname, l.last_seen
+FROM latest l
+JOIN shawk.hosts h ON h.id = l.host_id
+WHERE NOT EXISTS (
+  SELECT FROM p o
+  WHERE o.addr = l.addr AND o.host_id <> l.host_id
+    AND o.last_seen > l.first_seen + make_interval(secs => $2))`,
+		func(rows pgx.Rows) error {
+			var addr string
+			var f formerHolderRow
+			if err := rows.Scan(&addr, &f.host, &f.name, &f.lastSeen); err != nil {
+				return err
+			}
+			if a, err := netip.ParseAddr(addr); err == nil {
+				f.addr = a.Unmap()
+				out = append(out, f)
+			}
+			return nil
+		}, window.Seconds(), shareWindow.Seconds())
 	return out, err
 }
 
