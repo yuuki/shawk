@@ -49,7 +49,7 @@ func TestPGJobUsers(t *testing.T) {
 	if want := []string{"40000 1001"}; !slices.Equal(got, want) {
 		t.Errorf("listeners = %q, want %q", got, want)
 	}
-	got = queryStrings(t, conn, `SELECT host, unit, service, exe, coalesce(user_id::text, '-'), role, remote_addr, port FROM shawk_v1.job_edges`)
+	got = queryStrings(t, conn, `SELECT host, unit, service, exe, coalesce(user_id::text, '-'), role, host(remote_addr), port FROM shawk_v1.job_edges`)
 	want = []string{
 		"cn01 slurm/batch a.out /home/x/a.out - client 10.0.0.20 27000",
 		"cn01 slurm/batch a.out /home/x/a.out 1001 client 10.0.0.20 27000",
