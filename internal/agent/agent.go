@@ -45,9 +45,21 @@ type Config struct {
 	// LearnTranslations learns the translations of addresses the host
 	// makes from conntrack, and sends them.
 	LearnTranslations bool
-	Logger            *slog.Logger
+	// JobUsers sends the user ids of the processes of Slurm jobs
+	// (process.user.id), which PostgreSQL keeps if the connector is told to.
+	JobUsers bool
+	Logger   *slog.Logger
 
 	traceSelf bool // trace the agent's own flows; for tests
+}
+
+// jobUsers returns what reads the users of the processes of Slurm jobs:
+// nil without JobUsers.
+func jobUsers(cfg Config, cgroups *procinfo.Resolver) func(uint32) (uint32, uint64, bool) {
+	if !cfg.JobUsers || cgroups == nil {
+		return nil
+	}
+	return cgroups.User
 }
 
 // MaxInterval is the longest export interval.
@@ -237,7 +249,7 @@ func newAgent(cfg Config, src source, exp otlp.Exporter, cgroups *procinfo.Resol
 		cgroups:     cgroups,
 		state:       otlp.NewState(cfg.IdleTTL),
 		segment:     otlp.NewSegment(now, cfg.IdleTTL),
-		idents:      newIdentities(cfg.ServiceFallback, cfg.IdleTTL),
+		idents:      newIdentities(cfg.ServiceFallback, cfg.IdleTTL, jobUsers(cfg, cgroups)),
 		started:     now,
 		res:         res,
 		rdma:        newRDMACounters(rdmaClass),

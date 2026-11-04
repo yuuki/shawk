@@ -152,28 +152,33 @@ ON CONFLICT (host_id, addr, first_seen) DO UPDATE SET last_seen = greatest(a.las
 	}
 
 	if len(h.processes) > 0 {
-		var units, comms, exes, services []string
+		var units, comms, exes, services, users []string
 		var firsts, lasts []time.Time
 		for k, p := range h.processes {
 			units = append(units, k.unit)
 			comms = append(comms, k.comm)
 			exes = append(exes, p.exe)
 			services = append(services, k.service)
+			users = append(users, k.user)
 			firsts = append(firsts, p.first)
 			lasts = append(lasts, p.last)
 		}
+		// The user is part of the identity of a process (procKey), NULL if
+		// unknown; the unique index takes NULL as -1.
 		b.Queue(`
-INSERT INTO shawk.processes AS p (host_id, unit, comm, exe, service_name, first_seen, last_seen)
-SELECT $1, * FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::timestamptz[], $7::timestamptz[])
-ON CONFLICT (host_id, unit, comm, service_name) DO UPDATE SET
+INSERT INTO shawk.processes AS p (host_id, unit, comm, exe, service_name, user_id, first_seen, last_seen)
+SELECT $1, u.unit, u.comm, u.exe, u.service, nullif(u.uid, '')::bigint, u.f, u.l
+FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::timestamptz[], $8::timestamptz[])
+  AS u(unit, comm, exe, service, uid, f, l)
+ON CONFLICT (host_id, unit, comm, service_name, (coalesce(user_id, -1))) DO UPDATE SET
   exe          = CASE WHEN excluded.last_seen >= p.last_seen THEN excluded.exe ELSE p.exe END,
   first_seen   = least(p.first_seen, excluded.first_seen),
   last_seen    = greatest(p.last_seen, excluded.last_seen)`,
-			h.key, units, comms, exes, services, firsts, lasts)
+			h.key, units, comms, exes, services, users, firsts, lasts)
 	}
 
 	if len(h.edges) > 0 {
-		var units, comms, services, roles, protos, locals, peers []string
+		var units, comms, services, users, roles, protos, locals, peers []string
 		var ports []int32
 		var netns []int64
 		var firsts, lasts []time.Time
@@ -181,6 +186,7 @@ ON CONFLICT (host_id, unit, comm, service_name) DO UPDATE SET
 			units = append(units, k.unit)
 			comms = append(comms, k.comm)
 			services = append(services, k.service)
+			users = append(users, k.user)
 			roles = append(roles, k.role)
 			protos = append(protos, k.proto)
 			locals = append(locals, k.local.String())
@@ -193,14 +199,15 @@ ON CONFLICT (host_id, unit, comm, service_name) DO UPDATE SET
 		b.Queue(`
 INSERT INTO shawk.edges AS e (host_id, process_id, role, proto, local_addr, remote_addr, port, netns, first_seen, last_seen)
 SELECT $1, p.id, u.role, u.proto, u.local::inet, u.peer::inet, u.port, u.netns, u.f, u.l
-FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::text[], $9::integer[],
-            $10::bigint[], $11::timestamptz[], $12::timestamptz[])
-  AS u(unit, comm, service, role, proto, local, peer, port, netns, f, l)
+FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::text[], $9::text[],
+            $10::integer[], $11::bigint[], $12::timestamptz[], $13::timestamptz[])
+  AS u(unit, comm, service, uid, role, proto, local, peer, port, netns, f, l)
 JOIN shawk.processes p ON p.host_id = $1 AND p.unit = u.unit AND p.comm = u.comm AND p.service_name = u.service
+  AND coalesce(p.user_id, -1) = coalesce(nullif(u.uid, '')::bigint, -1)
 ON CONFLICT (host_id, role, proto, local_addr, remote_addr, port, netns, process_id) DO UPDATE SET
   first_seen = least(e.first_seen, excluded.first_seen),
   last_seen  = greatest(e.last_seen, excluded.last_seen)`,
-			h.key, units, comms, services, roles, protos, locals, peers, ports, netns, firsts, lasts)
+			h.key, units, comms, services, users, roles, protos, locals, peers, ports, netns, firsts, lasts)
 	}
 
 	if len(h.listeners) > 0 {
@@ -360,7 +367,7 @@ func queueListeners(b *pgx.Batch, h *hostChanges) {
 	// The latest owner of a listener in this write; one whose owner is
 	// unknown at the end keeps the latest known one.
 	rows := map[listener]*latest{}
-	var units, comms, services, protos, addrs []string
+	var units, comms, services, users, protos, addrs []string
 	var ports []int32
 	var netns []int64
 	var firsts, lasts []time.Time
@@ -381,6 +388,7 @@ func queueListeners(b *pgx.Batch, h *hostChanges) {
 		units = append(units, k.unit)
 		comms = append(comms, k.comm)
 		services = append(services, k.service)
+		users = append(users, k.user)
 		protos = append(protos, k.proto)
 		addrs = append(addrs, k.addr.String())
 		ports = append(ports, int32(k.port))
@@ -392,21 +400,23 @@ func queueListeners(b *pgx.Batch, h *hostChanges) {
 		b.Queue(`
 INSERT INTO shawk.listener_owners AS o (host_id, process_id, proto, addr, port, netns, first_seen, last_seen)
 SELECT $1, p.id, u.proto, u.addr::inet, u.port, u.netns, u.f, u.l
-FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::integer[], $8::bigint[],
-            $9::timestamptz[], $10::timestamptz[]) AS u(unit, comm, service, proto, addr, port, netns, f, l)
+FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::integer[], $9::bigint[],
+            $10::timestamptz[], $11::timestamptz[]) AS u(unit, comm, service, uid, proto, addr, port, netns, f, l)
 JOIN shawk.processes p ON p.host_id = $1 AND p.unit = u.unit AND p.comm = u.comm AND p.service_name = u.service
+  AND coalesce(p.user_id, -1) = coalesce(nullif(u.uid, '')::bigint, -1)
 ON CONFLICT (host_id, proto, addr, port, netns, process_id) DO UPDATE SET
   first_seen = least(o.first_seen, excluded.first_seen),
   last_seen  = greatest(o.last_seen, excluded.last_seen)`,
-			h.key, units, comms, services, protos, addrs, ports, netns, firsts, lasts)
+			h.key, units, comms, services, users, protos, addrs, ports, netns, firsts, lasts)
 	}
 
-	units, comms, services, protos, addrs = nil, nil, nil, nil, nil
+	units, comms, services, users, protos, addrs = nil, nil, nil, nil, nil, nil
 	ports, netns, firsts, lasts = nil, nil, nil, nil
 	for l, r := range rows {
 		units = append(units, r.proc.unit)
 		comms = append(comms, r.proc.comm)
 		services = append(services, r.proc.service)
+		users = append(users, r.proc.user)
 		protos = append(protos, l.proto)
 		addrs = append(addrs, l.addr.String())
 		ports = append(ports, int32(l.port))
@@ -417,16 +427,17 @@ ON CONFLICT (host_id, proto, addr, port, netns, process_id) DO UPDATE SET
 	b.Queue(`
 INSERT INTO shawk.listeners AS l (host_id, process_id, proto, addr, port, netns, first_seen, last_seen)
 SELECT $1, p.id, u.proto, u.addr::inet, u.port, u.netns, u.f, u.l
-FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::integer[], $8::bigint[],
-            $9::timestamptz[], $10::timestamptz[]) AS u(unit, comm, service, proto, addr, port, netns, f, l)
+FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::integer[], $9::bigint[],
+            $10::timestamptz[], $11::timestamptz[]) AS u(unit, comm, service, uid, proto, addr, port, netns, f, l)
 LEFT JOIN shawk.processes p ON p.host_id = $1 AND p.unit = u.unit AND p.comm = u.comm
-  AND p.service_name = u.service AND (u.unit <> '' OR u.comm <> '')
+  AND p.service_name = u.service AND coalesce(p.user_id, -1) = coalesce(nullif(u.uid, '')::bigint, -1)
+  AND (u.unit <> '' OR u.comm <> '')
 ON CONFLICT (host_id, proto, addr, port, netns) DO UPDATE SET
   process_id = CASE WHEN excluded.last_seen >= l.last_seen THEN coalesce(excluded.process_id, l.process_id)
                     ELSE l.process_id END,
   first_seen = least(l.first_seen, excluded.first_seen),
   last_seen  = greatest(l.last_seen, excluded.last_seen)`,
-		h.key, units, comms, services, protos, addrs, ports, netns, firsts, lasts)
+		h.key, units, comms, services, users, protos, addrs, ports, netns, firsts, lasts)
 }
 
 // queueTranslations writes the translations of addresses a host made, with

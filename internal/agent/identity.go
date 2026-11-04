@@ -24,6 +24,9 @@ type identities struct {
 	env  func(pid uint32) (map[string]string, bool)
 	// cgroup reads the path of the cgroup of a process.
 	cgroup func(pid uint32) string
+	// users reads the user id of a process and the cgroup it is in, which
+	// the processes of Slurm jobs carry; nil reads none.
+	users func(pid uint32) (uid uint32, cgroupID uint64, ok bool)
 	// stuck tells how many reads of environments hang; replaced in tests.
 	stuck func() procinfo.EnvironReads
 	// budget bounds the time spent reading /proc in an interval.
@@ -49,6 +52,11 @@ type procRead struct {
 	cgroup string
 	job    bool
 	env    map[string]string
+	// uid is the effective user id if hasUID, read with uidCgroup, the
+	// cgroup the process was in.
+	uid       uint32
+	uidCgroup uint64
+	hasUID    bool
 	// complete is false when the environment could not be read in time;
 	// noEnv tells that it was not read.
 	complete, noEnv bool
@@ -76,10 +84,13 @@ type latestIdentity struct {
 	at   time.Time
 }
 
-func newIdentities(fb procinfo.Fallback, ttl time.Duration) *identities {
+// newIdentities returns a resolver of identities; users reads the user ids
+// of the processes of Slurm jobs, nil none.
+func newIdentities(fb procinfo.Fallback, ttl time.Duration, users func(uint32) (uint32, uint64, bool)) *identities {
 	return &identities{
 		fallback: fb,
 		ttl:      ttl,
+		users:    users,
 		latest:   map[identityKey]latestIdentity{},
 		exe:      procinfo.Exe,
 		comm:     procinfo.Comm,
@@ -187,6 +198,11 @@ func (r *identities) read(pid uint32, env bool) procRead {
 // a slot of the reads of the other processes. A process whose cgroup
 // changed while its environment was read, as when its PID was reused, is
 // incomplete.
+//
+// If users are read, so are the user id of the process and its cgroup,
+// whether or not the environment is: a process that pam_slurm_adopt moved
+// into a job is asked for with its environment for the sockets it opened
+// before, and carries its user on the flows of the cgroup it is in now.
 func (r *identities) readNow(pid uint32, env bool) procRead {
 	p := procRead{exe: r.exe(pid), complete: true}
 	if p.exe != "" {
@@ -200,6 +216,9 @@ func (r *identities) readNow(pid uint32, env bool) procRead {
 			}
 		} else {
 			p.noEnv = true
+		}
+		if r.users != nil {
+			p.uid, p.uidCgroup, p.hasUID = r.users(pid)
 		}
 	}
 	return p
@@ -226,6 +245,13 @@ type flowCgroup struct {
 // the process of the flow, nor is its latest identity, since the unit of
 // the flow is not known. A process whose cgroup cannot be read is taken as
 // it is.
+//
+// With users, a process of a Slurm job carries its user id as read in this
+// interval, if it was read in the cgroup of the flow: the user id and the
+// cgroup are read together, after the checks above, and a process of
+// another job with the same comm may take the PID in between. A user id
+// that could not be read is unknown: it is never taken from the latest
+// identity, which the processes of the step share.
 func (r *identities) resolve(pid uint32, comm string, cg flowCgroup, unit string, ctr *procinfo.Container, now time.Time) otlp.Process {
 	k := newIdentityKey(unit, comm, cg.id)
 	job := procinfo.SlurmJob(unit)
@@ -264,6 +290,7 @@ func (r *identities) resolve(pid uint32, comm string, cg flowCgroup, unit string
 			if ctr != nil {
 				proc.ContainerID = ctr.ID
 			}
+			r.setUser(&proc, p, cg.id)
 			return proc
 		}
 	}
@@ -275,7 +302,17 @@ func (r *identities) resolve(pid uint32, comm string, cg flowCgroup, unit string
 	if keep && p.exe != "" && p.complete {
 		r.latest[k] = latestIdentity{proc: proc, at: now}
 	}
+	r.setUser(&proc, p, cg.id)
 	return proc
+}
+
+// setUser sets the user id of a process of a Slurm job in the cgroup
+// cgroupID to the one read, if it was read in that cgroup.
+func (r *identities) setUser(proc *otlp.Process, p procRead, cgroupID uint64) {
+	proc.UserID, proc.HasUserID = 0, false
+	if p.hasUID && p.uidCgroup == cgroupID && cgroupID != 0 && procinfo.SlurmJob(proc.Unit) {
+		proc.UserID, proc.HasUserID = p.uid, true
+	}
 }
 
 // expire forgets identities not used for the TTL.

@@ -23,6 +23,10 @@ type process struct {
 	// service or a container and the one that replaced it, are separate
 	// inputs; they make the same rows and output series.
 	containerID string
+	// user is the user id of the process (process.user.id) in decimal, ""
+	// if the agent does not send it. The series of the users of one unit
+	// and comm are separate inputs; their rows are apart with job_users.
+	user string
 }
 
 // job is the name of the local service as Prometheus shows it in the job
@@ -532,6 +536,9 @@ func parseProcess(a pcommon.Map) process {
 	}
 	p.svcNS = getString(a, attrServiceNS)
 	p.containerID = getString(a, attrContainerID)
+	if uid, ok := getInt(a, attrUserID); ok && uid >= 0 && uid <= math.MaxUint32 {
+		p.user = strconv.FormatInt(uid, 10)
+	}
 	return p
 }
 
