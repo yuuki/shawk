@@ -295,3 +295,30 @@ func TestPortRulesMismatchLogged(t *testing.T) {
 		t.Errorf("%d warnings an hour later, want 1", n)
 	}
 }
+
+// TestPortAgnosticPeerHosts: the outputs per peer host of a dependency on
+// a port-agnostic service have server.port 0 too.
+func TestPortAgnosticPeerHosts(t *testing.T) {
+	c, _, sink, _ := testConnector(t, func(cfg *Config) {
+		cfg.PortAgnosticServices = []string{"srun"}
+		cfg.PeerHosts = true
+	})
+	ts := t0.Add(15 * time.Second)
+	consume(t, c, sink, tAgent{host: "node01", addrs: []string{"10.1.0.1"}, time: ts,
+		listeners: []tListener{
+			{proto: "tcp", addr: "0.0.0.0", port: 41234, svc: "srun", comm: "srun"},
+			{proto: "tcp", addr: "0.0.0.0", port: 52345, svc: "srun", comm: "srun"},
+		}})
+	out := consume(t, c, sink, tAgent{host: "ctl01", addrs: []string{"10.1.0.100"}, time: ts,
+		edges: []tEdge{
+			{role: "client", proto: "tcp", local: "10.1.0.100", peer: "10.1.0.1", port: 41234, svc: "slurmctld", comm: "slurmctld", opened: 2},
+			{role: "client", proto: "tcp", local: "10.1.0.100", peer: "10.1.0.1", port: 52345, svc: "slurmctld", comm: "slurmctld", opened: 3},
+		}})
+	got := map[string]float64{}
+	for _, s := range find(out, metricHostConnOpened, "slurmctld", "*", roleClient, "") {
+		got[fmt.Sprintf("%s:%d", s.peer, s.port)] += s.value
+	}
+	if want := map[string]float64{"srun:0": 5}; !maps.Equal(got, want) {
+		t.Errorf("outputs per peer host = %v, want %v", got, want)
+	}
+}
