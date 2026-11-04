@@ -25,9 +25,10 @@ type store interface {
 	// deleted.
 	prune(ctx context.Context, retention time.Duration, maxRows int) (int64, error)
 	// peers reads the endpoints of services, the client sides of
-	// connections, the addresses of agents, and the translations learned
-	// in the last learnedTTL.
-	peers(ctx context.Context, learnedTTL time.Duration) (peerRows, error)
+	// connections, the addresses of agents, the translations learned in the
+	// last learnedTTL, and, unless formerWindow is zero, the latest hosts
+	// that held addresses alone within formerWindow.
+	peers(ctx context.Context, learnedTTL, formerWindow time.Duration) (peerRows, error)
 	// schemaVersion returns the version of the schema, 0 if it has not
 	// been created, and errDevelopmentSchema for a schema created before
 	// the migrations were consolidated.
@@ -670,7 +671,7 @@ func (s *pgStore) prune(ctx context.Context, retention time.Duration, maxRows in
 	return n, err
 }
 
-func (s *pgStore) peers(ctx context.Context, learnedTTL time.Duration) (peerRows, error) {
+func (s *pgStore) peers(ctx context.Context, learnedTTL, formerWindow time.Duration) (peerRows, error) {
 	var out peerRows
 	err := queryRows(ctx, s.pool, `SELECT host(addr), port, proto, host_id, service, last_seen, exact FROM shawk_v1.service_endpoints`,
 		func(rows pgx.Rows) error {
@@ -761,6 +762,51 @@ WHERE last_seen > now() - make_interval(secs => $1)`,
 			out.learned = append(out.learned, r)
 			return nil
 		}, learnedTTL.Seconds())
+	if err != nil || formerWindow == 0 {
+		return out, err
+	}
+	out.former, err = s.formerHolders(ctx, formerWindow)
+	return out, err
+}
+
+// formerHolders reads, for every address held within window, the host
+// whose latest period of holding it ended last, unless another host held it
+// after that period started (beyond shareWindow): an address that several
+// hosts held at once, such as the gateway of a container bridge, names
+// none. Loopback addresses are left out.
+func (s *pgStore) formerHolders(ctx context.Context, window time.Duration) ([]formerHolderRow, error) {
+	var out []formerHolderRow
+	err := queryRows(ctx, s.pool, `WITH p AS (
+  SELECT DISTINCT ON (addr, host_id) addr, host_id, first_seen, last_seen
+  FROM shawk.host_addrs
+  WHERE last_seen > now() - make_interval(secs => $1)
+    AND NOT (addr << inet '127.0.0.0/8' OR addr = inet '::1')
+  ORDER BY addr, host_id, last_seen DESC
+),
+latest AS (
+  SELECT DISTINCT ON (addr) addr, host_id, first_seen, last_seen
+  FROM p
+  ORDER BY addr, last_seen DESC, host_id
+)
+SELECT host(l.addr), l.host_id, h.hostname, l.last_seen
+FROM latest l
+JOIN shawk.hosts h ON h.id = l.host_id
+WHERE NOT EXISTS (
+  SELECT FROM p o
+  WHERE o.addr = l.addr AND o.host_id <> l.host_id
+    AND o.last_seen > l.first_seen + make_interval(secs => $2))`,
+		func(rows pgx.Rows) error {
+			var addr string
+			var f formerHolderRow
+			if err := rows.Scan(&addr, &f.host, &f.name, &f.lastSeen); err != nil {
+				return err
+			}
+			if a, err := netip.ParseAddr(addr); err == nil {
+				f.addr = a.Unmap()
+				out = append(out, f)
+			}
+			return nil
+		}, window.Seconds(), shareWindow.Seconds())
 	return out, err
 }
 
