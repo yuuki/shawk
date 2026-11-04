@@ -471,10 +471,14 @@ per packet.
   same cgroup (step) too.
 - Users, opt-in. With `-job-users`, a process of a Slurm job (a unit
   `slurm/...`) carries its user as `process.user.id`: the effective uid of
-  `/proc/PID/status`, read with the executable in the interval. A uid that could not be read (the process exited, its
-  PID was reused, the reads ran out of time) is unknown and not sent:
-  unlike the executable and the service, it is never taken from the latest
-  identity. Processes outside jobs (slurmstepd included) have no user, nor
+  `/proc/PID/status`, read with the executable in the interval. It is read
+  together with `/proc/PID/cgroup` through one open `/proc/PID`, which
+  fails once that process exits, and sent only if the process is in the
+  cgroup of the flow: a process of another job with the same comm may have
+  taken the PID since the flow was seen. A uid that could not be read (the
+  process exited, its PID was taken, the reads ran out of time) is unknown
+  and not sent: unlike the executable and the service, it is never taken
+  from the latest identity. Processes outside jobs (slurmstepd included) have no user, nor
   do the sockets of kernel clients (NFS, Lustre), which belong to no job.
   The series of a job grow with its users, not with jobs; the connector
   keeps the users only with `job_users` (§6), for administrators.
@@ -945,18 +949,21 @@ match.
 | `dependencies_between(since, until)`, `graph_edges_between`, `graph_nodes_between`, `dependency_changes_between` | the same for the dependencies active in a period. They take the edges active in the period with a margin of 15 minutes before matching, so a recent window does not scan the history (about 0.3 s instead of 3 s with a million edges) and both sides of a connection are matched at the edges of the period; the dashboards and alerts use them. A dependency appeared in a period when it was first seen in it and is not in `known_dependencies` from before it, so one that comes back on new edges (a new container, an hourly job) did not appear |
 
 The connector role writes `shawk` and reads `shawk_v1`; Grafana reads
-`shawk_v1` only (`packaging/postgres`), except `job_edges`: user ids with
-executables, peers and times tell the activity of the jobs of other users,
-and every viewer of Grafana can send SQL through the data source, so the
-users are for administrators in this version. `grants.sql` keeps the view
-from the connector and Grafana, and migration 0002 revokes what default
-privileges granted as it was created, so that only the owner reads it,
-or a role of administrators the owner grants it to. Views of their own
-jobs for users would be designed separately. Neither may create objects in the
+`shawk_v1` only (`packaging/postgres`). Neither may create objects in the
 database (tables or functions in `public`, temporary tables, large
 objects). The read-only transactions and statement timeout that `setup.sql`
 gives Grafana are session defaults it could change; the privileges are what
 hold.
+
+Neither reads `job_edges`: user ids with executables, peers and times tell
+the activity of the jobs of other users, and every viewer of Grafana can
+send SQL through the data source, so the users are for administrators in
+this version. `grants.sql` takes the view back from the connector and
+Grafana in the transaction that grants them the rest of `shawk_v1`, so
+that no session sees them on it in between, and migration 0002 revokes
+what default privileges granted as it was created. Only the owner reads
+it, or a role of administrators the owner grants it to. Views of their own
+jobs for users would be designed separately.
 
 ## 7. Counting each dependency once
 
