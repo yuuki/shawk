@@ -381,6 +381,82 @@ func TestMaxServices(t *testing.T) {
 	}
 }
 
+// TestSlurmJobs: the processes of Slurm jobs, whose units start with
+// slurm/, are forwarded under the job slurm-job, whatever their users named
+// them, and take one place of max_services; PostgreSQL keeps their names
+// (#173).
+func TestSlurmJobs(t *testing.T) {
+	c, st, sink, now := testConnector(t, func(cfg *Config) { cfg.MaxServices = 3 })
+	edge := func(peer, unit, comm, svc, ns string) tEdge {
+		return tEdge{role: roleClient, proto: "tcp", local: "10.0.0.11", peer: peer, port: 5432,
+			unit: unit, comm: comm, svc: svc, ns: ns, exe: "/opt/app/" + comm, opened: 1, start: t0}
+	}
+	edges := []tEdge{
+		edge("10.0.1.1", "slurm/batch", "python3", "python3", ""),
+		edge("10.0.1.2", "slurm/step", "vasp_std", "vasp_std", ""),
+		edge("10.0.1.3", "slurm/extern", "sshd", "sshd", ""),
+		edge("10.0.1.4", "slurm/interactive", "bash", "slurmctld", "hpc"),
+		edge("10.0.1.5", "slurmstepd", "slurmstepd", "slurmstepd", ""),
+		// A process that is not in a job keeps its name.
+		edge("10.0.1.6", "slurmd.service", "slurmd", "slurmd", ""),
+	}
+	*now = now.Add(15 * time.Second)
+	jobs := map[string]float64{}
+	for _, s := range consume(t, c, sink, tAgent{host: "node-01", addrs: []string{"10.0.0.11"}, time: *now, edges: edges}) {
+		if s.metric == metricConnOpened {
+			jobs[s.job] += s.value
+		}
+	}
+	if want := map[string]float64{slurmJobService: 4, "slurmstepd": 1, "slurmd": 1}; !maps.Equal(jobs, want) {
+		t.Errorf("connections by job = %v, want %v", jobs, want)
+	}
+	c.flush(context.Background())
+	var got []procKey
+	for k := range st.writes[0].processes {
+		got = append(got, k)
+	}
+	slices.SortFunc(got, func(a, b procKey) int { return strings.Compare(a.unit, b.unit) })
+	want := []procKey{{"slurm/batch", "python3", "python3", ""}, {"slurm/extern", "sshd", "sshd", ""},
+		{"slurm/interactive", "bash", "hpc/slurmctld", ""}, {"slurm/step", "vasp_std", "vasp_std", ""},
+		{"slurmd.service", "slurmd", "slurmd", ""}, {"slurmstepd", "slurmstepd", "slurmstepd", ""}}
+	if !slices.Equal(got, want) {
+		t.Errorf("processes written = %v, want %v", got, want)
+	}
+}
+
+// TestSlurmJobPeers: the processes of Slurm jobs are peers named
+// slurm-job too, as their job (#173). TestPGSlurmJobPeers reads them from
+// PostgreSQL.
+func TestSlurmJobPeers(t *testing.T) {
+	c, _, sink, now := testConnector(t, nil)
+	consume(t, c, sink, tAgent{host: "node-01", addrs: []string{"10.0.0.11"}, time: *now,
+		listeners: []tListener{{proto: "tcp", addr: "0.0.0.0", port: 40000, unit: "slurm/step", svc: "vasp_std", comm: "vasp_std"}},
+		edges: []tEdge{
+			{role: "client", proto: "tcp", local: "10.0.0.11", peer: "10.0.0.12", port: 8786, unit: "slurm/batch",
+				svc: "python3", comm: "python3", opened: 1},
+			{role: "client", proto: "tcp", local: "10.0.0.11", peer: "10.0.0.12", port: 6817, unit: "slurmd.service",
+				svc: "slurmd", comm: "slurmd", opened: 1},
+		}})
+	*now = now.Add(time.Second)
+	out := consume(t, c, sink, tAgent{host: "node-02", addrs: []string{"10.0.0.12"}, time: *now, edges: []tEdge{
+		{role: "client", proto: "tcp", local: "10.0.0.12", peer: "10.0.0.11", port: 40000, unit: "slurm/step",
+			svc: "a.out", comm: "a.out", opened: 1},
+		{role: "server", proto: "tcp", local: "10.0.0.12", peer: "10.0.0.11", port: 8786, unit: "slurm/step",
+			svc: "dask-scheduler", comm: "python3", opened: 1},
+		{role: "server", proto: "tcp", local: "10.0.0.12", peer: "10.0.0.11", port: 6817, unit: "slurmctld.service",
+			svc: "slurmctld", comm: "slurmctld", opened: 1},
+	}})
+	for _, w := range []struct{ peer, role string }{{slurmJobService, roleClient}, {slurmJobService, roleServer}} {
+		if s := find(out, metricConnOpened, slurmJobService, w.peer, w.role, ""); len(s) != 1 {
+			t.Errorf("%s of slurm-job to %s = %v", w.role, w.peer, find(out, metricConnOpened, "*", "*", "*", ""))
+		}
+	}
+	if s := find(out, metricConnOpened, "slurmctld", "slurmd", roleServer, ""); len(s) != 1 {
+		t.Errorf("server of slurmctld = %v", find(out, metricConnOpened, "slurmctld", "*", "*", ""))
+	}
+
+}
+
 // TestLongLabelsCut: the names of services and namespaces, host names, host
 // ids and versions of agents that are forwarded are cut to 255 bytes, at
 // the start of a character, and names of peers to twice that; PostgreSQL
@@ -412,7 +488,7 @@ func TestLongLabelsCut(t *testing.T) {
 	}
 	c.flush(context.Background())
 	h := st.writes[0]
-	if _, ok := h.processes[procKey{"", "app", ns + "/" + svc}]; !ok || h.hostname != host || h.machineID != id ||
+	if _, ok := h.processes[procKey{"", "app", ns + "/" + svc, ""}]; !ok || h.hostname != host || h.machineID != id ||
 		h.version != long(300) {
 		t.Errorf("written %q %q %q %v", h.hostname, h.machineID, h.version, slices.Collect(maps.Keys(h.processes)))
 	}

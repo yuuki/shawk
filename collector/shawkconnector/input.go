@@ -23,6 +23,10 @@ type process struct {
 	// service or a container and the one that replaced it, are separate
 	// inputs; they make the same rows and output series.
 	containerID string
+	// user is the user id of the process (process.user.id) in decimal, ""
+	// if the agent does not send it. The series of the users of one unit
+	// and comm are separate inputs; their rows are apart with job_users.
+	user string
 }
 
 // job is the name of the local service as Prometheus shows it in the job
@@ -32,6 +36,20 @@ func (p *process) job() string {
 		return p.service
 	}
 	return p.svcNS + "/" + p.service
+}
+
+// slurmJob tells whether a process is a process of a Slurm job (see
+// slurmJobUnit).
+func (p *process) slurmJob() bool { return strings.HasPrefix(p.unit, slurmJobUnit) }
+
+// peerName is the name of the service of a process as a peer of other
+// services in Prometheus (service.peer.name): its job, or slurm-job for the
+// processes of Slurm jobs, as the job of their outputs (aggregator.service).
+func (p *process) peerName() string {
+	if p.slurmJob() {
+		return slurmJobService
+	}
+	return p.job()
 }
 
 // edgeID identifies an input edge series of a host.
@@ -518,6 +536,9 @@ func parseProcess(a pcommon.Map) process {
 	}
 	p.svcNS = getString(a, attrServiceNS)
 	p.containerID = getString(a, attrContainerID)
+	if uid, ok := getInt(a, attrUserID); ok && uid >= 0 && uid <= math.MaxUint32 {
+		p.user = strconv.FormatInt(uid, 10)
+	}
 	return p
 }
 

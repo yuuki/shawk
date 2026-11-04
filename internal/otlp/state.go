@@ -17,6 +17,11 @@ type Process struct {
 	// (container.id), which changes when the container is recreated; the
 	// unit names the container by what stays.
 	ContainerID string
+	// UserID is the effective user id of the process (process.user.id) if
+	// HasUserID. The agent sends it for the processes of Slurm jobs only,
+	// with -job-users.
+	UserID    uint32
+	HasUserID bool
 }
 
 // EdgeKey identifies an edge series.

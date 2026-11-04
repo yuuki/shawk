@@ -3,6 +3,7 @@ package shawkconnector
 import (
 	"context"
 	"net/netip"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -21,11 +22,13 @@ type tEdge struct {
 	port                     int64
 	svc, ns, unit, comm, exe string
 	containerID              string
-	start, first, last       time.Time
-	opened, failed, count    int64
-	tx, rx, retrans          int64
-	rttSum                   float64
-	rttCount                 uint64
+	// user is the process.user.id, not sent if empty.
+	user                  string
+	start, first, last    time.Time
+	opened, failed, count int64
+	tx, rx, retrans       int64
+	rttSum                float64
+	rttCount              uint64
 	// folded marks the peer as folded (shawk.peer.folded); peer is then
 	// 0.0.0.0 or ::.
 	folded bool
@@ -53,6 +56,7 @@ type tListener struct {
 	proto, addr              string
 	port                     int64
 	svc, ns, unit, comm, exe string
+	user                     string // process.user.id, not sent if empty
 	first, last              time.Time
 }
 
@@ -102,6 +106,18 @@ func putProcess(a pcommon.Map, svc, ns, unit, comm, exe string) {
 	}
 	a.PutStr(attrCommand, comm)
 	a.PutStr(attrUnit, unit)
+}
+
+// putUser sends process.user.id, if user is not empty.
+func putUser(a pcommon.Map, user string) {
+	if user == "" {
+		return
+	}
+	uid, err := strconv.ParseInt(user, 10, 64)
+	if err != nil {
+		panic(err)
+	}
+	a.PutInt(attrUserID, uid)
 }
 
 func (ta tAgent) metrics() pmetric.Metrics {
@@ -155,6 +171,7 @@ func (ta tAgent) metrics() pmetric.Metrics {
 			if e.containerID != "" {
 				a.PutStr(attrContainerID, e.containerID)
 			}
+			putUser(a, e.user)
 			a.PutStr(attrRole, e.role)
 			a.PutStr(attrTransport, e.proto)
 			a.PutStr(attrLocalAddr, e.local)
@@ -259,6 +276,7 @@ func (ta tAgent) metrics() pmetric.Metrics {
 		for name, t := range map[string]time.Time{metricListenerFirst: first, metricListenerLast: last} {
 			dp := metric(name, pmetric.MetricTypeGauge).Gauge().DataPoints().AppendEmpty()
 			putProcess(dp.Attributes(), l.svc, l.ns, l.unit, l.comm, l.exe)
+			putUser(dp.Attributes(), l.user)
 			dp.Attributes().PutStr(attrTransport, l.proto)
 			dp.Attributes().PutStr(attrLocalAddr, l.addr)
 			dp.Attributes().PutInt(attrServerPort, l.port)
@@ -348,8 +366,11 @@ type fakeStore struct {
 	// behind is how many versions the schema is behind the connector.
 	behind  int
 	cidrs   []namedPrefix
+	ports   *portRules
 	trans   []translation
 	refresh int
+	// ruleKeys replaces the rules of ports read back when not nil.
+	ruleKeys []string
 	// inv is the inventory written, invSyncs how many times it was
 	// written, and invFailed the failures recorded.
 	inv       *inventory
@@ -370,11 +391,20 @@ func (s *fakeStore) schemaVersion(context.Context) (int, error) {
 	return SchemaVersion() - s.behind, nil
 }
 
-func (s *fakeStore) syncConfig(_ context.Context, cidrs []namedPrefix, ts []translation) error {
+func (s *fakeStore) syncConfig(_ context.Context, cidrs []namedPrefix, ts []translation, ports *portRules) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.cidrs, s.trans = cidrs, ts
+	s.cidrs, s.trans, s.ports = cidrs, ts, ports
 	return nil
+}
+
+func (s *fakeStore) portRuleKeys(context.Context) ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ruleKeys != nil {
+		return s.ruleKeys, nil
+	}
+	return s.ports.keys(), nil
 }
 
 func (s *fakeStore) syncInventory(_ context.Context, inv *inventory, _ time.Time) error {

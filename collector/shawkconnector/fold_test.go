@@ -410,7 +410,7 @@ func TestFoldWarningCount(t *testing.T) {
 // folds and when its counters started, by the clock of the agent, which
 // tells its runs apart whatever the clock of the connector.
 func TestSessionFoldAndDrops(t *testing.T) {
-	ch := newChanges(15 * time.Minute)
+	ch := newChanges(15*time.Minute, false)
 	ta := webAgent(t0)
 	ta.segment = t0.Add(-time.Minute)
 	ta.dropped, ta.droppedSince = 5, t0.Add(-time.Hour)

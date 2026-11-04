@@ -86,6 +86,22 @@ func (r *Resolver) Learn(id uint64, path string) {
 	}
 }
 
+// LearnOf records path as the path of the cgroup id if the directory of
+// path in the hierarchy is that cgroup, such as the cgroup a process of a
+// flow is in when the path of the cgroup of the flow is not known. It
+// reports whether it did.
+func (r *Resolver) LearnOf(id uint64, path string) bool {
+	if id == 0 || r.root == "" || !strings.HasPrefix(path, "/") || strings.Contains(path, "/..") {
+		return false
+	}
+	var st syscall.Stat_t
+	if syscall.Stat(r.root+path, &st) != nil || st.Ino != id {
+		return false
+	}
+	r.Learn(id, path)
+	return true
+}
+
 // queueRead queues the read of the state of the containers of a cgroup
 // path, unless the queue is full.
 func (r *Resolver) queueRead(path string) {
@@ -227,6 +243,34 @@ func Exe(pid uint32) string {
 		return ""
 	}
 	return strings.TrimSuffix(p, " (deleted)")
+}
+
+// CgroupOf returns the path of the cgroup v2 of a process, relative to the
+// root of the hierarchy as CgroupPath, or "" if it cannot be read or is
+// outside the cgroup namespace of the agent ("/../...").
+func CgroupOf(pid uint32) string {
+	if pid == 0 {
+		return ""
+	}
+	b, err := os.ReadFile("/proc/" + strconv.FormatUint(uint64(pid), 10) + "/cgroup")
+	if err != nil {
+		return ""
+	}
+	return parseProcCgroup(b)
+}
+
+// parseProcCgroup returns the path of the line of cgroup v2 ("0::<path>")
+// of /proc/PID/cgroup.
+func parseProcCgroup(b []byte) string {
+	for line := range strings.SplitSeq(string(b), "\n") {
+		if p, ok := strings.CutPrefix(line, "0::"); ok {
+			if strings.HasPrefix(p, "/..") {
+				return ""
+			}
+			return p
+		}
+	}
+	return ""
 }
 
 // NetNS returns the inode number of the network namespace of the current

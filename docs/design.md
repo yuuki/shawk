@@ -204,11 +204,11 @@ socket-activated service is preferred to systemd, and a parent to its
 workers (`internal/tracer/owner.go`). A listener that appears or disappears
 requests an owner scan, so a restarted service is attributed at once.
 
-**Sockets of the kernel.** The clients of NFS, iSCSI, CIFS and Ceph,
-nfsd and DRBD hold sockets without a process. They matter before a server
-is decommissioned (a mounted NFS export), but connect from a kernel worker
-or whichever process triggered them, so comm and cgroup change between
-reconnections. A connecting socket is the kernel's when `sk_kern_sock` is
+**Sockets of the kernel.** The clients of NFS, iSCSI, CIFS, Ceph and
+BeeGFS, nfsd, DRBD and Lustre's LNet hold sockets without a process. They
+matter before a server is decommissioned (a mounted NFS export), but
+connect from a kernel worker or whichever process triggered them, so comm
+and cgroup change between reconnections. A connecting socket is the kernel's when `sk_kern_sock` is
 set and it is not an orphan (MPTCP subflows and SMC's TCP socket excepted);
 it gets comm `~kernel` and cgroup id 0. A listener is the kernel's when no
 process held it at the last scan and the kernel may hold it; incoming
@@ -396,6 +396,20 @@ per packet.
   an interval keeps its name; reads that do not fit the queue are counted in
   `shawk.agent.container_reads.dropped` (alert `ShawkContainerReadsDropped`)
   and retried at export.
+- The processes of Slurm jobs (cgroup v2) are named by the structure of
+  `system.slice/slurmstepd.scope/<job>/<step>/...`, whatever names the job
+  directory (`job_<id>` before Slurm 26.05 or with `CgroupJobIdPaths=yes`,
+  the SLUID otherwise): `user/task_*` is `slurm/batch`, `slurm/step`
+  (`step_<n>`, `step_<n>+<component>`), `slurm/extern` (with
+  `task_special`, where `pam_slurm_adopt` puts the processes it adopts) or
+  `slurm/interactive` after the kind of step, and the directory of
+  slurmstepd in a step (`slurm`; `slurm_processes` in the documentation)
+  and `<scope>/system` are `slurmstepd`, as Slurm's `cgroup/v2` plugin
+  makes them. The scope is `slurmstepd.scope`, or `<node>_slurmstepd.scope`
+  with `--enable-multiple-slurmd`, recognized only under slices from the
+  root (`system.slice`, or the slice of `CgroupSlice`), where users cannot
+  make cgroups; other hierarchies, and cgroup v1, keep the rules above
+  (`internal/procinfo/cgroup.go`).
 - Container names are not trusted blindly. Docker merges image labels into
   container labels, so pod labels are believed only with the container name
   cri-dockerd gives, and Compose labels only with the name Compose gives.
@@ -421,7 +435,12 @@ per packet.
   not known). `-service-name-fallback=unit` uses the unit instead of the
   executable. `service.namespace` comes from `OTEL_RESOURCE_ATTRIBUTES`,
   else the namespace of the pod's service. Both are cut to 255 bytes, since
-  any process sets them and they repeat in every data point.
+  any process sets them and they repeat in every data point. The `OTEL_`
+  variables of the processes of Slurm jobs are not read: any user could
+  name a job `slurmctld`, so they are named after their executable onwards.
+  Nor is their environment read, so that reads that hang on a parallel
+  file system do not hold the slots of the other processes.
+  PostgreSQL keeps these names; Prometheus has them under one `job` (§5.3).
 - The service of a pod is named as OBI names it from API server metadata
   (annotations, `app.kubernetes.io/*` labels, then the top owner; see
   `internal/procinfo/container.go`). The agent does not ask the API server:
@@ -446,10 +465,14 @@ per packet.
   `~kernel:rpcbind` (111), `~kernel:smb` (139, 445), `~kernel:iscsi`
   (3260), `~kernel:ceph` (3300, 6789, 6800-7300), `~kernel:nvme-tcp` (4420,
   8009), `~kernel:drbd` (7788-7799), `~kernel:ocfs2` (7777), `~kernel:rds`
-  (16385), `~kernel:dlm` (21064), and `~kernel` otherwise. Kernel servers
-  are named apart so that a dependency has two ends: `~kernel:nfsd` (2049),
-  `~kernel:ksmbd` (445), `~kernel:iscsi-target` (3260, LIO),
-  `~kernel:nvmet-tcp` (4420, 8009). Names start with `~`, which
+  (16385), `~kernel:dlm` (21064), `~kernel:lnet` (988, Lustre over TCP),
+  `~kernel:beegfs` (8003, 8005 and 8008 of the daemons, 8004, the client's
+  UDP port), and `~kernel` otherwise. The BeeGFS daemons are processes and
+  keep their names; the nodes of LNet connect to each other in both
+  directions, so it has one name for both sides, as DRBD and OCFS2. Kernel
+  servers are named apart so that a dependency has two ends:
+  `~kernel:nfsd` (2049), `~kernel:ksmbd` (445), `~kernel:iscsi-target`
+  (3260, LIO), `~kernel:nvmet-tcp` (4420, 8009). Names start with `~`, which
   `peer_cidrs` names cannot, and have no `/`, which would read as a
   namespace in the `job`. The socket's callbacks would tell more, but
   mapping them to names needs `/proc/kallsyms` with `CAP_SYSLOG`, which the
@@ -458,7 +481,30 @@ per packet.
   stuck process can hold forever (a stalled FUSE mapping), so reads time out
   and back off, and hung reads are bounded (`internal/procinfo/service.go`). A PID whose comm no longer
   matches the flow is not trusted; a process that exits before it is read
-  takes the latest identity seen for the same unit and comm.
+  takes the latest identity seen for the same unit and comm, and for the
+  processes of Slurm jobs, whose units every job of every user shares, the
+  same cgroup (step) too. The agent reads `/proc/PID/cgroup` with the
+  executable. What `/proc` tells of a PID now in another cgroup than the
+  flow, one of them a job's, is not used: the PID was reused by another
+  job, or `pam_slurm_adopt` moved the process; nor is a read during which
+  the cgroup changed. A flow whose cgroup path is not known (its event was
+  dropped) learns it from its process if the process is still in that
+  cgroup (same inode); otherwise a process now in a job is not taken for
+  it.
+- Users, opt-in. With `-job-users`, a process of a Slurm job (a unit
+  `slurm/...`) carries its user as `process.user.id`: the effective uid of
+  `/proc/PID/status`, read with the executable in the interval. It is read
+  together with `/proc/PID/cgroup` through one open `/proc/PID`, which
+  fails once that process exits, and sent only if the process is in the
+  cgroup of the flow: a process of another job with the same comm may have
+  taken the PID since the flow was seen. A uid that could not be read (the
+  process exited, its PID was taken, the reads ran out of time) is unknown
+  and not sent: unlike the executable and the service, it is never taken
+  from the latest identity. Processes outside jobs (slurmstepd included)
+  have no user, nor do the sockets of kernel clients (NFS, Lustre), which
+  belong to no job. The series of a job grow with its users, not with
+  jobs; the connector keeps the users only with `job_users` (§6), for
+  administrators.
 - The host is identified by `host.id` (`/etc/machine-id`, else
   `/var/lib/dbus/machine-id`) and `host.name`. PostgreSQL keys a host by
   the hash of both, so VMs cloned with the same machine id stay apart.
@@ -474,8 +520,9 @@ attributes `service.name`, `service.namespace`, `process.executable.name`,
 `process.executable.path`, `process.command`, `shawk.unit`, `container.id`,
 `shawk.role` (`client` or `server`), `network.transport`,
 `network.local.address`, `network.peer.address`, `server.port` (the service
-port, whatever the role), `shawk.netns`, and `shawk.peer.folded=true` for a
-folded edge (§3.6). The PID is not an attribute, so a restarted process
+port, whatever the role), `shawk.netns`, `shawk.peer.folded=true` for a
+folded edge (§3.6), and `process.user.id` for a process of a Slurm job
+with `-job-users` (§4.1). The PID is not an attribute, so a restarted process
 continues the same series.
 
 | metric | type, unit | |
@@ -727,6 +774,33 @@ the host name; `host.id` and `host.name` are promoted to labels.
   fold into `~other`, while PostgreSQL keeps them apart. Agent-chosen names
   are cut to 255 bytes (`service.peer.name` to 511). `keep_peer_address`
   keeps `network.peer.address` when really needed.
+- The processes of Slurm jobs (units `slurm/*`, §4.1) are forwarded under
+  `job="slurm-job"`, which takes one place of `max_services`, so that
+  every executable of every job does not become a `job`. As peers they are
+  `service.peer.name="slurm-job"` too, so both sides of a dependency
+  between jobs match: the endpoints the connector learns from agents are
+  named so, and those read from PostgreSQL by the column `slurm_job` of
+  `shawk_v1.service_endpoints` and `client_endpoints`. PostgreSQL keeps
+  their names;
+  the series from the agent are still keyed by executable, bounded by its
+  idle TTL.
+- Some servers listen on a port chosen anew at every run: srun and salloc
+  without `SrunPortRange`, to which slurmctld and slurmstepd connect. Their
+  dependencies have `server.port` 0, so that each run adds no series:
+  those on a service of `port_agnostic_services` (e.g. `[srun, salloc,
+  slurm-job]`, where `slurm-job` names the processes of Slurm jobs, which
+  PostgreSQL keeps under their own names), and those on a server address,
+  port and transport in a range of
+  `dynamic_ports` (e.g. the `SrunPortRange` of the cluster, for its
+  hosts). The server is the peer of a client edge, at its backend through
+  a translation (§5.4), and the local process of a server edge;
+  PostgreSQL applies the same rules (§6.1, §6.2) and keeps the ports of
+  the edges. Without them every port is kept. PostgreSQL holds the rules
+  of the connector that wrote them last, so connectors that share it need
+  the same ones; one that finds others there, e.g. during a rolling update
+  of the configuration, logs an error hourly. Ports chosen by the kernel
+  are not detected: a listener is seen only while the iterator lists it,
+  and a kernel-chosen port does not make the servers on it one service.
 - Inputs are cumulative per peer address and outputs merge several, so the
   connector adds the increases of each input to its output, treating a
   decrease or new start time as a reset; an output never decreases when an
@@ -1095,7 +1169,8 @@ agent_sessions(host_id, started_at, last_heartbeat, udp_traced, netns_scope, dro
                peer_fold, peer_internal, counters_started)
 partial_observations(host_id, started_at, period_start, period_end, dropped_flows)  -- periods with drops
 host_addrs(host_id, addr, first_seen, last_seen)  -- one row per period
-processes(id, host_id, unit, comm, exe, service_name, first_seen, last_seen)  -- unique (host_id, unit, comm, service_name)
+processes(id, host_id, unit, comm, exe, service_name, user_id, first_seen, last_seen)
+  -- unique (host_id, unit, comm, service_name, user_id); user_id only for processes of jobs (job_users)
 edges(id, host_id, process_id, role, proto, local_addr, remote_addr, port, netns, first_seen, last_seen)
   -- remote_addr is the network 0.0.0.0/0 or ::/0 for folded peers
 listeners(host_id, process_id, proto, addr, port, netns, first_seen, last_seen)  -- the latest owner
@@ -1108,26 +1183,48 @@ inventory_state(digest, read_at, failed_at, error)  -- when the inventory was re
 learned_translations(host_id, proto, netns, client_addr, virtual_addr, virtual_port, source_addr,
                      backend_addr, backend_port, first_seen, last_seen)  -- learned by agents (§3.7, §5.4)
 known_dependencies(client_service, server_service, port, proto, first_seen, last_seen)
+port_agnostic_services(service)  -- written by the connector (§5.3)
+dynamic_ports(name, proto, addr, port_from, port_to)  -- written by the connector (§5.3); 0.0.0.0/0 and ::/0 for every host
 node_states(hostname, first_seen, last_seen, state, reason)  -- periods of states of Slurm (§5.7)
 maintenance_windows(hostname, starts_at, ends_at, reason, registered_at)  -- registered windows (§5.7)
 ```
 
+With `job_users`, the user (`process.user.id`) of a process of a Slurm job
+(a unit `slurm/...`) is part of its identity, so that the jobs of
+different users with the same unit, comm and service have rows of their
+own: rows grow with users, not with jobs. `user_id` is NULL for other
+processes, and for processes of jobs whose user is unknown: the agent
+could not read it or does not send it (`-job-users`), the connector does
+not keep it, or the row was written before. Migration 0002 added it,
+leaving the rows before with NULL; PostgreSQL 14 has no `NULLS NOT
+DISTINCT`, so the identity is a unique index on `coalesce(user_id, -1)`.
+Connectors from before it upsert on the former key, and their writes fail
+until they are upgraded. Job ids are not kept: edges have only their first
+and last times, so joining them with slurmdbd cannot split them by job.
+
 `known_dependencies` keeps every dependency between services ever seen,
-refreshed every 5 minutes (`shawk.refresh_known_dependencies()`). The
-session columns are described in §5.1. `service_name` has the form of the
-`job` label (`namespace/name`), so names in PostgreSQL and Prometheus
-match.
+refreshed every 5 minutes (`shawk.refresh_known_dependencies()`). When the
+connector changes the rules of ports, the next refresh rebuilds the table
+from every edge kept under the new rules, so that neither adding nor
+removing a rule makes a dependency seen before new, and the dependencies
+known on a service of `port_agnostic_services` are also added on port 0
+(`shawk.aggregate_known_dependencies()`), for those whose edges are gone.
+Ranges of `dynamic_ports` hold for addresses, which `known_dependencies`
+lacks, so they are left to the rebuild: a dependency known only outside a
+range would hide one new in it. The session columns are described in
+§5.1. `service_name` has the form of the `job` label (`namespace/name`), so
+names in PostgreSQL and Prometheus match.
 
 ### 6.2 Contract (schema `shawk_v1`)
 
 | view or function | |
 |---|---|
-| `dependencies` | one row per logical dependency: the client edge and the server edge matched by addresses and port over all time (loopback within a host and netns, addresses held by several hosts at once within a host), or through a translation (§5.4), when `virtual_addr`, `virtual_port` and `translation` (`~learned` for a learned one) tell what the client connected to. `observed_by` is `both`, `client` or `server`; a one-sided row means no agent on the other side, an undescribed NAT or load balancer between, or one of the own rows of §5.4. `client_observed_until` and `server_observed_until` are the latest heartbeats of the hosts (or NULL, §5.4): an old `last_seen` with a recent `observed_until` means no longer used; both old means no longer observed. An address `0.0.0.0/0` or `::/0` stands for folded peers (§3.6), named `~external`. |
-| `graph_nodes`, `graph_edges` | the dependency map between services in the format of the Grafana Node Graph; a peer without a service is named by `peer_class` |
+| `dependencies` | one row per logical dependency: the client edge and the server edge matched by addresses and port over all time (loopback within a host and netns, addresses held by several hosts at once within a host), or through a translation (§5.4), when `virtual_addr`, `virtual_port` and `translation` (`~learned` for a learned one) tell what the client connected to. `observed_by` is `both`, `client` or `server`; a one-sided row means no agent on the other side, an undescribed NAT or load balancer between, or one of the own rows of §5.4. `client_observed_until` and `server_observed_until` are the latest heartbeats of the hosts (or NULL, §5.4): an old `last_seen` with a recent `observed_until` means no longer used; both old means no longer observed. An address `0.0.0.0/0` or `::/0` stands for folded peers (§3.6), named `~external`. `port` is that of the edges, also under the rules of ports (§5.3): between two hosts it tells the connections of different processes apart. |
+| `graph_nodes`, `graph_edges` | the dependency map between services in the format of the Grafana Node Graph; a peer without a service is named by `peer_class`, and a dependency on a port of `port_agnostic_services` or `dynamic_ports` (§5.3) has port 0 |
 | `peer_class(addr)` | the name of a peer without a known service, as in `service.peer.name`: the narrowest range of `peer_cidrs`, `~unresolved` for an address not routed on the Internet, `~external` otherwise, including the networks of folded peers |
-| `dependency_changes` | dependencies between services that appeared, or disappeared while a host that saw them kept observing for 15 minutes |
-| `service_endpoints` | addresses and ports services accept connections on: the last known listeners of each host (unspecified addresses expanded to the host's addresses) and its server edges, for hosts that reported in the last 30 days, except addresses another host took over since; used by the connector (§5.2) |
-| `client_endpoints` | the client sides of connections in the last hour (client address, server address, port, client service); used by the connector to name the peer of a server edge |
+| `dependency_changes` | dependencies between services that appeared, or disappeared while a host that saw them kept observing for 15 minutes; port 0 for those of `port_agnostic_services` and `dynamic_ports` (§5.3), so that a run of srun on a new port is not new |
+| `service_endpoints` | addresses and ports services accept connections on: the last known listeners of each host (unspecified addresses expanded to the host's addresses) and its server edges, for hosts that reported in the last 30 days, except addresses another host took over since; `slurm_job` if a process of a Slurm job serves it; used by the connector (§5.2) |
+| `client_endpoints` | the client sides of connections in the last hour (client address, server address, port, client service, `slurm_job` if the client is a process of a Slurm job); used by the connector to name the peer of a server edge |
 | `agent_addrs` | addresses of hosts whose agent closed an interval in the last 5 minutes, with what the agent traces and folds; used by the connector |
 | `agents` | the latest segment of every host and whether its agent is alive; the last columns, `peer_fold` and `peer_internal`, tell what the agent folds and the ranges it keeps exact |
 | `unobserved(since, until, tolerance)` | the periods in which each host was not observed; Grafana overlays them as annotations |
@@ -1138,6 +1235,7 @@ match.
 | `unobserved_reasons(since, until, tolerance)` | the periods of `unobserved_by_name()` cut by what explains them (§5.7): `cause` is `maintenance` or `power_saving` for a planned stop and NULL otherwise, `node_state` the state of Slurm then (flags joined by `+`, NULL if none was read or it was stale) and `reason` that of Slurm or of the maintenance window, which takes precedence. The gaps are per host name, as the states and windows are, since a node that power saving boots often may get a new host id at every boot. `unobserved()` and `unobserved_by_name()` do not change |
 | `planned_stops` | hosts in a planned stop now and until when at the latest (`host`, `cause`, `since`, `until`, `reason`): in a maintenance window, or in a planned state of their latest reading from Slurm while it is fresh |
 | `partly_observed(since, until)` | the periods in which each host was observed but its agent dropped flows, cut to `[since, until]`: `host`, `gap_start`, `gap_end`, `dropped_flows` (flow updates dropped). A dependency may be missing from them although it was used; Grafana overlays them as annotations |
+| `job_edges` | the edges of the processes of Slurm jobs with the user of the process (`user_id`, NULL if unknown), host, unit, service and executable: which users connected to what, and when. For administrators: only its owner reads it (below) |
 | `dependencies_between(since, until)`, `graph_edges_between`, `graph_nodes_between`, `dependency_changes_between` | the same for the dependencies active in a period. They take the edges active in the period with a margin of 15 minutes before matching, so a recent window does not scan the history (about 0.3 s instead of 3 s with a million edges) and both sides of a connection are matched at the edges of the period; the dashboards and alerts use them. A dependency appeared in a period when it was first seen in it and is not in `known_dependencies` from before it, so one that comes back on new edges (a new container, an hourly job) did not appear |
 
 The connector role writes `shawk` and reads `shawk_v1`; Grafana reads
@@ -1146,6 +1244,16 @@ database (tables or functions in `public`, temporary tables, large
 objects). The read-only transactions and statement timeout that `setup.sql`
 gives Grafana are session defaults it could change; the privileges are what
 hold.
+
+Neither reads `job_edges`: user ids with executables, peers and times tell
+the activity of the jobs of other users, and every viewer of Grafana can
+send SQL through the data source, so the users are for administrators in
+this version. `grants.sql` takes the view back from the connector and
+Grafana in the transaction that grants them the rest of `shawk_v1`, so
+that no session sees them on it in between, and migration 0002 revokes
+what default privileges granted as it was created. Only the owner reads
+it, or a role of administrators the owner grants it to. Views of their own
+jobs for users would be designed separately.
 
 ## 7. Counting each dependency once
 
@@ -1197,21 +1305,21 @@ shows a failure ratio of 100%.
 PostgreSQL alerts use the time series format, with every row at `now()` so
 each series has a value at the last time; a query that finds nothing
 returns No Data, which the rules treat as Normal. New and disappeared
-dependencies are judged per service and port (`dependency_changes_between`),
-so a dependency seen before is not new, and peers without a service are
-named as in Prometheus. The window of new dependencies ends 5 minutes ago,
-when both sides of a new connection are written. A disappeared dependency is
-an explicit row (its `last_seen` falls in the window while a host that saw
-it is still observed) rather than a row missing from the result, so a
-stopped agent does not look like a removed dependency. Stopped agents are
-alerted by Prometheus (`ShawkAgentDown`) for 24 hours, then from
-`shawk_v1.agents` for 30 days, labelled with the host id; a host
-reinstalled under the same name and alive is not alerted. Neither alerts
-hosts in a planned stop (§5.7): the Grafana alert excludes
-`shawk_v1.planned_stops`, and `ShawkAgentDown` the nodes a Slurm exporter
-reports in power saving (powered down, powering down or up, with no flag but
-`IDLE`, `ALLOCATED`, `MIXED`, `CLOUD` and `POWER_DOWN`) or in a `MAINT`
-reservation, joined on the host name. The example in
+dependencies are judged per service and port (`dependency_changes_between`;
+port 0 under the rules of §5.3), so a dependency seen before is not new,
+and peers without a service are named as in Prometheus. The window of new
+dependencies ends 5 minutes ago, when both sides of a new connection are
+written. A disappeared dependency is an explicit row (its `last_seen`
+falls in the window while a host that saw it is still observed) rather
+than a row missing from the result, so a stopped agent does not look like
+a removed dependency. Stopped agents are alerted by Prometheus
+(`ShawkAgentDown`) for 24 hours, then from `shawk_v1.agents` for 30 days,
+labelled with the host id; a host reinstalled under the same name and
+alive is not alerted. Neither alerts hosts in a planned stop (§5.7): the
+Grafana alert excludes `shawk_v1.planned_stops`, and `ShawkAgentDown` the
+nodes a Slurm exporter reports in power saving (powered down, powering down
+or up, with no flag but `IDLE`, `ALLOCATED`, `MIXED`, `CLOUD` and
+`POWER_DOWN`) or in a `MAINT` reservation, joined on the host name. The example in
 `packaging/prometheus/shawk-rules.yml` assumes `slurm_node_state{node,
 state}`; the metric, its labels and the mapping of `NodeName` to
 `host_name` are replaced with those of the exporter in use. A state is
@@ -1316,8 +1424,10 @@ only the protocols it parses. shawk runs beside it:
 - **Sockets of the kernel** are named after their port (§4.1), so a
   subsystem on another's port is named after that one, and one on an
   unlisted port is `~kernel`; NFSv3 also talks to `lockd` and `mountd` on
-  ports rpcbind assigns. A socket created by a process and then held by the
-  kernel alone (an `nbd` or iSCSI connection whose process exited) is not
+  ports rpcbind assigns. Ports set in configuration are not read: LNet
+  with another `accept_port`, or BeeGFS with other `conn*Port`s, is named
+  after the port it moved to like any other. A socket created by a process and then held by the kernel
+  alone (an `nbd` or iSCSI connection whose process exited) is not
   the kernel's: adopted at startup it is not attributed. A listener with
   `sk_user_data` (e.g. in a BPF sockmap) held by a process in another PID
   namespace is taken for the kernel's; run the agent in the host PID

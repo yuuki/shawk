@@ -154,6 +154,9 @@ reasons that occurred.
 
 ### 2.1 Units (#173)
 
+Implemented (#185, design §4.1 and §5.3); see there for what differs from
+this section, such as the names of peers.
+
 - `Unit()` (`internal/procinfo/cgroup.go`) does not know the cgroups of
   Slurm, so the processes of jobs get the last element of the path:
   `task_0`, `task_1`, …, and slurmstepd `slurm`.
@@ -356,8 +359,11 @@ not observed.
   from either side, and `kernelPorts` does not list it, so these sockets
   are `~kernel`. Port 988 becomes `~kernel:lnet`, one name for both sides
   as for DRBD and OCFS2.
-- **BeeGFS.** Its client is a kernel module, so its sockets may be the
-  kernel's too; to be checked.
+- **BeeGFS.** Its client is a kernel module that creates its sockets with
+  `sock_create_kern()` (`StandardSocket.c`), so they are the kernel's:
+  `~kernel:beegfs` for the ports of the daemons (8003 storage, 8005
+  metadata, 8008 management) and the client's UDP port (8004). The daemons
+  are processes and keep their names.
 
 ## What does not change
 

@@ -33,9 +33,12 @@ type store interface {
 	// been created, and errDevelopmentSchema for a schema created before
 	// the migrations were consolidated.
 	schemaVersion(ctx context.Context) (int, error)
-	// syncConfig replaces the named address ranges of peers and the
-	// translations of addresses.
-	syncConfig(ctx context.Context, cidrs []namedPrefix, ts []translation) error
+	// syncConfig replaces the named address ranges of peers, the
+	// translations of addresses and the rules of ports.
+	syncConfig(ctx context.Context, cidrs []namedPrefix, ts []translation, ports *portRules) error
+	// portRuleKeys reads the rules of ports in PostgreSQL, as keys() makes
+	// them.
+	portRuleKeys(ctx context.Context) ([]string, error)
 	// syncInventory writes the inventory read at readAt, unless PostgreSQL
 	// holds the same contents, and records when it was read.
 	syncInventory(ctx context.Context, inv *inventory, readAt time.Time) error
@@ -154,28 +157,33 @@ ON CONFLICT (host_id, addr, first_seen) DO UPDATE SET last_seen = greatest(a.las
 	}
 
 	if len(h.processes) > 0 {
-		var units, comms, exes, services []string
+		var units, comms, exes, services, users []string
 		var firsts, lasts []time.Time
 		for k, p := range h.processes {
 			units = append(units, k.unit)
 			comms = append(comms, k.comm)
 			exes = append(exes, p.exe)
 			services = append(services, k.service)
+			users = append(users, k.user)
 			firsts = append(firsts, p.first)
 			lasts = append(lasts, p.last)
 		}
+		// The user is part of the identity of a process (procKey), NULL if
+		// unknown; the unique index takes NULL as -1.
 		b.Queue(`
-INSERT INTO shawk.processes AS p (host_id, unit, comm, exe, service_name, first_seen, last_seen)
-SELECT $1, * FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::timestamptz[], $7::timestamptz[])
-ON CONFLICT (host_id, unit, comm, service_name) DO UPDATE SET
+INSERT INTO shawk.processes AS p (host_id, unit, comm, exe, service_name, user_id, first_seen, last_seen)
+SELECT $1, u.unit, u.comm, u.exe, u.service, nullif(u.uid, '')::bigint, u.f, u.l
+FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::timestamptz[], $8::timestamptz[])
+  AS u(unit, comm, exe, service, uid, f, l)
+ON CONFLICT (host_id, unit, comm, service_name, (coalesce(user_id, -1))) DO UPDATE SET
   exe          = CASE WHEN excluded.last_seen >= p.last_seen THEN excluded.exe ELSE p.exe END,
   first_seen   = least(p.first_seen, excluded.first_seen),
   last_seen    = greatest(p.last_seen, excluded.last_seen)`,
-			h.key, units, comms, exes, services, firsts, lasts)
+			h.key, units, comms, exes, services, users, firsts, lasts)
 	}
 
 	if len(h.edges) > 0 {
-		var units, comms, services, roles, protos, locals, peers []string
+		var units, comms, services, users, roles, protos, locals, peers []string
 		var ports []int32
 		var netns []int64
 		var firsts, lasts []time.Time
@@ -183,6 +191,7 @@ ON CONFLICT (host_id, unit, comm, service_name) DO UPDATE SET
 			units = append(units, k.unit)
 			comms = append(comms, k.comm)
 			services = append(services, k.service)
+			users = append(users, k.user)
 			roles = append(roles, k.role)
 			protos = append(protos, k.proto)
 			locals = append(locals, k.local.String())
@@ -195,14 +204,15 @@ ON CONFLICT (host_id, unit, comm, service_name) DO UPDATE SET
 		b.Queue(`
 INSERT INTO shawk.edges AS e (host_id, process_id, role, proto, local_addr, remote_addr, port, netns, first_seen, last_seen)
 SELECT $1, p.id, u.role, u.proto, u.local::inet, u.peer::inet, u.port, u.netns, u.f, u.l
-FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::text[], $9::integer[],
-            $10::bigint[], $11::timestamptz[], $12::timestamptz[])
-  AS u(unit, comm, service, role, proto, local, peer, port, netns, f, l)
+FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::text[], $9::text[],
+            $10::integer[], $11::bigint[], $12::timestamptz[], $13::timestamptz[])
+  AS u(unit, comm, service, uid, role, proto, local, peer, port, netns, f, l)
 JOIN shawk.processes p ON p.host_id = $1 AND p.unit = u.unit AND p.comm = u.comm AND p.service_name = u.service
+  AND coalesce(p.user_id, -1) = coalesce(nullif(u.uid, '')::bigint, -1)
 ON CONFLICT (host_id, role, proto, local_addr, remote_addr, port, netns, process_id) DO UPDATE SET
   first_seen = least(e.first_seen, excluded.first_seen),
   last_seen  = greatest(e.last_seen, excluded.last_seen)`,
-			h.key, units, comms, services, roles, protos, locals, peers, ports, netns, firsts, lasts)
+			h.key, units, comms, services, users, roles, protos, locals, peers, ports, netns, firsts, lasts)
 	}
 
 	if len(h.listeners) > 0 {
@@ -362,7 +372,7 @@ func queueListeners(b *pgx.Batch, h *hostChanges) {
 	// The latest owner of a listener in this write; one whose owner is
 	// unknown at the end keeps the latest known one.
 	rows := map[listener]*latest{}
-	var units, comms, services, protos, addrs []string
+	var units, comms, services, users, protos, addrs []string
 	var ports []int32
 	var netns []int64
 	var firsts, lasts []time.Time
@@ -383,6 +393,7 @@ func queueListeners(b *pgx.Batch, h *hostChanges) {
 		units = append(units, k.unit)
 		comms = append(comms, k.comm)
 		services = append(services, k.service)
+		users = append(users, k.user)
 		protos = append(protos, k.proto)
 		addrs = append(addrs, k.addr.String())
 		ports = append(ports, int32(k.port))
@@ -394,21 +405,23 @@ func queueListeners(b *pgx.Batch, h *hostChanges) {
 		b.Queue(`
 INSERT INTO shawk.listener_owners AS o (host_id, process_id, proto, addr, port, netns, first_seen, last_seen)
 SELECT $1, p.id, u.proto, u.addr::inet, u.port, u.netns, u.f, u.l
-FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::integer[], $8::bigint[],
-            $9::timestamptz[], $10::timestamptz[]) AS u(unit, comm, service, proto, addr, port, netns, f, l)
+FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::integer[], $9::bigint[],
+            $10::timestamptz[], $11::timestamptz[]) AS u(unit, comm, service, uid, proto, addr, port, netns, f, l)
 JOIN shawk.processes p ON p.host_id = $1 AND p.unit = u.unit AND p.comm = u.comm AND p.service_name = u.service
+  AND coalesce(p.user_id, -1) = coalesce(nullif(u.uid, '')::bigint, -1)
 ON CONFLICT (host_id, proto, addr, port, netns, process_id) DO UPDATE SET
   first_seen = least(o.first_seen, excluded.first_seen),
   last_seen  = greatest(o.last_seen, excluded.last_seen)`,
-			h.key, units, comms, services, protos, addrs, ports, netns, firsts, lasts)
+			h.key, units, comms, services, users, protos, addrs, ports, netns, firsts, lasts)
 	}
 
-	units, comms, services, protos, addrs = nil, nil, nil, nil, nil
+	units, comms, services, users, protos, addrs = nil, nil, nil, nil, nil, nil
 	ports, netns, firsts, lasts = nil, nil, nil, nil
 	for l, r := range rows {
 		units = append(units, r.proc.unit)
 		comms = append(comms, r.proc.comm)
 		services = append(services, r.proc.service)
+		users = append(users, r.proc.user)
 		protos = append(protos, l.proto)
 		addrs = append(addrs, l.addr.String())
 		ports = append(ports, int32(l.port))
@@ -419,16 +432,17 @@ ON CONFLICT (host_id, proto, addr, port, netns, process_id) DO UPDATE SET
 	b.Queue(`
 INSERT INTO shawk.listeners AS l (host_id, process_id, proto, addr, port, netns, first_seen, last_seen)
 SELECT $1, p.id, u.proto, u.addr::inet, u.port, u.netns, u.f, u.l
-FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::integer[], $8::bigint[],
-            $9::timestamptz[], $10::timestamptz[]) AS u(unit, comm, service, proto, addr, port, netns, f, l)
+FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::integer[], $9::bigint[],
+            $10::timestamptz[], $11::timestamptz[]) AS u(unit, comm, service, uid, proto, addr, port, netns, f, l)
 LEFT JOIN shawk.processes p ON p.host_id = $1 AND p.unit = u.unit AND p.comm = u.comm
-  AND p.service_name = u.service AND (u.unit <> '' OR u.comm <> '')
+  AND p.service_name = u.service AND coalesce(p.user_id, -1) = coalesce(nullif(u.uid, '')::bigint, -1)
+  AND (u.unit <> '' OR u.comm <> '')
 ON CONFLICT (host_id, proto, addr, port, netns) DO UPDATE SET
   process_id = CASE WHEN excluded.last_seen >= l.last_seen THEN coalesce(excluded.process_id, l.process_id)
                     ELSE l.process_id END,
   first_seen = least(l.first_seen, excluded.first_seen),
   last_seen  = greatest(l.last_seen, excluded.last_seen)`,
-		h.key, units, comms, services, protos, addrs, ports, netns, firsts, lasts)
+		h.key, units, comms, services, users, protos, addrs, ports, netns, firsts, lasts)
 }
 
 // queueTranslations writes the translations of addresses a host made, with
@@ -503,17 +517,18 @@ func (s *pgStore) schemaVersion(ctx context.Context) (int, error) {
 }
 
 // configLock is the key of the advisory lock that serializes the writes of
-// the configuration of connectors (peer_cidrs, translations): without it,
-// two connectors that write different ones at once both delete the rows of
-// before and insert their own, and the tables hold the rows of both.
+// the configuration of connectors (peer_cidrs, translations, the rules of
+// ports): without it, two connectors that write different ones at once both
+// delete the rows of before and insert their own, and the tables hold the
+// rows of both.
 const configLock = 0x73686179 // "shay"
 
-// syncConfig replaces the named address ranges of peers and the
-// translations in one transaction, keeping the rows that stay, so that the
-// views see either the old rows or the new ones. It runs in READ COMMITTED,
-// whatever the default of the database, so that the statements after the
-// lock see what a connector that held it before wrote.
-func (s *pgStore) syncConfig(ctx context.Context, cidrs []namedPrefix, ts []translation) error {
+// syncConfig replaces the named address ranges of peers, the translations
+// and the rules of ports in one transaction, keeping the rows that stay, so
+// that the views see either the old rows or the new ones. It runs in READ
+// COMMITTED, whatever the default of the database, so that the statements
+// after the lock see what a connector that held it before wrote.
+func (s *pgStore) syncConfig(ctx context.Context, cidrs []namedPrefix, ts []translation, ports *portRules) error {
 	prefixes := make([]string, 0, len(cidrs))
 	cidrNames := make([]string, 0, len(cidrs))
 	for _, c := range cidrs {
@@ -521,13 +536,27 @@ func (s *pgStore) syncConfig(ctx context.Context, cidrs []namedPrefix, ts []tran
 		cidrNames = append(cidrNames, c.name)
 	}
 	var names, sides, protos, addrs []string
-	var ports []int32
+	var tports []int32
 	for _, r := range translationRows(ts) {
 		names = append(names, r.name)
 		sides = append(sides, r.side)
 		protos = append(protos, r.proto)
 		addrs = append(addrs, r.prefix.String())
-		ports = append(ports, int32(r.port))
+		tports = append(tports, int32(r.port))
+	}
+	// Not NULL, which = ANY would not match.
+	services := []string{}
+	if ports != nil {
+		services = append(services, ports.services...)
+	}
+	var dnames, dprotos, daddrs []string
+	var dfrom, dto []int32
+	for _, r := range ports.dynamicPortsRows() {
+		dnames = append(dnames, r.name)
+		dprotos = append(dprotos, r.proto)
+		daddrs = append(daddrs, r.prefix.String())
+		dfrom = append(dfrom, int32(r.from))
+		dto = append(dto, int32(r.to))
 	}
 	return pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.ReadCommitted}, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, int64(configLock)); err != nil {
@@ -544,13 +573,73 @@ DELETE FROM shawk.translations t
 WHERE NOT EXISTS (
   SELECT FROM unnest($1::text[], $2::text[], $3::text[], $4::cidr[], $5::integer[]) AS u(name, side, proto, addr, port)
   WHERE u.name = t.name AND u.side = t.side AND u.proto = t.proto AND u.addr = t.addr AND u.port = t.port)`,
-			names, sides, protos, addrs, ports)
+			names, sides, protos, addrs, tports)
 		b.Queue(`
 INSERT INTO shawk.translations (name, side, proto, addr, port)
 SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::cidr[], $5::integer[])
-ON CONFLICT DO NOTHING`, names, sides, protos, addrs, ports)
-		return tx.SendBatch(ctx, b).Close()
+ON CONFLICT DO NOTHING`, names, sides, protos, addrs, tports)
+		if err := tx.SendBatch(ctx, b).Close(); err != nil {
+			return err
+		}
+		changed := int64(0)
+		for _, q := range []struct {
+			sql  string
+			args []any
+		}{
+			{`DELETE FROM shawk.port_agnostic_services WHERE NOT (service = ANY ($1::text[]))`, []any{services}},
+			{`
+INSERT INTO shawk.port_agnostic_services (service)
+SELECT * FROM unnest($1::text[])
+ON CONFLICT DO NOTHING`, []any{services}},
+			{`
+DELETE FROM shawk.dynamic_ports d
+WHERE NOT EXISTS (
+  SELECT FROM unnest($1::text[], $2::text[], $3::cidr[], $4::integer[], $5::integer[]) AS u(name, proto, addr, port_from, port_to)
+  WHERE u.name = d.name AND u.proto = d.proto AND u.addr = d.addr AND u.port_from = d.port_from AND u.port_to = d.port_to)`,
+				[]any{dnames, dprotos, daddrs, dfrom, dto}},
+			{`
+INSERT INTO shawk.dynamic_ports (name, proto, addr, port_from, port_to)
+SELECT * FROM unnest($1::text[], $2::text[], $3::cidr[], $4::integer[], $5::integer[])
+ON CONFLICT DO NOTHING`, []any{dnames, dprotos, daddrs, dfrom, dto}},
+		} {
+			tag, err := tx.Exec(ctx, q.sql, q.args...)
+			if err != nil {
+				return err
+			}
+			changed += tag.RowsAffected()
+		}
+		if changed == 0 {
+			return nil
+		}
+		// The rules changed: the dependencies known on the ports of a new
+		// rule are known on port 0 too, so that they are not new under it,
+		// and known_dependencies is rebuilt from every edge at the next
+		// refresh, so that a dependency on a port of a rule removed, known
+		// on port 0 only meanwhile, is not new either.
+		if _, err := tx.Exec(ctx, `SELECT shawk.aggregate_known_dependencies()`); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `DELETE FROM shawk.known_dependencies_state`)
+		return err
 	})
+}
+
+func (s *pgStore) portRuleKeys(ctx context.Context) ([]string, error) {
+	var out []string
+	err := queryRows(ctx, s.pool, `
+SELECT 'service ' || service FROM shawk.port_agnostic_services
+UNION ALL
+SELECT format('dynamic_ports %s %s %s %s-%s', name, proto, addr, port_from, port_to) FROM shawk.dynamic_ports`,
+		func(rows pgx.Rows) error {
+			var k string
+			if err := rows.Scan(&k); err != nil {
+				return err
+			}
+			out = append(out, k)
+			return nil
+		})
+	slices.Sort(out)
+	return out, err
 }
 
 // inventoryLock is the key of the advisory lock that serializes the writes
@@ -788,13 +877,20 @@ FROM (SELECT now() - make_interval(secs => $1) AS c) t`,
 
 func (s *pgStore) peers(ctx context.Context, learnedTTL, formerWindow time.Duration) (peerRows, error) {
 	var out peerRows
-	err := queryRows(ctx, s.pool, `SELECT host(addr), port, proto, host_id, service, last_seen, exact FROM shawk_v1.service_endpoints`,
+	// The endpoints name the peers of the outputs only, so the processes of
+	// Slurm jobs are named as Prometheus names them (process.peerName).
+	err := queryRows(ctx, s.pool, `SELECT host(addr), port, proto, host_id, service, last_seen, exact, slurm_job
+FROM shawk_v1.service_endpoints`,
 		func(rows pgx.Rows) error {
 			var addr string
 			var port int32
+			var job bool
 			var e endpointRow
-			if err := rows.Scan(&addr, &port, &e.key.proto, &e.host, &e.service, &e.lastSeen, &e.exact); err != nil {
+			if err := rows.Scan(&addr, &port, &e.key.proto, &e.host, &e.service, &e.lastSeen, &e.exact, &job); err != nil {
 				return err
+			}
+			if job {
+				e.service = slurmJobService
 			}
 			if a, err := netip.ParseAddr(addr); err == nil {
 				e.key.addr, e.key.port = a.Unmap(), uint16(port)
@@ -806,15 +902,19 @@ func (s *pgStore) peers(ctx context.Context, learnedTTL, formerWindow time.Durat
 		return out, err
 	}
 	// A folded server address, a network, is no server.
-	err = queryRows(ctx, s.pool, `SELECT host(client_addr), host(server_addr), port, proto, host_id, service, last_seen
+	err = queryRows(ctx, s.pool, `SELECT host(client_addr), host(server_addr), port, proto, host_id, service, last_seen, slurm_job
 FROM shawk_v1.client_endpoints
 WHERE masklen(server_addr) = CASE family(server_addr) WHEN 4 THEN 32 ELSE 128 END`,
 		func(rows pgx.Rows) error {
 			var client, server string
 			var port int32
+			var job bool
 			var c clientRow
-			if err := rows.Scan(&client, &server, &port, &c.key.proto, &c.host, &c.service, &c.lastSeen); err != nil {
+			if err := rows.Scan(&client, &server, &port, &c.key.proto, &c.host, &c.service, &c.lastSeen, &job); err != nil {
 				return err
+			}
+			if job {
+				c.service = slurmJobService
 			}
 			ca, err1 := netip.ParseAddr(client)
 			sa, err2 := netip.ParseAddr(server)

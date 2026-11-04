@@ -301,9 +301,9 @@ func TestPGPipeline(t *testing.T) {
 	conn.QueryRow(ctx, `SELECT max(last_seen) FROM shawk.edges`).Scan(&before)
 	old := newHostChanges(hostKey("m-app", "app-01"))
 	old.setHost("m-app", "app-01", "4.18", "old", base.Add(-48*time.Hour))
-	old.addProcess(procKey{"app.service", "puma", "shop/app"}, "/old", span{base.Add(-48 * time.Hour), base.Add(-48 * time.Hour)})
+	old.addProcess(procKey{"app.service", "puma", "shop/app", ""}, "/old", span{base.Add(-48 * time.Hour), base.Add(-48 * time.Hour)})
 	old.addEdge(edgeRowKey{role: "client", proto: "tcp", local: addrOf("10.0.0.11"), peer: addrOf("10.0.0.10"), port: 5432,
-		netns: 4026531840, procKey: procKey{"app.service", "puma", "shop/app"}}, span{base.Add(-48 * time.Hour), base.Add(-48 * time.Hour)})
+		netns: 4026531840, procKey: procKey{"app.service", "puma", "shop/app", ""}}, span{base.Add(-48 * time.Hour), base.Add(-48 * time.Hour)})
 	if err := c.store.write(ctx, old); err != nil {
 		t.Fatal(err)
 	}
@@ -415,7 +415,7 @@ func TestPGPrune(t *testing.T) {
 		h.setHost("m", host, "5.14", "test", at)
 		h.addSession(at.Add(-time.Hour), sessionRow{lastHeartbeat: at, netnsScope: "all"})
 		h.addAddr(addrOf("10.0.0.1"), span{at, at})
-		pk := procKey{host + ".service", host, host}
+		pk := procKey{host + ".service", host, host, ""}
 		h.addProcess(pk, "/usr/bin/"+host, span{at, at})
 		for i := range 5 {
 			h.addEdge(edgeRowKey{role: "client", proto: "tcp", local: addrOf("10.0.0.1"), peer: addrOf("10.0.1.1"),
@@ -583,7 +583,7 @@ func TestPGProcessesKeepTheirServices(t *testing.T) {
 	h := newHostChanges("h1")
 	h.setHost("m", "h1", "k", "v", now)
 	for i, svc := range []string{"billing", "mailer"} {
-		pk := procKey{"workers.service", "python3", svc}
+		pk := procKey{"workers.service", "python3", svc, ""}
 		at := now.Add(time.Duration(i) * time.Minute)
 		h.addProcess(pk, "/usr/bin/python3", span{at, at})
 		h.addEdge(edgeRowKey{role: "client", proto: "tcp", local: addrOf("10.0.0.1"), peer: addrOf("10.0.0." + []string{"5", "6"}[i]),
@@ -595,6 +595,63 @@ func TestPGProcessesKeepTheirServices(t *testing.T) {
 	got := queryStrings(t, conn, `SELECT client_service, port FROM shawk_v1.dependencies`)
 	if !slices.Equal(got, []string{"billing 5432", "mailer 25"}) {
 		t.Errorf("dependencies = %v", got)
+	}
+}
+
+// TestPGSlurmJobPeers: the endpoints and clients of the processes of Slurm
+// jobs read from PostgreSQL are named slurm-job, as the peers the connector
+// learns, while PostgreSQL keeps the names of the processes; a process of
+// the same name on the same port of the host, at another address, is not
+// a job's (#173).
+func TestPGSlurmJobPeers(t *testing.T) {
+	dsn, conn := migratedDB(t)
+	st, err := newPGStore(context.Background(), dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+	now := time.Now().UTC().Truncate(time.Second)
+	h := newHostChanges("n1")
+	h.setHost("m1", "n1", "k", "v", now)
+	h.addAddr(addrOf("10.0.0.1"), span{now, now})
+	h.addAddr(addrOf("10.0.1.1"), span{now, now})
+	job := procKey{"slurm/step", "python3", "python3", ""}
+	batch := procKey{"slurm/batch", "python3", "python3", ""}
+	svc := procKey{"jupyter.service", "python3", "python3", ""}
+	for _, pk := range []procKey{job, batch, svc} {
+		h.addProcess(pk, "/usr/bin/python3", span{now, now})
+	}
+	h.addListener(listenerRowKey{proto: "tcp", addr: addrOf("10.0.0.1"), port: 8888, netns: 1, procKey: job}, span{now, now})
+	h.addListener(listenerRowKey{proto: "tcp", addr: addrOf("10.0.1.1"), port: 8888, netns: 1, procKey: svc}, span{now, now})
+	h.addEdge(edgeRowKey{role: "server", proto: "tcp", local: addrOf("10.0.0.1"), peer: addrOf("10.0.0.2"), port: 40001,
+		netns: 1, procKey: job}, span{now, now})
+	h.addEdge(edgeRowKey{role: "client", proto: "tcp", local: addrOf("10.0.0.1"), peer: addrOf("10.0.0.2"), port: 5432,
+		netns: 1, procKey: batch}, span{now, now})
+	h.addEdge(edgeRowKey{role: "client", proto: "tcp", local: addrOf("10.0.0.1"), peer: addrOf("10.0.0.3"), port: 5432,
+		netns: 1, procKey: svc}, span{now, now})
+	if err := st.write(context.Background(), h); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := st.peers(context.Background(), time.Hour, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, e := range rows.endpoints {
+		got = append(got, fmt.Sprint("server ", e.key.addr, ":", e.key.port, " ", e.service))
+	}
+	for _, c := range rows.clients {
+		got = append(got, fmt.Sprint("client ", c.key.server, ":", c.key.port, " ", c.service))
+	}
+	slices.Sort(got)
+	want := []string{"client 10.0.0.2:5432 slurm-job", "client 10.0.0.3:5432 python3",
+		"server 10.0.0.1:40001 slurm-job", "server 10.0.0.1:8888 slurm-job", "server 10.0.1.1:8888 python3"}
+	if !slices.Equal(got, want) {
+		t.Errorf("endpoints read = %q, want %q", got, want)
+	}
+	if got := queryStrings(t, conn, `SELECT unit, service_name FROM shawk.processes ORDER BY 1`); !slices.Equal(got,
+		[]string{"jupyter.service python3", "slurm/batch python3", "slurm/step python3"}) {
+		t.Errorf("processes = %q", got)
 	}
 }
 
@@ -616,7 +673,7 @@ func TestPGAddressPeriods(t *testing.T) {
 		h := newHostChanges(host)
 		h.setHost("m", host, "k", "v", last)
 		h.addAddr(addrOf("10.0.0.100"), span{first, last})
-		pk := procKey{"haproxy.service", "haproxy", "haproxy"}
+		pk := procKey{"haproxy.service", "haproxy", "haproxy", ""}
 		h.addProcess(pk, "", span{first, last})
 		h.addListener(listenerRowKey{proto: "tcp", addr: addrOf("0.0.0.0"), port: 80, netns: 1, procKey: pk}, span{first, last})
 		if err := st.write(ctx, h); err != nil {

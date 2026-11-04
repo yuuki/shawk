@@ -78,6 +78,7 @@ const (
 	attrCommand     = "process.command"
 	attrUnit        = "shawk.unit"
 	attrContainerID = "container.id"
+	attrUserID      = "process.user.id"
 	attrRole        = "shawk.role"
 	attrTransport   = "network.transport"
 	attrLocalAddr   = "network.local.address"
@@ -232,6 +233,16 @@ const serviceOther = "~other"
 // unknownService is the service.name the agent gives a socket whose owner
 // is unknown.
 const unknownService = "~unknown"
+
+// The processes of Slurm jobs have units that start with slurmJobUnit
+// (slurm/batch, slurm/step, slurm/extern, slurm/interactive), and are
+// forwarded to Prometheus under the service slurmJobService: their users
+// name them as they like, and every executable of every job would
+// otherwise be a job of Prometheus.
+const (
+	slurmJobUnit    = "slurm/"
+	slurmJobService = "slurm-job"
+)
 
 // hostKey identifies a host in PostgreSQL from its machine id and its name,
 // which tells apart hosts cloned with the same machine id. It is the host

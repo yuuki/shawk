@@ -35,8 +35,8 @@ func TestPGListenerOwners(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	old := procKey{"app.service", "puma", "app"}
-	replacement := procKey{"app.service", "unicorn", "app2"}
+	old := procKey{"app.service", "puma", "app", ""}
+	replacement := procKey{"app.service", "unicorn", "app2", ""}
 	write(8080, old, now.Add(-2*time.Hour), now.Add(-30*time.Minute))
 	// The owner is unknown for a moment, then the port changes hands.
 	write(8080, procKey{}, now.Add(-29*time.Minute), now.Add(-29*time.Minute))
@@ -93,8 +93,8 @@ func TestPGListenerOwnersBatch(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	h := newHostChanges("h")
 	h.setHost("m", "app-01", "k", "v", now)
-	a := procKey{"a.service", "a", "a"}
-	b := procKey{"b.service", "b", "b"}
+	a := procKey{"a.service", "a", "a", ""}
+	b := procKey{"b.service", "b", "b", ""}
 	for _, o := range []struct {
 		pk          procKey
 		first, last time.Time

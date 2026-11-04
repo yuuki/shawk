@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -36,11 +37,12 @@ type shawkConnector struct {
 	// ready tells that the schema has been migrated, or checked to be
 	// recent enough, so that writes may proceed.
 	ready bool
-	// cidrsSynced tells that peer_cidrs and the translations have been
-	// written to PostgreSQL.
+	// cidrsSynced tells that peer_cidrs, the translations and the rules of
+	// ports have been written to PostgreSQL.
 	cidrsSynced  bool
 	cidrs        []namedPrefix
 	translations []translation
+	ports        *portRules
 
 	// inventory is the inventory last read from inventory_file, or from
 	// PostgreSQL while the file cannot be read; nil while none is known.
@@ -62,6 +64,9 @@ type shawkConnector struct {
 	// written is when the latest write that took every pending change
 	// started: what was seen before it is in PostgreSQL.
 	written time.Time
+	// portRulesWarned is when rules of ports in PostgreSQL other than
+	// those of this connector were last logged.
+	portRulesWarned time.Time
 
 	// Of the node_states_file and the maintenance_file, used by the loop
 	// only: when the states last written were read from Slurm, the
@@ -115,6 +120,10 @@ func newConnector(set connector.Settings, cfg *Config, next consumer.Metrics) (*
 	if err != nil {
 		return nil, err
 	}
+	ports, err := parsePortRules(cfg.PortAgnosticServices, cfg.DynamicPorts)
+	if err != nil {
+		return nil, err
+	}
 	now := time.Now()
 	res := newResolver(cidrs, translations)
 	res.maxInferred = cfg.MaxSeriesPerHost
@@ -124,6 +133,7 @@ func newConnector(set connector.Settings, cfg *Config, next consumer.Metrics) (*
 	if cfg.PeerHosts {
 		agg.setPeerHosts(cfg.MaxPeerHosts, cfg.PeerHostServices)
 	}
+	agg.ports = ports
 	return &shawkConnector{
 		cfg:      cfg,
 		log:      set.Logger,
@@ -132,11 +142,12 @@ func newConnector(set connector.Settings, cfg *Config, next consumer.Metrics) (*
 		resolver: res,
 		limits:   newLimits(cfg.MaxHosts, cfg.MaxSeriesPerHost, cfg.IdleTTL),
 		agg:      agg,
-		changes:  newChanges(cfg.IdleTTL),
+		changes:  newChanges(cfg.IdleTTL, cfg.JobUsers),
 		cidrs:    cidrs,
 		now:      time.Now,
 
 		translations: translations,
+		ports:        ports,
 
 		foldWarned: map[foldWarnKey]*foldWarning{},
 		cidrWarned: map[string]time.Time{},
@@ -180,9 +191,9 @@ func (c *shawkConnector) Start(ctx context.Context, _ component.Host) error {
 }
 
 // prepare migrates the schema if configured to, or checks its version,
-// writes peer_cidrs and the translations, reads the inventory and writes
-// it, writes what changed in the node_states_file and the
-// maintenance_file, and reloads the names of peers.
+// writes peer_cidrs, the translations and the rules of ports, reads the
+// inventory and writes it, writes what changed in the node_states_file and
+// the maintenance_file, and reloads the names of peers.
 // It reports whether the schema is ready.
 func (c *shawkConnector) prepare(ctx context.Context) bool {
 	if !c.prepareSchemaOnly(ctx) {
@@ -192,10 +203,11 @@ func (c *shawkConnector) prepare(ctx context.Context) bool {
 	synced := c.cidrsSynced
 	c.mu.Unlock()
 	if !synced {
-		// PostgreSQL names peers without a service by peer_cidrs too, and
-		// matches edges through the translations.
-		if err := c.store.syncConfig(ctx, c.cidrs, c.translations); err != nil {
-			c.log.Warn("writing peer_cidrs and the translations to PostgreSQL", zap.Error(err))
+		// PostgreSQL names peers without a service by peer_cidrs too,
+		// matches edges through the translations, and aggregates
+		// dependencies by the rules of ports.
+		if err := c.store.syncConfig(ctx, c.cidrs, c.translations, c.ports); err != nil {
+			c.log.Warn("writing peer_cidrs, the translations, port_agnostic_services and dynamic_ports to PostgreSQL", zap.Error(err))
 		} else {
 			c.mu.Lock()
 			c.cidrsSynced = true
@@ -385,11 +397,36 @@ func (c *shawkConnector) refreshIfDue(ctx context.Context) {
 	}
 	rctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
+	c.checkPortRules(rctx)
 	if _, err := c.store.refreshDependencies(rctx); err != nil {
 		c.log.Error("updating the history of dependencies", zap.Error(err))
 		return
 	}
 	c.lastRefresh = c.now()
+}
+
+// checkPortRules logs, at most once an hour, that the rules of ports in
+// PostgreSQL are not those of this connector: another connector with
+// other port_agnostic_services or dynamic_ports wrote them since, e.g.
+// during a rolling update of the configuration. PostgreSQL aggregates the
+// dependencies by its rules, and the outputs of this connector by its own,
+// so the two disagree until every connector has the same configuration.
+func (c *shawkConnector) checkPortRules(ctx context.Context) {
+	if c.now().Sub(c.portRulesWarned) < foldWarnInterval {
+		return
+	}
+	got, err := c.store.portRuleKeys(ctx)
+	if err != nil {
+		c.log.Warn("reading the rules of ports from PostgreSQL", zap.Error(err))
+		return
+	}
+	if want := c.ports.keys(); !slices.Equal(got, want) {
+		c.log.Error("PostgreSQL has other port_agnostic_services or dynamic_ports than this connector, "+
+			"written by a connector with another configuration; dependencies on them are aggregated differently "+
+			"in PostgreSQL and in the outputs until every connector has the same configuration",
+			zap.Strings("postgres", got), zap.Strings("connector", want))
+		c.portRulesWarned = c.now()
+	}
 }
 
 // flush writes the pending changes, one transaction per host. The changes

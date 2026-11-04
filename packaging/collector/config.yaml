@@ -89,6 +89,10 @@ connectors:
     # names): an agent cannot write as another host.
     host_identity: certificate
     retention: 26280h         # 3 years; 0 keeps rows forever
+    # The users of the processes of Slurm jobs, from agents run with
+    # -job-users (docs/design.md, section 6). For administrators only:
+    # grants.sql keeps shawk_v1.job_edges from Grafana.
+    job_users: false
     # Bounds of what the connector holds (docs/design.md, section 5.5), far
     # above a large fleet. Lower max_hosts to the size of the fleet, with
     # room, to bound the memory of the collector more tightly.
@@ -101,6 +105,18 @@ connectors:
     # section 5.7).
     # node_states_file: /etc/shawk/node-states.json
     # maintenance_file: /etc/shawk/maintenance.yaml
+    # Servers that listen on a port chosen anew at every run, such as srun
+    # and salloc of Slurm without SrunPortRange: their dependencies are
+    # aggregated without the port (server_port 0 in Prometheus, port 0 in
+    # the dependencies between services and their changes in PostgreSQL),
+    # by service name or by ranges of ports of the servers (docs/design.md,
+    # section 5.3). The edges in PostgreSQL keep their ports.
+    # port_agnostic_services: [srun, salloc, slurm-job]   # slurm-job: the processes of jobs
+    # dynamic_ports:
+    #   srun:
+    #     hosts: [10.1.0.0/16]    # the addresses of the servers; empty for every host
+    #     transport: tcp          # empty for both
+    #     ports: 60001-63000      # SrunPortRange; or a single port, quoted: "50000"
 
 processors:
   memory_limiter:

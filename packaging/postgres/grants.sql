@@ -3,6 +3,12 @@
 -- applies new migrations:
 --
 --   psql -v ON_ERROR_STOP=1 -d shawk -U shawk_owner -f grants.sql
+--
+-- It is one transaction, so that other sessions see none of it or all of
+-- it: the grants of all of shawk_v1 below are taken back from job_edges
+-- before they hold, and a run that stops halfway changes nothing.
+
+BEGIN;
 
 REVOKE ALL ON SCHEMA shawk, shawk_v1 FROM PUBLIC;
 -- Only the owner creates temporary tables, which every role may by
@@ -26,9 +32,23 @@ GRANT SELECT ON ALL TABLES IN SCHEMA shawk_v1 TO shawk_connector;
 GRANT USAGE ON SCHEMA shawk_v1 TO shawk_grafana;
 GRANT SELECT ON ALL TABLES IN SCHEMA shawk_v1 TO shawk_grafana;
 
+-- The users of the processes of Slurm jobs (job_users of the connector)
+-- with their executables, peers and times tell the activity of the jobs of
+-- other users, so shawk_v1.job_edges is for administrators: the owner reads
+-- it, and may grant it to a role of administrators. Neither the connector
+-- nor Grafana reads it; every viewer of Grafana could through the data
+-- source.
+DO $$ BEGIN
+  IF to_regclass('shawk_v1.job_edges') IS NOT NULL THEN
+    REVOKE ALL ON shawk_v1.job_edges FROM shawk_connector, shawk_grafana;
+  END IF;
+END $$;
+
 -- Tables and views of later migrations, which shawk-migrate creates as the
 -- owner, get the same privileges; run this file again after new
 -- migrations all the same, for the objects they do not create themselves.
 ALTER DEFAULT PRIVILEGES IN SCHEMA shawk GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO shawk_connector;
 ALTER DEFAULT PRIVILEGES IN SCHEMA shawk GRANT USAGE ON SEQUENCES TO shawk_connector;
 ALTER DEFAULT PRIVILEGES IN SCHEMA shawk_v1 GRANT SELECT ON TABLES TO shawk_connector, shawk_grafana;
+
+COMMIT;

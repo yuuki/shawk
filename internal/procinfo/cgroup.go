@@ -59,7 +59,73 @@ var (
 	// Units named by the user, such as run-backup.service, are kept.
 	runScope    = regexp.MustCompile(`^run-([0-9]+|u[0-9]+(-s[0-9]+)?|r[0-9a-f]{32}|p[0-9]+-i[0-9]+)\.(scope|service)$`)
 	userService = regexp.MustCompile(`^user@\d+\.service$`)
+	// The scope slurmd makes for slurmstepd, with the name of the node
+	// when Slurm is built with --enable-multiple-slurmd: <node>_slurmstepd.scope
+	// (the documentation also writes slurmstepd_<node>.scope), and the
+	// directories of the steps of a job in it: step_<id>,
+	// step_<id>+<component> for a component of a heterogeneous job with a
+	// job id, step_batch, step_extern and step_interactive
+	// (log_build_step_id_str() in src/common/log.c of Slurm).
+	slurmScope = regexp.MustCompile(`^(.+_)?slurmstepd(_.+)?\.scope$`)
+	slurmStep  = regexp.MustCompile(`^step_(batch|extern|interactive|[0-9]+(\+[0-9]+)?)$`)
 )
+
+// SlurmStepd is the unit of slurmstepd, and SlurmJobPrefix the prefix of
+// the units of the processes of Slurm jobs (see Unit).
+const (
+	SlurmStepd     = "slurmstepd"
+	SlurmJobPrefix = "slurm/"
+)
+
+// SlurmJob reports whether unit is that of the processes of a Slurm job,
+// which the users of the cluster run and name as they like (see Unit).
+func SlurmJob(unit string) bool { return strings.HasPrefix(unit, SlurmJobPrefix) }
+
+// slurmUnit names the cgroups slurmstepd makes on cgroup v2. Every job has
+// a directory in the scope, named job_<id> before Slurm 26.05 or with
+// CgroupJobIdPaths=yes, and otherwise its SLUID; it is recognized by the
+// structure under it, whatever its name:
+//
+//	<scope>/<job>/<step>/user/task_<n>   the tasks of a step  -> slurm/<kind>
+//	<scope>/<job>/<step>/slurm           slurmstepd of a step -> slurmstepd
+//	<scope>/system                       slurmstepd waiting   -> slurmstepd
+//
+// as src/plugins/cgroup/v2/cgroup_v2.c of Slurm makes them. task_special
+// holds the processes that are not tasks, such as those pam_slurm_adopt
+// moves into the extern step. The documentation names the directory of
+// slurmstepd slurm_processes, which is recognized too. The kind of a step
+// is batch, extern, interactive, or step for those srun starts.
+//
+// The scope is in system.slice, or the slice of CgroupSlice, which systemd
+// nests from the root (a.slice/a-b.slice): only slices are above it, where
+// users cannot make cgroups, since systemd delegates cgroups to them in
+// units. Other paths are not recognized (ok is false), nor is cgroup v1.
+func slurmUnit(parts []string) (unit string, ok bool) {
+	i := 0
+	for i < len(parts) && strings.HasSuffix(parts[i], ".slice") {
+		i++
+	}
+	if i == 0 || i >= len(parts) || !slurmScope.MatchString(parts[i]) {
+		return "", false
+	}
+	switch rest := parts[i+1:]; {
+	case len(rest) == 1 && rest[0] == "system":
+		return SlurmStepd, true
+	case len(rest) < 3 || rest[0] == "system":
+		return "", false
+	case !slurmStep.MatchString(rest[1]):
+		return "", false
+	case len(rest) == 3 && (rest[2] == "slurm" || rest[2] == "slurm_processes"):
+		return SlurmStepd, true
+	case len(rest) == 4 && rest[2] == "user" && strings.HasPrefix(rest[3], "task_"):
+		kind := strings.TrimPrefix(rest[1], "step_")
+		if kind[0] >= '0' && kind[0] <= '9' {
+			kind = "step"
+		}
+		return SlurmJobPrefix + kind, true
+	}
+	return "", false
+}
 
 // Unit derives a stable name of the service a process belongs to from its
 // cgroup path. Names that change at every run, such as login sessions and
@@ -78,10 +144,20 @@ var (
 //	/user.slice/user-1000.slice/user@1000.service/app.slice/foo.service
 //	                                                 -> user@1000.service/foo.service
 //	/system.slice/run-u1234.scope                    -> run.scope
+//	/system.slice/slurmstepd.scope/job_42/step_0/user/task_0
+//	                                                 -> slurm/step
+//	/system.slice/slurmstepd.scope/job_42/step_0/slurm
+//	                                                 -> slurmstepd
+//
+// The processes of Slurm jobs are named after the kind of their step (see
+// slurmUnit): slurm/batch, slurm/step, slurm/extern or slurm/interactive.
 func Unit(cgroupPath string) string {
 	parts := strings.FieldsFunc(cgroupPath, func(r rune) bool { return r == '/' })
 	if len(parts) == 0 {
 		return ""
+	}
+	if u, ok := slurmUnit(parts); ok {
+		return u
 	}
 	if refs, under := cgroupContainers(cgroupPath); len(refs) > 0 {
 		outer := refs[len(refs)-1]

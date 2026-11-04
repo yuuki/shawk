@@ -334,12 +334,12 @@ func TestPGPackaged(t *testing.T) {
 	h.addSession(now.Add(-time.Hour), sessionRow{lastHeartbeat: now.Add(-time.Minute), netnsScope: "all",
 		peerFold: foldIn, peerInternal: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}})
 	h.addAddr(addrOf("10.0.0.30"), span{now, now})
-	h.addProcess(procKey{"x.service", "x", "x"}, "/usr/bin/x", span{now, now})
+	h.addProcess(procKey{"x.service", "x", "x", ""}, "/usr/bin/x", span{now, now})
 	h.addEdge(edgeRowKey{role: "client", proto: "tcp", local: addrOf("10.0.0.30"), peer: addrOf("10.0.0.10"), port: 5432,
-		netns: 1, procKey: procKey{"x.service", "x", "x"}}, span{now, now})
+		netns: 1, procKey: procKey{"x.service", "x", "x", ""}}, span{now, now})
 	h.addEdge(edgeRowKey{role: "server", proto: "tcp", local: addrOf("10.0.0.30"), peer: addrOf("0.0.0.0"), folded: true,
-		port: 9000, netns: 1, procKey: procKey{"x.service", "x", "x"}}, span{now, now})
-	h.addListener(listenerRowKey{proto: "tcp", addr: addrOf("0.0.0.0"), port: 9000, netns: 1, procKey: procKey{"x.service", "x", "x"}}, span{now, now})
+		port: 9000, netns: 1, procKey: procKey{"x.service", "x", "x", ""}}, span{now, now})
+	h.addListener(listenerRowKey{proto: "tcp", addr: addrOf("0.0.0.0"), port: 9000, netns: 1, procKey: procKey{"x.service", "x", "x", ""}}, span{now, now})
 	if err := pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error { return writeHost(ctx, tx, h) }); err != nil {
 		t.Errorf("writing as shawk_connector: %v", err)
 	}
@@ -511,9 +511,9 @@ func TestPGGrantsAsOwner(t *testing.T) {
 	h := newHostChanges("h1")
 	h.setHost("m", "h1", "k", "v", now)
 	h.addSession(now.Add(-time.Hour), sessionRow{lastHeartbeat: now, netnsScope: "all"})
-	h.addProcess(procKey{"a.service", "a", "a"}, "/usr/bin/a", span{now, now})
+	h.addProcess(procKey{"a.service", "a", "a", ""}, "/usr/bin/a", span{now, now})
 	h.addEdge(edgeRowKey{role: "client", proto: "tcp", local: addrOf("10.0.0.1"), peer: addrOf("10.0.0.2"), port: 80,
-		netns: 1, procKey: procKey{"a.service", "a", "a"}}, span{now, now})
+		netns: 1, procKey: procKey{"a.service", "a", "a", ""}}, span{now, now})
 	if err := pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error { return writeHost(ctx, tx, h) }); err != nil {
 		t.Errorf("writing as the connector: %v", err)
 	}
