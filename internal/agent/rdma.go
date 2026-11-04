@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -19,8 +20,8 @@ const rdmaClass = "/sys/class/infiniband"
 // neither which hosts or processes used RDMA nor that shawk missed none of
 // its dependencies.
 type rdmaCounters struct {
-	root  string            // rdmaClass, or a directory of tests
-	last  map[string]uint64 // the last value of every counter read
+	root  string                 // rdmaClass, or a directory of tests
+	last  map[rdmaCounter]uint64 // the last value of every counter read
 	bytes uint64
 
 	mu     sync.Mutex
@@ -28,8 +29,16 @@ type rdmaCounters struct {
 	found  bool
 }
 
+// rdmaCounter is a counter file. Its inode tells a device registered
+// again under the same name, whose counters start anew, from the one that
+// was there.
+type rdmaCounter struct {
+	path string
+	ino  uint64
+}
+
 func newRDMACounters(root string) *rdmaCounters {
-	return &rdmaCounters{root: root, last: map[string]uint64{}}
+	return &rdmaCounters{root: root, last: map[rdmaCounter]uint64{}}
 }
 
 // run reads the counters every interval until ctx is done. A read of a
@@ -63,8 +72,8 @@ func (r *rdmaCounters) latest() (uint64, bool) {
 // read adds the increase of the counters since the last read, and returns
 // the bytes since the first, and whether a counter was read. The first
 // value of a counter is its base; a counter that went down was reset, and
-// counts from zero. A counter no longer listed is forgotten, so that a
-// device that comes back under its name starts at a new base.
+// counts from zero. A counter no longer listed is forgotten, and a device
+// registered again under its name starts at a new base.
 func (r *rdmaCounters) read() (uint64, bool) {
 	// port_xmit_data and port_rcv_data count octets divided by 4. Without
 	// extended counters they have 32 bits and stop at their maximum.
@@ -72,13 +81,21 @@ func (r *rdmaCounters) read() (uint64, bool) {
 	if err != nil {
 		return r.bytes, false
 	}
-	listed := make(map[string]bool, len(paths))
+	listed := make(map[rdmaCounter]bool, len(paths))
 	found := false
 	for _, p := range paths {
 		if base := filepath.Base(p); base != "port_xmit_data" && base != "port_rcv_data" {
 			continue
 		}
-		listed[p] = true
+		fi, err := os.Stat(p)
+		if err != nil {
+			continue
+		}
+		c := rdmaCounter{path: p}
+		if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+			c.ino = st.Ino
+		}
+		listed[c] = true
 		b, err := os.ReadFile(p)
 		if err != nil {
 			continue
@@ -88,8 +105,8 @@ func (r *rdmaCounters) read() (uint64, bool) {
 			continue
 		}
 		found = true
-		last, seen := r.last[p]
-		r.last[p] = v
+		last, seen := r.last[c]
+		r.last[c] = v
 		switch {
 		case !seen:
 		case v >= last:
@@ -98,9 +115,9 @@ func (r *rdmaCounters) read() (uint64, bool) {
 			r.bytes += 4 * v
 		}
 	}
-	for p := range r.last {
-		if !listed[p] {
-			delete(r.last, p)
+	for c := range r.last {
+		if !listed[c] {
+			delete(r.last, c)
 		}
 	}
 	return r.bytes, found

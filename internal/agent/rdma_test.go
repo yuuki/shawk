@@ -60,6 +60,18 @@ func TestRDMACounters(t *testing.T) {
 	if n, _ := r.read(); n != 4*16 {
 		t.Errorf("back under its name: %d", n)
 	}
+
+	// A device registered again between two reads has new counter files.
+	dir := filepath.Join(root, "mlx5_0", "ports", "2", "counters")
+	if err := os.WriteFile(filepath.Join(dir, "new"), []byte("2000000\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(dir, "new"), filepath.Join(dir, "port_xmit_data")); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := r.read(); n != 4*16 {
+		t.Errorf("registered again: %d", n)
+	}
 }
 
 func TestRDMACountersRun(t *testing.T) {

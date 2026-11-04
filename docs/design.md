@@ -1014,7 +1014,10 @@ only the protocols it parses. shawk runs beside it:
   over TCP) belong to cgroup 0 and are named `~kernel` or after their port
   (`~kernel:nfs`, §4.1): shawk tells which hosts use a file system, not
   which users or jobs; usage by job is left to the file systems (Lustre
-  jobstats with `jobid_var=SLURM_JOB_ID`). See
+  jobstats with `jobid_var=SLURM_JOB_ID`). Tracing RDMA connections is not
+  done; [rpingmesh](https://github.com/yuuki/rpingmesh) traces those of user
+  space from the commands of the uverbs device, and those of the kernel
+  from `ib_modify_qp`, which needs the BTF of `ib_core`. See
   [proposals/slurm-hpc-clusters.md](proposals/slurm-hpc-clusters.md) §7.
 - **Relays that rewrite addresses** (NAT, IPVS, kube-proxy, cloud load
   balancers) hide the real peer, as discussed in §5.2 of the paper:
