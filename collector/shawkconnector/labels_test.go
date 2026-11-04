@@ -425,8 +425,8 @@ func TestSlurmJobs(t *testing.T) {
 }
 
 // TestSlurmJobPeers: the processes of Slurm jobs are peers named
-// slurm-job too, as their job, whether the connector learned them from
-// their agents or read them from PostgreSQL (#173).
+// slurm-job too, as their job (#173). TestPGSlurmJobPeers reads them from
+// PostgreSQL.
 func TestSlurmJobPeers(t *testing.T) {
 	c, _, sink, now := testConnector(t, nil)
 	consume(t, c, sink, tAgent{host: "node-01", addrs: []string{"10.0.0.11"}, time: *now,
@@ -455,34 +455,6 @@ func TestSlurmJobPeers(t *testing.T) {
 		t.Errorf("server of slurmctld = %v", find(out, metricConnOpened, "slurmctld", "*", "*", ""))
 	}
 
-	// After a restart, the endpoints of jobs read from PostgreSQL name the
-	// peers the same way.
-	rows := peerRows{
-		endpoints: []endpointRow{
-			{key: endpointKey{addrOf("10.0.0.21"), 40000, "tcp"}, endpoint: endpoint{host: "n21", service: "vasp_std", exact: true}},
-			{key: endpointKey{addrOf("10.0.0.21"), 22, "tcp"}, endpoint: endpoint{host: "n21", service: "sshd", exact: true}},
-		},
-		clients: []clientRow{
-			{key: clientKey{addrOf("10.0.0.21"), addrOf("10.0.0.22"), 8786, "tcp"}, endpoint: endpoint{host: "n21", service: "python3", exact: true}},
-		},
-		jobs: map[jobEndpoint]bool{
-			{host: "n21", role: roleServer, proto: "tcp", service: "vasp_std", port: 40000}: true,
-			{host: "n21", role: roleClient, proto: "tcp", service: "python3", port: 8786}:   true,
-			// Another service on the same port is not a job.
-			{host: "n21", role: roleServer, proto: "tcp", service: "a.out", port: 22}: true,
-		},
-	}
-	rows.nameJobs()
-	var got []string
-	for _, e := range rows.endpoints {
-		got = append(got, e.service)
-	}
-	for _, c := range rows.clients {
-		got = append(got, c.service)
-	}
-	if want := []string{slurmJobService, "sshd", slurmJobService}; !slices.Equal(got, want) {
-		t.Errorf("services read = %v, want %v", got, want)
-	}
 }
 
 // TestLongLabelsCut: the names of services and namespaces, host names, host

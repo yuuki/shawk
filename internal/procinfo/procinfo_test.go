@@ -106,6 +106,33 @@ func TestParseProcCgroup(t *testing.T) {
 	}
 }
 
+// LearnOf learns the path of a cgroup from a process only if the
+// directory of the path is that cgroup.
+func TestLearnOf(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "system.slice", "slurmstepd.scope", "job_1", "step_0", "user", "task_0")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var st syscall.Stat_t
+	if err := syscall.Stat(dir, &st); err != nil {
+		t.Fatal(err)
+	}
+	r := &Resolver{root: root, paths: map[uint64]string{}, learned: map[uint64]learnedPath{}}
+	const path = "/system.slice/slurmstepd.scope/job_1/step_0/user/task_0"
+	for _, tc := range []struct {
+		id   uint64
+		path string
+	}{{st.Ino + 1, path}, {st.Ino, "/system.slice/../system.slice/slurmstepd.scope/job_1/step_0/user/task_0"}, {st.Ino, ""}, {0, path}} {
+		if r.LearnOf(tc.id, tc.path) {
+			t.Errorf("LearnOf(%d, %q) learned", tc.id, tc.path)
+		}
+	}
+	if !r.LearnOf(st.Ino, path) || r.learned[st.Ino].path != path {
+		t.Errorf("LearnOf did not learn %s: %v", path, r.learned)
+	}
+}
+
 func TestCgroup2Mount(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "mountinfo")

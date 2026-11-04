@@ -192,6 +192,41 @@ CREATE TABLE shawk.translations (
   PRIMARY KEY (name, side, proto, addr, port)
 );
 
+-- The static inventory of hosts (docs/design.md, section 5.6): the hosts
+-- expected in a cluster whose hosts are known in advance, with all their
+-- addresses, including hosts that cannot run an agent (storage appliances,
+-- switches, BMCs). The connector writes it from its inventory_file, which
+-- it reads every write interval, and replaces the rows in one transaction
+-- when the contents change, so that readers see either the old inventory
+-- or the new one. A host is named as its agent sends host.name.
+CREATE TABLE shawk.inventory_hosts (
+  host       text PRIMARY KEY,
+  slurm_node text UNIQUE,                  -- the NodeName of the host in Slurm; NULL if none
+  roles      text[] NOT NULL DEFAULT '{}', -- free text of the operator, sorted
+  agent      boolean NOT NULL DEFAULT true -- an agent is expected to run on the host
+);
+
+-- Every address of every host of the inventory. An address belongs to one
+-- host at most, so that an address maps to a host without ambiguity.
+CREATE TABLE shawk.inventory_addrs (
+  addr inet PRIMARY KEY CHECK (masklen(addr) = CASE family(addr) WHEN 4 THEN 32 ELSE 128 END),
+  host text NOT NULL REFERENCES shawk.inventory_hosts ON DELETE CASCADE
+);
+CREATE INDEX inventory_addrs_host ON shawk.inventory_addrs (host);
+
+-- When the inventory was read. read_at is the latest time a connector read
+-- the contents above from a valid file; when the file cannot be read or is
+-- invalid the contents stay, and failed_at and error tell the latest
+-- failure since. digest identifies the contents, so that a connector
+-- writes them only when they change. One row at most.
+CREATE TABLE shawk.inventory_state (
+  singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+  digest    text,                          -- NULL until a valid file was read
+  read_at   timestamptz,
+  failed_at timestamptz,                   -- NULL unless the latest read failed
+  error     text
+);
+
 -- Translations of addresses learned by the agents of the hosts that make
 -- them from conntrack: DNAT of Docker published ports and of kube-proxy,
 -- IPVS with net.ipv4.vs.conntrack=1, SNAT and masquerade. A row tells that
@@ -1211,6 +1246,50 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
   WHERE p.period_end > since AND p.period_start < until;
 $$;
 
+-- Inventory ---------------------------------------------------------------
+
+-- The hosts of the inventory with their addresses.
+CREATE VIEW shawk_v1.inventory AS
+SELECT h.host, h.slurm_node, h.roles, h.agent,
+       coalesce(array_agg(a.addr ORDER BY a.addr) FILTER (WHERE a.addr IS NOT NULL), '{}') AS addrs
+FROM shawk.inventory_hosts h
+LEFT JOIN shawk.inventory_addrs a ON a.host = h.host
+GROUP BY h.host;
+
+-- The host of every address of the inventory, one row per address: join
+-- an address on addr to name its host.
+CREATE VIEW shawk_v1.inventory_addrs AS
+SELECT a.addr, a.host, h.slurm_node, h.roles, h.agent
+FROM shawk.inventory_addrs a
+JOIN shawk.inventory_hosts h ON h.host = a.host;
+
+-- When the inventory was read, the latest failure since, and how many
+-- hosts it has. No row when no connector has an inventory_file.
+CREATE VIEW shawk_v1.inventory_status AS
+SELECT s.read_at, s.failed_at, s.error,
+       (SELECT count(*) FROM shawk.inventory_hosts) AS hosts
+FROM shawk.inventory_state s;
+
+-- The hosts of the inventory expected to run an agent (agent is true)
+-- whose agent never reported, within the retention: no host has their
+-- name. seen_as names the hosts whose agents reported an address of the
+-- inventory host, as an agent whose host.name differs from the inventory
+-- (a short name instead of the FQDN) would.
+CREATE FUNCTION shawk_v1.never_observed()
+RETURNS TABLE (host text, slurm_node text, roles text[], seen_as text[])
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+  SELECT i.host, i.slurm_node, i.roles,
+         coalesce((SELECT array_agg(DISTINCT h.hostname ORDER BY h.hostname)
+                   FROM shawk.inventory_addrs ia
+                   JOIN shawk.host_addrs a ON a.addr = ia.addr
+                   JOIN shawk.hosts h ON h.id = a.host_id
+                   WHERE ia.host = i.host), '{}')
+  FROM shawk.inventory_hosts i
+  WHERE i.agent
+    AND NOT EXISTS (SELECT FROM shawk.hosts h WHERE h.hostname = i.host)
+  ORDER BY i.host;
+$$;
+
 -- Views the connector reads to name peers -----------------------------------
 
 -- Addresses and ports services accept connections on, used by the shawk
@@ -1231,7 +1310,8 @@ $$;
 --
 -- exact tells whether the address was observed on a socket rather than
 -- inferred from a listener on an unspecified address; the connector prefers
--- exact endpoints.
+-- exact endpoints. slurm_job tells that a process of a Slurm job (unit
+-- slurm/*) serves it, which the connector names slurm-job as a peer.
 CREATE VIEW shawk_v1.service_endpoints AS
 WITH latest AS (
   SELECT host_id, max(last_seen) AS last_seen FROM shawk.listeners GROUP BY host_id
@@ -1244,14 +1324,15 @@ current_addrs AS (
   WHERE a.last_seen >= m.last_seen - shawk.alive_window()
 ),
 s AS (
-  SELECT l.addr, l.port, l.proto, l.host_id, p.service_name AS service, l.last_seen, true AS exact
+  SELECT l.addr, l.port, l.proto, l.host_id, p.service_name AS service, l.last_seen, true AS exact,
+         p.unit LIKE 'slurm/%' AS slurm_job
   FROM shawk.listeners l
   JOIN shawk.processes p ON p.id = l.process_id
   JOIN latest ON latest.host_id = l.host_id
   WHERE l.addr NOT IN (inet '0.0.0.0', inet '::')
     AND l.last_seen >= latest.last_seen - interval '1 hour'
   UNION ALL
-  SELECT a.addr, l.port, l.proto, l.host_id, p.service_name, l.last_seen, false
+  SELECT a.addr, l.port, l.proto, l.host_id, p.service_name, l.last_seen, false, p.unit LIKE 'slurm/%'
   FROM shawk.listeners l
   JOIN shawk.processes p ON p.id = l.process_id
   JOIN latest ON latest.host_id = l.host_id
@@ -1260,7 +1341,7 @@ s AS (
   WHERE l.addr IN (inet '0.0.0.0', inet '::')
     AND l.last_seen >= latest.last_seen - interval '1 hour'
   UNION ALL
-  SELECT e.local_addr, e.port, e.proto, e.host_id, p.service_name, e.last_seen, true
+  SELECT e.local_addr, e.port, e.proto, e.host_id, p.service_name, e.last_seen, true, p.unit LIKE 'slurm/%'
   FROM latest
   CROSS JOIN LATERAL (
     SELECT DISTINCT ON (e.local_addr, e.port, e.proto, e.process_id) e.*
@@ -1282,7 +1363,7 @@ moved AS (
     AND NOT (mine.addr << inet '127.0.0.0/8' OR mine.addr = inet '::1')
 )
 SELECT s.addr, s.port, s.proto, h.hostname AS host, s.host_id, s.service, max(s.last_seen) AS last_seen,
-       bool_or(s.exact) AS exact
+       bool_or(s.exact) AS exact, bool_or(s.slurm_job) AS slurm_job
 FROM s
 JOIN shawk.hosts h ON h.id = s.host_id
 LEFT JOIN moved ON moved.host_id = s.host_id AND moved.addr = s.addr
@@ -1292,10 +1373,12 @@ GROUP BY s.addr, s.port, s.proto, h.hostname, s.host_id, s.service;
 
 -- The client sides of recent connections, used by the shawk connector to
 -- name the peer of a server edge after the client service, when the client
--- host runs an agent.
+-- host runs an agent. slurm_job tells that the client is a process of a
+-- Slurm job (unit slurm/*).
 CREATE VIEW shawk_v1.client_endpoints AS
 SELECT e.local_addr AS client_addr, e.remote_addr AS server_addr, e.port, e.proto,
-       h.hostname AS host, e.host_id, p.service_name AS service, e.last_seen
+       h.hostname AS host, e.host_id, p.service_name AS service, e.last_seen,
+       p.unit LIKE 'slurm/%' AS slurm_job
 FROM shawk.edges e
 JOIN shawk.processes p ON p.id = e.process_id
 JOIN shawk.hosts h ON h.id = e.host_id

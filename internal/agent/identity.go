@@ -47,8 +47,10 @@ const (
 type procRead struct {
 	exe  string
 	comm string
-	// cgroup is the path of the cgroup of the process when it was read.
+	// cgroup is the path of the cgroup of the process when it was read, and
+	// job tells that it is the cgroup of a Slurm job.
 	cgroup string
+	job    bool
 	env    map[string]string
 	// uid is the effective user id if hasUID, read with uidCgroup, the
 	// cgroup the process was in.
@@ -56,7 +58,7 @@ type procRead struct {
 	uidCgroup uint64
 	hasUID    bool
 	// complete is false when the environment could not be read in time;
-	// noEnv tells that it was not asked for.
+	// noEnv tells that it was not read.
 	complete, noEnv bool
 }
 
@@ -176,12 +178,12 @@ func (r *identities) prefetch(reqs []procRequest) {
 }
 
 // read returns the reads of a process, reading /proc if the interval has
-// not, with its environment if env is true.
+// not, with its environment if env is true and the process is not in a job.
 func (r *identities) read(pid uint32, env bool) procRead {
 	if pid == 0 {
 		return procRead{complete: true}
 	}
-	if p, ok := r.byPID[pid]; ok && (!p.noEnv || !env) {
+	if p, ok := r.byPID[pid]; ok && (!p.noEnv || !env || p.job) {
 		return p
 	}
 	p := r.readNow(pid, env)
@@ -189,19 +191,29 @@ func (r *identities) read(pid uint32, env bool) procRead {
 	return p
 }
 
-// readNow reads the executable, the command name, the cgroup, if env is
-// true the environment, and if users are read the user id of a process
-// with its cgroup. The user id is read whether or not the environment is:
-// a process that pam_slurm_adopt moved into a job is asked for with its
-// environment for the sockets it opened before, and carries its user on
-// the flows of the cgroup it is in now.
+// readNow reads the executable, the command name, the cgroup and, if env is
+// true, the environment of a process. The environment of a process in the
+// cgroup of a Slurm job is not read, whatever the cgroup of its flow: it
+// names nothing, and its read could hang on a parallel file system and hold
+// a slot of the reads of the other processes. A process whose cgroup
+// changed while its environment was read, as when its PID was reused, is
+// incomplete.
+//
+// If users are read, so are the user id of the process and its cgroup,
+// whether or not the environment is: a process that pam_slurm_adopt moved
+// into a job is asked for with its environment for the sockets it opened
+// before, and carries its user on the flows of the cgroup it is in now.
 func (r *identities) readNow(pid uint32, env bool) procRead {
 	p := procRead{exe: r.exe(pid), complete: true}
 	if p.exe != "" {
 		p.comm = r.comm(pid)
 		p.cgroup = r.cgroup(pid)
-		if env {
+		p.job = procinfo.SlurmJob(procinfo.Unit(p.cgroup))
+		if env && !p.job {
 			p.env, p.complete = r.env(pid)
+			if p.complete && r.cgroup(pid) != p.cgroup {
+				p.env, p.complete = nil, false
+			}
 		} else {
 			p.noEnv = true
 		}
@@ -227,10 +239,12 @@ type flowCgroup struct {
 // they are named after their executable onwards. What /proc tells of a PID
 // is not used when the process is now in another cgroup and one of them is
 // that of a job: the PID was reused by a process of another job, or the
-// process was moved, e.g. by pam_slurm_adopt. When the cgroup of the flow
-// is not known, the cgroup the process is in tells whether it is in a job;
-// its identity is then not kept, since its unit is not known. A process
-// whose cgroup cannot be read is taken as it is.
+// process was moved, e.g. by pam_slurm_adopt. The cgroup of a flow whose
+// path is not known is learned from its process when the process is still
+// in it (Agent.process); otherwise a process now in a job is not taken for
+// the process of the flow, nor is its latest identity, since the unit of
+// the flow is not known. A process whose cgroup cannot be read is taken as
+// it is.
 //
 // With users, a process of a Slurm job carries its user id as read in this
 // interval, if it was read in the cgroup of the flow: the user id and the
@@ -250,11 +264,13 @@ func (r *identities) resolve(pid uint32, comm string, cg flowCgroup, unit string
 		p = procRead{}
 	}
 	if p.exe != "" && p.cgroup != "" {
-		inJob := procinfo.SlurmJob(procinfo.Unit(p.cgroup))
 		switch {
-		case cg.path == "" && inJob:
-			job, keep = true, false
-		case cg.path != "" && p.cgroup != cg.path && (job || inJob):
+		case cg.path == "" && p.job:
+			// The process is in a job, and not in the cgroup of the flow
+			// (Agent.process): another process of a job took the PID, or
+			// the process was moved into a job.
+			p, keep = procRead{}, false
+		case cg.path != "" && p.cgroup != cg.path && (job || p.job):
 			p = procRead{}
 		}
 	}

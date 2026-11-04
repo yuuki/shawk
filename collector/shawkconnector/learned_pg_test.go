@@ -355,7 +355,7 @@ func TestPGLearnedAsConnectorRole(t *testing.T) {
 	if err := st.write(ctx, h); err != nil {
 		t.Fatal(err)
 	}
-	rows, err := st.peers(ctx, 3*time.Hour)
+	rows, err := st.peers(ctx, 3*time.Hour, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

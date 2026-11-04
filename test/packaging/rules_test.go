@@ -148,6 +148,73 @@ eval instant at 10m ` + r("shawk:dependency_response_datagrams:rate5m") + `
 	promqltest.RunTest(t, script, promqltest.NewTestEngine(t, false, 0, promqltest.DefaultMaxSamplesPerQuery))
 }
 
+// The family per peer host as Prometheus stores what the shawk connector
+// sends with peer_hosts: slurmctld on ctl-01 connects to the slurmd of
+// node-01, which runs an agent, and fails to reach node-03, which is down;
+// node-01 also serves a client without an agent at an address of no known
+// host.
+const hostSeries = `
+load 1m
+  shawk_host_connection_opened_total{job="slurmctld", instance="ctl-01", shawk_role="client", service_peer_name="slurmd", shawk_peer_agent="true", shawk_peer_host="node-01", server_port="6818", network_transport="tcp"} 0+60x10
+  shawk_host_connection_opened_total{job="slurmd", instance="node-01", shawk_role="server", service_peer_name="slurmctld", shawk_peer_agent="true", shawk_peer_host="ctl-01", server_port="6818", network_transport="tcp"} 0+60x10
+  shawk_host_connection_opened_total{job="slurmd", instance="node-01", shawk_role="server", service_peer_name="~unresolved", shawk_peer_agent="false", shawk_peer_host="~unknown", server_port="6818", network_transport="tcp"} 0+120x10
+  shawk_host_connection_failed_by_reason_total{job="slurmctld", instance="ctl-01", shawk_role="client", service_peer_name="slurmd", shawk_peer_agent="false", shawk_peer_host="node-03", server_port="6818", network_transport="tcp", error_type="timeout"} 0+30x10
+  shawk_host_tcp_handshake_seconds_sum{job="slurmctld", instance="ctl-01", shawk_role="client", service_peer_name="slurmd", shawk_peer_agent="true", shawk_peer_host="node-01", server_port="6818", network_transport="tcp"} 0+0.6x10
+  shawk_host_tcp_handshake_seconds_count{job="slurmctld", instance="ctl-01", shawk_role="client", service_peer_name="slurmd", shawk_peer_agent="true", shawk_peer_host="node-01", server_port="6818", network_transport="tcp"} 0+60x10
+  shawk_host_tcp_syn_retransmits_total{job="slurmctld", instance="ctl-01", shawk_role="client", service_peer_name="slurmd", shawk_peer_agent="false", shawk_peer_host="node-03", server_port="6818", network_transport="tcp"} 0+90x10
+  shawk_host_network_io_bytes_total{job="slurmctld", instance="ctl-01", shawk_role="client", service_peer_name="slurmd", shawk_peer_agent="true", shawk_peer_host="node-01", server_port="6818", network_transport="tcp", network_io_direction="transmit"} 0+600x10
+  shawk_host_network_io_bytes_total{job="slurmctld", instance="ctl-01", shawk_role="client", service_peer_name="slurmd", shawk_peer_agent="true", shawk_peer_host="node-01", server_port="6818", network_transport="tcp", network_io_direction="receive"} 0+6000x10
+  shawk_host_network_io_bytes_total{job="slurmd", instance="node-01", shawk_role="server", service_peer_name="slurmctld", shawk_peer_agent="true", shawk_peer_host="ctl-01", server_port="6818", network_transport="tcp", network_io_direction="receive"} 0+600x10
+  shawk_host_network_io_bytes_total{job="slurmd", instance="node-01", shawk_role="server", service_peer_name="~unresolved", shawk_peer_agent="false", shawk_peer_host="~unknown", server_port="6818", network_transport="tcp", network_io_direction="receive"} 0+300x10
+  shawk_host_network_io_bytes_total{job="slurmd", instance="node-01", shawk_role="server", service_peer_name="~unresolved", shawk_peer_agent="false", shawk_peer_host="~unknown", server_port="6818", network_transport="tcp", network_io_direction="transmit"} 0+3000x10
+  shawk_host_tcp_retransmits_total{job="slurmctld", instance="ctl-01", shawk_role="client", service_peer_name="slurmd", shawk_peer_agent="true", shawk_peer_host="node-01", server_port="6818", network_transport="tcp"} 0+60x10
+  shawk_host_tcp_retransmits_total{job="slurmd", instance="node-01", shawk_role="server", service_peer_name="slurmctld", shawk_peer_agent="true", shawk_peer_host="ctl-01", server_port="6818", network_transport="tcp"} 0+180x10
+`
+
+func TestHostRecordingRules(t *testing.T) {
+	records, _ := loadRules(t)
+	r := func(name string) string {
+		e, ok := records[name]
+		if !ok {
+			t.Fatalf("no recording rule %s", name)
+		}
+		return inline(e, nil)
+	}
+	node1 := `src_host="ctl-01", src="slurmctld", dst_host="node-01", dst="slurmd", server_port="6818", network_transport="tcp"`
+	node3 := `src_host="ctl-01", src="slurmctld", dst_host="node-03", dst="slurmd", server_port="6818", network_transport="tcp"`
+	unknown := `src_host="~unknown", src="~unresolved", dst_host="node-01", dst="slurmd", server_port="6818", network_transport="tcp"`
+	script := hostSeries + `
+# The server side of slurmctld's connections (shawk_peer_agent="true") is
+# not counted twice; that of the client without an agent is.
+eval instant at 10m ` + r("shawk:host_dependency_connections:rate5m") + `
+  {` + node1 + `} 1
+  {` + unknown + `} 2
+
+eval instant at 10m ` + r("shawk:host_dependency_connection_failures_by_reason:rate5m") + `
+  {` + node3 + `, error_type="timeout"} 0.5
+
+eval instant at 10m ` + r("shawk:host_dependency_handshake_seconds_sum:rate5m") + " / " + r("shawk:host_dependency_handshake_seconds_count:rate5m") + `
+  {` + node1 + `} 0.01
+
+eval instant at 10m ` + r("shawk:host_dependency_syn_retransmits:rate5m") + `
+  {` + node3 + `} 1.5
+
+eval instant at 10m ` + r("shawk:host_dependency_request_bytes:rate5m") + `
+  {` + node1 + `} 10
+  {` + unknown + `} 5
+
+eval instant at 10m ` + r("shawk:host_dependency_response_bytes:rate5m") + `
+  {` + node1 + `} 100
+  {` + unknown + `} 50
+
+# Each side's own retransmissions; the server names the client host.
+eval instant at 10m ` + r("shawk:host_dependency_retransmits:rate5m") + `
+  {` + node1 + `, shawk_role="client"} 1
+  {` + node1 + `, shawk_role="server"} 3
+`
+	promqltest.RunTest(t, script, promqltest.NewTestEngine(t, false, 0, promqltest.DefaultMaxSamplesPerQuery))
+}
+
 func TestAlerts(t *testing.T) {
 	records, alerts := loadRules(t)
 	a := func(name string) string {
@@ -243,6 +310,35 @@ load 1m
 eval instant at 10m ` + inline(expr, records) + `
   {src="shop/app", dst="postgres", server_port="5432"} 0.2
   {src="shop/app", dst="redis-server", server_port="6379"} 0.1
+`
+	promqltest.RunTest(t, script, promqltest.NewTestEngine(t, false, 0, promqltest.DefaultMaxSamplesPerQuery))
+}
+
+// TestHostFailureRatio evaluates the panel of the failure ratio by peer host
+// of the peer hosts dashboard: node-03 accepts no connection at all, so its
+// pair has failures without connections, and shows 100%.
+func TestHostFailureRatio(t *testing.T) {
+	records, _ := loadRules(t)
+	d := loadJSON(t, grafana+"/dashboards/shawk-hosts.json")
+	var expr string
+	for _, p := range d["panels"].([]any) {
+		p := p.(map[string]any)
+		if p["title"] == "Connection failure ratio by peer host" {
+			expr = p["targets"].([]any)[0].(map[string]any)["expr"].(string)
+		}
+	}
+	if expr == "" {
+		t.Fatal("no panel of the failure ratio by peer host")
+	}
+	expr = strings.ReplaceAll(expr, `{dst=~"$dst", src=~"$src", dst_host=~"$dst_host"}`, "")
+	script := hostSeries + `
+load 1m
+  shawk_host_connection_failed_by_reason_total{job="slurmctld", instance="ctl-01", shawk_role="client", service_peer_name="slurmd", shawk_peer_agent="true", shawk_peer_host="node-01", server_port="6818", network_transport="tcp", error_type="refused"} 0+20x10
+
+# node-01: 1/3 failures/s over 1 connection/s; node-03: failures only.
+eval instant at 10m ` + inline(expr, records) + `
+  {src_host="ctl-01", src="slurmctld", dst_host="node-01", dst="slurmd", server_port="6818"} 0.25
+  {src_host="ctl-01", src="slurmctld", dst_host="node-03", dst="slurmd", server_port="6818"} 1
 `
 	promqltest.RunTest(t, script, promqltest.NewTestEngine(t, false, 0, promqltest.DefaultMaxSamplesPerQuery))
 }

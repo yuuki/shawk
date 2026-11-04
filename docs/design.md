@@ -432,8 +432,8 @@ per packet.
   any process sets them and they repeat in every data point. The `OTEL_`
   variables of the processes of Slurm jobs are not read: any user could
   name a job `slurmctld`, so they are named after their executable onwards.
-  When the cgroup of a flow is not known, `/proc/PID/cgroup` tells whether
-  its process is in a job.
+  Nor is their environment read, so that reads that hang on a parallel
+  file system do not hold the slots of the other processes.
   PostgreSQL keeps these names; Prometheus has them under one `job` (§5.3).
 - The service of a pod is named as OBI names it from API server metadata
   (annotations, `app.kubernetes.io/*` labels, then the top owner; see
@@ -473,9 +473,14 @@ per packet.
   matches the flow is not trusted; a process that exits before it is read
   takes the latest identity seen for the same unit and comm, and for the
   processes of Slurm jobs, whose units every job of every user shares, the
-  same cgroup (step) too. What `/proc` tells of a PID now in another cgroup
-  than the flow, one of them a job's, is not used: the PID was reused by
-  another job, or `pam_slurm_adopt` moved the process.
+  same cgroup (step) too. The agent reads `/proc/PID/cgroup` with the
+  executable. What `/proc` tells of a PID now in another cgroup than the
+  flow, one of them a job's, is not used: the PID was reused by another
+  job, or `pam_slurm_adopt` moved the process; nor is a read during which
+  the cgroup changed. A flow whose cgroup path is not known (its event was
+  dropped) learns it from its process if the process is still in that
+  cgroup (same inode); otherwise a process now in a job is not taken for
+  it.
 - Users, opt-in. With `-job-users`, a process of a Slurm job (a unit
   `slurm/...`) carries its user as `process.user.id`: the effective uid of
   `/proc/PID/status`, read with the executable in the interval. It is read
@@ -557,6 +562,16 @@ which include containers.
 - A series idle (no connections, bytes, datagrams or open connections) for
   `-idle-ttl` (15 minutes) is dropped and restarts from zero if it
   reappears. This bounds the series of a host by its recent dependencies.
+- Readiness. Under systemd (`Type=notify`) the agent reports ready
+  (`READY=1` on `NOTIFY_SOCKET`) once its programs are attached and the
+  sockets that existed before were adopted; a failure to attach fails the
+  start. Units ordered after the agent, such as slurmd on a node that
+  power saving resumes, then start traced. What happens before the
+  programs are attached is not observed: connections that ended before are
+  lost, and those still open are adopted without their earlier traffic.
+  The start of the agent, and of its first segment, is taken after the
+  first walk and the resolution of owners, a little after the programs
+  are attached.
 - Observation segments. `shawk.agent.segment.start` is the time from which
   every dependency active on the host has reached the connector: the start
   of the agent, or, after requests failed for longer than the idle TTL minus
@@ -686,6 +701,35 @@ fold peers in a range of `peer_cidrs`. When both agents fold the other
 side, nothing tells and nothing is logged. Each folding host is logged at
 most once an hour; the connector has no metrics of its own.
 
+With `peer_hosts` (§5.3) a peer also gets a host, `shawk.peer.host`. A host
+takes stronger evidence than a service, so a peer whose host is not certain
+gets none:
+
+| peer | `shawk.peer.host` |
+|---|---|
+| loopback, or an address several live hosts hold, this one included | the host itself |
+| an address the inventory maps to one host (not implemented yet, #175) | that host |
+| an address one live host holds alone | that host |
+| an address no live host holds, whose latest holder held it alone within 30 days and whose agent has stopped since | that host, so that failures towards a host that is down are named |
+| otherwise, private address | `~unknown` |
+| otherwise, public address; or folded | `~external` |
+| a virtual address of a translation that no service of its own names | the host of its backend if the translation has one backend, a single address, or learned translations sent the client to one address; `~unknown` otherwise |
+
+The latest holders are read from `shawk.host_addrs` with the other names,
+with `peer_hosts` only: the host whose latest period at the address ended
+last, unless another host held the address after that period began (beyond
+3 minutes), and that last held it within 30 days, by the time it last
+held it, not as of the load. Until what the connector saw is written and
+read back, the holders it saw itself count too, so that an address that
+moved while PostgreSQL could not be written does not name its former
+holder again once the new one stops. An address that left a host whose
+agent is still alive names no host. The names of `peer_cidrs` are ranges, not hosts. Through a
+translation, `pickBackend()` chooses a representative to name the service,
+not the backend a connection reached, so a virtual address with several
+backends has host `~unknown`; the names of services do not change.
+`shawk.peer.agent` keeps its meaning: knowing the host of a peer does not
+mean that its agent records the other side.
+
 ### 5.3 Metrics to Prometheus
 
 Edge metrics are reduced to `service.peer.name`, `shawk.peer.agent`,
@@ -710,9 +754,9 @@ the host name; `host.id` and `host.name` are promoted to labels.
   every executable of every job does not become a `job`. As peers they are
   `service.peer.name="slurm-job"` too, so both sides of a dependency
   between jobs match: the endpoints the connector learns from agents are
-  named so, and those read from PostgreSQL by the ports their processes
-  served and connected to (a service of the same name on the same port of
-  the host as a job is taken for the job). PostgreSQL keeps their names;
+  named so, and those read from PostgreSQL by the column `slurm_job` of
+  `shawk_v1.service_endpoints` and `client_endpoints`. PostgreSQL keeps
+  their names;
   the series from the agent are still keyed by executable, bounded by its
   idle TTL.
 - Inputs are cumulative per peer address and outputs merge several, so the
@@ -761,7 +805,40 @@ the host name; `host.id` and `host.name` are promoted to labels.
 | `shawk_agent_*` | agents |
 
 A TCP client dependency thus has 13 series, plus one per failure reason
-that occurred. Prometheus needs `--web.enable-otlp-receiver`,
+that occurred.
+
+The outputs above reduce a peer to its service, which treats the hosts of
+one service as interchangeable; in an HPC cluster they are not (nfs01
+exports /home and nfs02 /scratch, and the `slurmd` of every compute node are
+one `slurmd`). `peer_hosts: true` adds a separate family whose series carry
+`shawk.peer.host` (§5.2) besides the attributes above; the outputs above,
+their labels and the rules over them do not change:
+
+| Prometheus name | sides |
+|---|---|
+| `shawk_host_connection_opened_total` | client, server |
+| `shawk_host_connection_failed_by_reason_total{error_type}` | client, reasons that occurred |
+| `shawk_host_tcp_handshake_seconds_sum`, `_count`, `_bucket{le="+Inf"}` | client |
+| `shawk_host_tcp_syn_retransmits_total` | client |
+| `shawk_host_network_io_bytes_total` | client, server |
+| `shawk_host_tcp_retransmits_total` | client, server |
+
+A TCP client edge has 8 series of the family, a TCP server edge 4, and
+each side of a UDP edge 2, per peer host, plus the failure reasons that
+occurred. `max_peer_hosts` (500) bounds the hosts per host, local service,
+role and peer service, folding the others into `~other`, and
+`peer_host_services` restricts the family to the dependencies with one of
+its services (`[namespace/]name`) at either end. Either end, so that both
+sides of a dependency have the family or neither: the rules of §7 leave out
+the server side of a client with an agent, whose client side counts the
+dependency, so a family on the server side only would count nothing.
+Connectors with other settings would break this the same way. Neither
+bound limits the total: traffic between all the
+compute nodes of a cluster costs about 12 series per pair, service and
+port, so measure the label combinations before enabling the family widely.
+A series lives until both idle TTLs pass after its last activity.
+
+Prometheus needs `--web.enable-otlp-receiver`,
 `otlp.promote_resource_attributes: [host.id, host.name]` and a 30-minute
 out-of-order window.
 
@@ -893,6 +970,64 @@ large host sends (16384 flows per interval by default; a much larger
 tightly, lower `max_hosts` to the fleet size with room: the connector holds
 about 5 KB per edge with its metrics and about 300 bytes per pending row.
 
+### 5.6 Static inventory
+
+In a cluster whose hosts are known in advance, `inventory_file` lists the
+hosts expected, with all their addresses, including hosts that cannot run
+an agent (storage appliances, switches, BMCs). It is YAML or JSON:
+
+```yaml
+hosts:
+  - name: cn001.hpc.example        # host.name, as the agent of the host sends it
+    slurm_node: cn001              # the NodeName in Slurm, if the host is a node
+    roles: [compute, gpu]          # free text, e.g. for dashboards
+    addrs: [10.0.1.1, 10.10.1.1, 10.20.1.1]  # management, IPoIB, storage
+  - name: sfa01
+    roles: [storage]
+    agent: false                   # no agent is expected (default true)
+    addrs: [10.20.0.5]
+```
+
+- **Addresses come from provisioning** (Warewulf, xCAT, …), not from Slurm:
+  `NodeAddr` may be a name and is one address. Each is a single address,
+  not loopback, unspecified or multicast, and belongs to one host at most,
+  so that an address maps to a host without ambiguity. Floating addresses
+  (a keepalived VIP) belong to no host and are left out; `translations`
+  (§5.4) describe them.
+- **The mapping to Slurm is written**, since `NodeName` may be any alias.
+  Host and node names are unique and must not start with `~`. Roles are
+  free text, without control characters.
+- **Loading.** The connector reads the file at start and every write
+  interval, and, when its contents changed (whatever their order and
+  layout), replaces the inventory in PostgreSQL in one transaction under an
+  advisory lock; it records the time it read them either way. A file that
+  cannot be read, is invalid (unknown fields included), larger than 16 MiB
+  or has no hosts (as a failed generator may leave) keeps the inventory
+  read before, from PostgreSQL if the connector has read none since it
+  started, and written again if writing it failed. The failure is logged
+  and recorded with its time (`inventory_status`); the record is shared, so
+  a connector that reads the file clears the failure of another. A file of
+  several YAML documents is invalid. Every connector should read the same
+  file, as with `peer_cidrs`: the last to write wins. A connector without
+  `inventory_file` leaves the inventory as it is; to drop it, delete the
+  rows of `shawk.inventory_hosts` and `shawk.inventory_state`.
+- **Generating it.** The connector does not talk to Slurm. A cron job may
+  write the file from the provisioning database and `scontrol show nodes
+  --json`, to a temporary file renamed over the old one, so that the
+  connector never reads half a file.
+- **Conflicts.** The inventory wins over what agents send: an agent that
+  sends an address the inventory gives to another host is logged at most
+  once an hour, with the addresses and their hosts in the inventory.
+- **Uses.** `never_observed()` reports the hosts expected to run an agent
+  whose agent never reported (§6.2). The host of an address is the row of
+  `shawk_v1.inventory_addrs` with that address, at most one, e.g. `LEFT
+  JOIN shawk_v1.inventory_addrs i ON i.addr = d.server_addr` for the
+  servers of `dependencies`; the connector holds the same mapping
+  (`inventory.hostOf()` in `inventory.go`) for the peers it names. Node
+  states of Slurm join `shawk_v1.inventory` on `slurm_node` to get the
+  host, and are kept apart from it, as time-stamped transitions: the
+  inventory holds the current contents only.
+
 ## 6. PostgreSQL
 
 PostgreSQL 14 or later (multiranges). The schema ships with the connector
@@ -920,6 +1055,9 @@ listeners(host_id, process_id, proto, addr, port, netns, first_seen, last_seen) 
 listener_owners(host_id, process_id, proto, addr, port, netns, first_seen, last_seen)  -- every known owner
 peer_cidrs(prefix, name)  -- written by the connector from its peer_cidrs
 translations(name, side, proto, addr, port)  -- side virtual, backend or source; written by the connector (§5.4)
+inventory_hosts(host, slurm_node, roles, agent)  -- written by the connector from its inventory_file (§5.6)
+inventory_addrs(addr, host)  -- every address of the inventory, one host each
+inventory_state(digest, read_at, failed_at, error)  -- when the inventory was read, and the latest failure since
 learned_translations(host_id, proto, netns, client_addr, virtual_addr, virtual_port, source_addr,
                      backend_addr, backend_port, first_seen, last_seen)  -- learned by agents (§3.7, §5.4)
 known_dependencies(client_service, server_service, port, proto, first_seen, last_seen)
@@ -952,11 +1090,14 @@ match.
 | `graph_nodes`, `graph_edges` | the dependency map between services in the format of the Grafana Node Graph; a peer without a service is named by `peer_class` |
 | `peer_class(addr)` | the name of a peer without a known service, as in `service.peer.name`: the narrowest range of `peer_cidrs`, `~unresolved` for an address not routed on the Internet, `~external` otherwise, including the networks of folded peers |
 | `dependency_changes` | dependencies between services that appeared, or disappeared while a host that saw them kept observing for 15 minutes |
-| `service_endpoints` | addresses and ports services accept connections on: the last known listeners of each host (unspecified addresses expanded to the host's addresses) and its server edges, for hosts that reported in the last 30 days, except addresses another host took over since; used by the connector (§5.2) |
-| `client_endpoints` | the client sides of connections in the last hour (client address, server address, port, client service); used by the connector to name the peer of a server edge |
+| `service_endpoints` | addresses and ports services accept connections on: the last known listeners of each host (unspecified addresses expanded to the host's addresses) and its server edges, for hosts that reported in the last 30 days, except addresses another host took over since; `slurm_job` if a process of a Slurm job serves it; used by the connector (§5.2) |
+| `client_endpoints` | the client sides of connections in the last hour (client address, server address, port, client service, `slurm_job` if the client is a process of a Slurm job); used by the connector to name the peer of a server edge |
 | `agent_addrs` | addresses of hosts whose agent closed an interval in the last 5 minutes, with what the agent traces and folds; used by the connector |
 | `agents` | the latest segment of every host and whether its agent is alive; the last columns, `peer_fold` and `peer_internal`, tell what the agent folds and the ranges it keeps exact |
 | `unobserved(since, until, tolerance)` | the periods in which each host was not observed; Grafana overlays them as annotations |
+| `never_observed()` | the hosts of the inventory (§5.6) expected to run an agent whose agent never reported within the retention (no host has their name): `host`, `slurm_node`, `roles`, and `seen_as`, the hosts whose agents reported an address of the host, as an agent whose `host.name` differs from the inventory would |
+| `inventory`, `inventory_addrs` | the hosts of the inventory with their addresses (`host`, `slurm_node`, `roles`, `agent`, `addrs`), and one row per address with its host: join an address on `addr` to name its host |
+| `inventory_status` | when the inventory was last read from a valid file (`read_at`, NULL if never), the latest failure since (`failed_at`, `error`), and how many hosts it has; no row before a connector with `inventory_file` read it |
 | `partly_observed(since, until)` | the periods in which each host was observed but its agent dropped flows, cut to `[since, until]`: `host`, `gap_start`, `gap_end`, `dropped_flows` (flow updates dropped). A dependency may be missing from them although it was used; Grafana overlays them as annotations |
 | `job_edges` | the edges of the processes of Slurm jobs with the user of the process (`user_id`, NULL if unknown), host, unit, service and executable: which users connected to what, and when. For administrators: only its owner reads it (below) |
 | `dependencies_between(since, until)`, `graph_edges_between`, `graph_nodes_between`, `dependency_changes_between` | the same for the dependencies active in a period. They take the edges active in the period with a margin of 15 minutes before matching, so a recent window does not scan the history (about 0.3 s instead of 3 s with a million edges) and both sides of a connection are matched at the edges of the period; the dashboards and alerts use them. A dependency appeared in a period when it was first seen in it and is not in `known_dependencies` from before it, so one that comes back on new edges (a new container, an hourly job) did not appear |
@@ -1001,10 +1142,29 @@ the relay, while the clients that run an agent count theirs. Each
 dependency is counted right, but the sum into the server counts those
 clients twice, since the server cannot tell its clients apart.
 
+The family per peer host (§5.3) is counted once the same way, per metric,
+by `shawk:host_dependency_…{src_host, src, dst_host, dst, server_port,
+network_transport}`: `src_host` is the host of the client and `dst_host`
+that of the server, on the client side its `instance` (the host name) and
+its `shawk_peer_host`, on the server side the other way round.
+
+| metric | per dependency | recording rules (`shawk:host_dependency_…`) |
+|---|---|---|
+| connections, bytes | the client side; the server side only when the client has no agent | `connections:rate5m`, `request_bytes:rate5m`, `response_bytes:rate5m` |
+| failures by reason, handshakes, SYN retransmissions | the client side only | `connection_failures_by_reason:rate5m`, `handshake_seconds_sum:rate5m`, `handshake_seconds_count:rate5m`, `syn_retransmits:rate5m` |
+| retransmissions | both sides; `shawk_role` is the sender | `retransmits:rate5m` |
+
+The exception above remains: behind a translation with sources, the server
+side also counts the clients that run an agent.
+
 ## 8. Grafana
 
 `packaging/grafana` holds data sources, dashboards (fleet, dependency map,
-dependency details, changes, application layer of OBI) and alert rules.
+dependency details, peer hosts, changes, application layer of OBI) and
+alert rules. The peer hosts dashboard needs `peer_hosts` (§5.3): the hosts
+towards the selected services, and failures, connect times and traffic by
+peer host; a host that accepts no connection, such as one that is down,
+shows a failure ratio of 100%.
 
 PostgreSQL alerts use the time series format, with every row at `now()` so
 each series has a value at the last time; a query that finds nothing
@@ -1020,9 +1180,9 @@ alerted by Prometheus (`ShawkAgentDown`) for 24 hours, then from
 `shawk_v1.agents` for 30 days, labelled with the host id; a host
 reinstalled under the same name and alive is not alerted.
 
-The fleet, dependency details and changes dashboards overlay the periods
-from `unobserved()` and `partly_observed()` as annotations, so the absence
-of a dependency is not read as disuse over them. SYN retransmissions
+The fleet, dependency details, peer hosts and changes dashboards overlay
+the periods from `unobserved()` and `partly_observed()` as annotations, so
+the absence of a dependency is not read as disuse over them. SYN retransmissions
 per connection attempt (handshakes plus failures) exceed 1 when connects
 time out, and `TCP_FASTOPEN_CONNECT` connects, which have no handshake,
 raise them. OBI panels use a minimum interval of a minute, since OBI

@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -41,7 +42,26 @@ type shawkConnector struct {
 	cidrs        []namedPrefix
 	translations []translation
 
+	// inventory is the inventory last read from inventory_file, or from
+	// PostgreSQL while the file cannot be read; nil while none is known.
+	inventory atomic.Pointer[inventory]
+	// inventoryReadAt is when the inventory was read from the file, and
+	// inventoryUnwritten tells that writing it to PostgreSQL failed since.
+	inventoryReadAt    time.Time
+	inventoryUnwritten bool
+	// inventoryErr is the latest failure to read inventory_file, and when
+	// it was logged.
+	inventoryErr       string
+	lastInventoryLog   time.Time
+	inventoryFromStore bool
+	// inventoryWarned is when hosts whose agents send addresses that the
+	// inventory gives to other hosts were last logged, by host.
+	inventoryWarned map[string]time.Time
+
 	lastPrune, lastRefresh time.Time
+	// written is when the latest write that took every pending change
+	// started: what was seen before it is in PostgreSQL.
+	written time.Time
 
 	// Errors of the pipeline after the connector, logged at most once a
 	// minute.
@@ -86,8 +106,12 @@ func newConnector(set connector.Settings, cfg *Config, next consumer.Metrics) (*
 	now := time.Now()
 	res := newResolver(cidrs, translations)
 	res.maxInferred = cfg.MaxSeriesPerHost
+	res.peerHosts = cfg.PeerHosts
 	agg := newAggregator(cfg.IdleTTL, cfg.MaxPeers, cfg.MaxServices, cfg.KeepPeerAddress, now)
 	agg.maxInputs = maxValuesPerEdge * cfg.MaxSeriesPerHost
+	if cfg.PeerHosts {
+		agg.setPeerHosts(cfg.MaxPeerHosts, cfg.PeerHostServices)
+	}
 	return &shawkConnector{
 		cfg:      cfg,
 		log:      set.Logger,
@@ -104,6 +128,8 @@ func newConnector(set connector.Settings, cfg *Config, next consumer.Metrics) (*
 
 		foldWarned: map[foldWarnKey]*foldWarning{},
 		cidrWarned: map[string]time.Time{},
+
+		inventoryWarned: map[string]time.Time{},
 	}, nil
 }
 
@@ -142,7 +168,8 @@ func (c *shawkConnector) Start(ctx context.Context, _ component.Host) error {
 }
 
 // prepare migrates the schema if configured to, or checks its version,
-// writes peer_cidrs and the translations, and reloads the names of peers.
+// writes peer_cidrs and the translations, reads the inventory and writes
+// it, and reloads the names of peers.
 // It reports whether the schema is ready.
 func (c *shawkConnector) prepare(ctx context.Context) bool {
 	if !c.prepareSchemaOnly(ctx) {
@@ -162,13 +189,26 @@ func (c *shawkConnector) prepare(ctx context.Context) bool {
 			c.mu.Unlock()
 		}
 	}
+	c.syncInventory(ctx)
 	at := c.now()
-	rows, err := c.store.peers(ctx, c.cfg.IdleTTL)
+	var former time.Duration
+	if c.cfg.PeerHosts {
+		former = formerHolderWindow
+	}
+	rows, err := c.store.peers(ctx, c.cfg.IdleTTL, former)
 	if err != nil {
 		c.log.Warn("reading the names of peers from PostgreSQL", zap.Error(err))
 		return true
 	}
 	c.resolver.load(rows, at)
+	c.mu.Lock()
+	written := c.written
+	c.mu.Unlock()
+	if !written.IsZero() {
+		// The holders of addresses seen before the latest write are read
+		// back from PostgreSQL now.
+		c.resolver.forgetHeld(written)
+	}
 	return true
 }
 
@@ -235,9 +275,14 @@ func (c *shawkConnector) loop(ctx context.Context) {
 			// Writes and the reload of peers have their own deadlines, so
 			// that a slow write does not stop the names from being reloaded.
 			wctx, cancel := context.WithTimeout(ctx, c.cfg.WriteInterval)
+			started := c.now()
 			written := c.prepareSchemaOnly(wctx) && c.flush(wctx)
 			cancel()
-			if !written {
+			if written {
+				c.mu.Lock()
+				c.written = started
+				c.mu.Unlock()
+			} else {
 				c.boundPending()
 			}
 			rctx, cancel := context.WithTimeout(ctx, c.cfg.WriteInterval)
@@ -259,6 +304,11 @@ func (c *shawkConnector) loop(ctx context.Context) {
 			for k, t := range c.cidrWarned {
 				if now.Sub(t) >= foldWarnInterval {
 					delete(c.cidrWarned, k)
+				}
+			}
+			for k, t := range c.inventoryWarned {
+				if now.Sub(t) >= foldWarnInterval {
+					delete(c.inventoryWarned, k)
 				}
 			}
 			c.mu.Unlock()
@@ -435,6 +485,7 @@ func (c *shawkConnector) ConsumeMetrics(ctx context.Context, md pmetric.Metrics)
 		c.resolver.learn(b, now)
 		c.mu.Lock()
 		c.foldedCIDRs(b, now)
+		c.inventoryConflicts(b, now)
 		c.changes.add(b, now)
 		c.agg.add(b, func(id *edgeID) peer {
 			p := c.resolver.peer(b.key, id, now)

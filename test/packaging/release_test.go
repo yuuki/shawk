@@ -223,10 +223,18 @@ func TestUnitsSandboxed(t *testing.T) {
 		if filepath.Base(u) != "shawk-agent.service" {
 			continue
 		}
+		// The agent reports ready from its main process once its programs
+		// are attached; NOTIFY_SOCKET is a Unix socket.
+		if s["Type"] != "notify" {
+			t.Errorf("%s: Type=%s, want notify", u, s["Type"])
+		}
+		if s["NotifyAccess"] == "none" {
+			t.Errorf("%s: NotifyAccess=none does not let the agent report ready", u)
+		}
 		for k, need := range map[string][]string{
 			"CapabilityBoundingSet":   {"CAP_BPF", "CAP_PERFMON", "CAP_SYS_ADMIN", "CAP_SYS_PTRACE", "CAP_DAC_READ_SEARCH"},
 			"SystemCallFilter":        {"@system-service", "bpf", "perf_event_open", "setns"},
-			"RestrictAddressFamilies": {"AF_INET", "AF_INET6", "AF_NETLINK"},
+			"RestrictAddressFamilies": {"AF_INET", "AF_INET6", "AF_NETLINK", "AF_UNIX"},
 			"RestrictNamespaces":      {"net"},
 		} {
 			for _, v := range need {
