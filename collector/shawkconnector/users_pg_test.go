@@ -5,8 +5,11 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // TestPGJobUsers: with job_users, the processes of Slurm jobs have a row per
@@ -106,11 +109,17 @@ func TestPGJobUsersMigration(t *testing.T) {
 	if _, err := Migrate(ctx, conn); err != nil {
 		t.Fatal(err)
 	}
+	other, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close(ctx)
+	// readable checks the privileges as another session sees them.
 	readable := func(when string) {
 		t.Helper()
 		for _, role := range []string{"shawk_connector", "shawk_grafana"} {
 			var users, others bool
-			if err := conn.QueryRow(ctx, `SELECT has_table_privilege($1, 'shawk_v1.job_edges', 'SELECT'),
+			if err := other.QueryRow(ctx, `SELECT has_table_privilege($1, 'shawk_v1.job_edges', 'SELECT'),
 			    has_table_privilege($1, 'shawk_v1.agents', 'SELECT')`, role).Scan(&users, &others); err != nil {
 				t.Fatal(err)
 			}
@@ -120,6 +129,15 @@ func TestPGJobUsersMigration(t *testing.T) {
 		}
 	}
 	readable("after the migration")
+	// grants.sql halfway, after granting all of shawk_v1 and before taking
+	// job_edges back: other sessions do not see the grants yet.
+	i := strings.Index(string(grants), "-- The users of the processes of Slurm jobs")
+	if i < 0 {
+		t.Fatal("grants.sql does not take job_edges back")
+	}
+	execAll(t, conn, string(grants)[:i])
+	readable("halfway through grants.sql")
+	execAll(t, conn, "ROLLBACK")
 	execAll(t, conn, string(grants))
 	readable("after grants.sql")
 

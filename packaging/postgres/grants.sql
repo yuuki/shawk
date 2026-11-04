@@ -3,6 +3,12 @@
 -- applies new migrations:
 --
 --   psql -v ON_ERROR_STOP=1 -d shawk -U shawk_owner -f grants.sql
+--
+-- It is one transaction, so that other sessions see none of it or all of
+-- it: the grants of all of shawk_v1 below are taken back from job_edges
+-- before they hold, and a run that stops halfway changes nothing.
+
+BEGIN;
 
 REVOKE ALL ON SCHEMA shawk, shawk_v1 FROM PUBLIC;
 -- Only the owner creates temporary tables, which every role may by
@@ -44,3 +50,5 @@ END $$;
 ALTER DEFAULT PRIVILEGES IN SCHEMA shawk GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO shawk_connector;
 ALTER DEFAULT PRIVILEGES IN SCHEMA shawk GRANT USAGE ON SEQUENCES TO shawk_connector;
 ALTER DEFAULT PRIVILEGES IN SCHEMA shawk_v1 GRANT SELECT ON TABLES TO shawk_connector, shawk_grafana;
+
+COMMIT;
