@@ -469,6 +469,15 @@ per packet.
   takes the latest identity seen for the same unit and comm, and for the
   processes of Slurm jobs, whose units every job of every user shares, the
   same cgroup (step) too.
+- Users, opt-in. With `-job-users`, a process of a Slurm job (a unit
+  `slurm/...`) carries its user as `process.user.id`: the effective uid of
+  `/proc/PID/status`, read with the executable in the interval. A uid that could not be read (the process exited, its
+  PID was reused, the reads ran out of time) is unknown and not sent:
+  unlike the executable and the service, it is never taken from the latest
+  identity. Processes outside jobs (slurmstepd included) have no user, nor
+  do the sockets of kernel clients (NFS, Lustre), which belong to no job.
+  The series of a job grow with its users, not with jobs; the connector
+  keeps the users only with `job_users` (§6), for administrators.
 - The host is identified by `host.id` (`/etc/machine-id`, else
   `/var/lib/dbus/machine-id`) and `host.name`. PostgreSQL keys a host by
   the hash of both, so VMs cloned with the same machine id stay apart.
@@ -480,8 +489,9 @@ attributes `service.name`, `service.namespace`, `process.executable.name`,
 `process.executable.path`, `process.command`, `shawk.unit`, `container.id`,
 `shawk.role` (`client` or `server`), `network.transport`,
 `network.local.address`, `network.peer.address`, `server.port` (the service
-port, whatever the role), `shawk.netns`, and `shawk.peer.folded=true` for a
-folded edge (§3.6). The PID is not an attribute, so a restarted process
+port, whatever the role), `shawk.netns`, `shawk.peer.folded=true` for a
+folded edge (§3.6), and `process.user.id` for a process of a Slurm job
+with `-job-users` (§4.1). The PID is not an attribute, so a restarted process
 continues the same series.
 
 | metric | type, unit | |
@@ -885,7 +895,8 @@ agent_sessions(host_id, started_at, last_heartbeat, udp_traced, netns_scope, dro
                peer_fold, peer_internal, counters_started)
 partial_observations(host_id, started_at, period_start, period_end, dropped_flows)  -- periods with drops
 host_addrs(host_id, addr, first_seen, last_seen)  -- one row per period
-processes(id, host_id, unit, comm, exe, service_name, first_seen, last_seen)  -- unique (host_id, unit, comm, service_name)
+processes(id, host_id, unit, comm, exe, service_name, user_id, first_seen, last_seen)
+  -- unique (host_id, unit, comm, service_name, user_id); user_id only for processes of jobs (job_users)
 edges(id, host_id, process_id, role, proto, local_addr, remote_addr, port, netns, first_seen, last_seen)
   -- remote_addr is the network 0.0.0.0/0 or ::/0 for folded peers
 listeners(host_id, process_id, proto, addr, port, netns, first_seen, last_seen)  -- the latest owner
@@ -896,6 +907,19 @@ learned_translations(host_id, proto, netns, client_addr, virtual_addr, virtual_p
                      backend_addr, backend_port, first_seen, last_seen)  -- learned by agents (§3.7, §5.4)
 known_dependencies(client_service, server_service, port, proto, first_seen, last_seen)
 ```
+
+With `job_users`, the user (`process.user.id`) of a process of a Slurm job
+(a unit `slurm/...`) is part of its identity, so that the jobs of
+different users with the same unit, comm and service have rows of their
+own: rows grow with users, not with jobs. `user_id` is NULL for other
+processes, and for processes of jobs whose user is unknown: the agent
+could not read it or does not send it (`-job-users`), the connector does
+not keep it, or the row was written before. Migration 0002 added it,
+leaving the rows before with NULL; PostgreSQL 14 has no `NULLS NOT
+DISTINCT`, so the identity is a unique index on `coalesce(user_id, -1)`.
+Connectors from before it upsert on the former key, and their writes fail
+until they are upgraded. Job ids are not kept: edges have only their first
+and last times, so joining them with slurmdbd cannot split them by job.
 
 `known_dependencies` keeps every dependency between services ever seen,
 refreshed every 5 minutes (`shawk.refresh_known_dependencies()`). The
@@ -917,10 +941,18 @@ match.
 | `agents` | the latest segment of every host and whether its agent is alive; the last columns, `peer_fold` and `peer_internal`, tell what the agent folds and the ranges it keeps exact |
 | `unobserved(since, until, tolerance)` | the periods in which each host was not observed; Grafana overlays them as annotations |
 | `partly_observed(since, until)` | the periods in which each host was observed but its agent dropped flows, cut to `[since, until]`: `host`, `gap_start`, `gap_end`, `dropped_flows` (flow updates dropped). A dependency may be missing from them although it was used; Grafana overlays them as annotations |
+| `job_edges` | the edges of the processes of Slurm jobs with the user of the process (`user_id`, NULL if unknown), host, unit, service and executable: which users connected to what, and when. For administrators: only its owner reads it (below) |
 | `dependencies_between(since, until)`, `graph_edges_between`, `graph_nodes_between`, `dependency_changes_between` | the same for the dependencies active in a period. They take the edges active in the period with a margin of 15 minutes before matching, so a recent window does not scan the history (about 0.3 s instead of 3 s with a million edges) and both sides of a connection are matched at the edges of the period; the dashboards and alerts use them. A dependency appeared in a period when it was first seen in it and is not in `known_dependencies` from before it, so one that comes back on new edges (a new container, an hourly job) did not appear |
 
 The connector role writes `shawk` and reads `shawk_v1`; Grafana reads
-`shawk_v1` only (`packaging/postgres`). Neither may create objects in the
+`shawk_v1` only (`packaging/postgres`), except `job_edges`: user ids with
+executables, peers and times tell the activity of the jobs of other users,
+and every viewer of Grafana can send SQL through the data source, so the
+users are for administrators in this version. `grants.sql` keeps the view
+from the connector and Grafana, and migration 0002 revokes what default
+privileges granted as it was created, so that only the owner reads it,
+or a role of administrators the owner grants it to. Views of their own
+jobs for users would be designed separately. Neither may create objects in the
 database (tables or functions in `public`, temporary tables, large
 objects). The read-only transactions and statement timeout that `setup.sql`
 gives Grafana are session defaults it could change; the privileges are what
