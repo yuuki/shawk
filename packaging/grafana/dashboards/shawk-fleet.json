@@ -479,7 +479,7 @@
           "sort": "desc"
         }
       },
-      "description": "Bytes sent and received by the RDMA ports (InfiniBand, RoCE) of hosts that have them, from their port counters. shawk observes TCP and UDP only, so traffic here may be dependencies that are not recorded. It is a hint, not coverage: the counters cover the whole port (IPoIB included), so they tell neither which hosts or jobs used RDMA, nor that nothing was missed when flat. Counters of 32 bits stop at their maximum and stay flat."
+      "description": "Bytes sent and received by the RDMA ports (InfiniBand, RoCE) of hosts whose port counters are readable (not software devices such as rxe and siw). shawk observes TCP and UDP only, so traffic here may be dependencies that are not recorded. It is a hint, not coverage: the counters cover the whole port (IPoIB included), so they tell neither which hosts or jobs used RDMA, nor that nothing was missed when flat. Counters of 32 bits stop at their maximum and stay flat."
     },
     {
       "id": 7,

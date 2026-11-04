@@ -113,8 +113,9 @@ Notes for static clusters managed by Slurm. The design is in
 ### What is observed
 
 shawk observes TCP and UDP sockets, so "not used" means "no TCP or UDP".
-RDMA verbs (InfiniBand, RoCE) bypass the sockets: MPI over UCX, NCCL,
-Lustre o2ib, GPFS verbs and NFS over RDMA are not seen, while TCP over
+RDMA verbs (InfiniBand, RoCE) bypass the sockets: the RDMA transports of
+MPI (UCX) and NCCL, Lustre o2ib, GPFS verbs and NFS over RDMA are not
+seen, even when their control connections over TCP are, while TCP over
 IPoIB is. A storage server used only over o2ib looks observed and unused.
 
 The fleet dashboard shows, below the observation periods, the traffic of
@@ -122,7 +123,8 @@ the RDMA ports of each host (`shawk_agent_rdma_io_bytes_total`, from
 `/sys/class/infiniband/*/ports/*/counters`). It is a hint that a host used
 what shawk does not see, not a coverage guarantee: the counters cover the
 whole port, IPoIB included, and tell neither which hosts or jobs used RDMA
-nor, when flat, that nothing was missed.
+nor, when flat, that nothing was missed. Hosts without readable port
+counters (software devices such as rxe and siw) have no series.
 
 The sockets of kernel clients (NFS, Lustre over TCP) belong to no process,
 so shawk tells which hosts use a file system, not which users or jobs. For

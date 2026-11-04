@@ -1,9 +1,11 @@
 package agent
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestRDMACounters(t *testing.T) {
@@ -45,4 +47,55 @@ func TestRDMACounters(t *testing.T) {
 	if n, _ := r.read(); n != 4*(10+5+1) {
 		t.Errorf("third read: %d", n)
 	}
+
+	// A device that is gone is forgotten: back under its name, it starts
+	// at a new base.
+	if err := os.RemoveAll(filepath.Join(root, "mlx5_0", "ports", "2")); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := r.read(); n != 4*16 {
+		t.Errorf("after removal: %d", n)
+	}
+	set("mlx5_0", "2", "port_xmit_data", "1000000")
+	if n, _ := r.read(); n != 4*16 {
+		t.Errorf("back under its name: %d", n)
+	}
+}
+
+func TestRDMACountersRun(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "mlx5_0", "ports", "1", "counters")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "port_xmit_data"), []byte("10\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r := newRDMACounters(root)
+	if _, ok := r.latest(); ok {
+		t.Error("found before a read")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { r.run(ctx, time.Millisecond); close(done) }()
+	// The first read is the base.
+	for _, ok := r.latest(); !ok; _, ok = r.latest() {
+		time.Sleep(time.Millisecond)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "port_xmit_data"), []byte("20\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if n, ok := r.latest(); ok && n == 40 {
+			break
+		}
+		if time.Now().After(deadline) {
+			n, ok := r.latest()
+			t.Fatalf("latest = %d, %v", n, ok)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	<-done
 }

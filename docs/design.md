@@ -37,8 +37,8 @@ primary target is Rocky Linux 9, kernel 5.14), and runs beside OBI (§9).
 
 What is observed is TCP and UDP sockets, so "not used" means "no TCP or
 UDP". RDMA verbs (InfiniBand, RoCE) bypass the sockets: in HPC clusters,
-where the main data paths use them (MPI over UCX, NCCL, Lustre o2ib, GPFS
-verbs, NFS over RDMA), a host may be observed throughout and still be used
+where the main data paths use them (the RDMA transports of MPI and NCCL,
+Lustre o2ib, GPFS verbs, NFS over RDMA), a host may be observed throughout and still be used
 (§10).
 
 ## 2. Architecture
@@ -501,12 +501,17 @@ metrics are `shawk.agent.up` (with `shawk.netns.scope`),
 `shawk.agent.container_reads.dropped` and
 `shawk.agent.translations.dropped`, `shawk.agent.translations.traced`,
 `shawk.agent.export.failures`, and with `-bpf-stats` per-program run counts
-and times. A host with RDMA ports (InfiniBand, RoCE) also sends
-`shawk.agent.rdma.io`, the bytes its ports sent and received since the
-agent started, read from `/sys/class/infiniband/*/ports/*/counters`
-(`port_xmit_data` and `port_rcv_data`, which count octets divided by 4) at
-every interval. It goes to Prometheus only, as a hint that the host used
-what shawk does not observe (§10). The resource carries `host.id`, `host.name`, `os.version`,
+and times. A host whose RDMA ports (InfiniBand, RoCE) have readable port
+counters also sends `shawk.agent.rdma.io`, the bytes its ports sent and
+received since the agent started, from
+`/sys/class/infiniband/*/ports/*/counters` (`port_xmit_data` and
+`port_rcv_data`, which count octets divided by 4). A read may query the
+device, so the counters are read every interval apart from the
+collection, and a device that does not answer delays only them. It goes
+to Prometheus only, as a hint that the host used what shawk does not
+observe (§10); its absence does not mean that the host has no RDMA
+(software devices such as rxe and siw have no port counters). The resource
+carries `host.id`, `host.name`, `os.version`,
 `service.name=shawk-agent` with `service.version`, `shawk.peer.fold`,
 `shawk.peer.internal`, and `host.ip`: the interface addresses of the traced
 namespaces plus the local addresses of recent series and open listeners,
@@ -996,9 +1001,10 @@ only the protocols it parses. shawk runs beside it:
 ## 10. Limitations
 
 - **TCP and UDP only.** "Observed and not used" holds for TCP and UDP
-  sockets. RDMA verbs (InfiniBand, RoCE) bypass them, so MPI over UCX,
-  NCCL, Lustre o2ib, GPFS verbs and NFS over RDMA are not seen; TCP over
-  IPoIB is. In HPC clusters the main data paths use RDMA, so a storage
+  sockets. RDMA verbs (InfiniBand, RoCE) bypass them, so the RDMA
+  transports of MPI (UCX) and NCCL, Lustre o2ib, GPFS verbs and NFS over
+  RDMA are not seen, even when their control connections over TCP are; TCP
+  over IPoIB is. In HPC clusters the main data paths use RDMA, so a storage
   server used over o2ib looks observed and unused. The counters of RDMA
   ports (§4.2) are a hint, not a coverage guarantee like `udp_traced`: they
   cover a whole port, all its virtual lanes and IPoIB included, so an
