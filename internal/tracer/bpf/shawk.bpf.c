@@ -315,7 +315,13 @@ static __always_inline bool ephemeral(__u16 port)
 	return port >= eph_port_low && port <= eph_port_high;
 }
 
-static __always_inline __u32 sock_netns(const struct sock *sk)
+/*
+ * The helpers take the kernel objects they read with BPF_CORE_READ() as
+ * pointers to non-const: the macro declares its result with the type of the
+ * field, which is const through a pointer to const, and clang 21 rejects
+ * such an object left uninitialized (-Wdefault-const-init-var-unsafe).
+ */
+static __always_inline __u32 sock_netns(struct sock *sk)
 {
 	return BPF_CORE_READ(sk, __sk_common.skc_net.net, ns.inum);
 }
@@ -329,7 +335,7 @@ static __always_inline void v4mapped(__u8 *dst, __be32 addr)
 }
 
 /* Reads the local and remote addresses of a socket. */
-static __always_inline int read_sock_addrs(const struct sock *sk, __u8 *laddr,
+static __always_inline int read_sock_addrs(struct sock *sk, __u8 *laddr,
 					   __u8 *raddr)
 {
 	__u16 family = BPF_CORE_READ(sk, __sk_common.skc_family);
@@ -349,7 +355,7 @@ static __always_inline int read_sock_addrs(const struct sock *sk, __u8 *laddr,
 	return -1;
 }
 
-static __always_inline int read_local_addr(const struct sock *sk, __u8 *laddr)
+static __always_inline int read_local_addr(struct sock *sk, __u8 *laddr)
 {
 	__u8 raddr[16];
 
@@ -392,7 +398,7 @@ static __always_inline void fold_peer(struct shawk_flow_key *key)
 
 /* Fills the addresses, port and protocol of a TCP flow key. */
 static __always_inline int build_tcp_key(struct shawk_flow_key *key,
-					 const struct sock *sk, __u8 direction)
+					 struct sock *sk, __u8 direction)
 {
 	if (read_sock_addrs(sk, key->laddr, key->raddr))
 		return -1;
@@ -564,7 +570,7 @@ static __always_inline void record_mptcp_owner(__u64 msk,
  * Kernels before 5.15 store the cgroup in a tagged union instead; there the
  * owner is left to user space.
  */
-static __always_inline __u64 sock_cgroup_id(const struct sock *sk)
+static __always_inline __u64 sock_cgroup_id(struct sock *sk)
 {
 	struct cgroup *cg;
 
@@ -1226,7 +1232,7 @@ int BPF_PROG(shawk_inet_sock_set_state, const struct sock *csk, int oldstate,
 }
 
 static __always_inline void emit_listener(struct seq_file *seq,
-					  const struct sock *sk, __u32 netns,
+					  struct sock *sk, __u32 netns,
 					  __u16 port, __u8 proto)
 {
 	struct shawk_iter_rec rec = {};
@@ -1424,7 +1430,7 @@ int shawk_iter_tcp(struct bpf_iter__tcp *ctx)
 
 /* ---------------------------------------------------------------- UDP --- */
 
-static __always_inline bool port_bound(const struct sock *sk)
+static __always_inline bool port_bound(struct sock *sk)
 {
 	__u8 locks = BPF_CORE_READ_BITFIELD_PROBED(sk, sk_userlocks);
 
@@ -1512,7 +1518,7 @@ static __always_inline __u32 set_udp_owner(struct shawk_flow_key *key,
 }
 
 /* Raw sockets of protocol 17 also send through ip_send_skb(). */
-static __always_inline bool is_udp_sock(const struct sock *sk)
+static __always_inline bool is_udp_sock(struct sock *sk)
 {
 	return BPF_CORE_READ(sk, sk_protocol) == IPPROTO_UDP &&
 	       BPF_CORE_READ(sk, sk_type) == SOCK_DGRAM;
@@ -2025,7 +2031,7 @@ static __always_inline __u64 kprobe_arg1(struct pt_regs *ctx)
 }
 
 /* Reads an address of a tuple of conntrack as an IPv6 address. */
-static __always_inline void ct_addr(__u8 *dst, const union nf_inet_addr *a,
+static __always_inline void ct_addr(__u8 *dst, union nf_inet_addr *a,
 				    __u16 family)
 {
 	if (family == AF_INET)
@@ -2040,11 +2046,11 @@ static __always_inline void ct_addr(__u8 *dst, const union nf_inet_addr *a,
  * port of the source alone, as a null binding that avoids a clash makes,
  * changes no address the edges are matched by.
  */
-static __always_inline int xlat_key(const struct nf_conn *ct,
+static __always_inline int xlat_key(struct nf_conn *ct,
 				    struct shawk_xlat_key *k)
 {
-	const struct nf_conntrack_tuple *o = &ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple;
-	const struct nf_conntrack_tuple *r = &ct->tuplehash[IP_CT_DIR_REPLY].tuple;
+	struct nf_conntrack_tuple *o = &ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple;
+	struct nf_conntrack_tuple *r = &ct->tuplehash[IP_CT_DIR_REPLY].tuple;
 	__u16 family = BPF_CORE_READ(o, src.l3num);
 	__u8 proto = BPF_CORE_READ(o, dst.protonum);
 
@@ -2135,7 +2141,7 @@ int shawk_ct_confirm(struct pt_regs *ctx)
 	ct = BPF_CORE_READ(skb, _nfct) & NFCT_PTRMASK_;
 	if (!ct)
 		return 0;
-	if (xlat_key((const struct nf_conn *)ct, &conn.key) ||
+	if (xlat_key((struct nf_conn *)ct, &conn.key) ||
 	    !netns_ok(conn.key.netns) || xlat_folded(&conn.key)) {
 		/*
 		 * Most entries translate nothing; one at the address of an entry
