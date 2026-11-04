@@ -914,9 +914,11 @@ maintenance windows registered by hand:
 # node_states_file
 generated_at: 2026-11-04T10:00:00Z     # when the states were read from Slurm
 nodes:
-  - host: cn001.cluster.example        # host.name of the agent
+  - node: cn001                        # NodeName, mapped by the inventory (§5.6)
     state: [IDLE, POWERED_DOWN]        # or "IDLE+POWERED_DOWN"
     reason: ""
+  - host: login01.cluster.example      # or host.name of the agent
+    state: [IDLE]
 # maintenance_file, for hosts with or without Slurm
 maintenance:
   - hosts: [nfs01.cluster.example]
@@ -925,11 +927,13 @@ maintenance:
     reason: firmware update
 ```
 
-The node states are generated, e.g. `scontrol show nodes --json | jq '{generated_at: (now | todate),
-nodes: [.nodes[] | {host: .name, state, reason}]}'` where the `NodeName` of
-Slurm is the host name. `NodeName` may be any alias, so otherwise the cron
-job maps it to the host name from a written mapping (the provisioning
-database), not by trimming names.
+The node states are generated, e.g. `scontrol show nodes --json | jq
+'{generated_at: (now | todate), nodes: [.nodes[] | {node: .name, state,
+reason}]}'`. `NodeName` may be any alias, so the connector maps it to a host
+by `slurm_node` of the inventory (§5.6), when it reads the file, and writes
+the host: the state of a past gap stays with the host it had then. Nodes
+the inventory does not map are left out, with a warning when they change;
+without an inventory, the file names hosts (`host`).
 
 - **Times.** States are written as periods (`node_states`): a state read
   again within 5 minutes (`shawk.node_state_max_age()`) continues its
@@ -946,21 +950,26 @@ database), not by trimming names.
   `NOT_RESPONDING`, and the symbols of `sinfo` (`idle~`) are invalid.
 - **Maintenance windows** are written by the clock of the database
   (`maintenance_windows`) when the file changes, and count from when they
-  were first written, so a window registered afterwards does not make a
-  past failure planned. A window removed from the file is deleted before it
+  were written, so a window registered afterwards does not make a past
+  failure planned. A window removed from the file is deleted before it
   starts and ends then while in progress, as one whose end is moved to the
-  past; one that ended stays as it was, and is not extended: a window is
-  extended before it ends. The file is the whole registry, so it is
-  replaced at once (renamed) and is the same for every connector: a
-  connector with an older file ends the windows it lacks.
-- **What is planned.** Power saving (`POWERED_DOWN`, `POWERING_DOWN`) with
-  no other flag than `IDLE`, `CLOUD` and `POWER_DOWN`, so never with
-  `DOWN`, which also follows failed boots and a `ResumeTimeout`, `DRAIN`,
-  on which jobs keep running, `FAIL`, `NOT_RESPONDING` or a flag unknown
-  here (`shawk.planned_state()`). Maintenance: a window of the file, or
-  the flag `MAINT` of a reservation of Slurm, which is registered with an
-  end, for 30 days at most. `POWERING_UP` is not planned: a booting node is
-  expected back.
+  past. A row that ended stays as it was: a window registered again after
+  its row ended, e.g. after a file read while it lacked the window or by a
+  connector with an older file, gets a new row from then, so the time in
+  between is not planned and nothing is lost for good. The file is still
+  the whole registry: it is replaced at once (renamed) and is the same for
+  every connector.
+- **What is planned.** Power saving (`POWERED_DOWN`, `POWERING_DOWN`,
+  `POWERING_UP`) with no other flag than `IDLE`, `ALLOCATED`, `MIXED` (a
+  job waits for a node that powers up), `CLOUD` and `POWER_DOWN`, so never
+  with `DOWN`, which also follows failed boots and a `ResumeTimeout`,
+  `DRAIN`, on which jobs keep running, `FAIL`, `NOT_RESPONDING` or a flag
+  unknown here (`shawk.planned_state()`). Powering up ends as the node is
+  up, when its agent is expected back, or at the `ResumeTimeout` of Slurm,
+  when the node is `DOWN`; without it, a node that resumes would be alerted
+  while it boots. Maintenance: a window of the file, or the flag `MAINT` of
+  a reservation of Slurm, which is registered with an end, for 30 days at
+  most.
 
 Slurm partitions and states are not labels of the metrics of shawk.
 
@@ -1077,17 +1086,17 @@ alerted by Prometheus (`ShawkAgentDown`) for 24 hours, then from
 reinstalled under the same name and alive is not alerted. Neither alerts
 hosts in a planned stop (§5.7): the Grafana alert excludes
 `shawk_v1.planned_stops`, and `ShawkAgentDown` the nodes a Slurm exporter
-reports powered down by power saving (with no flag but `IDLE`, `CLOUD` and
-`POWER_DOWN`) or in a `MAINT` reservation, joined on the host name. The example in
+reports in power saving (powered down, powering down or up, with no flag but
+`IDLE`, `ALLOCATED`, `MIXED`, `CLOUD` and `POWER_DOWN`) or in a `MAINT`
+reservation, joined on the host name. The example in
 `packaging/prometheus/shawk-rules.yml` assumes `slurm_node_state{node,
 state}`; the metric, its labels and the mapping of `NodeName` to
 `host_name` are replaced with those of the exporter in use. A state is
 current only while the exporter is scraped, so a stale state stops nothing.
 Prometheus does not know the windows of `maintenance_file`: in the first
 24 hours of one, `ShawkAgentDown` fires unless it is silenced in
-Alertmanager or is a `MAINT` reservation. A node that resumes from power
-saving is alerted if its agent does not send within the minute of `for`
-after the end of power saving.
+Alertmanager or is a `MAINT` reservation. A node that resumed is alerted
+if its agent does not send within the minute of `for` after it is up.
 
 The fleet, dependency details and changes dashboards overlay the periods
 from `unobserved()` and `partly_observed()` as annotations, so the absence
