@@ -278,3 +278,22 @@ run, and slurmctld and slurmstepd connect to it, so each run tends to show
 as a new dependency and `server_port` churns in Prometheus. Set it in
 `slurm.conf` (e.g. `SrunPortRange=60001-63000`; firewalls between the nodes
 usually need it anyway). How shawk aggregates these ports is #174.
+
+### Compute nodes: `-max-flows`, alerts and reserved CPUs
+
+Measured in a VM, not yet on a cluster:
+[docs/research/hpc-compute-nodes/compute_nodes.md](../docs/research/hpc-compute-nodes/compute_nodes.md)
+(#172).
+
+- Size `-max-flows` of the agent for the jobs whose ranks talk over TCP
+  (§7 of the note): 32768 for ranks that each talk to one rank of every
+  other node of 190, 65536 for all to all when the ranks of a step share a
+  cgroup. Each slot costs 2.7 KiB of kernel memory. A full table drops the
+  same flows in every interval, those of the infrastructure too.
+- `grafana/provisioning/alerting/shawk-compute-nodes.yaml.example` is an
+  opt-in rule that fires once for the compute nodes partly observed in the
+  last 30 minutes, rather than once per node.
+- `systemd/shawk-agent-reserved-cpus.conf` is a drop-in that runs the
+  agent on the CPUs Slurm reserves for the system (`CpuSpecList`,
+  `CoreSpecCount`); reserving them is what removed the effect of the agent
+  on jobs.

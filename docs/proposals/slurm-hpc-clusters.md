@@ -260,6 +260,12 @@ within the same step.
   measured and documented.
 - **Connector.** One active connector is the natural setup (#128 does not
   apply); its capacity and the downtime it can take are measured.
+- **Measured** in a VM in
+  [../research/hpc-compute-nodes/compute_nodes.md](../research/hpc-compute-nodes/compute_nodes.md),
+  with the guidance on `-max-flows`, the alert and the drop-in; not yet on
+  a cluster. With Slurm 22.05.11 the ranks of a step shared one cgroup
+  (`task_special`), unlike what is assumed above, and the agent has 10 s
+  for an interval in all rather than per request.
 
 ## 5. Inventory and node states
 
