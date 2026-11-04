@@ -23,6 +23,17 @@ psql -v ON_ERROR_STOP=1 -d shawk -U shawk_owner -f packaging/postgres/grants.sql
 `setup.sql` asks for the password of each role. Run `shawk-migrate` and
 `grants.sql` again whenever an upgrade brings new migrations.
 
+The users of the processes of Slurm jobs (`-job-users` of the agent,
+`job_users` of the connector) are for administrators: `shawk_v1.job_edges`
+is read by `shawk_owner` only, not by the connector or Grafana. To let
+other administrators read it, grant it to a role of theirs as the owner
+(`grants.sql` leaves such grants alone):
+
+```sql
+GRANT USAGE ON SCHEMA shawk_v1 TO hpc_admins;
+GRANT SELECT ON shawk_v1.job_edges TO hpc_admins;
+```
+
 Use `sslmode=verify-full` in every connection string: with
 `sslmode=require` any certificate is accepted, so whoever can intercept the
 connection gets the password.

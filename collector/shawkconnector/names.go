@@ -64,6 +64,7 @@ const (
 	attrCommand     = "process.command"
 	attrUnit        = "shawk.unit"
 	attrContainerID = "container.id"
+	attrUserID      = "process.user.id"
 	attrRole        = "shawk.role"
 	attrTransport   = "network.transport"
 	attrLocalAddr   = "network.local.address"

@@ -347,9 +347,9 @@ func TestPGLearnedAsConnectorRole(t *testing.T) {
 	then := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Second)
 	h := newHostChanges(hostKey("", "app-01"))
 	h.setHost("", "app-01", "5.14", "test", then)
-	h.addProcess(procKey{"app.service", "app", "app"}, "/usr/bin/app", span{then, then})
+	h.addProcess(procKey{"app.service", "app", "app", ""}, "/usr/bin/app", span{then, then})
 	h.addEdge(edgeRowKey{role: "client", proto: "tcp", local: addrOf("10.0.0.11"), peer: addrOf("10.96.0.10"), port: 5432,
-		netns: 1, procKey: procKey{"app.service", "app", "app"}}, span{then, then})
+		netns: 1, procKey: procKey{"app.service", "app", "app", ""}}, span{then, then})
 	h.addTranslation(translationID{proto: "tcp", netns: 1, client: addrOf("10.0.0.11"), virtual: addrOf("10.96.0.10"),
 		vport: 5432, source: addrOf("10.0.0.11"), backend: addrOf("10.0.1.10"), bport: 6432}, span{then, then})
 	if err := st.write(ctx, h); err != nil {

@@ -75,6 +75,10 @@ connectors:
     # names): an agent cannot write as another host.
     host_identity: certificate
     retention: 26280h         # 3 years; 0 keeps rows forever
+    # The users of the processes of Slurm jobs, from agents run with
+    # -job-users (docs/design.md, section 6). For administrators only:
+    # grants.sql keeps shawk_v1.job_edges from Grafana.
+    job_users: false
     # Bounds of what the connector holds (docs/design.md, section 5.5), far
     # above a large fleet. Lower max_hosts to the size of the fleet, with
     # room, to bound the memory of the collector more tightly.

@@ -37,8 +37,10 @@ func (s *span) merge(o span) {
 
 // procKey identifies a process in PostgreSQL. The service name is part of
 // it, so that processes of one unit with the same comm but different
-// OTEL_SERVICE_NAME stay apart.
-type procKey struct{ unit, comm, service string }
+// OTEL_SERVICE_NAME stay apart. With job_users, so is the user of a process
+// of a Slurm job (its uid in decimal, "" if unknown), so that the jobs of
+// different users stay apart; it is "" for other processes.
+type procKey struct{ unit, comm, service, user string }
 
 type procRow struct {
 	exe string
@@ -200,8 +202,10 @@ func (h *hostChanges) merge(o *hostChanges) {
 // write an edge whose last_seen alone advances only once per interval, it
 // remembers what it last accepted and skips data that changes nothing.
 type changes struct {
-	ttl     time.Duration
-	pending map[string]*hostChanges
+	ttl time.Duration
+	// jobUsers keeps the users of the processes of Slurm jobs (job_users).
+	jobUsers bool
+	pending  map[string]*hostChanges
 	// accepted are the spans last accepted for writing, with when they were
 	// last reported.
 	acceptedEdges        map[string]map[edgeRowKey]acceptedSpan
@@ -244,15 +248,25 @@ type acceptedSpan struct {
 	seen time.Time
 }
 
-func newChanges(ttl time.Duration) *changes {
+func newChanges(ttl time.Duration, jobUsers bool) *changes {
 	return &changes{
 		ttl:                  ttl,
+		jobUsers:             jobUsers,
 		pending:              map[string]*hostChanges{},
 		acceptedEdges:        map[string]map[edgeRowKey]acceptedSpan{},
 		acceptedListeners:    map[string]map[listenerRowKey]acceptedSpan{},
 		acceptedTranslations: map[string]map[translationID]acceptedSpan{},
 		floors:               map[string]sessionFloor{},
 	}
+}
+
+// procKey returns the row of a process in PostgreSQL.
+func (c *changes) procKey(p *process) procKey {
+	k := procKey{unit: p.unit, comm: p.comm, service: p.job()}
+	if c.jobUsers && strings.HasPrefix(p.unit, slurmJobUnit) {
+		k.user = p.user
+	}
+	return k
 }
 
 func (c *changes) host(key string) *hostChanges {
@@ -332,7 +346,7 @@ func (c *changes) add(b *hostBatch, now time.Time) {
 			s.first = s.last
 		}
 		s = s.notAfter(latest)
-		pk := procKey{e.id.unit, e.id.comm, e.id.job()}
+		pk := c.procKey(&e.id.process)
 		k := edgeRowKey{role: e.id.role, proto: e.id.proto, local: e.id.local, peer: e.id.peer, folded: e.id.folded,
 			port: e.id.port, netns: e.id.netns, procKey: pk}
 		acc, ok := edges[k]
@@ -363,7 +377,7 @@ func (c *changes) add(b *hostBatch, now time.Time) {
 		s = s.notAfter(latest)
 		k := listenerRowKey{proto: l.id.proto, addr: l.id.addr, port: l.id.port, netns: l.id.netns}
 		if l.id.unit != "" || l.id.comm != "" {
-			k.procKey = procKey{l.id.unit, l.id.comm, l.id.job()}
+			k.procKey = c.procKey(&l.id.process)
 		}
 		acc, ok := listeners[k]
 		// A listener's last_seen advances at every request; write it once

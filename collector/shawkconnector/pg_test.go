@@ -301,9 +301,9 @@ func TestPGPipeline(t *testing.T) {
 	conn.QueryRow(ctx, `SELECT max(last_seen) FROM shawk.edges`).Scan(&before)
 	old := newHostChanges(hostKey("m-app", "app-01"))
 	old.setHost("m-app", "app-01", "4.18", "old", base.Add(-48*time.Hour))
-	old.addProcess(procKey{"app.service", "puma", "shop/app"}, "/old", span{base.Add(-48 * time.Hour), base.Add(-48 * time.Hour)})
+	old.addProcess(procKey{"app.service", "puma", "shop/app", ""}, "/old", span{base.Add(-48 * time.Hour), base.Add(-48 * time.Hour)})
 	old.addEdge(edgeRowKey{role: "client", proto: "tcp", local: addrOf("10.0.0.11"), peer: addrOf("10.0.0.10"), port: 5432,
-		netns: 4026531840, procKey: procKey{"app.service", "puma", "shop/app"}}, span{base.Add(-48 * time.Hour), base.Add(-48 * time.Hour)})
+		netns: 4026531840, procKey: procKey{"app.service", "puma", "shop/app", ""}}, span{base.Add(-48 * time.Hour), base.Add(-48 * time.Hour)})
 	if err := c.store.write(ctx, old); err != nil {
 		t.Fatal(err)
 	}
@@ -414,7 +414,7 @@ func TestPGPrune(t *testing.T) {
 		h.setHost("m", host, "5.14", "test", at)
 		h.addSession(at.Add(-time.Hour), sessionRow{lastHeartbeat: at, netnsScope: "all"})
 		h.addAddr(addrOf("10.0.0.1"), span{at, at})
-		pk := procKey{host + ".service", host, host}
+		pk := procKey{host + ".service", host, host, ""}
 		h.addProcess(pk, "/usr/bin/"+host, span{at, at})
 		for i := range 5 {
 			h.addEdge(edgeRowKey{role: "client", proto: "tcp", local: addrOf("10.0.0.1"), peer: addrOf("10.0.1.1"),
@@ -582,7 +582,7 @@ func TestPGProcessesKeepTheirServices(t *testing.T) {
 	h := newHostChanges("h1")
 	h.setHost("m", "h1", "k", "v", now)
 	for i, svc := range []string{"billing", "mailer"} {
-		pk := procKey{"workers.service", "python3", svc}
+		pk := procKey{"workers.service", "python3", svc, ""}
 		at := now.Add(time.Duration(i) * time.Minute)
 		h.addProcess(pk, "/usr/bin/python3", span{at, at})
 		h.addEdge(edgeRowKey{role: "client", proto: "tcp", local: addrOf("10.0.0.1"), peer: addrOf("10.0.0." + []string{"5", "6"}[i]),
@@ -615,7 +615,7 @@ func TestPGAddressPeriods(t *testing.T) {
 		h := newHostChanges(host)
 		h.setHost("m", host, "k", "v", last)
 		h.addAddr(addrOf("10.0.0.100"), span{first, last})
-		pk := procKey{"haproxy.service", "haproxy", "haproxy"}
+		pk := procKey{"haproxy.service", "haproxy", "haproxy", ""}
 		h.addProcess(pk, "", span{first, last})
 		h.addListener(listenerRowKey{proto: "tcp", addr: addrOf("0.0.0.0"), port: 80, netns: 1, procKey: pk}, span{first, last})
 		if err := st.write(ctx, h); err != nil {

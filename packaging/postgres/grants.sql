@@ -26,6 +26,18 @@ GRANT SELECT ON ALL TABLES IN SCHEMA shawk_v1 TO shawk_connector;
 GRANT USAGE ON SCHEMA shawk_v1 TO shawk_grafana;
 GRANT SELECT ON ALL TABLES IN SCHEMA shawk_v1 TO shawk_grafana;
 
+-- The users of the processes of Slurm jobs (job_users of the connector)
+-- with their executables, peers and times tell the activity of the jobs of
+-- other users, so shawk_v1.job_edges is for administrators: the owner reads
+-- it, and may grant it to a role of administrators. Neither the connector
+-- nor Grafana reads it; every viewer of Grafana could through the data
+-- source.
+DO $$ BEGIN
+  IF to_regclass('shawk_v1.job_edges') IS NOT NULL THEN
+    REVOKE ALL ON shawk_v1.job_edges FROM shawk_connector, shawk_grafana;
+  END IF;
+END $$;
+
 -- Tables and views of later migrations, which shawk-migrate creates as the
 -- owner, get the same privileges; run this file again after new
 -- migrations all the same, for the objects they do not create themselves.
