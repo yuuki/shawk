@@ -35,8 +35,8 @@ func (r *Resolver) User(pid uint32) (uid uint32, cgroupID uint64, ok bool) {
 		return 0, 0, false
 	}
 	uid, ok = statusUID(string(status))
-	path, ok2 := cgroup2Path(string(cgroup))
-	if !ok || !ok2 {
+	path := parseProcCgroup(cgroup)
+	if !ok || path == "" {
 		return 0, 0, false
 	}
 	// On cgroup v2 the id of a cgroup is the inode number of its directory.
@@ -67,16 +67,4 @@ func statusUID(status string) (uint32, bool) {
 		return uint32(uid), true
 	}
 	return 0, false
-}
-
-// cgroup2Path returns the path of the cgroup v2 in the content of
-// /proc/PID/cgroup: the line "0::<path>".
-func cgroup2Path(cgroup string) (string, bool) {
-	for line := range strings.Lines(cgroup) {
-		p, ok := strings.CutPrefix(strings.TrimSuffix(line, "\n"), "0::")
-		if ok && strings.HasPrefix(p, "/") {
-			return p, true
-		}
-	}
-	return "", false
 }

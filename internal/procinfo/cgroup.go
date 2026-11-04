@@ -59,11 +59,13 @@ var (
 	// Units named by the user, such as run-backup.service, are kept.
 	runScope    = regexp.MustCompile(`^run-([0-9]+|u[0-9]+(-s[0-9]+)?|r[0-9a-f]{32}|p[0-9]+-i[0-9]+)\.(scope|service)$`)
 	userService = regexp.MustCompile(`^user@\d+\.service$`)
-	// The scope slurmd makes for slurmstepd, slurmstepd_<node>.scope when
-	// several slurmd run on a host, and the directories of the steps of a
-	// job in it: step_<id>, step_<id>.<component> for a component of a
-	// heterogeneous job, step_batch, step_extern and step_interactive.
-	slurmScope = regexp.MustCompile(`^slurmstepd(_[^/]+)?\.scope$`)
+	// The scope slurmd makes for slurmstepd, with the name of the node
+	// when Slurm is built with --enable-multiple-slurmd: <node>_slurmstepd.scope
+	// (the documentation also writes slurmstepd_<node>.scope), and the
+	// directories of the steps of a job in it: step_<id>,
+	// step_<id>.<component> for a component of a heterogeneous job,
+	// step_batch, step_extern and step_interactive.
+	slurmScope = regexp.MustCompile(`^(.+_)?slurmstepd(_.+)?\.scope$`)
 	slurmStep  = regexp.MustCompile(`^step_(batch|extern|interactive|[0-9]+(\.[0-9]+)?)$`)
 )
 

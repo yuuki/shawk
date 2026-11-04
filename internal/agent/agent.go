@@ -411,7 +411,8 @@ func (a *Agent) process(pid uint32, comm string, cgroupID uint64, port uint16, s
 		return otlp.Process{Comm: comm, Service: procinfo.KernelServiceName(port, server)}
 	}
 	unit, ctr := a.cgroups.Unit(cgroupID)
-	return a.idents.resolve(pid, comm, cgroupID, unit, ctr, now)
+	cg := flowCgroup{id: cgroupID, path: a.cgroups.CgroupPath(cgroupID)}
+	return a.idents.resolve(pid, comm, cg, unit, ctr, now)
 }
 
 // request builds the requests of the live series at now, and returns the

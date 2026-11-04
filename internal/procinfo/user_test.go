@@ -29,28 +29,13 @@ func TestStatusUID(t *testing.T) {
 	}
 }
 
-func TestCgroup2Path(t *testing.T) {
-	for in, want := range map[string]string{
-		"0::/system.slice/slurmstepd.scope/job_42/step_0/user/task_0\n": "/system.slice/slurmstepd.scope/job_42/step_0/user/task_0",
-		// A hybrid hierarchy lists the controllers of cgroup v1 too.
-		"12:pids:/user.slice\n1:name=systemd:/user.slice/x\n0::/user.slice/user-1000.slice\n": "/user.slice/user-1000.slice",
-		"12:pids:/user.slice\n": "",
-		"":                      "",
-	} {
-		got, ok := cgroup2Path(in)
-		if got != want || ok != (want != "") {
-			t.Errorf("cgroup2Path(%q) = %q, %v; want %q", in, got, ok, want)
-		}
-	}
-}
-
 // User reads the user id and the cgroup of a process, which is that of the
 // test: its id is the inode of its directory in the hierarchy.
 func TestUser(t *testing.T) {
 	r := NewResolver()
 	b, err := os.ReadFile("/proc/self/cgroup")
-	path, ok := cgroup2Path(string(b))
-	if err != nil || !ok || r.root == "" {
+	path := parseProcCgroup(b)
+	if err != nil || path == "" || r.root == "" {
 		t.Skip("no cgroup v2")
 	}
 	var st syscall.Stat_t

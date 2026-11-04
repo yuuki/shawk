@@ -51,7 +51,11 @@ func TestUnit(t *testing.T) {
 		{"/system.slice/slurmstepd.scope/s5K1KKYAYG5D00/step_interactive/user/task_0", "slurm/interactive"},
 		{"/system.slice/slurmstepd.scope/s5K1KKYAYG5D00/step_extern/slurm", "slurmstepd"},
 		{"/system.slice/slurmstepd.scope/s5K1KKYAYG5D00/step_0/slurm_processes", "slurmstepd"},
+		{"/system.slice/node1_slurmstepd.scope/job_42/step_0/user/task_0", "slurm/step"},
+		{"/system.slice/node1_slurmstepd.scope/s5K1KKYAYG5D00/step_0/slurm", "slurmstepd"},
 		{"/system.slice/slurmstepd_node1.scope/job_42/step_0/user/task_0", "slurm/step"},
+		{"/system.slice/node1_slurmstepd.scope/system", "slurmstepd"},
+		{"/system.slice/slurmstepd-x.scope/job_42/step_0/user/task_0", "task_0"},
 		{"/system.slice/slurmstepd.scope/system", "slurmstepd"},
 		// Other hierarchies keep the names they had.
 		{"/system.slice/slurmstepd.scope", "slurmstepd.scope"},
@@ -79,6 +83,20 @@ func TestSlurmJob(t *testing.T) {
 	} {
 		if got := SlurmJob(unit); got != want {
 			t.Errorf("SlurmJob(%q) = %v, want %v", unit, got, want)
+		}
+	}
+}
+
+func TestParseProcCgroup(t *testing.T) {
+	for in, want := range map[string]string{
+		"0::/system.slice/slurmstepd.scope/job_42/step_0/user/task_0\n": "/system.slice/slurmstepd.scope/job_42/step_0/user/task_0",
+		"12:memory:/user.slice\n0::/system.slice/nginx.service\n":       "/system.slice/nginx.service",
+		"12:memory:/user.slice\n":                                       "",
+		"0::/../../system.slice/nginx.service\n":                        "",
+		"":                                                              "",
+	} {
+		if got := parseProcCgroup([]byte(in)); got != want {
+			t.Errorf("parseProcCgroup(%q) = %q, want %q", in, got, want)
 		}
 	}
 }
