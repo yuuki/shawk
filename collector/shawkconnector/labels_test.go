@@ -424,6 +424,67 @@ func TestSlurmJobs(t *testing.T) {
 	}
 }
 
+// TestSlurmJobPeers: the processes of Slurm jobs are peers named
+// slurm-job too, as their job, whether the connector learned them from
+// their agents or read them from PostgreSQL (#173).
+func TestSlurmJobPeers(t *testing.T) {
+	c, _, sink, now := testConnector(t, nil)
+	consume(t, c, sink, tAgent{host: "node-01", addrs: []string{"10.0.0.11"}, time: *now,
+		listeners: []tListener{{proto: "tcp", addr: "0.0.0.0", port: 40000, unit: "slurm/step", svc: "vasp_std", comm: "vasp_std"}},
+		edges: []tEdge{
+			{role: "client", proto: "tcp", local: "10.0.0.11", peer: "10.0.0.12", port: 8786, unit: "slurm/batch",
+				svc: "python3", comm: "python3", opened: 1},
+			{role: "client", proto: "tcp", local: "10.0.0.11", peer: "10.0.0.12", port: 6817, unit: "slurmd.service",
+				svc: "slurmd", comm: "slurmd", opened: 1},
+		}})
+	*now = now.Add(time.Second)
+	out := consume(t, c, sink, tAgent{host: "node-02", addrs: []string{"10.0.0.12"}, time: *now, edges: []tEdge{
+		{role: "client", proto: "tcp", local: "10.0.0.12", peer: "10.0.0.11", port: 40000, unit: "slurm/step",
+			svc: "a.out", comm: "a.out", opened: 1},
+		{role: "server", proto: "tcp", local: "10.0.0.12", peer: "10.0.0.11", port: 8786, unit: "slurm/step",
+			svc: "dask-scheduler", comm: "python3", opened: 1},
+		{role: "server", proto: "tcp", local: "10.0.0.12", peer: "10.0.0.11", port: 6817, unit: "slurmctld.service",
+			svc: "slurmctld", comm: "slurmctld", opened: 1},
+	}})
+	for _, w := range []struct{ peer, role string }{{slurmJobService, roleClient}, {slurmJobService, roleServer}} {
+		if s := find(out, metricConnOpened, slurmJobService, w.peer, w.role, ""); len(s) != 1 {
+			t.Errorf("%s of slurm-job to %s = %v", w.role, w.peer, find(out, metricConnOpened, "*", "*", "*", ""))
+		}
+	}
+	if s := find(out, metricConnOpened, "slurmctld", "slurmd", roleServer, ""); len(s) != 1 {
+		t.Errorf("server of slurmctld = %v", find(out, metricConnOpened, "slurmctld", "*", "*", ""))
+	}
+
+	// After a restart, the endpoints of jobs read from PostgreSQL name the
+	// peers the same way.
+	rows := peerRows{
+		endpoints: []endpointRow{
+			{key: endpointKey{addrOf("10.0.0.21"), 40000, "tcp"}, endpoint: endpoint{host: "n21", service: "vasp_std", exact: true}},
+			{key: endpointKey{addrOf("10.0.0.21"), 22, "tcp"}, endpoint: endpoint{host: "n21", service: "sshd", exact: true}},
+		},
+		clients: []clientRow{
+			{key: clientKey{addrOf("10.0.0.21"), addrOf("10.0.0.22"), 8786, "tcp"}, endpoint: endpoint{host: "n21", service: "python3", exact: true}},
+		},
+		jobs: map[jobEndpoint]bool{
+			{host: "n21", role: roleServer, proto: "tcp", service: "vasp_std", port: 40000}: true,
+			{host: "n21", role: roleClient, proto: "tcp", service: "python3", port: 8786}:   true,
+			// Another service on the same port is not a job.
+			{host: "n21", role: roleServer, proto: "tcp", service: "a.out", port: 22}: true,
+		},
+	}
+	rows.nameJobs()
+	var got []string
+	for _, e := range rows.endpoints {
+		got = append(got, e.service)
+	}
+	for _, c := range rows.clients {
+		got = append(got, c.service)
+	}
+	if want := []string{slurmJobService, "sshd", slurmJobService}; !slices.Equal(got, want) {
+		t.Errorf("services read = %v, want %v", got, want)
+	}
+}
+
 // TestLongLabelsCut: the names of services and namespaces, host names, host
 // ids and versions of agents that are forwarded are cut to 255 bytes, at
 // the start of a character, and names of peers to twice that; PostgreSQL

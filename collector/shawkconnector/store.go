@@ -653,6 +653,34 @@ WHERE last_seen > now() - make_interval(secs => $1)`,
 			out.learned = append(out.learned, r)
 			return nil
 		}, learnedTTL.Seconds())
+	if err != nil {
+		return out, err
+	}
+	// The ports the processes of Slurm jobs served and connected to, over
+	// the times the views of endpoints look back, so that the endpoints of
+	// jobs name peers as the connector names them (peerRows.nameJobs).
+	out.jobs = map[jobEndpoint]bool{}
+	err = queryRows(ctx, s.pool, `SELECT DISTINCT p.host_id, x.role, x.proto, p.service_name, x.port
+FROM shawk.processes p
+CROSS JOIN LATERAL (
+  SELECT e.role, e.proto, e.port FROM shawk.edges e
+  WHERE e.process_id = p.id
+    AND e.last_seen > now() - CASE e.role WHEN 'server' THEN interval '7 days' ELSE interval '1 hour' END
+  UNION
+  SELECT 'server', l.proto, l.port FROM shawk.listeners l WHERE l.process_id = p.id
+) x
+WHERE p.unit LIKE 'slurm/%' AND p.last_seen > now() - interval '7 days'`,
+		func(rows pgx.Rows) error {
+			var k jobEndpoint
+			var port int32
+			if err := rows.Scan(&k.host, &k.role, &k.proto, &k.service, &port); err != nil {
+				return err
+			}
+			k.port = uint16(port)
+			out.jobs[k] = true
+			return nil
+		})
+	out.nameJobs()
 	return out, err
 }
 

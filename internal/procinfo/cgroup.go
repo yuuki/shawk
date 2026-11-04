@@ -63,10 +63,11 @@ var (
 	// when Slurm is built with --enable-multiple-slurmd: <node>_slurmstepd.scope
 	// (the documentation also writes slurmstepd_<node>.scope), and the
 	// directories of the steps of a job in it: step_<id>,
-	// step_<id>.<component> for a component of a heterogeneous job,
-	// step_batch, step_extern and step_interactive.
+	// step_<id>+<component> for a component of a heterogeneous job with a
+	// job id, step_batch, step_extern and step_interactive
+	// (log_build_step_id_str() in src/common/log.c of Slurm).
 	slurmScope = regexp.MustCompile(`^(.+_)?slurmstepd(_.+)?\.scope$`)
-	slurmStep  = regexp.MustCompile(`^step_(batch|extern|interactive|[0-9]+(\.[0-9]+)?)$`)
+	slurmStep  = regexp.MustCompile(`^step_(batch|extern|interactive|[0-9]+(\+[0-9]+)?)$`)
 )
 
 // SlurmStepd is the unit of slurmstepd, and SlurmJobPrefix the prefix of
@@ -89,17 +90,25 @@ func SlurmJob(unit string) bool { return strings.HasPrefix(unit, SlurmJobPrefix)
 //	<scope>/<job>/<step>/slurm           slurmstepd of a step -> slurmstepd
 //	<scope>/system                       slurmstepd waiting   -> slurmstepd
 //
-// task_special holds the processes that pam_slurm_adopt moves into the
-// extern step. slurmstepd moves itself into slurm_processes in later
-// releases. The kind of a step is batch, extern, interactive, or step for
-// those srun starts. The scope is in system.slice at the root, where users
-// cannot make cgroups; other paths are not recognized (ok is false), nor
-// is cgroup v1.
+// as src/plugins/cgroup/v2/cgroup_v2.c of Slurm makes them. task_special
+// holds the processes that are not tasks, such as those pam_slurm_adopt
+// moves into the extern step. The documentation names the directory of
+// slurmstepd slurm_processes, which is recognized too. The kind of a step
+// is batch, extern, interactive, or step for those srun starts.
+//
+// The scope is in system.slice, or the slice of CgroupSlice, which systemd
+// nests from the root (a.slice/a-b.slice): only slices are above it, where
+// users cannot make cgroups, since systemd delegates cgroups to them in
+// units. Other paths are not recognized (ok is false), nor is cgroup v1.
 func slurmUnit(parts []string) (unit string, ok bool) {
-	if len(parts) < 3 || parts[0] != "system.slice" || !slurmScope.MatchString(parts[1]) {
+	i := 0
+	for i < len(parts) && strings.HasSuffix(parts[i], ".slice") {
+		i++
+	}
+	if i == 0 || i >= len(parts) || !slurmScope.MatchString(parts[i]) {
 		return "", false
 	}
-	switch rest := parts[2:]; {
+	switch rest := parts[i+1:]; {
 	case len(rest) == 1 && rest[0] == "system":
 		return SlurmStepd, true
 	case len(rest) < 3 || rest[0] == "system":

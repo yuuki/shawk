@@ -394,13 +394,15 @@ per packet.
   `system.slice/slurmstepd.scope/<job>/<step>/...`, whatever names the job
   directory (`job_<id>` before Slurm 26.05 or with `CgroupJobIdPaths=yes`,
   the SLUID otherwise): `user/task_*` is `slurm/batch`, `slurm/step`
-  (`step_<n>`), `slurm/extern` (with the processes `pam_slurm_adopt`
-  adopts) or `slurm/interactive` after the kind of step, and the
-  directory of slurmstepd in a step (`slurm`, `slurm_processes`) and
-  `<scope>/system` are `slurmstepd`. The scope is `slurmstepd.scope`, or
-  `<node>_slurmstepd.scope` with `--enable-multiple-slurmd`, recognized
-  only in `system.slice` at the root, where users cannot make cgroups; other
-  hierarchies, and cgroup v1, keep the rules above
+  (`step_<n>`, `step_<n>+<component>`), `slurm/extern` (with
+  `task_special`, where `pam_slurm_adopt` puts the processes it adopts) or
+  `slurm/interactive` after the kind of step, and the directory of
+  slurmstepd in a step (`slurm`; `slurm_processes` in the documentation)
+  and `<scope>/system` are `slurmstepd`, as Slurm's `cgroup/v2` plugin
+  makes them. The scope is `slurmstepd.scope`, or `<node>_slurmstepd.scope`
+  with `--enable-multiple-slurmd`, recognized only under slices from the
+  root (`system.slice`, or the slice of `CgroupSlice`), where users cannot
+  make cgroups; other hierarchies, and cgroup v1, keep the rules above
   (`internal/procinfo/cgroup.go`).
 - Container names are not trusted blindly. Docker merges image labels into
   container labels, so pod labels are believed only with the container name
@@ -705,9 +707,14 @@ the host name; `host.id` and `host.name` are promoted to labels.
   keeps `network.peer.address` when really needed.
 - The processes of Slurm jobs (units `slurm/*`, §4.1) are forwarded under
   `job="slurm-job"`, which takes one place of `max_services`, so that
-  every executable of every job does not become a `job`. PostgreSQL keeps
-  their names; the series from the agent are still keyed by executable,
-  bounded by its idle TTL.
+  every executable of every job does not become a `job`. As peers they are
+  `service.peer.name="slurm-job"` too, so both sides of a dependency
+  between jobs match: the endpoints the connector learns from agents are
+  named so, and those read from PostgreSQL by the ports their processes
+  served and connected to (a service of the same name on the same port of
+  the host as a job is taken for the job). PostgreSQL keeps their names;
+  the series from the agent are still keyed by executable, bounded by its
+  idle TTL.
 - Inputs are cumulative per peer address and outputs merge several, so the
   connector adds the increases of each input to its output, treating a
   decrease or new start time as a reset; an output never decreases when an
