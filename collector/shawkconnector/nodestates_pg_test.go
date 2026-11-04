@@ -95,17 +95,22 @@ func TestPGMaintenance(t *testing.T) {
 	if !slices.Equal(got, []string{"kept false b", "late true late"}) {
 		t.Errorf("after removal = %v", got)
 	}
-	// Registered again after it ended, late stays as it was.
+	// Registered again after it ended, late keeps the row that ended and
+	// gets a new one from now: the time in between is not planned.
 	if err := st.syncMaintenance(ctx, []maintenanceWindow{
 		{host: "late", start: now.Add(-h), end: now.Add(5 * h), reason: "again"},
 	}); err != nil {
 		t.Fatal(err)
 	}
 	got = query(`SELECT hostname, ends_at <= now(), reason FROM shawk.maintenance_windows`)
-	if !slices.Equal(got, []string{"late true late"}) {
+	if !slices.Equal(got, []string{"late false again", "late true late"}) {
 		t.Errorf("registered again = %v", got)
 	}
-	// A window in progress whose end is moved to the past ends now.
+	if got := query(`SELECT count(*) FROM shawk.maintenance_periods WHERE hostname = 'late' AND period @> now()`); !slices.Equal(got, []string{"1"}) {
+		t.Errorf("periods of late in progress = %v", got)
+	}
+	// A window in progress whose end is moved to the past ends now (and
+	// late, no longer registered, too).
 	early := maintenanceWindow{host: "early", start: now.Add(-h), end: now.Add(h)}
 	if err := st.syncMaintenance(ctx, []maintenanceWindow{early}); err != nil {
 		t.Fatal(err)
@@ -115,7 +120,7 @@ func TestPGMaintenance(t *testing.T) {
 		t.Fatal(err)
 	}
 	got = query(`SELECT hostname, ends_at <= now() FROM shawk.maintenance_windows`)
-	if !slices.Equal(got, []string{"early true", "late true"}) {
+	if !slices.Equal(got, []string{"early true", "late true", "late true"}) {
 		t.Errorf("ended early = %v", got)
 	}
 }
@@ -167,11 +172,11 @@ FROM shawk_v1.unobserved_reasons(now() - interval '12 hours', now(), '0')`)
 }
 
 // TestPGPlannedStops: hosts in a planned stop now, by the latest state if it
-// is fresh and planned, or a window in progress; and the silent agent
-// alert does not name them.
+// is fresh and planned (powering up too, but not once up), or a window in
+// progress; and the silent agent alert does not name them.
 func TestPGPlannedStops(t *testing.T) {
 	_, conn := migratedDB(t)
-	hosts := []string{"off", "stale", "down", "resumed", "maint", "maintflag", "nothing"}
+	hosts := []string{"off", "stale", "down", "resuming", "booted", "maint", "maintflag", "nothing"}
 	for _, h := range hosts {
 		execAll(t, conn,
 			fmt.Sprintf(`INSERT INTO shawk.hosts VALUES ('%[1]s','m','%[1]s','k','v',now()-interval '30 days',now()-interval '2 days')`, h),
@@ -183,14 +188,16 @@ func TestPGPlannedStops(t *testing.T) {
 		   ('off', now()-interval '2 days', now()-interval '1 minute', '{IDLE,POWERED_DOWN}'),
 		   ('stale', now()-interval '2 days', now()-interval '10 minutes', '{IDLE,POWERED_DOWN}'),
 		   ('down', now()-interval '2 days', now()-interval '1 minute', '{DOWN,POWERED_DOWN}'),
-		   ('resumed', now()-interval '2 days', now()-interval '3 minutes', '{IDLE,POWERED_DOWN}'),
-		   ('resumed', now()-interval '2 minutes', now()-interval '1 minute', '{IDLE,POWERING_UP}'),
+		   ('resuming', now()-interval '2 days', now()-interval '3 minutes', '{IDLE,POWERED_DOWN}'),
+		   ('resuming', now()-interval '2 minutes', now()-interval '1 minute', '{ALLOCATED,POWERING_UP}'),
+		   ('booted', now()-interval '2 days', now()-interval '10 minutes', '{IDLE,POWERING_UP}'),
+		   ('booted', now()-interval '9 minutes', now()-interval '1 minute', '{IDLE}'),
 		   ('maintflag', now()-interval '1 hour', now(), '{DOWN,MAINT}')`,
 		`INSERT INTO shawk.maintenance_windows VALUES
 		   ('maint', now()-interval '1 hour', now()+interval '1 hour', 'firmware', now()-interval '2 hours'),
 		   ('nothing', now()-interval '3 hours', now()-interval '1 hour', '', now()-interval '4 hours')`)
 	got := queryStrings(t, conn, `SELECT host, cause FROM shawk_v1.planned_stops`)
-	if !slices.Equal(got, []string{"maint maintenance", "maintflag maintenance", "off power_saving"}) {
+	if !slices.Equal(got, []string{"maint maintenance", "maintflag maintenance", "off power_saving", "resuming power_saving"}) {
 		t.Errorf("planned_stops = %v", got)
 	}
 	q := packagedSQL(t)["shawk-rules.yaml/shawk-agents/shawk agent silent/A/A#0"]
@@ -205,7 +212,7 @@ func TestPGPlannedStops(t *testing.T) {
 	}
 	rows.Close()
 	slices.Sort(silent)
-	if !slices.Equal(silent, []string{"down", "nothing", "resumed", "stale"}) {
+	if !slices.Equal(silent, []string{"booted", "down", "nothing", "stale"}) {
 		t.Errorf("silent agents = %v", silent)
 	}
 }

@@ -36,11 +36,13 @@ type nodeStates struct {
 }
 
 // nodeState is the state of a node in Slurm: its flags, upper case and
-// sorted, e.g. [IDLE POWERED_DOWN], and its reason.
+// sorted, e.g. [IDLE POWERED_DOWN], and its reason. The node is a host, or
+// a NodeName of Slurm that the inventory maps to a host before it is
+// written.
 type nodeState struct {
-	host   string
-	state  []string
-	reason string
+	host, node string
+	state      []string
+	reason     string
 }
 
 // maintenanceWindow is a maintenance window registered for a host.
@@ -55,13 +57,16 @@ type maintenanceWindow struct {
 //
 //	generated_at: 2026-11-04T10:00:00Z
 //	nodes:
-//	  - host: cn001.cluster.example
+//	  - node: cn001                 # NodeName, mapped by the inventory
 //	    state: [IDLE, POWERED_DOWN]   # or "IDLE+POWERED_DOWN"
 //	    reason: ""
+//	  - host: cn002.cluster.example # or the host.name of the agent
+//	    state: [IDLE]
 type nodeStatesDoc struct {
 	GeneratedAt string `yaml:"generated_at"`
 	Nodes       []struct {
 		Host   string     `yaml:"host"`
+		Node   string     `yaml:"node"`
 		State  stateFlags `yaml:"state"`
 		Reason string     `yaml:"reason"`
 	} `yaml:"nodes"`
@@ -141,13 +146,17 @@ func parseNodeStates(b []byte, now time.Time) (*nodeStates, error) {
 	out.at = t
 	seen := map[string]bool{}
 	for i, n := range doc.Nodes {
-		if n.Host == "" {
-			return nil, fmt.Errorf("nodes[%d]: no host", i)
+		if (n.Host == "") == (n.Node == "") {
+			return nil, fmt.Errorf("nodes[%d]: give either host or node", i)
 		}
-		if seen[n.Host] {
-			return nil, fmt.Errorf("nodes[%d]: host %s is listed twice", i, n.Host)
+		name, key := n.Host, "host "+n.Host
+		if n.Node != "" {
+			name, key = n.Node, "node "+n.Node
 		}
-		seen[n.Host] = true
+		if seen[key] {
+			return nil, fmt.Errorf("nodes[%d]: %s is listed twice", i, key)
+		}
+		seen[key] = true
 		var state []string
 		add := func(f string) {
 			if !slices.Contains(state, f) {
@@ -164,16 +173,16 @@ func parseNodeStates(b []byte, now time.Time) (*nodeStates, error) {
 					add("NOT_RESPONDING")
 				}
 				if f == "" || strings.IndexFunc(f, func(r rune) bool { return !(r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_') }) >= 0 {
-					return nil, fmt.Errorf("nodes[%d]: invalid flag %q in the state of %s", i, f, n.Host)
+					return nil, fmt.Errorf("nodes[%d]: invalid flag %q in the state of %s", i, f, name)
 				}
 				add(f)
 			}
 		}
 		if len(state) == 0 {
-			return nil, fmt.Errorf("nodes[%d]: no state for %s", i, n.Host)
+			return nil, fmt.Errorf("nodes[%d]: no state for %s", i, name)
 		}
 		slices.Sort(state)
-		out.nodes = append(out.nodes, nodeState{host: n.Host, state: state, reason: n.Reason})
+		out.nodes = append(out.nodes, nodeState{host: n.Host, node: n.Node, state: state, reason: n.Reason})
 	}
 	return out, nil
 }
@@ -230,6 +239,39 @@ func parseMaintenance(b []byte) ([]maintenanceWindow, error) {
 	return out, nil
 }
 
+// hostsOfNodes gives the nodes named by their NodeName the hosts the
+// inventory maps them to. Nodes it does not map are left out, and
+// returned; a host given twice is an error.
+func hostsOfNodes(nodes []nodeState, inv *inventory) ([]nodeState, []string, error) {
+	byNode := map[string]string{}
+	if inv != nil {
+		for _, h := range inv.hosts {
+			if h.slurmNode != "" {
+				byNode[h.slurmNode] = h.name
+			}
+		}
+	}
+	out := make([]nodeState, 0, len(nodes))
+	var unknown []string
+	seen := map[string]bool{}
+	for _, n := range nodes {
+		if n.node != "" {
+			h, ok := byNode[n.node]
+			if !ok {
+				unknown = append(unknown, n.node)
+				continue
+			}
+			n.host = h
+		}
+		if seen[n.host] {
+			return nil, nil, fmt.Errorf("host %s is given twice, by its name and its node in Slurm", n.host)
+		}
+		seen[n.host] = true
+		out = append(out, n)
+	}
+	return out, unknown, nil
+}
+
 // windowsKey identifies a list of maintenance windows, to tell whether it
 // changed since it was written.
 func windowsKey(ws []maintenanceWindow) string {
@@ -250,8 +292,21 @@ func (c *shawkConnector) syncNodeStates(ctx context.Context) {
 	if path := c.cfg.NodeStatesFile; path != "" {
 		b, err := os.ReadFile(path)
 		var ns *nodeStates
+		var unknown []string
 		if err == nil {
 			ns, err = parseNodeStates(b, now)
+		}
+		if err == nil {
+			ns.nodes, unknown, err = hostsOfNodes(ns.nodes, c.inventory.Load())
+		}
+		// Nodes without a host are logged when they change: their states
+		// are not written, and they stop no alert.
+		if key := strings.Join(unknown, " "); key != c.unknownNodes {
+			if key != "" {
+				c.log.Warn("nodes in node_states_file that the inventory does not map to hosts; their states are left out",
+					zap.String("file", path), zap.Strings("nodes", unknown))
+			}
+			c.unknownNodes = key
 		}
 		switch {
 		case c.fileError(&c.nodeStatesErr, "node_states_file", path, err):

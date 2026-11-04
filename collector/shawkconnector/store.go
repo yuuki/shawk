@@ -721,11 +721,12 @@ ON CONFLICT DO NOTHING`,
 }
 
 // syncMaintenance replaces the maintenance windows registered, by the
-// clock of the database: a window no longer registered is deleted before it
-// starts and ends now while in progress, as one whose end was moved to the
-// past; a window registered is added, or
-// changed while it has not ended. A window that ended is kept as it was,
-// and one registered after its end is not added.
+// clock of the database. A window is the row of a host and start that has
+// not ended. One no longer registered is deleted before it starts and ends
+// now while in progress, as one whose end is moved to the past; one
+// registered changes its end and reason, or gets a new row from now if it
+// has none, also when its row ended. Rows that ended are kept as they
+// were.
 func (s *pgStore) syncMaintenance(ctx context.Context, windows []maintenanceWindow) error {
 	hosts := make([]string, 0, len(windows))
 	starts := make([]time.Time, 0, len(windows))
@@ -744,28 +745,32 @@ func (s *pgStore) syncMaintenance(ctx context.Context, windows []maintenanceWind
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, int64(nodeStatesLock)); err != nil {
 			return err
 		}
+		// The windows registered, whose end has not passed.
+		const registered = `
+SELECT FROM unnest($1::text[], $2::timestamptz[], $3::timestamptz[]) AS u(hostname, starts_at, ends_at)
+WHERE u.hostname = w.hostname AND u.starts_at = w.starts_at AND u.ends_at > now()`
 		b := &pgx.Batch{}
 		b.Queue(`
 DELETE FROM shawk.maintenance_windows w
-WHERE greatest(w.starts_at, w.registered_at) > now()
-  AND NOT EXISTS (SELECT FROM unnest($1::text[], $2::timestamptz[]) AS u(hostname, starts_at)
-                  WHERE u.hostname = w.hostname AND u.starts_at = w.starts_at)`,
-			hosts, starts)
-		b.Queue(`
-UPDATE shawk.maintenance_windows w SET ends_at = now()
-WHERE greatest(w.starts_at, w.registered_at) <= now() AND w.ends_at > now()
-  AND NOT EXISTS (SELECT FROM unnest($1::text[], $2::timestamptz[], $3::timestamptz[]) AS u(hostname, starts_at, ends_at)
-                  WHERE u.hostname = w.hostname AND u.starts_at = w.starts_at AND u.ends_at > now())`,
+WHERE greatest(w.starts_at, w.registered_at) > now() AND NOT EXISTS (`+registered+`)`,
 			hosts, starts, ends)
 		b.Queue(`
-INSERT INTO shawk.maintenance_windows AS w (hostname, starts_at, ends_at, reason, registered_at)
+UPDATE shawk.maintenance_windows w SET ends_at = now()
+WHERE greatest(w.starts_at, w.registered_at) <= now() AND w.ends_at > now() AND NOT EXISTS (`+registered+`)`,
+			hosts, starts, ends)
+		b.Queue(`
+UPDATE shawk.maintenance_windows w SET ends_at = u.ends_at, reason = u.reason
+FROM unnest($1::text[], $2::timestamptz[], $3::timestamptz[], $4::text[]) AS u(hostname, starts_at, ends_at, reason)
+WHERE u.hostname = w.hostname AND u.starts_at = w.starts_at AND u.ends_at > now() AND w.ends_at > now()`,
+			hosts, starts, ends, reasons)
+		b.Queue(`
+INSERT INTO shawk.maintenance_windows (hostname, starts_at, ends_at, reason, registered_at)
 SELECT u.hostname, u.starts_at, u.ends_at, u.reason, now()
 FROM unnest($1::text[], $2::timestamptz[], $3::timestamptz[], $4::text[]) AS u(hostname, starts_at, ends_at, reason)
 WHERE u.ends_at > now()
-ON CONFLICT (hostname, starts_at) DO UPDATE SET
-  ends_at = greatest(excluded.ends_at, now()),
-  reason  = excluded.reason
-WHERE w.ends_at > now()`,
+  AND NOT EXISTS (SELECT FROM shawk.maintenance_windows w
+                  WHERE w.hostname = u.hostname AND w.starts_at = u.starts_at AND w.ends_at > now())
+ON CONFLICT DO NOTHING`,
 			hosts, starts, ends, reasons)
 		return tx.SendBatch(ctx, b).Close()
 	})

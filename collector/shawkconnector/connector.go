@@ -68,6 +68,8 @@ type shawkConnector struct {
 	windowsSynced                 bool
 	nodeStatesErr, maintenanceErr string
 	nodeStatesStale               bool
+	// unknownNodes are the nodes the inventory did not map, last logged.
+	unknownNodes string
 
 	// Errors of the pipeline after the connector, logged at most once a
 	// minute.

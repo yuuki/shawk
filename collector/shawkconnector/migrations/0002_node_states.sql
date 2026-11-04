@@ -25,20 +25,23 @@ CREATE TABLE shawk.node_states (
 );
 CREATE INDEX node_states_last_seen ON shawk.node_states (last_seen);
 
--- Maintenance windows registered explicitly. A window counts from when a
--- connector first wrote it (registered_at) if that is after its start, so
--- that registering a window afterwards does not make a past failure
--- planned. A window removed from the file is deleted before it starts and
--- ends when it was removed while in progress; a window that ended is kept
--- as it was.
+-- Maintenance windows registered explicitly, one row per period in which
+-- a window (a host and a start) was registered. A row counts from when a
+-- connector wrote it (registered_at) if that is after its start, so that
+-- registering a window afterwards does not make a past failure planned. A
+-- window removed from the file is deleted before it starts and ends when
+-- it was removed while in progress; a row that ended is kept as it was. A
+-- window registered again after its row ended, e.g. after a file read
+-- while it lacked the window, gets a new row from then: the time in
+-- between is not planned, and nothing is lost for good.
 CREATE TABLE shawk.maintenance_windows (
   hostname      text NOT NULL,           -- host.name of the agent
   starts_at     timestamptz NOT NULL,    -- as registered
   ends_at       timestamptz NOT NULL,
   reason        text NOT NULL DEFAULT '',
   registered_at timestamptz NOT NULL,
-  PRIMARY KEY (hostname, starts_at),
-  CHECK (ends_at >= starts_at)
+  PRIMARY KEY (hostname, starts_at, registered_at),
+  CHECK (ends_at >= starts_at AND ends_at >= registered_at)
 );
 CREATE INDEX maintenance_windows_ends_at ON shawk.maintenance_windows (ends_at);
 
@@ -50,19 +53,21 @@ CREATE FUNCTION shawk.node_state_max_age() RETURNS interval
 LANGUAGE sql IMMUTABLE AS $$ SELECT interval '5 minutes' $$;
 
 -- The planned stop a state of Slurm stands for: maintenance for a node in a
--- reservation with the flag MAINT, power_saving for a node powered down or
--- powering down by power saving and nothing else, NULL otherwise. Power
--- saving is judged by the flags a node may have besides, not by those it
--- may not: DOWN (which also follows failed boots and a ResumeTimeout),
--- DRAIN (jobs keep running on a draining node), FAIL, NOT_RESPONDING and
--- flags unknown here are never planned. POWERING_UP is not planned either:
--- a node that boots is expected back.
+-- reservation with the flag MAINT, power_saving for a node of power saving
+-- powered down, powering down or powering up, NULL otherwise. Power saving
+-- is judged by the flags a node may have besides (a job may wait for a
+-- node that powers up, ALLOCATED or MIXED), not by those it may not: DOWN
+-- (which also follows failed boots and a ResumeTimeout), DRAIN (jobs keep
+-- running on a draining node), FAIL, NOT_RESPONDING and flags unknown here
+-- are never planned. Powering up ends as the node is up, when its agent is
+-- expected back, or at the ResumeTimeout of Slurm, when the node is DOWN.
 CREATE FUNCTION shawk.planned_state(state text[]) RETURNS text
 LANGUAGE sql IMMUTABLE AS $$
   SELECT CASE
     WHEN state && '{MAINT,MAINTENANCE}'::text[] THEN 'maintenance'
-    WHEN state && '{POWERED_DOWN,POWERING_DOWN}'::text[]
-         AND state <@ '{IDLE,CLOUD,POWER_DOWN,POWERED_DOWN,POWERING_DOWN}'::text[] THEN 'power_saving'
+    WHEN state && '{POWERED_DOWN,POWERING_DOWN,POWERING_UP}'::text[]
+         AND state <@ '{IDLE,ALLOCATED,MIXED,CLOUD,POWER_DOWN,POWERED_DOWN,POWERING_DOWN,POWERING_UP}'::text[]
+      THEN 'power_saving'
   END
 $$;
 

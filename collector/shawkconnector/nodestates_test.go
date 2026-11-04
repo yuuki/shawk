@@ -53,6 +53,8 @@ nodes:
 		{"no time", "nodes: [{host: cn001, state: IDLE}]\n"},
 		{"future", "generated_at: 2026-10-31T12:00:30Z\nnodes: [{host: cn001, state: IDLE}]\n"},
 		{"no host", "generated_at: 2026-10-31T12:00:00Z\nnodes: [{state: IDLE}]\n"},
+		{"host and node", "generated_at: 2026-10-31T12:00:00Z\nnodes: [{host: cn001, node: cn001, state: IDLE}]\n"},
+		{"node twice", "generated_at: 2026-10-31T12:00:00Z\nnodes: [{node: cn001, state: IDLE}, {node: cn001, state: DOWN}]\n"},
 		{"no state", "generated_at: 2026-10-31T12:00:00Z\nnodes: [{host: cn001}]\n"},
 		{"empty flag", "generated_at: 2026-10-31T12:00:00Z\nnodes: [{host: cn001, state: IDLE+}]\n"},
 		{"twice", "generated_at: 2026-10-31T12:00:00Z\nnodes: [{host: cn001, state: IDLE}, {host: cn001, state: DOWN}]\n"},
@@ -60,6 +62,39 @@ nodes:
 		if ns, err := parseNodeStates([]byte(bad.doc), t0); err == nil {
 			t.Errorf("%s: parsed %+v", bad.name, ns)
 		}
+	}
+}
+
+// TestHostsOfNodes: nodes named by their NodeName get the host the
+// inventory maps them to; those it does not map are left out.
+func TestHostsOfNodes(t *testing.T) {
+	ns, err := parseNodeStates([]byte(`
+generated_at: 2026-10-31T12:00:00Z
+nodes:
+  - {node: n1, state: IDLE+POWERED_DOWN}
+  - {node: n9, state: IDLE}
+  - {host: login01.hpc.example, state: IDLE}
+`), t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inv := &inventory{hosts: []inventoryHost{
+		{name: "cn001.hpc.example", slurmNode: "n1", agent: true},
+		{name: "login01.hpc.example", agent: true},
+	}}
+	got, unknown, err := hostsOfNodes(ns.nodes, inv)
+	if err != nil || len(got) != 2 || got[0].host != "cn001.hpc.example" || got[1].host != "login01.hpc.example" ||
+		!slices.Equal(unknown, []string{"n9"}) {
+		t.Errorf("hostsOfNodes = %+v, %v, %v", got, unknown, err)
+	}
+	// Without an inventory, only hosts given by name are kept.
+	if got, unknown, err := hostsOfNodes(ns.nodes, nil); err != nil || len(got) != 1 || len(unknown) != 2 {
+		t.Errorf("without an inventory = %+v, %v, %v", got, unknown, err)
+	}
+	// A host given by its name and by its node is an error.
+	ns.nodes = append(ns.nodes, nodeState{host: "cn001.hpc.example", state: []string{"IDLE"}})
+	if _, _, err := hostsOfNodes(ns.nodes, inv); err == nil {
+		t.Error("a host given twice is accepted")
 	}
 }
 
@@ -199,5 +234,34 @@ func TestConfigNodeStatesFile(t *testing.T) {
 	_, st, _, _ := testConnector(t, nil)
 	if len(st.nodeStates) != 0 || st.windowSyncs != 0 {
 		t.Errorf("without files: states %v, windows %d", st.nodeStates, st.windowSyncs)
+	}
+}
+
+// TestSyncNodeStatesByNode: nodes named by their NodeName are written under
+// the hosts of the inventory_file; those it does not map are left out and
+// logged once.
+func TestSyncNodeStatesByNode(t *testing.T) {
+	dir := t.TempDir()
+	invFile := filepath.Join(dir, "inventory.yaml")
+	statesFile := filepath.Join(dir, "node-states.json")
+	if err := os.WriteFile(invFile, []byte("hosts: [{name: cn001.hpc.example, slurm_node: n1, addrs: [10.0.1.1]}]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(statesFile, []byte(`{"generated_at": "2026-10-31T12:00:00Z",
+	  "nodes": [{"node": "n1", "state": ["IDLE", "POWERED_DOWN"]}, {"node": "n9", "state": ["IDLE"]}]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c, st, _, now := testConnector(t, func(cfg *Config) {
+		cfg.InventoryFile = invFile
+		cfg.NodeStatesFile = statesFile
+	})
+	if len(st.nodes) != 1 || st.nodes[0].host != "cn001.hpc.example" {
+		t.Errorf("nodes = %+v", st.nodes)
+	}
+	logs := observe(c)
+	*now = now.Add(time.Minute)
+	c.prepare(context.Background())
+	if n := logs.FilterMessageSnippet("does not map").Len(); n != 0 {
+		t.Errorf("unknown nodes logged again %d times", n)
 	}
 }
