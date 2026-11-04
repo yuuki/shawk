@@ -845,6 +845,61 @@ large host sends (16384 flows per interval by default; a much larger
 tightly, lower `max_hosts` to the fleet size with room: the connector holds
 about 5 KB per edge with its metrics and about 300 bytes per pending row.
 
+### 5.6 Static inventory
+
+In a cluster whose hosts are known in advance, `inventory_file` lists the
+hosts expected, with all their addresses, including hosts that cannot run
+an agent (storage appliances, switches, BMCs). It is YAML or JSON:
+
+```yaml
+hosts:
+  - name: cn001.hpc.example        # host.name, as the agent of the host sends it
+    slurm_node: cn001              # the NodeName in Slurm, if the host is a node
+    roles: [compute, gpu]          # free text, e.g. for dashboards
+    addrs: [10.0.1.1, 10.10.1.1, 10.20.1.1]  # management, IPoIB, storage
+  - name: sfa01
+    roles: [storage]
+    agent: false                   # no agent is expected (default true)
+    addrs: [10.20.0.5]
+```
+
+- **Addresses come from provisioning** (Warewulf, xCAT, …), not from Slurm:
+  `NodeAddr` may be a name and is one address. Each is a single address,
+  not loopback, unspecified or multicast, and belongs to one host at most,
+  so that an address maps to a host without ambiguity. Floating addresses
+  (a keepalived VIP) belong to no host and are left out; `translations`
+  (§5.4) describe them.
+- **The mapping to Slurm is written**, since `NodeName` may be any alias.
+  Host and node names are unique and must not start with `~`. Roles are
+  free text, without control characters.
+- **Loading.** The connector reads the file at start and every write
+  interval, and, when its contents changed (whatever their order and
+  layout), replaces the inventory in PostgreSQL in one transaction under an
+  advisory lock; it records the time it read them either way. A file that
+  cannot be read, is invalid (unknown fields included), larger than 16 MiB
+  or has no hosts (as a failed generator may leave) keeps the inventory
+  read before, from PostgreSQL if the connector has read none since it
+  started, and the failure is logged and recorded with its time
+  (`inventory_status`). Every connector should read the same file, as with
+  `peer_cidrs`. Without `inventory_file` the connector drops the inventory
+  from PostgreSQL at start.
+- **Generating it.** The connector does not talk to Slurm. A cron job may
+  write the file from the provisioning database and `scontrol show nodes
+  --json`, to a temporary file renamed over the old one, so that the
+  connector never reads half a file.
+- **Conflicts.** The inventory wins over what agents send: an agent that
+  sends an address the inventory gives to another host is logged at most
+  once an hour, with the addresses and their hosts in the inventory.
+- **Uses.** `never_observed()` reports the hosts expected to run an agent
+  whose agent never reported (§6.2). The host of an address is the row of
+  `shawk_v1.inventory_addrs` with that address, at most one, e.g. `LEFT
+  JOIN shawk_v1.inventory_addrs i ON i.addr = d.server_addr` for the
+  servers of `dependencies`; the connector holds the same mapping
+  (`inventory.hostOf()` in `inventory.go`) for the peers it names. Node
+  states of Slurm join `shawk_v1.inventory` on `slurm_node` to get the
+  host, and are kept apart from it, as time-stamped transitions: the
+  inventory holds the current contents only.
+
 ## 6. PostgreSQL
 
 PostgreSQL 14 or later (multiranges). The schema ships with the connector
@@ -871,6 +926,9 @@ listeners(host_id, process_id, proto, addr, port, netns, first_seen, last_seen) 
 listener_owners(host_id, process_id, proto, addr, port, netns, first_seen, last_seen)  -- every known owner
 peer_cidrs(prefix, name)  -- written by the connector from its peer_cidrs
 translations(name, side, proto, addr, port)  -- side virtual, backend or source; written by the connector (§5.4)
+inventory_hosts(host, slurm_node, roles, agent)  -- written by the connector from its inventory_file (§5.6)
+inventory_addrs(addr, host)  -- every address of the inventory, one host each
+inventory_state(digest, read_at, failed_at, error)  -- when the inventory was read, and the latest failure since
 learned_translations(host_id, proto, netns, client_addr, virtual_addr, virtual_port, source_addr,
                      backend_addr, backend_port, first_seen, last_seen)  -- learned by agents (§3.7, §5.4)
 known_dependencies(client_service, server_service, port, proto, first_seen, last_seen)
@@ -895,6 +953,9 @@ match.
 | `agent_addrs` | addresses of hosts whose agent closed an interval in the last 5 minutes, with what the agent traces and folds; used by the connector |
 | `agents` | the latest segment of every host and whether its agent is alive; the last columns, `peer_fold` and `peer_internal`, tell what the agent folds and the ranges it keeps exact |
 | `unobserved(since, until, tolerance)` | the periods in which each host was not observed; Grafana overlays them as annotations |
+| `never_observed()` | the hosts of the inventory (§5.6) expected to run an agent whose agent never reported within the retention (no host has their name): `host`, `slurm_node`, `roles`, and `seen_as`, the hosts whose agents reported an address of the host, as an agent whose `host.name` differs from the inventory would |
+| `inventory`, `inventory_addrs` | the hosts of the inventory with their addresses (`host`, `slurm_node`, `roles`, `agent`, `addrs`), and one row per address with its host: join an address on `addr` to name its host |
+| `inventory_status` | when the inventory was last read from a valid file (`read_at`), the latest failure since (`failed_at`, `error`), and how many hosts it has; no row without an inventory |
 | `partly_observed(since, until)` | the periods in which each host was observed but its agent dropped flows, cut to `[since, until]`: `host`, `gap_start`, `gap_end`, `dropped_flows` (flow updates dropped). A dependency may be missing from them although it was used; Grafana overlays them as annotations |
 | `dependencies_between(since, until)`, `graph_edges_between`, `graph_nodes_between`, `dependency_changes_between` | the same for the dependencies active in a period. They take the edges active in the period with a margin of 15 minutes before matching, so a recent window does not scan the history (about 0.3 s instead of 3 s with a million edges) and both sides of a connection are matched at the edges of the period; the dashboards and alerts use them. A dependency appeared in a period when it was first seen in it and is not in `known_dependencies` from before it, so one that comes back on new edges (a new container, an hourly job) did not appear |
 
