@@ -3,11 +3,15 @@ package shawkconnector
 import (
 	"fmt"
 	"maps"
+	"os"
+	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
 	"go.opentelemetry.io/collector/confmap"
+	"go.yaml.in/yaml/v3"
 )
 
 func TestParsePortRules(t *testing.T) {
@@ -118,6 +122,48 @@ func TestConfigValidatePortRules(t *testing.T) {
 	cfg.DynamicPorts = map[string]DynamicPortsConfig{"srun": {Ports: "63000-60001"}}
 	if err := cfg.Validate(); err == nil {
 		t.Error("a reversed range of ports was accepted")
+	}
+}
+
+// TestPackagedPortRulesExample: the example of port_agnostic_services and
+// dynamic_ports commented out in the packaged configuration is valid.
+func TestPackagedPortRulesExample(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join(packaging, "collector/config.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lines []string
+	in := false
+	for _, l := range strings.Split(string(b), "\n") {
+		switch {
+		case strings.HasPrefix(l, "    # port_agnostic_services:"):
+			in = true
+		case in && !strings.HasPrefix(l, "    #"):
+			in = false
+		}
+		if in {
+			lines = append(lines, strings.Replace(l, "# ", "", 1))
+		}
+	}
+	if len(lines) < 2 {
+		t.Fatal("no example of the rules of ports")
+	}
+	var raw map[string]any
+	if err := yaml.Unmarshal([]byte(strings.Join(lines, "\n")), &raw); err != nil {
+		t.Fatal(err)
+	}
+	cfg := createDefaultConfig()
+	cfg.Postgres.DSN = "postgres://unused"
+	if err := confmap.NewFromStringMap(raw).Unmarshal(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Error(err)
+	}
+	r := must(parsePortRules(cfg.PortAgnosticServices, cfg.DynamicPorts))
+	if !slices.Equal(r.services, []string{"salloc", "srun"}) || len(r.ranges) != 1 ||
+		r.ranges[0].from != 60001 || r.ranges[0].to != 63000 {
+		t.Errorf("rules = %+v", r)
 	}
 }
 
