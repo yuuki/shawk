@@ -68,6 +68,18 @@ type shawkConnector struct {
 	// those of this connector were last logged.
 	portRulesWarned time.Time
 
+	// Of the node_states_file and the maintenance_file, used by the loop
+	// only: when the states last written were read from Slurm, the
+	// maintenance windows last written and when, the errors last logged,
+	// and whether stale states were logged.
+	nodeStatesAt                  time.Time
+	windowsKey                    string
+	windowsSynced                 time.Time
+	nodeStatesErr, maintenanceErr string
+	nodeStatesStale               bool
+	// unknownNodes are the nodes the inventory did not map, last logged.
+	unknownNodes string
+
 	// Errors of the pipeline after the connector, logged at most once a
 	// minute.
 	downstreamErrs    int
@@ -180,7 +192,8 @@ func (c *shawkConnector) Start(ctx context.Context, _ component.Host) error {
 
 // prepare migrates the schema if configured to, or checks its version,
 // writes peer_cidrs, the translations and the rules of ports, reads the
-// inventory and writes it, and reloads the names of peers.
+// inventory and writes it, writes what changed in the node_states_file and
+// the maintenance_file, and reloads the names of peers.
 // It reports whether the schema is ready.
 func (c *shawkConnector) prepare(ctx context.Context) bool {
 	if !c.prepareSchemaOnly(ctx) {
@@ -202,6 +215,7 @@ func (c *shawkConnector) prepare(ctx context.Context) bool {
 		}
 	}
 	c.syncInventory(ctx)
+	c.syncNodeStates(ctx)
 	at := c.now()
 	var former time.Duration
 	if c.cfg.PeerHosts {

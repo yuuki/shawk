@@ -292,10 +292,36 @@ groups:
       # after their last sample (there is no staleness marker), so the alert
       # fires about 5 minutes after an agent stops and resolves by itself
       # after 24 hours; the Grafana alert on shawk_v1.agents takes over then.
+      #
+      # Nodes that Slurm stopped as planned are not alerted (docs/design.md
+      # §5.7): powered down, powering down or powering up by power saving,
+      # with no flag but IDLE, ALLOCATED, MIXED, CLOUD and POWER_DOWN besides
+      # (so never DOWN, DRAIN, FAIL or not responding, IDLE*), or in a
+      # reservation with the flag MAINT, which ends with the reservation.
+      # Powering up ends as the node is up, when its agent is expected
+      # within the minute of `for`, or at the ResumeTimeout of Slurm, when
+      # the node is DOWN. The states come from a Slurm exporter, joined on
+      # the host name; without one the `unless` removes nothing. The example
+      # assumes slurm_node_state{node="<NodeName>", state="<flags joined by
+      # +>"} 1 for the current state of every node: replace the metric, its
+      # labels and the mapping of NodeName to host_name (here the same; e.g.
+      # "$1.cluster.example" to add a domain) with those of the exporter in
+      # use. A state is current only while the exporter is scraped:
+      # Prometheus marks its series stale as soon as they are gone, so a
+      # stale state stops nothing.
       - alert: ShawkAgentDown
         expr: |
-          group by (host_name) (max_over_time(shawk_agent_up[24h]))
-            unless group by (host_name) (shawk_agent_up)
+          (
+            group by (host_name) (max_over_time(shawk_agent_up[24h]))
+              unless group by (host_name) (shawk_agent_up)
+          )
+          unless on (host_name) group by (host_name) (
+            label_replace(
+                slurm_node_state{state=~"(?i)((idle|allocated|mixed|cloud|power_down)[+])*(powered_down|powering_down|powering_up)([+](idle|allocated|mixed|cloud|power_down|powered_down|powering_down|powering_up))*"} == 1
+              or
+                slurm_node_state{state=~"(?i)(.*[+])?(maint|maintenance)([+].*)?"} == 1,
+              "host_name", "$1", "node", "(.*)")
+          )
         for: 1m
         labels:
           severity: warning

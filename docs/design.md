@@ -668,7 +668,8 @@ take a shared advisory lock that migrations take exclusively.
 Rows last seen longer ago than `retention` (3 years) are deleted hourly by
 `shawk.prune()` in short batches, with sessions and partly observed
 periods, so `unobserved()` reports the time before the retention as not
-observed.
+observed; node states and maintenance windows (§5.7) by
+`shawk.prune_node_states()`.
 
 ### 5.2 Names of peers
 
@@ -1069,6 +1070,86 @@ hosts:
   host, and are kept apart from it, as time-stamped transitions: the
   inventory holds the current contents only.
 
+### 5.7 Node states and maintenance windows
+
+Slurm powers nodes down to save energy, reboots them and takes them out
+for maintenance, so on its clusters stopped agents and observation gaps
+are often planned. The connector does not talk to Slurm: every write
+interval it reads two files in YAML or JSON, `node_states_file`, which a
+cron job generates every minute, and `maintenance_file`, which lists the
+maintenance windows registered by hand:
+
+```yaml
+# node_states_file
+generated_at: 2026-11-04T10:00:00Z     # when the states were read from Slurm
+nodes:
+  - node: cn001                        # NodeName, mapped by the inventory (§5.6)
+    state: [IDLE, POWERED_DOWN]        # or "IDLE+POWERED_DOWN"
+    reason: ""
+  - host: login01.cluster.example      # or host.name of the agent
+    state: [IDLE]
+# maintenance_file, for hosts with or without Slurm
+maintenance:
+  - hosts: [nfs01.cluster.example]
+    start: 2026-11-05T09:00:00+09:00
+    end: 2026-11-05T18:00:00+09:00     # required; at most 30 days after the start
+    reason: firmware update
+```
+
+The node states are generated, e.g. `scontrol show nodes --json | jq
+'{generated_at: (now | todate), nodes: [.nodes[] | {node: .name, state,
+reason}]}'`. `NodeName` may be any alias, so the connector maps it to a host
+by `slurm_node` of the inventory (§5.6), when it reads the file, and writes
+the host: the state of a past gap stays with the host it had then. Nodes
+the inventory does not map are left out, with a warning when they change,
+and the reading is written again until they are mapped; without an
+inventory, the file names hosts (`host`).
+
+- **Gaps.** `unobserved_reasons()` cuts the gaps of host names
+  (`unobserved_by_name()`), whose states and windows these are: a node
+  that power saving boots often may get a new host id at every boot (§4.1).
+- **Times.** States are written as periods (`node_states`): a state read
+  again within 5 minutes (`shawk.node_state_max_age()`) continues its
+  period, anything else starts one at `generated_at`. Older or repeated
+  readings, from the same file or another connector, change nothing. The
+  reason of a past gap is thus the state at that time, never today's.
+- **Staleness.** A state not read again for 5 minutes explains nothing
+  after that. A file whose `generated_at` is older is not written, with a
+  warning; one more than 10 seconds ahead is invalid (the file is
+  generated on the host of the connector). When a file cannot be read or
+  is invalid (an empty file is), what was written from it stays, and the
+  states become stale. Flags are names (`DOWN`, `POWERED_DOWN`), as
+  `scontrol` gives them; the `*` of a node that does not respond becomes
+  `NOT_RESPONDING`, and the symbols of `sinfo` (`idle~`) are invalid.
+- **Maintenance windows** are written by the clock of the database
+  (`maintenance_windows`) when the file changes, and count from when they
+  were written, so a window registered afterwards does not make a past
+  failure planned. A window removed from the file is deleted before it
+  starts and ends then while in progress, as one whose end is moved to the
+  past. A row that ended stays as it was: a window registered again after
+  its row ended, e.g. after a file read while it lacked the window or by a
+  connector with an older file, gets a new row from then, so the time in
+  between is not planned and nothing is lost for good. The file is still
+  the whole registry: it is replaced at once (renamed) and is the same for
+  every connector. It is written when it changes and again every 5
+  minutes, so what a connector wrote from an older file is put right.
+- **What is planned.** Power saving (`POWERED_DOWN`, `POWERING_DOWN`,
+  `POWERING_UP`) with no other flag than `IDLE`, `ALLOCATED`, `MIXED` (a
+  job waits for a node that powers up), `CLOUD` and `POWER_DOWN`, so never
+  with `DOWN`, which also follows failed boots and a `ResumeTimeout`,
+  `DRAIN`, on which jobs keep running, `FAIL`, `NOT_RESPONDING` or a flag
+  unknown here (`shawk.planned_state()`). Powering up ends as the node is
+  up, when its agent is expected back, or at the `ResumeTimeout` of Slurm,
+  when the node is `DOWN`; without it, a node that resumes would be alerted
+  while it boots. Maintenance: a window of the file, or the flag `MAINT` of
+  a reservation of Slurm, which is registered with an end; alerts are
+  stopped for 30 days at most from the first of the states with `MAINT`
+  that follow each other, whatever their other flags and reasons.
+  `unobserved_reasons()` reports the state as Slurm had it, `MAINT`
+  included, without this bound.
+
+Slurm partitions and states are not labels of the metrics of shawk.
+
 ## 6. PostgreSQL
 
 PostgreSQL 14 or later (multiranges). The schema ships with the connector
@@ -1104,6 +1185,8 @@ learned_translations(host_id, proto, netns, client_addr, virtual_addr, virtual_p
 known_dependencies(client_service, server_service, port, proto, first_seen, last_seen)
 port_agnostic_services(service)  -- written by the connector (§5.3)
 dynamic_ports(name, proto, addr, port_from, port_to)  -- written by the connector (§5.3); 0.0.0.0/0 and ::/0 for every host
+node_states(hostname, first_seen, last_seen, state, reason)  -- periods of states of Slurm (§5.7)
+maintenance_windows(hostname, starts_at, ends_at, reason, registered_at)  -- registered windows (§5.7)
 ```
 
 With `job_users`, the user (`process.user.id`) of a process of a Slurm job
@@ -1149,6 +1232,8 @@ names in PostgreSQL and Prometheus match.
 | `never_observed()` | the hosts of the inventory (§5.6) expected to run an agent whose agent never reported within the retention (no host has their name): `host`, `slurm_node`, `roles`, and `seen_as`, the hosts whose agents reported an address of the host, as an agent whose `host.name` differs from the inventory would |
 | `inventory`, `inventory_addrs` | the hosts of the inventory with their addresses (`host`, `slurm_node`, `roles`, `agent`, `addrs`), and one row per address with its host: join an address on `addr` to name its host |
 | `inventory_status` | when the inventory was last read from a valid file (`read_at`, NULL if never), the latest failure since (`failed_at`, `error`), and how many hosts it has; no row before a connector with `inventory_file` read it |
+| `unobserved_reasons(since, until, tolerance)` | the periods of `unobserved_by_name()` cut by what explains them (§5.7): `cause` is `maintenance` or `power_saving` for a planned stop and NULL otherwise, `node_state` the state of Slurm then (flags joined by `+`, NULL if none was read or it was stale) and `reason` that of Slurm or of the maintenance window, which takes precedence. The gaps are per host name, as the states and windows are, since a node that power saving boots often may get a new host id at every boot. `unobserved()` and `unobserved_by_name()` do not change |
+| `planned_stops` | hosts in a planned stop now and until when at the latest (`host`, `cause`, `since`, `until`, `reason`): in a maintenance window, or in a planned state of their latest reading from Slurm while it is fresh |
 | `partly_observed(since, until)` | the periods in which each host was observed but its agent dropped flows, cut to `[since, until]`: `host`, `gap_start`, `gap_end`, `dropped_flows` (flow updates dropped). A dependency may be missing from them although it was used; Grafana overlays them as annotations |
 | `job_edges` | the edges of the processes of Slurm jobs with the user of the process (`user_id`, NULL if unknown), host, unit, service and executable: which users connected to what, and when. For administrators: only its owner reads it (below) |
 | `dependencies_between(since, until)`, `graph_edges_between`, `graph_nodes_between`, `dependency_changes_between` | the same for the dependencies active in a period. They take the edges active in the period with a margin of 15 minutes before matching, so a recent window does not scan the history (about 0.3 s instead of 3 s with a million edges) and both sides of a connection are matched at the edges of the period; the dashboards and alerts use them. A dependency appeared in a period when it was first seen in it and is not in `known_dependencies` from before it, so one that comes back on new edges (a new container, an hourly job) did not appear |
@@ -1230,11 +1315,25 @@ than a row missing from the result, so a stopped agent does not look like
 a removed dependency. Stopped agents are alerted by Prometheus
 (`ShawkAgentDown`) for 24 hours, then from `shawk_v1.agents` for 30 days,
 labelled with the host id; a host reinstalled under the same name and
-alive is not alerted.
+alive is not alerted. Neither alerts hosts in a planned stop (§5.7): the
+Grafana alert excludes `shawk_v1.planned_stops`, and `ShawkAgentDown` the
+nodes a Slurm exporter reports in power saving (powered down, powering down
+or up, with no flag but `IDLE`, `ALLOCATED`, `MIXED`, `CLOUD` and
+`POWER_DOWN`) or in a `MAINT` reservation, joined on the host name. The example in
+`packaging/prometheus/shawk-rules.yml` assumes `slurm_node_state{node,
+state}`; the metric, its labels and the mapping of `NodeName` to
+`host_name` are replaced with those of the exporter in use. A state is
+current only while the exporter is scraped, so a stale state stops nothing.
+Prometheus does not know the windows of `maintenance_file`: in the first
+24 hours of one, `ShawkAgentDown` fires unless it is silenced in
+Alertmanager or is a `MAINT` reservation. A node that resumed is alerted
+if its agent does not send within the minute of `for` after it is up.
 
 The fleet, dependency details, peer hosts and changes dashboards overlay
 the periods from `unobserved()` and `partly_observed()` as annotations, so
-the absence of a dependency is not read as disuse over them. SYN retransmissions
+the absence of a dependency is not read as disuse over them. The table of
+gaps of the fleet dashboard gives their reasons (`unobserved_reasons()`).
+SYN retransmissions
 per connection attempt (handshakes plus failures) exceed 1 when connects
 time out, and `TCP_FASTOPEN_CONNECT` connects, which have no handshake,
 raise them. OBI panels use a minimum interval of a minute, since OBI

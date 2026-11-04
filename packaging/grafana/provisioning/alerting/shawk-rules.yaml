@@ -117,7 +117,10 @@ groups:
       # Agents silent for more than 24 hours, when the Prometheus alert
       # ShawkAgentDown resolves, for 30 days. A host reinstalled under a new
       # host id (a new machine id) with the same name is not silent; the
-      # host id tells hosts of the same name apart.
+      # host id tells hosts of the same name apart. Hosts in a planned stop
+      # (shawk_v1.planned_stops: a maintenance window, or the power saving
+      # of Slurm, as last read within 5 minutes) are not alerted while it
+      # lasts; DOWN, DRAIN and stale states are.
       - uid: shawk-agent-silent
         title: shawk agent silent
         condition: C
@@ -139,6 +142,7 @@ groups:
                   AND a.last_heartbeat > now() - interval '30 days'
                   AND NOT EXISTS (SELECT FROM shawk_v1.agents b
                                   WHERE b.host = a.host AND b.last_heartbeat > a.last_heartbeat)
+                  AND NOT EXISTS (SELECT FROM shawk_v1.planned_stops p WHERE p.host = a.host)
                 ORDER BY 1, 2, 3
           - refId: B
             datasourceUid: __expr__

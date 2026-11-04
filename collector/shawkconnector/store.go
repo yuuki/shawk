@@ -50,6 +50,11 @@ type store interface {
 	// refreshDependencies brings the history of dependencies between
 	// services up to date.
 	refreshDependencies(ctx context.Context) (int64, error)
+	// writeNodeStates records the states of nodes read from Slurm at a
+	// time.
+	writeNodeStates(ctx context.Context, at time.Time, nodes []nodeState) error
+	// syncMaintenance replaces the maintenance windows registered.
+	syncMaintenance(ctx context.Context, windows []maintenanceWindow) error
 	close()
 }
 
@@ -747,6 +752,114 @@ ORDER BY h.host`, func(rows pgx.Rows) error {
 	return inv, nil
 }
 
+// nodeStatesLock is the key of the advisory lock that serializes the writes
+// of node states and maintenance windows by several connectors.
+const nodeStatesLock = 0x7368617a // "shaz"
+
+// writeNodeStates records the states of nodes read from Slurm at a time. A
+// host whose latest state has the same flags and reason, read again within
+// node_state_max_age(), continues it; otherwise a new period starts at the
+// time. States read no later than the latest of a host (an older file, or
+// the same file written by another connector) change nothing.
+func (s *pgStore) writeNodeStates(ctx context.Context, at time.Time, nodes []nodeState) error {
+	hosts := make([]string, 0, len(nodes))
+	states := make([]string, 0, len(nodes))
+	reasons := make([]string, 0, len(nodes))
+	for _, n := range nodes {
+		hosts = append(hosts, n.host)
+		states = append(states, strings.Join(n.state, "+"))
+		reasons = append(reasons, n.reason)
+	}
+	return pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.ReadCommitted}, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared($1)`, int64(migrationLock)); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, int64(nodeStatesLock)); err != nil {
+			return err
+		}
+		b := &pgx.Batch{}
+		b.Queue(`
+WITH u AS (
+  SELECT * FROM unnest($1::text[], $2::text[], $3::text[]) AS u(hostname, state, reason)
+), latest AS (
+  SELECT DISTINCT ON (s.hostname) s.hostname, s.first_seen, s.last_seen, s.state, s.reason
+  FROM shawk.node_states s
+  WHERE s.hostname = ANY ($1::text[])
+  ORDER BY s.hostname, s.first_seen DESC
+)
+UPDATE shawk.node_states s SET last_seen = $4::timestamptz
+FROM u JOIN latest l ON l.hostname = u.hostname
+WHERE s.hostname = l.hostname AND s.first_seen = l.first_seen
+  AND l.state = string_to_array(u.state, '+') AND l.reason = u.reason
+  AND l.last_seen < $4::timestamptz AND l.last_seen >= $4::timestamptz - shawk.node_state_max_age()`,
+			hosts, states, reasons, at)
+		b.Queue(`
+INSERT INTO shawk.node_states (hostname, first_seen, last_seen, state, reason)
+SELECT u.hostname, $4::timestamptz, $4::timestamptz, string_to_array(u.state, '+'), u.reason
+FROM unnest($1::text[], $2::text[], $3::text[]) AS u(hostname, state, reason)
+WHERE NOT EXISTS (SELECT FROM shawk.node_states s WHERE s.hostname = u.hostname AND s.last_seen >= $4::timestamptz)
+ON CONFLICT DO NOTHING`,
+			hosts, states, reasons, at)
+		return tx.SendBatch(ctx, b).Close()
+	})
+}
+
+// syncMaintenance replaces the maintenance windows registered, by the
+// clock of the database. A window is the row of a host and start that has
+// not ended. One no longer registered is deleted before it starts and ends
+// now while in progress, as one whose end is moved to the past; one
+// registered changes its end and reason, or gets a new row from now if it
+// has none, also when its row ended. Rows that ended are kept as they
+// were.
+func (s *pgStore) syncMaintenance(ctx context.Context, windows []maintenanceWindow) error {
+	hosts := make([]string, 0, len(windows))
+	starts := make([]time.Time, 0, len(windows))
+	ends := make([]time.Time, 0, len(windows))
+	reasons := make([]string, 0, len(windows))
+	for _, w := range windows {
+		hosts = append(hosts, w.host)
+		starts = append(starts, w.start)
+		ends = append(ends, w.end)
+		reasons = append(reasons, w.reason)
+	}
+	return pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.ReadCommitted}, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared($1)`, int64(migrationLock)); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, int64(nodeStatesLock)); err != nil {
+			return err
+		}
+		// The windows registered, whose end has not passed.
+		const registered = `
+SELECT FROM unnest($1::text[], $2::timestamptz[], $3::timestamptz[]) AS u(hostname, starts_at, ends_at)
+WHERE u.hostname = w.hostname AND u.starts_at = w.starts_at AND u.ends_at > now()`
+		b := &pgx.Batch{}
+		b.Queue(`
+DELETE FROM shawk.maintenance_windows w
+WHERE greatest(w.starts_at, w.registered_at) > now() AND NOT EXISTS (`+registered+`)`,
+			hosts, starts, ends)
+		b.Queue(`
+UPDATE shawk.maintenance_windows w SET ends_at = now()
+WHERE greatest(w.starts_at, w.registered_at) <= now() AND w.ends_at > now() AND NOT EXISTS (`+registered+`)`,
+			hosts, starts, ends)
+		b.Queue(`
+UPDATE shawk.maintenance_windows w SET ends_at = u.ends_at, reason = u.reason
+FROM unnest($1::text[], $2::timestamptz[], $3::timestamptz[], $4::text[]) AS u(hostname, starts_at, ends_at, reason)
+WHERE u.hostname = w.hostname AND u.starts_at = w.starts_at AND u.ends_at > now() AND w.ends_at > now()`,
+			hosts, starts, ends, reasons)
+		b.Queue(`
+INSERT INTO shawk.maintenance_windows (hostname, starts_at, ends_at, reason, registered_at)
+SELECT u.hostname, u.starts_at, u.ends_at, u.reason, now()
+FROM unnest($1::text[], $2::timestamptz[], $3::timestamptz[], $4::text[]) AS u(hostname, starts_at, ends_at, reason)
+WHERE u.ends_at > now()
+  AND NOT EXISTS (SELECT FROM shawk.maintenance_windows w
+                  WHERE w.hostname = u.hostname AND w.starts_at = u.starts_at AND w.ends_at > now())
+ON CONFLICT DO NOTHING`,
+			hosts, starts, ends, reasons)
+		return tx.SendBatch(ctx, b).Close()
+	})
+}
+
 func (s *pgStore) refreshDependencies(ctx context.Context) (int64, error) {
 	var n int64
 	err := s.pool.QueryRow(ctx, `SELECT shawk.refresh_known_dependencies()`).Scan(&n)
@@ -755,7 +868,9 @@ func (s *pgStore) refreshDependencies(ctx context.Context) (int64, error) {
 
 func (s *pgStore) prune(ctx context.Context, retention time.Duration, maxRows int) (int64, error) {
 	var n int64
-	err := s.pool.QueryRow(ctx, `SELECT shawk.prune(now() - make_interval(secs => $1), $2)`,
+	err := s.pool.QueryRow(ctx, `
+SELECT shawk.prune(c, $2) + shawk.prune_node_states(c, $2)
+FROM (SELECT now() - make_interval(secs => $1) AS c) t`,
 		retention.Seconds(), maxRows).Scan(&n)
 	return n, err
 }

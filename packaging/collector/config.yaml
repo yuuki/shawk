@@ -99,6 +99,12 @@ connectors:
     max_hosts: 10000
     max_series_per_host: 100000   # edges, listeners, translations and addresses
     max_pending_rows: 10000000    # kept while PostgreSQL cannot be written
+    # States of nodes from Slurm, generated every minute by a cron job, and
+    # maintenance windows registered by hand; they tell why hosts were not
+    # observed and which stopped agents are planned (docs/design.md,
+    # section 5.7).
+    # node_states_file: /etc/shawk/node-states.json
+    # maintenance_file: /etc/shawk/maintenance.yaml
     # Servers that listen on a port chosen anew at every run, such as srun
     # and salloc of Slurm without SrunPortRange: their dependencies are
     # aggregated without the port (server_port 0 in Prometheus, port 0 in
