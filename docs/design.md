@@ -397,8 +397,9 @@ per packet.
   (`step_<n>`), `slurm/extern` (with the processes `pam_slurm_adopt`
   adopts) or `slurm/interactive` after the kind of step, and the
   directory of slurmstepd in a step (`slurm`, `slurm_processes`) and
-  `<scope>/system` are `slurmstepd`. The scope is recognized only in
-  `system.slice` at the root, where users cannot make cgroups; other
+  `<scope>/system` are `slurmstepd`. The scope is `slurmstepd.scope`, or
+  `<node>_slurmstepd.scope` with `--enable-multiple-slurmd`, recognized
+  only in `system.slice` at the root, where users cannot make cgroups; other
   hierarchies, and cgroup v1, keep the rules above
   (`internal/procinfo/cgroup.go`).
 - Container names are not trusted blindly. Docker merges image labels into
@@ -429,6 +430,8 @@ per packet.
   any process sets them and they repeat in every data point. The `OTEL_`
   variables of the processes of Slurm jobs are not read: any user could
   name a job `slurmctld`, so they are named after their executable onwards.
+  When the cgroup of a flow is not known, `/proc/PID/cgroup` tells whether
+  its process is in a job.
   PostgreSQL keeps these names; Prometheus has them under one `job` (§5.3).
 - The service of a pod is named as OBI names it from API server metadata
   (annotations, `app.kubernetes.io/*` labels, then the top owner; see
@@ -468,7 +471,9 @@ per packet.
   matches the flow is not trusted; a process that exits before it is read
   takes the latest identity seen for the same unit and comm, and for the
   processes of Slurm jobs, whose units every job of every user shares, the
-  same cgroup (step) too.
+  same cgroup (step) too. What `/proc` tells of a PID now in another cgroup
+  than the flow, one of them a job's, is not used: the PID was reused by
+  another job, or `pam_slurm_adopt` moved the process.
 - The host is identified by `host.id` (`/etc/machine-id`, else
   `/var/lib/dbus/machine-id`) and `host.name`. PostgreSQL keys a host by
   the hash of both, so VMs cloned with the same machine id stay apart.

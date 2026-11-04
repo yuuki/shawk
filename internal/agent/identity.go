@@ -22,6 +22,8 @@ type identities struct {
 	exe  func(pid uint32) string
 	comm func(pid uint32) string
 	env  func(pid uint32) (map[string]string, bool)
+	// cgroup reads the path of the cgroup of a process.
+	cgroup func(pid uint32) string
 	// stuck tells how many reads of environments hang; replaced in tests.
 	stuck func() procinfo.EnvironReads
 	// budget bounds the time spent reading /proc in an interval.
@@ -42,7 +44,9 @@ const (
 type procRead struct {
 	exe  string
 	comm string
-	env  map[string]string
+	// cgroup is the path of the cgroup of the process when it was read.
+	cgroup string
+	env    map[string]string
 	// complete is false when the environment could not be read in time;
 	// noEnv tells that it was not asked for.
 	complete, noEnv bool
@@ -78,6 +82,7 @@ func newIdentities(fb procinfo.Fallback, ttl time.Duration) *identities {
 		exe:      procinfo.Exe,
 		comm:     procinfo.Comm,
 		env:      procinfo.OTelEnv,
+		cgroup:   procinfo.CgroupOf,
 		stuck:    procinfo.StuckEnvironReads,
 		budget:   procReadBudget,
 	}
@@ -173,12 +178,13 @@ func (r *identities) read(pid uint32, env bool) procRead {
 	return p
 }
 
-// readNow reads the executable, the command name and, if env is true, the
-// environment of a process.
+// readNow reads the executable, the command name, the cgroup and, if env is
+// true, the environment of a process.
 func (r *identities) readNow(pid uint32, env bool) procRead {
 	p := procRead{exe: r.exe(pid), complete: true}
 	if p.exe != "" {
 		p.comm = r.comm(pid)
+		p.cgroup = r.cgroup(pid)
 		if env {
 			p.env, p.complete = r.env(pid)
 		} else {
@@ -188,22 +194,50 @@ func (r *identities) readNow(pid uint32, env bool) procRead {
 	return p
 }
 
+// flowCgroup is the cgroup of a flow or a listener: its id, and its path,
+// "" if it is not known.
+type flowCgroup struct {
+	id   uint64
+	path string
+}
+
 // resolve returns the identity of the process pid with comm in the cgroup
-// cgroupID of unit, which is the unit of the container ctr if it is not
-// nil. The OTEL_ variables of the processes of Slurm jobs are not read:
-// any user could name a job after a service of the cluster, such as
-// slurmctld, so they are named after their executable onwards.
-func (r *identities) resolve(pid uint32, comm string, cgroupID uint64, unit string, ctr *procinfo.Container, now time.Time) otlp.Process {
-	k := newIdentityKey(unit, comm, cgroupID)
-	trustEnv := !procinfo.SlurmJob(unit)
-	p := r.read(pid, trustEnv)
+// cg of unit, which is the unit of the container ctr if it is not nil.
+//
+// The OTEL_ variables of the processes of Slurm jobs are not read: any user
+// could name a job after a service of the cluster, such as slurmctld, so
+// they are named after their executable onwards. What /proc tells of a PID
+// is not used when the process is now in another cgroup and one of them is
+// that of a job: the PID was reused by a process of another job, or the
+// process was moved, e.g. by pam_slurm_adopt. When the cgroup of the flow
+// is not known, the cgroup the process is in tells whether it is in a job;
+// its identity is then not kept, since its unit is not known. A process
+// whose cgroup cannot be read is taken as it is.
+func (r *identities) resolve(pid uint32, comm string, cg flowCgroup, unit string, ctr *procinfo.Container, now time.Time) otlp.Process {
+	k := newIdentityKey(unit, comm, cg.id)
+	job := procinfo.SlurmJob(unit)
+	keep := true
+	p := r.read(pid, !job)
 	if p.comm != "" && p.comm != comm {
 		// The flow was seen up to an interval ago; the PID now belongs to
 		// another process (the tracer reports the command name of the main
 		// thread, as /proc/PID/comm does).
 		p = procRead{}
 	}
-	if p.exe == "" || !p.complete {
+	if p.exe != "" && p.cgroup != "" {
+		inJob := procinfo.SlurmJob(procinfo.Unit(p.cgroup))
+		switch {
+		case cg.path == "" && inJob:
+			job, keep = true, false
+		case cg.path != "" && p.cgroup != cg.path && (job || inJob):
+			p = procRead{}
+		}
+	}
+	if job {
+		// The environment is not used, whether or not it was read.
+		p.env, p.complete = nil, true
+	}
+	if keep && (p.exe == "" || !p.complete) {
 		if l, ok := r.latest[k]; ok {
 			l.at = now
 			r.latest[k] = l
@@ -218,16 +252,12 @@ func (r *identities) resolve(pid uint32, comm string, cgroupID uint64, unit stri
 			return proc
 		}
 	}
-	env := p.env
-	if !trustEnv {
-		env = nil
-	}
-	svc := procinfo.ServiceName(env, p.exe, comm, unit, ctr.Workload(), r.fallback)
+	svc := procinfo.ServiceName(p.env, p.exe, comm, unit, ctr.Workload(), r.fallback)
 	proc := otlp.Process{Unit: unit, Comm: comm, Exe: p.exe, Service: svc.Name, ServiceNamespace: svc.Namespace}
 	if ctr != nil {
 		proc.ContainerID = ctr.ID
 	}
-	if p.exe != "" && p.complete {
+	if keep && p.exe != "" && p.complete {
 		r.latest[k] = latestIdentity{proc: proc, at: now}
 	}
 	return proc

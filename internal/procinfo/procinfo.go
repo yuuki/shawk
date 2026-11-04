@@ -229,6 +229,34 @@ func Exe(pid uint32) string {
 	return strings.TrimSuffix(p, " (deleted)")
 }
 
+// CgroupOf returns the path of the cgroup v2 of a process, relative to the
+// root of the hierarchy as CgroupPath, or "" if it cannot be read or is
+// outside the cgroup namespace of the agent ("/../...").
+func CgroupOf(pid uint32) string {
+	if pid == 0 {
+		return ""
+	}
+	b, err := os.ReadFile("/proc/" + strconv.FormatUint(uint64(pid), 10) + "/cgroup")
+	if err != nil {
+		return ""
+	}
+	return parseProcCgroup(b)
+}
+
+// parseProcCgroup returns the path of the line of cgroup v2 ("0::<path>")
+// of /proc/PID/cgroup.
+func parseProcCgroup(b []byte) string {
+	for line := range strings.SplitSeq(string(b), "\n") {
+		if p, ok := strings.CutPrefix(line, "0::"); ok {
+			if strings.HasPrefix(p, "/..") {
+				return ""
+			}
+			return p
+		}
+	}
+	return ""
+}
+
 // NetNS returns the inode number of the network namespace of the current
 // process.
 func NetNS() uint32 { return netNS("/proc/self/ns/net") }
