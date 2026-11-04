@@ -130,16 +130,19 @@ func TestPGMaintenance(t *testing.T) {
 // planned.
 func TestPGUnobservedReasons(t *testing.T) {
 	_, conn := migratedDB(t)
-	// cn001 was observed until 10 hours ago and from 1 hour ago. Its states
+	// cn001 was observed until 10 hours ago and from 1 hour ago, after a
+	// boot that gave it a new host id (h2): the gaps are those of the name,
+	// not the time after the last heartbeat of h1. Its states
 	// over the gap (hours ago, by first and last read): powered down from
 	// 9.5 to 8, then nothing read until 7, DOWN with a flag of power saving
 	// from 7 to 6, DRAIN and powered down from 6 to 5, powered down again
 	// from 5 to 1. A maintenance window from 4 to 3 takes precedence.
 	execAll(t, conn,
-		`INSERT INTO shawk.hosts VALUES ('h1','m','cn001','k','v',now()-interval '1 day',now())`,
+		`INSERT INTO shawk.hosts VALUES ('h1','m1','cn001','k','v',now()-interval '1 day',now()-interval '10 hours'),
+		                                ('h2','m2','cn001','k','v',now()-interval '1 hour',now())`,
 		`INSERT INTO shawk.agent_sessions (host_id, started_at, last_heartbeat, udp_traced, netns_scope) VALUES
 		   ('h1', now()-interval '20 hours', now()-interval '10 hours', true, 'all'),
-		   ('h1', now()-interval '1 hour', now(), true, 'all')`,
+		   ('h2', now()-interval '1 hour', now(), true, 'all')`,
 		`INSERT INTO shawk.node_states (hostname, first_seen, last_seen, state, reason) VALUES
 		   ('cn001', now()-interval '570 minutes', now()-interval '8 hours', '{IDLE,POWERED_DOWN}', ''),
 		   ('cn001', now()-interval '7 hours', now()-interval '6 hours' - shawk.node_state_max_age(), '{DOWN,POWERED_DOWN}', 'ResumeTimeout'),
@@ -165,8 +168,8 @@ FROM shawk_v1.unobserved_reasons(now() - interval '12 hours', now() - interval '
 	if !slices.Equal(got, want) {
 		t.Errorf("unobserved_reasons =\n%v\nwant\n%v", got, want)
 	}
-	// unobserved() is unchanged: one gap.
-	if got := queryStrings(t, conn, `SELECT host FROM shawk_v1.unobserved(now() - interval '12 hours', now() - interval '1 minute', '0')`); len(got) != 1 {
+	// unobserved() is unchanged: a gap per host id.
+	if got := queryStrings(t, conn, `SELECT host FROM shawk_v1.unobserved(now() - interval '12 hours', now() - interval '1 minute', '0')`); len(got) != 2 {
 		t.Errorf("unobserved = %v", got)
 	}
 }

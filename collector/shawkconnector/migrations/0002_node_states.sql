@@ -127,13 +127,17 @@ WHERE s.last_seen + shawk.node_state_max_age() > now()
   AND s.cause IS NOT NULL
   AND (s.cause <> 'maintenance' OR s.since > now() - interval '30 days');
 
--- The periods of unobserved(since, until, tolerance), cut by what Slurm and
--- the maintenance windows tell about them: cause is maintenance or
--- power_saving for a planned stop and NULL otherwise; node_state is the
+-- The periods of unobserved_by_name(since, until, tolerance), cut by what
+-- Slurm and the maintenance windows tell about them: cause is maintenance
+-- or power_saving for a planned stop and NULL otherwise; node_state is the
 -- state of Slurm then ('+' between flags, NULL if none was read or it was
 -- stale) and reason the reason of Slurm or of the maintenance window. A
--- maintenance window takes precedence over the state. unobserved() itself
--- does not change: the gaps stay recorded whatever their reasons.
+-- maintenance window takes precedence over the state. The gaps are those of
+-- host names, as the states and windows are: a node that power saving
+-- boots often may get a new host id at every boot, and the old ids would
+-- report gaps although the name was observed. unobserved() and
+-- unobserved_by_name() do not change: the gaps stay recorded whatever
+-- their reasons.
 CREATE FUNCTION shawk_v1.unobserved_reasons(since timestamptz, until timestamptz,
                                             tolerance interval DEFAULT '3 minutes')
 RETURNS TABLE (host text, gap_start timestamptz, gap_end timestamptz,
@@ -144,8 +148,8 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
            coalesce((SELECT range_agg(w.period) FROM shawk.maintenance_periods w
                      WHERE w.hostname = u.host AND w.period && tstzrange(u.gap_start, u.gap_end)),
                     '{}'::tstzmultirange) AS maint
-    FROM shawk_v1.unobserved(unobserved_reasons.since, unobserved_reasons.until,
-                             unobserved_reasons.tolerance) u
+    FROM shawk_v1.unobserved_by_name(unobserved_reasons.since, unobserved_reasons.until,
+                                     unobserved_reasons.tolerance) u
   ),
   states AS (
     SELECT g.host, g.gap - g.maint AS rest, p.period, p.state, p.reason
