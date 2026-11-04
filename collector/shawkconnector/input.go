@@ -369,6 +369,7 @@ var agentMetrics = map[string]agentMetric{
 	metricAgentExportFailures:      {unit: "{request}"},
 	metricAgentTranslationsTraced:  {gauge: true},
 	metricAgentTranslationsDropped: {unit: "{translation}"},
+	metricAgentRDMAIO:              {unit: "By"},
 	metricAgentBPFRunCount:         {unit: "{run}", attr: attrBPFProgram, valid: isBPFProgram, perValue: true},
 	metricAgentBPFRunTime:          {unit: "s", attr: attrBPFProgram, valid: isBPFProgram, perValue: true},
 }
