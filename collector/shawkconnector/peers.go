@@ -122,6 +122,9 @@ type peer struct {
 	// named through a translation whose backend has another port than the
 	// one the client connected to; 0 otherwise.
 	port uint16
+	// server is the address of the server, when the peer of a client edge
+	// is named through a translation; invalid otherwise.
+	server netip.Addr
 }
 
 // resolver names the peers of edges. It combines the endpoints, clients and
@@ -545,7 +548,7 @@ func (r *resolver) peer(host string, id *edgeID, now time.Time) peer {
 		if p.name == "" {
 			if c, t, ok := r.translatedServer(id, now); ok {
 				// The holder of the virtual address, if any, is not the server.
-				p = peer{name: c.service, agent: c.agent}
+				p = peer{name: c.service, agent: c.agent, server: c.addr}
 				if c.port != id.port {
 					p.port = c.port
 				}
@@ -557,7 +560,7 @@ func (r *resolver) peer(host string, id *edgeID, now time.Time) peer {
 				}
 			} else if !learned {
 			} else if c, ok := r.learnedServer(host, id, now); ok {
-				p = peer{name: c.service, agent: c.agent}
+				p = peer{name: c.service, agent: c.agent, server: c.addr}
 				if c.port != id.port {
 					p.port = c.port
 				}
@@ -760,6 +763,8 @@ func (c *chooser) add(local map[endpoint]time.Time, db []endpoint, dbAge time.Du
 // records the server side.
 type candidate struct {
 	endpoint
+	// addr and port are where the service is reached.
+	addr  netip.Addr
 	port  uint16
 	agent bool
 	// dnat tells, of a backend of a learned translation, that it sees the
@@ -777,18 +782,18 @@ const backendWindow = aliveWindow
 // time it saw them, and those read from PostgreSQL, whose times are dbAge
 // older. If holder is set, the live host that alone holds the address of the
 // endpoints (holderOf), the endpoints of other hosts are left out.
-func appendCandidates(cs []candidate, local map[endpoint]time.Time, db []endpoint, dbAge time.Duration, port uint16,
-	holder string) []candidate {
+func appendCandidates(cs []candidate, local map[endpoint]time.Time, db []endpoint, dbAge time.Duration, addr netip.Addr,
+	port uint16, holder string) []candidate {
 	for e, at := range local {
 		if holder == "" || e.host == holder {
 			e.lastSeen = at
-			cs = append(cs, candidate{endpoint: e, port: port})
+			cs = append(cs, candidate{endpoint: e, addr: addr, port: port})
 		}
 	}
 	for _, e := range db {
 		if holder == "" || e.host == holder {
 			e.lastSeen = e.lastSeen.Add(dbAge)
-			cs = append(cs, candidate{endpoint: e, port: port})
+			cs = append(cs, candidate{endpoint: e, addr: addr, port: port})
 		}
 	}
 	return cs
@@ -849,7 +854,7 @@ func (r *resolver) translatedServer(id *edgeID, now time.Time) (candidate, *tran
 		}
 		if b.prefix.IsSingleIP() {
 			k := endpointKey{b.prefix.Addr(), port, id.proto}
-			cs = appendCandidates(cs, r.localEndpoints[k], r.dbEndpoints[k], age, port, r.holderOf(k.addr, now))
+			cs = appendCandidates(cs, r.localEndpoints[k], r.dbEndpoints[k], age, k.addr, port, r.holderOf(k.addr, now))
 			continue
 		}
 		cs = append(cs, r.inRange(b.prefix, port, id.proto, age, now)...)
@@ -877,12 +882,12 @@ func (r *resolver) inRange(p netip.Prefix, port uint16, proto string, dbAge time
 	var cs []candidate
 	for ek, es := range r.localEndpoints {
 		if ek.port == port && ek.proto == proto && p.Contains(ek.addr) {
-			cs = appendCandidates(cs, es, nil, 0, port, r.holderOf(ek.addr, now))
+			cs = appendCandidates(cs, es, nil, 0, ek.addr, port, r.holderOf(ek.addr, now))
 		}
 	}
 	for ek, es := range r.dbEndpoints {
 		if ek.port == port && ek.proto == proto && p.Contains(ek.addr) {
-			cs = appendCandidates(cs, nil, es, dbAge, port, r.holderOf(ek.addr, now))
+			cs = appendCandidates(cs, nil, es, dbAge, ek.addr, port, r.holderOf(ek.addr, now))
 		}
 	}
 	// The slice is shared: callers append to a copy.

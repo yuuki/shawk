@@ -230,3 +230,31 @@ func TestPortAgnosticOutputs(t *testing.T) {
 		t.Errorf("client outputs = %v, want %v", got, want)
 	}
 }
+
+// TestPortAgnosticThroughTranslations: through a translation, a range of
+// dynamic_ports is matched with the address and port of the backend, as in
+// PostgreSQL, rather than with the virtual address the client connected
+// to.
+func TestPortAgnosticThroughTranslations(t *testing.T) {
+	c, _, sink, _ := testConnector(t, func(cfg *Config) {
+		translationConfig(cfg)
+		cfg.DynamicPorts = map[string]DynamicPortsConfig{
+			"db":  {Hosts: []string{"10.0.1.0/24"}, Transport: "tcp", Ports: "5432-5432"},
+			"web": {Hosts: []string{"10.0.1.20"}, Ports: "8080-8080"},
+		}
+	})
+	app, db1, db2, web := translationAgents(t0.Add(15 * time.Second))
+	consume(t, c, sink, db1)
+	consume(t, c, sink, db2)
+	consume(t, c, sink, web)
+	out := consume(t, c, sink, app)
+	got := map[string]float64{}
+	for _, s := range find(out, metricConnOpened, "shop/app", "*", roleClient, "") {
+		got[fmt.Sprintf("%s:%d", s.peer, s.port)] += s.value
+	}
+	// Nothing listens behind api-lb yet: its virtual address is not in a
+	// range, and keeps its port.
+	if want := map[string]float64{"postgres:0": 4, "web:0": 2, "~unresolved:443": 1}; !maps.Equal(got, want) {
+		t.Errorf("client outputs = %v, want %v", got, want)
+	}
+}

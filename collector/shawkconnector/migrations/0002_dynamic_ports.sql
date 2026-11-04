@@ -94,9 +94,11 @@ GROUP BY 1, 2, 3, 4;
 -- to it under port 0, so that a dependency known before its rule was
 -- configured is not new under it. known_dependencies has no addresses, so
 -- a range of dynamic_ports applies to the rows of its protocol and ports
--- whatever their hosts. The connector calls it after it writes the rules;
--- it takes the lock of refresh_known_dependencies, so that the two do not
--- upsert the same rows in different orders. It returns the rows upserted.
+-- whatever their hosts. The connector calls it when it changes the rules,
+-- and clears known_dependencies_state, so that the next refresh rebuilds
+-- the table from every edge kept under the new rules. It takes the lock of
+-- refresh_known_dependencies, so that the two do not upsert the same rows
+-- in different orders. It returns the rows upserted.
 CREATE FUNCTION shawk.aggregate_known_dependencies() RETURNS bigint
 LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
 DECLARE

@@ -145,7 +145,7 @@ func (r *resolver) learnedServer(host string, id *edgeID, now time.Time) (candid
 	var cs []candidate
 	for _, b := range r.learnedOf(host, id, now) {
 		k := endpointKey{b.backend, b.bport, id.proto}
-		found := appendCandidates(nil, r.localEndpoints[k], r.dbEndpoints[k], age, b.bport, r.holderOf(b.backend, now))
+		found := appendCandidates(nil, r.localEndpoints[k], r.dbEndpoints[k], age, b.backend, b.bport, r.holderOf(b.backend, now))
 		onHost := r.sameHostAddr(b.backend, now)
 		for _, f := range found {
 			if onHost && f.host != b.host {

@@ -212,8 +212,9 @@ func (a *aggregator) service(h *hostOutputs, p *process, now time.Time) svcKey {
 }
 
 // portAgnostic tells whether the outputs of an edge whose peer is p have
-// server.port 0: the server is the peer of a client edge and the local
-// process of a server edge, as the edge sees it.
+// server.port 0: the server is the local process of a server edge, and the
+// peer of a client edge, at the backend through a translation, as in
+// PostgreSQL.
 func (a *aggregator) portAgnostic(id *edgeID, p peer) bool {
 	if a.ports == nil {
 		return false
@@ -221,11 +222,14 @@ func (a *aggregator) portAgnostic(id *edgeID, p peer) bool {
 	if id.role == roleServer {
 		return a.ports.portAgnostic(id.process.job(), id.local, id.port, id.proto)
 	}
-	port := id.port
+	server, port := id.peer, id.port
+	if p.server.IsValid() {
+		server = p.server
+	}
 	if p.port != 0 {
 		port = p.port
 	}
-	return a.ports.portAgnostic(p.name, id.peer, port, id.proto)
+	return a.ports.portAgnostic(p.name, server, port, id.proto)
 }
 
 // add accounts a request of a host received at now. If the request closes

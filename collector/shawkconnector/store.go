@@ -549,25 +549,49 @@ WHERE NOT EXISTS (
 INSERT INTO shawk.translations (name, side, proto, addr, port)
 SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::cidr[], $5::integer[])
 ON CONFLICT DO NOTHING`, names, sides, protos, addrs, tports)
-		b.Queue(`DELETE FROM shawk.port_agnostic_services WHERE NOT (service = ANY ($1::text[]))`, services)
-		b.Queue(`
+		if err := tx.SendBatch(ctx, b).Close(); err != nil {
+			return err
+		}
+		changed := int64(0)
+		for _, q := range []struct {
+			sql  string
+			args []any
+		}{
+			{`DELETE FROM shawk.port_agnostic_services WHERE NOT (service = ANY ($1::text[]))`, []any{services}},
+			{`
 INSERT INTO shawk.port_agnostic_services (service)
 SELECT * FROM unnest($1::text[])
-ON CONFLICT DO NOTHING`, services)
-		b.Queue(`
+ON CONFLICT DO NOTHING`, []any{services}},
+			{`
 DELETE FROM shawk.dynamic_ports d
 WHERE NOT EXISTS (
   SELECT FROM unnest($1::text[], $2::text[], $3::cidr[], $4::integer[], $5::integer[]) AS u(name, proto, addr, port_from, port_to)
   WHERE u.name = d.name AND u.proto = d.proto AND u.addr = d.addr AND u.port_from = d.port_from AND u.port_to = d.port_to)`,
-			dnames, dprotos, daddrs, dfrom, dto)
-		b.Queue(`
+				[]any{dnames, dprotos, daddrs, dfrom, dto}},
+			{`
 INSERT INTO shawk.dynamic_ports (name, proto, addr, port_from, port_to)
 SELECT * FROM unnest($1::text[], $2::text[], $3::cidr[], $4::integer[], $5::integer[])
-ON CONFLICT DO NOTHING`, dnames, dprotos, daddrs, dfrom, dto)
-		// The dependencies known under the ports of the rules are known
-		// under port 0 too, so that they are not new under the rules.
-		b.Queue(`SELECT shawk.aggregate_known_dependencies()`)
-		return tx.SendBatch(ctx, b).Close()
+ON CONFLICT DO NOTHING`, []any{dnames, dprotos, daddrs, dfrom, dto}},
+		} {
+			tag, err := tx.Exec(ctx, q.sql, q.args...)
+			if err != nil {
+				return err
+			}
+			changed += tag.RowsAffected()
+		}
+		if changed == 0 {
+			return nil
+		}
+		// The rules changed: the dependencies known on the ports of a new
+		// rule are known on port 0 too, so that they are not new under it,
+		// and known_dependencies is rebuilt from every edge at the next
+		// refresh, so that a dependency on a port of a rule removed, known
+		// on port 0 only meanwhile, is not new either.
+		if _, err := tx.Exec(ctx, `SELECT shawk.aggregate_known_dependencies()`); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `DELETE FROM shawk.known_dependencies_state`)
+		return err
 	})
 }
 
