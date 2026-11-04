@@ -74,7 +74,8 @@ connectors:
     # the others, e.g. for an HPC cluster where the hosts of a service have
     # different roles (docs/design.md, section 5.3). They multiply the
     # series with the hosts each service talks to: measure before enabling
-    # them widely, and restrict them to some local services.
+    # them widely, and restrict them to the dependencies of some services
+    # (at either end). Every connector of a fleet needs the same settings.
     # peer_hosts: true
     # max_peer_hosts: 500                   # per host, service, role and peer service
     # peer_host_services: [slurmctld, prometheus]

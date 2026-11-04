@@ -665,8 +665,12 @@ gets none:
 The latest holders are read from `shawk.host_addrs` with the other names,
 with `peer_hosts` only: the host whose latest period at the address ended
 last, unless another host held the address after that period began (beyond
-3 minutes). An address that left a host whose agent is still alive names
-no host. The names of `peer_cidrs` are ranges, not hosts. Through a
+3 minutes), and that last held it within 30 days, by the time it last
+held it, not as of the load. Until what the connector saw is written and
+read back, the holders it saw itself count too, so that an address that
+moved while PostgreSQL could not be written does not name its former
+holder again once the new one stops. An address that left a host whose
+agent is still alive names no host. The names of `peer_cidrs` are ranges, not hosts. Through a
 translation, `pickBackend()` chooses a representative to name the service,
 not the backend a connection reached, so a virtual address with several
 backends has host `~unknown`; the names of services do not change.
@@ -760,8 +764,13 @@ A TCP client edge has 8 series of the family, a TCP server edge 4, and
 each side of a UDP edge 2, per peer host, plus the failure reasons that
 occurred. `max_peer_hosts` (500) bounds the hosts per host, local service,
 role and peer service, folding the others into `~other`, and
-`peer_host_services` restricts the family to some local services
-(`[namespace/]name`). Neither bounds the total: traffic between all the
+`peer_host_services` restricts the family to the dependencies with one of
+its services (`[namespace/]name`) at either end. Either end, so that both
+sides of a dependency have the family or neither: the rules of §7 leave out
+the server side of a client with an agent, whose client side counts the
+dependency, so a family on the server side only would count nothing.
+Connectors with other settings would break this the same way. Neither
+bound limits the total: traffic between all the
 compute nodes of a cluster costs about 12 series per pair, service and
 port, so measure the label combinations before enabling the family widely.
 A series lives until both idle TTLs pass after its last activity.
