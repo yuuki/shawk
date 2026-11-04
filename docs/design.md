@@ -390,6 +390,17 @@ per packet.
   an interval keeps its name; reads that do not fit the queue are counted in
   `shawk.agent.container_reads.dropped` (alert `ShawkContainerReadsDropped`)
   and retried at export.
+- The processes of Slurm jobs (cgroup v2) are named by the structure of
+  `system.slice/slurmstepd.scope/<job>/<step>/...`, whatever names the job
+  directory (`job_<id>` before Slurm 26.05 or with `CgroupJobIdPaths=yes`,
+  the SLUID otherwise): `user/task_*` is `slurm/batch`, `slurm/step`
+  (`step_<n>`), `slurm/extern` (with the processes `pam_slurm_adopt`
+  adopts) or `slurm/interactive` after the kind of step, and the
+  directory of slurmstepd in a step (`slurm`, `slurm_processes`) and
+  `<scope>/system` are `slurmstepd`. The scope is recognized only in
+  `system.slice` at the root, where users cannot make cgroups; other
+  hierarchies, and cgroup v1, keep the rules above
+  (`internal/procinfo/cgroup.go`).
 - Container names are not trusted blindly. Docker merges image labels into
   container labels, so pod labels are believed only with the container name
   cri-dockerd gives, and Compose labels only with the name Compose gives.
@@ -415,7 +426,10 @@ per packet.
   not known). `-service-name-fallback=unit` uses the unit instead of the
   executable. `service.namespace` comes from `OTEL_RESOURCE_ATTRIBUTES`,
   else the namespace of the pod's service. Both are cut to 255 bytes, since
-  any process sets them and they repeat in every data point.
+  any process sets them and they repeat in every data point. The `OTEL_`
+  variables of the processes of Slurm jobs are not read: any user could
+  name a job `slurmctld`, so they are named after their executable onwards.
+  PostgreSQL keeps these names; Prometheus has them under one `job` (§5.3).
 - The service of a pod is named as OBI names it from API server metadata
   (annotations, `app.kubernetes.io/*` labels, then the top owner; see
   `internal/procinfo/container.go`). The agent does not ask the API server:
@@ -452,7 +466,9 @@ per packet.
   stuck process can hold forever (a stalled FUSE mapping), so reads time out
   and back off, and hung reads are bounded (`internal/procinfo/service.go`). A PID whose comm no longer
   matches the flow is not trusted; a process that exits before it is read
-  takes the latest identity seen for the same unit and comm.
+  takes the latest identity seen for the same unit and comm, and for the
+  processes of Slurm jobs, whose units every job of every user shares, the
+  same cgroup (step) too.
 - The host is identified by `host.id` (`/etc/machine-id`, else
   `/var/lib/dbus/machine-id`) and `host.name`. PostgreSQL keys a host by
   the hash of both, so VMs cloned with the same machine id stay apart.
@@ -667,6 +683,11 @@ the host name; `host.id` and `host.name` are promoted to labels.
   fold into `~other`, while PostgreSQL keeps them apart. Agent-chosen names
   are cut to 255 bytes (`service.peer.name` to 511). `keep_peer_address`
   keeps `network.peer.address` when really needed.
+- The processes of Slurm jobs (units `slurm/*`, §4.1) are forwarded under
+  `job="slurm-job"`, which takes one place of `max_services`, so that
+  every executable of every job does not become a `job`. PostgreSQL keeps
+  their names; the series from the agent are still keyed by executable,
+  bounded by its idle TTL.
 - Inputs are cumulative per peer address and outputs merge several, so the
   connector adds the increases of each input to its output, treating a
   decrease or new start time as a reset; an output never decreases when an
