@@ -648,6 +648,31 @@ fold peers in a range of `peer_cidrs`. When both agents fold the other
 side, nothing tells and nothing is logged. Each folding host is logged at
 most once an hour; the connector has no metrics of its own.
 
+With `peer_hosts` (§5.3) a peer also gets a host, `shawk.peer.host`. A host
+takes stronger evidence than a service, so a peer whose host is not certain
+gets none:
+
+| peer | `shawk.peer.host` |
+|---|---|
+| loopback, or an address several live hosts hold, this one included | the host itself |
+| an address the inventory maps to one host (not implemented yet, #175) | that host |
+| an address one live host holds alone | that host |
+| an address no live host holds, whose latest holder held it alone within 30 days and whose agent has stopped since | that host, so that failures towards a host that is down are named |
+| otherwise, private address | `~unknown` |
+| otherwise, public address; or folded | `~external` |
+| a virtual address of a translation that no service of its own names | the host of its backend if the translation has one backend, a single address, or learned translations sent the client to one address; `~unknown` otherwise |
+
+The latest holders are read from `shawk.host_addrs` with the other names,
+with `peer_hosts` only: the host whose latest period at the address ended
+last, unless another host held the address after that period began (beyond
+3 minutes). An address that left a host whose agent is still alive names
+no host. The names of `peer_cidrs` are ranges, not hosts. Through a
+translation, `pickBackend()` chooses a representative to name the service,
+not the backend a connection reached, so a virtual address with several
+backends has host `~unknown`; the names of services do not change.
+`shawk.peer.agent` keeps its meaning: knowing the host of a peer does not
+mean that its agent records the other side.
+
 ### 5.3 Metrics to Prometheus
 
 Edge metrics are reduced to `service.peer.name`, `shawk.peer.agent`,
@@ -713,7 +738,35 @@ the host name; `host.id` and `host.name` are promoted to labels.
 | `shawk_agent_*` | agents |
 
 A TCP client dependency thus has 13 series, plus one per failure reason
-that occurred. Prometheus needs `--web.enable-otlp-receiver`,
+that occurred.
+
+The outputs above reduce a peer to its service, which treats the hosts of
+one service as interchangeable; in an HPC cluster they are not (nfs01
+exports /home and nfs02 /scratch, and the `slurmd` of every compute node are
+one `slurmd`). `peer_hosts: true` adds a separate family whose series carry
+`shawk.peer.host` (§5.2) besides the attributes above; the outputs above,
+their labels and the rules over them do not change:
+
+| Prometheus name | sides |
+|---|---|
+| `shawk_host_connection_opened_total` | client, server |
+| `shawk_host_connection_failed_by_reason_total{error_type}` | client, reasons that occurred |
+| `shawk_host_tcp_handshake_seconds_sum`, `_count`, `_bucket{le="+Inf"}` | client |
+| `shawk_host_tcp_syn_retransmits_total` | client |
+| `shawk_host_network_io_bytes_total` | client, server |
+| `shawk_host_tcp_retransmits_total` | client, server |
+
+A TCP client edge has 8 series of the family, a TCP server edge 4, and
+each side of a UDP edge 2, per peer host, plus the failure reasons that
+occurred. `max_peer_hosts` (500) bounds the hosts per host, local service,
+role and peer service, folding the others into `~other`, and
+`peer_host_services` restricts the family to some local services
+(`[namespace/]name`). Neither bounds the total: traffic between all the
+compute nodes of a cluster costs about 12 series per pair, service and
+port, so measure the label combinations before enabling the family widely.
+A series lives until both idle TTLs pass after its last activity.
+
+Prometheus needs `--web.enable-otlp-receiver`,
 `otlp.promote_resource_attributes: [host.id, host.name]` and a 30-minute
 out-of-order window.
 
@@ -928,10 +981,29 @@ the relay, while the clients that run an agent count theirs. Each
 dependency is counted right, but the sum into the server counts those
 clients twice, since the server cannot tell its clients apart.
 
+The family per peer host (§5.3) is counted once the same way, per metric,
+by `shawk:host_dependency_…{src_host, src, dst_host, dst, server_port,
+network_transport}`: `src_host` is the host of the client and `dst_host`
+that of the server, on the client side its `instance` (the host name) and
+its `shawk_peer_host`, on the server side the other way round.
+
+| metric | per dependency | recording rules (`shawk:host_dependency_…`) |
+|---|---|---|
+| connections, bytes | the client side; the server side only when the client has no agent | `connections:rate5m`, `request_bytes:rate5m`, `response_bytes:rate5m` |
+| failures by reason, handshakes, SYN retransmissions | the client side only | `connection_failures_by_reason:rate5m`, `handshake_seconds_sum:rate5m`, `handshake_seconds_count:rate5m`, `syn_retransmits:rate5m` |
+| retransmissions | both sides; `shawk_role` is the sender | `retransmits:rate5m` |
+
+The exception above remains: behind a translation with sources, the server
+side also counts the clients that run an agent.
+
 ## 8. Grafana
 
 `packaging/grafana` holds data sources, dashboards (fleet, dependency map,
-dependency details, changes, application layer of OBI) and alert rules.
+dependency details, peer hosts, changes, application layer of OBI) and
+alert rules. The peer hosts dashboard needs `peer_hosts` (§5.3): the hosts
+towards the selected services, and failures, connect times and traffic by
+peer host; a host that accepts no connection, such as one that is down,
+shows a failure ratio of 100%.
 
 PostgreSQL alerts use the time series format, with every row at `now()` so
 each series has a value at the last time; a query that finds nothing
@@ -947,9 +1019,9 @@ alerted by Prometheus (`ShawkAgentDown`) for 24 hours, then from
 `shawk_v1.agents` for 30 days, labelled with the host id; a host
 reinstalled under the same name and alive is not alerted.
 
-The fleet, dependency details and changes dashboards overlay the periods
-from `unobserved()` and `partly_observed()` as annotations, so the absence
-of a dependency is not read as disuse over them. SYN retransmissions
+The fleet, dependency details, peer hosts and changes dashboards overlay
+the periods from `unobserved()` and `partly_observed()` as annotations, so
+the absence of a dependency is not read as disuse over them. SYN retransmissions
 per connection attempt (handshakes plus failures) exceed 1 when connects
 time out, and `TCP_FASTOPEN_CONNECT` connects, which have no handshake,
 raise them. OBI panels use a minimum interval of a minute, since OBI
