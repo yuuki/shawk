@@ -462,6 +462,10 @@ per packet.
 - The host is identified by `host.id` (`/etc/machine-id`, else
   `/var/lib/dbus/machine-id`) and `host.name`. PostgreSQL keys a host by
   the hash of both, so VMs cloned with the same machine id stay apart.
+  A node whose machine id changes at every boot (a stateless node with an
+  empty `/etc/machine-id`) becomes a new host each time; provisioning gives
+  each node a stable one (`packaging/README.md`), and
+  `unobserved_by_name()` (§6.2) computes gaps over all the hosts of a name.
 
 ### 4.2 What is sent
 
@@ -1044,6 +1048,7 @@ match.
 | `agent_addrs` | addresses of hosts whose agent closed an interval in the last 5 minutes, with what the agent traces and folds; used by the connector |
 | `agents` | the latest segment of every host and whether its agent is alive; the last columns, `peer_fold` and `peer_internal`, tell what the agent folds and the ranges it keeps exact |
 | `unobserved(since, until, tolerance)` | the periods in which each host was not observed; Grafana overlays them as annotations |
+| `unobserved_by_name(since, until, tolerance)` | the same over the sessions of all the host ids of each host name, for nodes whose machine id changed (§4.1), where `unobserved()` reports the time after the last heartbeat of each old id; two machines that share a name hide each other's gaps |
 | `never_observed()` | the hosts of the inventory (§5.6) expected to run an agent whose agent never reported within the retention (no host has their name): `host`, `slurm_node`, `roles`, and `seen_as`, the hosts whose agents reported an address of the host, as an agent whose `host.name` differs from the inventory would |
 | `inventory`, `inventory_addrs` | the hosts of the inventory with their addresses (`host`, `slurm_node`, `roles`, `agent`, `addrs`), and one row per address with its host: join an address on `addr` to name its host |
 | `inventory_status` | when the inventory was last read from a valid file (`read_at`, NULL if never), the latest failure since (`failed_at`, `error`), and how many hosts it has; no row before a connector with `inventory_file` read it |
@@ -1217,6 +1222,14 @@ only the protocols it parses. shawk runs beside it:
   `sk_user_data` (e.g. in a BPF sockmap) held by a process in another PID
   namespace is taken for the kernel's; run the agent in the host PID
   namespace.
+- **Machine ids that change at every boot** (§4.1) make a new host per
+  boot: `unobserved()` reports false gaps for the old ids, which
+  `unobserved_by_name()` does not, and `host_id` changes in Prometheus. The
+  host key stays the hash of the machine id and the name: keying by the
+  name would need a migration of the hosts, sessions and processes, and
+  would affect `host_id`, OBI's `host.id` and `host_identity: certificate`.
+  Host names are not rewritten either (a domain dropped to match a Slurm
+  `NodeName`): names could collide and certificates stop matching.
 - **Flow table capacity**: when more distinct flows than `-max-flows` occur
   in one interval, updates are dropped and counted in
   `shawk.agent.flows.dropped`, and the period is partly observed
