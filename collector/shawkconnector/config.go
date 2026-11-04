@@ -37,8 +37,10 @@ type Config struct {
 	// MaxPeerHosts bounds the values of shawk.peer.host per host, local
 	// service, role and peer service; the others are folded into ~other.
 	MaxPeerHosts int `mapstructure:"max_peer_hosts"`
-	// PeerHostServices, if set, restricts the family per peer host to these
-	// local services ([namespace/]name, as service.peer.name names them).
+	// PeerHostServices, if set, restricts the family per peer host to the
+	// dependencies with one of these services ([namespace/]name, as
+	// service.peer.name names them) at either end, so that both sides of a
+	// dependency have it or neither.
 	PeerHostServices []string `mapstructure:"peer_host_services"`
 	// Retention is how long rows are kept in PostgreSQL after they were
 	// last seen; zero keeps them forever. The connector deletes older rows

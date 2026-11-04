@@ -171,11 +171,11 @@ func TestPeerHostEvidence(t *testing.T) {
 		},
 		former: []formerHolderRow{
 			// node-03 is down.
-			{addr: addrOf("10.0.2.3"), formerHolder: formerHolder{host: "id-node-03", name: "node-03"}},
+			{addr: addrOf("10.0.2.3"), formerHolder: formerHolder{host: "id-node-03", name: "node-03", lastSeen: now.Add(-24 * time.Hour)}},
 			// The address left node-02, whose agent is alive.
-			{addr: addrOf("10.0.2.4"), formerHolder: formerHolder{host: "id-node-02", name: "node-02"}},
+			{addr: addrOf("10.0.2.4"), formerHolder: formerHolder{host: "id-node-02", name: "node-02", lastSeen: now.Add(-24 * time.Hour)}},
 			// A former holder of an address node-01 holds now.
-			{addr: addrOf("10.0.2.1"), formerHolder: formerHolder{host: "id-node-09", name: "node-09"}},
+			{addr: addrOf("10.0.2.1"), formerHolder: formerHolder{host: "id-node-09", name: "node-09", lastSeen: now.Add(-24 * time.Hour)}},
 		},
 	}, now)
 	host := func(self, peer string) string {
@@ -291,32 +291,85 @@ func TestPeerHostLearned(t *testing.T) {
 }
 
 // TestPeerHostBounds: max_peer_hosts folds further hosts into ~other, and
-// peer_host_services restricts the family to some local services.
+// peer_host_services restricts the family to the dependencies with one of
+// its services at either end, so that both sides of each have it: the
+// client slurmctld is not in the list, but its edges to slurmd are.
 func TestPeerHostBounds(t *testing.T) {
 	c, _, sink, _ := testConnector(t, func(cfg *Config) {
 		cfg.PeerHosts = true
 		cfg.MaxPeerHosts = 1
-		cfg.PeerHostServices = []string{"slurmctld"}
+		cfg.PeerHostServices = []string{"slurmd"}
 	})
-	ctl, n1, n2 := slurmAgents(t0.Add(15 * time.Second))
+	ts := t0.Add(15 * time.Second)
+	ctl, n1, n2 := slurmAgents(ts)
 	consume(t, c, sink, n1)
-	out := consume(t, c, sink, n2)
-	if got := hostsOf(out, metricHostConnOpened, "slurmd", "*", ""); len(got) != 0 {
-		t.Errorf("a local service outside peer_host_services: %v", got)
-	}
-	out = consume(t, c, sink, ctl)
+	consume(t, c, sink, n2)
+	out := consume(t, c, sink, ctl)
+	// The order of the hosts in a request decides which one is kept.
 	got := hostsOf(out, metricHostConnOpened, "slurmctld", roleClient, "")
-	var slurmd []string
-	for k := range got {
-		if k == "node-01 slurmd" || k == "node-02 slurmd" || k == "~other slurmd" {
-			slurmd = append(slurmd, k)
-		}
+	if len(got) != 2 || got["~other slurmd"] == 0 || got["node-01 slurmd"]+got["node-02 slurmd"] == 0 {
+		t.Errorf("client side with max_peer_hosts 1 = %v", got)
 	}
-	if len(slurmd) != 2 || got["~other slurmd"] == 0 {
-		t.Errorf("max_peer_hosts 1: %v", got)
+	// The next interval of node-01, now that its client is known.
+	n1.time = ts.Add(15 * time.Second)
+	n1.edges[0].opened = 6
+	out = consume(t, c, sink, n1)
+	// The connections accepted before the client was known stay with no
+	// host; the local service slurmd is in the list.
+	if got, want := hostsOf(out, metricHostConnOpened, "slurmd", roleServer, ""),
+		map[string]float64{"ctl-01 slurmctld": 2, "~unknown ~unresolved": 4}; !maps.Equal(got, want) {
+		t.Errorf("server side = %v, want %v", got, want)
 	}
-	if got["~external ~external"] != 1 {
-		t.Errorf("another peer service has its own bound: %v", got)
+}
+
+// TestPeerHostFormerHolderExpires: a former holder read from PostgreSQL
+// names the address for 30 days after it last held it, also while
+// PostgreSQL cannot be read again.
+func TestPeerHostFormerHolderExpires(t *testing.T) {
+	now := t0
+	r := newResolver(nil, nil)
+	r.peerHosts = true
+	r.load(peerRows{former: []formerHolderRow{{addr: addrOf("10.0.2.3"),
+		formerHolder: formerHolder{host: "id-node-03", name: "node-03", lastSeen: now.Add(-formerHolderWindow + time.Hour)}}}}, now)
+	host := func(at time.Time) string {
+		p := r.peer("id-ctl-01", &edgeID{role: roleClient, proto: "tcp", local: addrOf("10.0.0.1"), peer: addrOf("10.0.2.3"), port: 6818}, at)
+		return p.host
+	}
+	if got := host(now); got != "node-03" {
+		t.Errorf("within 30 days: %s", got)
+	}
+	if got := host(now.Add(2 * time.Hour)); got != hostUnknown {
+		t.Errorf("30 days after, without a new load: %s", got)
+	}
+}
+
+// TestPeerHostLocalMove: an address that moved to another host while
+// PostgreSQL could not be written names that host, not the former holder
+// PostgreSQL knows, once the new holder stops too; until it is written and
+// read back.
+func TestPeerHostLocalMove(t *testing.T) {
+	c, _, sink, now := testConnector(t, func(cfg *Config) { cfg.PeerHosts = true })
+	c.resolver.load(peerRows{former: []formerHolderRow{{addr: addrOf("10.0.2.3"),
+		formerHolder: formerHolder{host: hostKey("", "node-03"), name: "node-03", lastSeen: now.Add(-24 * time.Hour)}}}}, *now)
+	id := &edgeID{role: roleClient, proto: "tcp", local: addrOf("10.0.0.1"), peer: addrOf("10.0.2.3"), port: 6818}
+	host := func() string { return c.resolver.peer(hostKey("", "ctl-01"), id, *now).host }
+	if got := host(); got != "node-03" {
+		t.Fatalf("before the move: %s", got)
+	}
+	consume(t, c, sink, tAgent{host: "node-13", addrs: []string{"10.0.2.3"}, time: *now})
+	if got := host(); got != "node-13" {
+		t.Errorf("the live holder: %s", got)
+	}
+	// node-13 stops.
+	*now = now.Add(10 * time.Minute)
+	c.resolver.expire(now.Add(-c.cfg.IdleTTL), *now)
+	if got := host(); got != "node-13" {
+		t.Errorf("after the new holder stopped: %s", got)
+	}
+	// Written, and read back without it: PostgreSQL is the truth again.
+	c.resolver.forgetHeld(*now)
+	if got := host(); got != "node-03" {
+		t.Errorf("after the write: %s", got)
 	}
 }
 

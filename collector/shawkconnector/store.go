@@ -669,7 +669,7 @@ latest AS (
   FROM p
   ORDER BY addr, last_seen DESC, host_id
 )
-SELECT host(l.addr), l.host_id, h.hostname
+SELECT host(l.addr), l.host_id, h.hostname, l.last_seen
 FROM latest l
 JOIN shawk.hosts h ON h.id = l.host_id
 WHERE NOT EXISTS (
@@ -679,7 +679,7 @@ WHERE NOT EXISTS (
 		func(rows pgx.Rows) error {
 			var addr string
 			var f formerHolderRow
-			if err := rows.Scan(&addr, &f.host, &f.name); err != nil {
+			if err := rows.Scan(&addr, &f.host, &f.name, &f.lastSeen); err != nil {
 				return err
 			}
 			if a, err := netip.ParseAddr(addr); err == nil {

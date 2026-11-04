@@ -190,7 +190,8 @@ type aggregator struct {
 	peers map[peerGroup]map[string]time.Time
 
 	// peerHosts tells whether the outputs per peer host are made, for the
-	// local services peerHostServices ([namespace/]name; nil for all).
+	// dependencies with one of peerHostServices ([namespace/]name; nil for
+	// all) at either end.
 	// peerHostsUsed are the values of shawk.peer.host in use per group,
 	// with when they were last used: at most maxPeerHosts.
 	peerHosts        bool
@@ -221,8 +222,8 @@ func newAggregator(ttl time.Duration, maxPeers, maxServices int, keepPeerAddr bo
 	}
 }
 
-// setPeerHosts makes the outputs per peer host, for the local services
-// services, or every local service if services is empty.
+// setPeerHosts makes the outputs per peer host, for the dependencies with
+// one of services at either end, or every dependency if services is empty.
 func (a *aggregator) setPeerHosts(maxPeerHosts int, services []string) {
 	a.peerHosts, a.maxPeerHosts = true, maxPeerHosts
 	a.peerHostsUsed = map[peerHostGroup]map[string]time.Time{}
@@ -234,17 +235,19 @@ func (a *aggregator) setPeerHosts(maxPeerHosts int, services []string) {
 	}
 }
 
-// peerHostsOf tells whether the outputs of a local service have outputs
-// per peer host.
-func (a *aggregator) peerHostsOf(k svcKey) bool {
+// peerHostsOf tells whether the edges of a local service ([namespace/]name)
+// to a peer service have outputs per peer host: whether either is in
+// peer_host_services. Both sides of a dependency then have them, as the
+// recording rules expect: they leave out the server side of a client with
+// an agent (shawk.peer.agent), whose client side counts the dependency.
+func (a *aggregator) peerHostsOf(local, peer string) bool {
 	if !a.peerHosts {
 		return false
 	}
 	if a.peerHostServices == nil {
 		return true
 	}
-	p := process{service: k.service, svcNS: k.svcNS}
-	return a.peerHostServices[p.job()]
+	return a.peerHostServices[local] || a.peerHostServices[peer]
 }
 
 // peerHost returns the value of shawk.peer.host to use, folding hosts
@@ -331,9 +334,12 @@ func (a *aggregator) add(b *hostBatch, peerOf func(*edgeID) peer, now time.Time,
 		}
 		p := peerOf(&e.id)
 		g := peerGroup{b.key, sk.service, sk.svcNS, e.id.role}
-		name := a.peer(g, cutLabel(p.name, maxPeerName), now)
+		peerName := cutLabel(p.name, maxPeerName)
+		name := a.peer(g, peerName, now)
 		var peerHost string
-		if a.peerHostsOf(sk) {
+		// The name of the process, not that of its outputs, which may be
+		// ~other beyond max_services or max_peers.
+		if a.peerHostsOf(e.id.job(), peerName) {
 			peerHost = p.host
 			if p.self {
 				peerHost = b.hostname

@@ -192,6 +192,14 @@ type resolver struct {
 	// PostgreSQL with peer_hosts only.
 	dbFormer map[netip.Addr]formerHolder
 	dbNames  map[string]string // host id -> name, of dbFormer
+	// localHeld are the hosts this connector saw holding addresses, with
+	// when, with peer_hosts only, until they are written to PostgreSQL and
+	// read back into dbFormer (forgetHeld): while the database cannot be
+	// written or read, an address that moved to another host does not name
+	// its former holder again once the new one stops. localNames are the
+	// names of their hosts.
+	localHeld  map[netip.Addr]map[string]time.Time
+	localNames map[string]string
 }
 
 // formerHolderWindow is how long after a host last held an address the
@@ -203,6 +211,9 @@ const formerHolderWindow = 30 * 24 * time.Hour
 // formerHolderWindow, while no other host held it.
 type formerHolder struct {
 	host, name string
+	// lastSeen is when it last held the address, by the clock of the
+	// database.
+	lastSeen time.Time
 }
 
 // rangeKey is a range of addresses of backends, on a port.
@@ -242,6 +253,8 @@ func newResolver(cidrs []namedPrefix, translations []translation) *resolver {
 		localLearnedServers: map[learnedServerKey]map[learnedClient]time.Time{},
 		localServed:         map[clientKey]map[endpoint]time.Time{},
 		inferred:            map[string]int{},
+		localHeld:           map[netip.Addr]map[string]time.Time{},
+		localNames:          map[string]string{},
 	}
 }
 
@@ -423,6 +436,40 @@ func (r *resolver) learn(b *hostBatch, now time.Time) {
 	}
 	r.localAgents[b.key] = agentHost{seen: now, udpTraced: b.udpTraced, name: b.hostname,
 		fold: b.peerFold, internal: b.peerInternal}
+	if r.peerHosts {
+		for _, a := range b.addrs {
+			learnTimed(r.localHeld, a, b.key, now)
+		}
+		r.localNames[b.key] = b.hostname
+	}
+}
+
+// forgetHeld forgets the holders of addresses seen before t, once what was
+// seen then has been written to PostgreSQL and read back.
+func (r *resolver) forgetHeld(t time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	expireLearned(r.localHeld, t)
+	r.forgetNames()
+}
+
+// forgetNames forgets the names of hosts that hold no address in
+// localHeld. r.mu is held.
+func (r *resolver) forgetNames() {
+	if len(r.localNames) == 0 {
+		return
+	}
+	held := map[string]bool{}
+	for _, hs := range r.localHeld {
+		for h := range hs {
+			held[h] = true
+		}
+	}
+	for h := range r.localNames {
+		if !held[h] {
+			delete(r.localNames, h)
+		}
+	}
 }
 
 // infer learns an endpoint inferred from a listener on an unspecified
@@ -479,6 +526,8 @@ func (r *resolver) expire(t, now time.Time) {
 	expireLearned(r.localLearnedServers, t)
 	expireLearned(r.localServed, t)
 	expireLearned(r.localAddrs, now.Add(-aliveWindow))
+	expireLearned(r.localHeld, now.Add(-formerHolderWindow))
+	r.forgetNames()
 	for h, a := range r.localAgents {
 		if a.seen.Before(now.Add(-aliveWindow)) {
 			delete(r.localAgents, h)
@@ -690,15 +739,52 @@ func (r *resolver) addrHost(host string, a netip.Addr, now time.Time) (string, b
 	// The latest holder, if its agent stopped since, so that failures
 	// towards a host that is down are named. An address that left a host
 	// whose agent is alive is no longer that host's.
-	if f, ok := r.dbFormer[a]; ok {
-		if _, alive := r.agent(f.host, now); !alive && f.host != host {
-			return f.name, false
+	if h, ok := r.formerHolder(a, now); ok && h != host {
+		if _, alive := r.agent(h, now); !alive {
+			return r.hostName(h), false
 		}
 	}
 	if isPrivate(a) {
 		return hostUnknown, false
 	}
 	return hostExternal, false
+}
+
+// formerHolder returns the latest host that held an address within
+// formerHolderWindow, from PostgreSQL and from what this connector saw
+// since its latest write, unless another host held it within shareWindow
+// of that. r.mu is held.
+func (r *resolver) formerHolder(a netip.Addr, now time.Time) (string, bool) {
+	held := map[string]time.Time{}
+	add := func(h string, t time.Time) {
+		if !t.Before(now.Add(-formerHolderWindow)) && t.After(held[h]) {
+			held[h] = t
+		}
+	}
+	if f, ok := r.dbFormer[a]; ok {
+		// Not aged as of the load like the other times read from
+		// PostgreSQL: the window ends 30 days after the host last held the
+		// address, also while the database cannot be read.
+		add(f.host, f.lastSeen)
+	}
+	for h, t := range r.localHeld[a] {
+		add(h, t)
+	}
+	var latest string
+	for h, t := range held {
+		if latest == "" || t.After(held[latest]) || t.Equal(held[latest]) && h < latest {
+			latest = h
+		}
+	}
+	if latest == "" {
+		return "", false
+	}
+	for h, t := range held {
+		if h != latest && !t.Before(held[latest].Add(-shareWindow)) {
+			return "", false
+		}
+	}
+	return latest, true
 }
 
 // translatedHost returns the host of the peer of a client edge of host to a
@@ -743,6 +829,9 @@ func (r *resolver) hostName(h string) string {
 	}
 	if a, ok := r.dbAgents[h]; ok && a.name != "" {
 		return a.name
+	}
+	if n, ok := r.localNames[h]; ok {
+		return n
 	}
 	if n, ok := r.dbNames[h]; ok {
 		return n

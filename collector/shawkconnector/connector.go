@@ -42,6 +42,9 @@ type shawkConnector struct {
 	translations []translation
 
 	lastPrune, lastRefresh time.Time
+	// written is when the latest write that took every pending change
+	// started: what was seen before it is in PostgreSQL.
+	written time.Time
 
 	// Errors of the pipeline after the connector, logged at most once a
 	// minute.
@@ -177,6 +180,14 @@ func (c *shawkConnector) prepare(ctx context.Context) bool {
 		return true
 	}
 	c.resolver.load(rows, at)
+	c.mu.Lock()
+	written := c.written
+	c.mu.Unlock()
+	if !written.IsZero() {
+		// The holders of addresses seen before the latest write are read
+		// back from PostgreSQL now.
+		c.resolver.forgetHeld(written)
+	}
 	return true
 }
 
@@ -243,9 +254,14 @@ func (c *shawkConnector) loop(ctx context.Context) {
 			// Writes and the reload of peers have their own deadlines, so
 			// that a slow write does not stop the names from being reloaded.
 			wctx, cancel := context.WithTimeout(ctx, c.cfg.WriteInterval)
+			started := c.now()
 			written := c.prepareSchemaOnly(wctx) && c.flush(wctx)
 			cancel()
-			if !written {
+			if written {
+				c.mu.Lock()
+				c.written = started
+				c.mu.Unlock()
+			} else {
 				c.boundPending()
 			}
 			rctx, cancel := context.WithTimeout(ctx, c.cfg.WriteInterval)
