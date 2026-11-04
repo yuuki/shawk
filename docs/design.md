@@ -198,11 +198,11 @@ socket-activated service is preferred to systemd, and a parent to its
 workers (`internal/tracer/owner.go`). A listener that appears or disappears
 requests an owner scan, so a restarted service is attributed at once.
 
-**Sockets of the kernel.** The clients of NFS, iSCSI, CIFS and Ceph,
-nfsd and DRBD hold sockets without a process. They matter before a server
-is decommissioned (a mounted NFS export), but connect from a kernel worker
-or whichever process triggered them, so comm and cgroup change between
-reconnections. A connecting socket is the kernel's when `sk_kern_sock` is
+**Sockets of the kernel.** The clients of NFS, iSCSI, CIFS, Ceph and
+BeeGFS, nfsd, DRBD and Lustre's LNet hold sockets without a process. They
+matter before a server is decommissioned (a mounted NFS export), but
+connect from a kernel worker or whichever process triggered them, so comm
+and cgroup change between reconnections. A connecting socket is the kernel's when `sk_kern_sock` is
 set and it is not an orphan (MPTCP subflows and SMC's TCP socket excepted);
 it gets comm `~kernel` and cgroup id 0. A listener is the kernel's when no
 process held it at the last scan and the kernel may hold it; incoming
@@ -440,10 +440,14 @@ per packet.
   `~kernel:rpcbind` (111), `~kernel:smb` (139, 445), `~kernel:iscsi`
   (3260), `~kernel:ceph` (3300, 6789, 6800-7300), `~kernel:nvme-tcp` (4420,
   8009), `~kernel:drbd` (7788-7799), `~kernel:ocfs2` (7777), `~kernel:rds`
-  (16385), `~kernel:dlm` (21064), and `~kernel` otherwise. Kernel servers
-  are named apart so that a dependency has two ends: `~kernel:nfsd` (2049),
-  `~kernel:ksmbd` (445), `~kernel:iscsi-target` (3260, LIO),
-  `~kernel:nvmet-tcp` (4420, 8009). Names start with `~`, which
+  (16385), `~kernel:dlm` (21064), `~kernel:lnet` (988, Lustre over TCP),
+  `~kernel:beegfs` (8003, 8005 and 8008 of the daemons, 8004, the client's
+  UDP port), and `~kernel` otherwise. The BeeGFS daemons are processes and
+  keep their names; the nodes of LNet connect to each other in both
+  directions, so it has one name for both sides, as DRBD and OCFS2. Kernel
+  servers are named apart so that a dependency has two ends:
+  `~kernel:nfsd` (2049), `~kernel:ksmbd` (445), `~kernel:iscsi-target`
+  (3260, LIO), `~kernel:nvmet-tcp` (4420, 8009). Names start with `~`, which
   `peer_cidrs` names cannot, and have no `/`, which would read as a
   namespace in the `job`. The socket's callbacks would tell more, but
   mapping them to names needs `/proc/kallsyms` with `CAP_SYSLOG`, which the
@@ -1015,8 +1019,10 @@ only the protocols it parses. shawk runs beside it:
 - **Sockets of the kernel** are named after their port (§4.1), so a
   subsystem on another's port is named after that one, and one on an
   unlisted port is `~kernel`; NFSv3 also talks to `lockd` and `mountd` on
-  ports rpcbind assigns. A socket created by a process and then held by the
-  kernel alone (an `nbd` or iSCSI connection whose process exited) is not
+  ports rpcbind assigns. Ports set in configuration are not read: LNet
+  with another `accept_port`, or BeeGFS with other `conn*Port`s, is
+  `~kernel`. A socket created by a process and then held by the kernel
+  alone (an `nbd` or iSCSI connection whose process exited) is not
   the kernel's: adopted at startup it is not attributed. A listener with
   `sk_user_data` (e.g. in a BPF sockmap) held by a process in another PID
   namespace is taken for the kernel's; run the agent in the host PID

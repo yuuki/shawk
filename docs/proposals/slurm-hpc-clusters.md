@@ -354,8 +354,11 @@ not observed.
   from either side, and `kernelPorts` does not list it, so these sockets
   are `~kernel`. Port 988 becomes `~kernel:lnet`, one name for both sides
   as for DRBD and OCFS2.
-- **BeeGFS.** Its client is a kernel module, so its sockets may be the
-  kernel's too; to be checked.
+- **BeeGFS.** Its client is a kernel module that creates its sockets with
+  `sock_create_kern()` (`StandardSocket.c`), so they are the kernel's:
+  `~kernel:beegfs` for the ports of the daemons (8003 storage, 8005
+  metadata, 8008 management) and the client's UDP port (8004). The daemons
+  are processes and keep their names.
 
 ## What does not change
 
