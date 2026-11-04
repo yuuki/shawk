@@ -364,13 +364,18 @@ const KernelService = "~kernel"
 var kernelPorts = map[uint16]string{
 	111:   KernelService + ":rpcbind", // the portmapper, e.g. for NFSv3 and lockd
 	139:   KernelService + ":smb",
-	445:   KernelService + ":smb", // the CIFS/SMB client
-	2049:  KernelService + ":nfs", // the NFS client
+	445:   KernelService + ":smb",  // the CIFS/SMB client
+	988:   KernelService + ":lnet", // Lustre LNet over TCP (socklnd), either side
+	2049:  KernelService + ":nfs",  // the NFS client
 	3260:  KernelService + ":iscsi",
 	3300:  KernelService + ":ceph", // monitors (msgr2)
 	4420:  KernelService + ":nvme-tcp",
 	6789:  KernelService + ":ceph", // monitors (msgr1)
 	7777:  KernelService + ":ocfs2",
+	8003:  KernelService + ":beegfs",   // BeeGFS: the client to the storage daemons
+	8004:  KernelService + ":beegfs",   // the UDP port of the client
+	8005:  KernelService + ":beegfs",   // the client to the metadata daemons
+	8008:  KernelService + ":beegfs",   // the client to the management daemon
 	8009:  KernelService + ":nvme-tcp", // discovery
 	16385: KernelService + ":rds",
 	21064: KernelService + ":dlm",
@@ -379,7 +384,8 @@ var kernelPorts = map[uint16]string{
 // kernelServers names the servers of the kernel apart from its clients on
 // the same port, so that a dependency of a client on a server of the
 // kernel has two ends. The subsystems not listed here are clients only
-// (Ceph) or peers of one another (DRBD, OCFS2, DLM), and have one name.
+// (Ceph; BeeGFS, whose daemons are processes) or peers of one another
+// (DRBD, OCFS2, DLM, LNet), and have one name.
 var kernelServers = map[uint16]string{
 	445:  KernelService + ":ksmbd",
 	2049: KernelService + ":nfsd",
