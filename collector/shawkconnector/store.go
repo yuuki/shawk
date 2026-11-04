@@ -33,9 +33,12 @@ type store interface {
 	// been created, and errDevelopmentSchema for a schema created before
 	// the migrations were consolidated.
 	schemaVersion(ctx context.Context) (int, error)
-	// syncConfig replaces the named address ranges of peers and the
-	// translations of addresses.
-	syncConfig(ctx context.Context, cidrs []namedPrefix, ts []translation) error
+	// syncConfig replaces the named address ranges of peers, the
+	// translations of addresses and the rules of ports.
+	syncConfig(ctx context.Context, cidrs []namedPrefix, ts []translation, ports *portRules) error
+	// portRuleKeys reads the rules of ports in PostgreSQL, as keys() makes
+	// them.
+	portRuleKeys(ctx context.Context) ([]string, error)
 	// syncInventory writes the inventory read at readAt, unless PostgreSQL
 	// holds the same contents, and records when it was read.
 	syncInventory(ctx context.Context, inv *inventory, readAt time.Time) error
@@ -509,17 +512,18 @@ func (s *pgStore) schemaVersion(ctx context.Context) (int, error) {
 }
 
 // configLock is the key of the advisory lock that serializes the writes of
-// the configuration of connectors (peer_cidrs, translations): without it,
-// two connectors that write different ones at once both delete the rows of
-// before and insert their own, and the tables hold the rows of both.
+// the configuration of connectors (peer_cidrs, translations, the rules of
+// ports): without it, two connectors that write different ones at once both
+// delete the rows of before and insert their own, and the tables hold the
+// rows of both.
 const configLock = 0x73686179 // "shay"
 
-// syncConfig replaces the named address ranges of peers and the
-// translations in one transaction, keeping the rows that stay, so that the
-// views see either the old rows or the new ones. It runs in READ COMMITTED,
-// whatever the default of the database, so that the statements after the
-// lock see what a connector that held it before wrote.
-func (s *pgStore) syncConfig(ctx context.Context, cidrs []namedPrefix, ts []translation) error {
+// syncConfig replaces the named address ranges of peers, the translations
+// and the rules of ports in one transaction, keeping the rows that stay, so
+// that the views see either the old rows or the new ones. It runs in READ
+// COMMITTED, whatever the default of the database, so that the statements
+// after the lock see what a connector that held it before wrote.
+func (s *pgStore) syncConfig(ctx context.Context, cidrs []namedPrefix, ts []translation, ports *portRules) error {
 	prefixes := make([]string, 0, len(cidrs))
 	cidrNames := make([]string, 0, len(cidrs))
 	for _, c := range cidrs {
@@ -527,13 +531,27 @@ func (s *pgStore) syncConfig(ctx context.Context, cidrs []namedPrefix, ts []tran
 		cidrNames = append(cidrNames, c.name)
 	}
 	var names, sides, protos, addrs []string
-	var ports []int32
+	var tports []int32
 	for _, r := range translationRows(ts) {
 		names = append(names, r.name)
 		sides = append(sides, r.side)
 		protos = append(protos, r.proto)
 		addrs = append(addrs, r.prefix.String())
-		ports = append(ports, int32(r.port))
+		tports = append(tports, int32(r.port))
+	}
+	// Not NULL, which = ANY would not match.
+	services := []string{}
+	if ports != nil {
+		services = append(services, ports.services...)
+	}
+	var dnames, dprotos, daddrs []string
+	var dfrom, dto []int32
+	for _, r := range ports.dynamicPortsRows() {
+		dnames = append(dnames, r.name)
+		dprotos = append(dprotos, r.proto)
+		daddrs = append(daddrs, r.prefix.String())
+		dfrom = append(dfrom, int32(r.from))
+		dto = append(dto, int32(r.to))
 	}
 	return pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.ReadCommitted}, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, int64(configLock)); err != nil {
@@ -550,13 +568,73 @@ DELETE FROM shawk.translations t
 WHERE NOT EXISTS (
   SELECT FROM unnest($1::text[], $2::text[], $3::text[], $4::cidr[], $5::integer[]) AS u(name, side, proto, addr, port)
   WHERE u.name = t.name AND u.side = t.side AND u.proto = t.proto AND u.addr = t.addr AND u.port = t.port)`,
-			names, sides, protos, addrs, ports)
+			names, sides, protos, addrs, tports)
 		b.Queue(`
 INSERT INTO shawk.translations (name, side, proto, addr, port)
 SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::cidr[], $5::integer[])
-ON CONFLICT DO NOTHING`, names, sides, protos, addrs, ports)
-		return tx.SendBatch(ctx, b).Close()
+ON CONFLICT DO NOTHING`, names, sides, protos, addrs, tports)
+		if err := tx.SendBatch(ctx, b).Close(); err != nil {
+			return err
+		}
+		changed := int64(0)
+		for _, q := range []struct {
+			sql  string
+			args []any
+		}{
+			{`DELETE FROM shawk.port_agnostic_services WHERE NOT (service = ANY ($1::text[]))`, []any{services}},
+			{`
+INSERT INTO shawk.port_agnostic_services (service)
+SELECT * FROM unnest($1::text[])
+ON CONFLICT DO NOTHING`, []any{services}},
+			{`
+DELETE FROM shawk.dynamic_ports d
+WHERE NOT EXISTS (
+  SELECT FROM unnest($1::text[], $2::text[], $3::cidr[], $4::integer[], $5::integer[]) AS u(name, proto, addr, port_from, port_to)
+  WHERE u.name = d.name AND u.proto = d.proto AND u.addr = d.addr AND u.port_from = d.port_from AND u.port_to = d.port_to)`,
+				[]any{dnames, dprotos, daddrs, dfrom, dto}},
+			{`
+INSERT INTO shawk.dynamic_ports (name, proto, addr, port_from, port_to)
+SELECT * FROM unnest($1::text[], $2::text[], $3::cidr[], $4::integer[], $5::integer[])
+ON CONFLICT DO NOTHING`, []any{dnames, dprotos, daddrs, dfrom, dto}},
+		} {
+			tag, err := tx.Exec(ctx, q.sql, q.args...)
+			if err != nil {
+				return err
+			}
+			changed += tag.RowsAffected()
+		}
+		if changed == 0 {
+			return nil
+		}
+		// The rules changed: the dependencies known on the ports of a new
+		// rule are known on port 0 too, so that they are not new under it,
+		// and known_dependencies is rebuilt from every edge at the next
+		// refresh, so that a dependency on a port of a rule removed, known
+		// on port 0 only meanwhile, is not new either.
+		if _, err := tx.Exec(ctx, `SELECT shawk.aggregate_known_dependencies()`); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `DELETE FROM shawk.known_dependencies_state`)
+		return err
 	})
+}
+
+func (s *pgStore) portRuleKeys(ctx context.Context) ([]string, error) {
+	var out []string
+	err := queryRows(ctx, s.pool, `
+SELECT 'service ' || service FROM shawk.port_agnostic_services
+UNION ALL
+SELECT format('dynamic_ports %s %s %s %s-%s', name, proto, addr, port_from, port_to) FROM shawk.dynamic_ports`,
+		func(rows pgx.Rows) error {
+			var k string
+			if err := rows.Scan(&k); err != nil {
+				return err
+			}
+			out = append(out, k)
+			return nil
+		})
+	slices.Sort(out)
+	return out, err
 }
 
 // inventoryLock is the key of the advisory lock that serializes the writes

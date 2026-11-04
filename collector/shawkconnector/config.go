@@ -59,6 +59,18 @@ type Config struct {
 	// server edges of their backends, in PostgreSQL and in the names of
 	// peers.
 	Translations map[string]TranslationConfig `mapstructure:"translations"`
+	// PortAgnosticServices are services that listen on a port chosen anew
+	// at every run, such as srun and salloc without SrunPortRange, by their
+	// service name in PostgreSQL and Prometheus (slurm-job for the
+	// processes of Slurm jobs). Dependencies on them are
+	// aggregated without their port: server.port is 0 in the outputs, and
+	// the dependencies between services of PostgreSQL, with what appeared
+	// and disappeared, have port 0. The edges keep their port.
+	PortAgnosticServices []string `mapstructure:"port_agnostic_services"`
+	// DynamicPorts are ranges of ports by name, such as the SrunPortRange of
+	// a Slurm cluster, on which dependencies are aggregated without their
+	// port as on port_agnostic_services.
+	DynamicPorts map[string]DynamicPortsConfig `mapstructure:"dynamic_ports"`
 	// JobUsers keeps the users of the processes of Slurm jobs in
 	// PostgreSQL: the user id an agent run with -job-users sends
 	// (process.user.id) becomes part of the identity of such a process,
@@ -174,6 +186,9 @@ func (c *Config) Validate() error {
 		errs = append(errs, err)
 	}
 	if _, err := parseTranslations(c.Translations); err != nil {
+		errs = append(errs, err)
+	}
+	if _, err := parsePortRules(c.PortAgnosticServices, c.DynamicPorts); err != nil {
 		errs = append(errs, err)
 	}
 	switch c.HostIdentity {

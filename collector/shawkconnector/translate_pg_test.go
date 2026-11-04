@@ -131,7 +131,7 @@ func TestPGTranslations(t *testing.T) {
 		t.Errorf("translations = %q", got)
 	}
 	delete(c.cfg.Translations, "postgres-vip")
-	if err := c.store.syncConfig(ctx, c.cidrs, must(parseTranslations(c.cfg.Translations))); err != nil {
+	if err := c.store.syncConfig(ctx, c.cidrs, must(parseTranslations(c.cfg.Translations)), c.ports); err != nil {
 		t.Fatal(err)
 	}
 	if got := queryStrings(t, conn, `SELECT DISTINCT name FROM shawk.translations`); !slices.Equal(got, []string{"api-lb", "web-lb"}) {
@@ -326,7 +326,7 @@ func TestPGConcurrentTranslationSyncs(t *testing.T) {
 	initial := must(parseTranslations(map[string]TranslationConfig{
 		"lb": {Virtual: []string{"10.0.100.1:80"}, Backends: []string{"10.0.1.10"}, Transport: "tcp"}}))
 	for round := range 20 {
-		if err := stores[0].syncConfig(ctx, nil, initial); err != nil {
+		if err := stores[0].syncConfig(ctx, nil, initial, nil); err != nil {
 			t.Fatal(err)
 		}
 		var wg sync.WaitGroup
@@ -335,7 +335,7 @@ func TestPGConcurrentTranslationSyncs(t *testing.T) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				errs[i] = stores[i].syncConfig(ctx, cidrs[i], configs[i])
+				errs[i] = stores[i].syncConfig(ctx, cidrs[i], configs[i], nil)
 			}()
 		}
 		wg.Wait()

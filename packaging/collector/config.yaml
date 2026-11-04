@@ -99,6 +99,18 @@ connectors:
     max_hosts: 10000
     max_series_per_host: 100000   # edges, listeners, translations and addresses
     max_pending_rows: 10000000    # kept while PostgreSQL cannot be written
+    # Servers that listen on a port chosen anew at every run, such as srun
+    # and salloc of Slurm without SrunPortRange: their dependencies are
+    # aggregated without the port (server_port 0 in Prometheus, port 0 in
+    # the dependencies between services and their changes in PostgreSQL),
+    # by service name or by ranges of ports of the servers (docs/design.md,
+    # section 5.3). The edges in PostgreSQL keep their ports.
+    # port_agnostic_services: [srun, salloc, slurm-job]   # slurm-job: the processes of jobs
+    # dynamic_ports:
+    #   srun:
+    #     hosts: [10.1.0.0/16]    # the addresses of the servers; empty for every host
+    #     transport: tcp          # empty for both
+    #     ports: 60001-63000      # SrunPortRange; or a single port, quoted: "50000"
 
 processors:
   memory_limiter:
