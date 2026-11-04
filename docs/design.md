@@ -1020,8 +1020,8 @@ only the protocols it parses. shawk runs beside it:
   subsystem on another's port is named after that one, and one on an
   unlisted port is `~kernel`; NFSv3 also talks to `lockd` and `mountd` on
   ports rpcbind assigns. Ports set in configuration are not read: LNet
-  with another `accept_port`, or BeeGFS with other `conn*Port`s, is
-  `~kernel`. A socket created by a process and then held by the kernel
+  with another `accept_port`, or BeeGFS with other `conn*Port`s, is named
+  after the port it moved to like any other. A socket created by a process and then held by the kernel
   alone (an `nbd` or iSCSI connection whose process exited) is not
   the kernel's: adopted at startup it is not attributed. A listener with
   `sk_user_data` (e.g. in a BPF sockmap) held by a process in another PID
