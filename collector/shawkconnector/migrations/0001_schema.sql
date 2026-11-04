@@ -344,15 +344,18 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
 $$;
 
 -- The port of a dependency between services: 0 for a server service of
--- port_agnostic_services or a server address and port in a range of
--- dynamic_ports, the port otherwise. It runs with the rights of its owner,
--- as peer_class, since the views of the contract call it with the rights
--- of their reader.
-CREATE FUNCTION shawk.dependency_port(server_service text, server_addr inet, port integer, proto text)
+-- port_agnostic_services (slurm-job there names the processes of Slurm
+-- jobs, units slurm/*, as the connector names them as peers) or a server
+-- address and port in a range of dynamic_ports, the port otherwise. It
+-- runs with the rights of its owner, as peer_class, since the views of the
+-- contract call it with the rights of their reader.
+CREATE FUNCTION shawk.dependency_port(server_service text, server_unit text, server_addr inet, port integer, proto text)
 RETURNS integer
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
   SELECT CASE
-    WHEN EXISTS (SELECT FROM shawk.port_agnostic_services a WHERE a.service = dependency_port.server_service)
+    WHEN EXISTS (SELECT FROM shawk.port_agnostic_services a
+                 WHERE a.service = dependency_port.server_service
+                    OR (a.service = 'slurm-job' AND dependency_port.server_unit LIKE 'slurm/%'))
       OR EXISTS (SELECT FROM shawk.dynamic_ports r
                  WHERE r.proto = dependency_port.proto
                    AND dependency_port.port BETWEEN r.port_from AND r.port_to
@@ -779,7 +782,7 @@ LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $$
 SELECT
   n.client_service,
   n.server_service,
-  shawk.dependency_port(n.server_service, d.server_addr, d.port, d.proto),
+  shawk.dependency_port(n.server_service, d.server_unit, d.server_addr, d.port, d.proto),
   d.proto,
   min(d.first_seen), max(d.last_seen),
   max(d.client_observed_until), max(d.server_observed_until),
@@ -1187,7 +1190,7 @@ CREATE VIEW shawk.service_dependencies AS
 SELECT
   n.client_service,
   n.server_service,
-  shawk.dependency_port(n.server_service, d.server_addr, d.port, d.proto) AS port,
+  shawk.dependency_port(n.server_service, d.server_unit, d.server_addr, d.port, d.proto) AS port,
   d.proto,
   min(d.first_seen)                             AS first_seen,
   max(d.last_seen)                              AS last_seen,

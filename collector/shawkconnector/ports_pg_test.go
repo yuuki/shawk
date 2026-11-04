@@ -266,3 +266,30 @@ func TestPGPortRuleKeys(t *testing.T) {
 		t.Errorf("keys = %q, want %q", got, want)
 	}
 }
+
+// TestPGPortAgnosticSlurmJobs: slurm-job in port_agnostic_services names the
+// processes of Slurm jobs (units slurm/*), which keep their own names in
+// PostgreSQL, as the connector names them as peers.
+func TestPGPortAgnosticSlurmJobs(t *testing.T) {
+	dsn, conn := migratedDB(t)
+	ctx := context.Background()
+	st, err := newPGStore(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+	if err := st.syncConfig(ctx, nil, nil, must(parsePortRules([]string{"slurm-job"}, nil))); err != nil {
+		t.Fatal(err)
+	}
+	f := fixture{t, conn}
+	f.host("node01", "lmp", "sshd")
+	f.host("node02", "lmp")
+	execAll(t, conn, `UPDATE shawk.processes SET unit = 'slurm/step' WHERE service_name = 'lmp'`)
+	f.conn2("node02", "lmp", "10.1.0.2", "node01", "lmp", "10.1.0.1", 45678, "now()-interval '1 hour'", "now()")
+	f.conn2("node02", "lmp", "10.1.0.2", "node01", "sshd", "10.1.0.1", 22, "now()-interval '1 hour'", "now()")
+	got := queryStrings(t, conn, `SELECT client_service, server_service, port
+		FROM shawk.service_dependencies_between(now() - interval '1 day', now())`)
+	if want := []string{"lmp lmp 0", "lmp sshd 22"}; !slices.Equal(got, want) {
+		t.Errorf("service_dependencies_between = %q, want %q", got, want)
+	}
+}

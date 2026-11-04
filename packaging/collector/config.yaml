@@ -101,7 +101,7 @@ connectors:
     # the dependencies between services and their changes in PostgreSQL),
     # by service name or by ranges of ports of the servers (docs/design.md,
     # section 5.3). The edges in PostgreSQL keep their ports.
-    # port_agnostic_services: [srun, salloc]
+    # port_agnostic_services: [srun, salloc, slurm-job]   # slurm-job: the processes of jobs
     # dynamic_ports:
     #   srun:
     #     hosts: [10.1.0.0/16]    # the addresses of the servers; empty for every host

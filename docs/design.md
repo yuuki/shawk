@@ -767,8 +767,10 @@ the host name; `host.id` and `host.name` are promoted to labels.
 - Some servers listen on a port chosen anew at every run: srun and salloc
   without `SrunPortRange`, to which slurmctld and slurmstepd connect. Their
   dependencies have `server.port` 0, so that each run adds no series:
-  those on a service of `port_agnostic_services` (e.g. `[srun, salloc]`),
-  and those on a server address, port and transport in a range of
+  those on a service of `port_agnostic_services` (e.g. `[srun, salloc,
+  slurm-job]`, where `slurm-job` names the processes of Slurm jobs, which
+  PostgreSQL keeps under their own names), and those on a server address,
+  port and transport in a range of
   `dynamic_ports` (e.g. the `SrunPortRange` of the cluster, for its
   hosts). The server is the peer of a client edge, at its backend through
   a translation (§5.4), and the local process of a server edge;

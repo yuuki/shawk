@@ -307,7 +307,10 @@ func (a *aggregator) portAgnostic(id *edgeID, p peer) bool {
 		return false
 	}
 	if id.role == roleServer {
-		return a.ports.portAgnostic(id.process.job(), id.local, id.port, id.proto)
+		// A process of a Slurm job is slurm-job as a peer, and its own name
+		// in PostgreSQL: either names it.
+		return a.ports.portAgnostic(id.process.job(), id.local, id.port, id.proto) ||
+			(id.process.slurmJob() && a.ports.portAgnostic(slurmJobService, id.local, id.port, id.proto))
 	}
 	server, port := id.peer, id.port
 	if p.server.IsValid() {

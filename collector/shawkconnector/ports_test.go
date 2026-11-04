@@ -162,7 +162,7 @@ func TestPackagedPortRulesExample(t *testing.T) {
 		t.Error(err)
 	}
 	r := must(parsePortRules(cfg.PortAgnosticServices, cfg.DynamicPorts))
-	if !slices.Equal(r.services, []string{"salloc", "srun"}) || len(r.ranges) != 1 ||
+	if !slices.Equal(r.services, []string{"salloc", "slurm-job", "srun"}) || len(r.ranges) != 1 ||
 		r.ranges[0].from != 60001 || r.ranges[0].to != 63000 {
 		t.Errorf("rules = %+v", r)
 	}
@@ -320,5 +320,39 @@ func TestPortAgnosticPeerHosts(t *testing.T) {
 	}
 	if want := map[string]float64{"srun:0": 5}; !maps.Equal(got, want) {
 		t.Errorf("outputs per peer host = %v, want %v", got, want)
+	}
+}
+
+// TestPortAgnosticSlurmJobs: slurm-job in port_agnostic_services covers the
+// processes of Slurm jobs on both sides: as the local process of a server
+// edge, under its own name, and as the peer of a client edge.
+func TestPortAgnosticSlurmJobs(t *testing.T) {
+	c, _, sink, _ := testConnector(t, func(cfg *Config) { cfg.PortAgnosticServices = []string{"slurm-job"} })
+	ts := t0.Add(15 * time.Second)
+	out := consume(t, c, sink, tAgent{host: "node01", addrs: []string{"10.1.0.1"}, time: ts,
+		listeners: []tListener{{proto: "tcp", addr: "0.0.0.0", port: 45678, svc: "lmp", unit: "slurm/step", comm: "lmp"}},
+		edges: []tEdge{
+			{role: "server", proto: "tcp", local: "10.1.0.1", peer: "10.1.0.2", port: 45678, svc: "lmp", unit: "slurm/step", comm: "lmp", opened: 2},
+			{role: "server", proto: "tcp", local: "10.1.0.1", peer: "10.1.0.2", port: 22, svc: "sshd", unit: "sshd.service", comm: "sshd", opened: 1},
+		}})
+	got := map[string]float64{}
+	for _, s := range out {
+		if s.metric == metricConnOpened && s.role == roleServer {
+			got[fmt.Sprintf("%s:%d", s.job, s.port)] += s.value
+		}
+	}
+	if want := map[string]float64{"slurm-job:0": 2, "sshd:22": 1}; !maps.Equal(got, want) {
+		t.Errorf("server outputs = %v, want %v", got, want)
+	}
+	out = consume(t, c, sink, tAgent{host: "node02", addrs: []string{"10.1.0.2"}, time: ts,
+		edges: []tEdge{
+			{role: "client", proto: "tcp", local: "10.1.0.2", peer: "10.1.0.1", port: 45678, svc: "sshd-client", unit: "a.service", comm: "c", opened: 2},
+		}})
+	got = map[string]float64{}
+	for _, s := range find(out, metricConnOpened, "sshd-client", "*", roleClient, "") {
+		got[fmt.Sprintf("%s:%d", s.peer, s.port)] += s.value
+	}
+	if want := map[string]float64{"slurm-job:0": 2}; !maps.Equal(got, want) {
+		t.Errorf("client outputs = %v, want %v", got, want)
 	}
 }
