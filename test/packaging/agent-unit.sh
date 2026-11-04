@@ -148,4 +148,10 @@ if systemctl start "$FAILING"; then
 	fail "the agent started without bpf(2)"
 fi
 systemctl is-failed --quiet "$FAILING" || fail "the unit without bpf(2) did not fail"
+# The agent exited with its error, rather than hanging until systemd gave
+# up waiting for READY=1.
+[ "$(systemctl show -p Result --value "$FAILING")" = exit-code ] ||
+	fail "the unit without bpf(2) failed with $(systemctl show -p Result --value "$FAILING"), not exit-code"
+journalctl -u "$FAILING" -o cat --no-pager | grep -q 'starting tracer' ||
+	fail "the agent without bpf(2) did not fail to start its tracer"
 echo "PASS"
