@@ -79,6 +79,7 @@ type Agent struct {
 	idents   *identities
 	started  time.Time
 	res      otlp.Resource
+	rdma     *rdmaCounters
 
 	lastCollect time.Time
 	failures    uint64
@@ -219,6 +220,9 @@ func Run(ctx context.Context, cfg Config) error {
 
 // newAgent returns an agent whose flows are traced from now on.
 func newAgent(cfg Config, src source, exp otlp.Exporter, cgroups *procinfo.Resolver, res otlp.Resource, now time.Time) *Agent {
+	// The RDMA counters at the start are the base of what is reported.
+	rdma := newRDMACounters(rdmaClass)
+	rdma.read()
 	return &Agent{
 		cfg:         cfg,
 		log:         cfg.Logger,
@@ -230,6 +234,7 @@ func newAgent(cfg Config, src source, exp otlp.Exporter, cgroups *procinfo.Resol
 		idents:      newIdentities(cfg.ServiceFallback, cfg.IdleTTL),
 		started:     now,
 		res:         res,
+		rdma:        rdma,
 		lastCollect: now,
 	}
 }
@@ -421,6 +426,7 @@ func (a *Agent) request(now time.Time) ([]*colmetricspb.ExportMetricsServiceRequ
 		TranslationsTraced:  a.tracer.TranslationsTraced(),
 		TranslationsDropped: a.xlatDrops,
 	}
+	st.RDMAData, st.RDMA = a.rdma.read()
 	if a.cfg.BPFStats {
 		if stats, err := a.tracer.ProgramStats(); err == nil {
 			for _, s := range stats {

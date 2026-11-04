@@ -35,6 +35,12 @@ Instrumentation) sees only the protocols it parses. shawk focuses on history
 and coverage, for any TCP/UDP protocol, on VMs and on-premises hosts (the
 primary target is Rocky Linux 9, kernel 5.14), and runs beside OBI (§9).
 
+What is observed is TCP and UDP sockets, so "not used" means "no TCP or
+UDP". RDMA verbs (InfiniBand, RoCE) bypass the sockets: in HPC clusters,
+where the main data paths use them (MPI over UCX, NCCL, Lustre o2ib, GPFS
+verbs, NFS over RDMA), a host may be observed throughout and still be used
+(§10).
+
 ## 2. Architecture
 
 ```
@@ -495,7 +501,12 @@ metrics are `shawk.agent.up` (with `shawk.netns.scope`),
 `shawk.agent.container_reads.dropped` and
 `shawk.agent.translations.dropped`, `shawk.agent.translations.traced`,
 `shawk.agent.export.failures`, and with `-bpf-stats` per-program run counts
-and times. The resource carries `host.id`, `host.name`, `os.version`,
+and times. A host with RDMA ports (InfiniBand, RoCE) also sends
+`shawk.agent.rdma.io`, the bytes its ports sent and received since the
+agent started, read from `/sys/class/infiniband/*/ports/*/counters`
+(`port_xmit_data` and `port_rcv_data`, which count octets divided by 4) at
+every interval. It goes to Prometheus only, as a hint that the host used
+what shawk does not observe (§10). The resource carries `host.id`, `host.name`, `os.version`,
 `service.name=shawk-agent` with `service.version`, `shawk.peer.fold`,
 `shawk.peer.internal`, and `host.ip`: the interface addresses of the traced
 namespaces plus the local addresses of recent series and open listeners,
@@ -955,6 +966,12 @@ time out, and `TCP_FASTOPEN_CONNECT` connects, which have no handshake,
 raise them. OBI panels use a minimum interval of a minute, since OBI
 exports every 60 seconds by default.
 
+Where the absence of a dependency is read (the changes dashboard, and the
+observation periods of the fleet dashboard), the panels say that only TCP
+and UDP are observed. The fleet dashboard shows the traffic of the RDMA
+ports of each host (`shawk.agent.rdma.io`) below the observation periods,
+as a hint only (§10).
+
 ## 9. OBI
 
 OBI cannot replace the tracer of shawk: its network flows and TCP statistics
@@ -978,6 +995,21 @@ only the protocols it parses. shawk runs beside it:
 
 ## 10. Limitations
 
+- **TCP and UDP only.** "Observed and not used" holds for TCP and UDP
+  sockets. RDMA verbs (InfiniBand, RoCE) bypass them, so MPI over UCX,
+  NCCL, Lustre o2ib, GPFS verbs and NFS over RDMA are not seen; TCP over
+  IPoIB is. In HPC clusters the main data paths use RDMA, so a storage
+  server used over o2ib looks observed and unused. The counters of RDMA
+  ports (§4.2) are a hint, not a coverage guarantee like `udp_traced`: they
+  cover a whole port, all its virtual lanes and IPoIB included, so an
+  increase tells neither which hosts nor which jobs used RDMA, and no
+  increase does not prove that no RDMA dependency was missed (a counter of
+  32 bits stops at its maximum). The sockets of kernel clients (NFS, Lustre
+  over TCP) belong to cgroup 0 and are named `~kernel` or after their port
+  (`~kernel:nfs`, §4.1): shawk tells which hosts use a file system, not
+  which users or jobs; usage by job is left to the file systems (Lustre
+  jobstats with `jobid_var=SLURM_JOB_ID`). See
+  [proposals/slurm-hpc-clusters.md](proposals/slurm-hpc-clusters.md) §7.
 - **Relays that rewrite addresses** (NAT, IPVS, kube-proxy, cloud load
   balancers) hide the real peer, as discussed in §5.2 of the paper:
   dependencies end at the relay address and are seen on one side only,

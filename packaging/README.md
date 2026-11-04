@@ -103,3 +103,45 @@ The connector of the example does not migrate (`migrate: false`). It waits
 until the schema is at least its own version, and warns when the schema is
 newer. Run `shawk-migrate` and `grants.sql` before or while upgrading the
 collectors, and upgrade all of them, along with the agents.
+
+## HPC clusters
+
+Notes for static clusters managed by Slurm. The design is in
+[docs/proposals/slurm-hpc-clusters.md](../docs/proposals/slurm-hpc-clusters.md)
+(#170); each subsection below is one topic.
+
+### What is observed
+
+shawk observes TCP and UDP sockets, so "not used" means "no TCP or UDP".
+RDMA verbs (InfiniBand, RoCE) bypass the sockets: MPI over UCX, NCCL,
+Lustre o2ib, GPFS verbs and NFS over RDMA are not seen, while TCP over
+IPoIB is. A storage server used only over o2ib looks observed and unused.
+
+The fleet dashboard shows, below the observation periods, the traffic of
+the RDMA ports of each host (`shawk_agent_rdma_io_bytes_total`, from
+`/sys/class/infiniband/*/ports/*/counters`). It is a hint that a host used
+what shawk does not see, not a coverage guarantee: the counters cover the
+whole port, IPoIB included, and tell neither which hosts or jobs used RDMA
+nor, when flat, that nothing was missed.
+
+The sockets of kernel clients (NFS, Lustre over TCP) belong to no process,
+so shawk tells which hosts use a file system, not which users or jobs. For
+usage by job, use the file systems, e.g. Lustre jobstats with
+`jobid_var=SLURM_JOB_ID`.
+
+### A stable machine id per node
+
+PostgreSQL keys a host by its machine id and host name, and the machine id
+is `host_id` in Prometheus. A stateless node whose machine id changes at
+every boot becomes a new host at each boot, and its old ids show gaps
+although the node was observed. Give every node a stable machine id when
+it is provisioned, e.g. `systemd.machine_id=` on the kernel command line or
+a file per node in the image overlay. See #178.
+
+### `SrunPortRange`
+
+Without `SrunPortRange`, srun and salloc listen on a random port at every
+run, and slurmctld and slurmstepd connect to it, so each run tends to show
+as a new dependency and `server_port` churns in Prometheus. Set it in
+`slurm.conf` (e.g. `SrunPortRange=60001-63000`; firewalls between the nodes
+usually need it anyway). How shawk aggregates these ports is #174.

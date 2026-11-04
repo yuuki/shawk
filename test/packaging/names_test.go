@@ -32,6 +32,7 @@ func TestPrometheusNames(t *testing.T) {
 		{"shawk.agent.cgroup_events.dropped", "{event}", otlptranslator.MetricTypeMonotonicCounter, "shawk_agent_cgroup_events_dropped_total"},
 		{"shawk.agent.container_reads.dropped", "{read}", otlptranslator.MetricTypeMonotonicCounter, "shawk_agent_container_reads_dropped_total"},
 		{"shawk.agent.export.failures", "{request}", otlptranslator.MetricTypeMonotonicCounter, "shawk_agent_export_failures_total"},
+		{"shawk.agent.rdma.io", "By", otlptranslator.MetricTypeMonotonicCounter, "shawk_agent_rdma_io_bytes_total"},
 	} {
 		got, err := namer.Build(otlptranslator.Metric{Name: tc.name, Unit: tc.unit, Type: tc.typ})
 		if err != nil || got != tc.want {
