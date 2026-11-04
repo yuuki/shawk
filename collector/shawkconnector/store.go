@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"slices"
 	"strings"
 	"time"
 
@@ -583,35 +584,35 @@ ON CONFLICT (singleton) DO UPDATE SET digest = excluded.digest, read_at = exclud
 
 // replaceInventory replaces the hosts and addresses of the inventory.
 func replaceInventory(ctx context.Context, tx pgx.Tx, inv *inventory) error {
-	if _, err := tx.Exec(ctx, `DELETE FROM shawk.inventory_addrs`); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(ctx, `DELETE FROM shawk.inventory_hosts`); err != nil {
-		return err
-	}
-	hosts := make([][]any, 0, len(inv.hosts))
-	var addrs [][]any
+	var names, nodes, roleHosts, roles, addrs, addrHosts []string
+	var agents []bool
 	for _, h := range inv.hosts {
-		var node *string
-		if h.slurmNode != "" {
-			node = &h.slurmNode
+		names = append(names, h.name)
+		nodes = append(nodes, h.slurmNode)
+		agents = append(agents, h.agent)
+		for _, r := range h.roles {
+			roleHosts = append(roleHosts, h.name)
+			roles = append(roles, r)
 		}
-		roles := h.roles
-		if roles == nil {
-			roles = []string{}
-		}
-		hosts = append(hosts, []any{h.name, node, roles, h.agent})
 		for _, a := range h.addrs {
-			addrs = append(addrs, []any{netip.PrefixFrom(a, a.BitLen()), h.name})
+			addrs = append(addrs, a.String())
+			addrHosts = append(addrHosts, h.name)
 		}
 	}
-	if _, err := tx.CopyFrom(ctx, pgx.Identifier{"shawk", "inventory_hosts"},
-		[]string{"host", "slurm_node", "roles", "agent"}, pgx.CopyFromRows(hosts)); err != nil {
-		return err
-	}
-	_, err := tx.CopyFrom(ctx, pgx.Identifier{"shawk", "inventory_addrs"},
-		[]string{"addr", "host"}, pgx.CopyFromRows(addrs))
-	return err
+	b := &pgx.Batch{}
+	b.Queue(`DELETE FROM shawk.inventory_addrs`)
+	b.Queue(`DELETE FROM shawk.inventory_hosts`)
+	b.Queue(`
+INSERT INTO shawk.inventory_hosts (host, slurm_node, agent)
+SELECT u.host, nullif(u.node, ''), u.agent FROM unnest($1::text[], $2::text[], $3::boolean[]) AS u(host, node, agent)`,
+		names, nodes, agents)
+	b.Queue(`
+UPDATE shawk.inventory_hosts h SET roles = r.roles
+FROM (SELECT u.host, array_agg(u.role ORDER BY u.role COLLATE "C") AS roles
+      FROM unnest($1::text[], $2::text[]) AS u(host, role) GROUP BY u.host) r
+WHERE r.host = h.host`, roleHosts, roles)
+	b.Queue(`INSERT INTO shawk.inventory_addrs (addr, host) SELECT * FROM unnest($1::inet[], $2::text[])`, addrs, addrHosts)
+	return tx.SendBatch(ctx, b).Close()
 }
 
 func (s *pgStore) inventoryFailed(ctx context.Context, failedAt time.Time, msg string) error {
@@ -625,21 +626,26 @@ func (s *pgStore) inventory(ctx context.Context) (*inventory, error) {
 	var hosts []inventoryHost
 	err := queryRows(ctx, s.pool, `
 SELECT h.host, coalesce(h.slurm_node, ''), h.roles, h.agent,
-       coalesce(array_agg(a.addr ORDER BY a.addr) FILTER (WHERE a.addr IS NOT NULL), '{}')
+       coalesce(array_agg(host(a.addr) ORDER BY a.addr) FILTER (WHERE a.addr IS NOT NULL), '{}')
 FROM shawk.inventory_hosts h
 LEFT JOIN shawk.inventory_addrs a ON a.host = h.host
 GROUP BY h.host
 ORDER BY h.host`, func(rows pgx.Rows) error {
 		var h inventoryHost
-		var addrs []netip.Prefix
+		var addrs []string
 		if err := rows.Scan(&h.name, &h.slurmNode, &h.roles, &h.agent, &addrs); err != nil {
 			return err
 		}
 		if len(h.roles) == 0 {
 			h.roles = nil
 		}
-		for _, p := range addrs {
-			h.addrs = append(h.addrs, p.Addr().Unmap())
+		slices.Sort(h.roles)
+		for _, s := range addrs {
+			a, err := netip.ParseAddr(s)
+			if err != nil {
+				return err
+			}
+			h.addrs = append(h.addrs, a.Unmap())
 		}
 		hosts = append(hosts, h)
 		return nil
