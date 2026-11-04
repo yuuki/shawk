@@ -91,6 +91,7 @@ type Agent struct {
 	idents   *identities
 	started  time.Time
 	res      otlp.Resource
+	rdma     *rdmaCounters
 
 	lastCollect time.Time
 	failures    uint64
@@ -214,6 +215,8 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("notifying systemd that the agent is ready: %w", err)
 	}
 
+	go a.rdma.run(ctx, cfg.Interval)
+
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()
 	for {
@@ -249,6 +252,7 @@ func newAgent(cfg Config, src source, exp otlp.Exporter, cgroups *procinfo.Resol
 		idents:      newIdentities(cfg.ServiceFallback, cfg.IdleTTL, jobUsers(cfg, cgroups)),
 		started:     now,
 		res:         res,
+		rdma:        newRDMACounters(rdmaClass),
 		lastCollect: now,
 	}
 }
@@ -459,6 +463,7 @@ func (a *Agent) request(now time.Time) ([]*colmetricspb.ExportMetricsServiceRequ
 		TranslationsTraced:  a.tracer.TranslationsTraced(),
 		TranslationsDropped: a.xlatDrops,
 	}
+	st.RDMAData, st.RDMA = a.rdma.latest()
 	if a.cfg.BPFStats {
 		if stats, err := a.tracer.ProgramStats(); err == nil {
 			for _, s := range stats {

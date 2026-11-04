@@ -53,6 +53,11 @@ type AgentStatus struct {
 	// of those not learned because the in-kernel tables were full.
 	TranslationsTraced  bool
 	TranslationsDropped uint64
+	// RDMA tells whether the host has RDMA ports; RDMAData is the
+	// cumulative number of bytes they sent and received, all traffic of
+	// the ports, a hint that the host used what shawk does not observe.
+	RDMA     bool
+	RDMAData uint64
 }
 
 // BPFProgram is the run time statistic of a BPF program.
@@ -299,6 +304,9 @@ func addAgent(b *builder, st *AgentStatus) {
 	}
 	b.gauge(MetricAgentTranslationsTraced, "", traced, nil)
 	b.sum(MetricAgentTranslationsDropped, "{translation}", true, st.Started, st.TranslationsDropped, nil)
+	if st.RDMA {
+		b.sum(MetricAgentRDMAIO, "By", true, st.Started, st.RDMAData, nil)
+	}
 	for _, p := range st.BPFPrograms {
 		attrs := []*commonpb.KeyValue{str(AttrBPFProgram, p.Name)}
 		b.sum(MetricAgentBPFRunCount, "{run}", true, st.Started, p.RunCount, attrs)

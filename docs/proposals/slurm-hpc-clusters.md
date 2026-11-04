@@ -320,6 +320,8 @@ within the same step.
   the overlay), which also stabilizes `host_id` and OBI's `host.id`.
 - **In shawk.** A function computes the gaps over the sessions of all host
   ids with the same host name.
+- **Implemented:** `shawk_v1.unobserved_by_name()`, and the
+  guidance in `packaging/README.md`. The dashboards keep `unobserved()`.
 - **Not proposed.**
   - Changing the host key: it would need a migration of hosts, sessions and
     processes, and it affects Prometheus, OBI and `host_identity:

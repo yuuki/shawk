@@ -182,6 +182,27 @@ func TestRequest(t *testing.T) {
 	if metrics[MetricAgentBPFRunCount] != nil {
 		t.Error("BPF statistics without programs")
 	}
+	if metrics[MetricAgentRDMAIO] != nil {
+		t.Error("RDMA data of a host without RDMA ports")
+	}
+}
+
+// TestRequestRDMA: the data of the RDMA ports is sent by hosts that have
+// them, zero included.
+func TestRequestRDMA(t *testing.T) {
+	started := t0.Add(-time.Hour)
+	req := NewState(time.Minute).Request(Resource{Hostname: "h"}, AgentStatus{Started: started, RDMA: true}, t0)
+	for _, m := range req.ResourceMetrics[0].ScopeMetrics[0].Metrics {
+		if m.Name != MetricAgentRDMAIO {
+			continue
+		}
+		if p := m.GetSum().GetDataPoints(); m.Unit != "By" || len(p) != 1 || p[0].GetAsInt() != 0 ||
+			p[0].StartTimeUnixNano != uint64(started.UnixNano()) || !m.GetSum().IsMonotonic {
+			t.Errorf("rdma.io = %v", m)
+		}
+		return
+	}
+	t.Error("no rdma.io")
 }
 
 func TestRequestWithoutMachineID(t *testing.T) {

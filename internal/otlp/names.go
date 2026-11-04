@@ -45,6 +45,8 @@ const (
 
 	MetricAgentTranslationsTraced  = "shawk.agent.translations.traced"
 	MetricAgentTranslationsDropped = "shawk.agent.translations.dropped"
+
+	MetricAgentRDMAIO = "shawk.agent.rdma.io"
 )
 
 // Names of the attributes.
