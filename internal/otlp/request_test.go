@@ -114,6 +114,9 @@ func TestRequest(t *testing.T) {
 	if _, ok := a["container.id"]; ok {
 		t.Error("container.id of a process outside containers")
 	}
+	if _, ok := a["process.user.id"]; ok {
+		t.Error("process.user.id of a process without a user")
+	}
 	if !metrics[MetricConnOpened].GetSum().IsMonotonic || metrics[MetricConnCount].GetSum().IsMonotonic {
 		t.Error("wrong monotonicity")
 	}
@@ -371,6 +374,22 @@ func TestRequestInvalidUTF8(t *testing.T) {
 	req := s.Request(Resource{Hostname: "h"}, AgentStatus{}, t0)
 	if _, err := proto.Marshal(req); err != nil {
 		t.Fatalf("marshal: %v", err)
+	}
+}
+
+func TestUserIDAttribute(t *testing.T) {
+	for _, uid := range []uint32{0, 1001} {
+		p := Process{Unit: "slurm/batch", Comm: "a.out", Service: "a.out", UserID: uid, HasUserID: true}
+		if a := attrMap(processAttrs(&p)); a["process.user.id"] != int64(uid) {
+			t.Errorf("attributes = %v, want process.user.id %d", a, uid)
+		}
+	}
+	// The series of the users of one unit and comm are apart, in an order.
+	a := Process{Unit: "slurm/batch", Comm: "a.out"}
+	b := Process{Unit: "slurm/batch", Comm: "a.out", HasUserID: true}
+	c := Process{Unit: "slurm/batch", Comm: "a.out", UserID: 1001, HasUserID: true}
+	if compareProcess(&a, &b) >= 0 || compareProcess(&b, &c) >= 0 || compareProcess(&c, &c) != 0 {
+		t.Error("processes of users are not ordered")
 	}
 }
 

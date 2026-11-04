@@ -45,7 +45,10 @@ type Config struct {
 	// LearnTranslations learns the translations of addresses the host
 	// makes from conntrack, and sends them.
 	LearnTranslations bool
-	Logger            *slog.Logger
+	// JobUsers sends the user ids of the processes of Slurm jobs
+	// (process.user.id), which PostgreSQL keeps if the connector is told to.
+	JobUsers bool
+	Logger   *slog.Logger
 
 	traceSelf bool // trace the agent's own flows; for tests
 }
@@ -227,7 +230,7 @@ func newAgent(cfg Config, src source, exp otlp.Exporter, cgroups *procinfo.Resol
 		cgroups:     cgroups,
 		state:       otlp.NewState(cfg.IdleTTL),
 		segment:     otlp.NewSegment(now, cfg.IdleTTL),
-		idents:      newIdentities(cfg.ServiceFallback, cfg.IdleTTL),
+		idents:      newIdentities(cfg.ServiceFallback, cfg.IdleTTL, cfg.JobUsers),
 		started:     now,
 		res:         res,
 		lastCollect: now,

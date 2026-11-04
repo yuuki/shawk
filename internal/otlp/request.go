@@ -345,6 +345,9 @@ func processAttrs(p *Process) []*commonpb.KeyValue {
 	if p.ContainerID != "" {
 		attrs = append(attrs, str(AttrContainerID, p.ContainerID))
 	}
+	if p.HasUserID {
+		attrs = append(attrs, integer(AttrUserID, int64(p.UserID)))
+	}
 	return attrs
 }
 
@@ -536,7 +539,16 @@ func compareProcess(a, b *Process) int {
 		strings.Compare(a.Service, b.Service),
 		strings.Compare(a.ServiceNamespace, b.ServiceNamespace),
 		strings.Compare(a.ContainerID, b.ContainerID),
+		cmp.Compare(userOrder(a), userOrder(b)),
 	)
+}
+
+// userOrder orders a process without a user before those with one.
+func userOrder(p *Process) int64 {
+	if !p.HasUserID {
+		return -1
+	}
+	return int64(p.UserID)
 }
 
 // roleOrder puts server edges before client edges.
