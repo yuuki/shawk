@@ -35,11 +35,12 @@ type shawkConnector struct {
 	// ready tells that the schema has been migrated, or checked to be
 	// recent enough, so that writes may proceed.
 	ready bool
-	// cidrsSynced tells that peer_cidrs and the translations have been
-	// written to PostgreSQL.
+	// cidrsSynced tells that peer_cidrs, the translations and the rules of
+	// ports have been written to PostgreSQL.
 	cidrsSynced  bool
 	cidrs        []namedPrefix
 	translations []translation
+	ports        *portRules
 
 	lastPrune, lastRefresh time.Time
 
@@ -83,11 +84,16 @@ func newConnector(set connector.Settings, cfg *Config, next consumer.Metrics) (*
 	if err != nil {
 		return nil, err
 	}
+	ports, err := parsePortRules(cfg.PortAgnosticServices, cfg.DynamicPorts)
+	if err != nil {
+		return nil, err
+	}
 	now := time.Now()
 	res := newResolver(cidrs, translations)
 	res.maxInferred = cfg.MaxSeriesPerHost
 	agg := newAggregator(cfg.IdleTTL, cfg.MaxPeers, cfg.MaxServices, cfg.KeepPeerAddress, now)
 	agg.maxInputs = maxValuesPerEdge * cfg.MaxSeriesPerHost
+	agg.ports = ports
 	return &shawkConnector{
 		cfg:      cfg,
 		log:      set.Logger,
@@ -101,6 +107,7 @@ func newConnector(set connector.Settings, cfg *Config, next consumer.Metrics) (*
 		now:      time.Now,
 
 		translations: translations,
+		ports:        ports,
 
 		foldWarned: map[foldWarnKey]*foldWarning{},
 		cidrWarned: map[string]time.Time{},
@@ -142,7 +149,8 @@ func (c *shawkConnector) Start(ctx context.Context, _ component.Host) error {
 }
 
 // prepare migrates the schema if configured to, or checks its version,
-// writes peer_cidrs and the translations, and reloads the names of peers.
+// writes peer_cidrs, the translations and the rules of ports, and reloads
+// the names of peers.
 // It reports whether the schema is ready.
 func (c *shawkConnector) prepare(ctx context.Context) bool {
 	if !c.prepareSchemaOnly(ctx) {
@@ -152,10 +160,11 @@ func (c *shawkConnector) prepare(ctx context.Context) bool {
 	synced := c.cidrsSynced
 	c.mu.Unlock()
 	if !synced {
-		// PostgreSQL names peers without a service by peer_cidrs too, and
-		// matches edges through the translations.
-		if err := c.store.syncConfig(ctx, c.cidrs, c.translations); err != nil {
-			c.log.Warn("writing peer_cidrs and the translations to PostgreSQL", zap.Error(err))
+		// PostgreSQL names peers without a service by peer_cidrs too,
+		// matches edges through the translations, and aggregates
+		// dependencies by the rules of ports.
+		if err := c.store.syncConfig(ctx, c.cidrs, c.translations, c.ports); err != nil {
+			c.log.Warn("writing peer_cidrs, the translations, port_agnostic_services and dynamic_ports to PostgreSQL", zap.Error(err))
 		} else {
 			c.mu.Lock()
 			c.cidrsSynced = true

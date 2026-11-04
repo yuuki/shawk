@@ -667,6 +667,18 @@ the host name; `host.id` and `host.name` are promoted to labels.
   fold into `~other`, while PostgreSQL keeps them apart. Agent-chosen names
   are cut to 255 bytes (`service.peer.name` to 511). `keep_peer_address`
   keeps `network.peer.address` when really needed.
+- Some servers listen on a port chosen anew at every run: srun and salloc
+  without `SrunPortRange`, to which slurmctld and slurmstepd connect. Their
+  dependencies have `server.port` 0, so that each run adds no series:
+  those on a service of `port_agnostic_services` (e.g. `[srun, salloc]`),
+  and those on a server address, port and transport in a range of
+  `dynamic_ports` (e.g. the `SrunPortRange` of the cluster, for its
+  hosts). The server is the peer of a client edge and the local process of
+  a server edge, with the address the edge sees; PostgreSQL applies the
+  same rules (§6.1, §6.2) and keeps the ports of the edges. Without them every
+  port is kept. Ports chosen by the kernel are not detected: a listener
+  is seen only while the iterator lists it, and a kernel-chosen port does
+  not make the servers on it one service.
 - Inputs are cumulative per peer address and outputs merge several, so the
   connector adds the increases of each input to its output, treating a
   decrease or new start time as a reset; an output never decreases when an
@@ -874,22 +886,28 @@ translations(name, side, proto, addr, port)  -- side virtual, backend or source;
 learned_translations(host_id, proto, netns, client_addr, virtual_addr, virtual_port, source_addr,
                      backend_addr, backend_port, first_seen, last_seen)  -- learned by agents (§3.7, §5.4)
 known_dependencies(client_service, server_service, port, proto, first_seen, last_seen)
+port_agnostic_services(service)  -- written by the connector (§5.3)
+dynamic_ports(name, proto, addr, port_from, port_to)  -- written by the connector (§5.3); 0.0.0.0/0 and ::/0 for every host
 ```
 
 `known_dependencies` keeps every dependency between services ever seen,
-refreshed every 5 minutes (`shawk.refresh_known_dependencies()`). The
-session columns are described in §5.1. `service_name` has the form of the
-`job` label (`namespace/name`), so names in PostgreSQL and Prometheus
-match.
+refreshed every 5 minutes (`shawk.refresh_known_dependencies()`). When the
+connector writes the rules of ports, the dependencies known on ports they
+cover are added on port 0 (`shawk.aggregate_known_dependencies()`), so that
+configuring a rule makes nothing new; `known_dependencies` has no
+addresses, so a range of `dynamic_ports` covers its ports on every host
+there. The session columns are described in §5.1. `service_name` has the
+form of the `job` label (`namespace/name`), so names in PostgreSQL and
+Prometheus match.
 
 ### 6.2 Contract (schema `shawk_v1`)
 
 | view or function | |
 |---|---|
-| `dependencies` | one row per logical dependency: the client edge and the server edge matched by addresses and port over all time (loopback within a host and netns, addresses held by several hosts at once within a host), or through a translation (§5.4), when `virtual_addr`, `virtual_port` and `translation` (`~learned` for a learned one) tell what the client connected to. `observed_by` is `both`, `client` or `server`; a one-sided row means no agent on the other side, an undescribed NAT or load balancer between, or one of the own rows of §5.4. `client_observed_until` and `server_observed_until` are the latest heartbeats of the hosts (or NULL, §5.4): an old `last_seen` with a recent `observed_until` means no longer used; both old means no longer observed. An address `0.0.0.0/0` or `::/0` stands for folded peers (§3.6), named `~external`. |
-| `graph_nodes`, `graph_edges` | the dependency map between services in the format of the Grafana Node Graph; a peer without a service is named by `peer_class` |
+| `dependencies` | one row per logical dependency: the client edge and the server edge matched by addresses and port over all time (loopback within a host and netns, addresses held by several hosts at once within a host), or through a translation (§5.4), when `virtual_addr`, `virtual_port` and `translation` (`~learned` for a learned one) tell what the client connected to. `observed_by` is `both`, `client` or `server`; a one-sided row means no agent on the other side, an undescribed NAT or load balancer between, or one of the own rows of §5.4. `client_observed_until` and `server_observed_until` are the latest heartbeats of the hosts (or NULL, §5.4): an old `last_seen` with a recent `observed_until` means no longer used; both old means no longer observed. An address `0.0.0.0/0` or `::/0` stands for folded peers (§3.6), named `~external`. `port` is that of the edges, also under the rules of ports (§5.3): between two hosts it tells the connections of different processes apart. |
+| `graph_nodes`, `graph_edges` | the dependency map between services in the format of the Grafana Node Graph; a peer without a service is named by `peer_class`, and a dependency on a port of `port_agnostic_services` or `dynamic_ports` (§5.3) has port 0 |
 | `peer_class(addr)` | the name of a peer without a known service, as in `service.peer.name`: the narrowest range of `peer_cidrs`, `~unresolved` for an address not routed on the Internet, `~external` otherwise, including the networks of folded peers |
-| `dependency_changes` | dependencies between services that appeared, or disappeared while a host that saw them kept observing for 15 minutes |
+| `dependency_changes` | dependencies between services that appeared, or disappeared while a host that saw them kept observing for 15 minutes; port 0 for those of `port_agnostic_services` and `dynamic_ports` (§5.3), so that a run of srun on a new port is not new |
 | `service_endpoints` | addresses and ports services accept connections on: the last known listeners of each host (unspecified addresses expanded to the host's addresses) and its server edges, for hosts that reported in the last 30 days, except addresses another host took over since; used by the connector (§5.2) |
 | `client_endpoints` | the client sides of connections in the last hour (client address, server address, port, client service); used by the connector to name the peer of a server edge |
 | `agent_addrs` | addresses of hosts whose agent closed an interval in the last 5 minutes, with what the agent traces and folds; used by the connector |
@@ -936,16 +954,17 @@ dependency details, changes, application layer of OBI) and alert rules.
 PostgreSQL alerts use the time series format, with every row at `now()` so
 each series has a value at the last time; a query that finds nothing
 returns No Data, which the rules treat as Normal. New and disappeared
-dependencies are judged per service and port (`dependency_changes_between`),
-so a dependency seen before is not new, and peers without a service are
-named as in Prometheus. The window of new dependencies ends 5 minutes ago,
-when both sides of a new connection are written. A disappeared dependency is
-an explicit row (its `last_seen` falls in the window while a host that saw
-it is still observed) rather than a row missing from the result, so a
-stopped agent does not look like a removed dependency. Stopped agents are
-alerted by Prometheus (`ShawkAgentDown`) for 24 hours, then from
-`shawk_v1.agents` for 30 days, labelled with the host id; a host
-reinstalled under the same name and alive is not alerted.
+dependencies are judged per service and port (`dependency_changes_between`;
+port 0 under the rules of §5.3), so a dependency seen before is not new,
+and peers without a service are named as in Prometheus. The window of new
+dependencies ends 5 minutes ago, when both sides of a new connection are
+written. A disappeared dependency is an explicit row (its `last_seen`
+falls in the window while a host that saw it is still observed) rather
+than a row missing from the result, so a stopped agent does not look like
+a removed dependency. Stopped agents are alerted by Prometheus
+(`ShawkAgentDown`) for 24 hours, then from `shawk_v1.agents` for 30 days,
+labelled with the host id; a host reinstalled under the same name and
+alive is not alerted.
 
 The fleet, dependency details and changes dashboards overlay the periods
 from `unobserved()` and `partly_observed()` as annotations, so the absence

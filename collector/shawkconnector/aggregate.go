@@ -163,6 +163,8 @@ type aggregator struct {
 	// counts the new ones dropped beyond it, until they are taken.
 	maxInputs int
 	dropped   int
+	// ports are the dependencies whose output has server.port 0.
+	ports *portRules
 }
 
 // maxValuesPerEdge is how many input series an edge may have on average
@@ -209,6 +211,23 @@ func (a *aggregator) service(h *hostOutputs, p *process, now time.Time) svcKey {
 	return k
 }
 
+// portAgnostic tells whether the outputs of an edge whose peer is p have
+// server.port 0: the server is the peer of a client edge and the local
+// process of a server edge, as the edge sees it.
+func (a *aggregator) portAgnostic(id *edgeID, p peer) bool {
+	if a.ports == nil {
+		return false
+	}
+	if id.role == roleServer {
+		return a.ports.portAgnostic(id.process.job(), id.local, id.port, id.proto)
+	}
+	port := id.port
+	if p.port != 0 {
+		port = p.port
+	}
+	return a.ports.portAgnostic(p.name, id.peer, port, id.proto)
+}
+
 // add accounts a request of a host received at now. If the request closes
 // an interval, it appends to out every live output series of the host and
 // the metrics of the agent.
@@ -251,6 +270,7 @@ func (a *aggregator) add(b *hostBatch, peerOf func(*edgeID) peer, now time.Time,
 		}
 		p := peerOf(&e.id)
 		name := a.peer(peerGroup{b.key, sk.service, sk.svcNS, e.id.role}, cutLabel(p.name, maxPeerName), now)
+		agnostic := a.portAgnostic(&e.id, p)
 		for vk, pt := range e.values {
 			m, ok := outMetrics[vk.metric]
 			if !ok {
@@ -268,6 +288,9 @@ func (a *aggregator) add(b *hostBatch, peerOf func(*edgeID) peer, now time.Time,
 			if p.port != 0 {
 				// Through a translation, the port of the server.
 				key.port = p.port
+			}
+			if agnostic {
+				key.port = 0
 			}
 			if a.keepPeerAddr {
 				key.peerAddr = e.id.peerString()

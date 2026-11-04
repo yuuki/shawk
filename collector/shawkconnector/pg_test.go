@@ -737,7 +737,7 @@ func TestPGSchemaVersion(t *testing.T) {
 	// higher version, is refused rather than taken for a newer one: it has
 	// no shawk.schema_history(), or its history has other migrations.
 	for name, stmts := range map[string][]string{
-		"without the history": {`UPDATE shawk.schema_migrations SET version = 13, name = '0013_learned_translations.sql'`,
+		"without the history": {`UPDATE shawk.schema_migrations SET version = 13, name = '0013_learned_translations.sql' WHERE version = 1`,
 			`DROP FUNCTION shawk.schema_history()`},
 		"with another history": {`UPDATE shawk.schema_migrations SET name = '0001_init.sql'`},
 	} {

@@ -69,6 +69,18 @@ connectors:
     #     virtual: ["10.0.100.2:80", "[2001:db8::2]:80"]
     #     backends: [10.0.1.0/24:8080]
     #     sources: [10.0.100.250]            # what the backends see the clients at
+    # Servers that listen on a port chosen anew at every run, such as srun
+    # and salloc of Slurm without SrunPortRange: their dependencies are
+    # aggregated without the port (server_port 0 in Prometheus, port 0 in
+    # the dependencies between services and their changes in PostgreSQL),
+    # by service name or by ranges of ports of the servers (docs/design.md,
+    # section 5.3). The edges in PostgreSQL keep their ports.
+    # port_agnostic_services: [srun, salloc]
+    # dynamic_ports:
+    #   srun:
+    #     hosts: [10.1.0.0/16]    # the addresses of the servers; empty for every host
+    #     transport: tcp          # empty for both
+    #     ports: 60001-63000      # SrunPortRange; or a single port, quoted: "50000"
     keep_peer_address: false
     # The certificate of an agent must name its host as `hostname` prints
     # it (a DNS name, or the common name of a certificate without DNS

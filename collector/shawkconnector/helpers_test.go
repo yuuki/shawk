@@ -348,6 +348,7 @@ type fakeStore struct {
 	// behind is how many versions the schema is behind the connector.
 	behind  int
 	cidrs   []namedPrefix
+	ports   *portRules
 	trans   []translation
 	refresh int
 }
@@ -358,10 +359,10 @@ func (s *fakeStore) schemaVersion(context.Context) (int, error) {
 	return SchemaVersion() - s.behind, nil
 }
 
-func (s *fakeStore) syncConfig(_ context.Context, cidrs []namedPrefix, ts []translation) error {
+func (s *fakeStore) syncConfig(_ context.Context, cidrs []namedPrefix, ts []translation, ports *portRules) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.cidrs, s.trans = cidrs, ts
+	s.cidrs, s.trans, s.ports = cidrs, ts, ports
 	return nil
 }
 
