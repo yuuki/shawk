@@ -14,6 +14,14 @@ OBI (OpenTelemetry eBPF Instrumentation) as a foundation for shawk:
   the architecture, extensibility, licensing and governance of OBI, for
   deciding whether to rebuild shawk on it.
 
+The kernel hooks of shawk, measured on the targets (2026-11-04, #165):
+
+- [kernel-hooks/kernel_hooks.md](kernel-hooks/kernel_hooks.md): the state
+  change tracepoint and iterators of TCP against hooks on every message and
+  on accept, fentry, kprobes and cgroup_skb for UDP, and where the errors
+  of failed connects can be seen, on Rocky Linux 9.8 and Linux 6.8
+  (aarch64), with the raw results and the harness in `test/hookcost`.
+
 Similar tools, compared with the design of shawk:
 
 - [similar-tools-comparison-and-design-review/flow_observability_pipelines.md](similar-tools-comparison-and-design-review/flow_observability_pipelines.md):
