@@ -356,6 +356,12 @@ type fakeStore struct {
 	invSyncs  int
 	invFailed []string
 	invErr    error
+	// nodeStates are the times of the states written, nodes the latest
+	// states and windows the latest maintenance windows.
+	nodeStates  []time.Time
+	nodes       []nodeState
+	windowSyncs int
+	windows     []maintenanceWindow
 }
 
 func (s *fakeStore) schemaVersion(context.Context) (int, error) {
@@ -393,6 +399,28 @@ func (s *fakeStore) inventory(context.Context) (*inventory, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.inv, nil
+}
+
+func (s *fakeStore) writeNodeStates(_ context.Context, at time.Time, nodes []nodeState) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.fail {
+		return errFake
+	}
+	s.nodeStates = append(s.nodeStates, at)
+	s.nodes = nodes
+	return nil
+}
+
+func (s *fakeStore) syncMaintenance(_ context.Context, windows []maintenanceWindow) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.fail {
+		return errFake
+	}
+	s.windowSyncs++
+	s.windows = windows
+	return nil
 }
 
 func (s *fakeStore) refreshDependencies(context.Context) (int64, error) {

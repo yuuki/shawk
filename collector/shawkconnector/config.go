@@ -68,6 +68,15 @@ type Config struct {
 	// be written. Beyond it, the changes of the hosts pending the longest
 	// are dropped, and the hosts are not observed over them.
 	MaxPendingRows int `mapstructure:"max_pending_rows"`
+	// NodeStatesFile is a file, in YAML or JSON, with the states of nodes
+	// that a cron job reads from Slurm every minute. The connector reads it
+	// every write interval and writes the states to PostgreSQL with their
+	// times, where they tell why hosts were not observed and which stopped
+	// agents are planned.
+	NodeStatesFile string `mapstructure:"node_states_file"`
+	// MaintenanceFile is a file, in YAML or JSON, with the maintenance
+	// windows registered for hosts, read like NodeStatesFile.
+	MaintenanceFile string `mapstructure:"maintenance_file"`
 }
 
 // PostgresConfig configures the connection to PostgreSQL.
