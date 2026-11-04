@@ -23,33 +23,33 @@ func TestIdentities(t *testing.T) {
 	r.env = func(pid uint32) (map[string]string, bool) { return envs[pid], !stuck[pid] }
 
 	r.beginInterval()
-	got := r.resolve(100, "ruby", "billing.service", nil, now)
+	got := r.resolve(100, "ruby", 0, "billing.service", nil, now)
 	want := otlp.Process{Unit: "billing.service", Comm: "ruby", Exe: "/usr/bin/ruby", Service: "billing"}
 	if got != want {
 		t.Errorf("resolve = %+v, want %+v", got, want)
 	}
-	r.resolve(100, "ruby", "billing.service", nil, now)
+	r.resolve(100, "ruby", 0, "billing.service", nil, now)
 	if reads != 1 {
 		t.Errorf("/proc read %d times in an interval", reads)
 	}
-	if got := r.resolve(200, "nginx", "nginx.service", nil, now); got.Service != "nginx" || got.Exe != "/usr/sbin/nginx" {
+	if got := r.resolve(200, "nginx", 0, "nginx.service", nil, now); got.Service != "nginx" || got.Exe != "/usr/sbin/nginx" {
 		t.Errorf("resolve nginx = %+v", got)
 	}
 
 	// The process exited: the latest identity of the unit and comm is used.
 	delete(exes, 100)
 	r.beginInterval()
-	if got := r.resolve(100, "ruby", "billing.service", nil, now.Add(time.Minute)); got != want {
+	if got := r.resolve(100, "ruby", 0, "billing.service", nil, now.Add(time.Minute)); got != want {
 		t.Errorf("resolve after exit = %+v, want %+v", got, want)
 	}
 	// Unknown processes are named after comm, then the unit.
-	if got := r.resolve(0, "kworker", "", nil, now); got != (otlp.Process{Comm: "kworker", Service: "kworker"}) {
+	if got := r.resolve(0, "kworker", 0, "", nil, now); got != (otlp.Process{Comm: "kworker", Service: "kworker"}) {
 		t.Errorf("resolve without a process = %+v", got)
 	}
-	if got := r.resolve(0, "", "nfs-server.service", nil, now); got.Service != "nfs-server.service" {
+	if got := r.resolve(0, "", 0, "nfs-server.service", nil, now); got.Service != "nfs-server.service" {
 		t.Errorf("resolve without comm = %+v", got)
 	}
-	if got := r.resolve(0, "", "", nil, now); got.Service != procinfo.UnknownService {
+	if got := r.resolve(0, "", 0, "", nil, now); got.Service != procinfo.UnknownService {
 		t.Errorf("resolve without anything = %+v", got)
 	}
 
@@ -58,12 +58,12 @@ func TestIdentities(t *testing.T) {
 	exes[100] = "/usr/bin/ruby"
 	stuck[100] = true
 	r.beginInterval()
-	if got := r.resolve(100, "ruby", "billing.service", nil, now.Add(2*time.Minute)); got != want {
+	if got := r.resolve(100, "ruby", 0, "billing.service", nil, now.Add(2*time.Minute)); got != want {
 		t.Errorf("resolve of a stuck process = %+v, want %+v", got, want)
 	}
 
 	r.expire(now.Add(16 * time.Minute))
-	if _, ok := r.latest[unitComm{"billing.service", "ruby"}]; !ok {
+	if _, ok := r.latest[identityKey{unit: "billing.service", comm: "ruby"}]; !ok {
 		t.Error("an identity used recently expired")
 	}
 	r.expire(now.Add(30 * time.Minute))
@@ -92,27 +92,27 @@ func TestPrefetchBudget(t *testing.T) {
 	// An earlier interval left an identity for one of the stuck ones.
 	r.beginInterval()
 	r.byPID[1000] = procRead{exe: "/usr/bin/app", env: map[string]string{"OTEL_SERVICE_NAME": "known"}, complete: true}
-	r.resolve(1000, "app", "known.service", nil, now)
+	r.resolve(1000, "app", 0, "known.service", nil, now)
 
 	r.beginInterval()
-	pids := []uint32{1, 2, 3}
+	reqs := []procRequest{{1, true}, {2, true}, {3, true}}
 	for pid := uint32(1000); pid < 1100; pid++ {
-		pids = append(pids, pid)
+		reqs = append(reqs, procRequest{pid, true})
 	}
 	start := time.Now()
-	r.prefetch(pids)
+	r.prefetch(reqs)
 	if d := time.Since(start); d > time.Second {
 		t.Errorf("prefetch took %s with a budget of %s", d, r.budget)
 	}
-	if got := r.resolve(2, "app", "", nil, now); got.Service != "svc" {
+	if got := r.resolve(2, "app", 0, "", nil, now); got.Service != "svc" {
 		t.Errorf("a process read in time = %+v", got)
 	}
-	if got := r.resolve(1000, "app", "known.service", nil, now); got.Service != "known" {
+	if got := r.resolve(1000, "app", 0, "known.service", nil, now); got.Service != "known" {
 		t.Errorf("a stuck process with an earlier identity = %+v", got)
 	}
 	// One without an earlier identity is named without its environment, and
 	// /proc is not read again in the interval.
-	if got := r.resolve(1050, "worker", "", nil, now); got.Service != "worker" {
+	if got := r.resolve(1050, "worker", 0, "", nil, now); got.Service != "worker" {
 		t.Errorf("a stuck process without an earlier identity = %+v", got)
 	}
 }
@@ -126,11 +126,11 @@ func TestReusedPID(t *testing.T) {
 	r.comm = func(uint32) string { return "python3" }
 	r.env = func(uint32) (map[string]string, bool) { return map[string]string{"OTEL_SERVICE_NAME": "billing"}, true }
 	r.beginInterval()
-	if got := r.resolve(100, "python3", "billing.service", nil, now); got.Service != "billing" {
+	if got := r.resolve(100, "python3", 0, "billing.service", nil, now); got.Service != "billing" {
 		t.Errorf("resolve = %+v", got)
 	}
 	// The flow of a curl that exited; its PID now runs python3.
-	if got := r.resolve(100, "curl", "billing.service", nil, now); got.Service != "curl" || got.Exe != "" {
+	if got := r.resolve(100, "curl", 0, "billing.service", nil, now); got.Service != "curl" || got.Exe != "" {
 		t.Errorf("resolve of a reused PID = %+v", got)
 	}
 }
@@ -148,15 +148,15 @@ func TestLatestIdentityOfContainers(t *testing.T) {
 	a := &procinfo.Container{Runtime: procinfo.RuntimeDocker, ID: "aaaa", Name: "web"}
 	b := &procinfo.Container{Runtime: procinfo.RuntimeDocker, ID: "bbbb", Name: "web"}
 	r.beginInterval()
-	if got := r.resolve(100, "node", "docker/web", a, now); got.ContainerID != "aaaa" || got.Exe != "/usr/bin/node" {
+	if got := r.resolve(100, "node", 0, "docker/web", a, now); got.ContainerID != "aaaa" || got.Exe != "/usr/bin/node" {
 		t.Errorf("resolve of a = %+v", got)
 	}
 	// A short-lived process of b exited before /proc was read.
-	got := r.resolve(200, "node", "docker/web", b, now)
+	got := r.resolve(200, "node", 0, "docker/web", b, now)
 	if got.ContainerID != "bbbb" || got.Exe != "/usr/bin/node" || got.Service != "node" {
 		t.Errorf("resolve of b from the latest identity = %+v", got)
 	}
-	if got := r.resolve(300, "node", "docker/web", nil, now); got.ContainerID != "" {
+	if got := r.resolve(300, "node", 0, "docker/web", nil, now); got.ContainerID != "" {
 		t.Errorf("resolve without a container = %+v", got)
 	}
 }
@@ -194,5 +194,86 @@ func TestLogStuckReads(t *testing.T) {
 	a.logStuckReads(now.Add(2 * stuckLogEvery))
 	if l := lines(); len(l) != 3 || !strings.Contains(l[2], "skipped=50") {
 		t.Errorf("third line: %q", l)
+	}
+}
+
+// The processes of Slurm jobs are not named by their environment, which
+// their users set, and are not given the identity of a process of another
+// job: their unit is shared by every job, so the latest identities are
+// kept per cgroup (#173).
+func TestIdentitiesOfSlurmJobs(t *testing.T) {
+	now := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
+	r := newIdentities(procinfo.FallbackExe, 15*time.Minute)
+	exes := map[uint32]string{100: "/home/alice/bin/a.out", 200: "/home/bob/bin/a.out", 300: "/usr/sbin/slurmstepd"}
+	r.exe = func(pid uint32) string { return exes[pid] }
+	r.comm = func(uint32) string { return "" }
+	envReads := map[uint32]int{}
+	r.env = func(pid uint32) (map[string]string, bool) {
+		envReads[pid]++
+		return map[string]string{"OTEL_SERVICE_NAME": "slurmctld"}, true
+	}
+	const step1, step2, stepd = 11, 22, 33
+
+	r.beginInterval()
+	r.prefetch([]procRequest{{100, false}, {200, false}, {300, true}})
+	alice := r.resolve(100, "a.out", step1, "slurm/step", nil, now)
+	want := otlp.Process{Unit: "slurm/step", Comm: "a.out", Exe: "/home/alice/bin/a.out", Service: "a.out"}
+	if alice != want {
+		t.Errorf("resolve of a job = %+v, want %+v", alice, want)
+	}
+	if got := r.resolve(200, "a.out", step2, "slurm/step", nil, now); got.Exe != "/home/bob/bin/a.out" || got.Service != "a.out" {
+		t.Errorf("resolve of another job = %+v", got)
+	}
+	if envReads[100] != 0 || envReads[200] != 0 {
+		t.Errorf("environments of jobs read: %v", envReads)
+	}
+	// slurmstepd is not a process of the job, and keeps its environment.
+	if got := r.resolve(300, "slurmstepd", stepd, procinfo.SlurmStepd, nil, now); got.Service != "slurmctld" {
+		t.Errorf("resolve of slurmstepd = %+v", got)
+	}
+
+	// Both processes exited: each step keeps its own latest identity, and
+	// a new step has none.
+	clear(exes)
+	r.beginInterval()
+	if got := r.resolve(100, "a.out", step1, "slurm/step", nil, now.Add(time.Minute)); got != alice {
+		t.Errorf("resolve after exit = %+v, want %+v", got, alice)
+	}
+	if got := r.resolve(200, "a.out", step2, "slurm/step", nil, now.Add(time.Minute)); got.Exe != "/home/bob/bin/a.out" {
+		t.Errorf("resolve of the other job after exit = %+v", got)
+	}
+	if got := r.resolve(400, "a.out", 44, "slurm/step", nil, now.Add(time.Minute)); got.Exe != "" || got.Service != "a.out" {
+		t.Errorf("resolve in a new step = %+v", got)
+	}
+	// Other units are still keyed by unit and comm only.
+	exes[500] = "/usr/sbin/nginx"
+	r.resolve(500, "nginx", 55, "nginx.service", nil, now)
+	delete(exes, 500)
+	r.beginInterval()
+	if got := r.resolve(501, "nginx", 66, "nginx.service", nil, now); got.Exe != "/usr/sbin/nginx" {
+		t.Errorf("resolve in another cgroup of a unit = %+v", got)
+	}
+}
+
+// A PID asked for with and without its environment, e.g. a process that
+// pam_slurm_adopt moved into a job with sockets opened before, is read
+// with it.
+func TestPrefetchEnvironment(t *testing.T) {
+	r := newIdentities(procinfo.FallbackExe, 15*time.Minute)
+	r.exe = func(uint32) string { return "/usr/sbin/sshd" }
+	r.comm = func(uint32) string { return "sshd" }
+	reads := 0
+	r.env = func(uint32) (map[string]string, bool) {
+		reads++
+		return map[string]string{"OTEL_SERVICE_NAME": "ssh"}, true
+	}
+	r.beginInterval()
+	r.prefetch([]procRequest{{100, false}, {100, true}, {200, false}})
+	if reads != 1 || r.byPID[100].noEnv || !r.byPID[200].noEnv {
+		t.Errorf("prefetch read %d environments: %+v", reads, r.byPID)
+	}
+	// A process read without its environment is read again with it.
+	if got := r.read(200, true); got.noEnv || got.env["OTEL_SERVICE_NAME"] != "ssh" || reads != 2 {
+		t.Errorf("read with the environment = %+v after %d reads", got, reads)
 	}
 }

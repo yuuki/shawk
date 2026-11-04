@@ -313,14 +313,25 @@ func (a *Agent) observe(snap *tracer.Snapshot, start, end time.Time) {
 	a.xlatDrops = snap.TranslationDrops
 	a.cgroupDrops = snap.CgroupEventDrops
 	a.idents.beginInterval()
-	pids := make([]uint32, 0, len(snap.Flows)+len(snap.Listeners))
+	reqs := make([]procRequest, 0, len(snap.Flows)+len(snap.Listeners))
+	// The environment of the processes of Slurm jobs is not used.
+	env := map[uint64]bool{}
+	request := func(pid uint32, cgroupID uint64) {
+		e, ok := env[cgroupID]
+		if !ok {
+			unit, _ := a.cgroups.Unit(cgroupID)
+			e = !procinfo.SlurmJob(unit)
+			env[cgroupID] = e
+		}
+		reqs = append(reqs, procRequest{pid, e})
+	}
 	for i := range snap.Flows {
-		pids = append(pids, snap.Flows[i].PID)
+		request(snap.Flows[i].PID, snap.Flows[i].CgroupID)
 	}
 	for i := range snap.Listeners {
-		pids = append(pids, snap.Listeners[i].PID)
+		request(snap.Listeners[i].PID, snap.Listeners[i].CgroupID)
 	}
-	a.idents.prefetch(pids)
+	a.idents.prefetch(reqs)
 	a.state.BeginInterval()
 	for i := range snap.Flows {
 		f := &snap.Flows[i]
@@ -388,7 +399,7 @@ func (a *Agent) process(pid uint32, comm string, cgroupID uint64, port uint16, s
 		return otlp.Process{Comm: comm, Service: procinfo.KernelServiceName(port, server)}
 	}
 	unit, ctr := a.cgroups.Unit(cgroupID)
-	return a.idents.resolve(pid, comm, unit, ctr, now)
+	return a.idents.resolve(pid, comm, cgroupID, unit, ctr, now)
 }
 
 // request builds the requests of the live series at now, and returns the

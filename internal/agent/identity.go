@@ -17,7 +17,7 @@ type identities struct {
 	byPID map[uint32]procRead
 	// The latest identity of each unit and comm, for flows whose process
 	// exited before it could be read, such as short-lived batch jobs.
-	latest map[unitComm]latestIdentity
+	latest map[identityKey]latestIdentity
 	// Readers of /proc; replaced in tests.
 	exe  func(pid uint32) string
 	comm func(pid uint32) string
@@ -43,11 +43,27 @@ type procRead struct {
 	exe  string
 	comm string
 	env  map[string]string
-	// complete is false when the environment could not be read in time.
-	complete bool
+	// complete is false when the environment could not be read in time;
+	// noEnv tells that it was not asked for.
+	complete, noEnv bool
 }
 
-type unitComm struct{ unit, comm string }
+// identityKey keys the latest identities. The processes of a Slurm job are
+// keyed by their cgroup too, so that the identity of a process of a job is
+// filled in only from its own step: the units of jobs are shared by every
+// job of every user (procinfo.SlurmJob).
+type identityKey struct {
+	unit, comm string
+	cgroup     uint64
+}
+
+func newIdentityKey(unit, comm string, cgroupID uint64) identityKey {
+	k := identityKey{unit: unit, comm: comm}
+	if procinfo.SlurmJob(unit) {
+		k.cgroup = cgroupID
+	}
+	return k
+}
 
 type latestIdentity struct {
 	proc otlp.Process
@@ -58,7 +74,7 @@ func newIdentities(fb procinfo.Fallback, ttl time.Duration) *identities {
 	return &identities{
 		fallback: fb,
 		ttl:      ttl,
-		latest:   map[unitComm]latestIdentity{},
+		latest:   map[identityKey]latestIdentity{},
 		exe:      procinfo.Exe,
 		comm:     procinfo.Comm,
 		env:      procinfo.OTelEnv,
@@ -71,18 +87,29 @@ func newIdentities(fb procinfo.Fallback, ttl time.Duration) *identities {
 // have been reused.
 func (r *identities) beginInterval() { r.byPID = map[uint32]procRead{} }
 
+// procRequest asks for the identity of a process; env tells whether its
+// environment names it, which it does not in the cgroup of a Slurm job.
+type procRequest struct {
+	pid uint32
+	env bool
+}
+
 // prefetch reads /proc for the processes of an interval, several at once
 // and within the budget, so that a few stuck processes do not delay the
-// export. Processes not read in time are marked incomplete.
-func (r *identities) prefetch(pids []uint32) {
+// export. Processes not read in time are marked incomplete. The
+// environment of a process is read if one of its requests uses it.
+func (r *identities) prefetch(reqs []procRequest) {
 	var todo []uint32
-	queued := map[uint32]bool{}
-	for _, pid := range pids {
-		if _, ok := r.byPID[pid]; ok || pid == 0 || queued[pid] {
+	env := map[uint32]bool{}
+	for _, q := range reqs {
+		if _, ok := r.byPID[q.pid]; ok || q.pid == 0 {
 			continue
 		}
-		queued[pid] = true
-		todo = append(todo, pid)
+		e, queued := env[q.pid]
+		env[q.pid] = e || q.env
+		if !queued {
+			todo = append(todo, q.pid)
+		}
 	}
 	if len(todo) == 0 {
 		return
@@ -110,7 +137,7 @@ func (r *identities) prefetch(pids []uint32) {
 	for range min(procReaders, len(todo)) {
 		go func() {
 			for pid := range jobs {
-				results <- result{pid, r.readNow(pid)}
+				results <- result{pid, r.readNow(pid, env[pid])}
 			}
 		}()
 	}
@@ -132,34 +159,44 @@ func (r *identities) prefetch(pids []uint32) {
 	}
 }
 
-func (r *identities) read(pid uint32) procRead {
+// read returns the reads of a process, reading /proc if the interval has
+// not, with its environment if env is true.
+func (r *identities) read(pid uint32, env bool) procRead {
 	if pid == 0 {
 		return procRead{complete: true}
 	}
-	if p, ok := r.byPID[pid]; ok {
+	if p, ok := r.byPID[pid]; ok && (!p.noEnv || !env) {
 		return p
 	}
-	p := r.readNow(pid)
+	p := r.readNow(pid, env)
 	r.byPID[pid] = p
 	return p
 }
 
-// readNow reads the executable, the command name and the environment of a
-// process.
-func (r *identities) readNow(pid uint32) procRead {
+// readNow reads the executable, the command name and, if env is true, the
+// environment of a process.
+func (r *identities) readNow(pid uint32, env bool) procRead {
 	p := procRead{exe: r.exe(pid), complete: true}
 	if p.exe != "" {
 		p.comm = r.comm(pid)
-		p.env, p.complete = r.env(pid)
+		if env {
+			p.env, p.complete = r.env(pid)
+		} else {
+			p.noEnv = true
+		}
 	}
 	return p
 }
 
-// resolve returns the identity of the process pid with comm in unit, which
-// is the unit of the container ctr if it is not nil.
-func (r *identities) resolve(pid uint32, comm, unit string, ctr *procinfo.Container, now time.Time) otlp.Process {
-	k := unitComm{unit, comm}
-	p := r.read(pid)
+// resolve returns the identity of the process pid with comm in the cgroup
+// cgroupID of unit, which is the unit of the container ctr if it is not
+// nil. The OTEL_ variables of the processes of Slurm jobs are not read:
+// any user could name a job after a service of the cluster, such as
+// slurmctld, so they are named after their executable onwards.
+func (r *identities) resolve(pid uint32, comm string, cgroupID uint64, unit string, ctr *procinfo.Container, now time.Time) otlp.Process {
+	k := newIdentityKey(unit, comm, cgroupID)
+	trustEnv := !procinfo.SlurmJob(unit)
+	p := r.read(pid, trustEnv)
 	if p.comm != "" && p.comm != comm {
 		// The flow was seen up to an interval ago; the PID now belongs to
 		// another process (the tracer reports the command name of the main
@@ -181,7 +218,11 @@ func (r *identities) resolve(pid uint32, comm, unit string, ctr *procinfo.Contai
 			return proc
 		}
 	}
-	svc := procinfo.ServiceName(p.env, p.exe, comm, unit, ctr.Workload(), r.fallback)
+	env := p.env
+	if !trustEnv {
+		env = nil
+	}
+	svc := procinfo.ServiceName(env, p.exe, comm, unit, ctr.Workload(), r.fallback)
 	proc := otlp.Process{Unit: unit, Comm: comm, Exe: p.exe, Service: svc.Name, ServiceNamespace: svc.Namespace}
 	if ctr != nil {
 		proc.ContainerID = ctr.ID
