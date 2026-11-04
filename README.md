@@ -16,6 +16,12 @@ this host in the last 90 days, and were we watching?*
   sample: a job that runs once a month is still seen.
 - Each host's observation periods and the periods its agent dropped flows
   are recorded, so "not used" can be told apart from "not observed".
+- Only TCP and UDP sockets are observed, so "not used" means "no TCP or
+  UDP". RDMA verbs (InfiniBand, RoCE) bypass the sockets: the RDMA
+  transports of MPI (UCX) and NCCL, Lustre o2ib, GPFS verbs and NFS over
+  RDMA are not seen, even when their control connections over TCP are; TCP
+  over IPoIB is. See [packaging/README.md](packaging/README.md#hpc-clusters)
+  for HPC clusters.
 - Agents send OTLP to an OpenTelemetry Collector. Services are named the
   way OBI (OpenTelemetry eBPF Instrumentation) names them, so shawk's
   dependencies and OBI's application metrics share the same `job`.
