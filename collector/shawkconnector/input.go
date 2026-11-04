@@ -34,6 +34,20 @@ func (p *process) job() string {
 	return p.svcNS + "/" + p.service
 }
 
+// slurmJob tells whether a process is a process of a Slurm job (see
+// slurmJobUnit).
+func (p *process) slurmJob() bool { return strings.HasPrefix(p.unit, slurmJobUnit) }
+
+// peerName is the name of the service of a process as a peer of other
+// services in Prometheus (service.peer.name): its job, or slurm-job for the
+// processes of Slurm jobs, as the job of their outputs (aggregator.service).
+func (p *process) peerName() string {
+	if p.slurmJob() {
+		return slurmJobService
+	}
+	return p.job()
+}
+
 // edgeID identifies an input edge series of a host.
 type edgeID struct {
 	role, proto string

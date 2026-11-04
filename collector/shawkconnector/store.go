@@ -673,13 +673,20 @@ func (s *pgStore) prune(ctx context.Context, retention time.Duration, maxRows in
 
 func (s *pgStore) peers(ctx context.Context, learnedTTL, formerWindow time.Duration) (peerRows, error) {
 	var out peerRows
-	err := queryRows(ctx, s.pool, `SELECT host(addr), port, proto, host_id, service, last_seen, exact FROM shawk_v1.service_endpoints`,
+	// The endpoints name the peers of the outputs only, so the processes of
+	// Slurm jobs are named as Prometheus names them (process.peerName).
+	err := queryRows(ctx, s.pool, `SELECT host(addr), port, proto, host_id, service, last_seen, exact, slurm_job
+FROM shawk_v1.service_endpoints`,
 		func(rows pgx.Rows) error {
 			var addr string
 			var port int32
+			var job bool
 			var e endpointRow
-			if err := rows.Scan(&addr, &port, &e.key.proto, &e.host, &e.service, &e.lastSeen, &e.exact); err != nil {
+			if err := rows.Scan(&addr, &port, &e.key.proto, &e.host, &e.service, &e.lastSeen, &e.exact, &job); err != nil {
 				return err
+			}
+			if job {
+				e.service = slurmJobService
 			}
 			if a, err := netip.ParseAddr(addr); err == nil {
 				e.key.addr, e.key.port = a.Unmap(), uint16(port)
@@ -691,15 +698,19 @@ func (s *pgStore) peers(ctx context.Context, learnedTTL, formerWindow time.Durat
 		return out, err
 	}
 	// A folded server address, a network, is no server.
-	err = queryRows(ctx, s.pool, `SELECT host(client_addr), host(server_addr), port, proto, host_id, service, last_seen
+	err = queryRows(ctx, s.pool, `SELECT host(client_addr), host(server_addr), port, proto, host_id, service, last_seen, slurm_job
 FROM shawk_v1.client_endpoints
 WHERE masklen(server_addr) = CASE family(server_addr) WHEN 4 THEN 32 ELSE 128 END`,
 		func(rows pgx.Rows) error {
 			var client, server string
 			var port int32
+			var job bool
 			var c clientRow
-			if err := rows.Scan(&client, &server, &port, &c.key.proto, &c.host, &c.service, &c.lastSeen); err != nil {
+			if err := rows.Scan(&client, &server, &port, &c.key.proto, &c.host, &c.service, &c.lastSeen, &job); err != nil {
 				return err
+			}
+			if job {
+				c.service = slurmJobService
 			}
 			ca, err1 := netip.ParseAddr(client)
 			sa, err2 := netip.ParseAddr(server)

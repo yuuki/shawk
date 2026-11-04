@@ -374,8 +374,10 @@ func (r *resolver) learn(b *hostBatch, now time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	budget := r.maxInferred
+	// The endpoints name the peers of the outputs only, so the processes of
+	// Slurm jobs are named as Prometheus names them.
 	for _, l := range b.listeners {
-		svc := l.id.job()
+		svc := l.id.peerName()
 		if !l.id.addr.IsUnspecified() {
 			learnInto(r.localEndpoints, endpointKey{l.id.addr, l.id.port, l.id.proto},
 				endpoint{host: b.key, service: svc, exact: true}, now)
@@ -398,10 +400,10 @@ func (r *resolver) learn(b *hostBatch, now time.Time) {
 		switch e.id.role {
 		case roleServer:
 			learnInto(r.localEndpoints, endpointKey{e.id.local, e.id.port, e.id.proto},
-				endpoint{host: b.key, service: e.id.job(), exact: true}, now)
+				endpoint{host: b.key, service: e.id.peerName(), exact: true}, now)
 			if !e.id.folded {
 				learnInto(r.localServed, clientKey{e.id.peer, e.id.local, e.id.port, e.id.proto},
-					endpoint{host: b.key, service: e.id.job(), exact: true}, now)
+					endpoint{host: b.key, service: e.id.peerName(), exact: true}, now)
 			}
 		case roleClient:
 			if e.id.folded {
@@ -410,7 +412,7 @@ func (r *resolver) learn(b *hostBatch, now time.Time) {
 				continue
 			}
 			learnInto(r.localClients, clientKey{e.id.local, e.id.peer, e.id.port, e.id.proto},
-				endpoint{host: b.key, service: e.id.job(), exact: true}, now)
+				endpoint{host: b.key, service: e.id.peerName(), exact: true}, now)
 		}
 	}
 	for _, x := range b.translations {

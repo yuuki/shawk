@@ -281,10 +281,14 @@ func (a *aggregator) peer(g peerGroup, name string, now time.Time) string {
 }
 
 // service returns the local service of the outputs of a process on a
-// host: its name and namespace cut to maxLabelValue bytes, or ~other for
-// the services beyond max_services.
+// host: its name and namespace cut to maxLabelValue bytes, slurm-job for
+// the processes of Slurm jobs, or ~other for the services beyond
+// max_services. PostgreSQL keeps the names of the processes of jobs.
 func (a *aggregator) service(h *hostOutputs, p *process, now time.Time) svcKey {
 	k := svcKey{service: cutLabel(p.service, maxLabelValue), svcNS: cutLabel(p.svcNS, maxLabelValue)}
+	if p.slurmJob() {
+		k = svcKey{service: slurmJobService}
+	}
 	if _, ok := h.services[k]; !ok && len(h.services) >= a.maxServices {
 		return svcKey{service: serviceOther}
 	}

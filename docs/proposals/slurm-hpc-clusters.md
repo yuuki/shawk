@@ -154,6 +154,9 @@ reasons that occurred.
 
 ### 2.1 Units (#173)
 
+Implemented (#185, design §4.1 and §5.3); see there for what differs from
+this section, such as the names of peers.
+
 - `Unit()` (`internal/procinfo/cgroup.go`) does not know the cgroups of
   Slurm, so the processes of jobs get the last element of the path:
   `task_0`, `task_1`, …, and slurmstepd `slurm`.
