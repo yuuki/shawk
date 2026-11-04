@@ -100,11 +100,12 @@ on the host that runs it, with a cron job that replaces it at once:
 
 ```sh
 scontrol show nodes --json \
-  | jq '{generated_at: (now | todate), nodes: [.nodes[] | {host: .name, state, reason}]}' \
+  | jq '{generated_at: (now | todate), nodes: [.nodes[] | {node: .name, state, reason}]}' \
   > /etc/shawk/node-states.json.tmp && mv /etc/shawk/node-states.json.tmp /etc/shawk/node-states.json
 ```
 
-Map `NodeName` to the host name of the agent there if they differ.
+The connector maps each `NodeName` to a host by `slurm_node` of the
+`inventory_file`.
 Register maintenance windows, of hosts with or without Slurm, in
 `maintenance_file` before they start; replace it at once too, and give
 every connector the same one.
