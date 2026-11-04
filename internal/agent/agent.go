@@ -53,6 +53,15 @@ type Config struct {
 	traceSelf bool // trace the agent's own flows; for tests
 }
 
+// jobUsers returns what reads the users of the processes of Slurm jobs:
+// nil without JobUsers.
+func jobUsers(cfg Config, cgroups *procinfo.Resolver) func(uint32) (uint32, uint64, bool) {
+	if !cfg.JobUsers || cgroups == nil {
+		return nil
+	}
+	return cgroups.User
+}
+
 // MaxInterval is the longest export interval.
 const MaxInterval = time.Minute
 
@@ -230,7 +239,7 @@ func newAgent(cfg Config, src source, exp otlp.Exporter, cgroups *procinfo.Resol
 		cgroups:     cgroups,
 		state:       otlp.NewState(cfg.IdleTTL),
 		segment:     otlp.NewSegment(now, cfg.IdleTTL),
-		idents:      newIdentities(cfg.ServiceFallback, cfg.IdleTTL, cfg.JobUsers),
+		idents:      newIdentities(cfg.ServiceFallback, cfg.IdleTTL, jobUsers(cfg, cgroups)),
 		started:     now,
 		res:         res,
 		lastCollect: now,

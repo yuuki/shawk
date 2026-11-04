@@ -13,9 +13,6 @@ import (
 type identities struct {
 	fallback procinfo.Fallback
 	ttl      time.Duration
-	// users tells to read the user ids of processes, which the processes of
-	// Slurm jobs carry.
-	users bool
 	// Reads of /proc in the current interval, by PID.
 	byPID map[uint32]procRead
 	// The latest identity of each unit and comm, for flows whose process
@@ -25,7 +22,9 @@ type identities struct {
 	exe  func(pid uint32) string
 	comm func(pid uint32) string
 	env  func(pid uint32) (map[string]string, bool)
-	uid  func(pid uint32) (uint32, bool)
+	// users reads the user id of a process and the cgroup it is in, which
+	// the processes of Slurm jobs carry; nil reads none.
+	users func(pid uint32) (uid uint32, cgroupID uint64, ok bool)
 	// stuck tells how many reads of environments hang; replaced in tests.
 	stuck func() procinfo.EnvironReads
 	// budget bounds the time spent reading /proc in an interval.
@@ -47,9 +46,11 @@ type procRead struct {
 	exe  string
 	comm string
 	env  map[string]string
-	// uid is the effective user id if hasUID.
-	uid    uint32
-	hasUID bool
+	// uid is the effective user id if hasUID, read with uidCgroup, the
+	// cgroup the process was in.
+	uid       uint32
+	uidCgroup uint64
+	hasUID    bool
 	// complete is false when the environment could not be read in time;
 	// noEnv tells that it was not asked for.
 	complete, noEnv bool
@@ -77,7 +78,9 @@ type latestIdentity struct {
 	at   time.Time
 }
 
-func newIdentities(fb procinfo.Fallback, ttl time.Duration, users bool) *identities {
+// newIdentities returns a resolver of identities; users reads the user ids
+// of the processes of Slurm jobs, nil none.
+func newIdentities(fb procinfo.Fallback, ttl time.Duration, users func(uint32) (uint32, uint64, bool)) *identities {
 	return &identities{
 		fallback: fb,
 		ttl:      ttl,
@@ -86,7 +89,6 @@ func newIdentities(fb procinfo.Fallback, ttl time.Duration, users bool) *identit
 		exe:      procinfo.Exe,
 		comm:     procinfo.Comm,
 		env:      procinfo.OTelEnv,
-		uid:      procinfo.UserID,
 		stuck:    procinfo.StuckEnvironReads,
 		budget:   procReadBudget,
 	}
@@ -183,10 +185,11 @@ func (r *identities) read(pid uint32, env bool) procRead {
 }
 
 // readNow reads the executable, the command name, if env is true the
-// environment, and if users are read the user id of a process. The user id
-// is read whether or not the environment is: a process that
-// pam_slurm_adopt moved into a job is asked for with its environment for
-// the sockets it opened before.
+// environment, and if users are read the user id of a process with its
+// cgroup. The user id is read whether or not the environment is: a process
+// that pam_slurm_adopt moved into a job is asked for with its environment
+// for the sockets it opened before, and carries its user on the flows of
+// the cgroup it is in now.
 func (r *identities) readNow(pid uint32, env bool) procRead {
 	p := procRead{exe: r.exe(pid), complete: true}
 	if p.exe != "" {
@@ -196,8 +199,8 @@ func (r *identities) readNow(pid uint32, env bool) procRead {
 		} else {
 			p.noEnv = true
 		}
-		if r.users {
-			p.uid, p.hasUID = r.uid(pid)
+		if r.users != nil {
+			p.uid, p.uidCgroup, p.hasUID = r.users(pid)
 		}
 	}
 	return p
@@ -210,8 +213,10 @@ func (r *identities) readNow(pid uint32, env bool) procRead {
 // slurmctld, so they are named after their executable onwards.
 //
 // With users, a process of a Slurm job carries its user id as read in this
-// interval. A user id that could not be read is unknown: it is never taken
-// from the latest identity, which the processes of the step share.
+// interval, if it was read in the cgroup of the flow: the comm of a process
+// that took the PID of the flow may be the same. A user id that could not
+// be read is unknown: it is never taken from the latest identity, which the
+// processes of the step share.
 func (r *identities) resolve(pid uint32, comm string, cgroupID uint64, unit string, ctr *procinfo.Container, now time.Time) otlp.Process {
 	k := newIdentityKey(unit, comm, cgroupID)
 	trustEnv := !procinfo.SlurmJob(unit)
@@ -234,7 +239,7 @@ func (r *identities) resolve(pid uint32, comm string, cgroupID uint64, unit stri
 			if ctr != nil {
 				proc.ContainerID = ctr.ID
 			}
-			r.setUser(&proc, p)
+			r.setUser(&proc, p, cgroupID)
 			return proc
 		}
 	}
@@ -250,15 +255,15 @@ func (r *identities) resolve(pid uint32, comm string, cgroupID uint64, unit stri
 	if p.exe != "" && p.complete {
 		r.latest[k] = latestIdentity{proc: proc, at: now}
 	}
-	r.setUser(&proc, p)
+	r.setUser(&proc, p, cgroupID)
 	return proc
 }
 
-// setUser sets the user id of a process of a Slurm job to the one read, if
-// users are read.
-func (r *identities) setUser(proc *otlp.Process, p procRead) {
+// setUser sets the user id of a process of a Slurm job in the cgroup
+// cgroupID to the one read, if it was read in that cgroup.
+func (r *identities) setUser(proc *otlp.Process, p procRead, cgroupID uint64) {
 	proc.UserID, proc.HasUserID = 0, false
-	if r.users && p.hasUID && procinfo.SlurmJob(proc.Unit) {
+	if p.hasUID && p.uidCgroup == cgroupID && cgroupID != 0 && procinfo.SlurmJob(proc.Unit) {
 		proc.UserID, proc.HasUserID = p.uid, true
 	}
 }
