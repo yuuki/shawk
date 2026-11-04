@@ -120,7 +120,7 @@ func newConnector(set connector.Settings, cfg *Config, next consumer.Metrics) (*
 		resolver: res,
 		limits:   newLimits(cfg.MaxHosts, cfg.MaxSeriesPerHost, cfg.IdleTTL),
 		agg:      agg,
-		changes:  newChanges(cfg.IdleTTL),
+		changes:  newChanges(cfg.IdleTTL, cfg.JobUsers),
 		cidrs:    cidrs,
 		now:      time.Now,
 

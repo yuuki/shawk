@@ -59,6 +59,14 @@ type Config struct {
 	// server edges of their backends, in PostgreSQL and in the names of
 	// peers.
 	Translations map[string]TranslationConfig `mapstructure:"translations"`
+	// JobUsers keeps the users of the processes of Slurm jobs in
+	// PostgreSQL: the user id an agent run with -job-users sends
+	// (process.user.id) becomes part of the identity of such a process,
+	// so that its rows grow with users. User ids with executables, peers
+	// and times tell the activity of the jobs of other users, so the view
+	// that shows them (shawk_v1.job_edges) is for administrators; grants.sql
+	// keeps it from Grafana.
+	JobUsers bool `mapstructure:"job_users"`
 	// HostIdentity tells whom the connector believes about the host of a
 	// request. "certificate" accepts the metrics of a host only over gRPC
 	// from an agent whose verified client certificate names the host.name

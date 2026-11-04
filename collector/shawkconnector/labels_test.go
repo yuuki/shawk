@@ -416,9 +416,9 @@ func TestSlurmJobs(t *testing.T) {
 		got = append(got, k)
 	}
 	slices.SortFunc(got, func(a, b procKey) int { return strings.Compare(a.unit, b.unit) })
-	want := []procKey{{"slurm/batch", "python3", "python3"}, {"slurm/extern", "sshd", "sshd"},
-		{"slurm/interactive", "bash", "hpc/slurmctld"}, {"slurm/step", "vasp_std", "vasp_std"},
-		{"slurmd.service", "slurmd", "slurmd"}, {"slurmstepd", "slurmstepd", "slurmstepd"}}
+	want := []procKey{{"slurm/batch", "python3", "python3", ""}, {"slurm/extern", "sshd", "sshd", ""},
+		{"slurm/interactive", "bash", "hpc/slurmctld", ""}, {"slurm/step", "vasp_std", "vasp_std", ""},
+		{"slurmd.service", "slurmd", "slurmd", ""}, {"slurmstepd", "slurmstepd", "slurmstepd", ""}}
 	if !slices.Equal(got, want) {
 		t.Errorf("processes written = %v, want %v", got, want)
 	}
@@ -488,7 +488,7 @@ func TestLongLabelsCut(t *testing.T) {
 	}
 	c.flush(context.Background())
 	h := st.writes[0]
-	if _, ok := h.processes[procKey{"", "app", ns + "/" + svc}]; !ok || h.hostname != host || h.machineID != id ||
+	if _, ok := h.processes[procKey{"", "app", ns + "/" + svc, ""}]; !ok || h.hostname != host || h.machineID != id ||
 		h.version != long(300) {
 		t.Errorf("written %q %q %q %v", h.hostname, h.machineID, h.version, slices.Collect(maps.Keys(h.processes)))
 	}

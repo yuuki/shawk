@@ -16,7 +16,7 @@ func TestIdentities(t *testing.T) {
 	exes := map[uint32]string{100: "/usr/bin/ruby", 200: "/usr/sbin/nginx"}
 	envs := map[uint32]map[string]string{100: {"OTEL_SERVICE_NAME": "billing"}}
 	reads := 0
-	r := newIdentities(procinfo.FallbackExe, 15*time.Minute)
+	r := newIdentities(procinfo.FallbackExe, 15*time.Minute, nil)
 	r.exe = func(pid uint32) string { reads++; return exes[pid] }
 	r.comm = func(uint32) string { return "" }
 	stuck := map[uint32]bool{}
@@ -77,7 +77,7 @@ func TestIdentities(t *testing.T) {
 // latest identity.
 func TestPrefetchBudget(t *testing.T) {
 	now := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
-	r := newIdentities(procinfo.FallbackExe, 15*time.Minute)
+	r := newIdentities(procinfo.FallbackExe, 15*time.Minute, nil)
 	r.budget = 300 * time.Millisecond
 	block := make(chan struct{})
 	t.Cleanup(func() { close(block) })
@@ -121,7 +121,7 @@ func TestPrefetchBudget(t *testing.T) {
 // the command name of /proc must match that of the flow.
 func TestReusedPID(t *testing.T) {
 	now := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
-	r := newIdentities(procinfo.FallbackExe, 15*time.Minute)
+	r := newIdentities(procinfo.FallbackExe, 15*time.Minute, nil)
 	r.exe = func(uint32) string { return "/usr/bin/python3" }
 	r.comm = func(uint32) string { return "python3" }
 	r.env = func(uint32) (map[string]string, bool) { return map[string]string{"OTEL_SERVICE_NAME": "billing"}, true }
@@ -140,7 +140,7 @@ func TestReusedPID(t *testing.T) {
 // (#104).
 func TestLatestIdentityOfContainers(t *testing.T) {
 	now := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
-	r := newIdentities(procinfo.FallbackExe, 15*time.Minute)
+	r := newIdentities(procinfo.FallbackExe, 15*time.Minute, nil)
 	exes := map[uint32]string{100: "/usr/bin/node"}
 	r.exe = func(pid uint32) string { return exes[pid] }
 	r.comm = func(uint32) string { return "" }
@@ -207,7 +207,7 @@ func TestIdentitiesOfSlurmJobs(t *testing.T) {
 	step1 := flowCgroup{11, scope + "job_1/step_0/user/task_0"}
 	step2 := flowCgroup{22, scope + "job_2/step_0/user/task_0"}
 	stepd := flowCgroup{33, scope + "job_1/step_0/slurm"}
-	r := newIdentities(procinfo.FallbackExe, 15*time.Minute)
+	r := newIdentities(procinfo.FallbackExe, 15*time.Minute, nil)
 	exes := map[uint32]string{100: "/home/alice/bin/a.out", 200: "/home/bob/bin/a.out", 300: "/usr/sbin/slurmstepd"}
 	cgroups := map[uint32]string{100: step1.path, 200: step2.path, 300: stepd.path}
 	r.exe = func(pid uint32) string { return exes[pid] }
@@ -285,7 +285,7 @@ func TestIdentitiesOfSlurmJobs(t *testing.T) {
 func TestIdentitiesOfProcessesInJobs(t *testing.T) {
 	now := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
 	const extern = "/system.slice/slurmstepd.scope/job_1/step_extern/user/task_special"
-	r := newIdentities(procinfo.FallbackExe, 15*time.Minute)
+	r := newIdentities(procinfo.FallbackExe, 15*time.Minute, nil)
 	r.exe = func(uint32) string { return "/usr/bin/python3" }
 	r.comm = func(uint32) string { return "" }
 	r.cgroup = func(uint32) string { return extern }
@@ -320,7 +320,7 @@ func TestIdentitiesOfProcessesInJobs(t *testing.T) {
 func TestCgroupChangedWhileReading(t *testing.T) {
 	now := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
 	nginx := flowCgroup{11, "/system.slice/nginx.service"}
-	r := newIdentities(procinfo.FallbackExe, 15*time.Minute)
+	r := newIdentities(procinfo.FallbackExe, 15*time.Minute, nil)
 	r.exe = func(uint32) string { return "/usr/sbin/nginx" }
 	r.comm = func(uint32) string { return "" }
 	r.cgroup = func(uint32) string { return nginx.path }
@@ -346,7 +346,7 @@ func TestCgroupChangedWhileReading(t *testing.T) {
 // pam_slurm_adopt moved into a job with sockets opened before, is read
 // with it.
 func TestPrefetchEnvironment(t *testing.T) {
-	r := newIdentities(procinfo.FallbackExe, 15*time.Minute)
+	r := newIdentities(procinfo.FallbackExe, 15*time.Minute, nil)
 	r.exe = func(uint32) string { return "/usr/sbin/sshd" }
 	r.comm = func(uint32) string { return "sshd" }
 	reads := 0
@@ -362,5 +362,100 @@ func TestPrefetchEnvironment(t *testing.T) {
 	// A process read without its environment is read again with it.
 	if got := r.read(200, true); got.noEnv || got.env["OTEL_SERVICE_NAME"] != "ssh" || reads != 2 {
 		t.Errorf("read with the environment = %+v after %d reads", got, reads)
+	}
+}
+
+// With users, a process of a Slurm job carries the user id read in the
+// interval in the cgroup of the flow; one that could not be read is
+// unknown, never that of the latest identity, and so is the user of a
+// process that took the PID of the flow in another cgroup, even with the
+// same comm. Other processes carry no user.
+func TestIdentitiesUsers(t *testing.T) {
+	now := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
+	const step, other = 11, 12
+	exes := map[uint32]string{100: "/home/alice/a.out", 200: "/usr/sbin/slurmstepd"}
+	uids := map[uint32]uint32{100: 1001, 200: 0}
+	cgroups := map[uint32]uint64{100: step, 200: 22}
+	comms := map[uint32]string{100: "a.out", 200: "slurmstepd"}
+	uidReads := map[uint32]int{}
+	users := func(pid uint32) (uint32, uint64, bool) {
+		uidReads[pid]++
+		u, ok := uids[pid]
+		return u, cgroups[pid], ok && exes[pid] != ""
+	}
+	newResolver := func(users func(uint32) (uint32, uint64, bool)) *identities {
+		r := newIdentities(procinfo.FallbackExe, 15*time.Minute, users)
+		r.exe = func(pid uint32) string { return exes[pid] }
+		r.comm = func(pid uint32) string { return comms[pid] }
+		r.env = func(uint32) (map[string]string, bool) { return nil, true }
+		// The path of the cgroup is not read, so that the user id is
+		// checked alone: a process may take the PID after the path was
+		// read and before the user id.
+		r.cgroup = func(uint32) string { return "" }
+		return r
+	}
+
+	r := newResolver(users)
+	r.beginInterval()
+	r.prefetch([]procRequest{{100, false}, {200, true}})
+	got := r.resolve(100, "a.out", flowCgroup{id: step}, "slurm/batch", nil, now)
+	if !got.HasUserID || got.UserID != 1001 {
+		t.Errorf("job process = %+v, want user 1001", got)
+	}
+	// slurmstepd is not a process of the job.
+	if got := r.resolve(200, "slurmstepd", flowCgroup{id: 22}, procinfo.SlurmStepd, nil, now); got.HasUserID {
+		t.Errorf("slurmstepd = %+v, want no user", got)
+	}
+	if uidReads[100] != 1 {
+		t.Errorf("user ids read %v, want once per process", uidReads)
+	}
+	// A process asked for with its environment too, as one that
+	// pam_slurm_adopt moved into a job, carries its user on the flows of
+	// the job, not on those it opened before.
+	exes[300], uids[300], cgroups[300], comms[300] = "/usr/bin/bash", 1001, 33, "bash"
+	r.prefetch([]procRequest{{300, true}, {300, false}})
+	if got := r.resolve(300, "bash", flowCgroup{id: 33}, "slurm/extern", nil, now); !got.HasUserID || got.UserID != 1001 {
+		t.Errorf("adopted process = %+v, want user 1001", got)
+	}
+
+	// The process exited: the identity is the latest of the step, without
+	// its user.
+	delete(exes, 100)
+	r.beginInterval()
+	got = r.resolve(100, "a.out", flowCgroup{id: step}, "slurm/batch", nil, now.Add(time.Minute))
+	if got.HasUserID || got.Exe != "/home/alice/a.out" {
+		t.Errorf("exited job process = %+v, want the latest identity without a user", got)
+	}
+	// Another process of another job, with the same comm, took the PID:
+	// its user is not that of the flow. (The path of its cgroup is not
+	// read here, so the rest of what /proc tells is taken as it is.)
+	uids[100], cgroups[100], exes[100] = 1002, other, "/home/bob/a.out"
+	r.beginInterval()
+	if got := r.resolve(100, "a.out", flowCgroup{id: step}, "slurm/batch", nil, now.Add(2*time.Minute)); got.HasUserID {
+		t.Errorf("PID taken in another cgroup = %+v, want no user", got)
+	}
+	// The user id cannot be read.
+	uids[100], exes[100], cgroups[100] = 1001, "/home/alice/a.out", step
+	delete(uids, 100)
+	r.beginInterval()
+	if got := r.resolve(100, "a.out", flowCgroup{id: step}, "slurm/batch", nil, now.Add(3*time.Minute)); got.HasUserID || got.Exe == "" {
+		t.Errorf("job process without a readable user = %+v", got)
+	}
+	// The PID belongs to a process with another comm.
+	uids[100] = 1001
+	comms[100] = "other"
+	r.beginInterval()
+	if got := r.resolve(100, "a.out", flowCgroup{id: step}, "slurm/batch", nil, now.Add(4*time.Minute)); got.HasUserID {
+		t.Errorf("reused PID = %+v, want no user", got)
+	}
+
+	// Without users, no user id is read.
+	comms[100] = "a.out"
+	clear(uidReads)
+	r = newResolver(nil)
+	r.beginInterval()
+	r.prefetch([]procRequest{{100, false}})
+	if got := r.resolve(100, "a.out", flowCgroup{id: step}, "slurm/batch", nil, now); got.HasUserID || len(uidReads) != 0 {
+		t.Errorf("job process without users = %+v, user ids read %v", got, uidReads)
 	}
 }

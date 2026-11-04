@@ -146,6 +146,8 @@ func runAgent(ctx context.Context, args []string, _, stderr io.Writer) error {
 		bpfStats = fs.Bool("bpf-stats", false, "enable and send run time statistics of the BPF programs (small overhead)")
 		learn    = fs.Bool("learn-translations", true,
 			"learn the translations of addresses the host makes (DNAT, SNAT, IPVS) from conntrack, so that dependencies through them are matched")
+		jobUsers = fs.Bool("job-users", false,
+			"send the user ids of the processes of Slurm jobs (process.user.id), which PostgreSQL keeps with job_users of the connector; for administrators only")
 		logLevel = fs.String("log-level", "info", "log level: debug, info, warn or error")
 	)
 	if err := parseFlags(fs, args, stderr); err != nil {
@@ -191,6 +193,7 @@ func runAgent(ctx context.Context, args []string, _, stderr io.Writer) error {
 		ServiceFallback:     fb,
 		BPFStats:            *bpfStats,
 		LearnTranslations:   *learn,
+		JobUsers:            *jobUsers,
 		Logger:              logger,
 	}
 	if err := cfg.Validate(); err != nil {
