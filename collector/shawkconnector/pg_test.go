@@ -597,6 +597,60 @@ func TestPGProcessesKeepTheirServices(t *testing.T) {
 	}
 }
 
+// TestPGSlurmJobPeers: the endpoints and clients of the processes of Slurm
+// jobs read from PostgreSQL are named slurm-job, as the peers the connector
+// learns, while PostgreSQL keeps the names of the processes (#173).
+func TestPGSlurmJobPeers(t *testing.T) {
+	dsn, conn := migratedDB(t)
+	st, err := newPGStore(context.Background(), dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+	now := time.Now().UTC().Truncate(time.Second)
+	h := newHostChanges("n1")
+	h.setHost("m1", "n1", "k", "v", now)
+	h.addAddr(addrOf("10.0.0.1"), span{now, now})
+	job := procKey{"slurm/step", "vasp_std", "vasp_std"}
+	batch := procKey{"slurm/batch", "python3", "python3"}
+	sshd := procKey{"sshd.service", "sshd", "sshd"}
+	for _, pk := range []procKey{job, batch, sshd} {
+		h.addProcess(pk, "/usr/bin/"+pk.comm, span{now, now})
+	}
+	h.addListener(listenerRowKey{proto: "tcp", addr: addrOf("0.0.0.0"), port: 40000, netns: 1, procKey: job}, span{now, now})
+	h.addListener(listenerRowKey{proto: "tcp", addr: addrOf("0.0.0.0"), port: 22, netns: 1, procKey: sshd}, span{now, now})
+	h.addEdge(edgeRowKey{role: "server", proto: "tcp", local: addrOf("10.0.0.1"), peer: addrOf("10.0.0.2"), port: 40001,
+		netns: 1, procKey: job}, span{now, now})
+	h.addEdge(edgeRowKey{role: "client", proto: "tcp", local: addrOf("10.0.0.1"), peer: addrOf("10.0.0.2"), port: 8786,
+		netns: 1, procKey: batch}, span{now, now})
+	h.addEdge(edgeRowKey{role: "client", proto: "tcp", local: addrOf("10.0.0.1"), peer: addrOf("10.0.0.2"), port: 6817,
+		netns: 1, procKey: sshd}, span{now, now})
+	if err := st.write(context.Background(), h); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := st.peers(context.Background(), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, e := range rows.endpoints {
+		got = append(got, fmt.Sprint("server ", e.key.addr, ":", e.key.port, " ", e.service))
+	}
+	for _, c := range rows.clients {
+		got = append(got, fmt.Sprint("client ", c.key.server, ":", c.key.port, " ", c.service))
+	}
+	slices.Sort(got)
+	want := []string{"client 10.0.0.2:6817 sshd", "client 10.0.0.2:8786 slurm-job",
+		"server 10.0.0.1:22 sshd", "server 10.0.0.1:40000 slurm-job", "server 10.0.0.1:40001 slurm-job"}
+	if !slices.Equal(got, want) {
+		t.Errorf("endpoints read = %q, want %q", got, want)
+	}
+	if got := queryStrings(t, conn, `SELECT service_name FROM shawk.processes ORDER BY 1`); !slices.Equal(got,
+		[]string{"python3", "sshd", "vasp_std"}) {
+		t.Errorf("processes = %q", got)
+	}
+}
+
 // TestPGAddressPeriods: an address that moves to another host and comes back
 // is not held by the first host in between: it does not count as shared,
 // and the host it moved to does not keep it.

@@ -1,7 +1,6 @@
 package shawkconnector
 
 import (
-	"strings"
 	"time"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -204,7 +203,7 @@ func (a *aggregator) peer(g peerGroup, name string, now time.Time) string {
 // max_services. PostgreSQL keeps the names of the processes of jobs.
 func (a *aggregator) service(h *hostOutputs, p *process, now time.Time) svcKey {
 	k := svcKey{service: cutLabel(p.service, maxLabelValue), svcNS: cutLabel(p.svcNS, maxLabelValue)}
-	if strings.HasPrefix(p.unit, slurmJobUnit) {
+	if p.slurmJob() {
 		k = svcKey{service: slurmJobService}
 	}
 	if _, ok := h.services[k]; !ok && len(h.services) >= a.maxServices {
