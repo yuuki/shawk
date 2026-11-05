@@ -17,16 +17,17 @@ measured on a cluster yet.**
   the same rank of 189 other nodes make 24 192 flows, as the issue
   assumed. The agent counted exactly the flows that the connections
   predict, under Slurm (srun, PMIx) and across three nodes (mpirun).
-- **Slurm did not make a cgroup per task here.** With Slurm 22.05.11,
-  cgroup v2 and `task/cgroup`, with `jobacct_gather/cgroup` and with
-  `jobacct_gather/none`, all ranks of a step were in
-  `step_0/user/task_special`. The ranks of a node then share the key of a
-  remote port, and an all-to-all of R ranks per node over N nodes makes at
-  most about 2 R (N − 1) flows on a node (48 384 for 128 ranks and 190
-  nodes) instead of about R² (N − 1) / 2 (1.5 million) with a cgroup per
-  task. Where tasks do get cgroups of their own (the case the issue
-  assumes, and what `nodeload mesh` makes), all-to-all does not fit any
-  flow table.
+- **Whether Slurm makes a cgroup per task depends on its configuration.**
+  With cgroup v2, `task/cgroup` and `ConstrainCores=yes`, Slurm up to
+  24.11.2 moves every task to the cgroup of its step (`task_special`)
+  after `jobacct_gather/cgroup` moved it to `task_<n>`; `ConstrainRAMSpace`
+  moves it back, and 24.11.3 fixed the cpuset (Slurm commit 91f1fc540b).
+  With one cgroup per step, an all-to-all of R ranks per node over N nodes
+  makes at most about 2 R (N − 1) flows on a node (48 384 for 128 ranks
+  and 190 nodes); with a cgroup per task, as the issue assumes, up to
+  about R² (N − 1) / 2 (1.5 million), which no flow table holds. On one
+  node, 16 ranks of `MPI_Alltoall` made 33 flows with one cgroup and 88
+  with a cgroup per task.
 - **A full table drops the same flows in every interval, the dependencies
   of the infrastructure among them.** With 24 192 flows and the default
   `-max-flows` of 16 384, the same 16 384 were collected for 6 intervals
@@ -48,7 +49,7 @@ measured on a cluster yet.**
   export take longer never sends the last request of an interval, which
   carries the metrics of the agent. It happened in every interval with
   48 384 and 96 768 edges when the host was busy, and not once when it was
-  not; it is a bug of the agent to fix separately.
+  not; it is a bug of the agent, #194.
 - **Jobs on all CPUs are slowed by the agent; jobs off a reserved CPU are
   not, measurably.** An `MPI_Allreduce` loop over TCP on all 8 CPUs ran
   3.7 % longer (median of 5) with the agent and had 184 instead of 38
@@ -145,21 +146,45 @@ The agent counted what the connections predict, in every run
 
 | job | flows measured | predicted from `ss` | outgoing | ends of connections on the node |
 |---|---|---|---|---|
-| srun, one node, 4 / 8 / 16 ranks | 7 / 15 / 33 | 7 / 15 / 33 | 4 / 8 / 17 | 16 / 64 / 128 |
-| mpirun, 3 nodes, 4 / 8 / 16 ranks each, on one node | 15 / 32 / 64 | 15 / 32 / 64 | 12 / 17 / 33 | 48 / 76 / 184 |
+| srun, one node, 4 / 8 / 16 ranks, one cgroup per step | 7 / 15 / 33 | 7 / 15 / 33 | 4 / 8 / 17 | 16 / 64 / 128 |
+| srun, one node, 4 / 8 / 16 ranks, a cgroup per task | 13 / 43 / 88 | 13 / 43 / 88 | 10 / 36 / 72 | 16 / 64 / 128 |
+| mpirun, 3 nodes, 4 / 8 / 16 ranks each, on one node | 15 / 33 / 71 | 15 / 33 / 71 | 12 / 18 / 40 | 48 / 76 / 184 |
 
-A connection between two ranks of the node has both ends on it.
+A connection between two ranks of the node has both ends on it. Open MPI
+connects the pairs that exchange data, when they first do, so the flows
+differ a little between runs (15 / 32 / 64 for mpirun in another run,
+[mpi-acct-rocky9.8-aarch64.jsonl](data/mpi-acct-rocky9.8-aarch64.jsonl),
+with `jobacct_gather/cgroup` and `jobacct_gather/none` alike for srun).
+The ranks of mpirun are children of `orted` and share its cgroup.
 
-The ranks of every srun job were in `job_<id>/step_0/user/task_special`,
-with `jobacct_gather/cgroup` and with `jobacct_gather/none` alike: Slurm
-22.05.11 puts the processes of a step there when it adds them to the step
-(`cgroup_p_step_addto()`), and moves a task to `task_<n>` only when a
-plugin adds it with its id; here none did, and slurmd logged no error at
-its default level. Why `jobacct_gather/cgroup` did not was not found. The
-ranks of a node then share the key of a remote port, so the outgoing flows
-are those of the remote ports, 17 for 16 ranks. A cluster may lay out its
-tasks otherwise (another version of Slurm, other plugins): what
-`/proc/<rank>/cgroup` shows decides between the two columns of the table.
+**The cgroups of the tasks.** Slurm 22.05.11 with cgroup v2 adds the
+processes of a step to `step_0/user/task_special` (`cgroup_p_step_addto()`)
+and a task to `task_<n>` when a plugin adds it with its id
+(`cgroup_p_task_addto()`). slurmstepd adds every task to proctrack
+(`task_special`), then to `jobacct_gather/cgroup` (`task_<n>`), then to
+`task/cgroup` before setting its affinity: its cpuset, for
+`ConstrainCores=yes`, adds the process to the step (`task_special`) and
+its memory, for `ConstrainRAMSpace=yes`, to the task (`task_<n>`). In one
+hierarchy (cgroup v2) the last move wins
+([slurm-task-cgroups-rocky9.8-aarch64.txt](data/slurm-task-cgroups-rocky9.8-aarch64.txt),
+`srun -n 2 sleep 8`, and the log of slurmd with `DebugFlags=CGroup`):
+
+| `JobAcctGatherType` | `ConstrainCores` | `ConstrainRAMSpace` | the tasks are in |
+|---|---|---|---|
+| `jobacct_gather/cgroup` | yes | no | `task_special` |
+| `jobacct_gather/cgroup` | yes | yes | `task_0`, `task_1` |
+| `jobacct_gather/cgroup` | no | no | `task_0`, `task_1` |
+| `jobacct_gather/none` | no | no | `task_special` |
+| `jobacct_gather/none` | yes | yes | `task_0`, `task_1` |
+
+Slurm 24.11.3 made the cpuset work per task (commit 91f1fc540b, "There was
+a race when jobacctgather/cgroup moved a pid to task_x directory ... Then
+task/cgroup was removing it and putting again the pid in the step_0
+superior directory"), so from it the tasks have cgroups of their own
+whenever a plugin adds them as tasks. With one cgroup per step the ranks
+of a node share the key of a remote port: 17 outgoing flows for 16 ranks,
+against 72 with a cgroup per task. What `/proc/<rank>/cgroup` shows on a
+cluster decides between the two columns of the first table.
 Since the ports of the ranks are numbered from 1024 on every node, the
 ports of a job repeat on the next job of the same shape; MPI libraries
 other than Open MPI, and UCX, were not measured.
@@ -242,7 +267,7 @@ and the agent rows of the flows file):
   `exportTimeout()` (2/3 of the interval, 10 s), and each request's
   deadline derives from it; the comment of `tick()` says each request has a
   deadline of its own "so that a host with many requests delivers them
-  all", which the code does not do. In the second run all requests
+  all", which the code does not do (#194). In the second run all requests
   arrived, in 1.8 and 4.7 s.
 
 ## 5. The effect on jobs
@@ -339,12 +364,14 @@ interval, with a quarter of margin:
 
 - The ranks of a node talking to one rank of every other node of 190
   nodes: 24 192 flows, `-max-flows 32768` (102 MiB of BPF maps).
-- All to all over 190 nodes, 128 ranks a node, one cgroup per step (as
-  measured here): up to 48 384, `-max-flows 65536` (203 MiB).
+- All to all over 190 nodes, 128 ranks a node, one cgroup per step
+  (`ConstrainCores` without `ConstrainRAMSpace` before Slurm 24.11.3): up
+  to 48 384, `-max-flows 65536` (203 MiB).
 - All to all with a cgroup per task, or MPI over TCP between thousands of
   ranks: no table holds it. Keep the default and accept that such jobs are
   partly observed, or exclude them by not running MPI over TCP.
-- Check what the tasks are in (`cat /proc/<rank>/cgroup`) and count the
+- Check what the tasks are in (`cat /proc/<rank>/cgroup`: `task_<n>` or
+  `task_special`), which the version and `cgroup.conf` decide (§2), and count the
   flows of a real job with `nodeload probe -comm <executable>` or
   `keys.py` before choosing.
 

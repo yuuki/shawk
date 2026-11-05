@@ -1,0 +1,6 @@
+# Cgroups of the tasks of srun -n 2 sleep 8, Slurm 22.05.11, cgroup/v2, task/cgroup,task/affinity, proctrack/cgroup (test/nodeload/slurm.sh), 2026-11-05
+A (jobacct_gather/cgroup, ConstrainCores=yes, ConstrainRAMSpace=no): task_special task_special 
+B (jobacct_gather/cgroup, ConstrainCores=yes, ConstrainRAMSpace=yes): task_0 task_1 
+C (jobacct_gather/cgroup, ConstrainCores=no, ConstrainRAMSpace=no): task_0 task_1 
+D (jobacct_gather/none, ConstrainCores=no, ConstrainRAMSpace=no): task_special task_special 
+E (jobacct_gather/none, ConstrainCores=yes, ConstrainRAMSpace=yes): task_0 task_1 

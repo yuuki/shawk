@@ -263,9 +263,11 @@ within the same step.
 - **Measured** in a VM in
   [../research/hpc-compute-nodes/compute_nodes.md](../research/hpc-compute-nodes/compute_nodes.md),
   with the guidance on `-max-flows`, the alert and the drop-in; not yet on
-  a cluster. With Slurm 22.05.11 the ranks of a step shared one cgroup
-  (`task_special`), unlike what is assumed above, and the agent has 10 s
-  for an interval in all rather than per request.
+  a cluster. Slurm makes a cgroup per task only in some configurations:
+  up to 24.11.2 with cgroup v2, `ConstrainCores` without
+  `ConstrainRAMSpace` leaves the tasks of a step in one cgroup
+  (`task_special`), and their ranks then share flows. The agent has 10 s
+  for an interval in all rather than per request (#194).
 
 ## 5. Inventory and node states
 
