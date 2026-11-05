@@ -34,7 +34,7 @@ test: ## unit tests; BPF tests need root, PostgreSQL tests need SHAWK_TEST_POSTG
 	cd test/packaging && $(GO) test ./...
 
 .PHONY: complexity
-complexity: ## rank the most complex functions with cccc (https://github.com/moznion/cccc); fails above max-cognitive in cccc.toml
+complexity: ## rank the most complex functions with cccc (https://github.com/moznion/cccc); settings in cccc.toml
 	cccc --table --top-cognitive 20 .
 
 OCB_VERSION ?= v0.164.0
