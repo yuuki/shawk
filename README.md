@@ -166,6 +166,7 @@ make generate      # compile the BPF programs (clang, llvm-strip)
 make vet test      # BPF tests need root; PostgreSQL tests need SHAWK_TEST_POSTGRES_DSN
 make vm-test       # BPF tests in a VM: KERNEL=rocky9|5.14|5.15 ARCH=x86_64|aarch64
 make e2e           # multi-host test (sudo, SHAWK_E2E_POSTGRES_DSN)
+make complexity    # rank the most complex functions (needs cccc, see below)
 ```
 
 The other targets are described in the [Makefile](Makefile). The compiled
@@ -177,6 +178,17 @@ agent does not depend on the collector) and the tests of `packaging/`
 [docs/proposals/](docs/proposals/) holds designs not implemented yet, and
 [docs/research/](docs/research/README.md) background research that is not
 maintained.
+
+### Code complexity
+
+CI measures Cognitive and Cyclomatic Complexity with
+[cccc](https://github.com/moznion/cccc) on pull requests and pushes to `main`
+and writes the totals and the 20 most complex functions to the job summary
+(`.github/workflows/complexity.yml`). It only reports; no complexity
+threshold fails the build. `cccc.toml` sets what is analyzed: tests, generated
+code and vendored sources are excluded. To see the same ranking locally,
+install cccc (a [release binary](https://github.com/moznion/cccc/releases) or
+`cargo install cccc-cli`) and run `make complexity`.
 
 ## History
 

@@ -1,0 +1,15 @@
+# Configuration for cccc (https://github.com/moznion/cccc), which measures
+# Cognitive and Cyclomatic Complexity. Read by `make complexity` and by
+# .github/workflows/complexity.yml; the cccc README documents every key.
+
+# Measure hand-written production code only: tests, generated code and vendored
+# sources would skew the distribution.
+exclude = [
+  "*_test.go",          # Go tests
+  "test/**",            # e2e, packaging and hook-cost test harnesses
+  "**/testdata/**",     # test fixtures
+  "*_bpfel.go",         # bpf2go-generated bindings
+  "**/bpf/include/**",  # vendored libbpf headers and vmlinux.h
+]
+
+# No max-cognitive / max-cyclomatic gate: the numbers are reported, not enforced.
