@@ -195,19 +195,18 @@ maintained.
 
 CI measures Cognitive and Cyclomatic Complexity with
 [cccc](https://github.com/moznion/cccc) on pull requests and pushes to `main`
-(`.github/workflows/complexity.yml`) and fails when a function's cognitive
-complexity exceeds `max-cognitive` in `cccc.toml`; the job summary lists the
-functions above it and the 20 most complex ones. The threshold is a ratchet
-toward 15, SonarSource's default: it is the highest score in the code today, so
-split a function that would exceed it rather than raising the threshold, and
-lower the threshold whenever refactoring brings the maximum down. `cccc.toml`
-also lists what is not analyzed, such as tests and generated or vendored code;
-the BPF programs are exempt because the verifier constrains how they can be
-split (`shawk_inet_sock_set_state` in `shawk.bpf.c` scores 48). To check
-locally, install cccc (a [release
+(`.github/workflows/complexity.yml`) and tracks them with
+[octocov](https://github.com/k1LoW/octocov) as custom metrics: the number of
+functions and the total, maximum, median and 90th percentile of each score. A
+pull request gets a comment comparing them with `main`, each push to `main`
+stores a report in the `octocov` branch, and the job summary ranks the 20 most
+complex functions. Nothing fails on a score: the numbers point at hotspots and
+show trends, such as a component taking on too much, instead of being a target.
+`cccc.toml` lists what is not analyzed, such as tests and generated or vendored
+code; the BPF programs are left out because the verifier constrains how they
+can be split. To check locally, install cccc (a [release
 binary](https://github.com/moznion/cccc/releases) or `cargo install cccc-cli`)
-and run `make complexity`, which ranks the most complex functions and fails the
-same way.
+and run `make complexity`, which ranks the most complex functions.
 
 ## History
 

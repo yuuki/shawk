@@ -1,8 +1,11 @@
 name: Complexity
 
 # Measures Cognitive Complexity (SonarSource) and Cyclomatic Complexity (McCabe)
-# with cccc (https://github.com/moznion/cccc). What is analyzed, and the
-# max-cognitive threshold above which the job fails, are configured in cccc.toml.
+# with cccc (https://github.com/moznion/cccc) and tracks them as custom metrics
+# in octocov (https://github.com/k1LoW/octocov): a pull request gets a comment
+# comparing them with main, and each push to main stores a report in the
+# octocov branch. Nothing fails on a score; what is analyzed is configured in
+# cccc.toml, and the octocov settings are in .octocov.complexity.yml.
 on:
   pull_request:
   push:
@@ -15,6 +18,10 @@ jobs:
   complexity:
     name: Measure complexity
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # octocov stores the reports in the octocov branch
+      pull-requests: write # octocov comments on the pull request
+      actions: read # octocov reads the workflow run
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
@@ -27,51 +34,49 @@ jobs:
           path: .
           output-file: cccc.json
 
-      - name: Write job summary
-        # Also when the gate fails, so that the summary and the annotations name
-        # the offending functions: cccc itself only exits non-zero.
-        if: ${{ !cancelled() && hashFiles('cccc.json') != '' }}
+      # Turn the summary of cccc into octocov custom metrics:
+      # https://github.com/k1LoW/octocov#custom-metrics
+      - name: Build octocov custom metrics
         run: |
-          if [ ! -s cccc.json ]; then
-            echo "cccc wrote no report; see the log of the cccc step." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          max=$(sed -n 's/^max-cognitive *= *\([0-9][0-9]*\).*/\1/p' cccc.toml)
-          functions='[ .files[] | (.path | ltrimstr("./")) as $p | .functions[] | recurse(.children[]?)
-            | { path: $p, name, line, cognitive, cyclomatic } ] | sort_by(-.cognitive, -.cyclomatic)'
-          row='"| \(.cognitive) | \(.cyclomatic) | `\(.name)` | \(.path):\(.line) |"'
-          if [ -n "$max" ]; then
-            jq -r --argjson max "$max" "$functions"' | .[] | select(.cognitive > $max)
-              | "::error file=\(.path),line=\(.line)::\(.name): cognitive complexity \(.cognitive) exceeds max-cognitive = \($max) in cccc.toml"' cccc.json
-          fi
+          jq '{
+            key: "code_complexity",
+            name: "Code Complexity",
+            metrics: [
+              { key: "function_count",    name: "Function count",     value: .summary.function_count },
+              { key: "cognitive_sum",     name: "Cognitive: total",   value: .summary.cognitive.sum },
+              { key: "cognitive_max",     name: "Cognitive: max",     value: .summary.cognitive.max },
+              { key: "cognitive_median",  name: "Cognitive: median",  value: .summary.cognitive.median },
+              { key: "cognitive_p90",     name: "Cognitive: p90",     value: .summary.cognitive.p90 },
+              { key: "cyclomatic_sum",    name: "Cyclomatic: total",  value: .summary.cyclomatic.sum },
+              { key: "cyclomatic_max",    name: "Cyclomatic: max",    value: .summary.cyclomatic.max },
+              { key: "cyclomatic_median", name: "Cyclomatic: median", value: .summary.cyclomatic.median },
+              { key: "cyclomatic_p90",    name: "Cyclomatic: p90",    value: .summary.cyclomatic.p90 }
+            ]
+          }' cccc.json > custom_metrics_complexity.json
+          echo "::group::custom_metrics_complexity.json"
+          cat custom_metrics_complexity.json
+          echo "::endgroup::"
+
+      # For people: the hotspots behind the numbers.
+      - name: Write job summary
+        run: |
           {
-            echo "## Code complexity (cccc)"
+            echo "## Top 20 functions by cognitive complexity"
             echo
-            jq -r '.summary | "\(.file_count) files, \(.function_count) functions."' cccc.json
             jq -r '.summary | select(.parse_error_file_count > 0)
-              | "\(.parse_error_count) parse error(s) in \(.parse_error_file_count) file(s); results for those files may be partial."' cccc.json
-            echo
-            echo "| Metric | Sum | Max | Median | p90 | p95 |"
-            echo "| --- | ---: | ---: | ---: | ---: | ---: |"
-            jq -r '.summary | (["Cognitive", .cognitive], ["Cyclomatic", .cyclomatic])
-              | "| \(.[0]) | \(.[1].sum) | \(.[1].max) | \(.[1].median) | \(.[1].p90) | \(.[1].p95) |"' cccc.json
-            echo
-            if [ -n "$max" ]; then
-              over=$(jq --argjson max "$max" "$functions"' | map(select(.cognitive > $max)) | length' cccc.json)
-              if [ "$over" -eq 0 ]; then
-                echo "No function exceeds \`max-cognitive = $max\` (cccc.toml)."
-              else
-                echo "### $over function(s) exceed \`max-cognitive = $max\` (cccc.toml)"
-                echo
-                echo "| Cognitive | Cyclomatic | Function | File:Line |"
-                echo "| ---: | ---: | --- | --- |"
-                jq -r --argjson max "$max" "$functions"' | .[] | select(.cognitive > $max) | '"$row" cccc.json
-              fi
-              echo
-            fi
-            echo "### Top 20 functions by cognitive complexity"
-            echo
+              | "\(.parse_error_count) parse error(s) in \(.parse_error_file_count) file(s); results for those files may be partial.\n"' cccc.json
             echo "| Cognitive | Cyclomatic | Function | File:Line |"
             echo "| ---: | ---: | --- | --- |"
-            jq -r "$functions"' | .[:20][] | '"$row" cccc.json
+            jq -r '[ .files[] | (.path | ltrimstr("./")) as $p | .functions[] | recurse(.children[]?)
+                | { path: $p, name, line, cognitive, cyclomatic } ]
+              | sort_by(-.cognitive, -.cyclomatic) | .[:20][]
+              | "| \(.cognitive) | \(.cyclomatic) | `\(.name)` | \(.path):\(.line) |"' cccc.json
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Track the metrics (octocov)
+        uses: k1LoW/octocov-action@a167dc0dee441b7ffc45e1b862ab55ec0d87f278 # v1.5.2
+        with:
+          version: v0.83.3
+          config: .octocov.complexity.yml
+        env:
+          OCTOCOV_CUSTOM_METRICS_COMPLEXITY: custom_metrics_complexity.json

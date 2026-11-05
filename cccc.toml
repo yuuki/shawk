@@ -14,8 +14,6 @@ exclude = [
   "vendor/**",          # vendored Go modules (go mod vendor)
 ]
 
-# Fail when a function's cognitive complexity exceeds this. The threshold is a
-# ratchet toward 15, SonarSource's default: it is the highest score in the code
-# today, so split a function that would exceed it rather than raising it, and
-# lower it whenever refactoring brings the maximum down.
-max-cognitive = 30
+# No max-cognitive: CI does not fail on a score. It tracks the numbers over
+# time with octocov (.octocov.complexity.yml), so that they point at hotspots
+# and trends instead of being a target.
