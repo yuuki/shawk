@@ -28,9 +28,22 @@ jobs:
           output-file: cccc.json
 
       - name: Write job summary
-        # Also when the gate fails, so the summary shows the offending functions.
+        # Also when the gate fails, so that the summary and the annotations name
+        # the offending functions: cccc itself only exits non-zero.
         if: ${{ !cancelled() && hashFiles('cccc.json') != '' }}
         run: |
+          if [ ! -s cccc.json ]; then
+            echo "cccc wrote no report; see the log of the cccc step." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          max=$(sed -n 's/^max-cognitive *= *\([0-9][0-9]*\).*/\1/p' cccc.toml)
+          functions='[ .files[] | (.path | ltrimstr("./")) as $p | .functions[] | recurse(.children[]?)
+            | { path: $p, name, line, cognitive, cyclomatic } ] | sort_by(-.cognitive, -.cyclomatic)'
+          row='"| \(.cognitive) | \(.cyclomatic) | `\(.name)` | \(.path):\(.line) |"'
+          if [ -n "$max" ]; then
+            jq -r --argjson max "$max" "$functions"' | .[] | select(.cognitive > $max)
+              | "::error file=\(.path),line=\(.line)::\(.name): cognitive complexity \(.cognitive) exceeds max-cognitive = \($max) in cccc.toml"' cccc.json
+          fi
           {
             echo "## Code complexity (cccc)"
             echo
@@ -43,14 +56,22 @@ jobs:
             jq -r '.summary | (["Cognitive", .cognitive], ["Cyclomatic", .cyclomatic])
               | "| \(.[0]) | \(.[1].sum) | \(.[1].max) | \(.[1].median) | \(.[1].p90) | \(.[1].p95) |"' cccc.json
             echo
+            if [ -n "$max" ]; then
+              over=$(jq --argjson max "$max" "$functions"' | map(select(.cognitive > $max)) | length' cccc.json)
+              if [ "$over" -eq 0 ]; then
+                echo "No function exceeds \`max-cognitive = $max\` (cccc.toml)."
+              else
+                echo "### $over function(s) exceed \`max-cognitive = $max\` (cccc.toml)"
+                echo
+                echo "| Cognitive | Cyclomatic | Function | File:Line |"
+                echo "| ---: | ---: | --- | --- |"
+                jq -r --argjson max "$max" "$functions"' | .[] | select(.cognitive > $max) | '"$row" cccc.json
+              fi
+              echo
+            fi
             echo "### Top 20 functions by cognitive complexity"
             echo
             echo "| Cognitive | Cyclomatic | Function | File:Line |"
             echo "| ---: | ---: | --- | --- |"
-            jq -r '
-              [ .files[] | (.path | ltrimstr("./")) as $p | .functions[] | recurse(.children[]?)
-                | { path: $p, name, line, cognitive, cyclomatic } ]
-              | sort_by(-.cognitive, -.cyclomatic) | .[:20][]
-              | "| \(.cognitive) | \(.cyclomatic) | `\(.name)` | \(.path):\(.line) |"
-            ' cccc.json
+            jq -r "$functions"' | .[:20][] | '"$row" cccc.json
           } >> "$GITHUB_STEP_SUMMARY"

@@ -10,11 +10,12 @@ exclude = [
   "**/testdata/**",     # test fixtures
   "*_bpfel.go",         # bpf2go-generated bindings
   "**/bpf/include/**",  # vendored libbpf headers and vmlinux.h
-  "*.bpf.c",            # BPF programs: the parser cannot read their section and map macros
+  "*.bpf.c",            # BPF programs: the verifier constrains how they can be split
+  "vendor/**",          # vendored Go modules (go mod vendor)
 ]
 
 # Fail when a function's cognitive complexity exceeds this. The threshold is a
-# ratchet toward 15, SonarSource's default: split a function that exceeds it
-# rather than raising the threshold, and lower the threshold to the new maximum
-# whenever refactoring brings the maximum down.
-max-cognitive = 40
+# ratchet toward 15, SonarSource's default: it is the highest score in the code
+# today, so split a function that would exceed it rather than raising it, and
+# lower it whenever refactoring brings the maximum down.
+max-cognitive = 36
