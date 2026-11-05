@@ -189,6 +189,43 @@
         "overrides": []
       },
       "description": "Dependencies between services that appeared, or disappeared while a host that saw them kept observing for 15 minutes. Only TCP and UDP are observed: a dependency over RDMA verbs (MPI, NCCL, Lustre o2ib, NFS over RDMA) neither appears nor disappears here."
+    },
+    {
+      "id": 3,
+      "type": "table",
+      "title": "Listeners on ports the kernel chose",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "shawk-postgres"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 24,
+        "w": 24,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shawk-postgres"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT service, slurm_job, proto, hosts, ports, port_min, port_max, first_seen, last_seen\nFROM shawk_v1.kernel_chosen_ports\nORDER BY ports DESC, service\nLIMIT 1000"
+        }
+      ],
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "description": "Services that listened in the last 30 days, whatever the time range, on ports the kernel chose (bound to port 0, or listening without bind), which no rule of ports covers: a server whose port changes at every run, such as srun without SrunPortRange, makes a new dependency above each time. Add the service to port_agnostic_services (slurm-job for the processes of Slurm jobs), or its ports to dynamic_ports, in the configuration of the connector. A hint only: listeners are seen every interval of the agents, so short-lived ones are missed, and services on such ports are not one service."
     }
   ]
 }

@@ -2,6 +2,7 @@ package shawkconnector
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"testing"
 	"time"
@@ -291,5 +292,68 @@ func TestPGPortAgnosticSlurmJobs(t *testing.T) {
 		FROM shawk.service_dependencies_between(now() - interval '1 day', now())`)
 	if want := []string{"lmp lmp 0", "lmp sshd 22"}; !slices.Equal(got, want) {
 		t.Errorf("service_dependencies_between = %q, want %q", got, want)
+	}
+}
+
+// TestPGKernelChosenPorts: kernel_chosen_ports lists the services that
+// listened on ports the kernel chose in the last 30 days and that no rule
+// of ports covers, by service, processes of Slurm jobs and protocol.
+func TestPGKernelChosenPorts(t *testing.T) {
+	dsn, conn := migratedDB(t)
+	portRulesFixture(t, dsn)
+	f := fixture{t, conn}
+	f.host("node01", "srun", "sshd", "app")
+	f.host("node02")
+	f.host("login01", "mpi")
+	execAll(t, conn, `INSERT INTO shawk.host_addrs (host_id, addr, first_seen, last_seen) VALUES
+		('node01', '10.1.0.1', now() - interval '1 day', now()),
+		('node02', '10.1.0.2', now() - interval '1 day', now()),
+		('login01', '10.2.0.1', now() - interval '1 day', now())`,
+		// The ranks of jobs and PMIx, processes of Slurm jobs.
+		`INSERT INTO shawk.processes (host_id, unit, comm, exe, service_name, first_seen, last_seen) VALUES
+		('node01', 'slurm/7/step_0', 'mpi', '', 'mpi', now() - interval '1 day', now()),
+		('node01', 'slurm/7/step_0', 'pmix', '', 'pmix', now() - interval '1 day', now()),
+		('node02', 'slurm/7/step_0', 'pmix', '', 'pmix', now() - interval '1 day', now())`)
+	owner := func(host, unit, comm, proto, addr string, port int, chosen bool, lastSeen string) {
+		t.Helper()
+		execAll(t, conn, fmt.Sprintf(`INSERT INTO shawk.listener_owners
+			(host_id, process_id, proto, addr, port, netns, kernel_chosen, first_seen, last_seen)
+			VALUES ('%s', (SELECT id FROM shawk.processes WHERE host_id = '%s' AND unit = '%s' AND comm = '%s'),
+			        '%s', '%s', %d, 1, %t, %s - interval '1 minute', %s)`,
+			host, host, unit, comm, proto, addr, port, chosen, lastSeen, lastSeen))
+	}
+	// Covered: srun by port_agnostic_services, ranks on the range of
+	// node01, also on an unspecified address of a host in the range.
+	owner("node01", "srun.service", "srun", "tcp", "0.0.0.0", 41234, true, "now()")
+	owner("node01", "slurm/7/step_0", "mpi", "tcp", "10.1.0.1", 61000, true, "now()")
+	owner("node01", "slurm/7/step_0", "mpi", "tcp", "::", 62000, true, "now()")
+	// Not covered: PMIx of a job on two hosts, a rank on a host outside the
+	// range, UDP outside the range, which is for TCP.
+	owner("node01", "slurm/7/step_0", "pmix", "tcp", "0.0.0.0", 45000, true, "now() - interval '2 days'")
+	owner("node02", "slurm/7/step_0", "pmix", "tcp", "0.0.0.0", 45001, true, "now()")
+	owner("node02", "slurm/7/step_0", "pmix", "tcp", "0.0.0.0", 45002, true, "now()")
+	owner("login01", "mpi.service", "mpi", "tcp", "0.0.0.0", 61500, true, "now()")
+	owner("node01", "slurm/7/step_0", "mpi", "udp", "10.1.0.1", 61000, true, "now()")
+	// Left out: a port bound by its server, and a port the kernel chose
+	// that no process listened on in the last 30 days.
+	owner("node01", "sshd.service", "sshd", "tcp", "0.0.0.0", 22, false, "now()")
+	owner("node01", "app.service", "app", "tcp", "0.0.0.0", 40000, true, "now() - interval '31 days'")
+
+	q := `SELECT service, slurm_job, proto, hosts, ports, port_min, port_max,
+	             to_char(now() - first_seen, 'DD HH24:MI'), to_char(now() - last_seen, 'DD HH24:MI')
+	      FROM shawk_v1.kernel_chosen_ports`
+	want := []string{
+		"mpi false tcp 1 1 61500 61500 00 00:01 00 00:00",
+		"mpi true udp 1 1 61000 61000 00 00:01 00 00:00",
+		"pmix true tcp 2 3 45000 45002 02 00:01 00 00:00",
+	}
+	if got := queryStrings(t, conn, q); !slices.Equal(got, want) {
+		t.Errorf("kernel_chosen_ports = %q, want %q", got, want)
+	}
+	// slurm-job in port_agnostic_services covers the processes of jobs.
+	execAll(t, conn, `INSERT INTO shawk.port_agnostic_services VALUES ('slurm-job')`)
+	want = []string{"mpi false tcp 1 1 61500 61500 00 00:01 00 00:00"}
+	if got := queryStrings(t, conn, q); !slices.Equal(got, want) {
+		t.Errorf("kernel_chosen_ports with slurm-job = %q, want %q", got, want)
 	}
 }

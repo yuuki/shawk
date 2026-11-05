@@ -12,6 +12,7 @@ proposal, is in [docs/design.md](../design.md):
 | §2.1 to §2.3 processes of jobs | #173 | #185 | §4.1, §5.3 |
 | §2.4 users | #181 | #193 | §4.1, §6.1, §6.2 |
 | §3 dynamic ports | #174 | #187 | §5.3, §6.1, §6.2 |
+| §3.2 ports chosen by the kernel, a hint | #205 | | §4.2, §5.3, §6.1, §6.2 |
 | §4 load on compute nodes | #172 | #195, open | |
 | §5.1 inventory | #175 | #184 | §5.6 |
 | §5.2 node states | #177 | #191 | §5.7, §8 |
@@ -19,8 +20,9 @@ proposal, is in [docs/design.md](../design.md):
 | §6.2 start order | #179 | #183 | §4.3 |
 | §8 kernel sockets | #180 | #190 | §3.2, §4.1, §10 |
 
-Not implemented: the named networks of §1.5, and the automatic detection
-of ports chosen by the kernel of §3.2. The operating guidance is in
+Not implemented: the named networks of §1.5. Ports chosen by the kernel
+(§3.2) are detected as a hint for the rules only, as proposed. The
+operating guidance is in
 [packaging/README.md](../../packaging/README.md#hpc-clusters).
 
 The target is a traditional HPC cluster: bare-metal hosts that are not added

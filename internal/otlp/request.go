@@ -391,12 +391,16 @@ func translationAttrs(k *TranslationKey) []*commonpb.KeyValue {
 }
 
 func listenerAttrs(k *ListenerKey) []*commonpb.KeyValue {
-	return append(processAttrs(&k.Process),
+	attrs := append(processAttrs(&k.Process),
 		str(AttrTransport, k.Proto),
 		str(AttrLocalAddr, k.Addr.String()),
 		integer(AttrServerPort, int64(k.Port)),
 		str(AttrNetNS, strconv.FormatUint(uint64(k.NetNS), 10)),
 	)
+	if k.KernelChosen {
+		attrs = append(attrs, boolean(AttrKernelChosen, true))
+	}
+	return attrs
 }
 
 // str returns a string attribute. A string field of protobuf must be valid
@@ -609,6 +613,7 @@ func compareListenerKeys(a, b ListenerKey) int {
 		cmp.Compare(a.Port, b.Port),
 		a.Addr.Compare(b.Addr),
 		cmp.Compare(a.NetNS, b.NetNS),
+		compareBool(a.KernelChosen, b.KernelChosen),
 		compareProcess(&a.Process, &b.Process),
 	)
 }

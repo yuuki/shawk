@@ -92,6 +92,9 @@ const (
 	// attrPeerFolded marks an edge whose peer is folded: every peer outside
 	// the internal ranges of the agent, sent as the address 0.0.0.0 or ::.
 	attrPeerFolded = "shawk.peer.folded"
+	// attrKernelChosen marks a listener whose port the kernel chose: the
+	// socket was not bound to a port.
+	attrKernelChosen = "shawk.port.kernel_chosen"
 	// attrPeerFold and attrPeerInternal are resource attributes of the
 	// agent: which edges it folds, and the ranges it keeps exact.
 	attrPeerFold     = "shawk.peer.fold"

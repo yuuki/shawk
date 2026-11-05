@@ -154,20 +154,26 @@ CREATE INDEX listeners_process ON shawk.listeners (process_id);
 CREATE INDEX listeners_last_seen ON shawk.listeners (last_seen);
 
 -- Every known owner of a listener, so that the processes that listened on a
--- port before it changed hands are kept.
+-- port before it changed hands are kept. kernel_chosen tells that the
+-- kernel chose the port of a socket of the process there at least once:
+-- the socket was not bound to a port (bind(2) to port 0, or listen(2)
+-- without bind), as srun does without SrunPortRange; kernel_chosen_ports
+-- reads it.
 CREATE TABLE shawk.listener_owners (
-  host_id    text NOT NULL REFERENCES shawk.hosts,
-  process_id bigint NOT NULL REFERENCES shawk.processes,
-  proto      text NOT NULL,
-  addr       inet NOT NULL,
-  port       integer NOT NULL,
-  netns      bigint NOT NULL,
-  first_seen timestamptz NOT NULL,
-  last_seen  timestamptz NOT NULL,
+  host_id       text NOT NULL REFERENCES shawk.hosts,
+  process_id    bigint NOT NULL REFERENCES shawk.processes,
+  proto         text NOT NULL,
+  addr          inet NOT NULL,
+  port          integer NOT NULL,
+  netns         bigint NOT NULL,
+  kernel_chosen boolean NOT NULL DEFAULT false,
+  first_seen    timestamptz NOT NULL,
+  last_seen     timestamptz NOT NULL,
   PRIMARY KEY (host_id, proto, addr, port, netns, process_id)
 );
 CREATE INDEX listener_owners_process ON shawk.listener_owners (process_id);
 CREATE INDEX listener_owners_last_seen ON shawk.listener_owners (last_seen);
+CREATE INDEX listener_owners_kernel_chosen ON shawk.listener_owners (last_seen) WHERE kernel_chosen;
 
 -- Named address ranges of peers, written by the connector from its
 -- peer_cidrs, so that PostgreSQL names a peer without a known service like
@@ -1343,6 +1349,34 @@ UNION ALL
 SELECT last_seen, 'disappeared', client_service, server_service, port, proto
 FROM shawk.service_dependencies
 WHERE greatest(client_observed_until, server_observed_until) > last_seen + interval '15 minutes';
+
+-- Services that listened in the last 30 days on ports the kernel chose and
+-- that no rule of ports covers, by service, whether processes of Slurm
+-- jobs (slurm-job in port_agnostic_services) and protocol: a hint for the
+-- rules, since a server whose port changes at every run makes a new
+-- dependency each time. It is a hint only, and nothing is aggregated by
+-- it: listeners are seen while the iterator lists them, so short-lived
+-- ones are missed, and services on ports the kernel chose are not one
+-- service. A listener is covered when dependency_port() gives 0 for its
+-- address or, on an unspecified address, for an address of its host. ports
+-- counts the distinct ports, which grow with runs.
+CREATE VIEW shawk_v1.kernel_chosen_ports AS
+SELECT p.service_name AS service, p.unit LIKE 'slurm/%' AS slurm_job, o.proto,
+       count(DISTINCT o.host_id) AS hosts, count(DISTINCT o.port) AS ports,
+       min(o.port) AS port_min, max(o.port) AS port_max,
+       min(o.first_seen) AS first_seen, max(o.last_seen) AS last_seen
+FROM shawk.listener_owners o
+JOIN shawk.processes p ON p.id = o.process_id
+WHERE o.kernel_chosen
+  AND o.last_seen > now() - interval '30 days'
+  AND shawk.dependency_port(p.service_name, p.unit, o.addr, o.port, o.proto) <> 0
+  AND NOT EXISTS (
+    SELECT FROM shawk.host_addrs a
+    WHERE a.host_id = o.host_id
+      AND o.addr IN (inet '0.0.0.0', inet '::')
+      AND (o.addr = inet '::' OR family(a.addr) = 4)
+      AND shawk.dependency_port(p.service_name, p.unit, a.addr, o.port, o.proto) = 0)
+GROUP BY p.service_name, p.unit LIKE 'slurm/%', o.proto;
 
 -- Agents ------------------------------------------------------------------
 

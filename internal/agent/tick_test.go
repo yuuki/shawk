@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"maps"
 	"net/netip"
 	"strconv"
 	"testing"
@@ -185,6 +186,29 @@ func TestTickKernelSockets(t *testing.T) {
 		if got := services[side]; got != w {
 			t.Errorf("service of %s = %q, want %q", side, got, w)
 		}
+	}
+}
+
+// TestTickListenerKernelChosen checks that a listener tells whether the
+// kernel chose its port, as lockd's does unless its port is set.
+func TestTickListenerKernelChosen(t *testing.T) {
+	src := &fakeSource{snaps: []*tracer.Snapshot{{
+		Listeners: []tracer.Listener{
+			{Proto: tracer.ProtoTCP, Addr: netip.IPv4Unspecified(), Port: 2049, NetNS: 1, Comm: tracer.KernelComm},
+			{Proto: tracer.ProtoTCP, Addr: netip.IPv4Unspecified(), Port: 39917, NetNS: 1, Comm: tracer.KernelComm,
+				KernelChosen: true},
+		},
+	}}}
+	a := newTestAgent(src, &fakeExporter{}, 0, time.Now())
+	if err := a.tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got := map[uint16]bool{}
+	for k := range a.state.Listeners() {
+		got[k.Port] = k.KernelChosen
+	}
+	if want := map[uint16]bool{2049: false, 39917: true}; !maps.Equal(got, want) {
+		t.Errorf("kernel-chosen ports = %v, want %v", got, want)
 	}
 }
 
