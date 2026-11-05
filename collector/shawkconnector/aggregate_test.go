@@ -39,6 +39,22 @@ func TestLateAndDuplicateRequests(t *testing.T) {
 	}
 }
 
+// TestRetriedFinalRequest: a request that closes an interval and arrives
+// again with the same time, as an agent retries it, emits nothing again.
+func TestRetriedFinalRequest(t *testing.T) {
+	c, _, sink, now := testConnector(t, nil)
+	*now = t0.Add(15 * time.Second)
+	req := tAgent{host: "app-01", addrs: []string{"10.0.0.11"}, time: *now,
+		edges: []tEdge{{role: "client", proto: "tcp", local: "10.0.0.11", peer: "1.1.1.1", port: 443,
+			svc: "app", comm: "app", opened: 3, start: t0}}}
+	if v := opened(t, consume(t, c, sink, req), "app", "~external", roleClient); v != 3 {
+		t.Fatalf("first = %v", v)
+	}
+	if out := consume(t, c, sink, req); len(out) != 0 {
+		t.Errorf("the retried request emitted %v", out)
+	}
+}
+
 // TestSplitInterval: an agent with many edges sends an interval in several
 // requests; the outputs are emitted once, when the last one arrives.
 func TestSplitInterval(t *testing.T) {
