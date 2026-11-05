@@ -1,23 +1,28 @@
 #!/usr/bin/env bash
 # Configures and (re)starts a Slurm cluster of this host alone, as root,
-# for noise.sh: slurmctld and slurmd on this host, cgroup v2, a cgroup per
-# task (task/cgroup with ConstrainCores), PMIx for MPI. With SPEC, the CPUs
+# for noise.sh and mpi.sh: slurmctld and slurmd on this host, cgroup v2,
+# task/cgroup with ConstrainCores, PMIx for MPI. With SPEC, the CPUs
 # of SPEC are reserved for the system (CpuSpecList, abstract ids of Slurm,
 # here those of the kernel): jobs do not get them, and slurmd runs there
 # (slurmstepd runs in the cgroups of the job with cgroup v2).
 #
-#   sudo ACCT=cgroup ./slurm.sh [SPEC]
+#   sudo ACCT=cgroup RAM=no ./slurm.sh [SPEC]
 #
 # ACCT is the plugin of JobAcctGatherType without its prefix, cgroup by
-# default. With cgroup v2, Slurm makes a cgroup per task (task_0, ...) for
-# jobacct_gather/cgroup, and puts all tasks of a step into task_special
-# with jobacct_gather/none.
+# default, and RAM ConstrainRAMSpace, no by default. They decide the cgroups
+# of the tasks with cgroup v2: up to Slurm 24.11.2, task/cgroup moves the
+# processes of the tasks to the cgroup of the step (task_special) for
+# ConstrainCores after jobacct_gather/cgroup moved them to their task_<n>,
+# and memory moves them back to task_<n> after it. So the tasks of a step
+# share task_special with ConstrainCores and without RAM, and have a cgroup
+# each with RAM=yes (Slurm commit 91f1fc540b, 24.11.3, fixed the cpuset).
 #
 # Requires the packages slurm, slurm-slurmctld, slurm-slurmd and munge
 # (EPEL on Rocky Linux 9), and nothing else of Slurm on the host.
 set -euo pipefail
 SPEC=${1:-}
 ACCT=${ACCT:-cgroup}
+RAM=${RAM:-no}
 node=$(hostname -s)
 
 if [[ ! -s /etc/munge/munge.key ]]; then
@@ -57,7 +62,7 @@ cat >/etc/slurm/cgroup.conf <<EOF
 CgroupPlugin=cgroup/v2
 ConstrainCores=yes
 ConstrainDevices=no
-ConstrainRAMSpace=no
+ConstrainRAMSpace=$RAM
 EOF
 systemctl restart slurmctld slurmd
 for _ in $(seq 60); do

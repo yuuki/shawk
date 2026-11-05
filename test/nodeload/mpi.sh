@@ -8,8 +8,8 @@
 #   sudo NODELOAD=./nodeload ALLTOALL=./alltoall test/nodeload/mpi.sh [OUT]
 #
 # 1. A job of RANKS ranks of alltoall on the Slurm cluster of this host
-#    (slurm.sh), launched by srun with PMIx, with jobacct_gather/cgroup
-#    and with jobacct_gather/none.
+#    (slurm.sh), launched by srun with PMIx, with jobacct_gather/cgroup,
+#    without and with ConstrainRAMSpace.
 # 2. Three nodes as network namespaces m1, m2, m3 on a bridge (10.96.0.1 to
 #    .3), and RANKS ranks on each, launched by mpirun from m1 with an rsh
 #    agent that enters the namespaces: the ranks of a node share a cgroup.
@@ -50,11 +50,12 @@ count() {
 	"$NL" probe "${args[@]}" >>"$OUT"
 }
 
-# 1. Slurm, with jobacct_gather/cgroup and with jobacct_gather/none, which
-# lay out the cgroups of the tasks differently; the cgroups the ranks are
-# in are logged.
-for acct in cgroup none; do
-	ACCT=$acct bash "$HERE/slurm.sh"
+# 1. Slurm with jobacct_gather/cgroup, without ConstrainRAMSpace (the
+# tasks of a step share task_special up to Slurm 24.11.2) and with it (a
+# cgroup per task); the cgroups the ranks are in are logged.
+for ram in no yes; do
+	acct=ram-$ram
+	ACCT=cgroup RAM=$ram bash "$HERE/slurm.sh"
 	for ranks in 4 8 16; do
 		srun -n $ranks --overcommit "$A2A" 100 &
 		sleep 5
