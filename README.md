@@ -169,6 +169,18 @@ make e2e           # multi-host test (sudo, SHAWK_E2E_POSTGRES_DSN)
 make complexity    # rank the most complex functions (needs cccc, see below)
 ```
 
+The environments the tests need come up and go with one command each, on
+macOS and Linux, per checkout or worktree (see
+[test/harness](test/harness/README.md), which also lists the variables each
+test reads):
+
+```bash
+make pg-up         # a disposable PostgreSQL; prints SHAWK_TEST_POSTGRES_DSN and SHAWK_E2E_POSTGRES_DSN
+make pg-test       # the tests of the connector against it (make pg-down removes it)
+make slurm-up      # a Slurm cluster in a VM of Lima: SLURM_VERSION=26.05.5 SLURM_CGROUP_JOB_ID_PATHS=no ...
+make slurm-check   # run jobs and check the units of their processes (make slurm-down removes it)
+```
+
 The other targets are described in the [Makefile](Makefile). The compiled
 BPF object is committed, so building needs only Go. There are three Go
 modules: the agent (`.`), the connector (`collector/`, kept separate so the

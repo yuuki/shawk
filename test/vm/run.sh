@@ -18,8 +18,8 @@
 # its SHA-256 (scripts/fetch-verified.sh). The initramfs holds the init of
 # test/vm/init, the test binaries, and the BPF source that the prototype test
 # reads; the tests need no other program. QEMU uses KVM when the host can
-# run the guest with it, and emulates the guest otherwise (a few minutes
-# for aarch64 on x86_64).
+# run the guest with it (HVF on macOS), and emulates the guest otherwise (a
+# few minutes for aarch64 on x86_64).
 #
 # The tests run with SHAWK_TEST_STRICT=1, so that a skip fails, unless the
 # environment sets it. On kernels without BPF trampolines (aarch64 before
@@ -33,7 +33,10 @@
 # VM_TEST_ARGS, e.g. VM_TEST_ARGS='-test.run=TestUDP'.
 #
 # Requires go, qemu-system-x86_64 or qemu-system-aarch64, cpio, gzip, curl,
-# sha256sum, rpm2cpio and xz (rocky9), and dpkg-deb (5.14, 5.15).
+# sha256sum, timeout, rpm2cpio and xz (rocky9), and dpkg-deb (5.14, 5.15).
+# Without rpm2cpio or dpkg-deb, bsdtar (libarchive) extracts the packages,
+# as on macOS, where it is the tar of the system and Homebrew has the rest
+# (qemu, xz, coreutils for timeout).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -52,6 +55,29 @@ esac
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 fetch() { "$ROOT/scripts/fetch-verified.sh" "$@"; }
+# rpm_extract RPM DIR PATTERN...: extracts the files of RPM that match the
+# patterns into DIR, with rpm2cpio and cpio, or else with bsdtar, which
+# reads RPM packages.
+rpm_extract() {
+	local rpm=$1 dir=$2
+	shift 2
+	if command -v rpm2cpio >/dev/null; then
+		(cd "$dir" && rpm2cpio "$rpm" | cpio -idm --quiet "$@")
+	else
+		bsdtar -xf "$rpm" -C "$dir" "$@"
+	fi
+}
+# deb_extract DEB DIR PATTERN...: the same for a Debian package, with
+# dpkg-deb and GNU tar, or else with bsdtar.
+deb_extract() {
+	local deb=$1 dir=$2
+	shift 2
+	if command -v dpkg-deb >/dev/null; then
+		dpkg-deb --fsys-tarfile "$deb" | tar -x -C "$dir" --wildcards "$@"
+	else
+		bsdtar -xOf "$deb" 'data.tar*' | bsdtar -x -C "$dir" "$@"
+	fi
+}
 # The environment may declare a kernel without BPF trampolines, e.g. one
 # given by its path.
 no_udp="${SHAWK_TEST_NO_UDP:-}"
@@ -110,10 +136,10 @@ mkdir -p "$WORK/pkg"
 case "$pkg" in
 "") image="$(realpath "$KERNEL")" ;;
 *.rpm)
-	(cd "$WORK/pkg" && rpm2cpio "$pkg" | cpio -idm --quiet './lib/modules/*/vmlinuz')
+	rpm_extract "$pkg" "$WORK/pkg" './lib/modules/*/vmlinuz'
 	image="$(echo "$WORK"/pkg/lib/modules/*/vmlinuz)" ;;
 *.deb)
-	dpkg-deb --fsys-tarfile "$pkg" | tar -x -C "$WORK/pkg" --wildcards './boot/vmlinuz-*'
+	deb_extract "$pkg" "$WORK/pkg" './boot/vmlinuz-*'
 	image="$(echo "$WORK"/pkg/boot/vmlinuz-*)" ;;
 esac
 
@@ -129,7 +155,7 @@ cp "$ROOT/internal/tracer/bpf/shawk.bpf.c" "$initrd$ROOT/internal/tracer/bpf/"
 no_nfs=1
 if [[ -n "$modules" ]]; then
 	mkdir -p "$WORK/modules" "$initrd/vm/modules"
-	(cd "$WORK/modules" && rpm2cpio "$modules" | cpio -idm --quiet \
+	rpm_extract "$modules" "$WORK/modules" \
 		'./lib/modules/*/kernel/net/sunrpc/sunrpc.ko.xz' \
 		'./lib/modules/*/kernel/net/sunrpc/auth_gss/auth_rpcgss.ko.xz' \
 		'./lib/modules/*/kernel/net/dns_resolver/dns_resolver.ko.xz' \
@@ -138,7 +164,7 @@ if [[ -n "$modules" ]]; then
 		'./lib/modules/*/kernel/fs/netfs/netfs.ko.xz' \
 		'./lib/modules/*/kernel/fs/fscache/fscache.ko.xz' \
 		'./lib/modules/*/kernel/fs/nfs/nfs.ko.xz' \
-		'./lib/modules/*/kernel/fs/nfs/nfsv4.ko.xz')
+		'./lib/modules/*/kernel/fs/nfs/nfsv4.ko.xz'
 	for m in $(find "$WORK/modules" -name '*.ko.xz'); do
 		xz -dc "$m" >"$initrd/vm/modules/$(basename "$m" .xz)"
 	done
@@ -156,13 +182,13 @@ if [[ -n "$nfmodules" ]]; then
 	case "$nfmodules" in
 	*.rpm)
 		pats=(); for m in "${nf[@]}"; do pats+=("./lib/modules/*/kernel/$m.ko.xz"); done
-		(cd "$WORK/nf" && rpm2cpio "$nfmodules" | cpio -idm --quiet "${pats[@]}")
+		rpm_extract "$nfmodules" "$WORK/nf" "${pats[@]}"
 		for m in "${nf[@]}"; do
 			xz -dc "$WORK"/nf/lib/modules/*/kernel/"$m".ko.xz >"$initrd/vm/modules/$(basename "$m").ko"
 		done ;;
 	*.deb)
 		pats=(); for m in "${nf[@]}"; do pats+=("./lib/modules/*/kernel/$m.ko"); done
-		dpkg-deb --fsys-tarfile "$nfmodules" | tar -x -C "$WORK/nf" --wildcards "${pats[@]}"
+		deb_extract "$nfmodules" "$WORK/nf" "${pats[@]}"
 		for m in "${nf[@]}"; do
 			cp "$WORK"/nf/lib/modules/*/kernel/"$m".ko "$initrd/vm/modules/"
 		done ;;
@@ -188,8 +214,11 @@ EOF
 cmdline="console=$console panic=-1 quiet SHAWK_TEST_STRICT=${SHAWK_TEST_STRICT:-1} SHAWK_TEST_NO_UDP=${no_udp:-0} SHAWK_TEST_NO_NFS=${SHAWK_TEST_NO_NFS:-$no_nfs} SHAWK_TEST_NO_CONNTRACK=${SHAWK_TEST_NO_CONNTRACK:-$no_conntrack}"
 opts=(-m 2G -smp 2 -nographic -no-reboot -kernel "$image" -initrd "$WORK/initramfs.gz" -append "$cmdline")
 host="$(uname -m)"
+host="${host/arm64/aarch64}"
 if [[ "$host" == "$ARCH" && -r /dev/kvm && -w /dev/kvm ]]; then
 	opts+=(-accel kvm -cpu host)
+elif [[ "$host" == "$ARCH" && "$(uname -s)" == Darwin ]]; then
+	opts+=(-accel hvf -cpu host)
 else
 	opts+=(-accel tcg -cpu max)
 fi

@@ -25,7 +25,7 @@ vet:
 	$(GO) vet ./...
 	cd collector && $(GO) vet ./...
 	cd test/packaging && $(GO) vet ./...
-	test -z "$$(gofmt -l cmd internal collector/shawkconnector collector/cmd test/packaging test/vm test/hookcost)"
+	test -z "$$(gofmt -l cmd internal collector/shawkconnector collector/cmd test/packaging test/vm test/hookcost test/harness)"
 
 .PHONY: test
 test: ## unit tests; BPF tests need root, PostgreSQL tests need SHAWK_TEST_POSTGRES_DSN
@@ -61,6 +61,32 @@ ARCH ?= $(shell uname -m)
 vm-test: ## the tests of test-root in a virtual machine with KERNEL (rocky9, 5.14, 5.15) for ARCH (x86_64, aarch64)
 	test/vm/run.sh $(KERNEL) $(ARCH)
 
+# The environments of test/harness (see test/harness/README.md), per
+# workspace: a disposable PostgreSQL on the host and a Slurm cluster in a VM.
+.PHONY: pg-up
+pg-up: ## start a disposable PostgreSQL for this workspace and print its DSNs
+	test/harness/postgres.sh up
+
+.PHONY: pg-test
+pg-test: pg-up ## the tests of the connector, which use PostgreSQL, against that of pg-up
+	test/harness/postgres.sh run sh -c 'cd collector && $(GO) test ./...'
+
+.PHONY: pg-down
+pg-down: ## stop the PostgreSQL of pg-up and delete its data
+	test/harness/postgres.sh down
+
+.PHONY: slurm-up
+slurm-up: ## a Slurm cluster in a VM of Lima: SLURM_VERSION, SLURM_CGROUP_JOB_ID_PATHS, SLURM_SRUN_PORT_RANGE, ...
+	test/harness/slurm.sh up
+
+.PHONY: slurm-check
+slurm-check: ## run jobs on the cluster of slurm-up and check the units of their processes
+	test/harness/slurm.sh check
+
+.PHONY: slurm-down
+slurm-down: ## delete the VM of slurm-up
+	test/harness/slurm.sh down
+
 .PHONY: e2e
 e2e: build collector ## multi-host test with network namespaces; needs SHAWK_E2E_POSTGRES_DSN
 	sudo --preserve-env=SHAWK_E2E_POSTGRES_DSN,SHAWK_TEST_STRICT test/e2e/run.sh ./shawk collector/_build/shawk-collector
@@ -82,6 +108,10 @@ compat: rocky9.btf rocky9-nf_conntrack.btf ## check the BPF programs against the
 	SHAWK_TARGET_BTF=$(CURDIR)/rocky9.btf SHAWK_TARGET_MODULE_BTF=$(CURDIR)/rocky9-nf_conntrack.btf \
 		$(GO) test -run TestKernelCompatibility -v ./internal/tracer/
 
+# build/harness holds the state of the environments of test/harness, which
+# may run, also when this runs in the VM of slurm-up that mounts build:
+# pg-down and slurm-down remove it.
 .PHONY: clean
 clean:
-	rm -rf shawk shawk-migrate tracer.test rocky9.btf rocky9-nf_conntrack.btf build collector/_build
+	rm -rf shawk shawk-migrate tracer.test rocky9.btf rocky9-nf_conntrack.btf collector/_build \
+		$(filter-out build/harness,$(wildcard build/*))
