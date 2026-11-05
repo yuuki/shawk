@@ -1,0 +1,55 @@
+name: Complexity
+
+# Measures Cognitive Complexity (SonarSource) and Cyclomatic Complexity (McCabe)
+# with cccc (https://github.com/moznion/cccc). What is analyzed is configured in
+# cccc.toml. The job only reports: cccc.toml sets no max-cognitive or
+# max-cyclomatic threshold, so it never fails on complexity.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  complexity:
+    name: Measure complexity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Measure complexity (cccc)
+        uses: moznion/cccc-action@1d5313811f8451953e46a268c61791a01e40b7df # v1.1.2
+        with:
+          version: v1.8.6
+          path: .
+          output-file: cccc.json
+
+      - name: Write job summary
+        run: |
+          {
+            echo "## Code complexity (cccc)"
+            echo
+            jq -r '.summary | "\(.file_count) files, \(.function_count) functions."' cccc.json
+            jq -r '.summary | select(.parse_error_file_count > 0)
+              | "\(.parse_error_count) parse error(s) in \(.parse_error_file_count) file(s); results for those files may be partial."' cccc.json
+            echo
+            echo "| Metric | Sum | Max | Median | p90 | p95 |"
+            echo "| --- | ---: | ---: | ---: | ---: | ---: |"
+            jq -r '.summary | (["Cognitive", .cognitive], ["Cyclomatic", .cyclomatic])
+              | "| \(.[0]) | \(.[1].sum) | \(.[1].max) | \(.[1].median) | \(.[1].p90) | \(.[1].p95) |"' cccc.json
+            echo
+            echo "### Top 20 functions by cognitive complexity"
+            echo
+            echo "| Cognitive | Cyclomatic | Function | File:Line |"
+            echo "| ---: | ---: | --- | --- |"
+            jq -r '
+              [ .files[] | (.path | ltrimstr("./")) as $p | .functions[] | recurse(.children[]?)
+                | { path: $p, name, line, cognitive, cyclomatic } ]
+              | sort_by(-.cognitive, -.cyclomatic) | .[:20][]
+              | "| \(.cognitive) | \(.cyclomatic) | `\(.name)` | \(.path):\(.line) |"
+            ' cccc.json
+          } >> "$GITHUB_STEP_SUMMARY"
