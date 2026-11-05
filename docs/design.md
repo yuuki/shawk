@@ -38,8 +38,8 @@ primary target is Rocky Linux 9, kernel 5.14), and runs beside OBI (§9).
 What is observed is TCP and UDP sockets, so "not used" means "no TCP or
 UDP". RDMA verbs (InfiniBand, RoCE) bypass the sockets: in HPC clusters,
 where the main data paths use them (the RDMA transports of MPI and NCCL,
-Lustre o2ib, GPFS verbs, NFS over RDMA), a host may be observed throughout and still be used
-(§10).
+Lustre o2ib, GPFS verbs, NFS over RDMA), a host may be observed
+throughout and still be used (§10).
 
 ## 2. Architecture
 
@@ -208,13 +208,13 @@ requests an owner scan, so a restarted service is attributed at once.
 BeeGFS, nfsd, DRBD and Lustre's LNet hold sockets without a process. They
 matter before a server is decommissioned (a mounted NFS export), but
 connect from a kernel worker or whichever process triggered them, so comm
-and cgroup change between reconnections. A connecting socket is the kernel's when `sk_kern_sock` is
-set and it is not an orphan (MPTCP subflows and SMC's TCP socket excepted);
-it gets comm `~kernel` and cgroup id 0. A listener is the kernel's when no
-process held it at the last scan and the kernel may hold it; incoming
-connections are attributed through their listener, since children inherit
-`sk_kern_sock`. The exact tests are in shawk.bpf.c and
-`internal/tracer/owner.go`; naming is in §4.1.
+and cgroup change between reconnections. A connecting socket is the
+kernel's when `sk_kern_sock` is set and it is not an orphan (MPTCP
+subflows and SMC's TCP socket excepted); it gets comm `~kernel` and cgroup
+id 0. A listener is the kernel's when no process held it at the last scan
+and the kernel may hold it; incoming connections are attributed through
+their listener, since children inherit `sk_kern_sock`. The exact tests
+are in shawk.bpf.c and `internal/tracer/owner.go`; naming is in §4.1.
 
 **MPTCP.** Go listens with MPTCP by default since 1.24. The TCP hooks see
 the subflows of the MPTCP socket the application holds. Subflows opened
@@ -399,17 +399,17 @@ per packet.
 - The processes of Slurm jobs (cgroup v2) are named by the structure of
   `system.slice/slurmstepd.scope/<job>/<step>/...`, whatever names the job
   directory (`job_<id>` before Slurm 26.05 or with `CgroupJobIdPaths=yes`,
-  the SLUID otherwise): `user/task_*` is `slurm/batch`, `slurm/step`
-  (`step_<n>`, `step_<n>+<component>`), `slurm/extern` (with
-  `task_special`, where `pam_slurm_adopt` puts the processes it adopts) or
-  `slurm/interactive` after the kind of step, and the directory of
-  slurmstepd in a step (`slurm`; `slurm_processes` in the documentation)
-  and `<scope>/system` are `slurmstepd`, as Slurm's `cgroup/v2` plugin
-  makes them. The scope is `slurmstepd.scope`, or `<node>_slurmstepd.scope`
-  with `--enable-multiple-slurmd`, recognized only under slices from the
-  root (`system.slice`, or the slice of `CgroupSlice`), where users cannot
-  make cgroups; other hierarchies, and cgroup v1, keep the rules above
-  (`internal/procinfo/cgroup.go`).
+  the SLUID otherwise): `user/task_*` (`task_special` too, where
+  `pam_slurm_adopt` puts the processes it adopts) is named after the kind
+  of its step, `slurm/batch`, `slurm/step` (`step_<n>`,
+  `step_<n>+<component>`), `slurm/extern` or `slurm/interactive`, and the
+  directory of slurmstepd in a step (`slurm`; `slurm_processes` in the
+  documentation) and `<scope>/system` are `slurmstepd`, as Slurm's
+  `cgroup/v2` plugin makes them. The scope is `slurmstepd.scope`, or
+  `<node>_slurmstepd.scope` with `--enable-multiple-slurmd`, recognized
+  only under slices from the root (`system.slice`, or the slice of
+  `CgroupSlice`), where users cannot make cgroups; other hierarchies, and
+  cgroup v1, keep the rules above (`internal/procinfo/cgroup.go`).
 - Container names are not trusted blindly. Docker merges image labels into
   container labels, so pod labels are believed only with the container name
   cri-dockerd gives, and Compose labels only with the name Compose gives.
@@ -522,8 +522,8 @@ attributes `service.name`, `service.namespace`, `process.executable.name`,
 `network.local.address`, `network.peer.address`, `server.port` (the service
 port, whatever the role), `shawk.netns`, `shawk.peer.folded=true` for a
 folded edge (§3.6), and `process.user.id` for a process of a Slurm job
-with `-job-users` (§4.1). The PID is not an attribute, so a restarted process
-continues the same series.
+with `-job-users` (§4.1). The PID is not an attribute, so a restarted
+process continues the same series.
 
 | metric | type, unit | |
 |---|---|---|
@@ -748,10 +748,11 @@ held it, not as of the load. Until what the connector saw is written and
 read back, the holders it saw itself count too, so that an address that
 moved while PostgreSQL could not be written does not name its former
 holder again once the new one stops. An address that left a host whose
-agent is still alive names no host. The names of `peer_cidrs` are ranges, not hosts. Through a
-translation, `pickBackend()` chooses a representative to name the service,
-not the backend a connection reached, so a virtual address with several
-backends has host `~unknown`; the names of services do not change.
+agent is still alive names no host. The names of `peer_cidrs` are ranges,
+not hosts. Through a translation, `pickBackend()` chooses a
+representative to name the service, not the backend a connection reached,
+so a virtual address with several backends has host `~unknown`; the names
+of services do not change.
 `shawk.peer.agent` keeps its meaning: knowing the host of a peer does not
 mean that its agent records the other side.
 
@@ -781,9 +782,8 @@ the host name; `host.id` and `host.name` are promoted to labels.
   between jobs match: the endpoints the connector learns from agents are
   named so, and those read from PostgreSQL by the column `slurm_job` of
   `shawk_v1.service_endpoints` and `client_endpoints`. PostgreSQL keeps
-  their names;
-  the series from the agent are still keyed by executable, bounded by its
-  idle TTL.
+  their names; the series from the agent are still keyed by executable,
+  bounded by its idle TTL.
 - Some servers listen on a port chosen anew at every run: srun and salloc
   without `SrunPortRange`, to which slurmctld and slurmstepd connect. Their
   dependencies have `server.port` 0, so that each run adds no series:
@@ -1119,9 +1119,10 @@ inventory, the file names hosts (`host`).
   warning; one more than 10 seconds ahead is invalid (the file is
   generated on the host of the connector). When a file cannot be read, is
   invalid (an empty file is) or is larger than 16 MiB, as the inventory,
-  what was written from it stays, and the states become stale. Flags are names (`DOWN`, `POWERED_DOWN`), as
-  `scontrol` gives them; the `*` of a node that does not respond becomes
-  `NOT_RESPONDING`, and the symbols of `sinfo` (`idle~`) are invalid.
+  what was written from it stays, and the states become stale. Flags are
+  names (`DOWN`, `POWERED_DOWN`), as `scontrol` gives them; the `*` of a
+  node that does not respond becomes `NOT_RESPONDING`, and the symbols of
+  `sinfo` (`idle~`) are invalid.
 - **Maintenance windows** are written by the clock of the database
   (`maintenance_windows`) when the file changes, and count from when they
   were written, so a window registered afterwards does not make a past
@@ -1233,12 +1234,12 @@ names in PostgreSQL and Prometheus match.
 | `agents` | the latest segment of every host and whether its agent is alive; the last columns, `peer_fold` and `peer_internal`, tell what the agent folds and the ranges it keeps exact |
 | `unobserved(since, until, tolerance)` | the periods in which each host was not observed; Grafana overlays them as annotations |
 | `unobserved_by_name(since, until, tolerance)` | the same over the sessions of all the host ids of each host name, for nodes whose machine id changed (§4.1), where `unobserved()` reports the time after the last heartbeat of each old id; two machines that share a name hide each other's gaps |
+| `unobserved_reasons(since, until, tolerance)` | the periods of `unobserved_by_name()` cut by what explains them (§5.7): `cause` is `maintenance` or `power_saving` for a planned stop and NULL otherwise, `node_state` the state of Slurm then (flags joined by `+`, NULL if none was read or it was stale) and `reason` that of Slurm or of the maintenance window, which takes precedence. The gaps are per host name, as the states and windows are, since a node that power saving boots often may get a new host id at every boot. `unobserved()` and `unobserved_by_name()` do not change |
+| `partly_observed(since, until)` | the periods in which each host was observed but its agent dropped flows, cut to `[since, until]`: `host`, `gap_start`, `gap_end`, `dropped_flows` (flow updates dropped). A dependency may be missing from them although it was used; Grafana overlays them as annotations |
+| `planned_stops` | hosts in a planned stop now and until when at the latest (`host`, `cause`, `since`, `until`, `reason`): in a maintenance window, or in a planned state of their latest reading from Slurm while it is fresh |
 | `never_observed()` | the hosts of the inventory (§5.6) expected to run an agent whose agent never reported within the retention (no host has their name): `host`, `slurm_node`, `roles`, and `seen_as`, the hosts whose agents reported an address of the host, as an agent whose `host.name` differs from the inventory would |
 | `inventory`, `inventory_addrs` | the hosts of the inventory with their addresses (`host`, `slurm_node`, `roles`, `agent`, `addrs`), and one row per address with its host: join an address on `addr` to name its host |
 | `inventory_status` | when the inventory was last read from a valid file (`read_at`, NULL if never), the latest failure since (`failed_at`, `error`), and how many hosts it has; no row before a connector with `inventory_file` read it |
-| `unobserved_reasons(since, until, tolerance)` | the periods of `unobserved_by_name()` cut by what explains them (§5.7): `cause` is `maintenance` or `power_saving` for a planned stop and NULL otherwise, `node_state` the state of Slurm then (flags joined by `+`, NULL if none was read or it was stale) and `reason` that of Slurm or of the maintenance window, which takes precedence. The gaps are per host name, as the states and windows are, since a node that power saving boots often may get a new host id at every boot. `unobserved()` and `unobserved_by_name()` do not change |
-| `planned_stops` | hosts in a planned stop now and until when at the latest (`host`, `cause`, `since`, `until`, `reason`): in a maintenance window, or in a planned state of their latest reading from Slurm while it is fresh |
-| `partly_observed(since, until)` | the periods in which each host was observed but its agent dropped flows, cut to `[since, until]`: `host`, `gap_start`, `gap_end`, `dropped_flows` (flow updates dropped). A dependency may be missing from them although it was used; Grafana overlays them as annotations |
 | `job_edges` | the edges of the processes of Slurm jobs with the user of the process (`user_id`, NULL if unknown), host, unit, service and executable: which users connected to what, and when. For administrators: only its owner reads it (below) |
 | `dependencies_between(since, until)`, `graph_edges_between`, `graph_nodes_between`, `dependency_changes_between` | the same for the dependencies active in a period. They take the edges active in the period with a margin of 15 minutes before matching, so a recent window does not scan the history (about 0.3 s instead of 3 s with a million edges) and both sides of a connection are matched at the edges of the period; the dashboards and alerts use them. A dependency appeared in a period when it was first seen in it and is not in `known_dependencies` from before it, so one that comes back on new edges (a new container, an hourly job) did not appear |
 
@@ -1256,8 +1257,13 @@ this version. `grants.sql` takes the view back from the connector and
 Grafana in the transaction that grants them the rest of `shawk_v1`, so
 that no session sees them on it in between, and migration 0005 revokes
 what default privileges granted as it was created. Only the owner reads
-it, or a role of administrators the owner grants it to. Views of their own
-jobs for users would be designed separately.
+it, or a role of administrators the owner grants it to. The rest of the
+contract shows no user, but with `job_users` the processes of a job of
+different users are rows of their own, and so are their edges:
+`dependencies` and `dependencies_between()` have a row per user where
+they would have one, so their readers, Grafana included, can count the
+users of the executable of a job and tell when each was active. Views of
+their own jobs for users would be designed separately.
 
 ## 7. Counting each dependency once
 
@@ -1323,25 +1329,26 @@ alive is not alerted. Neither alerts hosts in a planned stop (§5.7): the
 Grafana alert excludes `shawk_v1.planned_stops`, and `ShawkAgentDown` the
 nodes a Slurm exporter reports in power saving (powered down, powering down
 or up, with no flag but `IDLE`, `ALLOCATED`, `MIXED`, `CLOUD` and
-`POWER_DOWN`) or in a `MAINT` reservation, joined on the host name. The example in
-`packaging/prometheus/shawk-rules.yml` assumes `slurm_node_state{node,
-state}`; the metric, its labels and the mapping of `NodeName` to
-`host_name` are replaced with those of the exporter in use. A state is
-current only while the exporter is scraped, so a stale state stops nothing.
-Prometheus does not know the windows of `maintenance_file`: in the first
-24 hours of one, `ShawkAgentDown` fires unless it is silenced in
-Alertmanager or is a `MAINT` reservation. A node that resumed is alerted
-if its agent does not send within the minute of `for` after it is up.
+`POWER_DOWN`) or in a `MAINT` reservation, joined on the host name. The
+example in `packaging/prometheus/shawk-rules.yml` assumes
+`slurm_node_state{node, state}`; the metric, its labels and the mapping of
+`NodeName` to `host_name` are replaced with those of the exporter in use. A
+state is current only while the exporter is scraped, so a stale state stops
+nothing. Prometheus does not know the windows of `maintenance_file`: in the
+first 24 hours of one, `ShawkAgentDown` fires unless it is silenced in
+Alertmanager or is a `MAINT` reservation. A node that resumed is alerted if
+its agent does not send within the minute of `for` after it is up.
 
 The fleet, dependency details, peer hosts and changes dashboards overlay
 the periods from `unobserved()` and `partly_observed()` as annotations, so
 the absence of a dependency is not read as disuse over them. The table of
-gaps of the fleet dashboard gives their reasons (`unobserved_reasons()`).
-SYN retransmissions
-per connection attempt (handshakes plus failures) exceed 1 when connects
-time out, and `TCP_FASTOPEN_CONNECT` connects, which have no handshake,
-raise them. OBI panels use a minimum interval of a minute, since OBI
-exports every 60 seconds by default.
+gaps of the fleet dashboard gives their reasons (`unobserved_reasons()`),
+per host name as `unobserved_by_name()`: the old ids of a node whose
+machine id changed have gaps in the annotations, not in the table. SYN
+retransmissions per connection attempt (handshakes plus failures) exceed 1
+when connects time out, and `TCP_FASTOPEN_CONNECT` connects, which have no
+handshake, raise them. OBI panels use a minimum interval of a minute, since
+OBI exports every 60 seconds by default.
 
 Where the absence of a dependency is read (the changes dashboard, and the
 observation periods of the fleet dashboard), the panels say that only TCP
@@ -1428,14 +1435,14 @@ only the protocols it parses. shawk runs beside it:
 - **Sockets of the kernel** are named after their port (§4.1), so a
   subsystem on another's port is named after that one, and one on an
   unlisted port is `~kernel`; NFSv3 also talks to `lockd` and `mountd` on
-  ports rpcbind assigns. Ports set in configuration are not read: LNet
-  with another `accept_port`, or BeeGFS with other `conn*Port`s, is named
-  after the port it moved to like any other. A socket created by a process and then held by the kernel
-  alone (an `nbd` or iSCSI connection whose process exited) is not
-  the kernel's: adopted at startup it is not attributed. A listener with
-  `sk_user_data` (e.g. in a BPF sockmap) held by a process in another PID
-  namespace is taken for the kernel's; run the agent in the host PID
-  namespace.
+  ports rpcbind assigns. Ports set in configuration are not read: LNet with
+  another `accept_port`, or BeeGFS with other `conn*Port`s, is named after
+  the port it moved to like any other. A socket created by a process and
+  then held by the kernel alone (an `nbd` or iSCSI connection whose process
+  exited) is not the kernel's: adopted at startup it is not attributed. A
+  listener with `sk_user_data` (e.g. in a BPF sockmap) held by a process in
+  another PID namespace is taken for the kernel's; run the agent in the
+  host PID namespace.
 - **Machine ids that change at every boot** (§4.1) make a new host per
   boot: `unobserved()` reports false gaps for the old ids, which
   `unobserved_by_name()` does not, and `host_id` changes in Prometheus. The
@@ -1444,6 +1451,17 @@ only the protocols it parses. shawk runs beside it:
   would affect `host_id`, OBI's `host.id` and `host_identity: certificate`.
   Host names are not rewritten either (a domain dropped to match a Slurm
   `NodeName`): names could collide and certificates stop matching.
+- **Slurm clusters.** The processes of jobs are recognized on cgroup v2
+  only, under the scope of slurmstepd in a slice from the root (§4.1): with
+  cgroup v1 or another hierarchy they are named as other processes, after
+  their `OTEL_` variables too, so a job can take the name of a service. Job
+  ids are not kept (§6.1). A server whose port changes at every run makes a
+  new dependency each time unless the rules of ports cover it (§5.3): ports
+  chosen by the kernel are not detected. Connections that end before the
+  agent attached its programs are not observed, whatever the start order
+  (§4.3). Node states map to hosts through the inventory, and alerts in
+  Prometheus stop only for the states of a Slurm exporter, not for the
+  windows of `maintenance_file` (§5.7, §8).
 - **Flow table capacity**: when more distinct flows than `-max-flows` occur
   in one interval, updates are dropped and counted in
   `shawk.agent.flows.dropped`, and the period is partly observed
