@@ -274,8 +274,7 @@ within the same step.
   `SOCK_BINDPORT_LOCK` got its port from the kernel (`port_bound()` in
   shawk.bpf.c), but listeners are listed by the iterator, so short-lived
   ones are missed, and a port chosen by the kernel does not make the
-  services on it one. Without evidence the port is kept. Not implemented
-  yet (#205).
+  services on it one. Without evidence the port is kept.
 - The rows of `shawk.edges` still grow with runs of srun. If they turn out
   to matter, matched dependencies may be kept in a separate table.
 
