@@ -719,19 +719,20 @@ func (r *resolver) addrHost(host string, a netip.Addr, now time.Time) (string, b
 	if a.IsLoopback() {
 		return "", true
 	}
+	// A shared address, such as the gateway of a container bridge, is the
+	// host's own if it holds it too, as for the names of services, whatever
+	// the inventory gives it to.
+	hs := r.holders(a, now)
+	if len(hs) > 1 && hs[host] {
+		return "", true
+	}
 	if r.inventory != nil {
 		if h, ok := r.inventory(a); ok {
 			return h, false
 		}
 	}
-	hs := r.holders(a, now)
 	switch {
 	case len(hs) > 1:
-		// A shared address, such as the gateway of a container bridge, is
-		// the host's own if it holds it too, as for the names of services.
-		if hs[host] {
-			return "", true
-		}
 		return hostUnknown, false
 	case len(hs) == 1:
 		for h := range hs {

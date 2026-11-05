@@ -276,16 +276,23 @@ func TestPeerHostEvidence(t *testing.T) {
 		t.Errorf("a folded peer = %+v", p)
 	}
 
-	// The inventory comes first.
-	inv := map[netip.Addr]string{addrOf("10.0.2.5"): "nas-01", addrOf("10.0.2.3"): "node-03-ib"}
+	// The inventory comes first, after the addresses of the host itself.
+	inv := map[netip.Addr]string{addrOf("10.0.2.5"): "nas-01", addrOf("10.0.2.3"): "node-03-ib",
+		addrOf("172.17.0.1"): "node-02"}
 	r.inventory = func(a netip.Addr) (string, bool) {
 		h, ok := inv[a]
 		return h, ok
 	}
-	for peer, want := range map[string]string{"10.0.2.5": "nas-01", "10.0.2.3": "node-03-ib", "10.0.2.1": "node-01"} {
+	for peer, want := range map[string]string{"10.0.2.5": "nas-01", "10.0.2.3": "node-03-ib", "10.0.2.1": "node-01",
+		"172.17.0.1": "node-02"} {
 		if got := host("id-ctl-01", peer); got != want {
 			t.Errorf("with an inventory, host of %s = %s, want %s", peer, got, want)
 		}
+	}
+	// A shared address the host holds too is its own, even when the
+	// inventory gives it to another host.
+	if got := host("id-node-01", "172.17.0.1"); got != "self" {
+		t.Errorf("with an inventory, a shared address of the host itself = %s", got)
 	}
 }
 
