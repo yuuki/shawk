@@ -142,6 +142,36 @@ func mapSlice[T, U any](s []T, f func(T) U) []U {
 	return out
 }
 
+// TestPeerHostInventory: the connector names the host of a peer from its
+// inventory_file first, so that the failures towards a node without an
+// agent, which no agent holds the address of, have its host.
+func TestPeerHostInventory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "inventory.yaml")
+	if err := os.WriteFile(path, []byte("hosts:\n  - name: node-03\n    slurm_node: node03\n    addrs: [10.0.2.3]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, _, sink, _ := testConnector(t, func(cfg *Config) {
+		cfg.PeerHosts = true
+		cfg.InventoryFile = path
+	})
+	ctl, n1, n2 := slurmAgents(t0.Add(15 * time.Second))
+	consume(t, c, sink, n1)
+	consume(t, c, sink, n2)
+	out := consume(t, c, sink, ctl)
+	var reasons []string
+	for _, s := range find(out, metricHostConnFailedByReason, "slurmctld", "*", roleClient, "") {
+		reasons = append(reasons, s.peerHost+" "+s.peer+" "+s.errType)
+	}
+	slices.Sort(reasons)
+	if want := []string{"node-03 ~unresolved refused", "node-03 ~unresolved timeout"}; !slices.Equal(reasons, want) {
+		t.Errorf("failures by peer host = %v, want %v", reasons, want)
+	}
+	if got, want := hostsOf(out, metricHostConnOpened, "slurmctld", roleClient, ""),
+		map[string]float64{"node-01 slurmd": 4, "node-02 slurmd": 2, "ctl-01 ~unresolved": 1, "~external ~external": 1}; !maps.Equal(got, want) {
+		t.Errorf("connections by peer host = %v, want %v", got, want)
+	}
+}
+
 // TestPeerHostServerSide: the server side names the host of its client, and
 // a client on the server's own shared address is the server itself.
 func TestPeerHostServerSide(t *testing.T) {

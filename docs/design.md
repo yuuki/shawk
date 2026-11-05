@@ -733,7 +733,7 @@ gets none:
 | peer | `shawk.peer.host` |
 |---|---|
 | loopback, or an address several live hosts hold, this one included | the host itself |
-| an address the inventory maps to one host (not implemented yet, #175) | that host |
+| an address the inventory maps to one host (§5.6) | that host |
 | an address one live host holds alone | that host |
 | an address no live host holds, whose latest holder held it alone within 30 days and whose agent has stopped since | that host, so that failures towards a host that is down are named |
 | otherwise, private address | `~unknown` |

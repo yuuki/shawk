@@ -186,10 +186,10 @@ type resolver struct {
 
 	// peerHosts tells whether peers are given a host (peer_hosts).
 	peerHosts bool
-	// inventory returns the host the inventory (#175) gives an address to,
-	// the first evidence of the host of a peer; nil without an inventory.
-	// It is called for every peer, so that the connector may replace the
-	// inventory it reads.
+	// inventory returns the host the inventory (inventory_file) gives an
+	// address to, the first evidence of the host of a peer. It is called
+	// for every peer, so that the connector may replace the inventory it
+	// reads; nil in tests without one.
 	inventory func(netip.Addr) (string, bool)
 	// dbFormer are the latest hosts that held addresses alone, read from
 	// PostgreSQL with peer_hosts only.

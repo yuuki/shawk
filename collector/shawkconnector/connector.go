@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"slices"
 	"strings"
@@ -134,7 +135,7 @@ func newConnector(set connector.Settings, cfg *Config, next consumer.Metrics) (*
 		agg.setPeerHosts(cfg.MaxPeerHosts, cfg.PeerHostServices)
 	}
 	agg.ports = ports
-	return &shawkConnector{
+	c := &shawkConnector{
 		cfg:      cfg,
 		log:      set.Logger,
 		next:     next,
@@ -153,7 +154,11 @@ func newConnector(set connector.Settings, cfg *Config, next consumer.Metrics) (*
 		cidrWarned: map[string]time.Time{},
 
 		inventoryWarned: map[string]time.Time{},
-	}, nil
+	}
+	// The inventory is the first evidence of the host of a peer (§5.2 of
+	// docs/design.md), read from inventory_file every write interval.
+	res.inventory = func(a netip.Addr) (string, bool) { return c.inventory.Load().hostOf(a) }
+	return c, nil
 }
 
 func (c *shawkConnector) Capabilities() consumer.Capabilities {
