@@ -237,9 +237,10 @@ func (a *aggregator) setPeerHosts(maxPeerHosts int, services []string) {
 	}
 }
 
-// peerHostsOf tells whether the edges of a local service ([namespace/]name)
-// to a peer service have outputs per peer host: whether either is in
-// peer_host_services. Both sides of a dependency then have them, as the
+// peerHostsOf tells whether the edges of a local service to a peer service
+// have outputs per peer host: whether either is in peer_host_services. The
+// local service is named as its peers name it ([namespace/]name, slurm-job
+// for the processes of Slurm jobs). Both sides of a dependency then have them, as the
 // recording rules expect: they leave out the server side of a client with
 // an agent (shawk.peer.agent), whose client side counts the dependency.
 func (a *aggregator) peerHostsOf(local, peer string) bool {
@@ -367,9 +368,11 @@ func (a *aggregator) add(b *hostBatch, peerOf func(*edgeID) peer, now time.Time,
 		peerName := cutLabel(p.name, maxPeerName)
 		name := a.peer(g, peerName, now)
 		var peerHost string
-		// The name of the process, not that of its outputs, which may be
-		// ~other beyond max_services or max_peers.
-		if a.peerHostsOf(e.id.job(), peerName) {
+		// The name of the process as a peer, as on the other side of the
+		// dependency (slurm-job for the processes of Slurm jobs), not that
+		// of its outputs, which may be ~other beyond max_services or
+		// max_peers.
+		if a.peerHostsOf(e.id.process.peerName(), peerName) {
 			peerHost = p.host
 			if p.self {
 				peerHost = b.hostname

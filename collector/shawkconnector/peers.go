@@ -186,10 +186,10 @@ type resolver struct {
 
 	// peerHosts tells whether peers are given a host (peer_hosts).
 	peerHosts bool
-	// inventory returns the host the inventory (#175) gives an address to,
-	// the first evidence of the host of a peer; nil without an inventory.
-	// It is called for every peer, so that the connector may replace the
-	// inventory it reads.
+	// inventory returns the host the inventory (inventory_file) gives an
+	// address to, the first evidence of the host of a peer. It is called
+	// for every peer, so that the connector may replace the inventory it
+	// reads; nil in tests without one.
 	inventory func(netip.Addr) (string, bool)
 	// dbFormer are the latest hosts that held addresses alone, read from
 	// PostgreSQL with peer_hosts only.
@@ -719,19 +719,20 @@ func (r *resolver) addrHost(host string, a netip.Addr, now time.Time) (string, b
 	if a.IsLoopback() {
 		return "", true
 	}
+	// A shared address, such as the gateway of a container bridge, is the
+	// host's own if it holds it too, as for the names of services, whatever
+	// the inventory gives it to.
+	hs := r.holders(a, now)
+	if len(hs) > 1 && hs[host] {
+		return "", true
+	}
 	if r.inventory != nil {
 		if h, ok := r.inventory(a); ok {
 			return h, false
 		}
 	}
-	hs := r.holders(a, now)
 	switch {
 	case len(hs) > 1:
-		// A shared address, such as the gateway of a container bridge, is
-		// the host's own if it holds it too, as for the names of services.
-		if hs[host] {
-			return "", true
-		}
 		return hostUnknown, false
 	case len(hs) == 1:
 		for h := range hs {

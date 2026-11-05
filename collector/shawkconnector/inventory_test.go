@@ -112,7 +112,7 @@ func TestParseInventoryInvalid(t *testing.T) {
 
 func TestReadInventoryTooLarge(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "inventory.yaml")
-	if err := os.WriteFile(path, make([]byte, maxInventoryBytes+1), 0o600); err != nil {
+	if err := os.WriteFile(path, make([]byte, maxFileBytes+1), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := readInventory(path); err == nil || !strings.Contains(err.Error(), "larger than") {
