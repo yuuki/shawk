@@ -355,9 +355,9 @@ func (c *shawkConnector) expire(now time.Time) {
 	c.limits.expire(now)
 }
 
-// expireWarnings forgets the warnings logged foldWarnInterval before now.
-// A host that folded hosts since it was logged is kept, so that the next
-// warning counts them. c.mu is held.
+// expireWarnings forgets the warnings logged at least foldWarnInterval
+// before now. A host that folded hosts since it was logged is kept, so that
+// the next warning counts them. c.mu is held.
 func (c *shawkConnector) expireWarnings(now time.Time) {
 	for k, w := range c.foldWarned {
 		if len(w.hosts) == 0 && now.Sub(w.logged) >= foldWarnInterval {

@@ -41,33 +41,39 @@ type storeCall struct {
 }
 
 // loopStore is a fakeStore through which a test runs the loop of the
-// connector one write interval at a time: once gated, its reads of the
-// names of peers, which the loop makes once per interval after its write,
-// wait until the test lets them through or ungates the store, or the loop
-// stops. It records the calls of the loop, and fails a write whose context
-// is canceled, as PostgreSQL does.
+// connector one write interval at a time: its reads of the names of peers,
+// which the loop makes once per interval after its write, wait until the
+// test lets them through or ungates the store. The first, of Start, does
+// not wait, so that the loop waits in its first interval. It records the
+// calls of the loop, and fails a write whose context is canceled, as
+// PostgreSQL does.
 type loopStore struct {
 	*fakeStore
-	gated   atomic.Bool
+	reads   atomic.Int64
 	reached chan struct{}
 	release chan struct{}
 	stop    chan struct{}
 	stopped sync.Once
-	// holdWrite makes the next write wait as a gated read of the names of
-	// peers does, and canceled tells that a call was canceled while it
-	// waited.
-	holdWrite atomic.Bool
-	canceled  atomic.Bool
-	// onWrite is called by every write.
-	onWrite func()
+	// onCall is called by every call, after it is recorded.
+	onCall func(name string)
 
 	callsMu sync.Mutex
 	calls   []storeCall
+
+	// stopIn is the call ("write" or "peers") in which the next interval
+	// stops the connector with stopLoop, see stopping. inStop is closed
+	// once it has, and canceled tells whether that canceled the context of
+	// the call.
+	stopMu   sync.Mutex
+	stopIn   string
+	stopLoop func()
+	inStop   chan struct{}
+	canceled atomic.Bool
 }
 
 func newLoopStore() *loopStore {
 	return &loopStore{fakeStore: &fakeStore{}, reached: make(chan struct{}), release: make(chan struct{}),
-		stop: make(chan struct{})}
+		stop: make(chan struct{}), inStop: make(chan struct{})}
 }
 
 func (s *loopStore) record(ctx context.Context, name string) {
@@ -78,6 +84,9 @@ func (s *loopStore) record(ctx context.Context, name string) {
 	s.callsMu.Lock()
 	s.calls = append(s.calls, call)
 	s.callsMu.Unlock()
+	if s.onCall != nil {
+		s.onCall(name)
+	}
 }
 
 // take returns the calls recorded since the last take.
@@ -89,17 +98,39 @@ func (s *loopStore) take() []storeCall {
 	return calls
 }
 
+// stopAt makes the next interval stop the connector with stop from within
+// the call named in, "write" or "peers".
+func (s *loopStore) stopAt(in string, stop func()) {
+	s.stopMu.Lock()
+	s.stopIn, s.stopLoop = in, stop
+	s.stopMu.Unlock()
+}
+
+// stopping stops the connector from within the call name, if it is the
+// one of stopAt, and records whether that canceled the context of the
+// call: canceling a context cancels those derived from it before it
+// returns. A call whose deadline passed already, which would hide the
+// cancellation, fails instead, so that the next interval tries again.
+func (s *loopStore) stopping(ctx context.Context, name string) error {
+	s.stopMu.Lock()
+	defer s.stopMu.Unlock()
+	if s.stopIn != name {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.stopIn = ""
+	s.stopLoop()
+	s.canceled.Store(errors.Is(ctx.Err(), context.Canceled))
+	close(s.inStop)
+	return nil
+}
+
 func (s *loopStore) write(ctx context.Context, h *hostChanges) error {
 	s.record(ctx, "write")
-	if s.holdWrite.CompareAndSwap(true, false) {
-		select {
-		case s.reached <- struct{}{}:
-			s.hold(ctx)
-		case <-s.stop:
-		}
-	}
-	if s.onWrite != nil {
-		s.onWrite()
+	if err := s.stopping(ctx, "write"); err != nil {
+		return err
 	}
 	if errors.Is(ctx.Err(), context.Canceled) {
 		return ctx.Err()
@@ -109,34 +140,20 @@ func (s *loopStore) write(ctx context.Context, h *hostChanges) error {
 
 func (s *loopStore) peers(ctx context.Context, ttl, former time.Duration) (peerRows, error) {
 	s.record(ctx, "peers")
-	if s.gated.Load() {
+	if err := s.stopping(ctx, "peers"); err != nil {
+		return peerRows{}, err
+	}
+	if s.reads.Add(1) > 1 {
 		select {
 		case s.reached <- struct{}{}:
-			s.hold(ctx)
+			select {
+			case <-s.release:
+			case <-s.stop:
+			}
 		case <-s.stop:
 		}
 	}
 	return s.fakeStore.peers(ctx, ttl, former)
-}
-
-// hold waits until the test lets the loop through, or the loop stops: the
-// deadline of ctx may pass meanwhile.
-func (s *loopStore) hold(ctx context.Context) {
-	done := ctx.Done()
-	for {
-		select {
-		case <-s.release:
-			return
-		case <-s.stop:
-			return
-		case <-done:
-			if errors.Is(ctx.Err(), context.Canceled) {
-				s.canceled.Store(true)
-				return
-			}
-			done = nil
-		}
-	}
 }
 
 func (s *loopStore) prune(ctx context.Context, retention time.Duration, batch int) (int64, error) {
@@ -154,8 +171,8 @@ func (s *loopStore) refreshDependencies(ctx context.Context) (int64, error) {
 	return s.fakeStore.refreshDependencies(ctx)
 }
 
-// wait waits until the loop reads the names of peers, or writes with
-// holdWrite, where it stays until step.
+// wait waits until the loop reads the names of peers, where it stays until
+// step.
 func (s *loopStore) wait(t *testing.T) {
 	t.Helper()
 	select {
@@ -180,10 +197,9 @@ func (s *loopStore) step(t *testing.T) {
 // ungate lets the loop run freely, as it must to stop.
 func (s *loopStore) ungate() { s.stopped.Do(func() { close(s.stop) }) }
 
-// loopConnector returns a started connector whose loop writes into st
-// every interval, with a clock at t0 that the test sets. st is gated once
-// the connector started.
-func loopConnector(t *testing.T, st *loopStore, interval time.Duration, mod func(*Config)) (*shawkConnector,
+// newLoopConnector returns a connector, not started, whose loop writes into
+// st every interval, with a clock at t0 that the test sets.
+func newLoopConnector(t *testing.T, st *loopStore, interval time.Duration, mod func(*Config)) (*shawkConnector,
 	*consumertest.MetricsSink, *testClock) {
 	t.Helper()
 	cfg := createDefaultConfig()
@@ -204,14 +220,28 @@ func loopConnector(t *testing.T, st *loopStore, interval time.Duration, mod func
 	clock := &testClock{t: t0}
 	c.now = clock.now
 	c.agg.started = t0.Add(-time.Hour)
+	return c, sink, clock
+}
+
+// startLoop starts a connector of newLoopConnector, and stops it when the
+// test ends.
+func startLoop(t *testing.T, c *shawkConnector, st *loopStore) {
+	t.Helper()
 	if err := c.Start(context.Background(), nil); err != nil {
 		t.Fatal(err)
 	}
-	st.gated.Store(true)
 	t.Cleanup(func() {
 		st.ungate()
 		c.Shutdown(context.Background())
 	})
+}
+
+// loopConnector returns a connector of newLoopConnector, started.
+func loopConnector(t *testing.T, st *loopStore, interval time.Duration, mod func(*Config)) (*shawkConnector,
+	*consumertest.MetricsSink, *testClock) {
+	t.Helper()
+	c, sink, clock := newLoopConnector(t, st, interval, mod)
+	startLoop(t, c, st)
 	return c, sink, clock
 }
 
@@ -240,7 +270,11 @@ func TestLoopInterval(t *testing.T) {
 	at := t0.Add(2 * time.Hour)
 	clock.set(at)
 	consume(t, c, sink, loopAgent(at))
-	st.onWrite = func() { clock.set(clock.now().Add(10 * time.Second)) }
+	st.onCall = func(name string) {
+		if name == "write" {
+			clock.set(clock.now().Add(10 * time.Second))
+		}
+	}
 	st.step(t)
 	calls := st.take()
 	var names []string
@@ -328,11 +362,10 @@ func TestLoopWriteFailure(t *testing.T) {
 	check("read back", at(5), 0)
 }
 
-// TestLoopExpiry: every write interval, after the rest, the loop forgets
-// what expired as of then: the state of the hosts not seen for the idle
-// TTL, the agents not seen within the alive window, and the warnings
-// logged foldWarnInterval ago, except those of hosts whose agents folded
-// hosts since.
+// TestLoopExpiry: every write interval, the loop forgets what expired: the
+// state of the hosts not seen for the idle TTL, the agents not seen within
+// the alive window, and the warnings logged at least foldWarnInterval
+// before, except those of hosts whose agents folded hosts since.
 func TestLoopExpiry(t *testing.T) {
 	st := newLoopStore()
 	c, sink, clock := loopConnector(t, st, loopInterval, nil)
@@ -438,37 +471,85 @@ func TestLoopShutdown(t *testing.T) {
 	}
 }
 
+// TestLoopExpiresLast: the loop forgets what expired at the end of a write
+// interval, as of then: after it wrote what is pending and read the names
+// of peers, whatever expired before, and after it pruned and refreshed,
+// however long they take.
+func TestLoopExpiresLast(t *testing.T) {
+	st := newLoopStore()
+	c, sink, clock := newLoopConnector(t, st, loopInterval, func(cfg *Config) { cfg.Retention = 24 * time.Hour })
+	ttl := c.cfg.IdleTTL
+	held := func(host string) bool {
+		c.limits.mu.Lock()
+		defer c.limits.mu.Unlock()
+		_, ok := c.limits.hosts[hostKey("", host)]
+		return ok
+	}
+	// app-01, seen at t0, has expired by the first interval.
+	consume(t, c, sink, loopAgent(t0))
+	clock.set(t0.Add(ttl + time.Nanosecond))
+	startLoop(t, c, st)
+	st.wait(t)
+	st.mu.Lock()
+	writes := len(st.writes)
+	st.mu.Unlock()
+	if !held("app-01") || writes != 1 {
+		t.Errorf("reading the names of peers: app-01 held %v, %d writes; want held, written once", held("app-01"), writes)
+	}
+
+	// app-02 is seen now, and expires a nanosecond after the two minutes
+	// that pruning and refreshing take.
+	at := clock.now()
+	ta := loopAgent(at)
+	ta.host = "app-02"
+	consume(t, c, sink, ta)
+	clock.set(at.Add(ttl - 2*time.Minute + time.Nanosecond))
+	st.onCall = func(name string) {
+		if name == "prune" || name == "refreshDependencies" {
+			clock.set(clock.now().Add(time.Minute))
+		}
+	}
+	st.step(t)
+	if held("app-01") || held("app-02") {
+		t.Errorf("after the interval: app-01 held %v, app-02 held %v; want neither", held("app-01"), held("app-02"))
+	}
+}
+
 // TestLoopShutdownInInterval: when the collector stops while the loop is in
 // a write interval, writing or reading the names of peers, what the
-// interval does is canceled, and then what is pending is written.
+// interval does is canceled, and then what is pending is written. The
+// connector is stopped from within the call, so that its deadline cannot
+// pass first.
 func TestLoopShutdownInInterval(t *testing.T) {
 	for _, in := range []string{"write", "peers"} {
 		t.Run(in, func(t *testing.T) {
 			st := newLoopStore()
-			c, sink, _ := loopConnector(t, st, time.Second, nil)
+			c, sink, _ := loopConnector(t, st, loopInterval, nil)
+			st.ungate()
+			var consumed error
 			if in == "write" {
-				st.gated.Store(false)
-				st.holdWrite.Store(true)
+				st.stopAt(in, c.cancel)
 				consume(t, c, sink, loopAgent(t0))
-				st.wait(t)
 			} else {
-				st.wait(t)
-				consume(t, c, sink, loopAgent(t0))
+				// A request arrives while the names of peers are read.
+				st.stopAt(in, func() {
+					consumed = c.ConsumeMetrics(context.Background(), loopAgent(t0).metrics())
+					c.cancel()
+				})
 			}
-			done := make(chan error, 1)
-			go func() { done <- c.Shutdown(context.Background()) }()
 			select {
-			case err := <-done:
-				if err != nil {
-					t.Fatal(err)
-				}
-			case <-time.After(5 * time.Second):
-				st.ungate()
-				<-done
-				t.Fatalf("the %s is not canceled when the collector stops", in)
+			case <-st.inStop:
+			case <-time.After(10 * time.Second):
+				t.Fatalf("no %s to stop the connector in", in)
+			}
+			if err := c.Shutdown(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if consumed != nil {
+				t.Fatal(consumed)
 			}
 			if !st.canceled.Load() || len(st.writes) != 1 {
-				t.Errorf("canceled %v, %d writes; want canceled, 1", st.canceled.Load(), len(st.writes))
+				t.Errorf("the %s canceled %v, %d writes; want canceled, 1", in, st.canceled.Load(), len(st.writes))
 			}
 		})
 	}

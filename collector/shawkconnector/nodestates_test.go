@@ -388,6 +388,21 @@ func TestNodeStatesStaleAgain(t *testing.T) {
 	generated(older)
 	c.syncNodeStates(ctx)
 	check("the older copy again", 4, 4)
+
+	// Newer states that fail to be written are not stale either.
+	*now = now.Add(time.Minute)
+	generated(*now)
+	st.mu.Lock()
+	st.fail = true
+	st.mu.Unlock()
+	c.syncNodeStates(ctx)
+	st.mu.Lock()
+	st.fail = false
+	st.mu.Unlock()
+	check("newer, not written", 4, 4)
+	generated(older)
+	c.syncNodeStates(ctx)
+	check("the older copy after a failed write", 4, 5)
 }
 
 // TestUnknownNodesAfterError: a node_states_file that cannot be read
