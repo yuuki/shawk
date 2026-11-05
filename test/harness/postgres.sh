@@ -72,6 +72,16 @@ binaries() {
 
 running() { [[ -f "$DATA/postmaster.pid" ]] && "$(binaries)/pg_ctl" -D "$DATA" status >/dev/null 2>&1; }
 
+# fail LOG MESSAGE: dies with MESSAGE and the end of LOG, or with the reason
+# when the sandbox of an agent denied the shared memory of PostgreSQL.
+fail() {
+	if grep -q 'could not create shared memory segment: Operation not permitted' "$1"; then
+		die "PostgreSQL cannot make System V shared memory here: in the sandbox of an agent (macOS), run test/harness/postgres.sh outside it"
+	fi
+	tail -20 "$1" >&2
+	die "$2 (log: $1)"
+}
+
 port() {
 	[[ -f "$DIR/port" ]] || die "PostgreSQL is not running: run test/harness/postgres.sh up"
 	cat "$DIR/port"
@@ -98,8 +108,7 @@ init() {
 	log "initializing $DATA"
 	(umask 077 && head -c 18 /dev/urandom | od -An -tx1 | tr -d ' \n' >"$DIR/password")
 	"$bin/initdb" -D "$DATA" -U postgres -A scram-sha-256 --pwfile="$DIR/password" -E UTF8 --no-locale \
-		>"$DIR/initdb.log" 2>&1 ||
-		{ tail -20 "$DIR/initdb.log" >&2; die "initdb failed (log: $DIR/initdb.log)"; }
+		>"$DIR/initdb.log" 2>&1 || fail "$DIR/initdb.log" "initdb failed"
 	cat >>"$DATA/postgresql.conf" <<-EOF
 		# test/harness/postgres.sh: a disposable server for tests.
 		listen_addresses = '127.0.0.1'
@@ -111,7 +120,7 @@ init() {
 	# The database of the end-to-end test, made in single-user mode, since
 	# the binaries have no psql.
 	echo "CREATE DATABASE shawke2e;" | "$bin/postgres" --single -D "$DATA" postgres >"$DIR/single.log" 2>&1 ||
-		{ tail -20 "$DIR/single.log" >&2; die "could not create the database shawke2e"; }
+		fail "$DIR/single.log" "could not create the database shawke2e"
 	touch "$DIR/initialized"
 }
 
@@ -137,15 +146,11 @@ up() {
 			env_lines
 			return
 		fi
-		if grep -q 'could not create shared memory segment: Operation not permitted' "$DIR/server.log"; then
-			die "PostgreSQL cannot create shared memory here; in the sandbox of an agent on macOS, run it outside the sandbox"
-		fi
 		grep -q 'Address already in use' "$DIR/server.log" || break
 		port=""
 	done
 	rm -f "$DIR/port"
-	tail -20 "$DIR/server.log" >&2
-	die "PostgreSQL did not start (log: $DIR/server.log)"
+	fail "$DIR/server.log" "PostgreSQL did not start"
 }
 
 stop() {
