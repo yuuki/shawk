@@ -2,7 +2,6 @@ package shawkconnector
 
 import (
 	"net/netip"
-	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -1307,10 +1306,8 @@ func (r *resolver) translatedClient(rules chooser, id *edgeID, now time.Time) st
 
 // classify names a peer without a known service from its address.
 func (r *resolver) classify(a netip.Addr) string {
-	for _, p := range r.cidrs {
-		if p.prefix.Contains(a) {
-			return p.name
-		}
+	if name, ok := rangeOf(r.cidrs, a); ok {
+		return name
 	}
 	if isPrivate(a) {
 		return peerUnresolved
@@ -1323,10 +1320,8 @@ func (r *resolver) classify(a netip.Addr) string {
 // whole network, ~external otherwise, as peer_class() names the network in
 // PostgreSQL.
 func (r *resolver) classifyFolded(a netip.Addr) string {
-	for _, p := range r.cidrs {
-		if p.prefix.Bits() == 0 && p.prefix.Addr().BitLen() == a.BitLen() {
-			return p.name
-		}
+	if name, ok := wholeRangeOf(r.cidrs, a); ok {
+		return name
 	}
 	return peerExternal
 }
@@ -1337,14 +1332,4 @@ var cgnat = netip.MustParsePrefix("100.64.0.0/10")
 // loopback, link-local, RFC 1918, CGNAT and IPv6 ULA.
 func isPrivate(a netip.Addr) bool {
 	return a.IsPrivate() || a.IsLoopback() || a.IsLinkLocalUnicast() || cgnat.Contains(a) || a.IsUnspecified()
-}
-
-// sortPrefixes orders prefixes from the narrowest.
-func sortPrefixes(ps []namedPrefix) {
-	slices.SortStableFunc(ps, func(a, b namedPrefix) int {
-		if a.prefix.Bits() != b.prefix.Bits() {
-			return b.prefix.Bits() - a.prefix.Bits()
-		}
-		return a.prefix.Addr().Compare(b.prefix.Addr())
-	})
 }

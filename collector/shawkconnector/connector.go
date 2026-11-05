@@ -117,6 +117,10 @@ func newConnector(set connector.Settings, cfg *Config, next consumer.Metrics) (*
 	if err != nil {
 		return nil, err
 	}
+	networks, err := parseNetworks(cfg.Networks)
+	if err != nil {
+		return nil, err
+	}
 	translations, err := parseTranslations(cfg.Translations)
 	if err != nil {
 		return nil, err
@@ -133,6 +137,9 @@ func newConnector(set connector.Settings, cfg *Config, next consumer.Metrics) (*
 	agg.maxInputs = maxValuesPerEdge * cfg.MaxSeriesPerHost
 	if cfg.PeerHosts {
 		agg.setPeerHosts(cfg.MaxPeerHosts, cfg.PeerHostServices)
+		if len(networks) > 0 {
+			agg.setNetworks(networks)
+		}
 	}
 	agg.ports = ports
 	c := &shawkConnector{

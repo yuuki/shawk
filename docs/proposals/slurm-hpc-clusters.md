@@ -9,6 +9,7 @@ proposal, is in [docs/design.md](../design.md):
 |---|---|---|---|
 | §0.1, §7 scope and RDMA | #171 | #192 | §1, §4.2, §8, §10 |
 | §1 metrics per peer host | #176 | #188 | §5.2, §5.3, §7, §8 |
+| §1.5 networks | #204 | | §5.3, §7, §8, §10 |
 | §2.1 to §2.3 processes of jobs | #173 | #185 | §4.1, §5.3 |
 | §2.4 users | #181 | #193 | §4.1, §6.1, §6.2 |
 | §3 dynamic ports | #174 | #187 | §5.3, §6.1, §6.2 |
@@ -22,9 +23,9 @@ proposal, is in [docs/design.md](../design.md):
 §4 changed neither the agent nor the connector. Its measurements in a VM,
 and the guidance from them, are in
 [docs/research/hpc-compute-nodes/compute_nodes.md](../research/hpc-compute-nodes/compute_nodes.md);
-measuring on a real cluster is #206. Not implemented: the named networks
-of §1.5 (#204), and the automatic detection of ports chosen by the kernel
-of §3.2 (#205). The operating guidance is in
+measuring on a real cluster is #206. Not implemented: the automatic
+detection of ports chosen by the kernel of §3.2 (#205). The operating
+guidance is in
 [packaging/README.md](../../packaging/README.md#hpc-clusters).
 
 The target is a traditional HPC cluster: bare-metal hosts that are not added
@@ -143,8 +144,16 @@ side also counts the clients that run an agent.
   `shawk_local_network` and `shawk_peer_network`. This classifies endpoints;
   it does not measure the path or the interface, and does not tell NICs of
   one subnet or a bond apart. It shares the matching of ranges with the
-  zones of [path-quality-zones.md](path-quality-zones.md). Not implemented
-  yet (#204).
+  zones of [path-quality-zones.md](path-quality-zones.md): `ranges.go`
+  parses and matches the ranges of `peer_cidrs` and `networks`, for the
+  zones to reuse.
+- Decided in #204: the labels are on the family `shawk_host_*` only, so
+  `networks` needs `peer_hosts`, and the recording rules of §1.4 keep them
+  as `src_network` and `dst_network`. An address in no range is
+  `~unknown` if it is not routed on the Internet and `~external`
+  otherwise, as for `shawk.peer.host`. A host and service reach a peer host
+  over one pair of networks as a rule, so the networks add series only
+  for the dependencies that use several (§1.6).
 
 ### 1.6 Series
 

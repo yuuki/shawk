@@ -9,6 +9,8 @@ func TestConfigValidate(t *testing.T) {
 	ok := createDefaultConfig()
 	ok.Postgres.DSNFile = "/etc/shawk/postgres-dsn"
 	ok.PeerCIDRs = map[string]string{"office-lan": "192.168.10.0/24"}
+	ok.PeerHosts = true
+	ok.Networks = map[string]string{"mgmt": "10.0.0.0/16", "ib": "10.10.0.0/16, fd00:10::/32"}
 	if err := ok.Validate(); err != nil {
 		t.Errorf("valid config: %v", err)
 	}
@@ -27,6 +29,13 @@ func TestConfigValidate(t *testing.T) {
 		"no pending rows":   func(c *Config) { c.MaxPendingRows = 0 },
 		"no peer hosts":     func(c *Config) { c.MaxPeerHosts = 0 },
 		"empty service":     func(c *Config) { c.PeerHostServices = []string{""} },
+		"networks without peer hosts": func(c *Config) {
+			c.PeerHosts = false
+			c.Networks = map[string]string{"ib": "10.10.0.0/16"}
+		},
+		"bad network":           func(c *Config) { c.Networks = map[string]string{"ib": "10.10.0.0/40"} },
+		"reserved network name": func(c *Config) { c.Networks = map[string]string{"~unknown": "10.10.0.0/16"} },
+		"network named twice":   func(c *Config) { c.Networks = map[string]string{"ib": "10.10.0.0/16", "ipoib": "10.10.0.0/16"} },
 	} {
 		c := *ok
 		mod(&c)

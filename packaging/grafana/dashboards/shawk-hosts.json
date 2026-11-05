@@ -610,6 +610,115 @@
         }
       },
       "description": "Bytes from the client to the server (request) and from the server to the client (response)."
+    },
+    {
+      "id": 9,
+      "type": "table",
+      "title": "Networks of the selected services",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "shawk-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 42,
+        "w": 24,
+        "h": 10
+      },
+      "targets": [
+        {
+          "refId": "connections",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "instant": true,
+          "format": "table",
+          "expr": "sum by (src, src_network, dst, dst_network, server_port) (shawk:host_dependency_connections:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})"
+        },
+        {
+          "refId": "request",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "instant": true,
+          "format": "table",
+          "expr": "sum by (src, src_network, dst, dst_network, server_port) (shawk:host_dependency_request_bytes:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})"
+        },
+        {
+          "refId": "response",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "instant": true,
+          "format": "table",
+          "expr": "sum by (src, src_network, dst, dst_network, server_port) (shawk:host_dependency_response_bytes:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            },
+            "renameByName": {
+              "Value #connections": "connections/s",
+              "Value #request": "request bytes/s",
+              "Value #response": "response bytes/s",
+              "src": "client",
+              "src_network": "client network",
+              "dst": "server",
+              "dst_network": "server network",
+              "server_port": "port"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "sort": [
+              {
+                "field": "request bytes/s",
+                "desc": true
+              }
+            ]
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "decimals": 2
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "(request|response) bytes/s"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "Bps"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true
+      },
+      "description": "Connections and bytes by the networks of the addresses of the client and of the server, now, with networks in the connector (empty without). An address in no network is ~unknown, a public one ~external. They name the addresses at the two ends, not the path or the interface, and do not tell the NICs of one subnet or of a bond apart."
     }
   ]
 }
