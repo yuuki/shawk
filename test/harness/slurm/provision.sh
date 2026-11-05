@@ -81,8 +81,14 @@ if [[ -n "${GO_TARBALL:-}" ]]; then
 	go_version="$(basename "$GO_TARBALL" | sed 's/\.linux-.*//')"
 	if [[ "$(head -1 /usr/local/go/VERSION 2>/dev/null)" != "$go_version" ]]; then
 		log "installing $go_version in /usr/local/go"
+		# Extracted aside and renamed once complete: an interrupted run leaves
+		# no /usr/local/go that looks installed.
+		rm -rf /usr/local/go.new
+		mkdir /usr/local/go.new
+		tar -xzf "$GO_TARBALL" -C /usr/local/go.new
 		rm -rf /usr/local/go
-		tar -xzf "$GO_TARBALL" -C /usr/local
+		mv /usr/local/go.new/go /usr/local/go
+		rmdir /usr/local/go.new
 	fi
 fi
 cat >/etc/profile.d/harness.sh <<'EOF'
@@ -157,16 +163,20 @@ install -d /var/spool/slurm/d
 
 # The key of munge, made here and never leaving the VM.
 if [[ ! -s /etc/munge/munge.key ]]; then
-	dd if=/dev/urandom of=/etc/munge/munge.key bs=1024 count=1 status=none
-	chown munge:munge /etc/munge/munge.key
-	chmod 0400 /etc/munge/munge.key
+	(umask 077 && dd if=/dev/urandom of=/etc/munge/munge.key.new bs=1024 count=1 status=none)
+	chown munge:munge /etc/munge/munge.key.new
+	chmod 0400 /etc/munge/munge.key.new
+	mv /etc/munge/munge.key.new /etc/munge/munge.key
 fi
 # The unit of munge of Rocky Linux has its PID file in /var/run, which
 # systemd-analyze verify warns about for every unit, those of shawk too,
 # which fails TestUnitsVerify of make test (#196). The same unit with
-# /run, which /var/run links to, replaces it.
-if [[ ! -f /etc/systemd/system/munge.service ]]; then
-	sed 's|^PIDFile=/var/run/|PIDFile=/run/|' /usr/lib/systemd/system/munge.service >/etc/systemd/system/munge.service
+# /run, which /var/run links to, replaces it, reconciled at every run.
+sed 's|^PIDFile=/var/run/|PIDFile=/run/|' /usr/lib/systemd/system/munge.service >/etc/systemd/system/munge.service.new
+if cmp -s /etc/systemd/system/munge.service.new /etc/systemd/system/munge.service; then
+	rm /etc/systemd/system/munge.service.new
+else
+	mv /etc/systemd/system/munge.service.new /etc/systemd/system/munge.service
 	systemctl daemon-reload
 fi
 systemctl enable --now munge

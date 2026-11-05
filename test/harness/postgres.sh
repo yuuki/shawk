@@ -70,7 +70,21 @@ binaries() {
 	echo "$bin/bin"
 }
 
-running() { [[ -f "$DATA/postmaster.pid" ]] && "$(binaries)/pg_ctl" -D "$DATA" status >/dev/null 2>&1; }
+# running: whether the server of the workspace runs, from the PID that its
+# postmaster.pid holds, without its binaries, which make clean may have
+# deleted from the cache meanwhile. It stops the script when it cannot tell,
+# rather than taking the server for stopped and deleting its data.
+running() {
+	local pid comm
+	pid="$(head -1 "$DATA/postmaster.pid" 2>/dev/null || true)"
+	[[ "$pid" =~ ^[0-9]+$ ]] || return 1
+	if ! comm="$(ps -p "$pid" -o comm= 2>/dev/null)"; then
+		ps -p $$ >/dev/null 2>&1 || die "cannot tell whether PostgreSQL ($pid) runs: ps fails here"
+		return 1
+	fi
+	# Not another process that has the PID of a server gone with the host.
+	[[ "$comm" == *postgres* ]]
+}
 
 # fail LOG MESSAGE: dies with MESSAGE and the end of LOG, or with the reason
 # when the sandbox of an agent denied the shared memory of PostgreSQL.
@@ -153,10 +167,18 @@ up() {
 	fail "$DIR/server.log" "PostgreSQL did not start"
 }
 
+# stop: a fast shutdown (SIGINT), which needs no binary either. It fails,
+# and so does down before deleting anything, unless the server is gone.
 stop() {
-	if running; then
-		"$(binaries)/pg_ctl" -D "$DATA" -m fast -w stop >/dev/null
-	fi
+	local pid i
+	running || return 0
+	pid="$(head -1 "$DATA/postmaster.pid")"
+	kill -INT "$pid" || die "could not stop PostgreSQL ($pid); its data is kept"
+	for ((i = 0; i < 600; i++)); do
+		running || return 0
+		sleep 0.1
+	done
+	die "PostgreSQL ($pid) did not stop within 60 seconds; its data is kept"
 }
 
 down() {

@@ -67,29 +67,35 @@ fetch() {
 	echo "$file"
 }
 
-# lock NAME: takes the lock NAME of the workspace, waiting for another run
-# that holds it, until the script exits; a lock whose holder died is taken
-# over. It serializes the commands that change an environment, which
-# sessions sharing a workspace may run at once.
+# lock NAME: holds the lock NAME of the workspace until the script exits,
+# waiting while another run holds it. It serializes the commands that
+# change an environment, which sessions sharing a workspace may run at once.
+# The lock is an advisory lock (flock) of STATE/NAME.lock that a process of
+# perl, which macOS and Linux have, holds for the script and gives up once
+# the script is gone; the kernel releases it if that process dies, so a
+# crash leaves no lock behind. The descriptor of the lock stays in that
+# process: the daemons the script starts (PostgreSQL, Lima) do not inherit
+# it.
 lock() {
-	local dir="$STATE/$1.lock" pid i
+	local ready=""
 	mkdir -p "$STATE"
-	for ((i = 0; ; i++)); do
-		if mkdir "$dir" 2>/dev/null; then
-			echo $$ >"$dir/pid"
-			# shellcheck disable=SC2064
-			trap "rm -rf '$dir'" EXIT
-			return
-		fi
-		pid="$(cat "$dir/pid" 2>/dev/null || true)"
-		if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
-			rm -rf "$dir"
-			continue
-		fi
-		((i > 0)) || log "waiting for another run on this workspace ($dir)"
-		((i < 3600)) || die "timed out waiting for $dir"
-		sleep 1
-	done
+	exec 8< <(exec perl -e '
+		use Fcntl qw(:flock);
+		my ($file, $owner) = @ARGV;
+		open(my $fh, ">>", $file) or die "harness: $file: $!\n";
+		if (!flock($fh, LOCK_EX | LOCK_NB)) {
+			print STDERR "harness: waiting for another run on this workspace ($file)\n";
+			flock($fh, LOCK_EX) or die "harness: $file: $!\n";
+		}
+		$| = 1;
+		print "locked\n";
+		close(STDOUT);
+		close(STDERR);
+		sleep(1) while kill(0, $owner);
+	' "$STATE/$1.lock" "$$" </dev/null)
+	read -r ready <&8 || true
+	exec 8<&-
+	[[ "$ready" == locked ]] || die "could not take the lock $STATE/$1.lock"
 }
 
 # listening PORT: whether a TCP socket listens on PORT of 127.0.0.1.
