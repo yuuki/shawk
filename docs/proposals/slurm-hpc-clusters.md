@@ -12,7 +12,7 @@ proposal, is in [docs/design.md](../design.md):
 | §2.1 to §2.3 processes of jobs | #173 | #185 | §4.1, §5.3 |
 | §2.4 users | #181 | #193 | §4.1, §6.1, §6.2 |
 | §3 dynamic ports | #174 | #187 | §5.3, §6.1, §6.2 |
-| §3.2 ports chosen by the kernel, a hint | #205 | | §4.2, §5.3, §6.1, §6.2 |
+| §3.2 ports chosen by the kernel, a hint | #205 | #209 | §4.2, §5.3, §6.1, §6.2 |
 | §4 load on compute nodes | #172 | #195 | |
 | §5.1 inventory | #175 | #184 | §5.6 |
 | §5.2 node states | #177 | #191 | §5.7, §8 |
