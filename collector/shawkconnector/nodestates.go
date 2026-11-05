@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"slices"
 	"strings"
 	"time"
@@ -294,7 +293,7 @@ func windowsKey(ws []maintenanceWindow) string {
 func (c *shawkConnector) syncNodeStates(ctx context.Context) {
 	now := c.now()
 	if path := c.cfg.NodeStatesFile; path != "" {
-		b, err := os.ReadFile(path)
+		b, err := readBoundedFile(path)
 		var ns *nodeStates
 		var unknown []string
 		if err == nil {
@@ -338,7 +337,7 @@ func (c *shawkConnector) syncNodeStates(ctx context.Context) {
 		}
 	}
 	if path := c.cfg.MaintenanceFile; path != "" {
-		b, err := os.ReadFile(path)
+		b, err := readBoundedFile(path)
 		var ws []maintenanceWindow
 		if err == nil {
 			ws, err = parseMaintenance(b)

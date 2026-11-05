@@ -69,12 +69,12 @@ func TestPGJobUsers(t *testing.T) {
 	}
 }
 
-// TestPGJobUsersMigration: the migration of the users keeps the processes
-// of an existing database, without users, which the connector then updates
-// rather than duplicates. The view of the users is only for its owner, from
-// its creation, although default privileges grant the other views of
-// shawk_v1 to the connector and Grafana, and after grants.sql.
-func TestPGJobUsersMigration(t *testing.T) {
+// TestPGJobUsersPrivileges: the view of the users is only for its owner,
+// from its creation, although default privileges grant the other views of
+// shawk_v1 to the connector and Grafana, and after grants.sql. A process
+// written without a user, as before job_users, is updated rather than
+// duplicated.
+func TestPGJobUsersPrivileges(t *testing.T) {
 	dsn, conn := testDB(t)
 	ctx := context.Background()
 	execAll(t, conn, `DO $$ BEGIN
@@ -85,30 +85,24 @@ func TestPGJobUsersMigration(t *testing.T) {
 		conn.Exec(ctx, "RESET ROLE")
 		conn.Exec(ctx, "DROP OWNED BY shawk_connector, shawk_grafana")
 	})
-	ms, err := Migrations()
-	if err != nil || len(ms) < 2 || ms[0].Name != "0001_schema.sql" {
-		t.Fatalf("migrations = %v, %v", ms, err)
+	// The default privileges of grants.sql, as on schemas that were set up
+	// before.
+	execAll(t, conn, `CREATE SCHEMA shawk; CREATE SCHEMA shawk_v1;
+		ALTER DEFAULT PRIVILEGES IN SCHEMA shawk_v1 GRANT SELECT ON TABLES TO shawk_connector, shawk_grafana`)
+	if _, err := Migrate(ctx, conn); err != nil {
+		t.Fatal(err)
 	}
-	// The schema before the users, set up with grants.sql.
-	execAll(t, conn,
-		`CREATE SCHEMA shawk; CREATE TABLE shawk.schema_migrations (version integer PRIMARY KEY, name text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now())`,
-		ms[0].SQL,
-		`INSERT INTO shawk.schema_migrations (version, name) VALUES (1, '0001_schema.sql')`)
 	grants, err := os.ReadFile(filepath.Join(packaging, "postgres/grants.sql"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	execAll(t, conn, string(grants),
+	execAll(t, conn,
 		`INSERT INTO shawk.hosts VALUES ('h', 'm', 'cn01', 'k', 'v', now(), now())`,
 		`INSERT INTO shawk.processes (id, host_id, unit, comm, exe, service_name, first_seen, last_seen)
 		 VALUES (1, 'h', 'slurm/batch', 'a.out', '/old', 'a.out', now() - interval '1 day', now() - interval '1 day')`,
 		`SELECT setval('shawk.processes_id_seq', 1)`,
 		`INSERT INTO shawk.edges (host_id, process_id, role, proto, local_addr, remote_addr, port, netns, first_seen, last_seen)
 		 VALUES ('h', 1, 'client', 'tcp', '10.0.0.11', '10.0.0.20', 27000, 1, now() - interval '1 day', now() - interval '1 day')`)
-
-	if _, err := Migrate(ctx, conn); err != nil {
-		t.Fatal(err)
-	}
 	other, err := pgx.Connect(ctx, dsn)
 	if err != nil {
 		t.Fatal(err)
@@ -128,7 +122,7 @@ func TestPGJobUsersMigration(t *testing.T) {
 			}
 		}
 	}
-	readable("after the migration")
+	readable("after migrating")
 	// grants.sql halfway, after granting all of shawk_v1 and before taking
 	// job_edges back: other sessions do not see the grants yet.
 	i := strings.Index(string(grants), "-- The users of the processes of Slurm jobs")

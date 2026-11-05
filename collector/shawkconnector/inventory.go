@@ -19,9 +19,11 @@ import (
 	"go.yaml.in/yaml/v3"
 )
 
-// maxInventoryBytes bounds the size of inventory_file: a host takes a few
-// hundred bytes, so this is far above a cluster of thousands of hosts.
-const maxInventoryBytes = 16 << 20
+// maxFileBytes bounds the size of the files the connector reads every
+// write interval: inventory_file, node_states_file and maintenance_file. A
+// host takes a few hundred bytes in each, so this is far above a cluster of
+// thousands of hosts.
+const maxFileBytes = 16 << 20
 
 // inventoryFile is the format of inventory_file, in YAML or JSON:
 //
@@ -77,19 +79,28 @@ func (inv *inventory) hostOf(a netip.Addr) (string, bool) {
 
 // readInventory reads and validates inventory_file.
 func readInventory(path string) (*inventory, error) {
+	b, err := readBoundedFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return parseInventory(b)
+}
+
+// readBoundedFile reads a file of at most maxFileBytes.
+func readBoundedFile(path string) ([]byte, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	b, err := io.ReadAll(io.LimitReader(f, maxInventoryBytes+1))
+	b, err := io.ReadAll(io.LimitReader(f, maxFileBytes+1))
 	if err != nil {
 		return nil, err
 	}
-	if len(b) > maxInventoryBytes {
-		return nil, fmt.Errorf("larger than %d bytes", maxInventoryBytes)
+	if len(b) > maxFileBytes {
+		return nil, fmt.Errorf("larger than %d bytes", maxFileBytes)
 	}
-	return parseInventory(b)
+	return b, nil
 }
 
 // errNoHosts refuses a file without hosts.

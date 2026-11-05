@@ -142,6 +142,66 @@ func mapSlice[T, U any](s []T, f func(T) U) []U {
 	return out
 }
 
+// TestPeerHostInventory: the connector names the host of a peer from its
+// inventory_file first, so that the failures towards a node without an
+// agent, which no agent holds the address of, have its host.
+func TestPeerHostInventory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "inventory.yaml")
+	if err := os.WriteFile(path, []byte("hosts:\n  - name: node-03\n    slurm_node: node03\n    addrs: [10.0.2.3]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, _, sink, _ := testConnector(t, func(cfg *Config) {
+		cfg.PeerHosts = true
+		cfg.InventoryFile = path
+	})
+	ctl, n1, n2 := slurmAgents(t0.Add(15 * time.Second))
+	consume(t, c, sink, n1)
+	consume(t, c, sink, n2)
+	out := consume(t, c, sink, ctl)
+	var reasons []string
+	for _, s := range find(out, metricHostConnFailedByReason, "slurmctld", "*", roleClient, "") {
+		reasons = append(reasons, s.peerHost+" "+s.peer+" "+s.errType)
+	}
+	slices.Sort(reasons)
+	if want := []string{"node-03 ~unresolved refused", "node-03 ~unresolved timeout"}; !slices.Equal(reasons, want) {
+		t.Errorf("failures by peer host = %v, want %v", reasons, want)
+	}
+	if got, want := hostsOf(out, metricHostConnOpened, "slurmctld", roleClient, ""),
+		map[string]float64{"node-01 slurmd": 4, "node-02 slurmd": 2, "ctl-01 ~unresolved": 1, "~external ~external": 1}; !maps.Equal(got, want) {
+		t.Errorf("connections by peer host = %v, want %v", got, want)
+	}
+}
+
+// TestPeerHostServicesSlurmJob: slurm-job in peer_host_services names the
+// processes of Slurm jobs at either end, as their peers name them, so that
+// both sides of a dependency of a job have the family.
+func TestPeerHostServicesSlurmJob(t *testing.T) {
+	c, _, sink, now := testConnector(t, func(cfg *Config) {
+		cfg.PeerHosts = true
+		cfg.PeerHostServices = []string{slurmJobService}
+	})
+	lic := tAgent{host: "lic-01", addrs: []string{"10.0.0.20"}, time: *now,
+		listeners: []tListener{{proto: "tcp", addr: "0.0.0.0", port: 27000, svc: "lmgrd", comm: "lmgrd"}}}
+	consume(t, c, sink, lic)
+	*now = now.Add(time.Second)
+	out := consume(t, c, sink, tAgent{host: "node-01", addrs: []string{"10.0.0.11"}, time: *now, edges: []tEdge{
+		{role: "client", proto: "tcp", local: "10.0.0.11", peer: "10.0.0.20", port: 27000, unit: "slurm/batch",
+			svc: "python3", comm: "python3", opened: 1}}})
+	if got, want := hostsOf(out, metricHostConnOpened, slurmJobService, roleClient, ""),
+		map[string]float64{"lic-01 lmgrd": 1}; !maps.Equal(got, want) {
+		t.Errorf("client side = %v, want %v", got, want)
+	}
+	*now = now.Add(time.Second)
+	lic.time = *now
+	lic.edges = []tEdge{{role: "server", proto: "tcp", local: "10.0.0.20", peer: "10.0.0.11", port: 27000,
+		svc: "lmgrd", comm: "lmgrd", opened: 1}}
+	out = consume(t, c, sink, lic)
+	if got, want := hostsOf(out, metricHostConnOpened, "lmgrd", roleServer, ""),
+		map[string]float64{"node-01 slurm-job": 1}; !maps.Equal(got, want) {
+		t.Errorf("server side = %v, want %v", got, want)
+	}
+}
+
 // TestPeerHostServerSide: the server side names the host of its client, and
 // a client on the server's own shared address is the server itself.
 func TestPeerHostServerSide(t *testing.T) {
@@ -216,16 +276,23 @@ func TestPeerHostEvidence(t *testing.T) {
 		t.Errorf("a folded peer = %+v", p)
 	}
 
-	// The inventory comes first.
-	inv := map[netip.Addr]string{addrOf("10.0.2.5"): "nas-01", addrOf("10.0.2.3"): "node-03-ib"}
+	// The inventory comes first, after the addresses of the host itself.
+	inv := map[netip.Addr]string{addrOf("10.0.2.5"): "nas-01", addrOf("10.0.2.3"): "node-03-ib",
+		addrOf("172.17.0.1"): "node-02"}
 	r.inventory = func(a netip.Addr) (string, bool) {
 		h, ok := inv[a]
 		return h, ok
 	}
-	for peer, want := range map[string]string{"10.0.2.5": "nas-01", "10.0.2.3": "node-03-ib", "10.0.2.1": "node-01"} {
+	for peer, want := range map[string]string{"10.0.2.5": "nas-01", "10.0.2.3": "node-03-ib", "10.0.2.1": "node-01",
+		"172.17.0.1": "node-02"} {
 		if got := host("id-ctl-01", peer); got != want {
 			t.Errorf("with an inventory, host of %s = %s, want %s", peer, got, want)
 		}
+	}
+	// A shared address the host holds too is its own, even when the
+	// inventory gives it to another host.
+	if got := host("id-node-01", "172.17.0.1"); got != "self" {
+		t.Errorf("with an inventory, a shared address of the host itself = %s", got)
 	}
 }
 
