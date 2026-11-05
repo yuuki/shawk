@@ -9,7 +9,7 @@ proposal, is in [docs/design.md](../design.md):
 |---|---|---|---|
 | §0.1, §7 scope and RDMA | #171 | #192 | §1, §4.2, §8, §10 |
 | §1 metrics per peer host | #176 | #188 | §5.2, §5.3, §7, §8 |
-| §1.5 networks | #204 | | §5.3, §7, §8, §10 |
+| §1.5 networks | #204 | #208 | §5.3, §7, §8, §10 |
 | §2.1 to §2.3 processes of jobs | #173 | #185 | §4.1, §5.3 |
 | §2.4 users | #181 | #193 | §4.1, §6.1, §6.2 |
 | §3 dynamic ports | #174 | #187 | §5.3, §6.1, §6.2 |
