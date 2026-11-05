@@ -295,7 +295,13 @@ usually need it anyway), and give the same range to the connector in
 that listen on ports of their own. Their dependencies then have port 0 in
 Prometheus and in the dependencies between services in PostgreSQL, while
 the edges keep their ports (`docs/design.md` §5.3). Every connector needs
-the same rules.
+the same rules. To find the services to list, the table "Listeners on
+ports the kernel chose" of the changes dashboard (`shawk_v1.kernel_chosen_ports`)
+shows those that listened on ports the kernel chose in the last 30 days
+and that no rule covers yet; it misses listeners shorter than the interval
+of the agents. A server on every address (`0.0.0.0`) stays listed until the
+`hosts` of `dynamic_ports` hold every address of its host but loopback and
+link-local, since clients may reach it at any of them.
 
 ### Metrics per peer host
 

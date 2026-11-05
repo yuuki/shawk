@@ -59,10 +59,11 @@ func (t *Tracer) scanSockets() ([]Listener, []uint64, error) {
 				inos = append(inos, recs[i].Ino)
 			}
 			l := Listener{
-				Proto: Proto(recs[i].Proto),
-				Addr:  addrFrom16(recs[i].Addr),
-				Port:  recs[i].Port,
-				NetNS: recs[i].Netns,
+				Proto:        Proto(recs[i].Proto),
+				Addr:         addrFrom16(recs[i].Addr),
+				Port:         recs[i].Port,
+				NetNS:        recs[i].Netns,
+				KernelChosen: recs[i].KernelChosen != 0,
 			}
 			if commString(recs[i].Comm) == KernelComm {
 				l.Comm = KernelComm
@@ -72,6 +73,7 @@ func (t *Tracer) scanSockets() ([]Listener, []uint64, error) {
 				if l.Comm != "" {
 					listeners[j].Comm = l.Comm
 				}
+				listeners[j].KernelChosen = listeners[j].KernelChosen || l.KernelChosen
 				continue
 			}
 			seen[k] = len(listeners)
