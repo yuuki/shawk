@@ -1,7 +1,27 @@
 # Static HPC clusters managed by Slurm: design proposal
 
-Status: proposed, not implemented. Tracked by #170; each part has a
-sub-issue, named in its section. Revised after an adversarial review.
+Status: implemented, except §4 and the parts noted below. Tracked by
+#170; each part has a sub-issue, named in its section. Revised after an
+adversarial review. What was built, and where it departs from this
+proposal, is in [docs/design.md](../design.md):
+
+| part | sub-issue | pull request | design |
+|---|---|---|---|
+| §0.1, §7 scope and RDMA | #171 | #192 | §1, §4.2, §8, §10 |
+| §1 metrics per peer host | #176 | #188 | §5.2, §5.3, §7, §8 |
+| §2.1 to §2.3 processes of jobs | #173 | #185 | §4.1, §5.3 |
+| §2.4 users | #181 | #193 | §4.1, §6.1, §6.2 |
+| §3 dynamic ports | #174 | #187 | §5.3, §6.1, §6.2 |
+| §4 load on compute nodes | #172 | #195, open | |
+| §5.1 inventory | #175 | #184 | §5.6 |
+| §5.2 node states | #177 | #191 | §5.7, §8 |
+| §6.1 host identity | #178 | #189 | §4.1, §6.2, §10 |
+| §6.2 start order | #179 | #183 | §4.3 |
+| §8 kernel sockets | #180 | #190 | §3.2, §4.1, §10 |
+
+Not implemented: the named networks of §1.5, and the automatic detection
+of ports chosen by the kernel of §3.2. The operating guidance is in
+[packaging/README.md](../../packaging/README.md#hpc-clusters).
 
 The target is a traditional HPC cluster: bare-metal hosts that are not added
 or removed dynamically, up to about 200 nodes, managed by Slurm. Most of
@@ -330,7 +350,9 @@ within the same step.
 - **In shawk.** A function computes the gaps over the sessions of all host
   ids with the same host name.
 - **Implemented:** `shawk_v1.unobserved_by_name()`, and the
-  guidance in `packaging/README.md`. The dashboards keep `unobserved()`.
+  guidance in `packaging/README.md`. The annotations of the dashboards
+  keep `unobserved()`; the table of gaps of the fleet dashboard is per
+  host name, through `unobserved_reasons()` of §5.2.
 - **Not proposed.**
   - Changing the host key: it would need a migration of hosts, sessions and
     processes, and it affects Prometheus, OBI and `host_identity:

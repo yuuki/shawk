@@ -46,8 +46,9 @@ type Config struct {
 	MaxPeerHosts int `mapstructure:"max_peer_hosts"`
 	// PeerHostServices, if set, restricts the family per peer host to the
 	// dependencies with one of these services ([namespace/]name, as
-	// service.peer.name names them) at either end, so that both sides of a
-	// dependency have it or neither.
+	// service.peer.name names them: slurm-job for the processes of Slurm
+	// jobs) at either end, so that both sides of a dependency have it or
+	// neither.
 	PeerHostServices []string `mapstructure:"peer_host_services"`
 	// Retention is how long rows are kept in PostgreSQL after they were
 	// last seen; zero keeps them forever. The connector deletes older rows

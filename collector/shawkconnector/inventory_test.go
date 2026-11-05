@@ -92,6 +92,9 @@ func TestParseInventoryInvalid(t *testing.T) {
 		{"space", "hosts:\n  - name: 'a b'", "spaces"},
 		{"twice", "hosts:\n  - name: a\n  - name: a", "listed twice"},
 		{"node twice", "hosts:\n  - name: a\n    slurm_node: n\n  - name: b\n    slurm_node: n", "slurm_node n is given to both a and b"},
+		{"reserved node", "hosts:\n  - name: a\n    slurm_node: '~n'", "host a: slurm_node: starts with ~"},
+		{"second without name", "hosts:\n  - name: a\n  - roles: [x]", "hosts[1]: name: empty"},
+		{"reserved role", "hosts:\n  - name: a\n    roles: [x, '~r']", `host a: role "~r": starts with ~`},
 		{"address twice", "hosts:\n  - name: a\n    addrs: [10.0.0.1]\n  - name: b\n    addrs: ['::ffff:10.0.0.1']", "address 10.0.0.1 is given to both a and b"},
 		{"range", "hosts:\n  - name: a\n    addrs: [10.0.0.0/24]", "host a"},
 		{"loopback", "hosts:\n  - name: a\n    addrs: [127.0.0.1]", "names no host"},
@@ -112,7 +115,7 @@ func TestParseInventoryInvalid(t *testing.T) {
 
 func TestReadInventoryTooLarge(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "inventory.yaml")
-	if err := os.WriteFile(path, make([]byte, maxInventoryBytes+1), 0o600); err != nil {
+	if err := os.WriteFile(path, make([]byte, maxFileBytes+1), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := readInventory(path); err == nil || !strings.Contains(err.Error(), "larger than") {

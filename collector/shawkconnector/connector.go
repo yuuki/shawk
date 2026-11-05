@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"slices"
 	"strings"
@@ -134,7 +135,7 @@ func newConnector(set connector.Settings, cfg *Config, next consumer.Metrics) (*
 		agg.setPeerHosts(cfg.MaxPeerHosts, cfg.PeerHostServices)
 	}
 	agg.ports = ports
-	return &shawkConnector{
+	c := &shawkConnector{
 		cfg:      cfg,
 		log:      set.Logger,
 		next:     next,
@@ -153,7 +154,11 @@ func newConnector(set connector.Settings, cfg *Config, next consumer.Metrics) (*
 		cidrWarned: map[string]time.Time{},
 
 		inventoryWarned: map[string]time.Time{},
-	}, nil
+	}
+	// The inventory is the first evidence of the host of a peer (§5.2 of
+	// docs/design.md), read from inventory_file every write interval.
+	res.inventory = func(a netip.Addr) (string, bool) { return c.inventory.Load().hostOf(a) }
+	return c, nil
 }
 
 func (c *shawkConnector) Capabilities() consumer.Capabilities {
@@ -290,56 +295,83 @@ func (c *shawkConnector) loop(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			// Write what is pending before the collector stops.
-			fctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			if c.prepareSchemaOnly(fctx) {
-				c.flush(fctx)
-			}
-			cancel()
+			c.flushOnShutdown()
 			return
 		case <-t.C:
-			// Writes and the reload of peers have their own deadlines, so
-			// that a slow write does not stop the names from being reloaded.
-			wctx, cancel := context.WithTimeout(ctx, c.cfg.WriteInterval)
-			started := c.now()
-			written := c.prepareSchemaOnly(wctx) && c.flush(wctx)
-			cancel()
-			if written {
-				c.mu.Lock()
-				c.written = started
-				c.mu.Unlock()
-			} else {
-				c.boundPending()
-			}
-			rctx, cancel := context.WithTimeout(ctx, c.cfg.WriteInterval)
-			c.prepare(rctx)
-			cancel()
-			c.pruneIfDue(ctx)
-			c.refreshIfDue(ctx)
-			now := c.now()
-			c.mu.Lock()
-			c.agg.expire(now)
-			c.changes.expire(now)
-			// A host that folded hosts since it was logged is kept, so that
-			// the next warning counts them.
-			for k, w := range c.foldWarned {
-				if len(w.hosts) == 0 && now.Sub(w.logged) >= foldWarnInterval {
-					delete(c.foldWarned, k)
-				}
-			}
-			for k, t := range c.cidrWarned {
-				if now.Sub(t) >= foldWarnInterval {
-					delete(c.cidrWarned, k)
-				}
-			}
-			for k, t := range c.inventoryWarned {
-				if now.Sub(t) >= foldWarnInterval {
-					delete(c.inventoryWarned, k)
-				}
-			}
-			c.mu.Unlock()
-			c.resolver.expire(now.Add(-c.cfg.IdleTTL), now)
-			c.limits.expire(now)
+			c.tick(ctx)
+		}
+	}
+}
+
+// flushOnShutdown writes what is pending before the collector stops.
+func (c *shawkConnector) flushOnShutdown() {
+	fctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if c.prepareSchemaOnly(fctx) {
+		c.flush(fctx)
+	}
+}
+
+// tick does the work of a write interval: it writes the pending changes,
+// then prepares the next writes and reloads the names of peers (prepare),
+// prunes and refreshes the history of dependencies when due, and forgets
+// what expired. Writes and the reload of peers have their own deadlines,
+// so that a slow write does not stop the names from being reloaded.
+func (c *shawkConnector) tick(ctx context.Context) {
+	c.writePending(ctx)
+	rctx, cancel := context.WithTimeout(ctx, c.cfg.WriteInterval)
+	c.prepare(rctx)
+	cancel()
+	c.pruneIfDue(ctx)
+	c.refreshIfDue(ctx)
+	c.expire(c.now())
+}
+
+// writePending writes the pending changes within a write interval. Once
+// they are written, what was seen before the write started is in
+// PostgreSQL; otherwise they are bounded by max_pending_rows.
+func (c *shawkConnector) writePending(ctx context.Context) {
+	wctx, cancel := context.WithTimeout(ctx, c.cfg.WriteInterval)
+	started := c.now()
+	written := c.prepareSchemaOnly(wctx) && c.flush(wctx)
+	cancel()
+	if !written {
+		c.boundPending()
+		return
+	}
+	c.mu.Lock()
+	c.written = started
+	c.mu.Unlock()
+}
+
+// expire forgets the state of the connector that expired by now.
+func (c *shawkConnector) expire(now time.Time) {
+	c.mu.Lock()
+	c.agg.expire(now)
+	c.changes.expire(now)
+	c.expireWarnings(now)
+	c.mu.Unlock()
+	c.resolver.expire(now.Add(-c.cfg.IdleTTL), now)
+	c.limits.expire(now)
+}
+
+// expireWarnings forgets the warnings logged foldWarnInterval before now.
+// A host that folded hosts since it was logged is kept, so that the next
+// warning counts them. c.mu is held.
+func (c *shawkConnector) expireWarnings(now time.Time) {
+	for k, w := range c.foldWarned {
+		if len(w.hosts) == 0 && now.Sub(w.logged) >= foldWarnInterval {
+			delete(c.foldWarned, k)
+		}
+	}
+	for k, t := range c.cidrWarned {
+		if now.Sub(t) >= foldWarnInterval {
+			delete(c.cidrWarned, k)
+		}
+	}
+	for k, t := range c.inventoryWarned {
+		if now.Sub(t) >= foldWarnInterval {
+			delete(c.inventoryWarned, k)
 		}
 	}
 }

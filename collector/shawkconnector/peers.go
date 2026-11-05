@@ -186,10 +186,10 @@ type resolver struct {
 
 	// peerHosts tells whether peers are given a host (peer_hosts).
 	peerHosts bool
-	// inventory returns the host the inventory (#175) gives an address to,
-	// the first evidence of the host of a peer; nil without an inventory.
-	// It is called for every peer, so that the connector may replace the
-	// inventory it reads.
+	// inventory returns the host the inventory (inventory_file) gives an
+	// address to, the first evidence of the host of a peer. It is called
+	// for every peer, so that the connector may replace the inventory it
+	// reads; nil in tests without one.
 	inventory func(netip.Addr) (string, bool)
 	// dbFormer are the latest hosts that held addresses alone, read from
 	// PostgreSQL with peer_hosts only.
@@ -376,9 +376,21 @@ func learnInto[K comparable](m map[K]map[endpoint]time.Time, k K, e endpoint, no
 func (r *resolver) learn(b *hostBatch, now time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.learnListeners(b, now)
+	r.learnEdges(b, now)
+	r.learnTranslations(b, now)
+	if b.final {
+		r.learnHost(b, now)
+	}
+}
+
+// learnListeners records the endpoints of the listeners of a request. The
+// endpoints name the peers of the outputs only, so the processes of Slurm
+// jobs are named as Prometheus names them. Of the endpoints inferred from
+// listeners on an unspecified address, the request infers at most
+// maxInferred, whatever the listener. r.mu is held.
+func (r *resolver) learnListeners(b *hostBatch, now time.Time) {
 	budget := r.maxInferred
-	// The endpoints name the peers of the outputs only, so the processes of
-	// Slurm jobs are named as Prometheus names them.
 	for _, l := range b.listeners {
 		svc := l.id.peerName()
 		if !l.id.addr.IsUnspecified() {
@@ -386,19 +398,35 @@ func (r *resolver) learn(b *hostBatch, now time.Time) {
 				endpoint{host: b.key, service: svc, exact: true}, now)
 			continue
 		}
-		for _, a := range b.addrs {
-			if r.maxInferred > 0 {
-				if budget == 0 {
-					break
-				}
-				budget--
-			}
-			if l.id.addr.Is4() && !a.Is4() {
-				continue
-			}
-			r.infer(endpointKey{a, l.id.port, l.id.proto}, endpoint{host: b.key, service: svc}, now)
-		}
+		budget = r.inferListener(b, &l.id, svc, budget, now)
 	}
+}
+
+// inferListener records the endpoints that a listener on an unspecified
+// address serves on the addresses of its host: of its family, or any for
+// an IPv6 one. With maxInferred, it takes at most budget addresses, which
+// include those of the other family that an IPv4 listener skips, and
+// returns what is left of budget. r.mu is held.
+func (r *resolver) inferListener(b *hostBatch, id *listenerID, svc string, budget int, now time.Time) int {
+	for _, a := range b.addrs {
+		if r.maxInferred > 0 {
+			if budget == 0 {
+				break
+			}
+			budget--
+		}
+		if id.addr.Is4() && !a.Is4() {
+			continue
+		}
+		r.infer(endpointKey{a, id.port, id.proto}, endpoint{host: b.key, service: svc}, now)
+	}
+	return budget
+}
+
+// learnEdges records the endpoints of the server edges of a request and,
+// unless their peers are folded, the clients they served, and the client
+// sides of its client edges whose peers are not folded. r.mu is held.
+func (r *resolver) learnEdges(b *hostBatch, now time.Time) {
 	for _, e := range b.edges {
 		switch e.id.role {
 		case roleServer:
@@ -418,19 +446,26 @@ func (r *resolver) learn(b *hostBatch, now time.Time) {
 				endpoint{host: b.key, service: e.id.peerName(), exact: true}, now)
 		}
 	}
+}
+
+// learnTranslations records the translations of a request. The agent sends
+// a translation for its idle TTL after its last use: it was last seen as
+// long before now as before the request, by the clock of the agent.
+// r.mu is held.
+func (r *resolver) learnTranslations(b *hostBatch, now time.Time) {
 	for _, x := range b.translations {
-		// The agent sends a translation for its idle TTL after its last use:
-		// it was last seen as long before now as before the request, by the
-		// clock of the agent.
 		at := now
 		if !x.last.IsZero() && !b.time.IsZero() && x.last.Before(b.time) {
 			at = now.Add(x.last.Sub(b.time))
 		}
 		learnTranslation(b.key, x.id, at, r.localLearned, r.localLearnedServers)
 	}
-	if !b.final {
-		return
-	}
+}
+
+// learnHost records, of a request that closes an interval, that the host
+// holds its addresses and that its agent is alive, and with peer_hosts the
+// host that holds each address and its name. r.mu is held.
+func (r *resolver) learnHost(b *hostBatch, now time.Time) {
 	for _, a := range b.addrs {
 		m := r.localAddrs[a]
 		if m == nil {
@@ -578,124 +613,20 @@ func (r *resolver) peer(host string, id *edgeID, now time.Time) peer {
 	shared := len(holders) > 1
 	loopback := id.peer.IsLoopback()
 	local := loopback || (shared && holders[host])
-	sameHostOnly := loopback || shared
-	// rules choose among the services and clients seen at the address of
-	// the peer.
-	rules := chooser{host: host, sameHostOnly: sameHostOnly}
-
-	var p peer
 	// covers tells whether the agent of the peer records the other side,
 	// unless it folds this one.
-	var covers bool
+	p, covers, holder := r.peerAgent(host, id, holders, local, now)
+	// rules choose among the services and clients seen at the address of
+	// the peer.
+	rules := chooser{host: host, sameHostOnly: loopback || shared, holder: holder}
+
 	// learned tells that a client edge goes through a learned translation,
 	// and named that a service at its peer address names it.
 	var learned, named bool
-	switch {
-	case local:
-		// The host itself runs an agent; before its first complete interval
-		// what it traces is not known yet.
-		p.agent = true
-		if a, ok := r.agent(host, now); ok {
-			p.agent = a.covers(id.proto)
-		}
-		covers = p.agent
-	case len(holders) == 1:
-		for h := range holders {
-			rules.holder = h
-			if a, ok := r.agent(h, now); ok {
-				p.agent = a.covers(id.proto)
-				covers = p.agent
-				switch {
-				case !p.agent || h == host:
-				case id.role == roleClient && r.foldsPeer(a, h, id.local, false, now):
-					p.foldedBy, p.foldedByName = h, a.name
-				case id.role == roleServer:
-					// Through a translation, the client connects to a virtual
-					// address, which its agent may fold.
-					v, through := r.foldedVirtual(a, h, id, now)
-					if !through && !r.foldsPeer(a, h, id.local, true, now) {
-						break
-					}
-					p.agent = false
-					p.foldedBy, p.foldedByName, p.foldsServer, p.foldedVirtual = h, a.name, true, v
-				}
-			}
-		}
-	}
 	if id.role == roleClient {
-		k := endpointKey{id.peer, id.port, id.proto}
-		c := rules
-		learned = r.virtualOf(id) == nil && len(r.learnedOf(host, id, now)) > 0
-		if r.virtualOf(id) != nil || learned {
-			// At a virtual address, only a service observed on a socket at it
-			// recently, such as a relay that runs an agent, comes before the
-			// backends: a listener on an unspecified address of a host that
-			// holds the address may be bypassed (DNAT), and a server edge of
-			// days ago replaced by a relay without an agent.
-			c.exactSince = now.Add(-aliveWindow)
-		}
-		if learned {
-			// Through a learned translation, only a service whose server edge
-			// from this client this connector saw recently comes first, as a
-			// match by address does in PostgreSQL: a container that reaches a
-			// published port of its host goes through docker-proxy, which
-			// serves the address, while the clients of other hosts go to the
-			// container.
-			c.add(r.localServed[clientKey{id.local, id.peer, id.port, id.proto}], nil, 0, 0)
-		} else {
-			c.add(r.localEndpoints[k], r.dbEndpoints[k], r.dbAge(now), 0)
-		}
-		p.name = c.best.service
-		named = p.name != ""
-		if p.name == "" {
-			if c, t, ok := r.translatedServer(id, now); ok {
-				// The holder of the virtual address, if any, is not the server.
-				p = peer{name: c.service, agent: c.agent, server: c.addr}
-				if c.port != id.port {
-					p.port = c.port
-				}
-				// Through a translation without sources the backend sees the
-				// address of the client, which its agent may fold.
-				if a, ok := r.agent(c.host, now); ok && c.agent && c.host != host && len(t.sources) == 0 &&
-					r.foldsPeer(a, c.host, id.local, false, now) {
-					p.foldedBy, p.foldedByName = c.host, a.name
-				}
-			} else if !learned {
-			} else if c, ok := r.learnedServer(host, id, now); ok {
-				p = peer{name: c.service, agent: c.agent, server: c.addr}
-				if c.port != id.port {
-					p.port = c.port
-				}
-				if a, ok := r.agent(c.host, now); ok && c.agent && c.host != host && c.dnat &&
-					r.foldsPeer(a, c.host, id.local, false, now) {
-					p.foldedBy, p.foldedByName = c.host, a.name
-				}
-			}
-		}
+		p, learned, named = r.clientPeer(host, id, rules, p, now)
 	} else {
-		k := clientKey{id.peer, id.local, id.port, id.proto}
-		c := rules
-		c.add(r.localClients[k], r.dbClients[k], r.dbAge(now), 0)
-		p.name = c.best.service
-		if p.name == "" {
-			if p.name = r.translatedClient(rules, id, now); p.name != "" {
-				// The client connected to the virtual address, which its agent
-				// keeps exact, whatever it does with the address of this host.
-				p.agent = covers
-				p.foldedBy, p.foldedByName, p.foldsServer, p.foldedVirtual = "", "", false, netip.Addr{}
-			} else if r.behindRelay(id) {
-				// The server sees a relay that replaces the addresses of its
-				// clients: an agent at the address of the relay records none of
-				// them, so this side counts the connections.
-				p.agent = false
-				p.foldedBy, p.foldedByName, p.foldsServer, p.foldedVirtual = "", "", false, netip.Addr{}
-			} else if p.name = r.learnedClientName(host, id, rules.holder, now); p.name != "" {
-				// As through a static translation without sources. A learned
-				// SNAT keeps its name: the source forwards several clients.
-				p.agent = covers
-				p.foldedBy, p.foldedByName, p.foldsServer, p.foldedVirtual = "", "", false, netip.Addr{}
-			}
-		}
+		p = r.serverPeer(host, id, rules, p, covers, now)
 	}
 	if p.name == "" {
 		p.name = r.classify(id.peer)
@@ -710,6 +641,166 @@ func (r *resolver) peer(host string, id *edgeID, now time.Time) peer {
 	return p
 }
 
+// peerAgent tells what the agent of the peer of an edge of host records,
+// local telling that the peer is on the host itself. It returns the peer
+// with agent and the folding of this side set, covers, and the live host
+// that alone holds the address of the peer, if any (holderOf). r.mu is
+// held.
+func (r *resolver) peerAgent(host string, id *edgeID, holders map[string]bool, local bool,
+	now time.Time) (p peer, covers bool, holder string) {
+	if local {
+		// The host itself runs an agent; before its first complete interval
+		// what it traces is not known yet.
+		p.agent = true
+		if a, ok := r.agent(host, now); ok {
+			p.agent = a.covers(id.proto)
+		}
+		return p, p.agent, ""
+	}
+	if len(holders) != 1 {
+		return peer{}, false, ""
+	}
+	for h := range holders {
+		holder = h
+	}
+	p, covers = r.holderAgent(host, holder, id, now)
+	return p, covers, holder
+}
+
+// holderAgent tells what the agent of holder, the live host that alone
+// holds the address of the peer of an edge of host, records: the peer with
+// agent and the folding of this side set, and covers (see peerAgent). r.mu
+// is held.
+func (r *resolver) holderAgent(host, holder string, id *edgeID, now time.Time) (p peer, covers bool) {
+	a, ok := r.agent(holder, now)
+	if !ok {
+		return peer{}, false
+	}
+	p.agent = a.covers(id.proto)
+	covers = p.agent
+	switch {
+	case !p.agent || holder == host:
+	case id.role == roleClient && r.foldsPeer(a, holder, id.local, false, now):
+		p.foldedBy, p.foldedByName = holder, a.name
+	case id.role == roleServer:
+		// Through a translation, the client connects to a virtual
+		// address, which its agent may fold.
+		v, through := r.foldedVirtual(a, holder, id, now)
+		if !through && !r.foldsPeer(a, holder, id.local, true, now) {
+			break
+		}
+		p.agent = false
+		p.foldedBy, p.foldedByName, p.foldsServer, p.foldedVirtual = holder, a.name, true, v
+	}
+	return p, covers
+}
+
+// clientPeer names the peer p of a client edge of host after the service it
+// reaches, if one is known, by the rules of the address of the peer. It
+// returns the peer, whether the edge goes through a learned translation,
+// and whether a service at the peer address names it. r.mu is held.
+func (r *resolver) clientPeer(host string, id *edgeID, rules chooser, p peer,
+	now time.Time) (_ peer, learned, named bool) {
+	learned = r.virtualOf(id) == nil && len(r.learnedOf(host, id, now)) > 0
+	if p.name = r.servedName(id, rules, learned, now); p.name != "" {
+		return p, learned, true
+	}
+	if c, t, ok := r.translatedServer(id, now); ok {
+		// The holder of the virtual address, if any, is not the server.
+		// Through a translation without sources the backend sees the
+		// address of the client, which its agent may fold.
+		return r.backendPeer(host, id, c, len(t.sources) == 0, now), learned, false
+	}
+	if !learned {
+		return p, learned, false
+	}
+	if c, ok := r.learnedServer(host, id, now); ok {
+		return r.backendPeer(host, id, c, c.dnat, now), learned, false
+	}
+	return p, learned, false
+}
+
+// servedName returns the service seen at the peer address and port of a
+// client edge, chosen by rules, or "". learned tells that the edge goes
+// through a learned translation. r.mu is held.
+func (r *resolver) servedName(id *edgeID, rules chooser, learned bool, now time.Time) string {
+	c := rules
+	if r.virtualOf(id) != nil || learned {
+		// At a virtual address, only a service observed on a socket at it
+		// recently, such as a relay that runs an agent, comes before the
+		// backends: a listener on an unspecified address of a host that
+		// holds the address may be bypassed (DNAT), and a server edge of
+		// days ago replaced by a relay without an agent.
+		c.exactSince = now.Add(-aliveWindow)
+	}
+	if learned {
+		// Through a learned translation, only a service whose server edge
+		// from this client this connector saw recently comes first, as a
+		// match by address does in PostgreSQL: a container that reaches a
+		// published port of its host goes through docker-proxy, which
+		// serves the address, while the clients of other hosts go to the
+		// container.
+		c.add(r.localServed[clientKey{id.local, id.peer, id.port, id.proto}], nil, 0, 0)
+	} else {
+		k := endpointKey{id.peer, id.port, id.proto}
+		c.add(r.localEndpoints[k], r.dbEndpoints[k], r.dbAge(now), 0)
+	}
+	return c.best.service
+}
+
+// backendPeer is the peer of a client edge of host whose service c is at a
+// backend of a translation. seesClient tells that the backend sees the
+// address of the client, which its agent may fold. r.mu is held.
+func (r *resolver) backendPeer(host string, id *edgeID, c candidate, seesClient bool, now time.Time) peer {
+	p := peer{name: c.service, agent: c.agent, server: c.addr}
+	if c.port != id.port {
+		p.port = c.port
+	}
+	if a, ok := r.agent(c.host, now); ok && c.agent && c.host != host && seesClient &&
+		r.foldsPeer(a, c.host, id.local, false, now) {
+		p.foldedBy, p.foldedByName = c.host, a.name
+	}
+	return p
+}
+
+// serverPeer names the peer p of a server edge of host after its client
+// service, if one is known, by the rules of the address of the peer.
+// covers tells whether the agent of the peer records the other side. r.mu
+// is held.
+func (r *resolver) serverPeer(host string, id *edgeID, rules chooser, p peer, covers bool, now time.Time) peer {
+	k := clientKey{id.peer, id.local, id.port, id.proto}
+	c := rules
+	c.add(r.localClients[k], r.dbClients[k], r.dbAge(now), 0)
+	if p.name = c.best.service; p.name != "" {
+		return p
+	}
+	if p.name = r.translatedClient(rules, id, now); p.name != "" {
+		// The client connected to the virtual address, which its agent
+		// keeps exact, whatever it does with the address of this host.
+		return unfolded(p, covers)
+	}
+	if r.behindRelay(id) {
+		// The server sees a relay that replaces the addresses of its
+		// clients: an agent at the address of the relay records none of
+		// them, so this side counts the connections.
+		return unfolded(p, false)
+	}
+	if p.name = r.learnedClientName(host, id, rules.holder, now); p.name != "" {
+		// As through a static translation without sources. A learned
+		// SNAT keeps its name: the source forwards several clients.
+		return unfolded(p, covers)
+	}
+	return p
+}
+
+// unfolded returns p with agent, as a peer whose agent folds nothing of
+// this side.
+func unfolded(p peer, agent bool) peer {
+	p.agent = agent
+	p.foldedBy, p.foldedByName, p.foldsServer, p.foldedVirtual = "", "", false, netip.Addr{}
+	return p
+}
+
 // addrHost returns the host of a peer of host at an address, or whether it
 // is host itself (§1.3 of docs/proposals/slurm-hpc-clusters.md): a host
 // takes stronger evidence than a service, so a peer whose host is not
@@ -719,19 +810,20 @@ func (r *resolver) addrHost(host string, a netip.Addr, now time.Time) (string, b
 	if a.IsLoopback() {
 		return "", true
 	}
+	// A shared address, such as the gateway of a container bridge, is the
+	// host's own if it holds it too, as for the names of services, whatever
+	// the inventory gives it to.
+	hs := r.holders(a, now)
+	if len(hs) > 1 && hs[host] {
+		return "", true
+	}
 	if r.inventory != nil {
 		if h, ok := r.inventory(a); ok {
 			return h, false
 		}
 	}
-	hs := r.holders(a, now)
 	switch {
 	case len(hs) > 1:
-		// A shared address, such as the gateway of a container bridge, is
-		// the host's own if it holds it too, as for the names of services.
-		if hs[host] {
-			return "", true
-		}
 		return hostUnknown, false
 	case len(hs) == 1:
 		for h := range hs {

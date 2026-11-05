@@ -237,9 +237,10 @@ func (a *aggregator) setPeerHosts(maxPeerHosts int, services []string) {
 	}
 }
 
-// peerHostsOf tells whether the edges of a local service ([namespace/]name)
-// to a peer service have outputs per peer host: whether either is in
-// peer_host_services. Both sides of a dependency then have them, as the
+// peerHostsOf tells whether the edges of a local service to a peer service
+// have outputs per peer host: whether either is in peer_host_services. The
+// local service is named as its peers name it ([namespace/]name, slurm-job
+// for the processes of Slurm jobs). Both sides of a dependency then have them, as the
 // recording rules expect: they leave out the server side of a client with
 // an agent (shawk.peer.agent), whose client side counts the dependency.
 func (a *aggregator) peerHostsOf(local, peer string) bool {
@@ -335,82 +336,10 @@ func (a *aggregator) add(b *hostBatch, peerOf func(*edgeID) peer, now time.Time,
 	skew := now.Sub(ts)
 	toConnector := func(t time.Time) time.Time { return t.Add(skew) }
 
-	h := a.hosts[b.key]
-	if h == nil {
-		h = &hostOutputs{inputs: map[inputKey]*inputState{}, resources: map[svcKey]*outResource{},
-			services: map[svcKey]time.Time{}}
-		a.hosts[b.key] = h
-	}
-	h.machineID, h.hostname = b.machineID, b.hostname
-	if !h.latest.IsZero() && ts.Before(h.latest.Add(-clockStepBack)) {
-		// The clock of the agent went back, e.g. NTP corrected a clock that
-		// was ahead. Points are compared by time, so every input takes its
-		// next point as a baseline, and the next interval is emitted.
-		for _, in := range h.inputs {
-			in.rebase = true
-		}
-		h.latest, h.emitted = ts, time.Time{}
-	}
-	if ts.After(h.latest) {
-		h.latest = ts
-	}
-
+	h := a.outputsOf(b)
+	h.advance(ts)
 	for _, e := range b.edges {
-		sk := a.service(h, &e.id.process, now)
-		r := h.resources[sk]
-		if r == nil {
-			r = &outResource{series: map[outKey]*outSeries{}}
-			h.resources[sk] = r
-		}
-		p := peerOf(&e.id)
-		g := peerGroup{b.key, sk.service, sk.svcNS, e.id.role}
-		peerName := cutLabel(p.name, maxPeerName)
-		name := a.peer(g, peerName, now)
-		var peerHost string
-		// The name of the process, not that of its outputs, which may be
-		// ~other beyond max_services or max_peers.
-		if a.peerHostsOf(e.id.job(), peerName) {
-			peerHost = p.host
-			if p.self {
-				peerHost = b.hostname
-			}
-			if peerHost == "" {
-				peerHost = hostUnknown
-			}
-			peerHost = a.peerHost(peerHostGroup{g, name}, cutLabel(peerHost, maxLabelValue), now)
-		}
-		agnostic := a.portAgnostic(&e.id, p)
-		for vk, pt := range e.values {
-			m, ok := outMetrics[vk.metric]
-			if !ok {
-				continue
-			}
-			ik := inputKey{e.id, vk}
-			dv, dc, fresh := a.delta(h, ik, pt, ts, now)
-			if !fresh {
-				continue
-			}
-			// Inputs of unknown reasons or directions keep series of their
-			// own, which add up in the output of _OTHER.
-			key := outKey{metric: vk.metric, dir: outDirection(vk.dir), errType: outErrorType(vk.errType), peer: name,
-				peerAgent: p.agent, role: e.id.role, transport: e.id.proto, port: e.id.port}
-			if p.port != 0 {
-				// Through a translation, the port of the server.
-				key.port = p.port
-			}
-			if agnostic {
-				key.port = 0
-			}
-			if a.keepPeerAddr {
-				key.peerAddr = e.id.peerString()
-			}
-			start := clampTime(toConnector(pt.start.AsTime()), a.started, now)
-			r.account(key, m, ik, pt, dv, dc, start, now)
-			if hm, ok := hostMetrics[vk.metric]; ok && peerHost != "" {
-				key.metric, key.peerHost = hm, peerHost
-				r.account(key, outMetrics[hm], ik, pt, dv, dc, start, now)
-			}
-		}
+		a.addEdge(b, h, e, peerOf, ts, now, toConnector)
 	}
 
 	// Emit once per interval, and never a request older than one emitted.
@@ -428,18 +357,126 @@ func (a *aggregator) add(b *hostBatch, peerOf func(*edgeID) peer, now time.Time,
 		r.appendTo(sk, h, interval, now, out)
 	}
 	if b.agent.Len() > 0 {
-		rm := out.ResourceMetrics().AppendEmpty()
-		attrs := rm.Resource().Attributes()
-		attrs.PutStr(attrServiceName, agentServiceName)
-		if b.agentVersion != "" {
-			attrs.PutStr(attrServiceVersion, cutLabel(b.agentVersion, maxLabelValue))
-		}
-		putHostAttrs(attrs, b.machineID, b.hostname)
-		sm := rm.ScopeMetrics().AppendEmpty()
-		sm.Scope().SetName(scopeName)
-		restamp(b.agent, toConnector, now)
-		b.agent.MoveAndAppendTo(sm.Metrics())
+		appendAgentMetrics(b, toConnector, now, out)
 	}
+}
+
+// outputsOf returns the series of the host of a request, with its
+// identity as of the request.
+func (a *aggregator) outputsOf(b *hostBatch) *hostOutputs {
+	h := a.hosts[b.key]
+	if h == nil {
+		h = &hostOutputs{inputs: map[inputKey]*inputState{}, resources: map[svcKey]*outResource{},
+			services: map[svcKey]time.Time{}}
+		a.hosts[b.key] = h
+	}
+	h.machineID, h.hostname = b.machineID, b.hostname
+	return h
+}
+
+// advance takes ts, the time of a request by the clock of the agent, as the
+// newest of the host if it is newer, or if the clock of the agent went back.
+func (h *hostOutputs) advance(ts time.Time) {
+	if !h.latest.IsZero() && ts.Before(h.latest.Add(-clockStepBack)) {
+		// The clock of the agent went back, e.g. NTP corrected a clock that
+		// was ahead. Points are compared by time, so every input takes its
+		// next point as a baseline, and the next interval is emitted.
+		for _, in := range h.inputs {
+			in.rebase = true
+		}
+		h.latest, h.emitted = ts, time.Time{}
+	}
+	if ts.After(h.latest) {
+		h.latest = ts
+	}
+}
+
+// addEdge accounts the inputs of an edge of a request into the output series
+// of its host h. ts is the time of the request by the clock of the agent,
+// and toConnector converts a time of the agent to the clock of the
+// connector.
+func (a *aggregator) addEdge(b *hostBatch, h *hostOutputs, e *edgeInput, peerOf func(*edgeID) peer, ts, now time.Time,
+	toConnector func(time.Time) time.Time) {
+	sk := a.service(h, &e.id.process, now)
+	r := h.resources[sk]
+	if r == nil {
+		r = &outResource{series: map[outKey]*outSeries{}}
+		h.resources[sk] = r
+	}
+	p := peerOf(&e.id)
+	g := peerGroup{b.key, sk.service, sk.svcNS, e.id.role}
+	peerName := cutLabel(p.name, maxPeerName)
+	name := a.peer(g, peerName, now)
+	var peerHost string
+	// The name of the process as a peer, as on the other side of the
+	// dependency (slurm-job for the processes of Slurm jobs), not that of
+	// its outputs, which may be ~other beyond max_services or max_peers.
+	if a.peerHostsOf(e.id.process.peerName(), peerName) {
+		peerHost = a.peerHost(peerHostGroup{g, name}, cutLabel(peerHostName(p, b.hostname), maxLabelValue), now)
+	}
+	// The key of the output series of the edge, but for the metric and its
+	// attributes.
+	base := outKey{peer: name, peerAgent: p.agent, role: e.id.role, transport: e.id.proto, port: e.id.port}
+	if p.port != 0 {
+		// Through a translation, the port of the server.
+		base.port = p.port
+	}
+	if a.portAgnostic(&e.id, p) {
+		base.port = 0
+	}
+	if a.keepPeerAddr {
+		base.peerAddr = e.id.peerString()
+	}
+	for vk, pt := range e.values {
+		m, ok := outMetrics[vk.metric]
+		if !ok {
+			continue
+		}
+		ik := inputKey{e.id, vk}
+		dv, dc, fresh := a.delta(h, ik, pt, ts, now)
+		if !fresh {
+			continue
+		}
+		// Inputs of unknown reasons or directions keep series of their
+		// own, which add up in the output of _OTHER.
+		key := base
+		key.metric, key.dir, key.errType = vk.metric, outDirection(vk.dir), outErrorType(vk.errType)
+		start := clampTime(toConnector(pt.start.AsTime()), a.started, now)
+		r.account(key, m, ik, pt, dv, dc, start, now)
+		if hm, ok := hostMetrics[vk.metric]; ok && peerHost != "" {
+			key.metric, key.peerHost = hm, peerHost
+			r.account(key, outMetrics[hm], ik, pt, dv, dc, start, now)
+		}
+	}
+}
+
+// peerHostName is the host of a peer p of a host named hostname as
+// shawk.peer.host names it.
+func peerHostName(p peer, hostname string) string {
+	h := p.host
+	if p.self {
+		h = hostname
+	}
+	if h == "" {
+		h = hostUnknown
+	}
+	return h
+}
+
+// appendAgentMetrics appends the metrics of the agent of a request to out,
+// moved to the clock of the connector at now.
+func appendAgentMetrics(b *hostBatch, toConnector func(time.Time) time.Time, now time.Time, out pmetric.Metrics) {
+	rm := out.ResourceMetrics().AppendEmpty()
+	attrs := rm.Resource().Attributes()
+	attrs.PutStr(attrServiceName, agentServiceName)
+	if b.agentVersion != "" {
+		attrs.PutStr(attrServiceVersion, cutLabel(b.agentVersion, maxLabelValue))
+	}
+	putHostAttrs(attrs, b.machineID, b.hostname)
+	sm := rm.ScopeMetrics().AppendEmpty()
+	sm.Scope().SetName(scopeName)
+	restamp(b.agent, toConnector, now)
+	b.agent.MoveAndAppendTo(sm.Metrics())
 }
 
 // account adds the increase of an input, dv and dc, to the output series
@@ -679,67 +716,94 @@ func (r *outResource) appendTo(k svcKey, h *hostOutputs, interval pcommon.Timest
 			}
 			desc := outMetrics[name]
 			if desc.gauge {
-				s.value = 0
-				for _, v := range s.gauge {
-					if v.time == interval {
-						s.value += v.value
-					}
-				}
-				clear(s.gauge)
+				s.closeGauge(interval)
 			}
 			m, ok := metrics[name]
 			if !ok {
-				m = sm.Metrics().AppendEmpty()
-				m.SetName(name)
-				m.SetUnit(desc.unit)
-				switch {
-				case desc.histogram:
-					m.SetEmptyHistogram().SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
-				default:
-					sum := m.SetEmptySum()
-					sum.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
-					sum.SetIsMonotonic(!desc.gauge)
-				}
+				m = appendOutMetric(sm.Metrics(), name, desc)
 				metrics[name] = m
 			}
-			var dpAttrs pcommon.Map
-			start := pcommon.NewTimestampFromTime(s.start)
-			if desc.histogram {
-				dp := m.Histogram().DataPoints().AppendEmpty()
-				dp.SetStartTimestamp(start)
-				dp.SetTimestamp(ts)
-				dp.SetCount(s.count)
-				dp.SetSum(s.value)
-				dp.BucketCounts().FromRaw([]uint64{s.count})
-				dpAttrs = dp.Attributes()
-			} else {
-				dp := m.Sum().DataPoints().AppendEmpty()
-				dp.SetStartTimestamp(start)
-				dp.SetTimestamp(ts)
-				dp.SetIntValue(int64(s.value))
-				dpAttrs = dp.Attributes()
-			}
-			dpAttrs.PutStr(attrPeerService, key.peer)
-			dpAttrs.PutBool(attrPeerAgent, key.peerAgent)
-			dpAttrs.PutStr(attrRole, key.role)
-			dpAttrs.PutInt(attrServerPort, int64(key.port))
-			dpAttrs.PutStr(attrTransport, key.transport)
-			if key.dir != "" {
-				dpAttrs.PutStr(attrIODirection, key.dir)
-			}
-			if key.errType != "" {
-				dpAttrs.PutStr(attrErrorType, key.errType)
-			}
-			if s.pending {
-				s.value += s.held
-				s.held, s.pending = 0, false
-			}
-			if key.peerAddr != "" {
-				dpAttrs.PutStr(attrPeerAddr, key.peerAddr)
-			}
-			if key.peerHost != "" {
-				dpAttrs.PutStr(attrPeerHost, key.peerHost)
-			}
+			putPointAttrs(s.appendPoint(m, desc, ts), key)
+			s.release()
 		}
+	}
+}
+
+// closeGauge sets the value of a gauge series to the sum of the values its
+// inputs had at interval, and forgets them.
+func (s *outSeries) closeGauge(interval pcommon.Timestamp) {
+	s.value = 0
+	for _, v := range s.gauge {
+		if v.time == interval {
+			s.value += v.value
+		}
+	}
+	clear(s.gauge)
+}
+
+// appendOutMetric appends the output metric name, as desc describes it, to
+// ms.
+func appendOutMetric(ms pmetric.MetricSlice, name string, desc outMetric) pmetric.Metric {
+	m := ms.AppendEmpty()
+	m.SetName(name)
+	m.SetUnit(desc.unit)
+	switch {
+	case desc.histogram:
+		m.SetEmptyHistogram().SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
+	default:
+		sum := m.SetEmptySum()
+		sum.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
+		sum.SetIsMonotonic(!desc.gauge)
+	}
+	return m
+}
+
+// appendPoint appends the point of the series at ts to its metric m, as
+// desc describes it, and returns the attributes of the point.
+func (s *outSeries) appendPoint(m pmetric.Metric, desc outMetric, ts pcommon.Timestamp) pcommon.Map {
+	start := pcommon.NewTimestampFromTime(s.start)
+	if desc.histogram {
+		dp := m.Histogram().DataPoints().AppendEmpty()
+		dp.SetStartTimestamp(start)
+		dp.SetTimestamp(ts)
+		dp.SetCount(s.count)
+		dp.SetSum(s.value)
+		dp.BucketCounts().FromRaw([]uint64{s.count})
+		return dp.Attributes()
+	}
+	dp := m.Sum().DataPoints().AppendEmpty()
+	dp.SetStartTimestamp(start)
+	dp.SetTimestamp(ts)
+	dp.SetIntValue(int64(s.value))
+	return dp.Attributes()
+}
+
+// putPointAttrs puts the attributes of the output series key on a point.
+func putPointAttrs(attrs pcommon.Map, key outKey) {
+	attrs.PutStr(attrPeerService, key.peer)
+	attrs.PutBool(attrPeerAgent, key.peerAgent)
+	attrs.PutStr(attrRole, key.role)
+	attrs.PutInt(attrServerPort, int64(key.port))
+	attrs.PutStr(attrTransport, key.transport)
+	if key.dir != "" {
+		attrs.PutStr(attrIODirection, key.dir)
+	}
+	if key.errType != "" {
+		attrs.PutStr(attrErrorType, key.errType)
+	}
+	if key.peerAddr != "" {
+		attrs.PutStr(attrPeerAddr, key.peerAddr)
+	}
+	if key.peerHost != "" {
+		attrs.PutStr(attrPeerHost, key.peerHost)
+	}
+}
+
+// release adds the increase a sparse series held to its value, once its
+// first point, 0, is emitted.
+func (s *outSeries) release() {
+	if s.pending {
+		s.value += s.held
+		s.held, s.pending = 0, false
 	}
 }

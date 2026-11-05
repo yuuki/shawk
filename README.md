@@ -166,6 +166,19 @@ make generate      # compile the BPF programs (clang, llvm-strip)
 make vet test      # BPF tests need root; PostgreSQL tests need SHAWK_TEST_POSTGRES_DSN
 make vm-test       # BPF tests in a VM: KERNEL=rocky9|5.14|5.15 ARCH=x86_64|aarch64
 make e2e           # multi-host test (sudo, SHAWK_E2E_POSTGRES_DSN)
+make complexity    # rank the most complex functions (needs cccc, see below)
+```
+
+The environments the tests need come up and go with one command each, on
+macOS and Linux, per checkout or worktree (see
+[test/harness](test/harness/README.md), which also lists the variables each
+test reads):
+
+```bash
+make pg-up         # a disposable PostgreSQL; prints SHAWK_TEST_POSTGRES_DSN and SHAWK_E2E_POSTGRES_DSN
+make pg-test       # the tests of the connector against it (make pg-down removes it)
+make slurm-up      # a Slurm cluster in a VM of Lima: SLURM_VERSION=26.05.5 SLURM_CGROUP_JOB_ID_PATHS=no ...
+make slurm-check   # run jobs and check the units of their processes (make slurm-down removes it)
 ```
 
 The other targets are described in the [Makefile](Makefile). The compiled
@@ -177,6 +190,24 @@ agent does not depend on the collector) and the tests of `packaging/`
 [docs/proposals/](docs/proposals/) holds designs not implemented yet, and
 [docs/research/](docs/research/README.md) background research that is not
 maintained.
+
+### Code complexity
+
+CI measures Cognitive and Cyclomatic Complexity with
+[cccc](https://github.com/moznion/cccc) on pull requests and pushes to `main`
+(`.github/workflows/complexity.yml`) and fails when a function's cognitive
+complexity exceeds `max-cognitive` in `cccc.toml`; the job summary lists the
+functions above it and the 20 most complex ones. The threshold is a ratchet
+toward 15, SonarSource's default: it is the highest score in the code today, so
+split a function that would exceed it rather than raising the threshold, and
+lower the threshold whenever refactoring brings the maximum down. `cccc.toml`
+also lists what is not analyzed, such as tests and generated or vendored code;
+the BPF programs are exempt because the verifier constrains how they can be
+split (`shawk_inet_sock_set_state` in `shawk.bpf.c` scores 48). To check
+locally, install cccc (a [release
+binary](https://github.com/moznion/cccc/releases) or `cargo install cccc-cli`)
+and run `make complexity`, which ranks the most complex functions and fails the
+same way.
 
 ## History
 

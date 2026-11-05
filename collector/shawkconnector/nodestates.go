@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"slices"
 	"strings"
 	"time"
@@ -294,68 +293,113 @@ func windowsKey(ws []maintenanceWindow) string {
 func (c *shawkConnector) syncNodeStates(ctx context.Context) {
 	now := c.now()
 	if path := c.cfg.NodeStatesFile; path != "" {
-		b, err := os.ReadFile(path)
-		var ns *nodeStates
-		var unknown []string
-		if err == nil {
-			ns, err = parseNodeStates(b, now)
-		}
-		if err == nil {
-			ns.nodes, unknown, err = hostsOfNodes(ns.nodes, c.inventory.Load())
-		}
-		// Nodes without a host are logged when they change: their states
-		// are not written, and they stop no alert.
-		leftOut := c.unknownNodes != ""
-		if key := strings.Join(unknown, " "); key != c.unknownNodes {
-			if key != "" {
-				c.log.Warn("nodes in node_states_file that the inventory does not map to hosts; their states are left out",
-					zap.String("file", path), zap.Strings("nodes", unknown))
-			}
-			c.unknownNodes = key
-		}
-		switch {
-		case c.fileError(&c.nodeStatesErr, "node_states_file", path, err):
-		case now.Sub(ns.at) > nodeStateMaxAge:
-			// The file is not being generated. Written, the states would
-			// explain nothing.
-			if !c.nodeStatesStale {
-				c.log.Warn("the states in node_states_file are stale; they stop no alert until it is generated again",
-					zap.String("file", path), zap.Time("generated_at", ns.at), zap.Duration("max_age", nodeStateMaxAge))
-				c.nodeStatesStale = true
-			}
-		case ns.at.After(c.nodeStatesAt) || leftOut:
-			// After nodes were left out, the same reading is written again,
-			// so that they are once the inventory maps them; what was
-			// written changes nothing.
-			c.nodeStatesStale = false
-			if err := c.store.writeNodeStates(ctx, ns.at, ns.nodes); err != nil {
-				c.log.Warn("writing the node states to PostgreSQL", zap.Error(err))
-			} else {
-				c.nodeStatesAt = ns.at
-			}
-		default:
-			c.nodeStatesStale = false
-		}
+		c.syncStatesFile(ctx, path, now)
 	}
 	if path := c.cfg.MaintenanceFile; path != "" {
-		b, err := os.ReadFile(path)
-		var ws []maintenanceWindow
-		if err == nil {
-			ws, err = parseMaintenance(b)
-		}
-		if c.fileError(&c.maintenanceErr, "maintenance_file", path, err) {
-			return
-		}
-		// Written when they change, and again every few minutes, so that
-		// windows another connector wrote from an older file are put right.
-		if key := windowsKey(ws); key != c.windowsKey || now.Sub(c.windowsSynced) >= maintenanceResync {
-			if err := c.store.syncMaintenance(ctx, ws); err != nil {
-				c.log.Warn("writing the maintenance windows to PostgreSQL", zap.Error(err))
-			} else {
-				c.windowsKey, c.windowsSynced = key, now
-			}
-		}
+		c.syncMaintenanceFile(ctx, path, now)
 	}
+}
+
+// syncStatesFile writes the states of the node_states_file at path when
+// they were read from Slurm again, or when nodes were left out of those
+// last read, and logs states that are stale.
+func (c *shawkConnector) syncStatesFile(ctx context.Context, path string, now time.Time) {
+	ns, unknown, err := c.readNodeStates(path, now)
+	leftOut := c.noteUnknownNodes(path, unknown)
+	switch {
+	case c.fileError(&c.nodeStatesErr, "node_states_file", path, err):
+	case now.Sub(ns.at) > nodeStateMaxAge:
+		// The file is not being generated. Written, the states would
+		// explain nothing.
+		c.staleNodeStates(path, ns.at)
+	case ns.at.After(c.nodeStatesAt) || leftOut:
+		// After nodes were left out, the same reading is written again,
+		// so that they are once the inventory maps them; what was
+		// written changes nothing.
+		c.nodeStatesStale = false
+		c.writeNodeStates(ctx, ns)
+	default:
+		c.nodeStatesStale = false
+	}
+}
+
+// readNodeStates reads the node_states_file at path at now, with its nodes
+// given by their NodeName mapped to hosts by the inventory, and returns
+// the nodes the inventory does not map.
+func (c *shawkConnector) readNodeStates(path string, now time.Time) (*nodeStates, []string, error) {
+	b, err := readBoundedFile(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	ns, err := parseNodeStates(b, now)
+	if err != nil {
+		return nil, nil, err
+	}
+	var unknown []string
+	ns.nodes, unknown, err = hostsOfNodes(ns.nodes, c.inventory.Load())
+	return ns, unknown, err
+}
+
+// noteUnknownNodes logs the nodes of the node_states_file at path without
+// a host when they change: their states are not written, and they stop no
+// alert. A file that cannot be read leaves none out, so that they are
+// logged again once it is read. It reports whether nodes were left out of
+// the states read before.
+func (c *shawkConnector) noteUnknownNodes(path string, unknown []string) bool {
+	leftOut := c.unknownNodes != ""
+	if key := strings.Join(unknown, " "); key != c.unknownNodes {
+		if key != "" {
+			c.log.Warn("nodes in node_states_file that the inventory does not map to hosts; their states are left out",
+				zap.String("file", path), zap.Strings("nodes", unknown))
+		}
+		c.unknownNodes = key
+	}
+	return leftOut
+}
+
+// staleNodeStates logs that the states of the node_states_file at path,
+// generated at at, are stale, once until states that are not are read.
+func (c *shawkConnector) staleNodeStates(path string, at time.Time) {
+	if c.nodeStatesStale {
+		return
+	}
+	c.log.Warn("the states in node_states_file are stale; they stop no alert until it is generated again",
+		zap.String("file", path), zap.Time("generated_at", at), zap.Duration("max_age", nodeStateMaxAge))
+	c.nodeStatesStale = true
+}
+
+// writeNodeStates writes the states of nodes, and remembers when the
+// states written were read from Slurm.
+func (c *shawkConnector) writeNodeStates(ctx context.Context, ns *nodeStates) {
+	if err := c.store.writeNodeStates(ctx, ns.at, ns.nodes); err != nil {
+		c.log.Warn("writing the node states to PostgreSQL", zap.Error(err))
+		return
+	}
+	c.nodeStatesAt = ns.at
+}
+
+// syncMaintenanceFile writes the maintenance windows of the
+// maintenance_file at path when they change, and again every few minutes,
+// so that windows another connector wrote from an older file are put
+// right.
+func (c *shawkConnector) syncMaintenanceFile(ctx context.Context, path string, now time.Time) {
+	b, err := readBoundedFile(path)
+	var ws []maintenanceWindow
+	if err == nil {
+		ws, err = parseMaintenance(b)
+	}
+	if c.fileError(&c.maintenanceErr, "maintenance_file", path, err) {
+		return
+	}
+	key := windowsKey(ws)
+	if key == c.windowsKey && now.Sub(c.windowsSynced) < maintenanceResync {
+		return
+	}
+	if err := c.store.syncMaintenance(ctx, ws); err != nil {
+		c.log.Warn("writing the maintenance windows to PostgreSQL", zap.Error(err))
+		return
+	}
+	c.windowsKey, c.windowsSynced = key, now
 }
 
 // fileError logs an error reading the file of an option when it differs
