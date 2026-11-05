@@ -254,56 +254,9 @@ func (b *hostBatch) addMetric(m pmetric.Metric) {
 	switch name {
 	case metricConnOpened, metricConnFailed, metricConnCount, metricNetworkIO, metricUDPDatagrams, metricRetransmits,
 		metricSynRetransmits, metricConnFailedByReason:
-		if m.Type() != pmetric.MetricTypeSum {
-			b.invalid++
-			return
-		}
-		dps := m.Sum().DataPoints()
-		for i := range dps.Len() {
-			dp := dps.At(i)
-			b.observe(dp.Timestamp())
-			k := valueKey{metric: name}
-			switch name {
-			case metricNetworkIO, metricUDPDatagrams:
-				// Another direction than the agents send is output as
-				// _OTHER (outDirection).
-				k.dir = getString(dp.Attributes(), attrIODirection)
-			case metricConnFailedByReason:
-				if k.errType = getString(dp.Attributes(), attrErrorType); k.errType == "" {
-					b.invalid++
-					continue
-				}
-			}
-			e := b.edge(dp.Attributes())
-			if e == nil {
-				continue
-			}
-			e.values[k] = point{start: dp.StartTimestamp(), time: dp.Timestamp(), value: numberValue(dp)}
-		}
+		b.addSums(m, name)
 	case metricRTT, metricHandshake:
-		if m.Type() != pmetric.MetricTypeHistogram {
-			b.invalid++
-			return
-		}
-		dps := m.Histogram().DataPoints()
-		for i := range dps.Len() {
-			dp := dps.At(i)
-			b.observe(dp.Timestamp())
-			p := point{start: dp.StartTimestamp(), time: dp.Timestamp(), value: dp.Sum(), count: dp.Count()}
-			if name == metricHandshake {
-				// The buckets of an agent with other bounds would not add
-				// up with those of the others.
-				if !slices.Equal(dp.ExplicitBounds().AsRaw(), handshakeBounds) ||
-					dp.BucketCounts().Len() != len(handshakeBounds)+1 {
-					b.invalid++
-					continue
-				}
-				p.buckets = dp.BucketCounts().AsRaw()
-			}
-			if e := b.edge(dp.Attributes()); e != nil {
-				e.values[valueKey{metric: name}] = p
-			}
-		}
+		b.addHistograms(m, name)
 	case metricEdgeFirst, metricEdgeLast:
 		forGauge(b, m, func(dp pmetric.NumberDataPoint, t time.Time) {
 			if e := b.edge(dp.Attributes()); e != nil {
@@ -335,31 +288,94 @@ func (b *hostBatch) addMetric(m pmetric.Metric) {
 			}
 		})
 	default:
-		if !strings.HasPrefix(name, metricAgentPrefix) {
-			return
+		if strings.HasPrefix(name, metricAgentPrefix) {
+			b.addAgent(m, name)
 		}
+	}
+}
+
+// addSums decodes the points of m, a sum of the edges named name.
+func (b *hostBatch) addSums(m pmetric.Metric, name string) {
+	if m.Type() != pmetric.MetricTypeSum {
+		b.invalid++
+		return
+	}
+	dps := m.Sum().DataPoints()
+	for i := range dps.Len() {
+		dp := dps.At(i)
+		b.observe(dp.Timestamp())
+		k := valueKey{metric: name}
 		switch name {
-		case metricAgentSegmentStart:
-			forGauge(b, m, func(_ pmetric.NumberDataPoint, t time.Time) { b.segmentStart = t })
-			return
-		case metricAgentUDPTraced:
-			forGauge(b, m, func(dp pmetric.NumberDataPoint, _ time.Time) { b.udpTraced = numberValue(dp) != 0 })
-		case metricAgentUp:
-			b.final = true
-			forGauge(b, m, func(dp pmetric.NumberDataPoint, _ time.Time) {
-				b.netnsScope = getString(dp.Attributes(), attrNetNSScope)
-			})
-		case metricAgentFlowsDropped:
-			if m.Type() == pmetric.MetricTypeSum && m.Sum().DataPoints().Len() > 0 {
-				dp := m.Sum().DataPoints().At(0)
-				b.dropped = int64(numberValue(dp))
-				if dp.StartTimestamp() != 0 {
-					b.droppedSince = dp.StartTimestamp().AsTime()
-				}
+		case metricNetworkIO, metricUDPDatagrams:
+			// Another direction than the agents send is output as
+			// _OTHER (outDirection).
+			k.dir = getString(dp.Attributes(), attrIODirection)
+		case metricConnFailedByReason:
+			if k.errType = getString(dp.Attributes(), attrErrorType); k.errType == "" {
+				b.invalid++
+				continue
 			}
 		}
-		b.addAgentMetric(m)
+		e := b.edge(dp.Attributes())
+		if e == nil {
+			continue
+		}
+		e.values[k] = point{start: dp.StartTimestamp(), time: dp.Timestamp(), value: numberValue(dp)}
 	}
+}
+
+// addHistograms decodes the points of m, a histogram of the edges named name.
+func (b *hostBatch) addHistograms(m pmetric.Metric, name string) {
+	if m.Type() != pmetric.MetricTypeHistogram {
+		b.invalid++
+		return
+	}
+	dps := m.Histogram().DataPoints()
+	for i := range dps.Len() {
+		dp := dps.At(i)
+		b.observe(dp.Timestamp())
+		p := point{start: dp.StartTimestamp(), time: dp.Timestamp(), value: dp.Sum(), count: dp.Count()}
+		if name == metricHandshake {
+			// The buckets of an agent with other bounds would not add
+			// up with those of the others.
+			if !slices.Equal(dp.ExplicitBounds().AsRaw(), handshakeBounds) ||
+				dp.BucketCounts().Len() != len(handshakeBounds)+1 {
+				b.invalid++
+				continue
+			}
+			p.buckets = dp.BucketCounts().AsRaw()
+		}
+		if e := b.edge(dp.Attributes()); e != nil {
+			e.values[valueKey{metric: name}] = p
+		}
+	}
+}
+
+// addAgent decodes m, a metric of the agent itself named name: what it tells
+// of the agent, and the metric to forward (addAgentMetric).
+// shawk.agent.segment.start is written to PostgreSQL only.
+func (b *hostBatch) addAgent(m pmetric.Metric, name string) {
+	switch name {
+	case metricAgentSegmentStart:
+		forGauge(b, m, func(_ pmetric.NumberDataPoint, t time.Time) { b.segmentStart = t })
+		return
+	case metricAgentUDPTraced:
+		forGauge(b, m, func(dp pmetric.NumberDataPoint, _ time.Time) { b.udpTraced = numberValue(dp) != 0 })
+	case metricAgentUp:
+		b.final = true
+		forGauge(b, m, func(dp pmetric.NumberDataPoint, _ time.Time) {
+			b.netnsScope = getString(dp.Attributes(), attrNetNSScope)
+		})
+	case metricAgentFlowsDropped:
+		if m.Type() == pmetric.MetricTypeSum && m.Sum().DataPoints().Len() > 0 {
+			dp := m.Sum().DataPoints().At(0)
+			b.dropped = int64(numberValue(dp))
+			if dp.StartTimestamp() != 0 {
+				b.droppedSince = dp.StartTimestamp().AsTime()
+			}
+		}
+	}
+	b.addAgentMetric(m)
 }
 
 // agentMetric describes a metric of the agent that is forwarded.

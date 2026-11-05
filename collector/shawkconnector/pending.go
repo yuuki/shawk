@@ -294,6 +294,33 @@ func (c *changes) add(b *hostBatch, now time.Time) {
 	}
 	h := c.host(b.key)
 	h.setHost(b.machineID, b.hostname, b.kernel, b.agentVersion, now)
+	f := c.advanceFloor(b, skew, now)
+	if !b.segmentStart.IsZero() && !b.limited {
+		start := b.segmentStart
+		if start.Before(f.start) {
+			start = f.start
+		}
+		s := sessionRow{lastHeartbeat: now, clockSkew: skew, udpTraced: b.udpTraced,
+			netnsScope: b.netnsScope, dropped: b.dropped, peerFold: b.peerFold, peerInternal: b.peerInternal}
+		s.countersStarted = b.droppedSince
+		h.addSession(start, s)
+	}
+	// The host holds its addresses as of the requests that close intervals,
+	// like its heartbeat.
+	if b.final {
+		for _, a := range b.addrs {
+			h.addAddr(a, span{now, now})
+		}
+	}
+	c.addEdges(b, h, latest, now)
+	c.addListeners(b, h, latest, now)
+	c.addTranslations(b, h, latest, now)
+}
+
+// advanceFloor updates the session floor of the host of a request received
+// at now, skew being how far the clock of the connector is ahead of the
+// clock of the agent, and returns it.
+func (c *changes) advanceFloor(b *hostBatch, skew time.Duration, now time.Time) sessionFloor {
 	f, ok := c.floors[b.key]
 	switch {
 	case !ok:
@@ -314,79 +341,47 @@ func (c *changes) add(b *hostBatch, now time.Time) {
 	}
 	f.skew, f.seen = skew, now
 	c.floors[b.key] = f
-	if !b.segmentStart.IsZero() && !b.limited {
-		start := b.segmentStart
-		if start.Before(f.start) {
-			start = f.start
-		}
-		s := sessionRow{lastHeartbeat: now, clockSkew: skew, udpTraced: b.udpTraced,
-			netnsScope: b.netnsScope, dropped: b.dropped, peerFold: b.peerFold, peerInternal: b.peerInternal}
-		s.countersStarted = b.droppedSince
-		h.addSession(start, s)
-	}
-	// The host holds its addresses as of the requests that close intervals,
-	// like its heartbeat.
-	if b.final {
-		for _, a := range b.addrs {
-			h.addAddr(a, span{now, now})
-		}
-	}
+	return f
+}
 
-	edges := c.acceptedEdges[b.key]
-	if edges == nil {
-		edges = map[edgeRowKey]acceptedSpan{}
-		c.acceptedEdges[b.key] = edges
-	}
+// addEdges records the edges of a request received at now, and their
+// processes, if they changed since they were last accepted for writing.
+// Their times are no later than latest.
+func (c *changes) addEdges(b *hostBatch, h *hostChanges, latest, now time.Time) {
+	edges := acceptedOf(c.acceptedEdges, b.key)
 	for _, e := range b.edges {
 		if e.last.IsZero() {
 			continue
 		}
-		s := span{e.first, e.last}
-		if s.first.IsZero() {
-			s.first = s.last
-		}
-		s = s.notAfter(latest)
+		s := observedSpan(e.first, e.last, latest)
 		pk := c.procKey(&e.id.process)
 		k := edgeRowKey{role: e.id.role, proto: e.id.proto, local: e.id.local, peer: e.id.peer, folded: e.id.folded,
 			port: e.id.port, netns: e.id.netns, procKey: pk}
-		acc, ok := edges[k]
-		changed := !ok || s.first.Before(acc.first) || s.last.After(acc.last)
-		acc.span.merge(s)
-		acc.seen = now
-		edges[k] = acc
-		if !changed {
+		if !accept(edges, k, s, now) {
 			continue
 		}
 		h.addProcess(pk, e.id.exe, s)
 		h.addEdge(k, s)
 	}
+}
 
-	listeners := c.acceptedListeners[b.key]
-	if listeners == nil {
-		listeners = map[listenerRowKey]acceptedSpan{}
-		c.acceptedListeners[b.key] = listeners
-	}
+// addListeners records the listeners of a request received at now, and
+// their processes, if they changed since they were last accepted for
+// writing. Their times are no later than latest.
+func (c *changes) addListeners(b *hostBatch, h *hostChanges, latest, now time.Time) {
+	listeners := acceptedOf(c.acceptedListeners, b.key)
 	for _, l := range b.listeners {
 		if l.last.IsZero() {
 			continue
 		}
-		s := span{l.first, l.last}
-		if s.first.IsZero() {
-			s.first = s.last
-		}
-		s = s.notAfter(latest)
+		s := observedSpan(l.first, l.last, latest)
 		k := listenerRowKey{proto: l.id.proto, addr: l.id.addr, port: l.id.port, netns: l.id.netns}
 		if l.id.unit != "" || l.id.comm != "" {
 			k.procKey = c.procKey(&l.id.process)
 		}
-		acc, ok := listeners[k]
 		// A listener's last_seen advances at every request; write it once
 		// per interval like the edges.
-		changed := !ok || s.first.Before(acc.first) || s.last.After(acc.last)
-		acc.span.merge(s)
-		acc.seen = now
-		listeners[k] = acc
-		if !changed {
+		if !accept(listeners, k, s, now) {
 			continue
 		}
 		if k.procKey != (procKey{}) {
@@ -394,30 +389,53 @@ func (c *changes) add(b *hostBatch, now time.Time) {
 		}
 		h.addListener(k, s)
 	}
+}
 
-	xlats := c.acceptedTranslations[b.key]
-	if xlats == nil {
-		xlats = map[translationID]acceptedSpan{}
-		c.acceptedTranslations[b.key] = xlats
-	}
+// addTranslations records the translations of a request received at now if
+// they changed since they were last accepted for writing. Their times are
+// no later than latest.
+func (c *changes) addTranslations(b *hostBatch, h *hostChanges, latest, now time.Time) {
+	xlats := acceptedOf(c.acceptedTranslations, b.key)
 	for _, x := range b.translations {
 		if x.last.IsZero() {
 			continue
 		}
-		s := span{x.first, x.last}
-		if s.first.IsZero() {
-			s.first = s.last
-		}
-		s = s.notAfter(latest)
-		acc, ok := xlats[x.id]
-		changed := !ok || s.first.Before(acc.first) || s.last.After(acc.last)
-		acc.span.merge(s)
-		acc.seen = now
-		xlats[x.id] = acc
-		if changed {
+		s := observedSpan(x.first, x.last, latest)
+		if accept(xlats, x.id, s, now) {
 			h.addTranslation(x.id, s)
 		}
 	}
+}
+
+// acceptedOf returns the spans last accepted for writing of a host.
+func acceptedOf[K comparable](m map[string]map[K]acceptedSpan, host string) map[K]acceptedSpan {
+	acc := m[host]
+	if acc == nil {
+		acc = map[K]acceptedSpan{}
+		m[host] = acc
+	}
+	return acc
+}
+
+// observedSpan is the span of an observation first and last seen at those
+// times, first being zero if not known, and no later than latest.
+func observedSpan(first, last, latest time.Time) span {
+	s := span{first, last}
+	if s.first.IsZero() {
+		s.first = s.last
+	}
+	return s.notAfter(latest)
+}
+
+// accept records that the span s of k was reported at now, and tells
+// whether it changes what was last accepted for writing.
+func accept[K comparable](accepted map[K]acceptedSpan, k K, s span, now time.Time) bool {
+	acc, ok := accepted[k]
+	changed := !ok || s.first.Before(acc.first) || s.last.After(acc.last)
+	acc.span.merge(s)
+	acc.seen = now
+	accepted[k] = acc
+	return changed
 }
 
 // take returns the pending changes and starts new ones.
