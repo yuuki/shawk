@@ -356,7 +356,7 @@ ON CONFLICT (host_id, started_at) DO UPDATE SET
 
 // queueListeners writes the listeners of a host: a row per listener with
 // its latest owner, and a row per known owner of a listener, which keeps its
-// history when it changes hands and whether the kernel chose the port.
+// history when it changes hands and when the kernel last chose the port.
 func queueListeners(b *pgx.Batch, h *hostChanges) {
 	type listener struct {
 		proto string
@@ -375,7 +375,7 @@ func queueListeners(b *pgx.Batch, h *hostChanges) {
 	}
 	type owned struct {
 		span
-		kernelChosen bool
+		chosen time.Time // last seen with a port the kernel chose; zero if not
 	}
 	// The latest owner of a listener in this write; one whose owner is
 	// unknown at the end keeps the latest known one.
@@ -403,12 +403,14 @@ func queueListeners(b *pgx.Batch, h *hostChanges) {
 			owners[owner{l, k.procKey}] = o
 		}
 		o.span.merge(s)
-		o.kernelChosen = o.kernelChosen || k.kernelChosen
+		if k.kernelChosen && s.last.After(o.chosen) {
+			o.chosen = s.last
+		}
 	}
 	var units, comms, services, users, protos, addrs []string
 	var ports []int32
 	var netns []int64
-	var chosen []bool
+	var chosen []*time.Time // nil if the kernel did not choose the port
 	var firsts, lasts []time.Time
 	for k, o := range owners {
 		units = append(units, k.unit)
@@ -419,23 +421,28 @@ func queueListeners(b *pgx.Batch, h *hostChanges) {
 		addrs = append(addrs, k.addr.String())
 		ports = append(ports, int32(k.port))
 		netns = append(netns, int64(k.netns))
-		chosen = append(chosen, o.kernelChosen)
+		var c *time.Time
+		if !o.chosen.IsZero() {
+			c = &o.chosen
+		}
+		chosen = append(chosen, c)
 		firsts = append(firsts, o.first)
 		lasts = append(lasts, o.last)
 	}
 	if len(units) > 0 {
 		b.Queue(`
-INSERT INTO shawk.listener_owners AS o (host_id, process_id, proto, addr, port, netns, kernel_chosen, first_seen, last_seen)
-SELECT $1, p.id, u.proto, u.addr::inet, u.port, u.netns, u.k, u.f, u.l
+INSERT INTO shawk.listener_owners AS o (host_id, process_id, proto, addr, port, netns, first_seen, last_seen,
+                                        kernel_chosen_seen)
+SELECT $1, p.id, u.proto, u.addr::inet, u.port, u.netns, u.f, u.l, u.k
 FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::integer[], $9::bigint[],
-            $10::boolean[], $11::timestamptz[], $12::timestamptz[])
+            $10::timestamptz[], $11::timestamptz[], $12::timestamptz[])
   AS u(unit, comm, service, uid, proto, addr, port, netns, k, f, l)
 JOIN shawk.processes p ON p.host_id = $1 AND p.unit = u.unit AND p.comm = u.comm AND p.service_name = u.service
   AND coalesce(p.user_id, -1) = coalesce(nullif(u.uid, '')::bigint, -1)
 ON CONFLICT (host_id, proto, addr, port, netns, process_id) DO UPDATE SET
-  kernel_chosen = o.kernel_chosen OR excluded.kernel_chosen,
-  first_seen    = least(o.first_seen, excluded.first_seen),
-  last_seen     = greatest(o.last_seen, excluded.last_seen)`,
+  first_seen         = least(o.first_seen, excluded.first_seen),
+  last_seen          = greatest(o.last_seen, excluded.last_seen),
+  kernel_chosen_seen = greatest(o.kernel_chosen_seen, excluded.kernel_chosen_seen)`,
 			h.key, units, comms, services, users, protos, addrs, ports, netns, chosen, firsts, lasts)
 	}
 

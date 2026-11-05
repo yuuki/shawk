@@ -58,8 +58,8 @@ type edgeRowKey struct {
 
 // listenerRowKey identifies a listener and its owner: a listener that
 // changes hands has a row per owner, which keeps its history. kernelChosen
-// tells that the kernel chose the port; the row of the owner keeps whether
-// it did for any of the keys that differ only by it.
+// tells that the kernel chose the port; the row of the owner keeps when it
+// last did, of the keys that differ only by it.
 type listenerRowKey struct {
 	proto        string
 	addr         netip.Addr

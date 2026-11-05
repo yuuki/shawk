@@ -122,10 +122,11 @@ FROM shawk.listeners l LEFT JOIN shawk.processes p ON p.id = l.process_id`)
 	}
 }
 
-// TestPGListenerOwnersKernelChosen: listener_owners keeps whether the
-// kernel chose the port of a listener of the process: srun without
+// TestPGListenerOwnersKernelChosen: listener_owners keeps when the kernel
+// last chose the port of a listener of the process: srun without
 // SrunPortRange. Series of one listener and owner that differ by the flag
-// make one row, which keeps it once set, through replays too.
+// make one row; a later series without it advances last_seen only, so that
+// a process that binds the port it was given leaves kernel_chosen_ports.
 func TestPGListenerOwnersKernelChosen(t *testing.T) {
 	c, sink, conn := pgConnector(t)
 	ctx := context.Background()
@@ -138,13 +139,19 @@ func TestPGListenerOwnersKernelChosen(t *testing.T) {
 		listeners: []tListener{srun(41823, true), srun(41823, false), srun(6817, false),
 			{proto: "udp", addr: "10.1.0.1", port: 45000, svc: "pmix", unit: "slurm/1/step_0", comm: "pmix", kernelChosen: true}}})
 	c.flush(ctx)
-	// A replay without the flag does not clear it.
+	// The port bound since, and a replay of the past.
+	replay := srun(41823, true)
+	replay.first, replay.last = now.Add(-time.Minute), now.Add(-time.Minute)
 	consume(t, c, sink, tAgent{host: "login01", machineID: "m-login", addrs: []string{"10.1.0.1"}, time: now,
-		listeners: []tListener{srun(41823, false)}})
+		listeners: []tListener{srun(41823, false), replay}})
+	if len(c.changes.pending) == 0 {
+		t.Fatal("nothing to write")
+	}
 	c.flush(ctx)
-	got := queryStrings(t, conn, `SELECT o.proto, o.port, p.comm, o.kernel_chosen
+	got := queryStrings(t, conn, `SELECT o.proto, o.port, p.comm,
+		coalesce(extract(epoch FROM o.last_seen - o.kernel_chosen_seen)::int::text, '-')
 		FROM shawk.listener_owners o JOIN shawk.processes p ON p.id = o.process_id`)
-	want := []string{"tcp 41823 srun true", "tcp 6817 srun false", "udp 45000 pmix true"}
+	want := []string{"tcp 41823 srun 60", "tcp 6817 srun -", "udp 45000 pmix 0"}
 	if !slices.Equal(got, want) {
 		t.Errorf("listener_owners = %q, want %q", got, want)
 	}

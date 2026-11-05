@@ -1184,8 +1184,8 @@ processes(id, host_id, unit, comm, exe, service_name, user_id, first_seen, last_
 edges(id, host_id, process_id, role, proto, local_addr, remote_addr, port, netns, first_seen, last_seen)
   -- remote_addr is the network 0.0.0.0/0 or ::/0 for folded peers
 listeners(host_id, process_id, proto, addr, port, netns, first_seen, last_seen)  -- the latest owner
-listener_owners(host_id, process_id, proto, addr, port, netns, kernel_chosen, first_seen, last_seen)
-  -- every known owner; kernel_chosen once the kernel chose the port (§5.3)
+listener_owners(host_id, process_id, proto, addr, port, netns, first_seen, last_seen, kernel_chosen_seen)
+  -- every known owner; kernel_chosen_seen when the kernel last chose the port (§5.3)
 peer_cidrs(prefix, name)  -- written by the connector from its peer_cidrs
 translations(name, side, proto, addr, port)  -- side virtual, backend or source; written by the connector (§5.4)
 inventory_hosts(host, slurm_node, roles, agent)  -- written by the connector from its inventory_file (§5.6)
@@ -1232,7 +1232,7 @@ names in PostgreSQL and Prometheus match.
 | `graph_nodes`, `graph_edges` | the dependency map between services in the format of the Grafana Node Graph; a peer without a service is named by `peer_class`, and a dependency on a port of `port_agnostic_services` or `dynamic_ports` (§5.3) has port 0 |
 | `peer_class(addr)` | the name of a peer without a known service, as in `service.peer.name`: the narrowest range of `peer_cidrs`, `~unresolved` for an address not routed on the Internet, `~external` otherwise, including the networks of folded peers |
 | `dependency_changes` | dependencies between services that appeared, or disappeared while a host that saw them kept observing for 15 minutes; port 0 for those of `port_agnostic_services` and `dynamic_ports` (§5.3), so that a run of srun on a new port is not new |
-| `kernel_chosen_ports` | a hint for the rules of ports (§5.3): the services that listened in the last 30 days on ports the kernel chose that no rule covers (`service`, `slurm_job` for processes of Slurm jobs, `proto`, `hosts`, `ports` distinct, `port_min`, `port_max`, `first_seen`, `last_seen`). A listener on an unspecified address is covered when a rule covers an address of its host. A UDP client socket taken for a server (§10) appears too |
+| `kernel_chosen_ports` | a hint for the rules of ports (§5.3): the services whose port the kernel chose in the last 30 days that no rule covers (`service`, `slurm_job` for processes of Slurm jobs, `proto`, `hosts`, `ports` distinct, `port_min`, `port_max`, `first_seen`, and `last_seen`, when the kernel last chose one). Rules apply to the address clients reach, so a listener on an unspecified address is covered only when they cover every address its host held meanwhile, but loopback and link-local; a process that binds the port it was given leaves after 30 days. A UDP client socket taken for a server (§10) appears too |
 | `service_endpoints` | addresses and ports services accept connections on: the last known listeners of each host (unspecified addresses expanded to the host's addresses) and its server edges, for hosts that reported in the last 30 days, except addresses another host took over since; `slurm_job` if a process of a Slurm job serves it; used by the connector (§5.2) |
 | `client_endpoints` | the client sides of connections in the last hour (client address, server address, port, client service, `slurm_job` if the client is a process of a Slurm job); used by the connector to name the peer of a server edge |
 | `agent_addrs` | addresses of hosts whose agent closed an interval in the last 5 minutes, with what the agent traces and folds; used by the connector |
