@@ -404,11 +404,12 @@ func (a *Agent) observe(snap *tracer.Snapshot, start, end time.Time) {
 	}
 	for _, l := range snap.Listeners {
 		a.state.AddListener(otlp.ListenerKey{
-			Proto:   l.Proto.String(),
-			Addr:    l.Addr,
-			Port:    l.Port,
-			NetNS:   l.NetNS,
-			Process: a.process(l.PID, l.Comm, l.CgroupID, l.Port, true, end),
+			Proto:        l.Proto.String(),
+			Addr:         l.Addr,
+			Port:         l.Port,
+			NetNS:        l.NetNS,
+			KernelChosen: l.KernelChosen,
+			Process:      a.process(l.PID, l.Comm, l.CgroupID, l.Port, true, end),
 		}, end)
 	}
 }

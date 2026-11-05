@@ -543,9 +543,12 @@ A failure reason is sent from its first occurrence on an edge, starting at
 that interval, so an edge does not carry six series of zeros and the
 connector takes the first value as new rather than as a baseline.
 
-Listeners are sent as `shawk.listener.first_seen`/`last_seen`, and
-translations (§3.7) as `shawk.translation.first_seen`/`last_seen` with the
-client, virtual, source and backend addresses and ports. The agent's own
+Listeners are sent as `shawk.listener.first_seen`/`last_seen`, with
+`shawk.port.kernel_chosen=true` when the kernel chose the port: the socket
+lacks `SOCK_BINDPORT_LOCK`, since it was bound to port 0 or listened
+without bind (§5.3). Translations (§3.7) are sent as
+`shawk.translation.first_seen`/`last_seen` with the client, virtual,
+source and backend addresses and ports. The agent's own
 metrics are `shawk.agent.up` (with `shawk.netns.scope`),
 `shawk.agent.segment.start`, `shawk.agent.udp.traced`, the drop counters
 `shawk.agent.flows.dropped`, `shawk.agent.cgroup_events.dropped`,
@@ -799,8 +802,13 @@ the host name; `host.id` and `host.name` are promoted to labels.
   of the connector that wrote them last, so connectors that share it need
   the same ones; one that finds others there, e.g. during a rolling update
   of the configuration, logs an error hourly. Ports chosen by the kernel
-  are not detected: a listener is seen only while the iterator lists it,
-  and a kernel-chosen port does not make the servers on it one service.
+  are a hint for the rules, not a rule: `shawk_v1.kernel_chosen_ports`
+  (§6.2), shown on the changes dashboard, lists the services that listened
+  on such ports in the last 30 days and that no rule covers, with how many
+  hosts and ports, so that operators can add them. Nothing is aggregated
+  by it, since a listener is seen only while the iterator lists it (an
+  srun of a few seconds may be missed) and a kernel-chosen port does not
+  make the servers on it one service.
 - Inputs are cumulative per peer address and outputs merge several, so the
   connector adds the increases of each input to its output, treating a
   decrease or new start time as a reset; an output never decreases when an
@@ -1193,7 +1201,8 @@ processes(id, host_id, unit, comm, exe, service_name, user_id, first_seen, last_
 edges(id, host_id, process_id, role, proto, local_addr, remote_addr, port, netns, first_seen, last_seen)
   -- remote_addr is the network 0.0.0.0/0 or ::/0 for folded peers
 listeners(host_id, process_id, proto, addr, port, netns, first_seen, last_seen)  -- the latest owner
-listener_owners(host_id, process_id, proto, addr, port, netns, first_seen, last_seen)  -- every known owner
+listener_owners(host_id, process_id, proto, addr, port, netns, first_seen, last_seen, kernel_chosen_seen)
+  -- every known owner; kernel_chosen_seen when the kernel last chose the port (§5.3)
 peer_cidrs(prefix, name)  -- written by the connector from its peer_cidrs
 translations(name, side, proto, addr, port)  -- side virtual, backend or source; written by the connector (§5.4)
 inventory_hosts(host, slurm_node, roles, agent)  -- written by the connector from its inventory_file (§5.6)
@@ -1240,6 +1249,7 @@ names in PostgreSQL and Prometheus match.
 | `graph_nodes`, `graph_edges` | the dependency map between services in the format of the Grafana Node Graph; a peer without a service is named by `peer_class`, and a dependency on a port of `port_agnostic_services` or `dynamic_ports` (§5.3) has port 0 |
 | `peer_class(addr)` | the name of a peer without a known service, as in `service.peer.name`: the narrowest range of `peer_cidrs`, `~unresolved` for an address not routed on the Internet, `~external` otherwise, including the networks of folded peers |
 | `dependency_changes` | dependencies between services that appeared, or disappeared while a host that saw them kept observing for 15 minutes; port 0 for those of `port_agnostic_services` and `dynamic_ports` (§5.3), so that a run of srun on a new port is not new |
+| `kernel_chosen_ports` | a hint for the rules of ports (§5.3): the services whose port the kernel chose in the last 30 days that no rule covers (`service`, `slurm_job` for processes of Slurm jobs, `proto`, `hosts`, `ports` distinct, `port_min`, `port_max`, `first_seen`, and `last_seen`, when the kernel last chose one). Rules apply to the address clients reach, so a listener on an unspecified address is covered only when they cover every address its host held meanwhile, but loopback and link-local; a process that binds the port it was given leaves after 30 days. A UDP client socket taken for a server (§10) appears too |
 | `service_endpoints` | addresses and ports services accept connections on: the last known listeners of each host (unspecified addresses expanded to the host's addresses) and its server edges, for hosts that reported in the last 30 days, except addresses another host took over since; `slurm_job` if a process of a Slurm job serves it; used by the connector (§5.2) |
 | `client_endpoints` | the client sides of connections in the last hour (client address, server address, port, client service, `slurm_job` if the client is a process of a Slurm job); used by the connector to name the peer of a server edge |
 | `agent_addrs` | addresses of hosts whose agent closed an interval in the last 5 minutes, with what the agent traces and folds; used by the connector |
@@ -1369,7 +1379,10 @@ OBI exports every 60 seconds by default.
 
 Where the absence of a dependency is read (the changes dashboard, and the
 observation periods of the fleet dashboard), the panels say that only TCP
-and UDP are observed. The fleet dashboard shows the traffic of the RDMA
+and UDP are observed. Below the changes, the changes dashboard lists the
+services on ports the kernel chose that no rule of ports covers
+(`kernel_chosen_ports`, §5.3), over the last 30 days whatever the time
+range. The fleet dashboard shows the traffic of the RDMA
 ports of each host (`shawk.agent.rdma.io`) below the observation periods,
 as a hint only (§10).
 
@@ -1441,7 +1454,9 @@ only the protocols it parses. shawk runs beside it:
 - **UDP direction** (§3.3): peer-to-peer protocols where both sides send
   first are recorded as clients of each other's port. A client socket that
   existed before the agent started and receives before it sends again is
-  recorded as a server, unless it is connected on a port the kernel chose. A
+  recorded as a server, unless it is connected on a port the kernel chose;
+  unconnected on such a port, it is also listed in `kernel_chosen_ports`
+  (§5.3). A
   connected socket on a bound port cannot be told from a server connected to
   its client (socat, DTLS). A socket that is both client and server on its
   port, like ntpd, has the direction of its first datagram for all peers.
@@ -1474,7 +1489,9 @@ only the protocols it parses. shawk runs beside it:
   their `OTEL_` variables too, so a job can take the name of a service. Job
   ids are not kept (§6.1). A server whose port changes at every run makes a
   new dependency each time unless the rules of ports cover it (§5.3): ports
-  chosen by the kernel are not detected. Connections that end before the
+  chosen by the kernel are a hint for the rules
+  (`kernel_chosen_ports`), which misses listeners shorter than an
+  interval. Connections that end before the
   agent attached its programs are not observed, whatever the start order
   (§4.3). Node states map to hosts through the inventory, and alerts in
   Prometheus stop only for the states of a Slurm exporter, not for the

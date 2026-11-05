@@ -355,6 +355,111 @@ func TestUDP(t *testing.T) {
 	}
 }
 
+// TestListenerKernelChosen checks that listeners tell whether the kernel
+// chose their port: bind(2) to port 0 or listen(2) without bind, as srun
+// does without SrunPortRange, against bind(2) to a port.
+func TestListenerKernelChosen(t *testing.T) {
+	tr := newTestTracer(t)
+	find := func(t *testing.T, snap *Snapshot, proto Proto, port uint16) *Listener {
+		t.Helper()
+		for i := range snap.Listeners {
+			if l := &snap.Listeners[i]; l.Proto == proto && l.Port == port {
+				return l
+			}
+		}
+		t.Fatalf("%v listener %d not found in %+v", proto, port, snap.Listeners)
+		return nil
+	}
+
+	chosen := echoServer(t, "tcp4", "127.0.0.1:0")
+	bound := listenTCPFixedPort(t, "tcp4", "127.0.0.1")
+	// listen(2) without bind(2): the kernel binds the socket to a port of
+	// the unspecified address.
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { unix.Close(fd) })
+	if err := unix.Listen(fd, 1); err != nil {
+		t.Fatal(err)
+	}
+	sa, err := unix.Getsockname(fd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auto := uint16(sa.(*unix.SockaddrInet4).Port)
+
+	snap, err := tr.Collect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		port uint16
+		want bool
+	}{
+		{"bind to port 0", uint16(chosen.Addr().(*net.TCPAddr).Port), true},
+		{"bind to a port", uint16(bound.Addr().(*net.TCPAddr).Port), false},
+		{"listen without bind", auto, true},
+	} {
+		if l := find(t, snap, ProtoTCP, tc.port); l.KernelChosen != tc.want {
+			t.Errorf("TCP, %s: KernelChosen = %v, want %v", tc.name, l.KernelChosen, tc.want)
+		}
+	}
+
+	t.Run("udp", func(t *testing.T) {
+		requireUDP(t, tr)
+		// UDP server sockets are listed once they received first.
+		srvChosen, err := net.ListenPacket("udp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer srvChosen.Close()
+		srvBound := listenUDPFixedPort(t, "udp4", "127.0.0.1")
+		defer srvBound.Close()
+		for _, srv := range []net.PacketConn{srvChosen, srvBound} {
+			cli, err := net.DialUDP("udp4", nil, srv.LocalAddr().(*net.UDPAddr))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer cli.Close()
+			if _, err := cli.Write([]byte("x")); err != nil {
+				t.Fatal(err)
+			}
+			buf := make([]byte, 16)
+			srv.SetReadDeadline(time.Now().Add(time.Second))
+			if _, _, err := srv.ReadFrom(buf); err != nil {
+				t.Fatal(err)
+			}
+		}
+		snap, err := tr.Collect()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if l := find(t, snap, ProtoUDP, uint16(srvChosen.LocalAddr().(*net.UDPAddr).Port)); !l.KernelChosen {
+			t.Error("UDP, bind to port 0: KernelChosen = false, want true")
+		}
+		if l := find(t, snap, ProtoUDP, uint16(srvBound.LocalAddr().(*net.UDPAddr).Port)); l.KernelChosen {
+			t.Error("UDP, bind to a port: KernelChosen = true, want false")
+		}
+	})
+}
+
+// listenTCPFixedPort listens on an explicit port outside the ephemeral
+// range, as servers do.
+func listenTCPFixedPort(t *testing.T, network, host string) net.Listener {
+	t.Helper()
+	for port := 20000 + os.Getpid()%5000; port < 32000; port++ {
+		ln, err := net.Listen(network, net.JoinHostPort(host, strconv.Itoa(port)))
+		if err == nil {
+			t.Cleanup(func() { ln.Close() })
+			return ln
+		}
+	}
+	t.Fatal("no free TCP port")
+	return nil
+}
+
 // listenUDPFixedPort binds a UDP server socket to an explicit port outside
 // the ephemeral range, as UDP servers do.
 func listenUDPFixedPort(t *testing.T, network, host string) net.PacketConn {

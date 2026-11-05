@@ -60,8 +60,15 @@ func TestGoldenRequest(t *testing.T) {
 	if !hb.droppedSince.Equal(t0.Add(-time.Hour)) {
 		t.Errorf("dropped since %v", hb.droppedSince)
 	}
-	if len(hb.edges) != 4 || len(hb.listeners) != 2 {
+	if len(hb.edges) != 4 || len(hb.listeners) != 3 {
 		t.Fatalf("%d edges, %d listeners", len(hb.edges), len(hb.listeners))
+	}
+	// srun listens on a port the kernel chose, the other listeners on
+	// ports they were bound to.
+	for _, l := range hb.listeners {
+		if want := l.id.port == 41823; l.id.kernelChosen != want || (want && l.id.service != "srun") {
+			t.Errorf("listener %+v: kernel chosen %v, want %v", l.id, l.id.kernelChosen, want)
+		}
 	}
 	// An agent that folds the peers of its servers tells so, and sends their
 	// edges with a folded peer.

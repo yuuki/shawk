@@ -2,6 +2,7 @@ package shawkconnector
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"testing"
 	"time"
@@ -292,4 +293,97 @@ func TestPGPortAgnosticSlurmJobs(t *testing.T) {
 	if want := []string{"lmp lmp 0", "lmp sshd 22"}; !slices.Equal(got, want) {
 		t.Errorf("service_dependencies_between = %q, want %q", got, want)
 	}
+}
+
+// TestPGKernelChosenPorts: kernel_chosen_ports lists the services that
+// listened on ports the kernel chose in the last 30 days and that no rule
+// of ports covers, by service, processes of Slurm jobs and protocol. A
+// listener on an unspecified address is covered only when the rules cover
+// every address its host held meanwhile, but loopback and link-local.
+func TestPGKernelChosenPorts(t *testing.T) {
+	dsn, conn := migratedDB(t)
+	portRulesFixture(t, dsn)
+	f := fixture{t, conn}
+	f.host("node01", "srun", "sshd", "app")
+	f.host("node02")
+	f.host("login01", "mpi")
+	f.host("node03", "rank")
+	f.host("node04", "rank")
+	f.host("node05", "rank")
+	execAll(t, conn, `INSERT INTO shawk.host_addrs (host_id, addr, first_seen, last_seen) VALUES
+		('node01', '10.1.0.1', now() - interval '1 day', now()),
+		('node01', '127.0.0.1', now() - interval '1 day', now()),
+		('node01', 'fe80::1', now() - interval '1 day', now()),
+		('node02', '10.1.0.2', now() - interval '1 day', now()),
+		('login01', '10.2.0.1', now() - interval '1 day', now()),
+		('node03', '10.1.0.3', now() - interval '1 day', now()),
+		('node03', '192.168.1.3', now() - interval '1 day', now()),
+		('node04', '10.1.0.4', now() - interval '60 days', now() - interval '50 days'),
+		('node04', '10.2.0.4', now() - interval '1 day', now())`,
+		// The ranks of jobs and PMIx, processes of Slurm jobs.
+		`INSERT INTO shawk.processes (host_id, unit, comm, exe, service_name, first_seen, last_seen) VALUES
+		('node01', 'slurm/7/step_0', 'mpi', '', 'mpi', now() - interval '1 day', now()),
+		('node01', 'slurm/7/step_0', 'pmix', '', 'pmix', now() - interval '3 days', now()),
+		('node02', 'slurm/7/step_0', 'pmix', '', 'pmix', now() - interval '1 day', now())`)
+	// owner adds a listener of the process comm of unit on host; chosen is
+	// when the kernel last chose its port, NULL if never.
+	owner := func(host, unit, comm, proto, addr string, port int, first, last, chosen string) {
+		t.Helper()
+		execAll(t, conn, fmt.Sprintf(`INSERT INTO shawk.listener_owners
+			(host_id, process_id, proto, addr, port, netns, first_seen, last_seen, kernel_chosen_seen)
+			VALUES ('%s', (SELECT id FROM shawk.processes WHERE host_id = '%s' AND unit = '%s' AND comm = '%s'),
+			        '%s', '%s', %d, 1, %s, %s, %s)`,
+			host, host, unit, comm, proto, addr, port, first, last, chosen))
+	}
+	const hour, now = "now() - interval '1 hour'", "now()"
+	// Covered: srun by port_agnostic_services, ranks on the range of
+	// node01, also on an unspecified address of a host in the range, whose
+	// loopback and link-local addresses the range need not hold.
+	owner("node01", "srun.service", "srun", "tcp", "0.0.0.0", 41234, hour, now, now)
+	owner("node01", "slurm/7/step_0", "mpi", "tcp", "10.1.0.1", 61000, hour, now, now)
+	owner("node01", "slurm/7/step_0", "mpi", "tcp", "::", 62000, hour, now, now)
+	// Not covered: PMIx of a job on two hosts, a rank on a host outside the
+	// range, UDP outside the range, which is for TCP.
+	owner("node01", "slurm/7/step_0", "pmix", "tcp", "0.0.0.0", 45000,
+		"now() - interval '3 days'", "now() - interval '2 days'", "now() - interval '2 days'")
+	owner("node02", "slurm/7/step_0", "pmix", "tcp", "0.0.0.0", 45001, hour, now, now)
+	owner("node02", "slurm/7/step_0", "pmix", "tcp", "0.0.0.0", 45002, hour, now, now)
+	owner("login01", "mpi.service", "mpi", "tcp", "0.0.0.0", 61500, hour, now, now)
+	owner("node01", "slurm/7/step_0", "mpi", "udp", "10.1.0.1", 61000, hour, now, now)
+	// Not covered either: a host with an address outside the range besides
+	// one in it, a host whose address in the range is long gone, and a host
+	// whose addresses are unknown.
+	owner("node03", "rank.service", "rank", "tcp", "0.0.0.0", 61100, hour, now, now)
+	owner("node04", "rank.service", "rank", "tcp", "0.0.0.0", 61200, hour, now, now)
+	owner("node05", "rank.service", "rank", "tcp", "0.0.0.0", 61300, hour, now, now)
+	// Left out: a port bound by its server, and a port the kernel last chose
+	// 40 days ago, which the process has bound since.
+	owner("node01", "sshd.service", "sshd", "tcp", "0.0.0.0", 22, hour, now, "NULL")
+	owner("node01", "app.service", "app", "tcp", "0.0.0.0", 40000,
+		"now() - interval '41 days'", now, "now() - interval '40 days'")
+
+	q := `SELECT service, slurm_job, proto, hosts, ports, port_min, port_max,
+	             to_char(now() - first_seen, 'DD HH24:MI'), to_char(now() - last_seen, 'DD HH24:MI')
+	      FROM shawk_v1.kernel_chosen_ports`
+	check := func(name string, want ...string) {
+		t.Helper()
+		if got := queryStrings(t, conn, q); !slices.Equal(got, want) {
+			t.Errorf("kernel_chosen_ports %s = %q, want %q", name, got, want)
+		}
+	}
+	check("",
+		"mpi false tcp 1 1 61500 61500 00 01:00 00 00:00",
+		"mpi true udp 1 1 61000 61000 00 01:00 00 00:00",
+		"pmix true tcp 2 3 45000 45002 03 00:00 00 00:00",
+		"rank false tcp 3 3 61100 61300 00 01:00 00 00:00")
+	// slurm-job in port_agnostic_services covers the processes of jobs.
+	execAll(t, conn, `INSERT INTO shawk.port_agnostic_services VALUES ('slurm-job')`)
+	check("with slurm-job",
+		"mpi false tcp 1 1 61500 61500 00 01:00 00 00:00",
+		"rank false tcp 3 3 61100 61300 00 01:00 00 00:00")
+	// A range of the other network of node03 covers its listener.
+	execAll(t, conn, `INSERT INTO shawk.dynamic_ports VALUES ('mgmt', 'tcp', '192.168.0.0/16', 61000, 61999)`)
+	check("with the other network of node03",
+		"mpi false tcp 1 1 61500 61500 00 01:00 00 00:00",
+		"rank false tcp 2 2 61200 61300 00 01:00 00 00:00")
 }

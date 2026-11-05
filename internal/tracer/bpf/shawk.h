@@ -132,7 +132,12 @@ struct shawk_iter_rec {
 	__u8 type;
 	__u8 proto;
 	char comm[TASK_COMM_LEN];
-	__u32 _pad;
+	/*
+	 * Of a listener: 1 if the kernel chose its port, i.e. the socket was
+	 * not bound to a port (bind(2) to port 0, or listen(2) without bind).
+	 */
+	__u8 kernel_chosen;
+	__u8 _pad[3];
 	/*
 	 * Inode of the socket, which tells apart a listener replaced by another
 	 * on the same address; 0 for sockets of the kernel, which have no file.

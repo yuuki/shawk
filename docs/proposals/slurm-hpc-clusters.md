@@ -13,6 +13,7 @@ proposal, is in [docs/design.md](../design.md):
 | §2.1 to §2.3 processes of jobs | #173 | #185 | §4.1, §5.3 |
 | §2.4 users | #181 | #193 | §4.1, §6.1, §6.2 |
 | §3 dynamic ports | #174 | #187 | §5.3, §6.1, §6.2 |
+| §3.2 ports chosen by the kernel, a hint | #205 | #209 | §4.2, §5.3, §6.1, §6.2 |
 | §4 load on compute nodes | #172 | #195 | |
 | §5.1 inventory | #175 | #184 | §5.6 |
 | §5.2 node states | #177 | #191 | §5.7, §8 |
@@ -23,9 +24,9 @@ proposal, is in [docs/design.md](../design.md):
 §4 changed neither the agent nor the connector. Its measurements in a VM,
 and the guidance from them, are in
 [docs/research/hpc-compute-nodes/compute_nodes.md](../research/hpc-compute-nodes/compute_nodes.md);
-measuring on a real cluster is #206. Not implemented: the automatic
-detection of ports chosen by the kernel of §3.2 (#205). The operating
-guidance is in
+measuring on a real cluster is #206. Ports chosen by the kernel (§3.2,
+#205) are detected as a hint for the rules only, as proposed. The
+operating guidance is in
 [packaging/README.md](../../packaging/README.md#hpc-clusters).
 
 The target is a traditional HPC cluster: bare-metal hosts that are not added

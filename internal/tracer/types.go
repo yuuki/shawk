@@ -269,6 +269,11 @@ type Listener struct {
 	Addr  netip.Addr
 	Port  uint16
 	NetNS uint32
+	// KernelChosen tells that the kernel chose the port: the socket was not
+	// bound to a port (bind(2) to port 0, or listen(2) without bind), as
+	// srun does without SrunPortRange. Of a SO_REUSEPORT group, true if it
+	// is for any socket of the group.
+	KernelChosen bool
 	// Owner of the socket. PID is zero when the socket is owned by the
 	// kernel (Comm is then KernelComm) or the owner could not be resolved.
 	PID      uint32

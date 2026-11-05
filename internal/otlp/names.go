@@ -73,6 +73,7 @@ const (
 	AttrPeerFold     = "shawk.peer.fold"     // resource: which edges fold their peers: none, in or all
 	AttrPeerInternal = "shawk.peer.internal" // resource: the internal ranges, whose peers are kept
 	AttrServerPort   = "server.port"
+	AttrKernelChosen = "shawk.port.kernel_chosen" // listener: the kernel chose the port, sent only when true
 	AttrNetNS        = "shawk.netns"
 	AttrIODirection  = "network.io.direction"
 	AttrNetNSScope   = "shawk.netns.scope"

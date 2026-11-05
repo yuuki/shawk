@@ -125,6 +125,8 @@ type listenerID struct {
 	addr  netip.Addr
 	port  uint16
 	netns uint64
+	// kernelChosen tells that the kernel chose the port.
+	kernelChosen bool
 	process
 }
 
@@ -601,7 +603,8 @@ func (b *hostBatch) listener(a pcommon.Map) *listenerInput {
 		b.invalid++
 		return nil
 	}
-	id := listenerID{proto: proto, addr: addr.Unmap(), port: uint16(port), netns: uint64(netns), process: parseProcess(a)}
+	id := listenerID{proto: proto, addr: addr.Unmap(), port: uint16(port), netns: uint64(netns),
+		kernelChosen: getString(a, attrKernelChosen) == "true", process: parseProcess(a)}
 	l, ok := b.listeners[id]
 	if !ok {
 		l = &listenerInput{id: id}

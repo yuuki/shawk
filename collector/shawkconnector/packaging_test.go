@@ -291,6 +291,9 @@ func TestPGPackaged(t *testing.T) {
 			unit: "postgresql.service", opened: 1}}})
 	consume(t, c, sink, tAgent{host: "app-01", machineID: "m-app", addrs: []string{"10.0.0.11"}, time: now.Add(-time.Minute),
 		segment: now.Add(-2 * time.Hour),
+		// srun without SrunPortRange, on a port the kernel chose.
+		listeners: []tListener{{proto: "tcp", addr: "0.0.0.0", port: 41823, svc: "srun", comm: "srun", unit: "session-3.scope",
+			kernelChosen: true}},
 		edges: []tEdge{
 			{role: "client", proto: "tcp", local: "10.0.0.11", peer: "10.0.0.10", port: 5432, svc: "app", ns: "shop", comm: "puma", opened: 1,
 				first: now.Add(-10 * time.Minute)},
@@ -425,6 +428,7 @@ func TestPGPackaged(t *testing.T) {
 		"shawk-dependency.json/shawk / Dependency details/Dependencies in PostgreSQL/A#0",
 		"shawk-changes.json/shawk / Changes/Changes/A#0",
 		"shawk-changes.json/shawk / Changes/Changes per hour/A#0",
+		"shawk-changes.json/shawk / Changes/Listeners on ports the kernel chose/A#0",
 		"shawk-fleet.json/shawk / Fleet/Partly observed/Anno#0",
 		"shawk-fleet.json/shawk / Fleet/Partly observed periods in the time range/A#0",
 		"shawk-dependency.json/shawk / Dependency details/Partly observed/Anno#0",
