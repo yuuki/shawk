@@ -54,20 +54,21 @@ type bpfShawkFlowStats struct {
 }
 
 type bpfShawkIterRec struct {
-	_        structs.HostLayout
-	Addr     [16]uint8
-	CgroupId uint64
-	Netns    uint32
-	Pid      uint32
-	Port     uint16
-	Type     uint8
-	Proto    uint8
-	Comm     [16]int8
-	Pad      uint32
-	Ino      uint64
-	Path     [108]int8
-	PathLen  uint16
-	Pad2     uint16
+	_            structs.HostLayout
+	Addr         [16]uint8
+	CgroupId     uint64
+	Netns        uint32
+	Pid          uint32
+	Port         uint16
+	Type         uint8
+	Proto        uint8
+	Comm         [16]int8
+	KernelChosen uint8
+	Pad          [3]uint8
+	Ino          uint64
+	Path         [108]int8
+	PathLen      uint16
+	Pad2         uint16
 }
 
 type bpfShawkListenKey struct {

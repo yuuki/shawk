@@ -61,14 +61,17 @@ type edgeRowKey struct {
 
 // listenerRowKey identifies a listener and its owner: a listener that
 // changes hands has a row per owner, which keeps its history. A listener
-// of transportUnix has a path and no address.
+// of transportUnix has a path and no address. kernelChosen tells that the
+// kernel chose the port; the row of the owner keeps when it last did, of
+// the keys that differ only by it.
 type listenerRowKey struct {
-	proto   string
-	path    string
-	addr    netip.Addr
-	port    uint16
-	netns   uint64
-	procKey // zero if the owner is unknown
+	proto        string
+	path         string
+	addr         netip.Addr
+	port         uint16
+	netns        uint64
+	kernelChosen bool
+	procKey      // zero if the owner is unknown
 }
 
 type sessionRow struct {
@@ -383,7 +386,8 @@ func (c *changes) addListeners(b *hostBatch, h *hostChanges, latest, now time.Ti
 			continue
 		}
 		s := observedSpan(l.first, l.last, latest)
-		k := listenerRowKey{proto: l.id.proto, path: l.id.path, addr: l.id.addr, port: l.id.port, netns: l.id.netns}
+		k := listenerRowKey{proto: l.id.proto, path: l.id.path, addr: l.id.addr, port: l.id.port, netns: l.id.netns,
+			kernelChosen: l.id.kernelChosen}
 		if l.id.unit != "" || l.id.comm != "" {
 			k.procKey = c.procKey(&l.id.process)
 		}

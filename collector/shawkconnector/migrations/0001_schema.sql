@@ -155,20 +155,28 @@ CREATE INDEX listeners_process ON shawk.listeners (process_id);
 CREATE INDEX listeners_last_seen ON shawk.listeners (last_seen);
 
 -- Every known owner of a listener, so that the processes that listened on a
--- port before it changed hands are kept.
+-- port before it changed hands are kept. kernel_chosen_seen is when a
+-- socket of the process there last had a port the kernel chose, NULL if
+-- none did: the socket was not bound to a port (bind(2) to port 0, or
+-- listen(2) without bind), as srun does without SrunPortRange. It is a
+-- time rather than a flag, so that a process that later binds the same
+-- port leaves kernel_chosen_ports when its last such listener is old.
 CREATE TABLE shawk.listener_owners (
-  host_id    text NOT NULL REFERENCES shawk.hosts,
-  process_id bigint NOT NULL REFERENCES shawk.processes,
-  proto      text NOT NULL,
-  addr       inet NOT NULL,
-  port       integer NOT NULL,
-  netns      bigint NOT NULL,
-  first_seen timestamptz NOT NULL,
-  last_seen  timestamptz NOT NULL,
+  host_id            text NOT NULL REFERENCES shawk.hosts,
+  process_id         bigint NOT NULL REFERENCES shawk.processes,
+  proto              text NOT NULL,
+  addr               inet NOT NULL,
+  port               integer NOT NULL,
+  netns              bigint NOT NULL,
+  first_seen         timestamptz NOT NULL,
+  last_seen          timestamptz NOT NULL,
+  kernel_chosen_seen timestamptz,
   PRIMARY KEY (host_id, proto, addr, port, netns, process_id)
 );
 CREATE INDEX listener_owners_process ON shawk.listener_owners (process_id);
 CREATE INDEX listener_owners_last_seen ON shawk.listener_owners (last_seen);
+CREATE INDEX listener_owners_kernel_chosen ON shawk.listener_owners (kernel_chosen_seen)
+  WHERE kernel_chosen_seen IS NOT NULL;
 
 -- A dependency of a local process on a Unix socket of its host: agents
 -- trace the clients of Unix stream sockets only, since a socket has a name
@@ -1505,6 +1513,55 @@ UNION ALL
 SELECT last_seen, 'disappeared', client_service, server_service, port, proto
 FROM shawk.service_dependencies
 WHERE greatest(client_observed_until, server_observed_until) > last_seen + interval '15 minutes';
+
+-- Services that listened in the last 30 days on ports the kernel chose and
+-- that no rule of ports covers, by service, whether processes of Slurm
+-- jobs (slurm-job in port_agnostic_services) and protocol: a hint for the
+-- rules, since a server whose port changes at every run makes a new
+-- dependency each time. It is a hint only, and nothing is aggregated by
+-- it: listeners are seen while the iterator lists them, so short-lived
+-- ones are missed, and services on ports the kernel chose are not one
+-- service.
+--
+-- A listener is covered when dependency_port() gives 0 for each address
+-- clients may reach it at, as the dependencies on it are aggregated by the
+-- address of the server: its own address, or for an unspecified address
+-- every address its host held in the window while it listened (IPv4 ones
+-- for 0.0.0.0), but those of loopback and link-local, which a range of
+-- the network of the host leaves out; its own if the host held none.
+-- ports counts the distinct ports, which grow with runs; last_seen is when
+-- the kernel last chose the port of one of them.
+CREATE VIEW shawk_v1.kernel_chosen_ports AS
+WITH chosen AS (
+  SELECT o.host_id, o.process_id, o.proto, o.addr, o.port, o.netns, o.first_seen, o.kernel_chosen_seen,
+         p.service_name AS service, p.unit
+  FROM shawk.listener_owners o
+  JOIN shawk.processes p ON p.id = o.process_id
+  WHERE o.kernel_chosen_seen > now() - interval '30 days'
+),
+expanded AS (
+  -- Whether the rules cover every address at which clients may reach a
+  -- listener on an unspecified address; no row if its host held none.
+  SELECT c.host_id, c.process_id, c.proto, c.addr, c.port, c.netns,
+         bool_and(shawk.dependency_port(c.service, c.unit, a.addr, c.port, c.proto) = 0) AS covered
+  FROM chosen c
+  JOIN shawk.host_addrs a ON a.host_id = c.host_id
+   AND (c.addr = inet '::' OR family(a.addr) = 4)
+   AND a.first_seen <= c.kernel_chosen_seen + shawk.alive_window()
+   AND a.last_seen >= greatest(c.first_seen, now() - interval '30 days') - shawk.alive_window()
+   AND NOT (a.addr <<= inet '127.0.0.0/8' OR a.addr = inet '::1'
+            OR a.addr <<= inet '169.254.0.0/16' OR a.addr <<= inet 'fe80::/10')
+  WHERE c.addr IN (inet '0.0.0.0', inet '::')
+  GROUP BY c.host_id, c.process_id, c.proto, c.addr, c.port, c.netns
+)
+SELECT c.service, c.unit LIKE 'slurm/%' AS slurm_job, c.proto,
+       count(DISTINCT c.host_id) AS hosts, count(DISTINCT c.port) AS ports,
+       min(c.port) AS port_min, max(c.port) AS port_max,
+       min(c.first_seen) AS first_seen, max(c.kernel_chosen_seen) AS last_seen
+FROM chosen c
+LEFT JOIN expanded e USING (host_id, process_id, proto, addr, port, netns)
+WHERE NOT coalesce(e.covered, shawk.dependency_port(c.service, c.unit, c.addr, c.port, c.proto) = 0)
+GROUP BY c.service, c.unit LIKE 'slurm/%', c.proto;
 
 -- Agents ------------------------------------------------------------------
 

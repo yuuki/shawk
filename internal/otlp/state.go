@@ -125,6 +125,9 @@ type ListenerKey struct {
 	Addr  netip.Addr
 	Port  uint16
 	NetNS uint32
+	// KernelChosen tells that the kernel chose the port, which the socket
+	// was not bound to (tracer.Listener.KernelChosen).
+	KernelChosen bool
 	Process
 }
 

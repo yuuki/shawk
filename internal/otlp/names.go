@@ -78,12 +78,13 @@ const (
 	// listener whose network.transport is TransportUnix, whatever the role,
 	// like server.port: such series carry it instead of
 	// network.local.address, network.peer.address and server.port.
-	AttrServerAddr  = "server.address"
-	AttrNetNS       = "shawk.netns"
-	AttrIODirection = "network.io.direction"
-	AttrNetNSScope  = "shawk.netns.scope"
-	AttrBPFProgram  = "shawk.bpf.program"
-	AttrErrorType   = "error.type"
+	AttrServerAddr   = "server.address"
+	AttrKernelChosen = "shawk.port.kernel_chosen" // listener: the kernel chose the port, sent only when true
+	AttrNetNS        = "shawk.netns"
+	AttrIODirection  = "network.io.direction"
+	AttrNetNSScope   = "shawk.netns.scope"
+	AttrBPFProgram   = "shawk.bpf.program"
+	AttrErrorType    = "error.type"
 
 	// Attributes of a translation of addresses (see TranslationKey).
 	AttrTranslationClient      = "shawk.translation.client.address"

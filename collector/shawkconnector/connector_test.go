@@ -60,7 +60,7 @@ func TestGoldenRequest(t *testing.T) {
 	if !hb.droppedSince.Equal(t0.Add(-time.Hour)) {
 		t.Errorf("dropped since %v", hb.droppedSince)
 	}
-	if len(hb.edges) != 5 || len(hb.listeners) != 3 {
+	if len(hb.edges) != 5 || len(hb.listeners) != 4 {
 		t.Fatalf("%d edges, %d listeners", len(hb.edges), len(hb.listeners))
 	}
 	if hb.unixTraced == nil || !*hb.unixTraced {
@@ -92,6 +92,13 @@ func TestGoldenRequest(t *testing.T) {
 	if l := hb.listeners[listenerID{proto: transportUnix, path: "@app/control", netns: 4026531840, process: app}]; l == nil ||
 		!l.last.Equal(t0.Add(15*time.Second)) {
 		t.Errorf("Unix listener = %+v of %v", l, slices.Collect(maps.Keys(hb.listeners)))
+	}
+	// srun listens on a port the kernel chose, the other listeners on
+	// ports they were bound to.
+	for _, l := range hb.listeners {
+		if want := l.id.port == 41823; l.id.kernelChosen != want || (want && l.id.service != "srun") {
+			t.Errorf("listener %+v: kernel chosen %v, want %v", l.id, l.id.kernelChosen, want)
+		}
 	}
 	// An agent that folds the peers of its servers tells so, and sends their
 	// edges with a folded peer.

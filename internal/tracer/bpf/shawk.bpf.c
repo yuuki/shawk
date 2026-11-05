@@ -592,6 +592,19 @@ static __always_inline bool kernel_owned(struct sock *sk)
 }
 
 /*
+ * Whether a socket was bound to its port: bind(2) to a nonzero port sets
+ * SOCK_BINDPORT_LOCK, while a port the kernel chose, at bind(2) to port 0
+ * or at the autobind of listen(2), connect(2) or sendmsg(2), leaves it
+ * clear.
+ */
+static __always_inline bool port_bound(struct sock *sk)
+{
+	__u8 locks = BPF_CORE_READ_BITFIELD_PROBED(sk, sk_userlocks);
+
+	return locks & SOCK_BINDPORT_LOCK;
+}
+
+/*
  * Whether a listening socket may be the kernel's: one the kernel created,
  * other than the first subflow of an MPTCP listener, one without a file,
  * which no process can hold, or one the kernel uses, such as a socket that
@@ -1305,6 +1318,7 @@ static __always_inline void emit_listener(struct seq_file *seq,
 	rec.proto = proto;
 	rec.netns = netns;
 	rec.port = port;
+	rec.kernel_chosen = !port_bound(sk);
 	/* Zero when the socket has no file. */
 	rec.ino = BPF_CORE_READ(sk, sk_socket, file, f_inode, i_ino);
 	if (kernel_listener((struct sock *)sk, proto, rec.ino))
@@ -1491,13 +1505,6 @@ int shawk_iter_tcp(struct bpf_iter__tcp *ctx)
 }
 
 /* ---------------------------------------------------------------- UDP --- */
-
-static __always_inline bool port_bound(struct sock *sk)
-{
-	__u8 locks = BPF_CORE_READ_BITFIELD_PROBED(sk, sk_userlocks);
-
-	return locks & SOCK_BINDPORT_LOCK;
-}
 
 /*
  * The direction of a UDP socket is decided by its first datagram: a socket

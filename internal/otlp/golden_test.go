@@ -53,6 +53,10 @@ func goldenRequest() *colmetricspb.ExportMetricsServiceRequest {
 	s.AddListener(ListenerKey{Proto: TransportUnix, Path: "@app/control", NetNS: 4026531840, Process: app},
 		t0.Add(15*time.Second))
 	s.AddListener(ListenerKey{Proto: "udp", Addr: netip.MustParseAddr("0.0.0.0"), Port: 68, NetNS: 4026531840}, t0.Add(15*time.Second))
+	// srun without SrunPortRange listens on a port the kernel chose.
+	s.AddListener(ListenerKey{Proto: "tcp", Addr: netip.MustParseAddr("0.0.0.0"), Port: 41823, NetNS: 4026531840,
+		KernelChosen: true, Process: Process{Unit: "session-3.scope", Comm: "srun", Exe: "/opt/slurm/bin/srun", Service: "srun"}},
+		t0.Add(15*time.Second))
 	// kube-proxy on the host translates a ClusterIP to a pod, and
 	// masquerades a container that leaves with the address of the host.
 	s.AddTranslation(TranslationKey{Proto: "tcp", NetNS: 4026531840, Client: netip.MustParseAddr("10.0.0.11"),

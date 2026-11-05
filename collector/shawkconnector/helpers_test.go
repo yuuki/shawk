@@ -62,6 +62,7 @@ type tListener struct {
 	port                     int64
 	svc, ns, unit, comm, exe string
 	user                     string // process.user.id, not sent if empty
+	kernelChosen             bool   // shawk.port.kernel_chosen, sent only if true
 	first, last              time.Time
 }
 
@@ -311,6 +312,9 @@ func (ta tAgent) metrics() pmetric.Metrics {
 				netns = "4026531840"
 			}
 			dp.Attributes().PutStr(attrNetNS, netns)
+			if l.kernelChosen {
+				dp.Attributes().PutBool(attrKernelChosen, true)
+			}
 			dp.SetTimestamp(now)
 			dp.SetIntValue(t.Unix())
 		}
