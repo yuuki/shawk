@@ -192,41 +192,6 @@ CREATE TABLE shawk.translations (
   PRIMARY KEY (name, side, proto, addr, port)
 );
 
--- The static inventory of hosts (docs/design.md, section 5.6): the hosts
--- expected in a cluster whose hosts are known in advance, with all their
--- addresses, including hosts that cannot run an agent (storage appliances,
--- switches, BMCs). The connector writes it from its inventory_file, which
--- it reads every write interval, and replaces the rows in one transaction
--- when the contents change, so that readers see either the old inventory
--- or the new one. A host is named as its agent sends host.name.
-CREATE TABLE shawk.inventory_hosts (
-  host       text PRIMARY KEY,
-  slurm_node text UNIQUE,                  -- the NodeName of the host in Slurm; NULL if none
-  roles      text[] NOT NULL DEFAULT '{}', -- free text of the operator, sorted
-  agent      boolean NOT NULL DEFAULT true -- an agent is expected to run on the host
-);
-
--- Every address of every host of the inventory. An address belongs to one
--- host at most, so that an address maps to a host without ambiguity.
-CREATE TABLE shawk.inventory_addrs (
-  addr inet PRIMARY KEY CHECK (masklen(addr) = CASE family(addr) WHEN 4 THEN 32 ELSE 128 END),
-  host text NOT NULL REFERENCES shawk.inventory_hosts ON DELETE CASCADE
-);
-CREATE INDEX inventory_addrs_host ON shawk.inventory_addrs (host);
-
--- When the inventory was read. read_at is the latest time a connector read
--- the contents above from a valid file; when the file cannot be read or is
--- invalid the contents stay, and failed_at and error tell the latest
--- failure since. digest identifies the contents, so that a connector
--- writes them only when they change. One row at most.
-CREATE TABLE shawk.inventory_state (
-  singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
-  digest    text,                          -- NULL until a valid file was read
-  read_at   timestamptz,
-  failed_at timestamptz,                   -- NULL unless the latest read failed
-  error     text
-);
-
 -- Translations of addresses learned by the agents of the hosts that make
 -- them from conntrack: DNAT of Docker published ports and of kube-proxy,
 -- IPVS with net.ipv4.vs.conntrack=1, SNAT and masquerade. A row tells that
@@ -275,34 +240,6 @@ CREATE TABLE shawk.known_dependencies_state (
   refreshed_until timestamptz NOT NULL
 );
 
--- Rules of ports, written by the connector from its port_agnostic_services
--- and dynamic_ports. srun and salloc listen on a port chosen anew at every
--- run unless SrunPortRange is set, and slurmctld and slurmstepd connect to
--- it, so that every run would be a new dependency between services. The
--- edges keep their port: the direct match of shawk_v1.dependencies tells
--- the connections of different processes between two hosts apart by it.
--- The dependencies between services, and what appeared and disappeared,
--- are aggregated without the port (port 0) by these rules.
---
--- Services whose dependencies are aggregated without their port, by their
--- name as in service_name and peer_class.
-CREATE TABLE shawk.port_agnostic_services (
-  service text PRIMARY KEY
-);
-
--- Ranges of ports by host and protocol, such as the SrunPortRange of a
--- Slurm cluster: a dependency on a server whose address is in addr and
--- whose port is in [port_from, port_to] is aggregated without its port. A
--- range for every host has the rows 0.0.0.0/0 and ::/0.
-CREATE TABLE shawk.dynamic_ports (
-  name      text NOT NULL,
-  proto     text NOT NULL CHECK (proto IN ('tcp', 'udp')),
-  addr      cidr NOT NULL,
-  port_from integer NOT NULL CHECK (port_from BETWEEN 1 AND 65535),
-  port_to   integer NOT NULL CHECK (port_to BETWEEN port_from AND 65535),
-  PRIMARY KEY (name, proto, addr, port_from, port_to)
-);
-
 -- Helpers -----------------------------------------------------------------
 
 -- How long an agent can be silent and still be alive: a few write
@@ -341,26 +278,6 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
            OR addr <<= inet 'fc00::/7' OR addr <<= inet 'fe80::/10' OR addr = inet '::1'
            OR addr = inet '0.0.0.0' OR addr = inet '::'
          THEN '~unresolved' ELSE '~external' END)
-$$;
-
--- The port of a dependency between services: 0 for a server service of
--- port_agnostic_services (slurm-job there names the processes of Slurm
--- jobs, units slurm/*, as the connector names them as peers) or a server
--- address and port in a range of dynamic_ports, the port otherwise. It
--- runs with the rights of its owner, as peer_class, since the views of the
--- contract call it with the rights of their reader.
-CREATE FUNCTION shawk.dependency_port(server_service text, server_unit text, server_addr inet, port integer, proto text)
-RETURNS integer
-LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
-  SELECT CASE
-    WHEN EXISTS (SELECT FROM shawk.port_agnostic_services a
-                 WHERE a.service = dependency_port.server_service
-                    OR (a.service = 'slurm-job' AND dependency_port.server_unit LIKE 'slurm/%'))
-      OR EXISTS (SELECT FROM shawk.dynamic_ports r
-                 WHERE r.proto = dependency_port.proto
-                   AND dependency_port.port BETWEEN r.port_from AND r.port_to
-                   AND dependency_port.server_addr <<= r.addr)
-    THEN 0 ELSE dependency_port.port END
 $$;
 
 -- Addresses that several hosts held at the same time for more than 10
@@ -769,9 +686,8 @@ $$;
 -- Dependencies between services in [since, until]: a peer without a known
 -- service is named by peer_class, like in Prometheus, so that a service
 -- that talks to rotating addresses (a cloud API, the clients of a public
--- server) is one dependency rather than one per address, and the port is
--- that of dependency_port. Called by the functions below, with the rights
--- of their owner.
+-- server) is one dependency rather than one per address. Called by the
+-- functions below, with the rights of their owner.
 CREATE FUNCTION shawk.service_dependencies_between(since timestamptz, until timestamptz)
 RETURNS TABLE (
   client_service text, server_service text, port integer, proto text,
@@ -780,19 +696,14 @@ RETURNS TABLE (
   client_hosts text[], server_hosts text[])
 LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $$
 SELECT
-  n.client_service,
-  n.server_service,
-  shawk.dependency_port(n.server_service, d.server_unit, d.server_addr, d.port, d.proto),
-  d.proto,
+  coalesce(d.client_service, shawk_v1.peer_class(d.client_addr)),
+  coalesce(d.server_service, shawk_v1.peer_class(d.server_addr)),
+  d.port, d.proto,
   min(d.first_seen), max(d.last_seen),
   max(d.client_observed_until), max(d.server_observed_until),
   array_agg(DISTINCT d.client_host) FILTER (WHERE d.client_host IS NOT NULL),
   array_agg(DISTINCT d.server_host) FILTER (WHERE d.server_host IS NOT NULL)
 FROM shawk_v1.dependencies_between(since, until) d
-CROSS JOIN LATERAL (
-  SELECT coalesce(d.client_service, shawk_v1.peer_class(d.client_addr)) AS client_service,
-         coalesce(d.server_service, shawk_v1.peer_class(d.server_addr)) AS server_service
-) n
 GROUP BY 1, 2, 3, 4
 $$;
 
@@ -1188,21 +1099,17 @@ LEFT JOIN observed so ON so.host_id = t.s_host_id;
 -- service_dependencies_between.
 CREATE VIEW shawk.service_dependencies AS
 SELECT
-  n.client_service,
-  n.server_service,
-  shawk.dependency_port(n.server_service, d.server_unit, d.server_addr, d.port, d.proto) AS port,
-  d.proto,
-  min(d.first_seen)                             AS first_seen,
-  max(d.last_seen)                              AS last_seen,
-  max(d.client_observed_until)                  AS client_observed_until,
-  max(d.server_observed_until)                  AS server_observed_until,
-  array_agg(DISTINCT d.client_host) FILTER (WHERE d.client_host IS NOT NULL) AS client_hosts,
-  array_agg(DISTINCT d.server_host) FILTER (WHERE d.server_host IS NOT NULL) AS server_hosts
-FROM shawk_v1.dependencies d
-CROSS JOIN LATERAL (
-  SELECT coalesce(d.client_service, shawk_v1.peer_class(d.client_addr)) AS client_service,
-         coalesce(d.server_service, shawk_v1.peer_class(d.server_addr)) AS server_service
-) n
+  coalesce(client_service, shawk_v1.peer_class(client_addr)) AS client_service,
+  coalesce(server_service, shawk_v1.peer_class(server_addr)) AS server_service,
+  port,
+  proto,
+  min(first_seen)                             AS first_seen,
+  max(last_seen)                              AS last_seen,
+  max(client_observed_until)                  AS client_observed_until,
+  max(server_observed_until)                  AS server_observed_until,
+  array_agg(DISTINCT client_host) FILTER (WHERE client_host IS NOT NULL) AS client_hosts,
+  array_agg(DISTINCT server_host) FILTER (WHERE server_host IS NOT NULL) AS server_hosts
+FROM shawk_v1.dependencies
 GROUP BY 1, 2, 3, 4;
 
 -- Edges of the dependency map in the format of the Grafana Node Graph.
@@ -1290,41 +1197,6 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
   WHERE h.last_seen >= since;
 $$;
 
--- The periods in [since, until] in which no host of a name was observed:
--- unobserved() over the sessions of all the host ids with the same host
--- name. A host whose machine id changes at every boot (a stateless node
--- with an empty /etc/machine-id) becomes a new host id each time, and
--- unobserved() reports the time after the last heartbeat of each old id as
--- a gap although the name was observed throughout. Two machines that share
--- a name hide each other's gaps here; unobserved() tells them apart.
-CREATE FUNCTION shawk_v1.unobserved_by_name(since timestamptz, until timestamptz,
-                                            tolerance interval DEFAULT '3 minutes')
-RETURNS TABLE (host text, gap_start timestamptz, gap_end timestamptz)
-LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
-  WITH names AS (
-    SELECT h.hostname FROM shawk.hosts h GROUP BY h.hostname HAVING max(h.last_seen) >= since
-  ),
-  -- Only the sessions that meet [since, until], so that a short period does
-  -- not aggregate the sessions of the whole retention; an old host id whose
-  -- tolerance reaches into the period still counts.
-  observed AS (
-    SELECT h.hostname,
-           range_agg(tstzrange(least(s.started_at + s.clock_skew, s.last_heartbeat),
-                               s.last_heartbeat + tolerance)) AS observed
-    FROM shawk.agent_sessions s
-    JOIN shawk.hosts h ON h.id = s.host_id
-    WHERE s.last_heartbeat > since - tolerance
-      AND least(s.started_at + s.clock_skew, s.last_heartbeat) < until
-    GROUP BY h.hostname
-  )
-  SELECT n.hostname, lower(g), upper(g)
-  FROM names n
-  LEFT JOIN observed o ON o.hostname = n.hostname
-  CROSS JOIN LATERAL unnest(
-    tstzmultirange(tstzrange(since, until)) - coalesce(o.observed, '{}'::tstzmultirange)
-  ) AS g;
-$$;
-
 -- The periods in [since, until] in which a host was observed but its agent
 -- dropped flows, cut to [since, until], with the flow updates dropped in
 -- each. A dependency may be missing from such a period although it was
@@ -1337,50 +1209,6 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
   FROM shawk.partial_observations p
   JOIN shawk.hosts h ON h.id = p.host_id
   WHERE p.period_end > since AND p.period_start < until;
-$$;
-
--- Inventory ---------------------------------------------------------------
-
--- The hosts of the inventory with their addresses.
-CREATE VIEW shawk_v1.inventory AS
-SELECT h.host, h.slurm_node, h.roles, h.agent,
-       coalesce(array_agg(a.addr ORDER BY a.addr) FILTER (WHERE a.addr IS NOT NULL), '{}') AS addrs
-FROM shawk.inventory_hosts h
-LEFT JOIN shawk.inventory_addrs a ON a.host = h.host
-GROUP BY h.host;
-
--- The host of every address of the inventory, one row per address: join
--- an address on addr to name its host.
-CREATE VIEW shawk_v1.inventory_addrs AS
-SELECT a.addr, a.host, h.slurm_node, h.roles, h.agent
-FROM shawk.inventory_addrs a
-JOIN shawk.inventory_hosts h ON h.host = a.host;
-
--- When the inventory was read, the latest failure since, and how many
--- hosts it has. No row when no connector has an inventory_file.
-CREATE VIEW shawk_v1.inventory_status AS
-SELECT s.read_at, s.failed_at, s.error,
-       (SELECT count(*) FROM shawk.inventory_hosts) AS hosts
-FROM shawk.inventory_state s;
-
--- The hosts of the inventory expected to run an agent (agent is true)
--- whose agent never reported, within the retention: no host has their
--- name. seen_as names the hosts whose agents reported an address of the
--- inventory host, as an agent whose host.name differs from the inventory
--- (a short name instead of the FQDN) would.
-CREATE FUNCTION shawk_v1.never_observed()
-RETURNS TABLE (host text, slurm_node text, roles text[], seen_as text[])
-LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
-  SELECT i.host, i.slurm_node, i.roles,
-         coalesce((SELECT array_agg(DISTINCT h.hostname ORDER BY h.hostname)
-                   FROM shawk.inventory_addrs ia
-                   JOIN shawk.host_addrs a ON a.addr = ia.addr
-                   JOIN shawk.hosts h ON h.id = a.host_id
-                   WHERE ia.host = i.host), '{}')
-  FROM shawk.inventory_hosts i
-  WHERE i.agent
-    AND NOT EXISTS (SELECT FROM shawk.hosts h WHERE h.hostname = i.host)
-  ORDER BY i.host;
 $$;
 
 -- Views the connector reads to name peers -----------------------------------
@@ -1403,8 +1231,7 @@ $$;
 --
 -- exact tells whether the address was observed on a socket rather than
 -- inferred from a listener on an unspecified address; the connector prefers
--- exact endpoints. slurm_job tells that a process of a Slurm job (unit
--- slurm/*) serves it, which the connector names slurm-job as a peer.
+-- exact endpoints.
 CREATE VIEW shawk_v1.service_endpoints AS
 WITH latest AS (
   SELECT host_id, max(last_seen) AS last_seen FROM shawk.listeners GROUP BY host_id
@@ -1417,15 +1244,14 @@ current_addrs AS (
   WHERE a.last_seen >= m.last_seen - shawk.alive_window()
 ),
 s AS (
-  SELECT l.addr, l.port, l.proto, l.host_id, p.service_name AS service, l.last_seen, true AS exact,
-         p.unit LIKE 'slurm/%' AS slurm_job
+  SELECT l.addr, l.port, l.proto, l.host_id, p.service_name AS service, l.last_seen, true AS exact
   FROM shawk.listeners l
   JOIN shawk.processes p ON p.id = l.process_id
   JOIN latest ON latest.host_id = l.host_id
   WHERE l.addr NOT IN (inet '0.0.0.0', inet '::')
     AND l.last_seen >= latest.last_seen - interval '1 hour'
   UNION ALL
-  SELECT a.addr, l.port, l.proto, l.host_id, p.service_name, l.last_seen, false, p.unit LIKE 'slurm/%'
+  SELECT a.addr, l.port, l.proto, l.host_id, p.service_name, l.last_seen, false
   FROM shawk.listeners l
   JOIN shawk.processes p ON p.id = l.process_id
   JOIN latest ON latest.host_id = l.host_id
@@ -1434,7 +1260,7 @@ s AS (
   WHERE l.addr IN (inet '0.0.0.0', inet '::')
     AND l.last_seen >= latest.last_seen - interval '1 hour'
   UNION ALL
-  SELECT e.local_addr, e.port, e.proto, e.host_id, p.service_name, e.last_seen, true, p.unit LIKE 'slurm/%'
+  SELECT e.local_addr, e.port, e.proto, e.host_id, p.service_name, e.last_seen, true
   FROM latest
   CROSS JOIN LATERAL (
     SELECT DISTINCT ON (e.local_addr, e.port, e.proto, e.process_id) e.*
@@ -1456,7 +1282,7 @@ moved AS (
     AND NOT (mine.addr << inet '127.0.0.0/8' OR mine.addr = inet '::1')
 )
 SELECT s.addr, s.port, s.proto, h.hostname AS host, s.host_id, s.service, max(s.last_seen) AS last_seen,
-       bool_or(s.exact) AS exact, bool_or(s.slurm_job) AS slurm_job
+       bool_or(s.exact) AS exact
 FROM s
 JOIN shawk.hosts h ON h.id = s.host_id
 LEFT JOIN moved ON moved.host_id = s.host_id AND moved.addr = s.addr
@@ -1466,12 +1292,10 @@ GROUP BY s.addr, s.port, s.proto, h.hostname, s.host_id, s.service;
 
 -- The client sides of recent connections, used by the shawk connector to
 -- name the peer of a server edge after the client service, when the client
--- host runs an agent. slurm_job tells that the client is a process of a
--- Slurm job (unit slurm/*).
+-- host runs an agent.
 CREATE VIEW shawk_v1.client_endpoints AS
 SELECT e.local_addr AS client_addr, e.remote_addr AS server_addr, e.port, e.proto,
-       h.hostname AS host, e.host_id, p.service_name AS service, e.last_seen,
-       p.unit LIKE 'slurm/%' AS slurm_job
+       h.hostname AS host, e.host_id, p.service_name AS service, e.last_seen
 FROM shawk.edges e
 JOIN shawk.processes p ON p.id = e.process_id
 JOIN shawk.hosts h ON h.id = e.host_id
@@ -1526,37 +1350,6 @@ BEGIN
   GET DIAGNOSTICS n = ROW_COUNT;
   INSERT INTO shawk.known_dependencies_state (refreshed_until) VALUES (t)
   ON CONFLICT (id) DO UPDATE SET refreshed_until = excluded.refreshed_until;
-  RETURN n;
-END
-$$;
-
--- Adds the dependencies of known_dependencies on services of
--- port_agnostic_services to it under port 0, so that a dependency known
--- before its service was configured is not new under it, even once its
--- edges are gone. Ranges of dynamic_ports are not applied here: they hold
--- for addresses, which known_dependencies does not have, and a dependency
--- known only outside a range would hide one that is new in it. The
--- connector calls it when it changes the rules, and clears
--- known_dependencies_state, so that the next refresh rebuilds the table
--- from every edge kept under the new rules. It takes the lock of
--- refresh_known_dependencies, so that the two do not upsert the same rows
--- in different orders. It returns the rows upserted.
-CREATE FUNCTION shawk.aggregate_known_dependencies() RETURNS bigint
-LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
-DECLARE
-  n bigint;
-BEGIN
-  PERFORM pg_advisory_xact_lock(1936220536);  -- 0x73686178, see refresh_known_dependencies
-  INSERT INTO shawk.known_dependencies AS k (client_service, server_service, port, proto, first_seen, last_seen)
-  SELECT d.client_service, d.server_service, 0, d.proto, min(d.first_seen), max(d.last_seen)
-  FROM shawk.known_dependencies d
-  WHERE d.port <> 0
-    AND EXISTS (SELECT FROM shawk.port_agnostic_services a WHERE a.service = d.server_service)
-  GROUP BY d.client_service, d.server_service, d.proto
-  ON CONFLICT (client_service, server_service, port, proto) DO UPDATE SET
-    first_seen = least(k.first_seen, excluded.first_seen),
-    last_seen  = greatest(k.last_seen, excluded.last_seen);
-  GET DIAGNOSTICS n = ROW_COUNT;
   RETURN n;
 END
 $$;

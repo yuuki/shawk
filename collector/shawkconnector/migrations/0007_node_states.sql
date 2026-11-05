@@ -2,10 +2,10 @@
 -- which stopped agents are planned (docs/design.md §5.7).
 --
 -- The shawk connector writes them from its node_states_file, which a cron
--- job generates from Slurm (scontrol show nodes --json) and which lists the
--- maintenance windows registered explicitly. They are kept as periods with
--- times, apart from the hosts, so that the reason of a past gap is the state
--- at that time, not today's.
+-- job generates from Slurm (scontrol show nodes --json), and from its
+-- maintenance_file, which lists the maintenance windows registered
+-- explicitly. They are kept as periods with times, apart from the hosts, so
+-- that the reason of a past gap is the state at that time, not today's.
 
 -- Tables ------------------------------------------------------------------
 
