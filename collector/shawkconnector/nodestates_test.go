@@ -2,6 +2,7 @@ package shawkconnector
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -327,5 +328,151 @@ func TestMaintenanceResync(t *testing.T) {
 	c.syncNodeStates(ctx)
 	if st.windowSyncs != 2 {
 		t.Errorf("after %s: %d writes", maintenanceResync, st.windowSyncs)
+	}
+}
+
+// TestNodeStatesStaleAgain: states as old as nodeStateMaxAge are written,
+// older ones are stale. Staleness is logged again once states that are not
+// stale were read since, whether they were written or were not newer than
+// those written, as an older copy of the file put back.
+func TestNodeStatesStaleAgain(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "node-states.yaml")
+	generated := func(at time.Time) {
+		t.Helper()
+		doc := "generated_at: " + at.Format(time.RFC3339) + "\nnodes: [{host: cn001, state: IDLE}]\n"
+		if err := os.WriteFile(file, []byte(doc), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	generated(t0)
+	c, st, _, now := testConnector(t, func(cfg *Config) { cfg.NodeStatesFile = file })
+	logs := observe(c)
+	ctx := context.Background()
+	check := func(step string, writes, stale int) {
+		t.Helper()
+		if n := logs.FilterMessageSnippet("are stale").Len(); len(st.nodeStates) != writes || n != stale {
+			t.Errorf("%s: %d writes, stale logged %d times; want %d and %d", step, len(st.nodeStates), n, writes, stale)
+		}
+	}
+	check("at start", 1, 0)
+
+	generated(t0.Add(time.Minute))
+	*now = t0.Add(time.Minute + nodeStateMaxAge)
+	c.syncNodeStates(ctx)
+	check("as old as the maximum", 2, 0)
+	*now = now.Add(time.Second)
+	c.syncNodeStates(ctx)
+	check("older", 2, 1)
+
+	// Newer states are written; once stale, they are logged again.
+	generated(*now)
+	c.syncNodeStates(ctx)
+	check("newer", 3, 1)
+	*now = now.Add(nodeStateMaxAge + time.Second)
+	c.syncNodeStates(ctx)
+	check("newer, stale", 3, 2)
+
+	// States not newer than those written, as the copy of an older file
+	// put back, are not written; stale again after them, they are logged
+	// again.
+	generated(*now)
+	c.syncNodeStates(ctx)
+	check("newer again", 4, 2)
+	older := now.Add(-nodeStateMaxAge - time.Second)
+	generated(older)
+	c.syncNodeStates(ctx)
+	check("an older copy", 4, 3)
+	generated(*now)
+	c.syncNodeStates(ctx)
+	check("not newer", 4, 3)
+	generated(older)
+	c.syncNodeStates(ctx)
+	check("the older copy again", 4, 4)
+}
+
+// TestUnknownNodesAfterError: a node_states_file that cannot be read
+// forgets the nodes it left out, which are logged again once it is read
+// again, and its reading is not written again for them. Once the inventory
+// maps every node, nothing is logged.
+func TestUnknownNodesAfterError(t *testing.T) {
+	dir := t.TempDir()
+	invFile := filepath.Join(dir, "inventory.yaml")
+	statesFile := filepath.Join(dir, "node-states.yaml")
+	write := func(file, doc string) {
+		t.Helper()
+		if err := os.WriteFile(file, []byte(doc), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	states := "generated_at: 2026-10-31T12:00:00Z\nnodes: [{node: n1, state: IDLE}, {node: n9, state: IDLE}]\n"
+	write(invFile, "hosts: [{name: cn001.hpc.example, slurm_node: n1, addrs: [10.0.1.1]}]\n")
+	write(statesFile, states)
+	c, st, _, _ := testConnector(t, func(cfg *Config) {
+		cfg.InventoryFile = invFile
+		cfg.NodeStatesFile = statesFile
+	})
+	logs := observe(c)
+	ctx := context.Background()
+	unknown := func() []string {
+		var out []string
+		for _, e := range logs.TakeAll() {
+			if strings.Contains(e.Message, "does not map") {
+				out = append(out, fmt.Sprint(e.ContextMap()["nodes"]))
+			}
+		}
+		return out
+	}
+	if len(st.nodeStates) != 1 || c.unknownNodes != "n9" {
+		t.Fatalf("at start: states %v, unknown nodes %q", st.nodeStates, c.unknownNodes)
+	}
+	write(statesFile, "nodes: []\n")
+	c.prepare(ctx)
+	write(statesFile, states)
+	c.prepare(ctx)
+	if got := unknown(); len(st.nodeStates) != 1 || !slices.Equal(got, []string{"[n9]"}) {
+		t.Errorf("read again: states %v, unknown nodes logged %v", st.nodeStates, got)
+	}
+	write(invFile, "hosts: [{name: cn001.hpc.example, slurm_node: n1, addrs: [10.0.1.1]},"+
+		" {name: cn009.hpc.example, slurm_node: n9, addrs: [10.0.1.9]}]\n")
+	c.prepare(ctx)
+	if got := unknown(); len(st.nodeStates) != 2 || len(st.nodes) != 2 || len(got) != 0 || c.unknownNodes != "" {
+		t.Errorf("all mapped: states %v %+v, unknown nodes logged %v, held %q", st.nodeStates, st.nodes, got, c.unknownNodes)
+	}
+}
+
+// TestMaintenanceFileInvalid: the maintenance windows are written again
+// maintenanceResync after they last were, and not before. A
+// maintenance_file that becomes invalid leaves those written from it, also
+// once they are due to be written again.
+func TestMaintenanceFileInvalid(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "maintenance.yaml")
+	windows := "maintenance: [{hosts: [cn001], start: 2026-11-01T00:00:00Z, end: 2026-11-02T00:00:00Z}]\n"
+	write := func(doc string) {
+		t.Helper()
+		if err := os.WriteFile(file, []byte(doc), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(windows)
+	c, st, _, now := testConnector(t, func(cfg *Config) { cfg.MaintenanceFile = file })
+	ctx := context.Background()
+	for _, step := range []struct {
+		name   string
+		after  time.Duration
+		doc    string
+		writes int
+	}{
+		{"just before the resync", maintenanceResync - time.Nanosecond, windows, 1},
+		{"at the resync", maintenanceResync, windows, 2},
+		{"after the resync", maintenanceResync + time.Minute, windows, 2},
+		{"invalid", 2 * maintenanceResync, "maintenance: [{hosts: [cn001]}]\n", 2},
+		{"valid again", 2 * maintenanceResync, windows, 3},
+	} {
+		write(step.doc)
+		*now = t0.Add(step.after)
+		c.syncNodeStates(ctx)
+		if st.windowSyncs != step.writes || len(st.windows) != 1 {
+			t.Errorf("%s: %d writes of %+v, want %d of one window", step.name, st.windowSyncs, st.windows, step.writes)
+		}
 	}
 }
