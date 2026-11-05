@@ -83,9 +83,8 @@ SELECT pg_cancel_backend(pid) FROM pg_stat_activity
 WHERE usename = 'shawk_grafana' AND state = 'active' AND now() - query_start > interval '1 minute';
 ```
 
-A database created by the first build of v0.8.0 (before
-`0001_schema.sql`) or by a development build with other migrations is
-refused. Back it up if you need its history
+A database created by v0.8.0 or a development build before
+`0001_schema.sql` is refused. Back it up if you need its history
 (`pg_dump -n shawk -n shawk_v1`), drop it (`DROP SCHEMA shawk, shawk_v1
 CASCADE`, which also drops your own views on them), then migrate and run
 `grants.sql` again.

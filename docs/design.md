@@ -1156,13 +1156,10 @@ Slurm partitions and states are not labels of the metrics of shawk.
 
 PostgreSQL 14 or later (multiranges). The schema ships with the connector
 as SQL migrations (`collector/shawkconnector/migrations`), applied by
-`shawk-migrate` or by the connector with `postgres.migrate`. A migration
-that was released is never changed, since databases that applied it do
-not apply it again: a change of the schema is a new migration. A schema
-from the first build of v0.8.0 (before `0001_schema.sql`) or from a
-development build with other migrations is refused, with an error that
-says to drop the schemas `shawk` and `shawk_v1` (losing their history)
-and migrate again. A database is set up with
+`shawk-migrate` or by the connector with `postgres.migrate`. A schema from
+v0.8.0 or a development build before `0001_schema.sql` is refused, with an
+error that says to drop the schemas `shawk` and `shawk_v1` (losing their
+history) and migrate again. A database is set up with
 `packaging/postgres/setup.sql`, then `shawk-migrate`, then `grants.sql`,
 which must be run again after every `shawk-migrate` that applies migrations.
 
@@ -1200,12 +1197,10 @@ different users with the same unit, comm and service have rows of their
 own: rows grow with users, not with jobs. `user_id` is NULL for other
 processes, and for processes of jobs whose user is unknown: the agent
 could not read it or does not send it (`-job-users`), the connector does
-not keep it, or the row was written before. Migration 0005 added it,
-leaving the rows before with NULL; PostgreSQL 14 has no `NULLS NOT
-DISTINCT`, so the identity is a unique index on `coalesce(user_id, -1)`.
-Connectors from before it upsert on the former key, and their writes fail
-until they are upgraded. Job ids are not kept: edges have only their first
-and last times, so joining them with slurmdbd cannot split them by job.
+not keep it, or the row was written before. PostgreSQL 14 has no `NULLS
+NOT DISTINCT`, so the identity is a unique index on `coalesce(user_id,
+-1)`. Job ids are not kept: edges have only their first and last times, so
+joining them with slurmdbd cannot split them by job.
 
 `known_dependencies` keeps every dependency between services ever seen,
 refreshed every 5 minutes (`shawk.refresh_known_dependencies()`). When the
@@ -1255,8 +1250,8 @@ the activity of the jobs of other users, and every viewer of Grafana can
 send SQL through the data source, so the users are for administrators in
 this version. `grants.sql` takes the view back from the connector and
 Grafana in the transaction that grants them the rest of `shawk_v1`, so
-that no session sees them on it in between, and migration 0005 revokes
-what default privileges granted as it was created. Only the owner reads
+that no session sees them on it in between, and the schema revokes what
+default privileges grant as it creates the view. Only the owner reads
 it, or a role of administrators the owner grants it to. The rest of the
 contract shows no user, but with `job_users` the processes of a job of
 different users are rows of their own, and so are their edges:

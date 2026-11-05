@@ -95,11 +95,10 @@ CREATE TABLE IF NOT EXISTS shawk.schema_migrations (
 }
 
 // errDevelopmentSchema is returned for a database whose schema was created
-// by other migrations than those released: by the first build of shawk
-// v0.8.0, before the migrations were consolidated into 0001_schema.sql, or
-// by a development version.
+// before the migrations were consolidated into 0001_schema.sql: by shawk
+// v0.8.0 or a development version.
 var errDevelopmentSchema = errors.New("the schema was created by shawk v0.8.0 or a development version " +
-	"with other migrations; back it up if needed, drop the schemas shawk and shawk_v1, " +
+	"before the migrations were consolidated; back it up if needed, drop the schemas shawk and shawk_v1, " +
 	"migrate again and run grants.sql again")
 
 // appliedMigration is a row of the history of migrations.
@@ -128,9 +127,8 @@ func appliedVersion(ctx context.Context, conn *pgx.Conn, ms []Migration) (int, e
 // checkHistory returns the latest version of a history of migrations. It
 // fails if the history holds a migration under the name of another one of
 // the same version, as a schema created before the migrations were
-// consolidated, or by a development version, does: migrating it would
-// leave it as it is, without the tables and views this connector writes
-// and reads.
+// consolidated does: migrating it would leave it as it is, without the
+// tables and views this connector writes and reads.
 func checkHistory(history []appliedMigration, ms []Migration) (int, error) {
 	names := make(map[int]string, len(ms))
 	for _, m := range ms {
