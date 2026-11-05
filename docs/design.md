@@ -870,7 +870,8 @@ each side of a UDP edge 2, per peer host, plus the failure reasons that
 occurred. `max_peer_hosts` (500) bounds the hosts per host, local service,
 role and peer service, folding the others into `~other`, and
 `peer_host_services` restricts the family to the dependencies with one of
-its services (`[namespace/]name`) at either end. Either end, so that both
+its services at either end, named as peers name them (`[namespace/]name`,
+`slurm-job` for the processes of Slurm jobs). Either end, so that both
 sides of a dependency have the family or neither: the rules of §7 leave out
 the server side of a client with an agent, whose client side counts the
 dependency, so a family on the server side only would count nothing.

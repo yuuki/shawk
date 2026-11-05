@@ -172,6 +172,36 @@ func TestPeerHostInventory(t *testing.T) {
 	}
 }
 
+// TestPeerHostServicesSlurmJob: slurm-job in peer_host_services names the
+// processes of Slurm jobs at either end, as their peers name them, so that
+// both sides of a dependency of a job have the family.
+func TestPeerHostServicesSlurmJob(t *testing.T) {
+	c, _, sink, now := testConnector(t, func(cfg *Config) {
+		cfg.PeerHosts = true
+		cfg.PeerHostServices = []string{slurmJobService}
+	})
+	lic := tAgent{host: "lic-01", addrs: []string{"10.0.0.20"}, time: *now,
+		listeners: []tListener{{proto: "tcp", addr: "0.0.0.0", port: 27000, svc: "lmgrd", comm: "lmgrd"}}}
+	consume(t, c, sink, lic)
+	*now = now.Add(time.Second)
+	out := consume(t, c, sink, tAgent{host: "node-01", addrs: []string{"10.0.0.11"}, time: *now, edges: []tEdge{
+		{role: "client", proto: "tcp", local: "10.0.0.11", peer: "10.0.0.20", port: 27000, unit: "slurm/batch",
+			svc: "python3", comm: "python3", opened: 1}}})
+	if got, want := hostsOf(out, metricHostConnOpened, slurmJobService, roleClient, ""),
+		map[string]float64{"lic-01 lmgrd": 1}; !maps.Equal(got, want) {
+		t.Errorf("client side = %v, want %v", got, want)
+	}
+	*now = now.Add(time.Second)
+	lic.time = *now
+	lic.edges = []tEdge{{role: "server", proto: "tcp", local: "10.0.0.20", peer: "10.0.0.11", port: 27000,
+		svc: "lmgrd", comm: "lmgrd", opened: 1}}
+	out = consume(t, c, sink, lic)
+	if got, want := hostsOf(out, metricHostConnOpened, "lmgrd", roleServer, ""),
+		map[string]float64{"node-01 slurm-job": 1}; !maps.Equal(got, want) {
+		t.Errorf("server side = %v, want %v", got, want)
+	}
+}
+
 // TestPeerHostServerSide: the server side names the host of its client, and
 // a client on the server's own shared address is the server itself.
 func TestPeerHostServerSide(t *testing.T) {
