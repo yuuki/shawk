@@ -110,24 +110,9 @@ var errNoHosts = errors.New("no hosts")
 // Unknown fields are refused, so that a misspelt field is not taken as
 // absent.
 func parseInventory(b []byte) (*inventory, error) {
-	var f inventoryFile
-	dec := yaml.NewDecoder(bytes.NewReader(b))
-	dec.KnownFields(true)
-	if err := dec.Decode(&f); err != nil {
-		if errors.Is(err, io.EOF) {
-			return nil, errNoHosts
-		}
+	f, err := decodeInventory(b)
+	if err != nil {
 		return nil, err
-	}
-	// Files concatenated by mistake would leave the hosts after the first
-	// document unchecked and dropped.
-	if err := dec.Decode(new(any)); !errors.Is(err, io.EOF) {
-		return nil, errors.New("more than one YAML document")
-	}
-	if len(f.Hosts) == 0 {
-		// A generator that failed may leave an empty list, which would
-		// drop the whole inventory.
-		return nil, errNoHosts
 	}
 	inv := &inventory{byAddr: map[netip.Addr]string{}}
 	names := map[string]bool{}
@@ -141,52 +126,117 @@ func parseInventory(b []byte) (*inventory, error) {
 			return nil, fmt.Errorf("host %s is listed twice", h.name)
 		}
 		names[h.name] = true
-		if h.slurmNode != "" {
-			if err := checkInventoryName(h.slurmNode); err != nil {
-				return nil, fmt.Errorf("host %s: slurm_node: %w", h.name, err)
-			}
-			if other, dup := nodes[h.slurmNode]; dup {
-				return nil, fmt.Errorf("slurm_node %s is given to both %s and %s", h.slurmNode, other, h.name)
-			}
-			nodes[h.slurmNode] = h.name
+		if err := claimSlurmNode(h, nodes); err != nil {
+			return nil, err
 		}
-		for _, r := range fh.Roles {
-			if err := checkInventoryRole(r); err != nil {
-				return nil, fmt.Errorf("host %s: role %q: %w", h.name, r, err)
-			}
-			if !slices.Contains(h.roles, r) {
-				h.roles = append(h.roles, r)
-			}
+		if h.roles, err = inventoryRoles(h.name, fh.Roles); err != nil {
+			return nil, err
 		}
-		slices.Sort(h.roles)
-		for _, s := range fh.Addrs {
-			a, err := netip.ParseAddr(strings.TrimSpace(s))
-			if err != nil {
-				return nil, fmt.Errorf("host %s: %w", h.name, err)
-			}
-			a = a.Unmap()
-			switch {
-			case a.Zone() != "":
-				return nil, fmt.Errorf("host %s: address %s has a zone", h.name, s)
-			case a.IsUnspecified(), a.IsLoopback(), a.IsMulticast():
-				// Every host has these, or none.
-				return nil, fmt.Errorf("host %s: address %s names no host", h.name, s)
-			}
-			if other, dup := inv.byAddr[a]; dup {
-				if other == h.name {
-					continue
-				}
-				return nil, fmt.Errorf("address %s is given to both %s and %s", a, other, h.name)
-			}
-			inv.byAddr[a] = h.name
-			h.addrs = append(h.addrs, a)
+		if h.addrs, err = inv.claimAddrs(h.name, fh.Addrs); err != nil {
+			return nil, err
 		}
-		slices.SortFunc(h.addrs, netip.Addr.Compare)
 		inv.hosts = append(inv.hosts, h)
 	}
 	slices.SortFunc(inv.hosts, func(a, b inventoryHost) int { return strings.Compare(a.name, b.name) })
 	inv.digest = inventoryDigest(inv.hosts)
 	return inv, nil
+}
+
+// decodeInventory decodes the contents of inventory_file: one YAML
+// document, with hosts.
+func decodeInventory(b []byte) (inventoryFile, error) {
+	var f inventoryFile
+	dec := yaml.NewDecoder(bytes.NewReader(b))
+	dec.KnownFields(true)
+	if err := dec.Decode(&f); err != nil {
+		if errors.Is(err, io.EOF) {
+			return f, errNoHosts
+		}
+		return f, err
+	}
+	// Files concatenated by mistake would leave the hosts after the first
+	// document unchecked and dropped.
+	if err := dec.Decode(new(any)); !errors.Is(err, io.EOF) {
+		return f, errors.New("more than one YAML document")
+	}
+	if len(f.Hosts) == 0 {
+		// A generator that failed may leave an empty list, which would
+		// drop the whole inventory.
+		return f, errNoHosts
+	}
+	return f, nil
+}
+
+// claimSlurmNode checks the node of Slurm of a host, if it has one, and
+// gives it to the host in nodes: a node belongs to one host at most.
+func claimSlurmNode(h inventoryHost, nodes map[string]string) error {
+	if h.slurmNode == "" {
+		return nil
+	}
+	if err := checkInventoryName(h.slurmNode); err != nil {
+		return fmt.Errorf("host %s: slurm_node: %w", h.name, err)
+	}
+	if other, dup := nodes[h.slurmNode]; dup {
+		return fmt.Errorf("slurm_node %s is given to both %s and %s", h.slurmNode, other, h.name)
+	}
+	nodes[h.slurmNode] = h.name
+	return nil
+}
+
+// inventoryRoles checks the roles of a host and returns them sorted,
+// without duplicates.
+func inventoryRoles(host string, roles []string) ([]string, error) {
+	var out []string
+	for _, r := range roles {
+		if err := checkInventoryRole(r); err != nil {
+			return nil, fmt.Errorf("host %s: role %q: %w", host, r, err)
+		}
+		if !slices.Contains(out, r) {
+			out = append(out, r)
+		}
+	}
+	slices.Sort(out)
+	return out, nil
+}
+
+// claimAddrs parses the addresses of a host, gives them to the host in
+// byAddr and returns them sorted, without duplicates: an address belongs to
+// one host at most.
+func (inv *inventory) claimAddrs(host string, addrs []string) ([]netip.Addr, error) {
+	var out []netip.Addr
+	for _, s := range addrs {
+		a, err := parseInventoryAddr(host, s)
+		if err != nil {
+			return nil, err
+		}
+		if other, dup := inv.byAddr[a]; dup {
+			if other == host {
+				continue
+			}
+			return nil, fmt.Errorf("address %s is given to both %s and %s", a, other, host)
+		}
+		inv.byAddr[a] = host
+		out = append(out, a)
+	}
+	slices.SortFunc(out, netip.Addr.Compare)
+	return out, nil
+}
+
+// parseInventoryAddr parses an address of a host, which must name one host.
+func parseInventoryAddr(host, s string) (netip.Addr, error) {
+	a, err := netip.ParseAddr(strings.TrimSpace(s))
+	if err != nil {
+		return netip.Addr{}, fmt.Errorf("host %s: %w", host, err)
+	}
+	a = a.Unmap()
+	switch {
+	case a.Zone() != "":
+		return netip.Addr{}, fmt.Errorf("host %s: address %s has a zone", host, s)
+	case a.IsUnspecified(), a.IsLoopback(), a.IsMulticast():
+		// Every host has these, or none.
+		return netip.Addr{}, fmt.Errorf("host %s: address %s names no host", host, s)
+	}
+	return a, nil
 }
 
 // checkInventoryName checks a host name or a node name of Slurm: a name

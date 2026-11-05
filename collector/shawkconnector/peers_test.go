@@ -2,6 +2,7 @@ package shawkconnector
 
 import (
 	"context"
+	"net/netip"
 	"testing"
 	"time"
 )
@@ -163,5 +164,52 @@ func TestUnknownListenerNotLearned(t *testing.T) {
 		peer: addrOf("10.0.0.30"), port: 2049}, *now)
 	if p.name != peerUnresolved {
 		t.Errorf("peer = %+v, want %s", p, peerUnresolved)
+	}
+}
+
+// TestPeerHolderWithoutAgent: an address that one host alone holds is that
+// host's even while its agent is not alive, since PostgreSQL keeps when the
+// address was last seen apart from the last heartbeat of the agent. The
+// clients that other hosts report at the address name no peer, also
+// behind a translation, and the peer has no agent that records the other
+// side.
+func TestPeerHolderWithoutAgent(t *testing.T) {
+	r := newResolver(nil, must(parseTranslations(map[string]TranslationConfig{
+		"vip": {Virtual: []string{"10.0.100.1:5432"}, Backends: []string{"10.0.1.10"}},
+	})))
+	now := t0
+	client := func(host, service string, seen time.Time) clientRow {
+		return clientRow{key: clientKey{addrOf("10.0.0.11"), addrOf("10.0.100.1"), 5432, "tcp"},
+			endpoint: endpoint{host: host, service: service, exact: true, lastSeen: seen}}
+	}
+	r.load(peerRows{
+		// app-01 last held the address a minute ago, but its agent sent no
+		// heartbeat for 10 minutes.
+		agents: []agentAddrRow{{addr: addrOf("10.0.0.11"), host: "app-01", seen: now.Add(-time.Minute),
+			agent: agentHost{seen: now.Add(-10 * time.Minute), udpTraced: true, name: "app-01"}}},
+		// A client edge that another host reports at the address, more
+		// recent: a socket it no longer has.
+		clients: []clientRow{client("app-01", "app", now.Add(-time.Minute)), client("other-01", "other", now)},
+	}, now)
+	p := r.peer("db-01", &edgeID{role: roleServer, proto: "tcp", local: addrOf("10.0.1.10"), peer: addrOf("10.0.0.11"),
+		port: 5432}, now)
+	if p.name != "app" || p.agent {
+		t.Errorf("peer = %+v, want app without an agent", p)
+	}
+}
+
+// TestPeerOnItsOwnHost: a peer at an address that only the host of the edge
+// holds is on that host, whose agent records both sides of the edge: it
+// folds neither, whatever it does with the local address.
+func TestPeerOnItsOwnHost(t *testing.T) {
+	r := newResolver(nil, nil)
+	now := t0
+	r.load(peerRows{agents: []agentAddrRow{{addr: addrOf("10.0.0.11"), host: "app-01", seen: now,
+		agent: agentHost{seen: now, udpTraced: true, name: "app-01", fold: foldIn,
+			internal: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}}}}}, now)
+	p := r.peer("app-01", &edgeID{role: roleClient, proto: "tcp", local: addrOf("192.0.2.7"), peer: addrOf("10.0.0.11"),
+		port: 80}, now)
+	if !p.agent || p.foldedBy != "" {
+		t.Errorf("peer = %+v, want one with an agent that folds nothing", p)
 	}
 }

@@ -422,6 +422,32 @@ func TestTranslationFolds(t *testing.T) {
 	}
 }
 
+// TestTranslationSourcesNoFoldWarning: behind a translation with sources
+// the backend sees the source, not the client: that its agent would fold
+// the address of the client is no warning.
+func TestTranslationSourcesNoFoldWarning(t *testing.T) {
+	c, _, sink, _ := testConnector(t, func(cfg *Config) {
+		cfg.Translations = map[string]TranslationConfig{
+			"vip": {Virtual: []string{"10.0.100.1:5432"}, Backends: []string{"192.0.2.10"}, Sources: []string{"10.0.100.250"}},
+		}
+	})
+	logs := observe(c)
+	ts := t0.Add(15 * time.Second)
+	consume(t, c, sink, tAgent{host: "db-01", addrs: []string{"192.0.2.10"}, time: ts, fold: foldIn, internal: []string{"192.168.0.0/16"},
+		listeners: []tListener{{proto: "tcp", addr: "0.0.0.0", port: 5432, svc: "postgres", comm: "postgres"}},
+		edges: []tEdge{{role: "server", proto: "tcp", local: "192.0.2.10", peer: "10.0.100.250", port: 5432,
+			svc: "postgres", comm: "postgres", opened: 4}}})
+	out := consume(t, c, sink, tAgent{host: "app-01", addrs: []string{"10.0.0.11"}, time: ts, fold: foldAll,
+		internal: []string{"10.0.0.0/8"}, edges: []tEdge{{role: "client", proto: "tcp", local: "10.0.0.11", peer: "10.0.100.1",
+			port: 5432, svc: "app", comm: "app", opened: 4}}})
+	if s := find(out, metricConnOpened, "app", "postgres", roleClient, ""); len(s) != 1 || !s[0].agent {
+		t.Errorf("client series = %+v", find(out, metricConnOpened, "app", "*", roleClient, ""))
+	}
+	if got := foldWarnings(logs); len(got) != 0 {
+		t.Errorf("warnings = %q", got)
+	}
+}
+
 // TestTranslationBackendChoice: the backend that names a client edge does
 // not depend on the order of maps, nor change with every report of the
 // backends: among those seen recently, one whose agent records the server
