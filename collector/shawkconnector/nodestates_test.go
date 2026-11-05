@@ -229,6 +229,33 @@ func TestSyncNodeStates(t *testing.T) {
 	}
 }
 
+// TestNodeStatesFilesTooLarge: node_states_file and maintenance_file are
+// bounded as inventory_file is; a larger one is not written.
+func TestNodeStatesFilesTooLarge(t *testing.T) {
+	dir := t.TempDir()
+	statesFile := filepath.Join(dir, "node-states.yaml")
+	maintFile := filepath.Join(dir, "maintenance.yaml")
+	pad := "\n#" + strings.Repeat("x", maxFileBytes)
+	for file, doc := range map[string]string{
+		statesFile: "generated_at: 2026-10-31T11:59:00Z\nnodes: [{host: cn001, state: IDLE+POWERED_DOWN}]" + pad,
+		maintFile:  "maintenance: [{hosts: [nfs01], start: 2026-11-01T00:00:00Z, end: 2026-11-02T00:00:00Z}]" + pad,
+	} {
+		if err := os.WriteFile(file, []byte(doc), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c, st, _, _ := testConnector(t, func(cfg *Config) {
+		cfg.NodeStatesFile = statesFile
+		cfg.MaintenanceFile = maintFile
+	})
+	if len(st.nodeStates) != 0 || st.windowSyncs != 0 {
+		t.Errorf("written: states %v, windows %d", st.nodeStates, st.windowSyncs)
+	}
+	if !strings.Contains(c.nodeStatesErr, "larger than") || !strings.Contains(c.maintenanceErr, "larger than") {
+		t.Errorf("errors %q, %q", c.nodeStatesErr, c.maintenanceErr)
+	}
+}
+
 func TestConfigNodeStatesFile(t *testing.T) {
 	// Without the files, nothing is read or written.
 	_, st, _, _ := testConnector(t, nil)

@@ -1117,9 +1117,9 @@ inventory, the file names hosts (`host`).
 - **Staleness.** A state not read again for 5 minutes explains nothing
   after that. A file whose `generated_at` is older is not written, with a
   warning; one more than 10 seconds ahead is invalid (the file is
-  generated on the host of the connector). When a file cannot be read or
-  is invalid (an empty file is), what was written from it stays, and the
-  states become stale. Flags are names (`DOWN`, `POWERED_DOWN`), as
+  generated on the host of the connector). When a file cannot be read, is
+  invalid (an empty file is) or is larger than 16 MiB, as the inventory,
+  what was written from it stays, and the states become stale. Flags are names (`DOWN`, `POWERED_DOWN`), as
   `scontrol` gives them; the `*` of a node that does not respond becomes
   `NOT_RESPONDING`, and the symbols of `sinfo` (`idle~`) are invalid.
 - **Maintenance windows** are written by the clock of the database
