@@ -1,9 +1,8 @@
 name: Complexity
 
 # Measures Cognitive Complexity (SonarSource) and Cyclomatic Complexity (McCabe)
-# with cccc (https://github.com/moznion/cccc). What is analyzed is configured in
-# cccc.toml. The job only reports: cccc.toml sets no max-cognitive or
-# max-cyclomatic threshold, so it never fails on complexity.
+# with cccc (https://github.com/moznion/cccc). What is analyzed, and the
+# max-cognitive threshold above which the job fails, are configured in cccc.toml.
 on:
   pull_request:
   push:
@@ -29,6 +28,8 @@ jobs:
           output-file: cccc.json
 
       - name: Write job summary
+        # Also when the gate fails, so the summary shows the offending functions.
+        if: ${{ !cancelled() && hashFiles('cccc.json') != '' }}
         run: |
           {
             echo "## Code complexity (cccc)"

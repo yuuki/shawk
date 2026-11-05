@@ -184,11 +184,15 @@ maintained.
 CI measures Cognitive and Cyclomatic Complexity with
 [cccc](https://github.com/moznion/cccc) on pull requests and pushes to `main`
 and writes the totals and the 20 most complex functions to the job summary
-(`.github/workflows/complexity.yml`). It only reports; no complexity
-threshold fails the build. `cccc.toml` sets what is analyzed: tests, generated
-code and vendored sources are excluded. To see the same ranking locally,
-install cccc (a [release binary](https://github.com/moznion/cccc/releases) or
-`cargo install cccc-cli`) and run `make complexity`.
+(`.github/workflows/complexity.yml`). The job fails when a function's cognitive
+complexity exceeds `max-cognitive` in `cccc.toml` (currently 40). The threshold
+is a ratchet toward 15, SonarSource's default: split a function that exceeds it
+rather than raising the threshold, and lower the threshold whenever refactoring
+brings the maximum down. `cccc.toml` also sets what is analyzed: tests,
+generated code, vendored sources and BPF programs are excluded. To see the same
+ranking locally, install cccc (a [release
+binary](https://github.com/moznion/cccc/releases) or `cargo install cccc-cli`)
+and run `make complexity`.
 
 ## History
 
