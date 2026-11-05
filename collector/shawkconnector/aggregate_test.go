@@ -2,6 +2,7 @@ package shawkconnector
 
 import (
 	"fmt"
+	"maps"
 	"testing"
 	"time"
 
@@ -208,6 +209,88 @@ func TestOutputsByConnectorClock(t *testing.T) {
 		if !ts.AsTime().Equal(*now) {
 			t.Errorf("an output at %v, want the time of the connector %v", ts.AsTime(), *now)
 		}
+	}
+}
+
+// testBatch decodes the request of an agent.
+func testBatch(t *testing.T, ta tAgent) *hostBatch {
+	t.Helper()
+	b, err := parseResource(ta.metrics().ResourceMetrics().At(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// TestRequestWithoutTime: a request without a time of the agent is taken as
+// of its receipt, so that the start of its series stays the time of the
+// agent. A value of a metric that has no output is left out.
+func TestRequestWithoutTime(t *testing.T) {
+	a := newAggregator(15*time.Minute, 50, 200, false, t0.Add(-time.Hour))
+	b := testBatch(t, tAgent{host: "app-01", time: t0, edges: []tEdge{{role: "client", proto: "tcp",
+		local: "10.0.0.11", peer: "10.0.0.10", port: 5432, svc: "app", comm: "app", opened: 3}}})
+	b.time = time.Time{}
+	for _, e := range b.edges {
+		e.values[valueKey{metric: metricEdgeFirst}] = point{value: 1}
+	}
+	now := t0.Add(15 * time.Second)
+	out := pmetric.NewMetrics()
+	a.add(b, func(*edgeID) peer { return peer{name: "postgres"} }, now, out)
+	h := a.hosts[b.key]
+	if !h.latest.Equal(now) || !h.emitted.Equal(now) {
+		t.Errorf("latest %v, emitted %v, want %v", h.latest, h.emitted, now)
+	}
+	for k := range h.inputs {
+		if k.value.metric == metricEdgeFirst {
+			t.Errorf("input %v of a metric without output", k.value)
+		}
+	}
+	var starts []time.Time
+	rms := out.ResourceMetrics()
+	for i := range rms.Len() {
+		ms := rms.At(i).ScopeMetrics().At(0).Metrics()
+		for j := range ms.Len() {
+			if m := ms.At(j); m.Name() == metricConnOpened {
+				for k := range m.Sum().DataPoints().Len() {
+					dp := m.Sum().DataPoints().At(k)
+					starts = append(starts, dp.StartTimestamp().AsTime())
+					if dp.IntValue() != 3 {
+						t.Errorf("connections opened = %d, want 3", dp.IntValue())
+					}
+				}
+			}
+		}
+	}
+	if len(starts) != 1 || !starts[0].Equal(t0) {
+		t.Errorf("starts of connection.opened = %v, want [%v]", starts, t0)
+	}
+}
+
+// TestPeerHostOfOutputs: the outputs per peer host name a peer on the host
+// itself after the host, and a peer whose host is not known ~unknown.
+func TestPeerHostOfOutputs(t *testing.T) {
+	a := newAggregator(15*time.Minute, 50, 200, false, t0.Add(-time.Hour))
+	a.setPeerHosts(10, nil)
+	edge := func(peer string) tEdge {
+		return tEdge{role: "client", proto: "tcp", local: "10.0.0.11", peer: peer, port: 5432, svc: "app", comm: "app", opened: 1}
+	}
+	b := testBatch(t, tAgent{host: "app-01", time: t0, edges: []tEdge{edge("10.0.0.10"), edge("10.0.0.11"), edge("10.0.0.12")}})
+	out := pmetric.NewMetrics()
+	a.add(b, func(id *edgeID) peer {
+		switch id.peer.String() {
+		case "10.0.0.10":
+			return peer{name: "db", host: "db-01"}
+		case "10.0.0.11":
+			return peer{name: "cache", self: true}
+		}
+		return peer{name: "queue"}
+	}, t0, out)
+	got := map[string]string{}
+	for _, s := range find(flatten(out), metricHostConnOpened, "app", "*", roleClient, "") {
+		got[s.peer] = s.peerHost
+	}
+	if want := map[string]string{"db": "db-01", "cache": "app-01", "queue": hostUnknown}; !maps.Equal(got, want) {
+		t.Errorf("peer hosts = %v, want %v", got, want)
 	}
 }
 

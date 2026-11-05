@@ -381,3 +381,25 @@ func TestLearnedSNATNoFoldWarning(t *testing.T) {
 		t.Errorf("warnings = %q", got)
 	}
 }
+
+// TestLearnedDNATFoldWarning: behind a learned DNAT the backend sees the
+// address of the client, which its agent folds: the client names the
+// backend, and the connector warns.
+func TestLearnedDNATFoldWarning(t *testing.T) {
+	c, _, sink, _ := testConnector(t, nil)
+	logs := observe(c)
+	ts := t0.Add(15 * time.Second)
+	consume(t, c, sink, tAgent{host: "db-01", addrs: []string{"192.0.2.10"}, time: ts, fold: foldIn, internal: []string{"10.0.0.0/8"},
+		edges: []tEdge{{role: "server", proto: "tcp", local: "192.0.2.10", peer: "0.0.0.0", folded: true, port: 5432,
+			svc: "postgres", comm: "postgres", opened: 1}}})
+	out := consume(t, c, sink, tAgent{host: "h1", addrs: []string{"10.0.0.1", "172.17.0.2"}, time: ts,
+		edges: []tEdge{{role: "client", proto: "tcp", local: "172.17.0.2", peer: "10.96.0.70", port: 5432, svc: "a", comm: "a", opened: 1}},
+		translations: []tTranslation{{client: "172.17.0.2", virtual: "10.96.0.70", vport: 5432,
+			backend: "192.0.2.10", bport: 5432}}})
+	if got, want := peersOf(out, "a", roleClient), map[string]string{"postgres:5432": "1 true"}; !maps.Equal(got, want) {
+		t.Errorf("client peers = %v, want %v", got, want)
+	}
+	if got, want := foldWarnings(logs), []string{"h1 172.17.0.2 -> db-01 10.96.0.70"}; !slices.Equal(got, want) {
+		t.Errorf("warnings = %q, want %q", got, want)
+	}
+}
