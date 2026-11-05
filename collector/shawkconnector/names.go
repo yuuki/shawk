@@ -73,6 +73,11 @@ const (
 	attrPeerService       = "service.peer.name"
 	attrPeerAgent         = "shawk.peer.agent"
 	attrPeerHost          = "shawk.peer.host"
+	// attrLocalNetwork and attrPeerNetwork are the networks of the local
+	// and the peer address of the edges of an output per peer host, with
+	// networks.
+	attrLocalNetwork = "shawk.local.network"
+	attrPeerNetwork  = "shawk.peer.network"
 
 	attrExePath     = "process.executable.path"
 	attrCommand     = "process.command"
@@ -227,6 +232,13 @@ const (
 	hostUnknown  = "~unknown"  // an internal address
 	hostExternal = "~external" // a public address, or a folded peer
 	hostOther    = "~other"    // folded beyond max_peer_hosts
+)
+
+// Values of shawk.local.network and shawk.peer.network for addresses in no
+// range of networks.
+const (
+	networkUnknown  = "~unknown"  // an address not routed on the Internet
+	networkExternal = "~external" // another address, or a folded peer
 )
 
 // serviceOther is the service.name of the outputs of the local services

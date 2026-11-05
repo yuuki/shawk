@@ -73,6 +73,8 @@ connectors:
   - The narrowest range wins.
   - Empty names, names starting with `~`, duplicate prefixes, and more than
     1000 zones are rejected.
+  - `parseRanges()` in `ranges.go` does all of this but the limit, for
+    `peer_cidrs` and the `networks` of the outputs per peer host (#204).
 - **No zones.** Without `zones` (the default), no path metric is emitted.
 - **`peer_cidrs`.** Zones may overlap with `peer_cidrs`, which only names
   peers without a service (decision 2).

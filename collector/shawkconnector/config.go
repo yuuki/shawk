@@ -3,8 +3,6 @@ package shawkconnector
 import (
 	"errors"
 	"fmt"
-	"net/netip"
-	"strings"
 	"time"
 )
 
@@ -50,6 +48,16 @@ type Config struct {
 	// jobs) at either end, so that both sides of a dependency have it or
 	// neither.
 	PeerHostServices []string `mapstructure:"peer_host_services"`
+	// Networks names the address ranges of the networks of the fleet, e.g.
+	// ib: 10.10.0.0/16 and mgmt: 10.0.0.0/16, to tell which network a
+	// connection used. A value may list several prefixes separated by
+	// commas, and the narrowest matching range wins. The outputs per peer
+	// host then carry the network of the local address of their edges
+	// (shawk.local.network) and that of the peer address
+	// (shawk.peer.network); other addresses are ~unknown if not routed on
+	// the Internet and ~external otherwise. It needs peer_hosts, and the
+	// other outputs do not change.
+	Networks map[string]string `mapstructure:"networks"`
 	// Retention is how long rows are kept in PostgreSQL after they were
 	// last seen; zero keeps them forever. The connector deletes older rows
 	// every hour.
@@ -195,6 +203,13 @@ func (c *Config) Validate() error {
 	if _, err := parsePeerCIDRs(c.PeerCIDRs); err != nil {
 		errs = append(errs, err)
 	}
+	if _, err := parseNetworks(c.Networks); err != nil {
+		errs = append(errs, err)
+	}
+	if len(c.Networks) > 0 && !c.PeerHosts {
+		// Only the outputs per peer host carry the networks.
+		errs = append(errs, errors.New("networks needs peer_hosts"))
+	}
 	if _, err := parseTranslations(c.Translations); err != nil {
 		errs = append(errs, err)
 	}
@@ -209,32 +224,12 @@ func (c *Config) Validate() error {
 	return errors.Join(errs...)
 }
 
-type namedPrefix struct {
-	name   string
-	prefix netip.Prefix
-}
-
 // parsePeerCIDRs parses peer_cidrs, narrowest prefixes first.
 func parsePeerCIDRs(m map[string]string) ([]namedPrefix, error) {
-	var out []namedPrefix
-	seen := map[netip.Prefix]string{}
-	for name, v := range m {
-		if name == "" || strings.HasPrefix(name, "~") {
-			return nil, fmt.Errorf("peer_cidrs: invalid name %q", name)
-		}
-		for _, s := range strings.Split(v, ",") {
-			p, err := netip.ParsePrefix(strings.TrimSpace(s))
-			if err != nil {
-				return nil, fmt.Errorf("peer_cidrs: %s: %w", name, err)
-			}
-			p = p.Masked()
-			if other, dup := seen[p]; dup {
-				return nil, fmt.Errorf("peer_cidrs: %s is named both %s and %s", p, other, name)
-			}
-			seen[p] = name
-			out = append(out, namedPrefix{name: name, prefix: p})
-		}
-	}
-	sortPrefixes(out)
-	return out, nil
+	return parseRanges("peer_cidrs", m)
+}
+
+// parseNetworks parses networks, narrowest prefixes first.
+func parseNetworks(m map[string]string) ([]namedPrefix, error) {
+	return parseRanges("networks", m)
 }

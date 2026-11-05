@@ -313,6 +313,17 @@ restrict them with `peer_host_services` (e.g. `[slurmctld, slurm-job]`,
 either end of a dependency) and measure before enabling them widely
 (`docs/design.md` §5.3).
 
+`networks` names the ranges of the networks of the cluster, e.g.
+`mgmt: 10.0.0.0/16`, `ib: 10.10.0.0/16` and `storage: 10.20.0.0/16`. The
+metrics per peer host then carry the networks of the two addresses of each
+edge (`shawk_local_network`, `shawk_peer_network`; `src_network` and
+`dst_network` in the recording rules), and the dashboard "Peer hosts" a
+table of the traffic by network: NFS traffic that goes over the management
+network rather than the storage network shows there. An address in no
+range is `~unknown`, or `~external` if it is public. The networks name the
+addresses at the two ends, not the path or the interface, and do not tell
+the NICs of one subnet or of a bond apart.
+
 ### Users of jobs
 
 With `-job-users` on the agents and `job_users` in the connector,
