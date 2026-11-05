@@ -222,8 +222,21 @@ func TestNodeGraphEdgeIDs(t *testing.T) {
 }
 
 func TestAlertRules(t *testing.T) {
+	if n := checkAlertRules(t, "shawk-rules.yaml"); n < 3 {
+		t.Errorf("%d alert rules", n)
+	}
+	// The opt-in rules for the compute nodes of HPC clusters.
+	if n := checkAlertRules(t, "shawk-compute-nodes.yaml.example"); n != 1 {
+		t.Errorf("%d alert rules for compute nodes", n)
+	}
+}
+
+// checkAlertRules checks a file of alert rules of the provisioning and
+// returns the number of its rules.
+func checkAlertRules(t *testing.T, name string) int {
+	t.Helper()
 	datasources := provisionedDatasources(t)
-	b, err := os.ReadFile(filepath.Join(grafana, "provisioning/alerting/shawk-rules.yaml"))
+	b, err := os.ReadFile(filepath.Join(grafana, "provisioning/alerting", name))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -283,7 +296,5 @@ func TestAlertRules(t *testing.T) {
 			}
 		}
 	}
-	if n < 3 {
-		t.Errorf("%d alert rules", n)
-	}
+	return n
 }

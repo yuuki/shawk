@@ -1,0 +1,8 @@
+{"label": "mpi64", "window": 0, "cpu_ms": 35580, "busy_ms": 59828.095, "longest_ms": 59828.095, "bursts": 1, "rss_mib": 3839.8828125, "hwm_mib": 3839.8828125}
+{"label": "mpi64", "window": 1, "cpu_ms": 38150, "busy_ms": 60000.464, "longest_ms": 60000.464, "bursts": 1, "rss_mib": 3959.8359375, "hwm_mib": 3959.8359375}
+{"label": "mpi64", "window": 2, "cpu_ms": 37800, "busy_ms": 60000.724, "longest_ms": 60000.724, "bursts": 1, "rss_mib": 4030.078125, "hwm_mib": 4028.97265625}
+{"label": "mpi64", "window": 3, "cpu_ms": 38450, "busy_ms": 59998.582, "longest_ms": 59998.582, "bursts": 1, "rss_mib": 3990.65625, "hwm_mib": 4028.97265625}
+{"label": "mpi64", "window": 4, "cpu_ms": 34020, "busy_ms": 59999.902, "longest_ms": 59999.902, "bursts": 1, "rss_mib": 4027.86328125, "hwm_mib": 4028.97265625}
+{"label": "mpi64", "window": 5, "cpu_ms": 126970, "busy_ms": 60000.075, "longest_ms": 60000.075, "bursts": 1, "rss_mib": 7939.16796875, "hwm_mib": 7938.359375}
+{"label": "mpi64", "window": 6, "cpu_ms": 177540, "busy_ms": 60000.095, "longest_ms": 60000.095, "bursts": 1, "rss_mib": 8647.12890625, "hwm_mib": 8646.21875}
+{"label": "mpi64", "window": 7, "cpu_ms": 194120, "busy_ms": 60002.374, "longest_ms": 60002.374, "bursts": 1, "rss_mib": 8861.828125, "hwm_mib": 8861.1171875}

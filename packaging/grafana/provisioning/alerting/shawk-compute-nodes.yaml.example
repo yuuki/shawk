@@ -1,0 +1,66 @@
+# An opt-in Grafana alert rule for the compute nodes of an HPC cluster, on
+# the PostgreSQL contract of shawk (shawk_v1.partly_observed), in the format
+# of shawk-rules.yaml. Copy it to shawk-compute-nodes.yaml in this directory
+# and set the pattern of the names of the compute nodes.
+#
+# A job whose ranks talk over TCP (MPI over TCP) makes a flow per remote
+# rank port it connects to, per local rank where tasks have cgroups of
+# their own, in every interval (§2 of
+# docs/research/hpc-compute-nodes/compute_nodes.md): a job too large for
+# -max-flows makes all its nodes drop flows at once, in every interval it
+# runs; the connections that do not fit stay out in every interval while
+# they are open (measured with long-lived connections in the note). One
+# alert per host (the Prometheus rule
+# ShawkFlowsDropped) then fires for all of them; this rule fires once, with
+# the number of compute nodes that were partly observed in the last 30
+# minutes. Their dependencies in that time may be missing in PostgreSQL;
+# the periods are in shawk_v1.partly_observed() and on the dashboards as
+# annotations. Raise -max-flows of these nodes after the guidance of the
+# note. To keep ShawkFlowsDropped for the other hosts, exclude the compute
+# nodes from it in a copy of shawk-rules.yml, e.g. with
+# shawk_agent_flows_dropped_total{host_name!~"cn[0-9]+"}.
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: shawk-compute-nodes
+    folder: shawk
+    interval: 5m
+    rules:
+      - uid: shawk-compute-partly-observed
+        title: Compute nodes partly observed
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 1800, to: 0 }
+            datasourceUid: shawk-postgres
+            model:
+              refId: A
+              editorMode: code
+              format: time_series
+              rawQuery: true
+              # The names of the compute nodes, as their agents send them
+              # (host.name): change the pattern.
+              rawSql: |-
+                SELECT now() AS time, count(DISTINCT host)::float8 AS value
+                FROM shawk_v1.partly_observed(now() - interval '30 minutes', now())
+                WHERE host ~ '^cn[0-9]+$'
+                ORDER BY 1
+          - refId: B
+            datasourceUid: __expr__
+            model: { refId: B, type: reduce, expression: A, reducer: last, settings: { mode: dropNN } }
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+        noDataState: OK
+        execErrState: Error
+        for: 0s
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $values.B }} compute nodes dropped flows in the last 30 minutes"
+          description: "Their agents dropped flow updates, usually because the flow table was full (-max-flows) during jobs whose ranks talk over TCP; the agent logs when updates were refused on a contended table instead. The dependencies of those nodes may be missing for that time. See shawk_v1.partly_observed()."

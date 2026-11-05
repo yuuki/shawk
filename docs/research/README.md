@@ -22,6 +22,17 @@ The kernel hooks of shawk, measured on the targets (2026-11-04, #165):
   of failed connects can be seen, on Rocky Linux 9.8 and Linux 6.8
   (aarch64), with the raw results and the harness in `test/hookcost`.
 
+The agent on the compute nodes of a Slurm cluster, measured in a VM
+(2026-11-05, #172):
+
+- [hpc-compute-nodes/compute_nodes.md](hpc-compute-nodes/compute_nodes.md):
+  the flows of MPI over TCP and the flow table, the cost of collecting
+  and exporting them, the effect on latency-bound jobs with and without
+  reserved CPUs, and the connector for 200 hosts, on Rocky Linux 9.8
+  (aarch64) with Slurm 22.05 and Open MPI 4.1, with the raw results and
+  the harness in `test/nodeload`, and the guidance that follows. Not yet
+  measured on a cluster; the note gives the procedure.
+
 Similar tools, compared with the design of shawk:
 
 - [similar-tools-comparison-and-design-review/flow_observability_pipelines.md](similar-tools-comparison-and-design-review/flow_observability_pipelines.md):

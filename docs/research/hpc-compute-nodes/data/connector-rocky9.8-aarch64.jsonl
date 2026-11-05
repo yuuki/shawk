@@ -1,0 +1,209 @@
+{"label": "star", "window": 0, "cpu_ms": 3240, "busy_ms": 59969.895, "longest_ms": 59969.895, "bursts": 1, "rss_mib": 145.23828125, "hwm_mib": 144.3046875}
+{"label": "star", "window": 1, "cpu_ms": 3250, "busy_ms": 60000.79, "longest_ms": 60000.79, "bursts": 1, "rss_mib": 150.54296875, "hwm_mib": 149.51953125}
+{"label": "star", "window": 2, "cpu_ms": 3230, "busy_ms": 59999, "longest_ms": 59999, "bursts": 1, "rss_mib": 155.7578125, "hwm_mib": 154.70703125}
+{"label": "star", "window": 3, "cpu_ms": 3250, "busy_ms": 60000.856, "longest_ms": 60000.856, "bursts": 1, "rss_mib": 155.2421875, "hwm_mib": 154.70703125}
+{"label": "star", "window": 4, "cpu_ms": 3190, "busy_ms": 59999.105, "longest_ms": 59999.105, "bursts": 1, "rss_mib": 149.78515625, "hwm_mib": 154.70703125}
+{"label": "star", "window": 5, "cpu_ms": 3240, "busy_ms": 60000.256, "longest_ms": 60000.256, "bursts": 1, "rss_mib": 158.63671875, "hwm_mib": 157.74609375}
+{"label": "star", "window": 6, "cpu_ms": 3180, "busy_ms": 59999.405, "longest_ms": 59999.405, "bursts": 1, "rss_mib": 158.375, "hwm_mib": 157.74609375}
+{"label": "star", "window": 7, "cpu_ms": 3250, "busy_ms": 60000.562, "longest_ms": 60000.562, "bursts": 1, "rss_mib": 154.265625, "hwm_mib": 157.74609375}
+{"label": "star", "window": 8, "cpu_ms": 3190, "busy_ms": 60000.303, "longest_ms": 60000.303, "bursts": 1, "rss_mib": 160.0546875, "hwm_mib": 159.5}
+{"label": "star", "window": 9, "cpu_ms": 3280, "busy_ms": 60000.62, "longest_ms": 60000.62, "bursts": 1, "rss_mib": 161.234375, "hwm_mib": 160.32421875}
+{"label": "star", "window": 10, "cpu_ms": 3170, "busy_ms": 59998.875, "longest_ms": 59998.875, "bursts": 1, "rss_mib": 158.0078125, "hwm_mib": 160.32421875}
+{"label": "star", "window": 11, "cpu_ms": 3110, "busy_ms": 59999.92, "longest_ms": 59999.92, "bursts": 1, "rss_mib": 152.1640625, "hwm_mib": 160.32421875}
+{"label": "star", "window": 12, "cpu_ms": 3230, "busy_ms": 60000.275, "longest_ms": 60000.275, "bursts": 1, "rss_mib": 157.71875, "hwm_mib": 160.32421875}
+{"label": "star", "window": 13, "cpu_ms": 3180, "busy_ms": 60000.599, "longest_ms": 60000.599, "bursts": 1, "rss_mib": 161.26171875, "hwm_mib": 160.55078125}
+{"label": "star", "window": 14, "cpu_ms": 3190, "busy_ms": 60000.593, "longest_ms": 60000.593, "bursts": 1, "rss_mib": 160.73828125, "hwm_mib": 160.7265625}
+{"label": "star", "window": 15, "cpu_ms": 3160, "busy_ms": 59998.484, "longest_ms": 59998.484, "bursts": 1, "rss_mib": 156.41015625, "hwm_mib": 160.7265625}
+{"label": "star", "window": 16, "cpu_ms": 3140, "busy_ms": 60000.444, "longest_ms": 60000.444, "bursts": 1, "rss_mib": 153.91015625, "hwm_mib": 160.7265625}
+{"label": "star", "window": 17, "cpu_ms": 3150, "busy_ms": 59999.331, "longest_ms": 59999.331, "bursts": 1, "rss_mib": 150.73828125, "hwm_mib": 160.7265625}
+{"label": "star", "window": 18, "cpu_ms": 3150, "busy_ms": 60000.97, "longest_ms": 60000.97, "bursts": 1, "rss_mib": 158.73046875, "hwm_mib": 160.7265625}
+{"label": "star", "window": 19, "cpu_ms": 3150, "busy_ms": 59999.877, "longest_ms": 59999.877, "bursts": 1, "rss_mib": 160.453125, "hwm_mib": 160.7265625}
+{"label": "star", "window": 20, "cpu_ms": 3040, "busy_ms": 60000.134, "longest_ms": 60000.134, "bursts": 1, "rss_mib": 158.01953125, "hwm_mib": 160.7265625}
+{"label": "star", "window": 21, "cpu_ms": 3040, "busy_ms": 60001.006, "longest_ms": 60001.006, "bursts": 1, "rss_mib": 158.12109375, "hwm_mib": 160.7265625}
+{"label": "star", "window": 22, "cpu_ms": 3080, "busy_ms": 59998.093, "longest_ms": 59998.093, "bursts": 1, "rss_mib": 159.703125, "hwm_mib": 160.7265625}
+{"label": "star", "window": 23, "cpu_ms": 3100, "busy_ms": 60000.476, "longest_ms": 60000.476, "bursts": 1, "rss_mib": 157.4765625, "hwm_mib": 160.7265625}
+{"label": "star", "window": 24, "cpu_ms": 3000, "busy_ms": 60000.602, "longest_ms": 60000.602, "bursts": 1, "rss_mib": 163.05078125, "hwm_mib": 162.06640625}
+{"label": "star-restarted", "window": 0, "cpu_ms": 1400, "busy_ms": 58890.770000000004, "longest_ms": 46291.076, "bursts": 2, "rss_mib": 100.734375, "hwm_mib": 100.734375}
+{"label": "star-restarted", "window": 1, "cpu_ms": 2240, "busy_ms": 59999.332, "longest_ms": 59999.332, "bursts": 1, "rss_mib": 120.6171875, "hwm_mib": 120.6171875}
+{"label": "star-restarted", "window": 2, "cpu_ms": 3030, "busy_ms": 59999.591, "longest_ms": 59999.591, "bursts": 1, "rss_mib": 149.48046875, "hwm_mib": 149.48046875}
+{"label": "star-restarted", "window": 3, "cpu_ms": 2760, "busy_ms": 60000.59, "longest_ms": 60000.59, "bursts": 1, "rss_mib": 154.21484375, "hwm_mib": 153.23046875}
+{"label": "star", "kind": "write", "lines": 45, "sum_ms": 38.7, "span_ms": 40.0}
+{"label": "star", "kind": "write", "lines": 3623, "sum_ms": 134.2, "span_ms": 195.0}
+{"label": "star", "kind": "write", "lines": 3609, "sum_ms": 177.8, "span_ms": 260.0}
+{"label": "star", "kind": "write", "lines": 3609, "sum_ms": 137.8, "span_ms": 200.0}
+{"label": "star", "kind": "write", "lines": 3609, "sum_ms": 148.9, "span_ms": 218.0}
+{"label": "star", "kind": "write", "lines": 3609, "sum_ms": 137.6, "span_ms": 212.0}
+{"label": "star", "kind": "write", "lines": 3609, "sum_ms": 137.6, "span_ms": 204.0}
+{"label": "star", "kind": "write", "lines": 3611, "sum_ms": 143.6, "span_ms": 207.0}
+{"label": "star", "kind": "write", "lines": 3609, "sum_ms": 143.6, "span_ms": 209.0}
+{"label": "star", "kind": "write", "lines": 3609, "sum_ms": 145.0, "span_ms": 215.0}
+{"label": "star", "kind": "write", "lines": 3609, "sum_ms": 143.5, "span_ms": 210.0}
+{"label": "star", "kind": "write", "lines": 3609, "sum_ms": 143.3, "span_ms": 212.0}
+{"label": "star", "kind": "write", "lines": 3609, "sum_ms": 137.2, "span_ms": 203.0}
+{"label": "star", "kind": "write", "lines": 3611, "sum_ms": 147.9, "span_ms": 214.0}
+{"label": "star", "kind": "write", "lines": 3609, "sum_ms": 135.0, "span_ms": 199.0}
+{"label": "star", "kind": "write", "lines": 3609, "sum_ms": 133.7, "span_ms": 196.0}
+{"label": "star", "kind": "write", "lines": 3623, "sum_ms": 158.5, "span_ms": 217.0}
+{"label": "star", "kind": "write", "lines": 3609, "sum_ms": 135.7, "span_ms": 196.0}
+{"label": "star", "kind": "write", "lines": 3609, "sum_ms": 136.6, "span_ms": 200.0}
+{"label": "star", "kind": "write", "lines": 3609, "sum_ms": 132.3, "span_ms": 192.0}
+{"label": "star", "kind": "write", "lines": 3753, "sum_ms": 180.9, "span_ms": 608.0}
+{"label": "star", "kind": "write", "lines": 39, "sum_ms": 16.7, "span_ms": 19.0}
+{"label": "star", "kind": "write", "lines": 1733, "sum_ms": 108.6, "span_ms": 146.0}
+{"label": "star", "kind": "write", "lines": 3051, "sum_ms": 154.8, "span_ms": 246.0}
+{"label": "star", "kind": "write", "lines": 3609, "sum_ms": 131.3, "span_ms": 192.0}
+{"label": "star", "kind": "write", "lines": 3609, "sum_ms": 132.5, "span_ms": 196.0}
+{"label": "star", "kind": "write", "lines": 3601, "sum_ms": 123.1, "span_ms": 188.0}
+{"label": "star", "kind": "tables", "hosts": 200, "edges": 4960, "bytes": 12958743}
+{"label": "mpi16", "window": 0, "cpu_ms": 11060, "busy_ms": 59751.189, "longest_ms": 59751.189, "bursts": 1, "rss_mib": 1068.86328125, "hwm_mib": 1068.86328125}
+{"label": "mpi16", "window": 1, "cpu_ms": 10650, "busy_ms": 59999.77, "longest_ms": 59999.77, "bursts": 1, "rss_mib": 1101.5859375, "hwm_mib": 1101.5859375}
+{"label": "mpi16", "window": 2, "cpu_ms": 10540, "busy_ms": 59999.413, "longest_ms": 59999.413, "bursts": 1, "rss_mib": 1113.79296875, "hwm_mib": 1113.79296875}
+{"label": "mpi16", "window": 3, "cpu_ms": 10610, "busy_ms": 60000.36, "longest_ms": 60000.36, "bursts": 1, "rss_mib": 1113.87890625, "hwm_mib": 1113.87890625}
+{"label": "mpi16", "window": 4, "cpu_ms": 10320, "busy_ms": 59999.271, "longest_ms": 59999.271, "bursts": 1, "rss_mib": 1113.9453125, "hwm_mib": 1113.9453125}
+{"label": "mpi16", "window": 5, "cpu_ms": 16030, "busy_ms": 60000.926, "longest_ms": 60000.926, "bursts": 1, "rss_mib": 2018.9609375, "hwm_mib": 2018.9609375}
+{"label": "mpi16", "window": 6, "cpu_ms": 16360, "busy_ms": 59999.288, "longest_ms": 59999.288, "bursts": 1, "rss_mib": 2077.1171875, "hwm_mib": 2076.19140625}
+{"label": "mpi16", "window": 7, "cpu_ms": 15900, "busy_ms": 60000.587, "longest_ms": 60000.587, "bursts": 1, "rss_mib": 2087.14453125, "hwm_mib": 2086.1953125}
+{"label": "mpi16", "window": 8, "cpu_ms": 16030, "busy_ms": 60000.012, "longest_ms": 60000.012, "bursts": 1, "rss_mib": 2071.15625, "hwm_mib": 2086.1953125}
+{"label": "mpi16", "window": 9, "cpu_ms": 16010, "busy_ms": 59999.949, "longest_ms": 59999.949, "bursts": 1, "rss_mib": 2087.58203125, "hwm_mib": 2086.66015625}
+{"label": "mpi16", "window": 10, "cpu_ms": 23610, "busy_ms": 60000.047, "longest_ms": 60000.047, "bursts": 1, "rss_mib": 2903.37890625, "hwm_mib": 2903.37890625}
+{"label": "mpi16", "window": 11, "cpu_ms": 23480, "busy_ms": 60000.164, "longest_ms": 60000.164, "bursts": 1, "rss_mib": 2970.94921875, "hwm_mib": 2969.87890625}
+{"label": "mpi16", "window": 12, "cpu_ms": 23730, "busy_ms": 59999.716, "longest_ms": 59999.716, "bursts": 1, "rss_mib": 2966.8125, "hwm_mib": 2969.87890625}
+{"label": "mpi16", "window": 13, "cpu_ms": 24350, "busy_ms": 59999.787, "longest_ms": 59999.787, "bursts": 1, "rss_mib": 2987.8203125, "hwm_mib": 2986.78125}
+{"label": "mpi16", "window": 14, "cpu_ms": 24370, "busy_ms": 59999.517, "longest_ms": 59999.517, "bursts": 1, "rss_mib": 2981.828125, "hwm_mib": 2986.78125}
+{"label": "mpi16", "window": 15, "cpu_ms": 34800, "busy_ms": 60000.404, "longest_ms": 60000.404, "bursts": 1, "rss_mib": 3695.66796875, "hwm_mib": 3695.63671875}
+{"label": "mpi16", "window": 16, "cpu_ms": 34540, "busy_ms": 60000.449, "longest_ms": 60000.449, "bursts": 1, "rss_mib": 3743, "hwm_mib": 3742.9375}
+{"label": "mpi16", "window": 17, "cpu_ms": 36160, "busy_ms": 60000.051, "longest_ms": 60000.051, "bursts": 1, "rss_mib": 3849.03515625, "hwm_mib": 3848.33203125}
+{"label": "mpi16", "window": 18, "cpu_ms": 35640, "busy_ms": 59998.961, "longest_ms": 59998.961, "bursts": 1, "rss_mib": 3769.33984375, "hwm_mib": 3848.33203125}
+{"label": "mpi16", "window": 19, "cpu_ms": 35040, "busy_ms": 60001.29, "longest_ms": 60001.29, "bursts": 1, "rss_mib": 3799.8203125, "hwm_mib": 3848.33203125}
+{"label": "mpi16", "window": 20, "cpu_ms": 43170, "busy_ms": 59999.701, "longest_ms": 59999.701, "bursts": 1, "rss_mib": 4427.11328125, "hwm_mib": 4427.11328125}
+{"label": "mpi16", "window": 21, "cpu_ms": 46010, "busy_ms": 60000.1, "longest_ms": 60000.1, "bursts": 1, "rss_mib": 4688.06640625, "hwm_mib": 4688.06640625}
+{"label": "mpi16", "window": 22, "cpu_ms": 45750, "busy_ms": 60000.007, "longest_ms": 60000.007, "bursts": 1, "rss_mib": 4776.1640625, "hwm_mib": 4775.23828125}
+{"label": "mpi16", "window": 23, "cpu_ms": 46480, "busy_ms": 59999.789, "longest_ms": 59999.789, "bursts": 1, "rss_mib": 4677.0859375, "hwm_mib": 4775.23828125}
+{"label": "mpi16", "window": 24, "cpu_ms": 43490, "busy_ms": 59999.242, "longest_ms": 59999.242, "bursts": 1, "rss_mib": 4615.31640625, "hwm_mib": 4775.23828125}
+{"label": "mpi16", "window": 25, "cpu_ms": 57070, "busy_ms": 60000.771, "longest_ms": 60000.771, "bursts": 1, "rss_mib": 5350.7578125, "hwm_mib": 5350.7578125}
+{"label": "mpi16", "window": 26, "cpu_ms": 57740, "busy_ms": 60000.367, "longest_ms": 60000.367, "bursts": 1, "rss_mib": 5494.26171875, "hwm_mib": 5493.2109375}
+{"label": "mpi16", "window": 27, "cpu_ms": 58270, "busy_ms": 59999.007, "longest_ms": 59999.007, "bursts": 1, "rss_mib": 5496.28515625, "hwm_mib": 5495.47265625}
+{"label": "mpi16", "window": 28, "cpu_ms": 58520, "busy_ms": 59999.894, "longest_ms": 59999.894, "bursts": 1, "rss_mib": 5570.6796875, "hwm_mib": 5569.77734375}
+{"label": "mpi16", "window": 29, "cpu_ms": 59890, "busy_ms": 60000.613, "longest_ms": 60000.613, "bursts": 1, "rss_mib": 5422.57421875, "hwm_mib": 5569.77734375}
+{"label": "mpi16", "window": 30, "cpu_ms": 70500, "busy_ms": 59999.252, "longest_ms": 59999.252, "bursts": 1, "rss_mib": 6249.74609375, "hwm_mib": 6248.6328125}
+{"label": "mpi16", "window": 31, "cpu_ms": 89370, "busy_ms": 60000.397, "longest_ms": 60000.397, "bursts": 1, "rss_mib": 6863.08203125, "hwm_mib": 6862.00390625}
+{"label": "mpi16", "window": 32, "cpu_ms": 82870, "busy_ms": 59999.689, "longest_ms": 59999.689, "bursts": 1, "rss_mib": 6605.33984375, "hwm_mib": 6862.00390625}
+{"label": "mpi16", "window": 33, "cpu_ms": 70690, "busy_ms": 59999.931, "longest_ms": 59999.931, "bursts": 1, "rss_mib": 6661.2734375, "hwm_mib": 6862.00390625}
+{"label": "mpi16", "window": 34, "cpu_ms": 67140, "busy_ms": 59999.93, "longest_ms": 59999.93, "bursts": 1, "rss_mib": 6638.89453125, "hwm_mib": 6862.00390625}
+{"label": "mpi16", "window": 35, "cpu_ms": 83400, "busy_ms": 60000.861, "longest_ms": 60000.861, "bursts": 1, "rss_mib": 6467.65625, "hwm_mib": 6862.00390625}
+{"label": "mpi16", "window": 36, "cpu_ms": 93870, "busy_ms": 59999.397, "longest_ms": 59999.397, "bursts": 1, "rss_mib": 6639.1875, "hwm_mib": 6862.00390625}
+{"label": "mpi16", "window": 37, "cpu_ms": 87190, "busy_ms": 60013.784, "longest_ms": 60013.784, "bursts": 1, "rss_mib": 6530.6796875, "hwm_mib": 6862.00390625}
+{"label": "mpi16", "window": 38, "cpu_ms": 93790, "busy_ms": 59987.485, "longest_ms": 59987.485, "bursts": 1, "rss_mib": 6662.1796875, "hwm_mib": 6862.00390625}
+{"label": "mpi16", "window": 39, "cpu_ms": 86780, "busy_ms": 59998.798, "longest_ms": 59998.798, "bursts": 1, "rss_mib": 6824.3515625, "hwm_mib": 6862.00390625}
+{"label": "mpi16", "kind": "write", "lines": 45, "sum_ms": 28.9, "span_ms": 30.0}
+{"label": "mpi16", "kind": "write", "lines": 3623, "sum_ms": 688.3, "span_ms": 807.0}
+{"label": "mpi16", "kind": "write", "lines": 3609, "sum_ms": 835.5, "span_ms": 995.0}
+{"label": "mpi16", "kind": "write", "lines": 3609, "sum_ms": 711.2, "span_ms": 873.0}
+{"label": "mpi16", "kind": "write", "lines": 3609, "sum_ms": 697.6, "span_ms": 872.0}
+{"label": "mpi16", "kind": "write", "lines": 3609, "sum_ms": 651.5, "span_ms": 793.0}
+{"label": "mpi16", "kind": "write", "lines": 3611, "sum_ms": 1038.0, "span_ms": 1166.0}
+{"label": "mpi16", "kind": "write", "lines": 3609, "sum_ms": 876.3, "span_ms": 1000.0}
+{"label": "mpi16", "kind": "write", "lines": 3609, "sum_ms": 675.9, "span_ms": 803.0}
+{"label": "mpi16", "kind": "write", "lines": 3609, "sum_ms": 679.6, "span_ms": 800.0}
+{"label": "mpi16", "kind": "write", "lines": 3609, "sum_ms": 707.5, "span_ms": 828.0}
+{"label": "mpi16", "kind": "write", "lines": 3609, "sum_ms": 969.3, "span_ms": 1110.0}
+{"label": "mpi16", "kind": "write", "lines": 3611, "sum_ms": 1366.4, "span_ms": 1578.0}
+{"label": "mpi16", "kind": "write", "lines": 3609, "sum_ms": 985.0, "span_ms": 1141.0}
+{"label": "mpi16", "kind": "write", "lines": 3609, "sum_ms": 885.5, "span_ms": 1096.0}
+{"label": "mpi16", "kind": "write", "lines": 3609, "sum_ms": 897.9, "span_ms": 1040.0}
+{"label": "mpi16", "kind": "write", "lines": 3609, "sum_ms": 1077.7, "span_ms": 1279.0}
+{"label": "mpi16", "kind": "write", "lines": 3609, "sum_ms": 1029.5, "span_ms": 1210.0}
+{"label": "mpi16", "kind": "write", "lines": 3611, "sum_ms": 1469.0, "span_ms": 1638.0}
+{"label": "mpi16", "kind": "write", "lines": 3609, "sum_ms": 1052.4, "span_ms": 1303.0}
+{"label": "mpi16", "kind": "write", "lines": 3609, "sum_ms": 1039.6, "span_ms": 1266.0}
+{"label": "mpi16", "kind": "write", "lines": 3609, "sum_ms": 1133.2, "span_ms": 1307.0}
+{"label": "mpi16", "kind": "write", "lines": 3609, "sum_ms": 1180.2, "span_ms": 1428.0}
+{"label": "mpi16", "kind": "write", "lines": 3609, "sum_ms": 1014.6, "span_ms": 1207.0}
+{"label": "mpi16", "kind": "write", "lines": 3611, "sum_ms": 1573.8, "span_ms": 1781.0}
+{"label": "mpi16", "kind": "write", "lines": 3609, "sum_ms": 1122.4, "span_ms": 1325.0}
+{"label": "mpi16", "kind": "write", "lines": 3609, "sum_ms": 1441.4, "span_ms": 1736.0}
+{"label": "mpi16", "kind": "write", "lines": 3609, "sum_ms": 1259.4, "span_ms": 1443.0}
+{"label": "mpi16", "kind": "write", "lines": 3609, "sum_ms": 1057.3, "span_ms": 1230.0}
+{"label": "mpi16", "kind": "write", "lines": 3611, "sum_ms": 2322.7, "span_ms": 2690.0}
+{"label": "mpi16", "kind": "write", "lines": 3609, "sum_ms": 1276.3, "span_ms": 1481.0}
+{"label": "mpi16", "kind": "write", "lines": 3609, "sum_ms": 1690.6, "span_ms": 2317.0}
+{"label": "mpi16", "kind": "write", "lines": 3609, "sum_ms": 1215.5, "span_ms": 1434.0}
+{"label": "mpi16", "kind": "write", "lines": 3609, "sum_ms": 1599.1, "span_ms": 2342.0}
+{"label": "mpi16", "kind": "write", "lines": 3609, "sum_ms": 1293.3, "span_ms": 1716.0}
+{"label": "mpi16", "kind": "write", "lines": 3611, "sum_ms": 2358.6, "span_ms": 2644.0}
+{"label": "mpi16", "kind": "write", "lines": 3609, "sum_ms": 1975.9, "span_ms": 2274.0}
+{"label": "mpi16", "kind": "write", "lines": 3609, "sum_ms": 2019.0, "span_ms": 2401.0}
+{"label": "mpi16", "kind": "write", "lines": 3609, "sum_ms": 2237.6, "span_ms": 2871.0}
+{"label": "mpi16", "kind": "write", "lines": 3609, "sum_ms": 1326.1, "span_ms": 1870.0}
+{"label": "mpi16", "kind": "write", "lines": 3658, "sum_ms": 1417.9, "span_ms": 2552.0}
+{"label": "mpi16", "kind": "tables", "hosts": 200, "edges": 394062, "bytes": 197426199}
+{"label": "star", "kind": "out", "block": 0, "lines": 800, "hosts": 200, "points_median": 72, "points_max": 102, "points_sum": 61696, "complete": 800}
+{"label": "star", "kind": "out", "block": 1, "lines": 800, "hosts": 200, "points_median": 96, "points_max": 102, "points_sum": 64433, "complete": 800}
+{"label": "star", "kind": "out", "block": 2, "lines": 800, "hosts": 200, "points_median": 96, "points_max": 102, "points_sum": 64480, "complete": 800}
+{"label": "star", "kind": "out", "block": 3, "lines": 800, "hosts": 200, "points_median": 96, "points_max": 102, "points_sum": 64546, "complete": 800}
+{"label": "star", "kind": "out", "block": 4, "lines": 800, "hosts": 200, "points_median": 96, "points_max": 102, "points_sum": 64386, "complete": 800}
+{"label": "star", "kind": "out", "block": 5, "lines": 800, "hosts": 200, "points_median": 96, "points_max": 102, "points_sum": 64574, "complete": 800}
+{"label": "star", "kind": "out", "block": 6, "lines": 800, "hosts": 200, "points_median": 96, "points_max": 102, "points_sum": 64527, "complete": 800}
+{"label": "star", "kind": "out", "block": 7, "lines": 800, "hosts": 200, "points_median": 96, "points_max": 102, "points_sum": 64386, "complete": 800}
+{"label": "star", "kind": "out", "block": 8, "lines": 800, "hosts": 200, "points_median": 96, "points_max": 102, "points_sum": 64414, "complete": 800}
+{"label": "star", "kind": "out", "block": 9, "lines": 800, "hosts": 200, "points_median": 96, "points_max": 102, "points_sum": 64499, "complete": 800}
+{"label": "star", "kind": "out", "block": 10, "lines": 800, "hosts": 200, "points_median": 96, "points_max": 102, "points_sum": 64621, "complete": 800}
+{"label": "star", "kind": "out", "block": 11, "lines": 800, "hosts": 200, "points_median": 96, "points_max": 102, "points_sum": 64386, "complete": 800}
+{"label": "star", "kind": "out", "block": 12, "lines": 800, "hosts": 200, "points_median": 96, "points_max": 102, "points_sum": 64433, "complete": 800}
+{"label": "star", "kind": "out", "block": 13, "lines": 800, "hosts": 200, "points_median": 96, "points_max": 102, "points_sum": 64480, "complete": 800}
+{"label": "star", "kind": "out", "block": 14, "lines": 800, "hosts": 200, "points_median": 96, "points_max": 102, "points_sum": 64386, "complete": 800}
+{"label": "star", "kind": "out", "block": 15, "lines": 800, "hosts": 200, "points_median": 55, "points_max": 102, "points_sum": 44884, "complete": 800}
+{"label": "star", "kind": "out", "block": 16, "lines": 800, "hosts": 200, "points_median": 55, "points_max": 55, "points_sum": 42664, "complete": 800}
+{"label": "star", "kind": "out", "block": 17, "lines": 800, "hosts": 200, "points_median": 55, "points_max": 55, "points_sum": 42664, "complete": 800}
+{"label": "star", "kind": "out", "block": 18, "lines": 800, "hosts": 200, "points_median": 55, "points_max": 55, "points_sum": 42631, "complete": 800}
+{"label": "star", "kind": "out", "block": 19, "lines": 800, "hosts": 200, "points_median": 55, "points_max": 55, "points_sum": 42697, "complete": 800}
+{"label": "star", "kind": "out", "block": 20, "lines": 800, "hosts": 200, "points_median": 55, "points_max": 55, "points_sum": 42664, "complete": 800}
+{"label": "star", "kind": "out", "block": 21, "lines": 800, "hosts": 200, "points_median": 55, "points_max": 55, "points_sum": 42631, "complete": 800}
+{"label": "star", "kind": "out", "block": 22, "lines": 800, "hosts": 200, "points_median": 55, "points_max": 55, "points_sum": 42664, "complete": 800}
+{"label": "star", "kind": "out", "block": 23, "lines": 800, "hosts": 200, "points_median": 55, "points_max": 55, "points_sum": 42664, "complete": 800}
+{"label": "star", "kind": "out", "block": 24, "lines": 800, "hosts": 200, "points_median": 55, "points_max": 55, "points_sum": 42697, "complete": 800}
+{"label": "star", "kind": "out", "block": 25, "lines": 800, "hosts": 170, "points_median": 81, "points_max": 102, "points_sum": 62538, "complete": 800}
+{"label": "star", "kind": "out", "block": 26, "lines": 800, "hosts": 200, "points_median": 102, "points_max": 102, "points_sum": 70340, "complete": 800}
+{"label": "star", "kind": "out", "block": 27, "lines": 800, "hosts": 200, "points_median": 102, "points_max": 102, "points_sum": 70215, "complete": 800}
+{"label": "star", "kind": "out", "block": 28, "lines": 723, "hosts": 200, "points_median": 102, "points_max": 102, "points_sum": 63100, "complete": 723}
+{"label": "mpi16", "kind": "out", "block": 0, "lines": 800, "hosts": 200, "points_median": 2433, "points_max": 3942, "points_sum": 1925694, "complete": 800}
+{"label": "mpi16", "kind": "out", "block": 1, "lines": 800, "hosts": 200, "points_median": 2871, "points_max": 3942, "points_sum": 2250248, "complete": 800}
+{"label": "mpi16", "kind": "out", "block": 2, "lines": 800, "hosts": 200, "points_median": 2913, "points_max": 3942, "points_sum": 2253296, "complete": 800}
+{"label": "mpi16", "kind": "out", "block": 3, "lines": 800, "hosts": 200, "points_median": 2871, "points_max": 3942, "points_sum": 2253669, "complete": 800}
+{"label": "mpi16", "kind": "out", "block": 4, "lines": 800, "hosts": 200, "points_median": 2913, "points_max": 3942, "points_sum": 2251727, "complete": 800}
+{"label": "mpi16", "kind": "out", "block": 5, "lines": 800, "hosts": 200, "points_median": 5352, "points_max": 7782, "points_sum": 4106497, "complete": 800}
+{"label": "mpi16", "kind": "out", "block": 6, "lines": 800, "hosts": 200, "points_median": 5745, "points_max": 7782, "points_sum": 4439325, "complete": 800}
+{"label": "mpi16", "kind": "out", "block": 7, "lines": 800, "hosts": 200, "points_median": 5649, "points_max": 7782, "points_sum": 4425643, "complete": 800}
+{"label": "mpi16", "kind": "out", "block": 8, "lines": 800, "hosts": 200, "points_median": 5745, "points_max": 7782, "points_sum": 4437194, "complete": 800}
+{"label": "mpi16", "kind": "out", "block": 9, "lines": 800, "hosts": 200, "points_median": 5745, "points_max": 7782, "points_sum": 4431533, "complete": 800}
+{"label": "mpi16", "kind": "out", "block": 10, "lines": 800, "hosts": 200, "points_median": 8262, "points_max": 11604, "points_sum": 6290924, "complete": 800}
+{"label": "mpi16", "kind": "out", "block": 11, "lines": 800, "hosts": 200, "points_median": 8550, "points_max": 11604, "points_sum": 6611087, "complete": 800}
+{"label": "mpi16", "kind": "out", "block": 12, "lines": 800, "hosts": 200, "points_median": 8433, "points_max": 11604, "points_sum": 6604670, "complete": 800}
+{"label": "mpi16", "kind": "out", "block": 13, "lines": 800, "hosts": 200, "points_median": 8550, "points_max": 11604, "points_sum": 6613526, "complete": 800}
+{"label": "mpi16", "kind": "out", "block": 14, "lines": 800, "hosts": 200, "points_median": 8550, "points_max": 11604, "points_sum": 6621795, "complete": 800}
+{"label": "mpi16", "kind": "out", "block": 15, "lines": 800, "hosts": 200, "points_median": 10024, "points_max": 13459, "points_sum": 7718467, "complete": 800}
+{"label": "mpi16", "kind": "out", "block": 16, "lines": 800, "hosts": 200, "points_median": 10402, "points_max": 13459, "points_sum": 8033296, "complete": 800}
+{"label": "mpi16", "kind": "out", "block": 17, "lines": 800, "hosts": 200, "points_median": 10402, "points_max": 13459, "points_sum": 8024194, "complete": 800}
+{"label": "mpi16", "kind": "out", "block": 18, "lines": 800, "hosts": 200, "points_median": 10315, "points_max": 13459, "points_sum": 8027854, "complete": 800}
+{"label": "mpi16", "kind": "out", "block": 19, "lines": 800, "hosts": 200, "points_median": 10402, "points_max": 13459, "points_sum": 8029798, "complete": 800}
+{"label": "mpi16", "kind": "out", "block": 20, "lines": 800, "hosts": 200, "points_median": 11944, "points_max": 15361, "points_sum": 9171259, "complete": 800}
+{"label": "mpi16", "kind": "out", "block": 21, "lines": 800, "hosts": 200, "points_median": 12322, "points_max": 15361, "points_sum": 9483780, "complete": 800}
+{"label": "mpi16", "kind": "out", "block": 22, "lines": 800, "hosts": 200, "points_median": 12322, "points_max": 15361, "points_sum": 9470152, "complete": 800}
+{"label": "mpi16", "kind": "out", "block": 23, "lines": 800, "hosts": 200, "points_median": 12322, "points_max": 15361, "points_sum": 9469156, "complete": 800}
+{"label": "mpi16", "kind": "out", "block": 24, "lines": 800, "hosts": 200, "points_median": 12322, "points_max": 15361, "points_sum": 9453536, "complete": 800}
+{"label": "mpi16", "kind": "out", "block": 25, "lines": 800, "hosts": 200, "points_median": 13894, "points_max": 17254, "points_sum": 10629009, "complete": 800}
+{"label": "mpi16", "kind": "out", "block": 26, "lines": 800, "hosts": 200, "points_median": 14218, "points_max": 17254, "points_sum": 10889330, "complete": 800}
+{"label": "mpi16", "kind": "out", "block": 27, "lines": 800, "hosts": 200, "points_median": 14218, "points_max": 17254, "points_sum": 10907092, "complete": 800}
+{"label": "mpi16", "kind": "out", "block": 28, "lines": 800, "hosts": 200, "points_median": 14218, "points_max": 17254, "points_sum": 10908232, "complete": 800}
+{"label": "mpi16", "kind": "out", "block": 29, "lines": 800, "hosts": 200, "points_median": 14092, "points_max": 17254, "points_sum": 10923288, "complete": 800}
+{"label": "mpi16", "kind": "out", "block": 30, "lines": 800, "hosts": 200, "points_median": 15763, "points_max": 19147, "points_sum": 12054268, "complete": 800}
+{"label": "mpi16", "kind": "out", "block": 31, "lines": 800, "hosts": 200, "points_median": 16096, "points_max": 19147, "points_sum": 12326099, "complete": 800}
+{"label": "mpi16", "kind": "out", "block": 32, "lines": 800, "hosts": 200, "points_median": 15997, "points_max": 19147, "points_sum": 12335944, "complete": 800}
+{"label": "mpi16", "kind": "out", "block": 33, "lines": 800, "hosts": 200, "points_median": 16096, "points_max": 19147, "points_sum": 12341440, "complete": 800}
+{"label": "mpi16", "kind": "out", "block": 34, "lines": 800, "hosts": 200, "points_median": 15565, "points_max": 19147, "points_sum": 11996905, "complete": 800}
+{"label": "mpi16", "kind": "out", "block": 35, "lines": 800, "hosts": 200, "points_median": 15793, "points_max": 19144, "points_sum": 12059680, "complete": 800}
+{"label": "mpi16", "kind": "out", "block": 36, "lines": 800, "hosts": 200, "points_median": 16090, "points_max": 19144, "points_sum": 12331798, "complete": 800}
+{"label": "mpi16", "kind": "out", "block": 37, "lines": 800, "hosts": 200, "points_median": 16090, "points_max": 19144, "points_sum": 12337489, "complete": 800}
+{"label": "mpi16", "kind": "out", "block": 38, "lines": 800, "hosts": 200, "points_median": 16090, "points_max": 19144, "points_sum": 12338998, "complete": 800}
+{"label": "mpi16", "kind": "out", "block": 39, "lines": 800, "hosts": 200, "points_median": 15532, "points_max": 19144, "points_sum": 11952124, "complete": 800}
+{"label": "mpi16", "kind": "out", "block": 40, "lines": 48, "hosts": 48, "points_median": 12784, "points_max": 16801, "points_sum": 615466, "complete": 48}
