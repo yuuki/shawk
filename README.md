@@ -1,7 +1,8 @@
 # shawk
 
 shawk records the network dependencies of your servers: which process talks
-to which TCP/UDP service on every host, since when, until when, and how much.
+to which TCP/UDP service on every host, or to which local service on its
+Unix socket, since when, until when, and how much.
 It traces sockets in the kernel with eBPF, keeps the dependencies in
 PostgreSQL, sends their traffic to Prometheus and shows both in Grafana.
 
@@ -16,8 +17,11 @@ this host in the last 90 days, and were we watching?*
   sample: a job that runs once a month is still seen.
 - Each host's observation periods and the periods its agent dropped flows
   are recorded, so "not used" can be told apart from "not observed".
-- Only TCP and UDP sockets are observed, so "not used" means "no TCP or
-  UDP". RDMA verbs (InfiniBand, RoCE) bypass the sockets: the RDMA
+- TCP and UDP sockets are observed, and the connections of Unix stream
+  sockets (a local PostgreSQL, php-fpm, Docker, munge), without their
+  traffic; so "not used" means "no TCP, UDP or Unix stream connection".
+  Datagram Unix sockets (syslog, journald) are not traced. RDMA verbs
+  (InfiniBand, RoCE) bypass the sockets: the RDMA
   transports of MPI (UCX) and NCCL, Lustre o2ib, GPFS verbs and NFS over
   RDMA are not seen, even when their control connections over TCP are; TCP
   over IPoIB is. See [packaging/README.md](packaging/README.md#hpc-clusters)
@@ -47,8 +51,9 @@ The design is in [docs/design.md](docs/design.md).
 ## Requirements
 
 - Linux with BTF (`/sys/kernel/btf/vmlinux`): RHEL / Rocky Linux 9, or
-  upstream 5.14 or later. UDP needs BPF trampolines (fentry), which arm64
-  has only since 6.0; without them only TCP is traced. The tested kernels
+  upstream 5.14 or later. UDP and Unix sockets need BPF trampolines
+  (fentry, fexit), which arm64 has only since 6.0; without them only TCP is
+  traced. The tested kernels
   are listed in
   [design §3.5](docs/design.md#35-kernel-requirements-and-features-used).
   The agent runs as root with the capabilities that

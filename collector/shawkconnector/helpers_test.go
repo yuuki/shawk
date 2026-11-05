@@ -17,8 +17,11 @@ import (
 var t0 = time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
 
 // tEdge is an edge in a request built by tAgent, in the format of the agent.
+// An edge of proto unix has path, the name of the socket, rather than
+// addresses and a port, and its connections only.
 type tEdge struct {
 	role, proto, local, peer string
+	path                     string
 	port                     int64
 	svc, ns, unit, comm, exe string
 	containerID              string
@@ -54,6 +57,8 @@ type tReason struct {
 
 type tListener struct {
 	proto, addr              string
+	path                     string // of a listener of proto unix, which has no address and port
+	netns                    string // 4026531840 if empty
 	port                     int64
 	svc, ns, unit, comm, exe string
 	user                     string // process.user.id, not sent if empty
@@ -84,7 +89,9 @@ type tAgent struct {
 	// is not its last.
 	partial bool
 	// noUDP reports that UDP is not traced; netnsScope defaults to "all".
-	noUDP      bool
+	noUDP bool
+	// unixTraced is sent as shawk.agent.unix.traced if not nil.
+	unixTraced *bool
 	netnsScope string
 	// dropped is sent as shawk.agent.flows.dropped, counted since
 	// droppedSince (t0 if zero), when either is set.
@@ -174,9 +181,13 @@ func (ta tAgent) metrics() pmetric.Metrics {
 			putUser(a, e.user)
 			a.PutStr(attrRole, e.role)
 			a.PutStr(attrTransport, e.proto)
-			a.PutStr(attrLocalAddr, e.local)
-			a.PutStr(attrPeerAddr, e.peer)
-			a.PutInt(attrServerPort, e.port)
+			if e.proto == transportUnix {
+				a.PutStr(attrServerAddr, e.path)
+			} else {
+				a.PutStr(attrLocalAddr, e.local)
+				a.PutStr(attrPeerAddr, e.peer)
+				a.PutInt(attrServerPort, e.port)
+			}
 			netns := e.netns
 			if netns == "" {
 				netns = "4026531840"
@@ -200,7 +211,27 @@ func (ta tAgent) metrics() pmetric.Metrics {
 			dp.SetTimestamp(now)
 			dp.SetIntValue(v)
 		}
-		if e.proto == "tcp" {
+		reasons := func() {
+			for r, v := range e.reasons {
+				dp := metric(metricConnFailedByReason, pmetric.MetricTypeSum).Sum().DataPoints().AppendEmpty()
+				attrs(dp.Attributes())
+				dp.Attributes().PutStr(attrErrorType, r)
+				rs := v.start
+				if rs.IsZero() {
+					rs = t0
+				}
+				dp.SetStartTimestamp(pcommon.NewTimestampFromTime(rs))
+				dp.SetTimestamp(now)
+				dp.SetIntValue(v.value)
+			}
+		}
+		switch e.proto {
+		case transportUnix:
+			sum(metricConnOpened, e.opened, "")
+			sum(metricConnFailed, e.failed, "")
+			sum(metricConnCount, e.count, "")
+			reasons()
+		case "tcp":
 			sum(metricConnOpened, e.opened, "")
 			if e.role == roleClient {
 				sum(metricConnFailed, e.failed, "")
@@ -233,24 +264,15 @@ func (ta tAgent) metrics() pmetric.Metrics {
 				dp.ExplicitBounds().FromRaw(bounds)
 				sum(metricSynRetransmits, e.synRetrans, "")
 			}
-			for r, v := range e.reasons {
-				dp := metric(metricConnFailedByReason, pmetric.MetricTypeSum).Sum().DataPoints().AppendEmpty()
-				attrs(dp.Attributes())
-				dp.Attributes().PutStr(attrErrorType, r)
-				rs := v.start
-				if rs.IsZero() {
-					rs = t0
-				}
-				dp.SetStartTimestamp(pcommon.NewTimestampFromTime(rs))
-				dp.SetTimestamp(now)
-				dp.SetIntValue(v.value)
-			}
-		} else {
+			reasons()
+		default:
 			sum(metricUDPDatagrams, 1, "transmit")
 			sum(metricUDPDatagrams, 1, "receive")
 		}
-		sum(metricNetworkIO, e.tx, "transmit")
-		sum(metricNetworkIO, e.rx, "receive")
+		if e.proto != transportUnix {
+			sum(metricNetworkIO, e.tx, "transmit")
+			sum(metricNetworkIO, e.rx, "receive")
+		}
 		first, last := e.first, e.last
 		if last.IsZero() {
 			last = ta.time
@@ -278,9 +300,17 @@ func (ta tAgent) metrics() pmetric.Metrics {
 			putProcess(dp.Attributes(), l.svc, l.ns, l.unit, l.comm, l.exe)
 			putUser(dp.Attributes(), l.user)
 			dp.Attributes().PutStr(attrTransport, l.proto)
-			dp.Attributes().PutStr(attrLocalAddr, l.addr)
-			dp.Attributes().PutInt(attrServerPort, l.port)
-			dp.Attributes().PutStr(attrNetNS, "4026531840")
+			if l.proto == transportUnix {
+				dp.Attributes().PutStr(attrServerAddr, l.path)
+			} else {
+				dp.Attributes().PutStr(attrLocalAddr, l.addr)
+				dp.Attributes().PutInt(attrServerPort, l.port)
+			}
+			netns := l.netns
+			if netns == "" {
+				netns = "4026531840"
+			}
+			dp.Attributes().PutStr(attrNetNS, netns)
 			dp.SetTimestamp(now)
 			dp.SetIntValue(t.Unix())
 		}
@@ -333,6 +363,13 @@ func (ta tAgent) metrics() pmetric.Metrics {
 	udp.SetTimestamp(now)
 	if !ta.noUDP {
 		udp.SetIntValue(1)
+	}
+	if ta.unixTraced != nil {
+		dp := metric(metricAgentUnixTraced, pmetric.MetricTypeGauge).Gauge().DataPoints().AppendEmpty()
+		dp.SetTimestamp(now)
+		if *ta.unixTraced {
+			dp.SetIntValue(1)
+		}
 	}
 	seg := ta.segment
 	if seg.IsZero() {
@@ -534,6 +571,7 @@ func testConnector(t *testing.T, mod func(*Config)) (*shawkConnector, *fakeStore
 // series is an output data point flattened for comparisons.
 type series struct {
 	job, instance, metric, peer, role, dir string
+	transport                              string
 	errType                                string
 	peerHost                               string // shawk.peer.host
 	agent                                  bool
@@ -564,7 +602,8 @@ func flatten(md pmetric.Metrics) []series {
 					agent, _ := a.Get(attrPeerAgent)
 					out = append(out, series{job: job, instance: inst, metric: m.Name(), peer: getString(a, attrPeerService),
 						agent: agent.Bool(), errType: getString(a, attrErrorType), peerHost: getString(a, attrPeerHost),
-						role: getString(a, attrRole), dir: getString(a, attrIODirection), port: port, value: v, count: c})
+						role: getString(a, attrRole), dir: getString(a, attrIODirection), port: port, value: v, count: c,
+						transport: getString(a, attrTransport)})
 				}
 				switch m.Type() {
 				case pmetric.MetricTypeSum:

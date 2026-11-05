@@ -36,6 +36,7 @@ const (
 	metricAgentUp             = "shawk.agent.up"
 	metricAgentSegmentStart   = "shawk.agent.segment.start"
 	metricAgentUDPTraced      = "shawk.agent.udp.traced"
+	metricAgentUnixTraced     = "shawk.agent.unix.traced"
 	metricAgentFlowsDropped   = "shawk.agent.flows.dropped"
 	metricAgentCgroupsDropped = "shawk.agent.cgroup_events.dropped"
 	metricAgentReadsDropped   = "shawk.agent.container_reads.dropped"
@@ -84,6 +85,10 @@ const (
 	attrLocalAddr   = "network.local.address"
 	attrPeerAddr    = "network.peer.address"
 	attrServerPort  = "server.port"
+	// attrServerAddr is the name of the Unix socket of an edge or a listener
+	// of transportUnix, which they carry instead of network.local.address,
+	// network.peer.address and server.port.
+	attrServerAddr  = "server.address"
 	attrNetNS       = "shawk.netns"
 	attrIODirection = "network.io.direction"
 	attrNetNSScope  = "shawk.netns.scope"
@@ -111,6 +116,11 @@ const (
 
 	roleClient = "client"
 	roleServer = "server"
+
+	// transportUnix is the network.transport of Unix stream and seqpacket
+	// sockets: only client edges, to the name of a socket on their host,
+	// and listeners.
+	transportUnix = "unix"
 )
 
 // errorTypeOther is the error.type of failures without a known reason.
@@ -196,6 +206,8 @@ var bpfPrograms = map[string]bool{
 	"shawk_iter_tcp":            true,
 	"shawk_iter_udp":            true,
 	"shawk_skb_consume_udp":     true,
+	"shawk_unix_release":        true,
+	"shawk_unix_stream_connect": true,
 }
 
 // handshakeBounds are the explicit bounds, in seconds, of the histogram

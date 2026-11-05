@@ -286,14 +286,29 @@ func checkPrototype(t *testing.T, target *btf.Spec, prog *ebpf.ProgramSpec, atta
 	if err != nil {
 		return // reported by checkAttachTarget
 	}
+	// The last parameter of an fexit program is the return value.
+	if prog.AttachType == ebpf.AttachTraceFExit && len(decls) > 0 {
+		decls = decls[:len(decls)-1]
+	}
 	want := make([]string, 0, len(decls))
 	for _, d := range decls {
 		want = append(want, declType(target, d))
+	}
+	for i, p := range got {
+		if alias, ok := paramAliases[p]; ok {
+			got[i] = alias
+		}
 	}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Errorf("parameters of %s = %v, %s reads %v", attachTo, got, prog.Name, want)
 	}
 }
+
+// paramAliases are the types of parameters that kernels renamed without
+// changing what the programs read through them: the address that
+// connect(2) passes to proto_ops, struct sockaddr_unsized since Linux 6.19,
+// is the struct sockaddr of before.
+var paramAliases = map[string]string{"*sockaddr_unsized": "*sockaddr"}
 
 // paramType names a parameter type: the name of an integer, or of the
 // struct a pointer points to, prefixed with *.

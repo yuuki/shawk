@@ -21,8 +21,9 @@ predict: platform migrations where old and new systems coexist, and clients
 such as batch jobs that talk to a server once a day or a week, which
 sampling-based tracing misses. Answering those needs:
 
-- completeness: every process and every TCP/UDP service, including
-  middleware and third-party software that cannot be instrumented;
+- completeness: every process and every TCP/UDP service, and the local
+  services reached on Unix sockets, including middleware and third-party
+  software that cannot be instrumented;
 - always-on tracing with low overhead, so that rare dependencies are
   observed;
 - long retention with known coverage, so that "nobody used it in the last
@@ -35,8 +36,10 @@ Instrumentation) sees only the protocols it parses. shawk focuses on history
 and coverage, for any TCP/UDP protocol, on VMs and on-premises hosts (the
 primary target is Rocky Linux 9, kernel 5.14), and runs beside OBI (§9).
 
-What is observed is TCP and UDP sockets, so "not used" means "no TCP or
-UDP". RDMA verbs (InfiniBand, RoCE) bypass the sockets: in HPC clusters,
+What is observed is TCP and UDP sockets and the connections of Unix stream
+sockets (§3.8), so "not used" means "no TCP, UDP or Unix stream
+connection": datagram Unix sockets are not traced. RDMA verbs (InfiniBand,
+RoCE) bypass the sockets: in HPC clusters,
 where the main data paths use them (the RDMA transports of MPI and NCCL,
 Lustre o2ib, GPFS verbs, NFS over RDMA), a host may be observed
 throughout and still be used (§10).
@@ -85,7 +88,7 @@ A bundled flow is identified by
 | direction | `out`: the local process opened the connection (client). `in`: it accepted it (server). |
 | local / remote address | IPv4 is stored as IPv4-mapped IPv6 in the kernel |
 | port | the service port: the remote port of an outgoing flow, the local port of an incoming flow |
-| protocol | TCP or UDP |
+| protocol | TCP, UDP, or Unix stream sockets, whose flows have the name of a socket instead of addresses and a port (§3.8) |
 | network namespace | inode number |
 | cgroup id, comm | the identity of the local process |
 
@@ -238,7 +241,9 @@ decided per socket by its first datagram:
 * a socket that sends first on the port of a known server socket (e.g. the
   per-client connected sockets of a QUIC server) is a server;
 * bound, unconnected sockets that exist when the agent starts are servers,
-  since their first datagram afterwards may be a reply;
+  since their first datagram afterwards may be a reply; the walk at start
+  marks them before the UDP programs attach, so that a reply sent in
+  between does not make one a client;
 * a connected socket on a port the kernel chose is a client even if it
   receives first: no client could have known its port.
 
@@ -276,13 +281,13 @@ Linux 5.14 or later with BTF (`CONFIG_DEBUG_INFO_BTF`):
 | `bpf_sock_from_file`, `bpf_get_current_task_btf` | 5.11 |
 | cgroup pointer in `sock_cgroup_data` (else the owner of accepted connections is resolved in user space only) | 5.15, RHEL 9 |
 | TCP iterator that locks each socket (else rare double counting) | 5.19, RHEL 9 |
-| fentry (UDP only) | 5.5 on x86_64, 6.0 on arm64 (RHEL 9 on arm64: 5.14.0-621, in 9.8, not in 9.6) |
+| fentry, fexit (UDP and Unix sockets only) | 5.5 on x86_64, 6.0 on arm64 (RHEL 9 on arm64: 5.14.0-621, in 9.8, not in 9.6) |
 | kprobes on the module nf_conntrack (translations, §3.7; `CONFIG_KPROBES`, the system call `perf_event_open`) | `__nf_conntrack_confirm`, and `nf_ct_destroy` since 5.19 and in RHEL 9, `destroy_conntrack` before |
 
 CI loads the programs on the Ubuntu runner kernels (6.8 to 7.0, x86_64 and
 arm64) and in VMs (`make vm-test`) on Rocky Linux 9.6 (x86_64, aarch64),
 upstream 5.14 (x86_64) and 5.15 (x86_64, aarch64); on aarch64 before 6.0
-the tests check that UDP is reported as not traced. All struct accesses use CO-RE. `make compat`
+the tests check that UDP and Unix sockets are reported as not traced. All struct accesses use CO-RE. `make compat`
 checks every attach target, helper, CO-RE relocation and `BPF_PROG`
 parameter list against the BTF of Rocky Linux 9.6 and its nf_conntrack
 module (the verifier does not check arguments read through
@@ -372,6 +377,83 @@ per packet.
 - The kprobes are not reattached when the module is reloaded; restart the
   agent then. A load failure is logged, e.g. a unit whose
   `SystemCallFilter` denies `perf_event_open`.
+
+### 3.8 Unix stream sockets
+
+Local clients often reach a service on its Unix socket rather than over
+TCP: PostgreSQL and MySQL (`/run/postgresql/.s.PGSQL.5432`,
+`mysqld.sock`), php-fpm behind nginx, Docker and containerd, munge for
+Slurm, sssd. "Who still uses this database" then has answers that TCP does
+not show. The connections of stream and seqpacket Unix sockets to a named
+socket, a path or an abstract name, are traced at the connect and the close
+of the client; no tracepoint reports their state, so the programs hook two
+functions that the socket operations point to, and so are never inlined:
+
+| hook | role |
+|---|---|
+| `fexit/unix_stream_connect` | in `connect(2)` of the client: an established connection, counted open in the socket storage of the client, or a failed connect with its reason |
+| `fentry/unix_release` | the client closes its socket (its last file): the connection is no longer open |
+| `iter/task_file` | the listening sockets with their names and owners, and the adoption of the client sides of connections that predate the agent |
+
+- **Flows.** A flow bundles the connections of a client process (cgroup and
+  comm) to one name, in the network namespace of the client socket, with
+  `network.transport` `unix` and the name as `server.address` instead of
+  addresses and a port. The client's own name, which it rarely has or which
+  the kernel gives it (autobind, e.g. with `SO_PASSCRED`), is dropped like an
+  ephemeral port. The name is the one the server bound, which the socket the
+  kernel creates for the server shares with the listener: a client that
+  connects through a symbolic link (`/var/run` to `/run`) or through a mount
+  in a container has the name as the server bound it. Names are shown
+  as ss(8) shows them, an abstract name with `@` for its leading NUL; bytes
+  that are not printable UTF-8 are escaped as `\xHH`, a backslash as `\\`
+  and the `@` a path starts with as `\x40`.
+- **No server side.** A client is traced in its own process, the only side
+  that has a name to connect to: the server's end is created by the kernel
+  in the connect of the client and accepted later, by whichever process.
+  The server is the owner of the listener of the name on the same host
+  (§5.2): in the namespace of the client, else, for a path, the only
+  listener of the name on the host, since a socket file is reached from
+  other namespaces through mounts; an abstract name is reached in the
+  namespace of its client only. Listeners are found by the owner scans of §3.2 (every
+  minute), since `iter/unix` exists only since Linux 5.17; a client of a
+  name that no scan found requests one at the next interval, so a new
+  server is named an interval later. The owner is chosen as for TCP: the
+  service rather than systemd for socket activation, the parent among its
+  workers.
+- **Open connections** are entries of a table that is not flipped, one per
+  client socket, by its address: added at the connect, or when the walk
+  of the processes adopts it, and deleted at the close; user space counts
+  them per flow, so an edge with an open connection stays alive without
+  new ones. Entries rather than counts leave nothing that a race could
+  make drift: the programs that add the same socket at once insert it
+  once, user space deletes nothing, and connect(2) and the walk hold a
+  reference to the file of the socket, so it cannot close while they add
+  it. A Unix
+  socket keeps no counters of the bytes it carries, so its traffic is not
+  measured: it would take a hook on every message, the cost that §3.2
+  avoids for TCP.
+- **Failures** have the name the client asked for and a reason, as
+  `error.type` of TCP: `refused` (no such path, or nothing listens on it,
+  e.g. a socket file left by a server that exited), `timeout` (the backlog
+  of the listener is full), `unreachable` (permission denied on the path or
+  by an LSM), `local` (no memory for the connection), `aborted` (a signal
+  interrupted a connect that waited for the backlog), and `_OTHER`. A connect
+  the kernel restarts after a signal is counted when it ends.
+- **Adoption.** The owner scan at start adopts the connections that predate
+  the agent, which are counted open from then on, not as connections. The
+  client side of a connected socket is the one whose peer has a name while
+  it has none, or only one the kernel gave it; when both bound names, the
+  server's is the listener's, held more than once while the listener is
+  open. Unnamed pairs (`socketpair(2)`) connect no service and are not
+  traced, nor are the connections the scans cannot tell apart.
+- **Not traced:** datagram Unix sockets (syslog and journald, `sd_notify`),
+  whose messages only a hook on every message would see, and unnamed pairs.
+- The programs need BPF trampolines, as UDP does (§3.3): without them the
+  agent reports that Unix sockets are not traced
+  (`shawk.agent.unix.traced`). `-max-flows` sizes the tables of Unix flows to
+  a quarter of it and that of their open connections to a half, at least
+  1024 each (about 3.6 MiB at the default); a connection that does not fit
+  is a dropped update (§10).
 
 ## 4. The agent
 
@@ -480,7 +562,10 @@ per packet.
 - Reading `/proc/PID/environ` takes the process's memory map lock, which a
   stuck process can hold forever (a stalled FUSE mapping), so reads time out
   and back off, and hung reads are bounded (`internal/procinfo/service.go`). A PID whose comm no longer
-  matches the flow is not trusted; a process that exits before it is read
+  matches the flow is not trusted, except the child that systemd forks for
+  a service, named `(cron)` until it executes `cron`, which connects the
+  standard output of the service to journald over a Unix socket (§3.8):
+  its flow takes the identity and the comm of the service. A process that exits before it is read
   takes the latest identity seen for the same unit and comm, and for the
   processes of Slurm jobs, whose units every job of every user shares, the
   same cgroup (step) too. The agent reads `/proc/PID/cgroup` with the
@@ -523,31 +608,37 @@ attributes `service.name`, `service.namespace`, `process.executable.name`,
 port, whatever the role), `shawk.netns`, `shawk.peer.folded=true` for a
 folded edge (§3.6), and `process.user.id` for a process of a Slurm job
 with `-job-users` (§4.1). The PID is not an attribute, so a restarted
-process continues the same series.
+process continues the same series. An edge of Unix sockets (§3.8), always
+a client's, has `network.transport=unix` and `server.address`, the name of
+the socket, instead of the addresses and the port, and its connections,
+failures and open connections only.
 
 | metric | type, unit | |
 |---|---|---|
-| `shawk.connection.opened` | Counter, `{connection}` | established connections (TCP) |
-| `shawk.connection.failed` | Counter, `{connection}` | failed attempts (TCP client side only) |
-| `shawk.connection.count` | UpDownCounter, `{connection}` | connections open at the end of the interval (TCP) |
-| `shawk.network.io` | Counter, `By` | bytes, with `network.io.direction` |
+| `shawk.connection.opened` | Counter, `{connection}` | established connections (TCP, Unix) |
+| `shawk.connection.failed` | Counter, `{connection}` | failed attempts (client side only: TCP, Unix) |
+| `shawk.connection.count` | UpDownCounter, `{connection}` | connections open at the end of the interval (TCP, Unix) |
+| `shawk.network.io` | Counter, `By` | bytes, with `network.io.direction` (TCP, UDP) |
 | `shawk.udp.datagrams` | Counter, `{datagram}` | UDP datagrams, with `network.io.direction` |
 | `shawk.tcp.retransmits` | Counter, `{segment}` | segments the local socket retransmitted |
 | `shawk.tcp.rtt` | Histogram without buckets, `s` | smoothed RTT samples (sum and count) |
 | `shawk.tcp.handshake` | Histogram, `s` | handshakes of established active opens, with the bounds of §3.2 (TCP client side only) |
 | `shawk.tcp.syn_retransmits` | Counter, `{segment}` | SYNs the active opens retransmitted, established or failed (TCP client side only) |
-| `shawk.connection.failed.by_reason` | Counter, `{connection}` | failed attempts with `error.type` (`refused`, `timeout`, `unreachable`, `local`, `aborted`, `_OTHER`; TCP client side only) |
+| `shawk.connection.failed.by_reason` | Counter, `{connection}` | failed attempts with `error.type` (`refused`, `timeout`, `unreachable`, `local`, `aborted`, `_OTHER`; client side only: TCP, Unix, §3.8) |
 | `shawk.edge.first_seen`, `shawk.edge.last_seen` | Gauge, `s` | Unix time of the first and last activity |
 
 A failure reason is sent from its first occurrence on an edge, starting at
 that interval, so an edge does not carry six series of zeros and the
 connector takes the first value as new rather than as a baseline.
 
-Listeners are sent as `shawk.listener.first_seen`/`last_seen`, and
+Listeners are sent as `shawk.listener.first_seen`/`last_seen` (those of
+Unix sockets with `server.address`, and `shawk.netns` the namespace of the
+listening socket), and
 translations (§3.7) as `shawk.translation.first_seen`/`last_seen` with the
 client, virtual, source and backend addresses and ports. The agent's own
 metrics are `shawk.agent.up` (with `shawk.netns.scope`),
-`shawk.agent.segment.start`, `shawk.agent.udp.traced`, the drop counters
+`shawk.agent.segment.start`, `shawk.agent.udp.traced`,
+`shawk.agent.unix.traced`, the drop counters
 `shawk.agent.flows.dropped`, `shawk.agent.cgroup_events.dropped`,
 `shawk.agent.container_reads.dropped` and
 `shawk.agent.translations.dropped`, `shawk.agent.translations.traced`,
@@ -629,6 +720,12 @@ result and several connectors do not conflict. An edge whose `last_seen`
 alone advances is written once per write interval, and an idle edge that
 agents keep sending until its TTL is not written again.
 
+Edges and listeners of Unix sockets (§3.8) are written the same way to
+tables of their own, `unix_edges` and `unix_listeners`, since they have a
+name rather than addresses and a port; a listener of a Unix socket
+whose owner is not known is not written, and a server edge of a Unix
+socket is invalid.
+
 The request that closes an interval upserts the segment into
 `agent_sessions`, with `last_heartbeat` the time the connector received it,
 and the host's addresses, one row per period held (a period ends after 5
@@ -650,7 +747,8 @@ earlier than 2 minutes (the shortest idle TTL) before the first request the
 connector received from the host, and again after it dropped changes of the
 host; the gap since the previous heartbeat shows as not observed.
 
-The session also keeps `peer_fold`, `peer_internal` and `counters_started`
+The session also keeps `peer_fold`, `peer_internal`, `unix_traced` (NULL
+for an agent that does not send it) and `counters_started`
 (the start of the agent's drop counter, by its clock), which identifies one
 run of the agent across the sessions that several connectors, a connector
 restart or a clock step create. When the drops of a run exceed the most
@@ -690,6 +788,16 @@ no service; kernel sockets (§4.1) do.
 | either | unknown, private address | `~unresolved` |
 | either | unknown, public address | `~external` |
 | either | folded (`0.0.0.0/0`, `::/0`) | a range of `peer_cidrs` that holds the whole network, `~external` otherwise |
+| client of a Unix socket | a service listens on the name on the same host, in the namespace of the edge, else, for a path, in the only namespace where any does | the service |
+| client of a Unix socket | no listener of the name, listeners in several other namespaces, or an abstract name served in other namespaces only | `~unresolved` |
+
+The listeners of Unix sockets come from requests and from
+`shawk_v1.unix_endpoints`; among them only those seen within 5 minutes of
+the latest one of the name count, so that a socket that moved to another
+namespace leaves the former, and the most recently seen service wins. A
+Unix socket is on the host of its client, so its peer has
+`shawk.peer.agent` true and, with `peer_hosts`, `shawk.peer.host` the host
+itself.
 
 `shawk.peer.agent` tells whether the peer address belongs to a host whose
 agent is alive (closed an interval in the last 5 minutes, or the host itself
@@ -809,6 +917,14 @@ the host name; `host.id` and `host.name` are promoted to labels.
   here, after the connector started and within 2 minutes); otherwise its
   first value is a baseline, so a connector restart or a host moving between
   connectors does not add past totals at once.
+- The dependencies over Unix sockets (§3.8) are client edges with
+  `network.transport` `unix` and `server.port` 0: their names are not
+  forwarded, as addresses are not (`keep_peer_address` keeps none), so
+  the series grow with the services their clients reach, not with names.
+  They have connections, failures by reason and open connections, no
+  bytes, and in the family of peer hosts connections and failures by
+  reason. A service that listens on Unix sockets only has no series of
+  its own: it is the `service.peer.name` of its clients.
 - Histograms are forwarded as sum and count only (mean RTT and connect
   time): buckets would add 10 series to every TCP client dependency. A
   handshake histogram with other bounds than §3.2 is dropped as invalid.
@@ -847,7 +963,7 @@ the host name; `host.id` and `host.name` are promoted to labels.
 | `shawk_agent_*` | agents |
 
 A TCP client dependency thus has 13 series, plus one per failure reason
-that occurred.
+that occurred, and one over a Unix socket 3.
 
 The outputs above reduce a peer to its service, which treats the hosts of
 one service as interchangeable; in an HPC cluster they are not (nfs01
@@ -1168,13 +1284,15 @@ which must be run again after every `shawk-migrate` that applies migrations.
 ```
 hosts(id, machine_id, hostname, kernel, agent_version, first_seen, last_seen)
 agent_sessions(host_id, started_at, last_heartbeat, udp_traced, netns_scope, dropped_flows, clock_skew,
-               peer_fold, peer_internal, counters_started)
+               peer_fold, peer_internal, counters_started, unix_traced)
 partial_observations(host_id, started_at, period_start, period_end, dropped_flows)  -- periods with drops
 host_addrs(host_id, addr, first_seen, last_seen)  -- one row per period
 processes(id, host_id, unit, comm, exe, service_name, user_id, first_seen, last_seen)
   -- unique (host_id, unit, comm, service_name, user_id); user_id only for processes of jobs (job_users)
 edges(id, host_id, process_id, role, proto, local_addr, remote_addr, port, netns, first_seen, last_seen)
   -- remote_addr is the network 0.0.0.0/0 or ::/0 for folded peers
+unix_edges(id, host_id, process_id, path, netns, first_seen, last_seen)  -- clients of Unix sockets (§3.8)
+unix_listeners(host_id, process_id, path, netns, first_seen, last_seen)  -- every known owner of a listening Unix socket
 listeners(host_id, process_id, proto, addr, port, netns, first_seen, last_seen)  -- the latest owner
 listener_owners(host_id, process_id, proto, addr, port, netns, first_seen, last_seen)  -- every known owner
 peer_cidrs(prefix, name)  -- written by the connector from its peer_cidrs
@@ -1219,14 +1337,15 @@ names in PostgreSQL and Prometheus match.
 
 | view or function | |
 |---|---|
-| `dependencies` | one row per logical dependency: the client edge and the server edge matched by addresses and port over all time (loopback within a host and netns, addresses held by several hosts at once within a host), or through a translation (§5.4), when `virtual_addr`, `virtual_port` and `translation` (`~learned` for a learned one) tell what the client connected to. `observed_by` is `both`, `client` or `server`; a one-sided row means no agent on the other side, an undescribed NAT or load balancer between, or one of the own rows of §5.4. `client_observed_until` and `server_observed_until` are the latest heartbeats of the hosts (or NULL, §5.4): an old `last_seen` with a recent `observed_until` means no longer used; both old means no longer observed. An address `0.0.0.0/0` or `::/0` stands for folded peers (§3.6), named `~external`. `port` is that of the edges, also under the rules of ports (§5.3): between two hosts it tells the connections of different processes apart. |
+| `dependencies` | one row per logical dependency: the client edge and the server edge matched by addresses and port over all time (loopback within a host and netns, addresses held by several hosts at once within a host), or through a translation (§5.4), when `virtual_addr`, `virtual_port` and `translation` (`~learned` for a learned one) tell what the client connected to. `observed_by` is `both`, `client` or `server`; a one-sided row means no agent on the other side, an undescribed NAT or load balancer between, or one of the own rows of §5.4. `client_observed_until` and `server_observed_until` are the latest heartbeats of the hosts (or NULL, §5.4): an old `last_seen` with a recent `observed_until` means no longer used; both old means no longer observed. An address `0.0.0.0/0` or `::/0` stands for folded peers (§3.6), named `~external`. `port` is that of the edges, also under the rules of ports (§5.3): between two hosts it tells the connections of different processes apart. A dependency over a Unix socket (§3.8) has `proto` `unix`, port 0, no addresses, and `path`, the last column (NULL otherwise), the name of the socket: its client edge is matched with the owners of the listeners of the name on its host (in the namespace of the client, else, for a path, in the only namespace that has one) whose periods overlap it, within 2 minutes; a matched row lasts the part of the client edge the owner held the listener, except that the row of the first owner starts with the client edge and that of the last ends with it, as a row of TCP spans both its edges (a client keeps the connections it opened after the listener closed, or keeps trying), never longer than the client edge; it has `server_host` the client's and `observed_by` `both`, and an unmatched edge is a row of its own observed by the client. |
 | `graph_nodes`, `graph_edges` | the dependency map between services in the format of the Grafana Node Graph; a peer without a service is named by `peer_class`, and a dependency on a port of `port_agnostic_services` or `dynamic_ports` (§5.3) has port 0 |
-| `peer_class(addr)` | the name of a peer without a known service, as in `service.peer.name`: the narrowest range of `peer_cidrs`, `~unresolved` for an address not routed on the Internet, `~external` otherwise, including the networks of folded peers |
+| `peer_class(addr)` | the name of a peer without a known service, as in `service.peer.name`: the narrowest range of `peer_cidrs`, `~unresolved` for an address not routed on the Internet or no address (the server of a Unix socket without a listener), `~external` otherwise, including the networks of folded peers |
 | `dependency_changes` | dependencies between services that appeared, or disappeared while a host that saw them kept observing for 15 minutes; port 0 for those of `port_agnostic_services` and `dynamic_ports` (§5.3), so that a run of srun on a new port is not new |
 | `service_endpoints` | addresses and ports services accept connections on: the last known listeners of each host (unspecified addresses expanded to the host's addresses) and its server edges, for hosts that reported in the last 30 days, except addresses another host took over since; `slurm_job` if a process of a Slurm job serves it; used by the connector (§5.2) |
+| `unix_endpoints` | the names of the Unix sockets services listen on (`path`, `netns`, host, service, `slurm_job`), seen within an hour of the latest listener of Unix sockets of the host, for hosts that reported in the last 30 days; used by the connector (§5.2) |
 | `client_endpoints` | the client sides of connections in the last hour (client address, server address, port, client service, `slurm_job` if the client is a process of a Slurm job); used by the connector to name the peer of a server edge |
 | `agent_addrs` | addresses of hosts whose agent closed an interval in the last 5 minutes, with what the agent traces and folds; used by the connector |
-| `agents` | the latest segment of every host and whether its agent is alive; the last columns, `peer_fold` and `peer_internal`, tell what the agent folds and the ranges it keeps exact |
+| `agents` | the latest segment of every host and whether its agent is alive; the last columns, `peer_fold` and `peer_internal`, tell what the agent folds and the ranges it keeps exact, and `unix_traced` whether it traces Unix sockets (NULL if it does not tell) |
 | `unobserved(since, until, tolerance)` | the periods in which each host was not observed; Grafana overlays them as annotations |
 | `unobserved_by_name(since, until, tolerance)` | the same over the sessions of all the host ids of each host name, for nodes whose machine id changed (§4.1), where `unobserved()` reports the time after the last heartbeat of each old id; two machines that share a name hide each other's gaps |
 | `unobserved_reasons(since, until, tolerance)` | the periods of `unobserved_by_name()` cut by what explains them (§5.7): `cause` is `maintenance` or `power_saving` for a planned stop and NULL otherwise, `node_state` the state of Slurm then (flags joined by `+`, NULL if none was read or it was stale) and `reason` that of Slurm or of the maintenance window, which takes precedence. The gaps are per host name, as the states and windows are, since a node that power saving boots often may get a new host id at every boot. `unobserved()` and `unobserved_by_name()` do not change |
@@ -1235,7 +1354,7 @@ names in PostgreSQL and Prometheus match.
 | `never_observed()` | the hosts of the inventory (§5.6) expected to run an agent whose agent never reported within the retention (no host has their name): `host`, `slurm_node`, `roles`, and `seen_as`, the hosts whose agents reported an address of the host, as an agent whose `host.name` differs from the inventory would |
 | `inventory`, `inventory_addrs` | the hosts of the inventory with their addresses (`host`, `slurm_node`, `roles`, `agent`, `addrs`), and one row per address with its host: join an address on `addr` to name its host |
 | `inventory_status` | when the inventory was last read from a valid file (`read_at`, NULL if never), the latest failure since (`failed_at`, `error`), and how many hosts it has; no row before a connector with `inventory_file` read it |
-| `job_edges` | the edges of the processes of Slurm jobs with the user of the process (`user_id`, NULL if unknown), host, unit, service and executable: which users connected to what, and when. For administrators: only its owner reads it (below) |
+| `job_edges` | the edges of the processes of Slurm jobs, those to Unix sockets included (with `path`), with the user of the process (`user_id`, NULL if unknown), host, unit, service and executable: which users connected to what, and when. For administrators: only its owner reads it (below) |
 | `dependencies_between(since, until)`, `graph_edges_between`, `graph_nodes_between`, `dependency_changes_between` | the same for the dependencies active in a period. They take the edges active in the period with a margin of 15 minutes before matching, so a recent window does not scan the history (about 0.3 s instead of 3 s with a million edges) and both sides of a connection are matched at the edges of the period; the dashboards and alerts use them. A dependency appeared in a period when it was first seen in it and is not in `known_dependencies` from before it, so one that comes back on new edges (a new container, an hourly job) did not appear |
 
 The connector role writes `shawk` and reads `shawk_v1`; Grafana reads
@@ -1271,6 +1390,10 @@ recording rules in `packaging/prometheus/shawk-rules.yml` count it once:
 | connections, open connections, bytes, datagrams, RTT | the client side; the server side only when the client has no agent (`shawk_peer_agent="false"`) | `connections:rate5m`, `open_connections`, `request_bytes:rate5m`, `response_bytes:rate5m`, `request_datagrams:rate5m`, `response_datagrams:rate5m`, `rtt_seconds_sum:rate5m`, `rtt_seconds_count:rate5m` |
 | connection failures, by reason, handshakes, SYN retransmissions | the client side only (the server never sees them, and its side of a handshake is not measured) | `connection_failures:rate5m`, `connection_failures_by_reason:rate5m`, `handshake_seconds_sum:rate5m`, `handshake_seconds_count:rate5m`, `syn_retransmits:rate5m` |
 | retransmissions | both sides: each counts its own retransmitted segments; `shawk_role` is the sender | `retransmits:rate5m` |
+
+A dependency over a Unix socket is seen on its client side only (§3.8),
+which the rules count, with `network_transport="unix"` and `server_port`
+0; it has no bytes, datagrams, RTT, handshakes or retransmissions.
 
 The two sides differ in `shawk_role`, so their `or` is a union. The rules
 label the client `src` and the server `dst` whichever side observed the
@@ -1346,8 +1469,14 @@ handshake, raise them. OBI panels use a minimum interval of a minute, since
 OBI exports every 60 seconds by default.
 
 Where the absence of a dependency is read (the changes dashboard, and the
-observation periods of the fleet dashboard), the panels say that only TCP
-and UDP are observed. The fleet dashboard shows the traffic of the RDMA
+observation periods of the fleet dashboard), the panels say that only TCP,
+UDP and Unix stream sockets are observed; the fleet dashboard shows which
+agents trace Unix sockets (`unix_traced`), and `ShawkUnixNotTraced` alerts,
+as `ShawkUDPNotTraced`, on agents that do not. `ShawkConnectionFailureRate`
+leaves out the failed connects to Unix sockets that no listener serves
+(`~unresolved`): glibc tries the socket of nscd from every process that
+looks up a user or a host, and most hosts do not run nscd; the dashboards
+still show them. The fleet dashboard shows the traffic of the RDMA
 ports of each host (`shawk.agent.rdma.io`) below the observation periods,
 as a hint only (§10).
 
@@ -1374,8 +1503,11 @@ only the protocols it parses. shawk runs beside it:
 
 ## 10. Limitations
 
-- **TCP and UDP only.** "Observed and not used" holds for TCP and UDP
-  sockets. RDMA verbs (InfiniBand, RoCE) bypass them, so the RDMA
+- **TCP, UDP and Unix stream sockets only.** "Observed and not used" holds
+  for TCP and UDP sockets and the connections of Unix stream and seqpacket
+  sockets (§3.8), not for datagram Unix sockets (syslog, journald,
+  `sd_notify`), unnamed pairs, pipes or shared memory. RDMA verbs
+  (InfiniBand, RoCE) bypass the sockets, so the RDMA
   transports of MPI (UCX) and NCCL, Lustre o2ib, GPFS verbs and NFS over
   RDMA are not seen, even when their control connections over TCP are; TCP
   over IPoIB is. In HPC clusters the main data paths use RDMA, so a storage
@@ -1501,6 +1633,21 @@ only the protocols it parses. shawk runs beside it:
 - **Connections that predate the agent** are counted from the adoption on.
   One accepted by a listener with a backlog of 0 that is gone is recorded
   as outgoing.
+- **Unix sockets** (§3.8): their traffic is not measured, only their
+  connections. A failed connect has the name the client asked for, which
+  differs from the server's when the client reaches it through a link or a
+  mount, so its failures are on an edge of their own. The server is the
+  owner of the listener of the name in the namespace of the client, else,
+  for a path, the only one on the host: servers that bind the same path in file systems
+  of their own (systemd's `PrivateTmp=`) in one network namespace are not
+  told apart, and a client from another namespace of a name that several
+  namespaces listen on is not named. A listener appears up to a minute
+  after it opened (an interval after a client connected) and stays until
+  the scan after it closed. A connection that the client passed to another
+  process stays with the process that connected. Connections that predate
+  the agent are not adopted when both sides bound names and the listener is
+  gone. More open connections than the table holds (half of `-max-flows`)
+  are dropped updates, and the period is partly observed.
 - **Clocks**: first and last seen times come from each host's clock, capped
   at 2 minutes ahead of the connector (§5.1), as does the segment start;
   heartbeats come from the connector's clock, compared with PostgreSQL's.

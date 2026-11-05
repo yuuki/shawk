@@ -136,7 +136,7 @@ func runAgent(ctx context.Context, args []string, _, stderr io.Writer) error {
 		interval = fs.Duration("interval", 15*time.Second, "collection and export interval, at most 1m")
 		idleTTL  = fs.Duration("idle-ttl", 15*time.Minute, "how long a dependency is sent after its last activity")
 		netns    = fs.String("netns", "all", `network namespaces to trace: "all", "self" or an inode number`)
-		maxFlows = fs.Uint("max-flows", 16384, "capacity of the in-kernel flow table per interval; also sizes the tables of listening ports (8192 to 65536)")
+		maxFlows = fs.Uint("max-flows", 16384, "capacity of the in-kernel flow table per interval; also sizes the tables of listening ports (8192 to 65536) and those of Unix sockets: a quarter of it for their flows, a half for their open connections (at least 1024 each)")
 		fold     = fs.String("fold-external", "in",
 			`fold the peers outside -internal-peers into one dependency per local endpoint: "in" (the clients of local servers), "all" (also the servers of local clients) or "none"`)
 		internal = fs.String("internal-peers", "private",
@@ -238,6 +238,9 @@ func runFlows(ctx context.Context, args []string, w, stderr io.Writer) error {
 	if !tr.UDPEnabled() {
 		fmt.Fprintln(stderr, "warning: UDP is not traced: its programs could not be loaded (they need BPF trampolines, fentry)")
 	}
+	if !tr.UnixEnabled() {
+		fmt.Fprintln(stderr, "warning: Unix sockets are not traced: their programs could not be loaded (they need BPF trampolines, fexit)")
+	}
 	ticker := time.NewTicker(*interval)
 	defer ticker.Stop()
 	for i := 0; *count == 0 || i < *count; i++ {
@@ -267,8 +270,14 @@ func printFlows(w io.Writer, flows []tracer.Flow) {
 		if a.Direction != b.Direction {
 			return a.Direction > b.Direction
 		}
+		if a.Proto != b.Proto {
+			return a.Proto < b.Proto
+		}
 		if a.Port != b.Port {
 			return a.Port < b.Port
+		}
+		if a.Path != b.Path {
+			return a.Path < b.Path
 		}
 		return a.RemoteAddr.Less(b.RemoteAddr)
 	})
@@ -277,6 +286,11 @@ func printFlows(w io.Writer, flows []tracer.Flow) {
 	fmt.Fprintln(tw, "DIR\tPROTO\tLOCAL\tREMOTE\tPORT\tPROCESS\tPID\tCONNS\tFAILED\tHANDSHAKE\tSYN-RETRANS\tOPEN\tSENT\tRECV")
 	for _, f := range flows {
 		local, remote := f.LocalAddr.String(), f.RemoteAddr.String()
+		port := strconv.FormatUint(uint64(f.Port), 10)
+		if f.Proto == tracer.ProtoUnix {
+			// The name of the socket of the server, which has no address.
+			local, remote, port = "-", f.Path, "-"
+		}
 		arrow := "-->"
 		if f.Direction == tracer.DirIn {
 			arrow = "<--"
@@ -285,13 +299,18 @@ func printFlows(w io.Writer, flows []tracer.Flow) {
 		if f.Proto == tracer.ProtoUDP {
 			conns = fmt.Sprintf("%dmsg", f.MsgsSent+f.MsgsRecv)
 		}
-		// Only active opens of TCP have handshakes and failures.
+		// Only active opens of TCP have handshakes, and they and the
+		// connects of Unix sockets failures; Unix sockets count no bytes.
 		failed, handshake, synRetrans := "-", "-", "-"
-		if f.Proto == tracer.ProtoTCP && f.Direction == tracer.DirOut {
+		sent, recv := humanBytes(f.BytesSent), humanBytes(f.BytesRecv)
+		switch {
+		case f.Proto == tracer.ProtoTCP && f.Direction == tracer.DirOut:
 			failed, handshake, synRetrans = failures(&f.FlowStats), meanHandshake(&f.FlowStats), strconv.FormatUint(f.SynRetrans, 10)
+		case f.Proto == tracer.ProtoUnix:
+			failed, sent, recv = failures(&f.FlowStats), "-", "-"
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%s\t%d\t%s\t%s\t%s\t%s\t%d\t%s\t%s\n", arrow, f.Proto, local, remote, f.Port, f.Comm,
-			f.PID, conns, failed, handshake, synRetrans, f.OpenConns, humanBytes(f.BytesSent), humanBytes(f.BytesRecv))
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\t%d\t%s\t%s\n", arrow, f.Proto, local, remote, port, f.Comm,
+			f.PID, conns, failed, handshake, synRetrans, f.OpenConns, sent, recv)
 	}
 	tw.Flush()
 }

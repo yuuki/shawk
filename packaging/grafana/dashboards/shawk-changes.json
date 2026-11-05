@@ -1,7 +1,7 @@
 {
   "uid": "shawk-changes",
   "title": "shawk / Changes",
-  "description": "Dependencies over TCP and UDP that appeared or disappeared. RDMA (InfiniBand, RoCE) is not observed.",
+  "description": "Dependencies over TCP, UDP and Unix stream sockets that appeared or disappeared. RDMA (InfiniBand, RoCE) is not observed.",
   "tags": [
     "shawk"
   ],
@@ -188,7 +188,7 @@
         "defaults": {},
         "overrides": []
       },
-      "description": "Dependencies between services that appeared, or disappeared while a host that saw them kept observing for 15 minutes. Only TCP and UDP are observed: a dependency over RDMA verbs (MPI, NCCL, Lustre o2ib, NFS over RDMA) neither appears nor disappears here."
+      "description": "Dependencies between services that appeared, or disappeared while a host that saw them kept observing for 15 minutes. Only TCP, UDP and Unix stream sockets are observed: a dependency over RDMA verbs (MPI, NCCL, Lustre o2ib, NFS over RDMA) neither appears nor disappears here."
     }
   ]
 }

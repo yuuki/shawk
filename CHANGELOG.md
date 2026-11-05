@@ -1,3 +1,65 @@
+## Unreleased
+
+### Added
+
+* Unix domain sockets. The agent traces the connections of Unix stream
+  and seqpacket sockets to named sockets, a path or an abstract name
+  (`/run/postgresql/.s.PGSQL.5432`, php-fpm, `/run/docker.sock`, munge),
+  at the connect and the close of the client (`fexit/unix_stream_connect`,
+  `fentry/unix_release`), which need BPF trampolines as UDP does:
+  connections, failed connects by reason (`refused`, `timeout` for a full
+  backlog, `unreachable` for a permission denied, `local`, `aborted`) and
+  open connections. Their traffic is not measured: a Unix socket keeps no
+  count of its bytes. The listening sockets are found by the walks of the
+  processes, and connections that predate the agent are adopted. Datagram
+  Unix sockets (syslog, journald, `sd_notify`) and unnamed pairs are not
+  traced. Edges have `network.transport=unix` and the name of the socket
+  as `server.address`, and the agent reports `shawk.agent.unix.traced`
+  (`docs/design.md` §3.8).
+* The connector names the server of a Unix socket after the owner of its
+  listener on the host of the client, writes the edges and listeners to
+  `shawk.unix_edges` and `shawk.unix_listeners`, and forwards their
+  connections to Prometheus with `network_transport="unix"` and
+  `server_port="0"`, counted by the recording rules like the others.
+* PostgreSQL, in the one migration `0001_schema.sql`: `shawk_v1.dependencies`
+  and `dependencies_between()` have a last column `path` and the
+  dependencies over Unix sockets (`proto` `unix`, no addresses, port 0),
+  matched with the owners of the listeners of their names; `agents` has
+  `unix_traced` and `job_edges` `path`; the new view `unix_endpoints` is
+  for the connector. `peer_class(NULL)` is `~unresolved`, the name of the
+  server of a Unix socket without a listener, and `graph_edges` shows
+  `unix` for those dependencies.
+* The alert `ShawkUnixNotTraced`, and `unix_traced` in the fleet dashboard.
+  `ShawkConnectionFailureRate` leaves out the failed connects to Unix
+  sockets without a listener: glibc tries the socket of nscd from every
+  process that looks up a user or a host, and most hosts do not run nscd.
+* `shawk flows` shows the flows of Unix sockets.
+
+### Changed
+
+* A flow opened by the child that systemd forks for a service, named
+  `(cron)` until it executes `cron`, takes the identity of the service:
+  systemd connects the standard output of the service to journald in it.
+* `-max-flows` also sizes the in-kernel tables of the flows of Unix
+  sockets, to a quarter of it, and of their open connections, to a half,
+  at least 1024 each (about 3.6 MiB at the default).
+
+### Fixed
+
+* A UDP server that existed before the agent started could be taken for a
+  client of its own clients when it sent a reply between the attach of the
+  UDP programs and the walk that marks the servers, as the end-to-end test
+  did in a VM once the agent loaded more programs at start: the walk now
+  runs before the UDP programs attach.
+
+**Upgrading.** The tables and views of Unix sockets are in
+`0001_schema.sql`, which `shawk-migrate` does not apply again to a database
+that has it: create the database of v0.8.1 again as for the first build of
+v0.8.0 below (back up, drop the schemas `shawk` and `shawk_v1`, then run
+`shawk-migrate` and `grants.sql`). Upgrade the connectors with the agents:
+a connector of the previous version ignores the series of Unix sockets as
+invalid data points, and logs them.
+
 ## [v0.8.1](https://github.com/yuuki/shawk/compare/v0.8.0...v0.8.1) (2026-11-04)
 
 No change in behavior: the BPF programs run the same instructions.

@@ -35,6 +35,7 @@ func (f *fakeSource) Collect() (*tracer.Snapshot, error) {
 }
 
 func (f *fakeSource) UDPEnabled() bool                            { return true }
+func (f *fakeSource) UnixEnabled() bool                           { return true }
 func (f *fakeSource) TranslationsTraced() bool                    { return true }
 func (f *fakeSource) ProgramStats() ([]tracer.ProgramStat, error) { return nil, nil }
 
@@ -141,6 +142,67 @@ func TestTickMergesFlows(t *testing.T) {
 	}
 	if series != 2 {
 		t.Errorf("%d series of %s, want one per role", series, otlp.MetricConnOpened)
+	}
+}
+
+// TestTickUnix checks that the flows and listeners of Unix sockets are sent
+// with their names, and that an open connection keeps its series alive
+// without new ones.
+func TestTickUnix(t *testing.T) {
+	const name = "/run/postgresql/.s.PGSQL.5432"
+	unixFlow := func(conns, open uint64) tracer.Flow {
+		return tracer.Flow{
+			FlowKey: tracer.FlowKey{Direction: tracer.DirOut, Proto: tracer.ProtoUnix, Path: name, NetNS: 1,
+				CgroupID: unknownCgroup, Comm: "psql"},
+			FlowStats: tracer.FlowStats{Conns: conns, OpenConns: open},
+		}
+	}
+	src := &fakeSource{snaps: []*tracer.Snapshot{
+		{
+			Flows: []tracer.Flow{unixFlow(2, 1)},
+			Listeners: []tracer.Listener{{Proto: tracer.ProtoUnix, Path: name, NetNS: 1, CgroupID: unknownCgroup,
+				Comm: "postgres"}},
+		},
+		{Flows: []tracer.Flow{unixFlow(0, 1)}},
+	}}
+	exp := &fakeExporter{}
+	now := time.Now()
+	a := newTestAgent(src, exp, 0, now)
+	for range 2 {
+		if err := a.tick(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(a.state.Edges()) != 1 {
+		t.Fatalf("edges = %v", a.state.Edges())
+	}
+	for k, e := range a.state.Edges() {
+		if k.Role != otlp.RoleClient || k.Proto != otlp.TransportUnix || k.Path != name || k.LocalAddr.IsValid() || k.Port != 0 {
+			t.Errorf("edge = %+v", k)
+		}
+		if e.Total.Conns != 2 || e.Total.OpenConns != 1 {
+			t.Errorf("edge totals = %+v", e.Total)
+		}
+	}
+	for k := range a.state.Listeners() {
+		if k.Proto != otlp.TransportUnix || k.Path != name || k.Comm != "postgres" {
+			t.Errorf("listener = %+v", k)
+		}
+	}
+	var points int
+	for _, m := range exp.sent[len(exp.sent)-1].ResourceMetrics[0].ScopeMetrics[0].Metrics {
+		if m.Name != otlp.MetricConnCount {
+			continue
+		}
+		for _, p := range m.GetSum().GetDataPoints() {
+			points++
+			if a := attrs(p.Attributes); a["server.address"] != name || a["network.transport"] != "unix" || p.GetAsInt() != 1 {
+				t.Errorf("open connections = %v %v", a, p.GetAsInt())
+			}
+		}
+	}
+	if points != 1 {
+		t.Errorf("%d points of %s", points, otlp.MetricConnCount)
 	}
 }
 

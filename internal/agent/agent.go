@@ -69,6 +69,7 @@ const MaxInterval = time.Minute
 type source interface {
 	Collect() (*tracer.Snapshot, error)
 	UDPEnabled() bool
+	UnixEnabled() bool
 	TranslationsTraced() bool
 	ProgramStats() ([]tracer.ProgramStat, error)
 }
@@ -186,6 +187,9 @@ func Run(ctx context.Context, cfg Config) error {
 	if !tr.UDPEnabled() {
 		cfg.Logger.Warn("UDP is not traced; see the error above (UDP tracing needs BPF trampolines, fentry)")
 	}
+	if !tr.UnixEnabled() {
+		cfg.Logger.Warn("Unix sockets are not traced; see the error above (their tracing needs BPF trampolines, fexit)")
+	}
 	if cfg.NetNS != 0 && cfg.NetNS == procinfo.NetNSOf(1) {
 		cfg.Logger.Warn("only the initial network namespace is traced: connections of containers in other namespaces are not, " +
 			"and those that leave with the addresses of the host look traced to their peers; use -netns all on hosts with containers")
@@ -205,7 +209,7 @@ func Run(ctx context.Context, cfg Config) error {
 		InternalPeers: cfg.InternalPeers,
 	}, time.Now())
 	a.log.Info("agent started", "endpoint", cfg.Exporter.Endpoint, "protocol", cfg.Exporter.Protocol,
-		"interval", cfg.Interval, "idle_ttl", cfg.IdleTTL, "udp", tr.UDPEnabled(),
+		"interval", cfg.Interval, "idle_ttl", cfg.IdleTTL, "udp", tr.UDPEnabled(), "unix", tr.UnixEnabled(),
 		"learn_translations", cfg.LearnTranslations)
 	// The programs are attached and the sockets that existed before were
 	// adopted, so connections from now on are traced: units ordered after
@@ -365,6 +369,7 @@ func (a *Agent) observe(snap *tracer.Snapshot, start, end time.Time) {
 		k := otlp.EdgeKey{
 			Role:       role,
 			Proto:      f.Proto.String(),
+			Path:       f.Path,
 			LocalAddr:  f.LocalAddr,
 			PeerAddr:   f.RemoteAddr,
 			PeerFolded: f.Folded,
@@ -405,6 +410,7 @@ func (a *Agent) observe(snap *tracer.Snapshot, start, end time.Time) {
 	for _, l := range snap.Listeners {
 		a.state.AddListener(otlp.ListenerKey{
 			Proto:   l.Proto.String(),
+			Path:    l.Path,
 			Addr:    l.Addr,
 			Port:    l.Port,
 			NetNS:   l.NetNS,
@@ -455,6 +461,7 @@ func (a *Agent) request(now time.Time) ([]*colmetricspb.ExportMetricsServiceRequ
 		SegmentStart:        segStart,
 		NetNSScope:          a.netnsScope(),
 		UDPTraced:           a.tracer.UDPEnabled(),
+		UnixTraced:          a.tracer.UnixEnabled(),
 		FlowsDropped:        a.drops,
 		CgroupEventsDropped: a.cgroupDrops,
 		ContainerReadsDrops: a.cgroups.ReadsDropped(),

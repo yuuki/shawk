@@ -39,6 +39,9 @@ type AgentStatus struct {
 	SegmentStart time.Time
 	NetNSScope   string // "all" or the inode of the traced namespace
 	UDPTraced    bool
+	// UnixTraced tells whether the connections of Unix stream sockets are
+	// traced.
+	UnixTraced   bool
 	FlowsDropped uint64 // cumulative
 	// CgroupEventsDropped counts the cgroups created whose event the
 	// kernel dropped (cumulative).
@@ -199,24 +202,30 @@ var errorTypeSize = func() int {
 // edgeSize bounds the encoded size of the data points of an edge.
 func edgeSize(k *EdgeKey, e *Edge, attrs []*commonpb.KeyValue) int {
 	a := attrsSize(attrs)
-	// Two gauges, first and last seen, and two directions of bytes.
-	n := 2*(a+pointOverhead) + 2*(a+directionSize+pointOverhead)
+	// Two gauges, first and last seen.
+	n := 2 * (a + pointOverhead)
+	// The reasons of failure that occurred.
+	reasons := 0
+	for _, t := range e.FailStart {
+		if !t.IsZero() {
+			reasons += a + errorTypeSize + pointOverhead
+		}
+	}
 	switch k.Proto {
 	case "tcp":
-		// Opened, open connections, retransmits and RTT.
-		n += 4 * (a + pointOverhead)
+		// Two directions of bytes; opened, open connections, retransmits
+		// and RTT.
+		n += 2*(a+directionSize+pointOverhead) + 4*(a+pointOverhead)
 		if k.Role == RoleClient {
 			// Failed, SYN retransmits and the histogram of handshakes.
-			n += 3*(a+pointOverhead) + bucketsOverhead
-			// The reasons of failure that occurred.
-			for _, t := range e.FailStart {
-				if !t.IsZero() {
-					n += a + errorTypeSize + pointOverhead
-				}
-			}
+			n += 3*(a+pointOverhead) + bucketsOverhead + reasons
 		}
 	case "udp":
-		n += 2 * (a + directionSize + pointOverhead)
+		// Two directions of bytes and of datagrams.
+		n += 4 * (a + directionSize + pointOverhead)
+	case TransportUnix:
+		// Opened, failed and open connections.
+		n += 3*(a+pointOverhead) + reasons
 	}
 	return n
 }
@@ -252,25 +261,41 @@ func (s *State) addEdge(b *builder, k *EdgeKey, attrs []*commonpb.KeyValue) {
 		if k.Role == RoleClient {
 			b.handshake(start, t, attrs)
 			b.sum(MetricSynRetransmits, "{segment}", true, start, t.SynRetrans, attrs)
-			for i, fs := range e.FailStart {
-				if fs.IsZero() {
-					continue
-				}
-				reason := ErrorOther
-				if i < len(FailReasons) {
-					reason = FailReasons[i]
-				}
-				b.sum(MetricConnFailedByReason, "{connection}", true, fs, t.fails(i), with(attrs, AttrErrorType, reason))
-			}
+			s.addFailReasons(b, e, attrs)
 		}
 	case "udp":
 		b.sum(MetricUDPDatagrams, "{datagram}", true, start, t.MsgsSent, with(attrs, AttrIODirection, DirTransmit))
 		b.sum(MetricUDPDatagrams, "{datagram}", true, start, t.MsgsRecv, with(attrs, AttrIODirection, DirReceive))
+	case TransportUnix:
+		// The connections of a client only: a Unix socket keeps no count of
+		// the bytes it carries, which only a hook on every message could
+		// take.
+		b.sum(MetricConnOpened, "{connection}", true, start, t.Conns, attrs)
+		b.sum(MetricConnFailed, "{connection}", true, start, t.ConnFails, attrs)
+		b.sum(MetricConnCount, "{connection}", false, start, t.OpenConns, attrs)
+		s.addFailReasons(b, e, attrs)
 	}
-	b.sum(MetricNetworkIO, "By", true, start, t.BytesSent, with(attrs, AttrIODirection, DirTransmit))
-	b.sum(MetricNetworkIO, "By", true, start, t.BytesRecv, with(attrs, AttrIODirection, DirReceive))
+	if k.Proto != TransportUnix {
+		b.sum(MetricNetworkIO, "By", true, start, t.BytesSent, with(attrs, AttrIODirection, DirTransmit))
+		b.sum(MetricNetworkIO, "By", true, start, t.BytesRecv, with(attrs, AttrIODirection, DirReceive))
+	}
 	b.gauge(MetricEdgeFirst, "s", e.FirstSeen.Unix(), attrs)
 	b.gauge(MetricEdgeLast, "s", e.LastSeen.Unix(), attrs)
+}
+
+// addFailReasons adds the failures of a client edge by error.type, for the
+// reasons that occurred on it.
+func (s *State) addFailReasons(b *builder, e *Edge, attrs []*commonpb.KeyValue) {
+	for i, fs := range e.FailStart {
+		if fs.IsZero() {
+			continue
+		}
+		reason := ErrorOther
+		if i < len(FailReasons) {
+			reason = FailReasons[i]
+		}
+		b.sum(MetricConnFailedByReason, "{connection}", true, fs, e.Total.fails(i), with(attrs, AttrErrorType, reason))
+	}
 }
 
 func (s *State) addListener(b *builder, k *ListenerKey, attrs []*commonpb.KeyValue) {
@@ -294,6 +319,11 @@ func addAgent(b *builder, st *AgentStatus) {
 		udp = 1
 	}
 	b.gauge(MetricAgentUDPTraced, "", udp, nil)
+	unixTraced := int64(0)
+	if st.UnixTraced {
+		unixTraced = 1
+	}
+	b.gauge(MetricAgentUnixTraced, "", unixTraced, nil)
 	b.sum(MetricAgentFlowsDropped, "{update}", true, st.Started, st.FlowsDropped, nil)
 	b.sum(MetricAgentCgroupsDropped, "{event}", true, st.Started, st.CgroupEventsDropped, nil)
 	b.sum(MetricAgentReadsDropped, "{read}", true, st.Started, st.ContainerReadsDrops, nil)
@@ -360,6 +390,15 @@ func processAttrs(p *Process) []*commonpb.KeyValue {
 }
 
 func edgeAttrs(k *EdgeKey) []*commonpb.KeyValue {
+	if k.Proto == TransportUnix {
+		// A Unix socket has a name rather than addresses and a port.
+		return append(processAttrs(&k.Process),
+			str(AttrRole, k.Role),
+			str(AttrTransport, k.Proto),
+			str(AttrServerAddr, k.Path),
+			str(AttrNetNS, strconv.FormatUint(uint64(k.NetNS), 10)),
+		)
+	}
 	attrs := append(processAttrs(&k.Process),
 		str(AttrRole, k.Role),
 		str(AttrTransport, k.Proto),
@@ -391,6 +430,13 @@ func translationAttrs(k *TranslationKey) []*commonpb.KeyValue {
 }
 
 func listenerAttrs(k *ListenerKey) []*commonpb.KeyValue {
+	if k.Proto == TransportUnix {
+		return append(processAttrs(&k.Process),
+			str(AttrTransport, k.Proto),
+			str(AttrServerAddr, k.Path),
+			str(AttrNetNS, strconv.FormatUint(uint64(k.NetNS), 10)),
+		)
+	}
 	return append(processAttrs(&k.Process),
 		str(AttrTransport, k.Proto),
 		str(AttrLocalAddr, k.Addr.String()),
@@ -571,6 +617,7 @@ func compareEdgeKeys(a, b EdgeKey) int {
 	return cmp.Or(
 		cmp.Compare(roleOrder(a.Role), roleOrder(b.Role)),
 		strings.Compare(a.Proto, b.Proto),
+		strings.Compare(a.Path, b.Path),
 		cmp.Compare(a.Port, b.Port),
 		a.PeerAddr.Compare(b.PeerAddr),
 		compareBool(a.PeerFolded, b.PeerFolded),
@@ -606,6 +653,7 @@ func compareTranslationKeys(a, b TranslationKey) int {
 func compareListenerKeys(a, b ListenerKey) int {
 	return cmp.Or(
 		strings.Compare(a.Proto, b.Proto),
+		strings.Compare(a.Path, b.Path),
 		cmp.Compare(a.Port, b.Port),
 		a.Addr.Compare(b.Addr),
 		cmp.Compare(a.NetNS, b.NetNS),

@@ -155,11 +155,13 @@ settings of the connector below are off unless set.
 
 ### What is observed
 
-shawk observes TCP and UDP sockets, so "not used" means "no TCP or UDP".
-RDMA verbs (InfiniBand, RoCE) bypass the sockets: the RDMA transports of
-MPI (UCX) and NCCL, Lustre o2ib, GPFS verbs and NFS over RDMA are not
-seen, even when their control connections over TCP are, while TCP over
-IPoIB is. A storage server used only over o2ib looks observed and unused.
+shawk observes TCP and UDP sockets, and the connections of Unix stream
+sockets on each host (e.g. to the socket of munge or of a database), so
+"not used" means "no TCP, UDP or Unix stream connection". RDMA verbs
+(InfiniBand, RoCE) bypass the sockets: the RDMA transports of MPI (UCX)
+and NCCL, Lustre o2ib, GPFS verbs and NFS over RDMA are not seen, even
+when their control connections over TCP are, while TCP over IPoIB is. A
+storage server used only over o2ib looks observed and unused.
 
 The fleet dashboard shows, below the observation periods, the traffic of
 the RDMA ports of each host (`shawk_agent_rdma_io_bytes_total`, from

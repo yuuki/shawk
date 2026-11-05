@@ -36,6 +36,7 @@ const (
 	MetricAgentUp             = "shawk.agent.up"
 	MetricAgentSegmentStart   = "shawk.agent.segment.start"
 	MetricAgentUDPTraced      = "shawk.agent.udp.traced"
+	MetricAgentUnixTraced     = "shawk.agent.unix.traced"
 	MetricAgentFlowsDropped   = "shawk.agent.flows.dropped"
 	MetricAgentCgroupsDropped = "shawk.agent.cgroup_events.dropped"
 	MetricAgentReadsDropped   = "shawk.agent.container_reads.dropped"
@@ -73,11 +74,16 @@ const (
 	AttrPeerFold     = "shawk.peer.fold"     // resource: which edges fold their peers: none, in or all
 	AttrPeerInternal = "shawk.peer.internal" // resource: the internal ranges, whose peers are kept
 	AttrServerPort   = "server.port"
-	AttrNetNS        = "shawk.netns"
-	AttrIODirection  = "network.io.direction"
-	AttrNetNSScope   = "shawk.netns.scope"
-	AttrBPFProgram   = "shawk.bpf.program"
-	AttrErrorType    = "error.type"
+	// AttrServerAddr is the name of the Unix socket of an edge or a
+	// listener whose network.transport is TransportUnix, whatever the role,
+	// like server.port: such series carry it instead of
+	// network.local.address, network.peer.address and server.port.
+	AttrServerAddr  = "server.address"
+	AttrNetNS       = "shawk.netns"
+	AttrIODirection = "network.io.direction"
+	AttrNetNSScope  = "shawk.netns.scope"
+	AttrBPFProgram  = "shawk.bpf.program"
+	AttrErrorType   = "error.type"
 
 	// Attributes of a translation of addresses (see TranslationKey).
 	AttrTranslationClient      = "shawk.translation.client.address"
@@ -91,10 +97,14 @@ const (
 	AgentServiceName = "shawk-agent"
 )
 
-// Values of shawk.role and network.io.direction.
+// Values of shawk.role, network.transport and network.io.direction.
 const (
 	RoleClient = "client"
 	RoleServer = "server"
+
+	// TransportUnix is the network.transport of Unix stream and seqpacket
+	// sockets; TCP and UDP are "tcp" and "udp".
+	TransportUnix = "unix"
 
 	DirTransmit = "transmit"
 	DirReceive  = "receive"

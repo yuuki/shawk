@@ -33,13 +33,16 @@ func (t *Tracer) Collect() (*Snapshot, error) {
 		return nil, err
 	}
 	t.warnOnIncrease(t.iterSkips, "the TCP iterator of the kernel skipped some connections, which the walk of the processes accounts at every interval instead; Linux 6.17 fixes the iterator")
-	if adopted != t.lastAdopted || t.ownerMissing || t.skipping || time.Since(t.lastOwnScan) >= t.opts.OwnerScanInterval ||
-		t.hasNewListener(listeners, inos) {
+	periodic := time.Since(t.lastOwnScan) >= t.opts.OwnerScanInterval
+	if adopted != t.lastAdopted || t.ownerMissing || t.skipping || periodic || t.hasNewListener(listeners, inos) {
 		if err := t.refreshOwners(listeners, inos); err != nil {
 			return nil, err
 		}
 		t.lastAdopted = adopted
 		t.ownerMissing = false
+		if periodic {
+			clear(t.unixMissing)
+		}
 	}
 	for i := range listeners {
 		k := listenerKey(&listeners[i])
@@ -53,11 +56,22 @@ func (t *Tracer) Collect() (*Snapshot, error) {
 		}
 	}
 
-	flows, err := t.flip()
+	listeners = append(listeners, t.unixListeners()...)
+
+	flows, unixFlows, err := t.flip()
 	if err != nil {
 		return nil, err
 	}
 	flows = t.attribute(flows)
+	for i := range unixFlows {
+		// A client connected to a name that no scan found a listener of: a
+		// server that started since the last scan.
+		if f := &unixFlows[i]; f.Conns > 0 && !t.hasUnixListener(f.Path) && !t.unixMissing[f.Path] {
+			t.unixMissing[f.Path] = true
+			t.ownerMissing = true
+		}
+	}
+	flows = append(flows, unixFlows...)
 	t.tryConntrack(time.Now())
 	// The flows are drained already: an error with the translations loses
 	// those of the interval only.
@@ -87,22 +101,34 @@ func (t *Tracer) Collect() (*Snapshot, error) {
 	return snap, nil
 }
 
-// flip switches the active flow map and drains the previous one.
-func (t *Tracer) flip() ([]Flow, error) {
+// flip switches the active flow maps and drains the previous ones: the
+// flows, and those of Unix sockets with their open connections.
+func (t *Tracer) flip() ([]Flow, []Flow, error) {
 	old := t.idx
 	next := old ^ 1
 	if err := t.activeIdx.Set(next); err != nil {
-		return nil, fmt.Errorf("switching flow map: %w", err)
+		return nil, nil, fmt.Errorf("switching flow map: %w", err)
 	}
 	t.idx = next
-	// Programs that read the old index may still be updating the old map.
+	// Programs that read the old index may still be updating the old maps.
 	// Updating an element of a map-in-map makes the kernel wait for an RCU
 	// grace period, after which they have all finished.
 	if err := t.flowsOuter.Update(old, t.flowMaps[old], ebpf.UpdateAny); err != nil {
-		return nil, fmt.Errorf("waiting for programs: %w", err)
+		return nil, nil, fmt.Errorf("waiting for programs: %w", err)
 	}
+	flows, err := drainFlows(t.flowMaps[old])
+	if err != nil {
+		return nil, nil, err
+	}
+	unixFlows, err := t.drainUnix(t.unixFlowMaps[old])
+	if err != nil {
+		return nil, nil, err
+	}
+	return flows, unixFlows, nil
+}
 
-	m := t.flowMaps[old]
+// drainFlows reads and deletes the flows of an inactive map.
+func drainFlows(m *ebpf.Map) ([]Flow, error) {
 	var (
 		key   bpfShawkFlowKey
 		val   bpfShawkFlowStats
@@ -123,6 +149,92 @@ func (t *Tracer) flip() ([]Flow, error) {
 		}
 	}
 	return flows, nil
+}
+
+// drainUnix reads and deletes the flows of Unix sockets of an inactive map,
+// and counts the connections open now, which the programs add to and
+// delete from unix_conns.
+func (t *Tracer) drainUnix(m *ebpf.Map) ([]Flow, error) {
+	var (
+		key  bpfShawkUnixKey
+		val  bpfShawkUnixStats
+		keys []bpfShawkUnixKey
+	)
+	flows := map[FlowKey]*Flow{}
+	it := m.Iterate()
+	for it.Next(&key, &val) {
+		keys = append(keys, key)
+		f := convertUnixFlow(&key, &val)
+		flows[f.FlowKey] = &f
+	}
+	if err := it.Err(); err != nil {
+		return nil, fmt.Errorf("reading Unix flows: %w", err)
+	}
+	for i := range keys {
+		if err := m.Delete(&keys[i]); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			return nil, fmt.Errorf("deleting Unix flow: %w", err)
+		}
+	}
+
+	var (
+		sk   uint64
+		conn bpfShawkUnixConn
+	)
+	it = t.unixConns.Iterate()
+	for it.Next(&sk, &conn) {
+		k := unixFlowKey(&conn.Key)
+		f, ok := flows[k]
+		if !ok {
+			f = &Flow{FlowKey: k}
+			flows[k] = f
+		}
+		f.OpenConns++
+		if f.PID == 0 {
+			f.PID = conn.Pid
+		}
+	}
+	if err := it.Err(); err != nil {
+		return nil, fmt.Errorf("reading open Unix connections: %w", err)
+	}
+	out := make([]Flow, 0, len(flows))
+	for _, f := range flows {
+		out = append(out, *f)
+	}
+	return out, nil
+}
+
+// unixFlowKey converts the key of a flow of Unix sockets.
+func unixFlowKey(k *bpfShawkUnixKey) FlowKey {
+	b := make([]byte, min(int(k.PathLen), len(k.Path)))
+	for i := range b {
+		b[i] = byte(k.Path[i])
+	}
+	return FlowKey{
+		Direction: DirOut,
+		Proto:     ProtoUnix,
+		Path:      UnixName(b),
+		NetNS:     k.Netns,
+		CgroupID:  k.CgroupId,
+		Comm:      commString(k.Comm),
+	}
+}
+
+// The reasons of struct shawk_unix_stats are those of FlowStats.
+var _ [len(bpfShawkUnixStats{}.Fails)]struct{} = [len(FlowStats{}.Fails)]struct{}{}
+
+func convertUnixFlow(k *bpfShawkUnixKey, v *bpfShawkUnixStats) Flow {
+	f := Flow{
+		FlowKey: unixFlowKey(k),
+		FlowStats: FlowStats{
+			Conns:     uint64(v.Conns),
+			ConnFails: uint64(v.ConnFails),
+			PID:       v.Pid,
+		},
+	}
+	for i, n := range v.Fails {
+		f.Fails[i] = uint64(n)
+	}
+	return f
 }
 
 // attribute assigns incoming TCP flows to the owner of the listening

@@ -148,6 +148,61 @@ eval instant at 10m ` + r("shawk:dependency_response_datagrams:rate5m") + `
 	promqltest.RunTest(t, script, promqltest.NewTestEngine(t, false, 0, promqltest.DefaultMaxSamplesPerQuery))
 }
 
+// TestUnixRecordingRules: the dependencies over Unix sockets, which the
+// connector sends from their client side only, with port 0 and without
+// bytes, are counted by the same rules, apart from those over TCP.
+func TestUnixRecordingRules(t *testing.T) {
+	records, alerts := loadRules(t)
+	r := func(name string) string {
+		e, ok := records[name]
+		if !ok {
+			t.Fatalf("no recording rule %s", name)
+		}
+		return inline(e, nil)
+	}
+	app := `src="shop/app", dst="postgres", server_port="5432", network_transport="tcp"`
+	office := `src="office-lan", dst="postgres", server_port="5432", network_transport="tcp"`
+	unix := `src="shop/app", dst="postgres", server_port="0", network_transport="unix"`
+	// cron tries the socket of nscd, which does not run, at every job.
+	nscd := `src="cron", dst="~unresolved", server_port="0", network_transport="unix"`
+	script := series + `
+load 1m
+  shawk_connection_opened_total{job="shop/app", instance="app-01", shawk_role="client", service_peer_name="postgres", shawk_peer_agent="true", server_port="0", network_transport="unix"} 0+60x10
+  shawk_connection_failed_total{job="shop/app", instance="app-01", shawk_role="client", service_peer_name="postgres", shawk_peer_agent="true", server_port="0", network_transport="unix"} 0+60x10
+  shawk_connection_failed_by_reason_total{job="shop/app", instance="app-01", shawk_role="client", service_peer_name="postgres", shawk_peer_agent="true", server_port="0", network_transport="unix", error_type="refused"} 0+60x10
+  shawk_connection_count{job="shop/app", instance="app-01", shawk_role="client", service_peer_name="postgres", shawk_peer_agent="true", server_port="0", network_transport="unix"} 3x10
+  shawk_connection_opened_total{job="cron", instance="app-01", shawk_role="client", service_peer_name="~unresolved", shawk_peer_agent="true", server_port="0", network_transport="unix"} 0x10
+  shawk_connection_failed_total{job="cron", instance="app-01", shawk_role="client", service_peer_name="~unresolved", shawk_peer_agent="true", server_port="0", network_transport="unix"} 0+2x10
+
+eval instant at 10m ` + r("shawk:dependency_connections:rate5m") + `
+  {` + app + `} 2
+  {` + office + `} 3
+  {` + unix + `} 1
+  {` + nscd + `} 0
+
+eval instant at 10m ` + r("shawk:dependency_connection_failures_by_reason:rate5m") + `
+  {` + app + `, error_type="timeout"} 0.3
+  {` + app + `, error_type="refused"} 0.2
+  {` + unix + `, error_type="refused"} 1
+
+eval instant at 10m ` + r("shawk:dependency_open_connections") + `
+  {` + app + `} 4
+  {` + office + `} 1
+  {` + unix + `} 3
+
+# No bytes: a Unix socket keeps no count of them.
+eval instant at 10m ` + r("shawk:dependency_request_bytes:rate5m") + `
+  {` + app + `} 10
+  {` + office + `} 5
+
+# Connects to Unix sockets that no listener serves are not alerted.
+eval instant at 10m ` + inline(alerts["ShawkConnectionFailureRate"], records) + `
+  {` + app + `} 0.2
+  {` + unix + `} 0.5
+`
+	promqltest.RunTest(t, script, promqltest.NewTestEngine(t, false, 0, promqltest.DefaultMaxSamplesPerQuery))
+}
+
 // The family per peer host as Prometheus stores what the shawk connector
 // sends with peer_hosts: slurmctld on ctl-01 connects to the slurmd of
 // node-01, which runs an agent, and fails to reach node-03, which is down;
@@ -241,6 +296,8 @@ eval instant at 10m ` + a("ShawkConnectionFailureRate") + `
 load 1m
   shawk_agent_udp_traced{job="shawk-agent", host_name="app-01"} 1x30
   shawk_agent_udp_traced{job="shawk-agent", host_name="app-03"} 0x30
+  shawk_agent_unix_traced{job="shawk-agent", host_name="app-01"} 1x30
+  shawk_agent_unix_traced{job="shawk-agent", host_name="app-03"} 0x30
   shawk_agent_export_failures_total{job="shawk-agent", host_name="app-01"} 0x30
   shawk_agent_export_failures_total{job="shawk-agent", host_name="app-03"} 0+1x30
   shawk_agent_cgroup_events_dropped_total{job="shawk-agent", host_name="app-01"} 0x30
@@ -250,6 +307,9 @@ load 1m
 
 eval instant at 20m ` + a("ShawkUDPNotTraced") + `
   shawk_agent_udp_traced{job="shawk-agent", host_name="app-03"} 0
+
+eval instant at 20m ` + a("ShawkUnixNotTraced") + `
+  shawk_agent_unix_traced{job="shawk-agent", host_name="app-03"} 0
 
 # One failure a minute.
 eval instant at 20m ` + a("ShawkExportFailures") + `

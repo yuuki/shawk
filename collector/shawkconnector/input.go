@@ -55,6 +55,10 @@ func (p *process) peerName() string {
 // edgeID identifies an input edge series of a host.
 type edgeID struct {
 	role, proto string
+	// path is the name of the socket a client edge of transportUnix
+	// connected to, on its host; such an edge has no addresses and port 0.
+	// It is empty for TCP and UDP.
+	path        string
 	local, peer netip.Addr
 	// folded tells that the peer stands for every peer outside the internal
 	// ranges of the agent: the network 0.0.0.0/0 or ::/0, whose address is
@@ -122,6 +126,9 @@ type translationInput struct {
 
 type listenerID struct {
 	proto string
+	// path is the name of a listening Unix socket (transportUnix), which
+	// has no address and port 0; empty for TCP and UDP.
+	path  string
 	addr  netip.Addr
 	port  uint16
 	netns uint64
@@ -149,8 +156,11 @@ type hostBatch struct {
 
 	segmentStart time.Time
 	udpTraced    bool
-	netnsScope   string
-	dropped      int64
+	// unixTraced tells whether the agent traces Unix sockets, nil if it
+	// does not tell (an agent before shawk.agent.unix.traced).
+	unixTraced *bool
+	netnsScope string
+	dropped    int64
 	// droppedSince is the start of the counter of dropped flows, when the
 	// agent started, by the clock of the agent; zero if unknown.
 	droppedSince time.Time
@@ -361,6 +371,11 @@ func (b *hostBatch) addAgent(m pmetric.Metric, name string) {
 		return
 	case metricAgentUDPTraced:
 		forGauge(b, m, func(dp pmetric.NumberDataPoint, _ time.Time) { b.udpTraced = numberValue(dp) != 0 })
+	case metricAgentUnixTraced:
+		forGauge(b, m, func(dp pmetric.NumberDataPoint, _ time.Time) {
+			traced := numberValue(dp) != 0
+			b.unixTraced = &traced
+		})
 	case metricAgentUp:
 		b.final = true
 		forGauge(b, m, func(dp pmetric.NumberDataPoint, _ time.Time) {
@@ -397,6 +412,7 @@ type agentMetric struct {
 var agentMetrics = map[string]agentMetric{
 	metricAgentUp:                  {gauge: true, attr: attrNetNSScope, valid: netnsScope},
 	metricAgentUDPTraced:           {gauge: true},
+	metricAgentUnixTraced:          {gauge: true},
 	metricAgentFlowsDropped:        {unit: "{update}"},
 	metricAgentCgroupsDropped:      {unit: "{event}"},
 	metricAgentReadsDropped:        {unit: "{read}"},
@@ -563,6 +579,9 @@ func parseProcess(a pcommon.Map) process {
 func (b *hostBatch) edge(a pcommon.Map) *edgeInput {
 	role := getString(a, attrRole)
 	proto := getString(a, attrTransport)
+	if proto == transportUnix {
+		return b.unixEdge(a, role)
+	}
 	local, err1 := parseAddr(getString(a, attrLocalAddr))
 	peer, err2 := parseAddr(getString(a, attrPeerAddr))
 	port, ok1 := getInt(a, attrServerPort)
@@ -592,8 +611,31 @@ func (b *hostBatch) edge(a pcommon.Map) *edgeInput {
 	return e
 }
 
+// unixEdge returns the edge of the attributes of a data point of a Unix
+// socket, or nil if they are invalid. Agents trace the clients of Unix
+// sockets only: the server is the owner of the listener of the name, on
+// the same host.
+func (b *hostBatch) unixEdge(a pcommon.Map, role string) *edgeInput {
+	path := getString(a, attrServerAddr)
+	netns, ok := getInt(a, attrNetNS)
+	if role != roleClient || path == "" || !ok || netns < 0 || netns > math.MaxUint32 {
+		b.invalid++
+		return nil
+	}
+	id := edgeID{role: role, proto: transportUnix, path: path, netns: uint64(netns), process: parseProcess(a)}
+	e, ok := b.edges[id]
+	if !ok {
+		e = &edgeInput{id: id, values: map[valueKey]point{}}
+		b.edges[id] = e
+	}
+	return e
+}
+
 func (b *hostBatch) listener(a pcommon.Map) *listenerInput {
 	proto := getString(a, attrTransport)
+	if proto == transportUnix {
+		return b.unixListener(a)
+	}
 	addr, err := parseAddr(getString(a, attrLocalAddr))
 	port, ok1 := getInt(a, attrServerPort)
 	netns, ok2 := getInt(a, attrNetNS)
@@ -602,6 +644,24 @@ func (b *hostBatch) listener(a pcommon.Map) *listenerInput {
 		return nil
 	}
 	id := listenerID{proto: proto, addr: addr.Unmap(), port: uint16(port), netns: uint64(netns), process: parseProcess(a)}
+	l, ok := b.listeners[id]
+	if !ok {
+		l = &listenerInput{id: id}
+		b.listeners[id] = l
+	}
+	return l
+}
+
+// unixListener returns the listener of the attributes of a data point of a
+// Unix socket, or nil if they are invalid.
+func (b *hostBatch) unixListener(a pcommon.Map) *listenerInput {
+	path := getString(a, attrServerAddr)
+	netns, ok := getInt(a, attrNetNS)
+	if path == "" || !ok || netns < 0 || netns > math.MaxUint32 {
+		b.invalid++
+		return nil
+	}
+	id := listenerID{proto: transportUnix, path: path, netns: uint64(netns), process: parseProcess(a)}
 	l, ok := b.listeners[id]
 	if !ok {
 		l = &listenerInput{id: id}

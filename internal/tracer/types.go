@@ -3,7 +3,10 @@ package tracer
 import (
 	"fmt"
 	"net/netip"
+	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 // Direction is the direction of a flow seen from the local host.
@@ -37,12 +40,16 @@ func ParseDirection(s string) (Direction, error) {
 	return 0, fmt.Errorf("invalid direction %q", s)
 }
 
-// Proto is an IP protocol number.
+// Proto is an IP protocol number, or ProtoUnix.
 type Proto uint8
 
 const (
 	ProtoTCP Proto = 6
 	ProtoUDP Proto = 17
+	// ProtoUnix stands for Unix stream and seqpacket sockets: not an IP
+	// protocol number but IPPROTO_RAW, which shawk never traces, as
+	// PROTO_UNIX of the BPF programs.
+	ProtoUnix Proto = 255
 )
 
 func (p Proto) String() string {
@@ -51,6 +58,8 @@ func (p Proto) String() string {
 		return "tcp"
 	case ProtoUDP:
 		return "udp"
+	case ProtoUnix:
+		return "unix"
 	}
 	return fmt.Sprintf("proto(%d)", uint8(p))
 }
@@ -62,21 +71,30 @@ func ParseProto(s string) (Proto, error) {
 		return ProtoTCP, nil
 	case "udp":
 		return ProtoUDP, nil
+	case "unix":
+		return ProtoUnix, nil
 	}
 	return 0, fmt.Errorf("invalid protocol %q", s)
 }
 
 // FlowKey identifies a bundled flow. All connections or datagrams between
 // LocalAddr and RemoteAddr to the same service Port by the same process
-// identity are bundled into one flow.
+// identity are bundled into one flow. A flow of Unix sockets (ProtoUnix)
+// bundles the connections of a client process to the socket named Path
+// instead: it is outgoing, without addresses or port.
 type FlowKey struct {
-	Direction  Direction
-	Proto      Proto
+	Direction Direction
+	Proto     Proto
+	// Path is the name of the Unix socket a flow of ProtoUnix connected to
+	// (see UnixName); empty otherwise.
+	Path       string
 	LocalAddr  netip.Addr
 	RemoteAddr netip.Addr
 	// Port is the service port: the remote port for outgoing flows and the
 	// local port for incoming flows.
-	Port     uint16
+	Port uint16
+	// NetNS is the network namespace of the local socket: for a flow of
+	// Unix sockets, of the client socket.
 	NetNS    uint32
 	CgroupID uint64
 	Comm     string
@@ -188,9 +206,9 @@ func (r FailReason) String() string {
 
 // FlowStats holds the statistics of a bundled flow in an interval.
 type FlowStats struct {
-	Conns      uint64 // TCP connections established
-	ConnFails  uint64 // TCP active opens that failed
-	OpenConns  uint64 // TCP connections open at the end of the interval
+	Conns      uint64 // TCP and Unix connections established
+	ConnFails  uint64 // TCP active opens and Unix connects that failed
+	OpenConns  uint64 // TCP and Unix connections open at the end of the interval
 	BytesSent  uint64
 	BytesRecv  uint64
 	MsgsSent   uint64 // UDP datagrams sent
@@ -208,8 +226,8 @@ type FlowStats struct {
 	// SynRetrans are the SYNs that the TCP active opens counted in Conns
 	// or ConnFails retransmitted.
 	SynRetrans uint64
-	// Fails are the TCP active opens that failed, by FailReason. ConnFails
-	// minus their sum failed for another reason.
+	// Fails are the TCP active opens and Unix connects that failed, by
+	// FailReason. ConnFails minus their sum failed for another reason.
 	Fails [NumFailReasons]uint64
 	PID   uint32 // last observed process id
 }
@@ -263,9 +281,12 @@ type Flow struct {
 	FlowStats
 }
 
-// Listener is a listening TCP socket or a bound UDP server socket.
+// Listener is a listening TCP socket, a bound UDP server socket, or a
+// listening Unix stream or seqpacket socket, which has a Path (see
+// UnixName) rather than an address and a port.
 type Listener struct {
 	Proto Proto
+	Path  string
 	Addr  netip.Addr
 	Port  uint16
 	NetNS uint32
@@ -297,6 +318,38 @@ type Snapshot struct {
 	// event the kernel dropped because the ring buffer was full: their
 	// paths are not learned (#126).
 	CgroupEventDrops uint64
+}
+
+// UnixName returns the name of a Unix socket from the bytes of its sun_path
+// (struct sockaddr_un), as ss(8) shows it: a path as it is, and an abstract
+// name, which starts with a NUL, with @ for that NUL. Bytes that are not
+// printable characters of valid UTF-8 are escaped as \xHH, a backslash as
+// \\, and an @ that a path starts with as \x40, so that a name is valid
+// UTF-8 and tells an abstract name from a path.
+func UnixName(b []byte) string {
+	var sb strings.Builder
+	if len(b) > 0 && b[0] == 0 {
+		sb.WriteByte('@')
+		b = b[1:]
+	} else if len(b) > 0 && b[0] == '@' {
+		sb.WriteString(`\x40`)
+		b = b[1:]
+	}
+	for len(b) > 0 {
+		r, n := utf8.DecodeRune(b)
+		switch {
+		case r == '\\':
+			sb.WriteString(`\\`)
+		case r == utf8.RuneError && n <= 1, !unicode.IsPrint(r):
+			for _, c := range b[:max(n, 1)] {
+				fmt.Fprintf(&sb, `\x%02x`, c)
+			}
+		default:
+			sb.Write(b[:n])
+		}
+		b = b[max(n, 1):]
+	}
+	return sb.String()
 }
 
 func addrFrom16(b [16]uint8) netip.Addr {
