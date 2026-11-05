@@ -17,17 +17,21 @@ measured on a cluster yet.**
   the same rank of 189 other nodes make 24 192 flows, as the issue
   assumed. The agent counted exactly the flows that the connections
   predict, under Slurm (srun, PMIx) and across three nodes (mpirun).
-- **Whether Slurm makes a cgroup per task depends on its configuration.**
-  With cgroup v2, `task/cgroup` and `ConstrainCores=yes`, Slurm up to
-  24.11.2 moves every task to the cgroup of its step (`task_special`)
-  after `jobacct_gather/cgroup` moved it to `task_<n>`; `ConstrainRAMSpace`
-  moves it back, and 24.11.3 fixed the cpuset (Slurm commit 91f1fc540b).
-  With one cgroup per step, an all-to-all of R ranks per node over N nodes
-  makes at most about 2 R (N − 1) flows on a node (48 384 for 128 ranks
-  and 190 nodes); with a cgroup per task, as the issue assumes, up to
-  about R² (N − 1) / 2 (1.5 million), which no flow table holds. On one
-  node, 16 ranks of `MPI_Alltoall` made 33 flows with one cgroup and 88
-  with a cgroup per task.
+- **Whether Slurm makes a cgroup per task depends on its version and
+  `cgroup.conf`.** Of the versions shawk targets, 22.05.9 (like 22.05.11,
+  measured) leaves the tasks of a step in one cgroup (`task_special`) with
+  `ConstrainCores=yes` and without `ConstrainRAMSpace`: `task/cgroup`
+  moves every task back to the step for its cpuset after
+  `jobacct_gather/cgroup` moved it to `task_<n>`. 24.11.7 and 25.11.4 give
+  every task a cgroup of its own whenever `jobacct_gather/cgroup` or a
+  constraint of `task/cgroup` is on (Slurm commit 91f1fc540b, 24.11.3;
+  read from their sources, not measured). With one cgroup per step, an
+  all-to-all of R ranks per node over N nodes makes at most about
+  2 R (N − 1) flows on a node (48 384 for 128 ranks and 190 nodes); with a
+  cgroup per task, as the issue assumes, up to about R² (N − 1) / 2
+  (1.5 million), which no flow table holds. On one node, 16 ranks of
+  `MPI_Alltoall` made 33 flows with one cgroup and 88 with a cgroup per
+  task.
 - **A full table drops the same flows in every interval, the dependencies
   of the infrastructure among them.** With 24 192 flows and the default
   `-max-flows` of 16 384, the same 16 384 were collected for 6 intervals
@@ -180,9 +184,18 @@ hierarchy (cgroup v2) the last move wins
 Slurm 24.11.3 made the cpuset work per task (commit 91f1fc540b, "There was
 a race when jobacctgather/cgroup moved a pid to task_x directory ... Then
 task/cgroup was removing it and putting again the pid in the step_0
-superior directory"), so from it the tasks have cgroups of their own
-whenever a plugin adds them as tasks. With one cgroup per step the ranks
-of a node share the key of a remote port: 17 outgoing flows for 16 ranks,
+superior directory"). For the versions shawk targets, from their sources
+(`_fork_all_tasks()` of `slurmstepd/mgr.c`, `task_cgroup_cpuset.c`,
+`cgroup_v2.c`; only 22.05.11 was run):
+
+| Slurm | the order of the plugins for a task | the tasks of a step are in |
+|---|---|---|
+| 22.05.9 | proctrack, `jobacct_gather`, `task/cgroup` (cpuset to the step, memory to the task) | as measured with 22.05.11 above |
+| 24.11.7, 25.11.4 | proctrack, `jobacct_gather`, `task/cgroup` (cpuset and memory to the task) | `task_<n>` with `jobacct_gather/cgroup` or a constraint of `task/cgroup`; `task_special` without either |
+
+The directories are the same in all three (`job_<id>/step_<n>/user/` with
+`task_<n>` and `task_special`). With one cgroup per step the ranks of a
+node share the key of a remote port: 17 outgoing flows for 16 ranks,
 against 72 with a cgroup per task. What `/proc/<rank>/cgroup` shows on a
 cluster decides between the two columns of the first table.
 Since the ports of the ranks are numbered from 1024 on every node, the
@@ -365,10 +378,11 @@ interval, with a quarter of margin:
 - The ranks of a node talking to one rank of every other node of 190
   nodes: 24 192 flows, `-max-flows 32768` (102 MiB of BPF maps).
 - All to all over 190 nodes, 128 ranks a node, one cgroup per step
-  (`ConstrainCores` without `ConstrainRAMSpace` before Slurm 24.11.3): up
-  to 48 384, `-max-flows 65536` (203 MiB).
-- All to all with a cgroup per task, or MPI over TCP between thousands of
-  ranks: no table holds it. Keep the default and accept that such jobs are
+  (22.05.9 with `ConstrainCores` and without `ConstrainRAMSpace`): up to
+  48 384, `-max-flows 65536` (203 MiB).
+- All to all with a cgroup per task (24.11.7 and 25.11.4 with the usual
+  `cgroup.conf`), or MPI over TCP between thousands of ranks: no table
+  holds it. Keep the default and accept that such jobs are
   partly observed, or exclude them by not running MPI over TCP.
 - Check what the tasks are in (`cat /proc/<rank>/cgroup`: `task_<n>` or
   `task_special`), which the version and `cgroup.conf` decide (§2), and count the
@@ -414,8 +428,8 @@ What the VM could not show:
 - bare-metal compute nodes of 64 to 128 cores and x86_64, a real interface
   and its interrupts, IPoIB, and jobs over many nodes at once;
 - MPI over TCP across real nodes at the scale of the issue, other MPI
-  libraries (MPICH, Intel MPI, UCX over TCP), and Slurm configurations
-  that make a cgroup per task;
+  libraries (MPICH, Intel MPI, UCX over TCP), and the Slurm versions shawk
+  targets (22.05.9, 24.11.7, 25.11.4) rather than 22.05.11 of EPEL;
 - the effect on jobs spanning nodes, whose collective operations wait for
   the slowest node, with the agents of all nodes collecting at the same
   time or not;
@@ -426,7 +440,8 @@ and `nodeload` built from the same commit (`go build ./cmd/shawk
 ./test/nodeload`, `mpicc` for `mpi/*.c`):
 
 1. *Flows of real jobs.* While a representative job runs, on one of its
-   nodes: `cat /proc/<rank>/cgroup` for a few ranks; `nodeload probe -comm
+   nodes, for each Slurm version in use: `cat /proc/<rank>/cgroup` for a
+   few ranks, with `cgroup.conf` and `JobAcctGatherType`; `nodeload probe -comm
    <executable> -count 4` (with `-max-flows` above the expected flows) and
    `(ss -Htnp state established; echo --; ss -Htlnp) | keys.py
    <executable>`; record ranks per node, nodes, the MPI library and its
