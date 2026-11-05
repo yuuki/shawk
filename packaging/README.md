@@ -134,37 +134,53 @@ OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE=/etc/obi/tls/obi.crt
 OTEL_EXPORTER_OTLP_CLIENT_KEY=/etc/obi/tls/obi.key
 ```
 
-## Slurm
-
-On a cluster managed by Slurm, nodes powered down by power saving or in
-maintenance are not alerted (`docs/design.md` §5.7). For PostgreSQL, set
-`node_states_file` in the connector and generate the file every minute
-on the host that runs it, with a cron job that replaces it at once:
-
-```sh
-scontrol show nodes --json \
-  | jq '{generated_at: (now | todate), nodes: [.nodes[] | {node: .name, state, reason}]}' \
-  > /etc/shawk/node-states.json.tmp && mv /etc/shawk/node-states.json.tmp /etc/shawk/node-states.json
-```
-
-The connector maps each `NodeName` to a host by `slurm_node` of the
-`inventory_file`.
-Register maintenance windows, of hosts with or without Slurm, in
-`maintenance_file` before they start; replace it at once too, and give
-every connector the same one.
-
-For Prometheus, `ShawkAgentDown` joins the node states of a Slurm
-exporter: replace `slurm_node_state` and its labels in
-`prometheus/shawk-rules.yml` with those of the exporter in use. Silence
-the maintenance windows that are not `MAINT` reservations in Alertmanager.
-
 ## Grafana
 
 Set `SHAWK_GRAFANA_PROMETHEUS_PASSWORD` and put the CA of Prometheus at
 `/etc/grafana/tls/prometheus-ca.crt`, then adjust the URLs and credentials
 in `grafana/provisioning/datasources/shawk.yaml`.
 
-## Stateless nodes: a stable machine id
+## Upgrading
+
+The connector of the example does not migrate (`migrate: false`). It waits
+until the schema is at least its own version, and warns when the schema is
+newer. Run `shawk-migrate` and `grants.sql` before or while upgrading the
+collectors, and upgrade all of them, along with the agents.
+
+## HPC clusters
+
+Notes for static clusters managed by Slurm. The design is in
+[docs/proposals/slurm-hpc-clusters.md](../docs/proposals/slurm-hpc-clusters.md)
+(#170) and `docs/design.md`; each subsection below is one topic. The
+settings of the connector below are off unless set.
+
+### What is observed
+
+shawk observes TCP and UDP sockets, so "not used" means "no TCP or UDP".
+RDMA verbs (InfiniBand, RoCE) bypass the sockets: the RDMA transports of
+MPI (UCX) and NCCL, Lustre o2ib, GPFS verbs and NFS over RDMA are not
+seen, even when their control connections over TCP are, while TCP over
+IPoIB is. A storage server used only over o2ib looks observed and unused.
+
+The fleet dashboard shows, below the observation periods, the traffic of
+the RDMA ports of each host (`shawk_agent_rdma_io_bytes_total`, from
+`/sys/class/infiniband/*/ports/*/counters`). It is a hint that a host used
+what shawk does not see, not a coverage guarantee: the counters cover the
+whole port, IPoIB included, and tell neither which hosts or jobs used RDMA
+nor, when flat, that nothing was missed. Hosts without readable port
+counters (software devices such as rxe and siw) have no series.
+
+The sockets of kernel clients (NFS, Lustre over TCP) belong to no process,
+so shawk tells which hosts use a file system, not which users or jobs. For
+usage by job, use the file systems, e.g. Lustre jobstats with
+`jobid_var=SLURM_JOB_ID`.
+
+### Start order
+
+Order slurmd after the agent with the drop-ins of [Agent](#agent), so that
+the first connections of a node that power saving resumes are traced.
+
+### A stable machine id per node
 
 PostgreSQL keys a host by its machine id and host name, and the connector
 sends the machine id to Prometheus as `host_id`, as OBI does as `host.id`.
@@ -224,58 +240,77 @@ SELECT host, count(*) AS host_ids FROM shawk_v1.agents GROUP BY host HAVING coun
 
 The host ids already recorded stay. `shawk_v1.unobserved_by_name()` takes
 the same arguments as `unobserved()` and computes the periods over the
-sessions of all the host ids of each name; the dashboards use
-`unobserved()`, and their annotations can call `unobserved_by_name()`
-instead where machine ids changed. It hides the gaps of two machines that
-share a name.
+sessions of all the host ids of each name. The annotations of the
+dashboards use `unobserved()`, and can call `unobserved_by_name()` instead
+where machine ids changed; the table of gaps of the fleet dashboard is per
+name already (`unobserved_reasons()`, below). Per name, the gaps of two
+machines that share a name hide each other.
 
-## Upgrading
+### Inventory
 
-The connector of the example does not migrate (`migrate: false`). It waits
-until the schema is at least its own version, and warns when the schema is
-newer. Run `shawk-migrate` and `grants.sql` before or while upgrading the
-collectors, and upgrade all of them, along with the agents.
+Set `inventory_file` in the connector to the hosts of the cluster, with all
+their addresses (management, IPoIB, storage), their roles, and the
+`NodeName` of each node in Slurm (`docs/design.md` §5.6). Generate it from
+the provisioning database, which knows every address, rather than from
+Slurm's `NodeAddr`, and replace it at once. The connector names the host
+of an address from it before what agents report (`shawk_peer_host`
+below), and maps the `NodeName`s of the node states to hosts with it;
+`shawk_v1.never_observed()` lists the hosts expected to run an agent whose
+agent never reported.
 
-## HPC clusters
+### Node states and maintenance windows
 
-Notes for static clusters managed by Slurm. The design is in
-[docs/proposals/slurm-hpc-clusters.md](../docs/proposals/slurm-hpc-clusters.md)
-(#170); each subsection below is one topic.
+Nodes that Slurm powered down to save energy, or that are in maintenance,
+are not alerted (`docs/design.md` §5.7). For PostgreSQL, set
+`node_states_file` in the connector and generate the file every minute
+on the host that runs it, with a cron job that replaces it at once:
 
-### What is observed
+```sh
+scontrol show nodes --json \
+  | jq '{generated_at: (now | todate), nodes: [.nodes[] | {node: .name, state, reason}]}' \
+  > /etc/shawk/node-states.json.tmp && mv /etc/shawk/node-states.json.tmp /etc/shawk/node-states.json
+```
 
-shawk observes TCP and UDP sockets, so "not used" means "no TCP or UDP".
-RDMA verbs (InfiniBand, RoCE) bypass the sockets: the RDMA transports of
-MPI (UCX) and NCCL, Lustre o2ib, GPFS verbs and NFS over RDMA are not
-seen, even when their control connections over TCP are, while TCP over
-IPoIB is. A storage server used only over o2ib looks observed and unused.
+The connector maps each `NodeName` to a host by `slurm_node` of the
+`inventory_file` (above).
 
-The fleet dashboard shows, below the observation periods, the traffic of
-the RDMA ports of each host (`shawk_agent_rdma_io_bytes_total`, from
-`/sys/class/infiniband/*/ports/*/counters`). It is a hint that a host used
-what shawk does not see, not a coverage guarantee: the counters cover the
-whole port, IPoIB included, and tell neither which hosts or jobs used RDMA
-nor, when flat, that nothing was missed. Hosts without readable port
-counters (software devices such as rxe and siw) have no series.
+Register maintenance windows, of hosts with or without Slurm, in
+`maintenance_file` before they start; replace it at once too, and give
+every connector the same one.
 
-The sockets of kernel clients (NFS, Lustre over TCP) belong to no process,
-so shawk tells which hosts use a file system, not which users or jobs. For
-usage by job, use the file systems, e.g. Lustre jobstats with
-`jobid_var=SLURM_JOB_ID`.
+For Prometheus, `ShawkAgentDown` joins the node states of a Slurm
+exporter: replace `slurm_node_state` and its labels in
+`prometheus/shawk-rules.yml` with those of the exporter in use. Silence
+the maintenance windows that are not `MAINT` reservations in Alertmanager.
 
-### A stable machine id per node
-
-PostgreSQL keys a host by its machine id and host name, and the machine id
-is `host_id` in Prometheus. A stateless node whose machine id changes at
-every boot becomes a new host at each boot, and its old ids show gaps
-although the node was observed. Give every node a stable machine id when
-it is provisioned, e.g. `systemd.machine_id=` on the kernel command line or
-a file per node in the image overlay. See #178.
-
-### `SrunPortRange`
+### Dynamic ports of srun and salloc
 
 Without `SrunPortRange`, srun and salloc listen on a random port at every
 run, and slurmctld and slurmstepd connect to it, so each run tends to show
 as a new dependency and `server_port` churns in Prometheus. Set it in
 `slurm.conf` (e.g. `SrunPortRange=60001-63000`; firewalls between the nodes
-usually need it anyway). How shawk aggregates these ports is #174.
+usually need it anyway), and give the same range to the connector in
+`dynamic_ports`. Without a range, list the services in
+`port_agnostic_services` instead, e.g. `[srun, salloc, slurm-job]`, where
+`slurm-job` stands for the processes of jobs, such as MPI ranks over TCP
+that listen on ports of their own. Their dependencies then have port 0 in
+Prometheus and in the dependencies between services in PostgreSQL, while
+the edges keep their ports (`docs/design.md` §5.3). Every connector needs
+the same rules.
+
+### Metrics per peer host
+
+`peer_hosts: true` adds the metrics `shawk_host_*`, with the host of each
+peer (`shawk_peer_host`), and the dashboard "Peer hosts": which nodes
+slurmctld fails to reach, and how, or which storage server a node talks
+to. They multiply the series with the hosts each service talks to:
+restrict them with `peer_host_services` (e.g. `[slurmctld, slurm-job]`,
+either end of a dependency) and measure before enabling them widely
+(`docs/design.md` §5.3).
+
+### Users of jobs
+
+With `-job-users` on the agents and `job_users` in the connector,
+PostgreSQL keeps the users of the processes of Slurm jobs, in
+`shawk_v1.job_edges`, which only administrators read: see
+[PostgreSQL](#postgresql).
