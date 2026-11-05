@@ -18,4 +18,4 @@ exclude = [
 # ratchet toward 15, SonarSource's default: it is the highest score in the code
 # today, so split a function that would exceed it rather than raising it, and
 # lower it whenever refactoring brings the maximum down.
-max-cognitive = 36
+max-cognitive = 30

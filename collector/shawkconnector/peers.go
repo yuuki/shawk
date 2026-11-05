@@ -376,9 +376,21 @@ func learnInto[K comparable](m map[K]map[endpoint]time.Time, k K, e endpoint, no
 func (r *resolver) learn(b *hostBatch, now time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.learnListeners(b, now)
+	r.learnEdges(b, now)
+	r.learnTranslations(b, now)
+	if b.final {
+		r.learnHost(b, now)
+	}
+}
+
+// learnListeners records the endpoints of the listeners of a request. The
+// endpoints name the peers of the outputs only, so the processes of Slurm
+// jobs are named as Prometheus names them. Of the endpoints inferred from
+// listeners on an unspecified address, the request infers at most
+// maxInferred, whatever the listener. r.mu is held.
+func (r *resolver) learnListeners(b *hostBatch, now time.Time) {
 	budget := r.maxInferred
-	// The endpoints name the peers of the outputs only, so the processes of
-	// Slurm jobs are named as Prometheus names them.
 	for _, l := range b.listeners {
 		svc := l.id.peerName()
 		if !l.id.addr.IsUnspecified() {
@@ -386,19 +398,35 @@ func (r *resolver) learn(b *hostBatch, now time.Time) {
 				endpoint{host: b.key, service: svc, exact: true}, now)
 			continue
 		}
-		for _, a := range b.addrs {
-			if r.maxInferred > 0 {
-				if budget == 0 {
-					break
-				}
-				budget--
-			}
-			if l.id.addr.Is4() && !a.Is4() {
-				continue
-			}
-			r.infer(endpointKey{a, l.id.port, l.id.proto}, endpoint{host: b.key, service: svc}, now)
-		}
+		budget = r.inferListener(b, &l.id, svc, budget, now)
 	}
+}
+
+// inferListener records the endpoints that a listener on an unspecified
+// address serves on the addresses of its host: of its family, or any for
+// an IPv6 one. With maxInferred, it takes at most budget addresses, which
+// include those of the other family that an IPv4 listener skips, and
+// returns what is left of budget. r.mu is held.
+func (r *resolver) inferListener(b *hostBatch, id *listenerID, svc string, budget int, now time.Time) int {
+	for _, a := range b.addrs {
+		if r.maxInferred > 0 {
+			if budget == 0 {
+				break
+			}
+			budget--
+		}
+		if id.addr.Is4() && !a.Is4() {
+			continue
+		}
+		r.infer(endpointKey{a, id.port, id.proto}, endpoint{host: b.key, service: svc}, now)
+	}
+	return budget
+}
+
+// learnEdges records the endpoints of the server edges of a request and,
+// unless their peers are folded, the clients they served, and the client
+// sides of its client edges whose peers are not folded. r.mu is held.
+func (r *resolver) learnEdges(b *hostBatch, now time.Time) {
 	for _, e := range b.edges {
 		switch e.id.role {
 		case roleServer:
@@ -418,19 +446,26 @@ func (r *resolver) learn(b *hostBatch, now time.Time) {
 				endpoint{host: b.key, service: e.id.peerName(), exact: true}, now)
 		}
 	}
+}
+
+// learnTranslations records the translations of a request. The agent sends
+// a translation for its idle TTL after its last use: it was last seen as
+// long before now as before the request, by the clock of the agent.
+// r.mu is held.
+func (r *resolver) learnTranslations(b *hostBatch, now time.Time) {
 	for _, x := range b.translations {
-		// The agent sends a translation for its idle TTL after its last use:
-		// it was last seen as long before now as before the request, by the
-		// clock of the agent.
 		at := now
 		if !x.last.IsZero() && !b.time.IsZero() && x.last.Before(b.time) {
 			at = now.Add(x.last.Sub(b.time))
 		}
 		learnTranslation(b.key, x.id, at, r.localLearned, r.localLearnedServers)
 	}
-	if !b.final {
-		return
-	}
+}
+
+// learnHost records, of a request that closes an interval, that the host
+// holds its addresses and that its agent is alive, and with peer_hosts the
+// host that holds each address and its name. r.mu is held.
+func (r *resolver) learnHost(b *hostBatch, now time.Time) {
 	for _, a := range b.addrs {
 		m := r.localAddrs[a]
 		if m == nil {
