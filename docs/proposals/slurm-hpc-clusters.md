@@ -1,6 +1,6 @@
 # Static HPC clusters managed by Slurm: design proposal
 
-Status: implemented, except §4 and the parts noted below. Tracked by
+Status: implemented, except the parts noted below. Tracked by
 #170; each part has a sub-issue, named in its section. Revised after an
 adversarial review. What was built, and where it departs from this
 proposal, is in [docs/design.md](../design.md):
@@ -13,16 +13,19 @@ proposal, is in [docs/design.md](../design.md):
 | §2.4 users | #181 | #193 | §4.1, §6.1, §6.2 |
 | §3 dynamic ports | #174 | #187 | §5.3, §6.1, §6.2 |
 | §3.2 ports chosen by the kernel, a hint | #205 | | §4.2, §5.3, §6.1, §6.2 |
-| §4 load on compute nodes | #172 | #195, open | |
+| §4 load on compute nodes | #172 | #195 | |
 | §5.1 inventory | #175 | #184 | §5.6 |
 | §5.2 node states | #177 | #191 | §5.7, §8 |
 | §6.1 host identity | #178 | #189 | §4.1, §6.2, §10 |
 | §6.2 start order | #179 | #183 | §4.3 |
 | §8 kernel sockets | #180 | #190 | §3.2, §4.1, §10 |
 
-Not implemented: the named networks of §1.5. Ports chosen by the kernel
-(§3.2) are detected as a hint for the rules only, as proposed. The
-operating guidance is in
+§4 changed neither the agent nor the connector. Its measurements in a VM,
+and the guidance from them, are in
+[docs/research/hpc-compute-nodes/compute_nodes.md](../research/hpc-compute-nodes/compute_nodes.md);
+measuring on a real cluster is #206. Not implemented: the named networks
+of §1.5 (#204). Ports chosen by the kernel (§3.2, #205) are detected as a
+hint for the rules only, as proposed. The operating guidance is in
 [packaging/README.md](../../packaging/README.md#hpc-clusters).
 
 The target is a traditional HPC cluster: bare-metal hosts that are not added
@@ -141,7 +144,8 @@ side also counts the clients that run an agent.
   `shawk_local_network` and `shawk_peer_network`. This classifies endpoints;
   it does not measure the path or the interface, and does not tell NICs of
   one subnet or a bond apart. It shares the matching of ranges with the
-  zones of [path-quality-zones.md](path-quality-zones.md).
+  zones of [path-quality-zones.md](path-quality-zones.md). Not implemented
+  yet (#204).
 
 ### 1.6 Series
 
@@ -261,7 +265,8 @@ within the same step.
   `SOCK_BINDPORT_LOCK` got its port from the kernel (`port_bound()` in
   shawk.bpf.c), but listeners are listed by the iterator, so short-lived
   ones are missed, and a port chosen by the kernel does not make the
-  services on it one. Without evidence the port is kept.
+  services on it one. Without evidence the port is kept. Not implemented
+  yet (#205).
 - The rows of `shawk.edges` still grow with runs of srun. If they turn out
   to matter, matched dependencies may be kept in a separate table.
 
@@ -285,8 +290,8 @@ within the same step.
 - **Measured** in a VM in
   [../research/hpc-compute-nodes/compute_nodes.md](../research/hpc-compute-nodes/compute_nodes.md),
   with the guidance on `-max-flows`, the alert and the drop-in; not yet on
-  a cluster. Slurm makes a cgroup per task only in some configurations:
-  22.05.9 with cgroup v2, `ConstrainCores` and without
+  a cluster (#206). Slurm makes a cgroup per task only in some
+  configurations: 22.05.9 with cgroup v2, `ConstrainCores` and without
   `ConstrainRAMSpace` leaves the tasks of a step in one cgroup
   (`task_special`), and their ranks then share flows; 24.11.7 and 25.11.4
   make one per task (fixed in 24.11.3). The agent has 10 s
