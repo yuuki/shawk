@@ -21,8 +21,9 @@ in `SHAWK_CACHE_DIR`, which several workspaces can share (e.g.
 the exception: dnf checks their signatures, but takes the current ones and
 does not cache them. Nothing secret is committed: the password of
 PostgreSQL and the munge key are made where they are used. `make clean`
-deletes `build/`, the data of PostgreSQL included (it stops the server of
-the host first; run it on the host, not in the VM, which shares `build/`).
+keeps `build/harness`, which environments still running use (the VM
+mounts it too); `make pg-down` and `make slurm-down` delete it. The
+commands that change an environment wait for one another in a workspace.
 
 ## PostgreSQL
 
@@ -91,10 +92,12 @@ version replaces Slurm and deletes the state of slurmctld.
 [`slurm/check.sh`](slurm/check.sh) (`make slurm-check`) runs a batch job of
 the user with an srun of two tasks and checks with
 [`units`](units/main.go), which applies the agent's `procinfo.Unit` to the
-cgroups of the processes, that they are `slurm/batch`, `slurm/step` and
-`slurmstepd`, that the cgroup of the job is `job_<id>` or its SLUID as the
-version and `CgroupJobIdPaths` have it, and that srun listens in
-`SrunPortRange`; then that an MPI program runs with two ranks through srun.
+cgroups of the processes, that each has the unit its step in Slurm calls
+for (`slurm/batch` for the script and srun, `slurm/step` for the tasks,
+`slurmstepd`), that the cgroup of the job is `job_<id>` or the SLUID that
+scontrol shows, as the version and `CgroupJobIdPaths` have it, and that
+srun listens in `SrunPortRange`; then that an MPI program runs with two
+ranks through srun.
 
 The VM is also a Linux host with systemd for the tests that need one. It
 has the Go of `go.mod` (1.27.3, the release of go.dev pinned by its SHA-256,

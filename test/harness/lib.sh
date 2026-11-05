@@ -67,6 +67,31 @@ fetch() {
 	echo "$file"
 }
 
+# lock NAME: takes the lock NAME of the workspace, waiting for another run
+# that holds it, until the script exits; a lock whose holder died is taken
+# over. It serializes the commands that change an environment, which
+# sessions sharing a workspace may run at once.
+lock() {
+	local dir="$STATE/$1.lock" pid i
+	mkdir -p "$STATE"
+	for ((i = 0; ; i++)); do
+		if mkdir "$dir" 2>/dev/null; then
+			echo $$ >"$dir/pid"
+			# shellcheck disable=SC2064
+			trap "rm -rf '$dir'" EXIT
+			return
+		fi
+		pid="$(cat "$dir/pid" 2>/dev/null || true)"
+		if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
+			rm -rf "$dir"
+			continue
+		fi
+		((i > 0)) || log "waiting for another run on this workspace ($dir)"
+		((i < 3600)) || die "timed out waiting for $dir"
+		sleep 1
+	done
+}
+
 # listening PORT: whether a TCP socket listens on PORT of 127.0.0.1.
 listening() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
 

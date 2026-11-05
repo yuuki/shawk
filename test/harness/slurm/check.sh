@@ -8,10 +8,13 @@
 # the VM runs srun with two tasks; while they run:
 #
 # - every process of the job has the unit the agent gives it
-#   (procinfo.Unit): slurm/batch for the batch script and srun, slurm/step
-#   for the tasks, slurmstepd for slurmstepd (#173);
-# - the directory of the job in the cgroup tree is job_<id> before Slurm
-#   26.05 or with CgroupJobIdPaths=yes, and its SLUID otherwise;
+#   (procinfo.Unit) that its step in Slurm calls for (scontrol listpids):
+#   slurm/batch for those of the batch step (the script and srun),
+#   slurm/step for those of step 0 (the two tasks), and slurmstepd for the
+#   slurmstepd of both steps (#173);
+# - the directory of the job in the cgroup tree, the same for all of them,
+#   is job_<id> before Slurm 26.05 or with CgroupJobIdPaths=yes, and
+#   otherwise the SLUID that scontrol shows;
 # - the ports srun listens on are printed, and must be in SrunPortRange if
 #   it is set (#174).
 #
@@ -62,31 +65,48 @@ scontrol listpids "$job" >"$WORK/pids" 2>&1 || true
 	squeue >&2
 	fail "the tasks of job $job did not start"
 }
-# The processes of the job and the slurmstepd of its steps.
+# The processes of the job by their step (PID STEP), and the slurmstepd of
+# its steps.
+awk 'NR > 1 { print $1, $3 }' "$WORK/pids" >"$WORK/steps"
 pids=$({
-	awk 'NR > 1 { print $1 }' "$WORK/pids"
+	awk '{ print $1 }' "$WORK/steps"
 	pgrep -f "^slurmstepd: \[$job\." || true
 } | sort -nu)
 echo "processes of job $job:"
 # shellcheck disable=SC2086
-"$UNITS" $pids >"$WORK/units" || echo "  (some processes of job $job exited meanwhile)"
+"$UNITS" $pids >"$WORK/units" || fail "units failed: a process of job $job is gone"
 sed 's/^/  /' "$WORK/units"
 
-grep -q ' sleep slurm/step ' "$WORK/units" || fail "no task of job $job has the unit slurm/step"
-grep -q ' slurm/batch ' "$WORK/units" || fail "no process of job $job has the unit slurm/batch"
-if awk '$3 !~ /^slurm\// && $3 != "slurmstepd"' "$WORK/units" | grep .; then
-	fail "processes of job $job above have other units"
-fi
-ok "the processes of job $job have the units slurm/batch, slurm/step and slurmstepd"
+# The unit each process must have, from its step in Slurm.
+awk 'FNR == NR { step[$1] = $2; next }
+	{
+		if ($2 == "slurmstepd") want = "slurmstepd"
+		else if (step[$1] == "batch") want = "slurm/batch"
+		else if (step[$1] == "0") want = "slurm/step"
+		else want = "none (step " step[$1] ")"
+		if ($3 != want) { printf "  %s %s has the unit %s, not %s\n", $1, $2, $3, want; bad = 1 }
+	}
+	END { exit bad }' "$WORK/steps" "$WORK/units" >&2 || fail "processes of job $job have other units than their steps call for"
+# count COMM UNIT: the processes named COMM with the unit UNIT.
+count() { awk -v c="$1" -v u="$2" '$2 == c && $3 == u' "$WORK/units" | wc -l | tr -d ' '; }
+[[ "$(count sleep slurm/step)" == 2 ]] || fail "not the two tasks of job $job with the unit slurm/step"
+(($(count slurm_script slurm/batch) >= 1)) || fail "no batch script of job $job with the unit slurm/batch"
+(($(count srun slurm/batch) >= 1)) || fail "no srun of job $job with the unit slurm/batch"
+(($(count slurmstepd slurmstepd) >= 2)) || fail "not the slurmstepd of both steps of job $job with the unit slurmstepd"
+ok "the processes of job $job have the units of their steps: slurm/batch, slurm/step, slurmstepd"
 
-# The directory of the job, after the scope of slurmstepd.
-dir="$(awk '$3 == "slurm/step" { print $4; exit }' "$WORK/units" | sed -n 's|.*slurmstepd[^/]*\.scope/\([^/]*\)/.*|\1|p')"
+# The directory of the job, after the scope of slurmstepd, in the cgroups of
+# all its processes.
+dirs="$(awk '{ print $4 }' "$WORK/units" | sed -n 's|^.*slurmstepd[^/]*\.scope/\([^/]*\)/.*$|\1|p' | sort -u)"
 if ! at_least "$version" 26.05 || [[ "$job_id_paths" == yes ]]; then
-	[[ "$dir" == "job_$job" ]] || fail "the cgroup of job $job is $dir, not job_$job"
+	want="job_$job"
 else
-	[[ -n "$dir" && "$dir" != job_* ]] || fail "the cgroup of job $job is $dir, not a SLUID"
+	# scontrol shows the SLUID with -d.
+	want="$(scontrol -d show job "$job" | sed -n 's/.*SLUID=\([^ ]*\).*/\1/p' | head -1)"
+	[[ -n "$want" ]] || fail "scontrol -d shows no SLUID of job $job"
 fi
-ok "the cgroup of job $job is $dir"
+[[ "$dirs" == "$want" ]] || fail "the cgroups of job $job are in $(echo $dirs), not $want"
+ok "the cgroups of job $job are in $want"
 
 ports="$(ss -Htlnp | awk '/"srun"/ { n = split($4, a, ":"); print a[n] }' | sort -nu | tr '\n' ' ')"
 [[ -n "$ports" ]] || fail "srun listens on no port"

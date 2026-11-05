@@ -136,12 +136,19 @@ if [[ "$(cat /opt/slurm/.harness 2>/dev/null)" != "$VERSION $flavor" ]]; then
 		rm -rf /opt/slurm "$pkg"
 		die "the build of Slurm in the cache was damaged and is deleted: run test/harness/slurm.sh up again"
 	fi
-	echo "$VERSION $flavor" >/opt/slurm/.harness
-	install -m 0644 /opt/slurm/systemd/slurmctld.service /opt/slurm/systemd/slurmd.service /etc/systemd/system/
 	# The binaries are labeled like those of /usr/bin, which systemd starts.
 	command -v chcon >/dev/null && chcon -R -t bin_t /opt/slurm/bin /opt/slurm/sbin 2>/dev/null || true
-	systemctl daemon-reload
+	# Written last: an interrupted installation is done again.
+	echo "$VERSION $flavor" >/opt/slurm/.harness
 fi
+# The units of the Slurm installed, at every run, so that they are those of
+# its version whatever an earlier run left.
+for unit in slurmctld.service slurmd.service; do
+	if ! cmp -s "/opt/slurm/systemd/$unit" "/etc/systemd/system/$unit"; then
+		install -m 0644 "/opt/slurm/systemd/$unit" /etc/systemd/system/
+		systemctl daemon-reload
+	fi
+done
 
 # The user of slurmctld, which the build does not make.
 id slurm >/dev/null 2>&1 || useradd -r -M -d /var/spool/slurm -s /sbin/nologin slurm

@@ -108,7 +108,10 @@ compat: rocky9.btf rocky9-nf_conntrack.btf ## check the BPF programs against the
 	SHAWK_TARGET_BTF=$(CURDIR)/rocky9.btf SHAWK_TARGET_MODULE_BTF=$(CURDIR)/rocky9-nf_conntrack.btf \
 		$(GO) test -run TestKernelCompatibility -v ./internal/tracer/
 
+# build/harness holds the state of the environments of test/harness, which
+# may run, also when this runs in the VM of slurm-up that mounts build:
+# pg-down and slurm-down remove it.
 .PHONY: clean
-clean: # the PostgreSQL of pg-up keeps its data in build/harness
-	test/harness/postgres.sh stop
-	rm -rf shawk shawk-migrate tracer.test rocky9.btf rocky9-nf_conntrack.btf build collector/_build
+clean:
+	rm -rf shawk shawk-migrate tracer.test rocky9.btf rocky9-nf_conntrack.btf collector/_build \
+		$(filter-out build/harness,$(wildcard build/*))

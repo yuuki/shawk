@@ -161,6 +161,9 @@ down() {
 }
 
 case "${1:-}" in
+up | stop | down) lock postgres ;;
+esac
+case "${1:-}" in
 up) up ;;
 env) running || die "PostgreSQL is not running: run test/harness/postgres.sh up"; env_lines ;;
 run)

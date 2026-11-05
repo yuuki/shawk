@@ -247,6 +247,9 @@ case "${1:-}" in
 up | check | run | shell | status | stop | down) find_limactl ;;
 esac
 case "${1:-}" in
+up | stop | down) lock slurm ;;
+esac
+case "${1:-}" in
 up) up ;;
 check) check ;;
 run)
