@@ -674,6 +674,14 @@ which include containers.
   the interval; after a failed request the rest is not sent. Translations of
   other hosts may arrive later, so a client edge may lack its translation
   for an interval.
+- Each request has a deadline of 2/3 of the interval (at least a second)
+  from when it is sent, so that a host with many requests sends them all
+  when they take longer together; the requests of an interval together
+  take at most 4 intervals. A collection waits for the requests of the
+  previous interval, so the intervals of a host whose requests take longer
+  than an interval are as long as its requests take, which the agent logs
+  (at most every 10 minutes). In a VM of 8 vCPUs, 96 768 edges took 149
+  requests and 4.7 s to a local sink, and 9 s on a busy host.
 - Counters are cumulative, so a failed request is made up for by the next
   one, and requests are not retried.
 - A series idle (no connections, bytes, datagrams or open connections) for
