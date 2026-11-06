@@ -63,7 +63,9 @@
   kprobes on `ip_icmp_error` and `ipv6_icmp_error` (`docs/design.md`
   §3.2). Each hook attaches on its own; without the kprobes (no
   `CONFIG_KPROBES`, or `perf_event_open` denied) the agent warns, and the
-  failures of ICMP errors race as before.
+  failures of ICMP errors race as before. The connector forwards the run
+  counts and times of the new programs with `-bpf-stats`
+  (`shawk.bpf.program`); an older one leaves them out.
 * A UDP server that existed before the agent started could be taken for a
   client of its own clients when it sent a reply between the attach of the
   UDP programs and the walk that marks the servers, as the end-to-end test
