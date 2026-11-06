@@ -324,7 +324,8 @@ table of the traffic by network: NFS traffic that goes over the management
 network rather than the storage network shows there. An address in no
 range is `~unknown`, or `~external` if it is public. The networks name the
 addresses at the two ends, not the path or the interface, and do not tell
-the NICs of one subnet or of a bond apart.
+the NICs of one subnet or of a bond apart. A Unix socket has no address,
+so its metrics carry no network.
 
 ### Users of jobs
 

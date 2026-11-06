@@ -1440,7 +1440,8 @@ the client and `dst_host` that of the server, on the client side its
 `instance` (the host name) and its `shawk_peer_host`, on the server side
 the other way round. `src_network` and `dst_network` are the networks of
 their addresses likewise, from `shawk_local_network` and
-`shawk_peer_network`, and are not set without `networks`.
+`shawk_peer_network`, and are not set without `networks`, nor for Unix
+sockets, which have no address.
 
 | metric | per dependency | recording rules (`shawk:host_dependency_…`) |
 |---|---|---|

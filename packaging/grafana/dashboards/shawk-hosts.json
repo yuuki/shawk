@@ -635,7 +635,7 @@
           "editorMode": "code",
           "instant": true,
           "format": "table",
-          "expr": "sum by (src, src_network, dst, dst_network, server_port) (shawk:host_dependency_connections:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})"
+          "expr": "sum by (src, src_network, dst, dst_network, server_port) (shawk:host_dependency_connections:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\", network_transport!=\"unix\"})"
         },
         {
           "refId": "request",
@@ -718,7 +718,7 @@
       "options": {
         "showHeader": true
       },
-      "description": "Connections and bytes by the networks of the addresses of the client and of the server, now, with networks in the connector (empty without). An address in no network is ~unknown, a public one ~external. They name the addresses at the two ends, not the path or the interface, and do not tell the NICs of one subnet or of a bond apart."
+      "description": "Connections and bytes by the networks of the addresses of the client and of the server, now, with networks in the connector (empty without). An address in no network is ~unknown, a public one ~external. They name the addresses at the two ends, not the path or the interface, and do not tell the NICs of one subnet or of a bond apart. Unix sockets, which use no network, are left out."
     }
   ]
 }
