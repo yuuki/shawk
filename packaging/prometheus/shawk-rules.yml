@@ -380,6 +380,15 @@ groups:
           summary: "shawk agent on {{ $labels.host_name }} does not trace UDP"
           description: "The kernel lacks BPF trampolines (fentry); UDP dependencies of the host are not observed."
 
+      - alert: ShawkUnixNotTraced
+        expr: shawk_agent_unix_traced == 0
+        for: 1h
+        labels:
+          severity: info
+        annotations:
+          summary: "shawk agent on {{ $labels.host_name }} does not trace Unix sockets"
+          description: "The kernel lacks BPF trampolines (fentry), or the programs on Unix sockets did not attach; dependencies of the host on its Unix sockets are not observed."
+
       - alert: ShawkExportFailures
         expr: increase(shawk_agent_export_failures_total[15m]) > 3
         labels:
@@ -388,10 +397,18 @@ groups:
           summary: "shawk agent on {{ $labels.host_name }} fails to send"
           description: "The agent could not reach the collector; dependencies that end while it cannot send may be lost."
 
+      # Connects to Unix sockets that no listener serves (dst ~unresolved)
+      # are left out: glibc tries the socket of nscd, which most hosts do not
+      # run, from every process that looks up a user or a host, and other
+      # programs probe optional services the same way.
       - alert: ShawkConnectionFailureRate
         expr: |
-          shawk:dependency_connection_failures:rate5m
-            / (shawk:dependency_connections:rate5m + shawk:dependency_connection_failures:rate5m) > 0.05
+          (
+            shawk:dependency_connection_failures:rate5m
+              / (shawk:dependency_connections:rate5m + shawk:dependency_connection_failures:rate5m) > 0.05
+          )
+          unless on (network_transport, dst)
+            label_replace(label_replace(vector(1), "network_transport", "unix", "", ""), "dst", "~unresolved", "", "")
         for: 5m
         labels:
           severity: warning

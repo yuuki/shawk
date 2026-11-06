@@ -135,6 +135,35 @@ func TestReusedPID(t *testing.T) {
 	}
 }
 
+// The child that systemd forks for a service connects the standard output
+// of the service to journald under the name "(cron)", then executes it:
+// the flow is the service's, under the name it runs with.
+func TestSystemdChild(t *testing.T) {
+	now := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
+	r := newIdentities(procinfo.FallbackExe, 15*time.Minute, nil)
+	r.exe = func(uint32) string { return "/usr/sbin/cron" }
+	r.comm = func(uint32) string { return "cron" }
+	r.env = func(uint32) (map[string]string, bool) { return nil, true }
+	r.beginInterval()
+	want := otlp.Process{Unit: "cron.service", Comm: "cron", Exe: "/usr/sbin/cron", Service: "cron"}
+	if got := r.resolve(100, "(cron)", flowCgroup{}, "cron.service", nil, now); got != want {
+		t.Errorf("resolve = %+v, want %+v", got, want)
+	}
+	// A name cut at 15 bytes loses its closing parenthesis.
+	r.comm = func(uint32) string { return "systemd-network" }
+	r.exe = func(uint32) string { return "/usr/lib/systemd/systemd-networkd" }
+	r.beginInterval()
+	if got := r.resolve(101, "(systemd-netwo", flowCgroup{}, "systemd-networkd.service", nil, now); got.Comm != "systemd-network" ||
+		got.Service != "systemd-networkd" {
+		t.Errorf("resolve of a cut name = %+v", got)
+	}
+	// Another process in parentheses is not taken for it.
+	r.beginInterval()
+	if got := r.resolve(101, "(sd-pam)", flowCgroup{}, "user@1000.service", nil, now); got.Comm != "(sd-pam)" || got.Exe != "" {
+		t.Errorf("resolve of another process = %+v", got)
+	}
+}
+
 // The latest identity of a unit shared by containers, such as replicas or a
 // container and the one that replaced it, keeps the container of the flow
 // (#104).

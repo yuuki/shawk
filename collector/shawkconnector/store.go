@@ -183,24 +183,57 @@ ON CONFLICT (host_id, unit, comm, service_name, (coalesce(user_id, -1))) DO UPDA
 	}
 
 	if len(h.edges) > 0 {
-		var units, comms, services, users, roles, protos, locals, peers []string
-		var ports []int32
-		var netns []int64
-		var firsts, lasts []time.Time
-		for k, s := range h.edges {
-			units = append(units, k.unit)
-			comms = append(comms, k.comm)
-			services = append(services, k.service)
-			users = append(users, k.user)
-			roles = append(roles, k.role)
-			protos = append(protos, k.proto)
-			locals = append(locals, k.local.String())
-			peers = append(peers, peerString(k.peer, k.folded))
-			ports = append(ports, int32(k.port))
-			netns = append(netns, int64(k.netns))
-			firsts = append(firsts, s.first)
-			lasts = append(lasts, s.last)
+		queueEdges(b, h)
+	}
+	if len(h.listeners) > 0 {
+		queueListeners(b, h)
+		queueUnixListeners(b, h)
+	}
+	if len(h.translations) > 0 {
+		queueTranslations(b, h)
+	}
+	return tx.SendBatch(ctx, b).Close()
+}
+
+// queueEdges writes the edges of a host: those of TCP and UDP to
+// shawk.edges, and those of Unix sockets, which have a name rather than
+// addresses and a port, to shawk.unix_edges.
+func queueEdges(b *pgx.Batch, h *hostChanges) {
+	var units, comms, services, users, roles, protos, locals, peers []string
+	var ports []int32
+	var netns []int64
+	var firsts, lasts []time.Time
+	var unix struct {
+		units, comms, services, users, paths []string
+		netns                                []int64
+		firsts, lasts                        []time.Time
+	}
+	for k, s := range h.edges {
+		if k.proto == transportUnix {
+			unix.units = append(unix.units, k.unit)
+			unix.comms = append(unix.comms, k.comm)
+			unix.services = append(unix.services, k.service)
+			unix.users = append(unix.users, k.user)
+			unix.paths = append(unix.paths, k.path)
+			unix.netns = append(unix.netns, int64(k.netns))
+			unix.firsts = append(unix.firsts, s.first)
+			unix.lasts = append(unix.lasts, s.last)
+			continue
 		}
+		units = append(units, k.unit)
+		comms = append(comms, k.comm)
+		services = append(services, k.service)
+		users = append(users, k.user)
+		roles = append(roles, k.role)
+		protos = append(protos, k.proto)
+		locals = append(locals, k.local.String())
+		peers = append(peers, peerString(k.peer, k.folded))
+		ports = append(ports, int32(k.port))
+		netns = append(netns, int64(k.netns))
+		firsts = append(firsts, s.first)
+		lasts = append(lasts, s.last)
+	}
+	if len(units) > 0 {
 		b.Queue(`
 INSERT INTO shawk.edges AS e (host_id, process_id, role, proto, local_addr, remote_addr, port, netns, first_seen, last_seen)
 SELECT $1, p.id, u.role, u.proto, u.local::inet, u.peer::inet, u.port, u.netns, u.f, u.l
@@ -214,14 +247,19 @@ ON CONFLICT (host_id, role, proto, local_addr, remote_addr, port, netns, process
   last_seen  = greatest(e.last_seen, excluded.last_seen)`,
 			h.key, units, comms, services, users, roles, protos, locals, peers, ports, netns, firsts, lasts)
 	}
-
-	if len(h.listeners) > 0 {
-		queueListeners(b, h)
+	if len(unix.units) > 0 {
+		b.Queue(`
+INSERT INTO shawk.unix_edges AS e (host_id, process_id, path, netns, first_seen, last_seen)
+SELECT $1, p.id, u.path, u.netns, u.f, u.l
+FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::bigint[], $8::timestamptz[], $9::timestamptz[])
+  AS u(unit, comm, service, uid, path, netns, f, l)
+JOIN shawk.processes p ON p.host_id = $1 AND p.unit = u.unit AND p.comm = u.comm AND p.service_name = u.service
+  AND coalesce(p.user_id, -1) = coalesce(nullif(u.uid, '')::bigint, -1)
+ON CONFLICT (host_id, path, netns, process_id) DO UPDATE SET
+  first_seen = least(e.first_seen, excluded.first_seen),
+  last_seen  = greatest(e.last_seen, excluded.last_seen)`,
+			h.key, unix.units, unix.comms, unix.services, unix.users, unix.paths, unix.netns, unix.firsts, unix.lasts)
 	}
-	if len(h.translations) > 0 {
-		queueTranslations(b, h)
-	}
-	return tx.SendBatch(ctx, b).Close()
 }
 
 // queueSessions writes the sessions of a host, and the periods in which its
@@ -249,6 +287,7 @@ func queueSessions(b *pgx.Batch, h *hostChanges) {
 	var starts, beats []time.Time
 	var runs []*time.Time // nil if unknown
 	var udp []bool
+	var unixTraced []*bool // nil if the agent does not tell
 	var scopes, folds []string
 	var internals []*string
 	var dropped []int64
@@ -258,6 +297,7 @@ func queueSessions(b *pgx.Batch, h *hostChanges) {
 		starts = append(starts, t)
 		beats = append(beats, s.lastHeartbeat)
 		udp = append(udp, s.udpTraced)
+		unixTraced = append(unixTraced, s.unixTraced)
 		scopes = append(scopes, s.netnsScope)
 		dropped = append(dropped, s.dropped)
 		skews = append(skews, s.clockSkew.Seconds())
@@ -336,22 +376,23 @@ ON CONFLICT (host_id, started_at, period_start) DO UPDATE SET
 	// What the agent traces and folds is kept as of the latest heartbeat.
 	b.Queue(`
 INSERT INTO shawk.agent_sessions AS s (host_id, started_at, last_heartbeat, udp_traced, netns_scope, dropped_flows, clock_skew,
-                                       peer_fold, peer_internal, counters_started)
+                                       peer_fold, peer_internal, counters_started, unix_traced)
 SELECT $1, u.started, u.beat, u.udp, u.scope, u.dropped, make_interval(secs => u.skew),
-       coalesce(nullif(u.fold, ''), 'none'), string_to_array(u.internal, ',')::cidr[], u.run
+       coalesce(nullif(u.fold, ''), 'none'), string_to_array(u.internal, ',')::cidr[], u.run, u.unix
 FROM unnest($2::timestamptz[], $3::timestamptz[], $4::boolean[], $5::text[], $6::bigint[], $7::float8[],
-            $8::text[], $9::text[], $10::timestamptz[])
-  AS u(started, beat, udp, scope, dropped, skew, fold, internal, run)
+            $8::text[], $9::text[], $10::timestamptz[], $11::boolean[])
+  AS u(started, beat, udp, scope, dropped, skew, fold, internal, run, unix)
 ON CONFLICT (host_id, started_at) DO UPDATE SET
   clock_skew       = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat THEN excluded.clock_skew ELSE s.clock_skew END,
   udp_traced       = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat THEN excluded.udp_traced ELSE s.udp_traced END,
+  unix_traced      = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat THEN excluded.unix_traced ELSE s.unix_traced END,
   netns_scope      = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat THEN excluded.netns_scope ELSE s.netns_scope END,
   peer_fold        = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat THEN excluded.peer_fold ELSE s.peer_fold END,
   peer_internal    = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat THEN excluded.peer_internal ELSE s.peer_internal END,
   counters_started = coalesce(s.counters_started, excluded.counters_started),
   dropped_flows    = greatest(s.dropped_flows, excluded.dropped_flows),
   last_heartbeat   = greatest(s.last_heartbeat, excluded.last_heartbeat)`,
-		h.key, starts, beats, udp, scopes, dropped, skews, folds, internals, runs)
+		h.key, starts, beats, udp, scopes, dropped, skews, folds, internals, runs, unixTraced)
 }
 
 // queueListeners writes the listeners of a host: a row per listener with
@@ -384,6 +425,9 @@ func queueListeners(b *pgx.Batch, h *hostChanges) {
 	// kernelChosen would conflict in one INSERT.
 	owners := map[owner]*owned{}
 	for k, s := range h.listeners {
+		if k.proto == transportUnix {
+			continue // queueUnixListeners
+		}
 		l := listener{k.proto, k.addr, k.port, k.netns}
 		r := rows[l]
 		if r == nil {
@@ -460,6 +504,9 @@ ON CONFLICT (host_id, proto, addr, port, netns, process_id) DO UPDATE SET
 		firsts = append(firsts, r.first)
 		lasts = append(lasts, r.last)
 	}
+	if len(rows) == 0 {
+		return
+	}
 	b.Queue(`
 INSERT INTO shawk.listeners AS l (host_id, process_id, proto, addr, port, netns, first_seen, last_seen)
 SELECT $1, p.id, u.proto, u.addr::inet, u.port, u.netns, u.f, u.l
@@ -474,6 +521,43 @@ ON CONFLICT (host_id, proto, addr, port, netns) DO UPDATE SET
   first_seen = least(l.first_seen, excluded.first_seen),
   last_seen  = greatest(l.last_seen, excluded.last_seen)`,
 		h.key, units, comms, services, users, protos, addrs, ports, netns, firsts, lasts)
+}
+
+// queueUnixListeners writes the listening Unix sockets of a host: a row per
+// known owner of a listener, with the period it held it, which
+// shawk_v1.dependencies matches the client edges of the name with. A
+// listener whose owner is not known names no server and is left out.
+func queueUnixListeners(b *pgx.Batch, h *hostChanges) {
+	var units, comms, services, users, paths []string
+	var netns []int64
+	var firsts, lasts []time.Time
+	for k, s := range h.listeners {
+		if k.proto != transportUnix || k.procKey == (procKey{}) {
+			continue
+		}
+		units = append(units, k.unit)
+		comms = append(comms, k.comm)
+		services = append(services, k.service)
+		users = append(users, k.user)
+		paths = append(paths, k.path)
+		netns = append(netns, int64(k.netns))
+		firsts = append(firsts, s.first)
+		lasts = append(lasts, s.last)
+	}
+	if len(units) == 0 {
+		return
+	}
+	b.Queue(`
+INSERT INTO shawk.unix_listeners AS o (host_id, process_id, path, netns, first_seen, last_seen)
+SELECT $1, p.id, u.path, u.netns, u.f, u.l
+FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::bigint[], $8::timestamptz[], $9::timestamptz[])
+  AS u(unit, comm, service, uid, path, netns, f, l)
+JOIN shawk.processes p ON p.host_id = $1 AND p.unit = u.unit AND p.comm = u.comm AND p.service_name = u.service
+  AND coalesce(p.user_id, -1) = coalesce(nullif(u.uid, '')::bigint, -1)
+ON CONFLICT (host_id, path, netns, process_id) DO UPDATE SET
+  first_seen = least(o.first_seen, excluded.first_seen),
+  last_seen  = greatest(o.last_seen, excluded.last_seen)`,
+		h.key, units, comms, services, users, paths, netns, firsts, lasts)
 }
 
 // queueTranslations writes the translations of addresses a host made, with
@@ -977,6 +1061,26 @@ FROM shawk_v1.agent_addrs`,
 				r.addr = a.Unmap()
 				out.agents = append(out.agents, r)
 			}
+			return nil
+		})
+	if err != nil {
+		return out, err
+	}
+	// The services listening on Unix sockets, named as Prometheus names them
+	// like the endpoints above.
+	err = queryRows(ctx, s.pool, `SELECT host_id, path, netns, service, last_seen, slurm_job FROM shawk_v1.unix_endpoints`,
+		func(rows pgx.Rows) error {
+			var u unixEndpointRow
+			var netns int64
+			var job bool
+			if err := rows.Scan(&u.key.host, &u.key.path, &netns, &u.service, &u.lastSeen, &job); err != nil {
+				return err
+			}
+			if job {
+				u.service = slurmJobService
+			}
+			u.netns = uint64(netns)
+			out.unix = append(out.unix, u)
 			return nil
 		})
 	if err != nil {

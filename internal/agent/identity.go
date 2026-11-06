@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"strings"
 	"sync"
 	"time"
 
@@ -257,7 +258,14 @@ func (r *identities) resolve(pid uint32, comm string, cg flowCgroup, unit string
 	job := procinfo.SlurmJob(unit)
 	keep := true
 	p := r.read(pid, !job)
-	if p.comm != "" && p.comm != comm {
+	switch {
+	case p.comm == "" || p.comm == comm:
+	case systemdChild(comm, p.comm):
+		// The child that systemd forked for a service, which connected the
+		// standard output of the service to journald, executed it: the
+		// flow is the service's.
+		comm = p.comm
+	default:
 		// The flow was seen up to an interval ago; the PID now belongs to
 		// another process (the tracer reports the command name of the main
 		// thread, as /proc/PID/comm does).
@@ -304,6 +312,17 @@ func (r *identities) resolve(pid uint32, comm string, cg flowCgroup, unit string
 	}
 	r.setUser(&proc, p, cg.id)
 	return proc
+}
+
+// systemdChild reports whether a flow of comm was opened by the child that
+// systemd forks to execute a service, and which now runs procComm: systemd
+// names the child after the executable in parentheses, "(cron)", until it
+// executes it, and connects the standard output of the service to journald
+// before. Command names are cut to 15 bytes, the closing parenthesis first.
+func systemdChild(comm, procComm string) bool {
+	name, ok := strings.CutPrefix(comm, "(")
+	name = strings.TrimSuffix(name, ")")
+	return ok && name != "" && strings.HasPrefix(procComm, name)
 }
 
 // setUser sets the user id of a process of a Slurm job in the cgroup

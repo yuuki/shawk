@@ -42,8 +42,16 @@ func goldenRequest() *colmetricspb.ExportMetricsServiceRequest {
 		PeerAddr: netip.MustParseAddr("8.8.8.8"), Port: 53, NetNS: 4026531840,
 		Process: Process{Unit: "app.service", Comm: "puma", Exe: "/usr/bin/ruby", Service: "app", ServiceNamespace: "shop"}},
 		EdgeStats{MsgsSent: 2, MsgsRecv: 2, BytesSent: 80, BytesRecv: 160}, t0, t0.Add(15*time.Second))
+	// The app connects to PostgreSQL on its Unix socket: a connection
+	// open, and connects refused while the server restarted.
+	s.AddEdge(EdgeKey{Role: RoleClient, Proto: TransportUnix, Path: "/run/postgresql/.s.PGSQL.5432", NetNS: 4026531840,
+		Process: app},
+		EdgeStats{Conns: 4, ConnFails: 2, OpenConns: 1, Fails: [len(FailReasons)]uint64{0: 2}}, t0, t0.Add(15*time.Second))
 	s.AddListener(ListenerKey{Proto: "tcp", Addr: netip.MustParseAddr("0.0.0.0"), Port: 8080, NetNS: 4026531840,
 		Process: app}, t0.Add(15*time.Second))
+	// The app listens on a Unix socket with an abstract name.
+	s.AddListener(ListenerKey{Proto: TransportUnix, Path: "@app/control", NetNS: 4026531840, Process: app},
+		t0.Add(15*time.Second))
 	s.AddListener(ListenerKey{Proto: "udp", Addr: netip.MustParseAddr("0.0.0.0"), Port: 68, NetNS: 4026531840}, t0.Add(15*time.Second))
 	// srun without SrunPortRange listens on a port the kernel chose.
 	s.AddListener(ListenerKey{Proto: "tcp", Addr: netip.MustParseAddr("0.0.0.0"), Port: 41823, NetNS: 4026531840,
@@ -67,7 +75,7 @@ func goldenRequest() *colmetricspb.ExportMetricsServiceRequest {
 			netip.MustParsePrefix("fc00::/7"), netip.MustParsePrefix("fe80::/10"), netip.MustParsePrefix("::1/128"),
 		},
 	}, AgentStatus{
-		Started: t0.Add(-time.Hour), SegmentStart: t0.Add(-time.Hour), NetNSScope: "all", UDPTraced: true,
+		Started: t0.Add(-time.Hour), SegmentStart: t0.Add(-time.Hour), NetNSScope: "all", UDPTraced: true, UnixTraced: true,
 		FlowsDropped: 7, CgroupEventsDropped: 3, ContainerReadsDrops: 2, ExportFailures: 1,
 		TranslationsTraced: true, TranslationsDropped: 2,
 		RDMA: true, RDMAData: 1 << 32,

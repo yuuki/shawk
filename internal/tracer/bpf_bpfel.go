@@ -66,6 +66,9 @@ type bpfShawkIterRec struct {
 	KernelChosen uint8
 	Pad          [3]uint8
 	Ino          uint64
+	Path         [108]int8
+	PathLen      uint16
+	Pad2         uint16
 }
 
 type bpfShawkListenKey struct {
@@ -108,6 +111,32 @@ type bpfShawkUdpState struct {
 	Dir uint32
 }
 
+type bpfShawkUnixConn struct {
+	_   structs.HostLayout
+	Key bpfShawkUnixKey
+	Pid uint32
+	Pad uint32
+}
+
+type bpfShawkUnixKey struct {
+	_        structs.HostLayout
+	Path     [108]int8
+	PathLen  uint16
+	Pad0     uint16
+	Netns    uint32
+	Pad1     uint32
+	CgroupId uint64
+	Comm     [16]int8
+}
+
+type bpfShawkUnixStats struct {
+	_         structs.HostLayout
+	Conns     uint32
+	ConnFails uint32
+	Fails     [5]uint32
+	Pid       uint32
+}
+
 type bpfShawkXlatConn struct {
 	_   structs.HostLayout
 	Key bpfShawkXlatKey
@@ -138,51 +167,58 @@ type bpfShawkXlatStats struct {
 //
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
-	bpfMapCgroupEvents           = "cgroup_events"
-	bpfMapFlows                  = "flows"
-	bpfMapFlows0                 = "flows_0"
-	bpfMapFlows1                 = "flows_1"
-	bpfMapInternalPeers          = "internal_peers"
-	bpfMapListenPorts            = "listen_ports"
-	bpfMapMptcpOwners            = "mptcp_owners"
-	bpfMapSockStates             = "sock_states"
-	bpfMapUdpListenPorts         = "udp_listen_ports"
-	bpfMapUdpStates              = "udp_states"
-	bpfMapXlatConns              = "xlat_conns"
-	bpfMapXlats                  = "xlats"
-	bpfProgShawkCgroupMkdir      = "shawk_cgroup_mkdir"
-	bpfProgShawkCtConfirm        = "shawk_ct_confirm"
-	bpfProgShawkCtDestroy        = "shawk_ct_destroy"
-	bpfProgShawkInetSockSetState = "shawk_inet_sock_set_state"
-	bpfProgShawkIp6SendSkb       = "shawk_ip6_send_skb"
-	bpfProgShawkIpSendSkb        = "shawk_ip_send_skb"
-	bpfProgShawkIterTaskFile     = "shawk_iter_task_file"
-	bpfProgShawkIterTcp          = "shawk_iter_tcp"
-	bpfProgShawkIterUdp          = "shawk_iter_udp"
-	bpfProgShawkSkbConsumeUdp    = "shawk_skb_consume_udp"
-	bpfVarActiveIdx              = "active_idx"
-	bpfVarAdoptedUnowned         = "adopted_unowned"
-	bpfVarCgroupEventDrops       = "cgroup_event_drops"
-	bpfVarEphPortHigh            = "eph_port_high"
-	bpfVarEphPortLow             = "eph_port_low"
-	bpfVarFlowBusy               = "flow_busy"
-	bpfVarFlowDrops              = "flow_drops"
-	bpfVarFoldMode               = "fold_mode"
-	bpfVarInitialScan            = "initial_scan"
-	bpfVarIterSkips              = "iter_skips"
-	bpfVarLearnSelf              = "learn_self"
-	bpfVarListenPortDrops        = "listen_port_drops"
-	bpfVarOwnerScan              = "owner_scan"
-	bpfVarSelfTgid               = "self_tgid"
-	bpfVarStorageFails           = "storage_fails"
-	bpfVarTargetNetns            = "target_netns"
-	bpfVarUnusedCgroupEvent      = "unused_cgroup_event"
-	bpfVarUnusedIterRec          = "unused_iter_rec"
-	bpfVarUnusedXlatConn         = "unused_xlat_conn"
-	bpfVarUnusedXlatKey          = "unused_xlat_key"
-	bpfVarUnusedXlatStats        = "unused_xlat_stats"
-	bpfVarWalkGen                = "walk_gen"
-	bpfVarXlatDrops              = "xlat_drops"
+	bpfMapCgroupEvents            = "cgroup_events"
+	bpfMapFlows                   = "flows"
+	bpfMapFlows0                  = "flows_0"
+	bpfMapFlows1                  = "flows_1"
+	bpfMapInternalPeers           = "internal_peers"
+	bpfMapListenPorts             = "listen_ports"
+	bpfMapMptcpOwners             = "mptcp_owners"
+	bpfMapSockStates              = "sock_states"
+	bpfMapUdpListenPorts          = "udp_listen_ports"
+	bpfMapUdpStates               = "udp_states"
+	bpfMapUnixConns               = "unix_conns"
+	bpfMapUnixFlows               = "unix_flows"
+	bpfMapUnixFlows0              = "unix_flows_0"
+	bpfMapUnixFlows1              = "unix_flows_1"
+	bpfMapXlatConns               = "xlat_conns"
+	bpfMapXlats                   = "xlats"
+	bpfProgShawkCgroupMkdir       = "shawk_cgroup_mkdir"
+	bpfProgShawkCtConfirm         = "shawk_ct_confirm"
+	bpfProgShawkCtDestroy         = "shawk_ct_destroy"
+	bpfProgShawkInetSockSetState  = "shawk_inet_sock_set_state"
+	bpfProgShawkIp6SendSkb        = "shawk_ip6_send_skb"
+	bpfProgShawkIpSendSkb         = "shawk_ip_send_skb"
+	bpfProgShawkIterTaskFile      = "shawk_iter_task_file"
+	bpfProgShawkIterTcp           = "shawk_iter_tcp"
+	bpfProgShawkIterUdp           = "shawk_iter_udp"
+	bpfProgShawkSkbConsumeUdp     = "shawk_skb_consume_udp"
+	bpfProgShawkUnixRelease       = "shawk_unix_release"
+	bpfProgShawkUnixStreamConnect = "shawk_unix_stream_connect"
+	bpfVarActiveIdx               = "active_idx"
+	bpfVarAdoptedUnowned          = "adopted_unowned"
+	bpfVarCgroupEventDrops        = "cgroup_event_drops"
+	bpfVarEphPortHigh             = "eph_port_high"
+	bpfVarEphPortLow              = "eph_port_low"
+	bpfVarFlowBusy                = "flow_busy"
+	bpfVarFlowDrops               = "flow_drops"
+	bpfVarFoldMode                = "fold_mode"
+	bpfVarInitialScan             = "initial_scan"
+	bpfVarIterSkips               = "iter_skips"
+	bpfVarLearnSelf               = "learn_self"
+	bpfVarListenPortDrops         = "listen_port_drops"
+	bpfVarOwnerScan               = "owner_scan"
+	bpfVarSelfTgid                = "self_tgid"
+	bpfVarStorageFails            = "storage_fails"
+	bpfVarTargetNetns             = "target_netns"
+	bpfVarUnixTraced              = "unix_traced"
+	bpfVarUnusedCgroupEvent       = "unused_cgroup_event"
+	bpfVarUnusedIterRec           = "unused_iter_rec"
+	bpfVarUnusedXlatConn          = "unused_xlat_conn"
+	bpfVarUnusedXlatKey           = "unused_xlat_key"
+	bpfVarUnusedXlatStats         = "unused_xlat_stats"
+	bpfVarWalkGen                 = "walk_gen"
+	bpfVarXlatDrops               = "xlat_drops"
 )
 
 // loadBpf returns the embedded CollectionSpec for bpf.
@@ -227,16 +263,18 @@ type bpfSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type bpfProgramSpecs struct {
-	ShawkCgroupMkdir      *ebpf.ProgramSpec `ebpf:"shawk_cgroup_mkdir"`
-	ShawkCtConfirm        *ebpf.ProgramSpec `ebpf:"shawk_ct_confirm"`
-	ShawkCtDestroy        *ebpf.ProgramSpec `ebpf:"shawk_ct_destroy"`
-	ShawkInetSockSetState *ebpf.ProgramSpec `ebpf:"shawk_inet_sock_set_state"`
-	ShawkIp6SendSkb       *ebpf.ProgramSpec `ebpf:"shawk_ip6_send_skb"`
-	ShawkIpSendSkb        *ebpf.ProgramSpec `ebpf:"shawk_ip_send_skb"`
-	ShawkIterTaskFile     *ebpf.ProgramSpec `ebpf:"shawk_iter_task_file"`
-	ShawkIterTcp          *ebpf.ProgramSpec `ebpf:"shawk_iter_tcp"`
-	ShawkIterUdp          *ebpf.ProgramSpec `ebpf:"shawk_iter_udp"`
-	ShawkSkbConsumeUdp    *ebpf.ProgramSpec `ebpf:"shawk_skb_consume_udp"`
+	ShawkCgroupMkdir       *ebpf.ProgramSpec `ebpf:"shawk_cgroup_mkdir"`
+	ShawkCtConfirm         *ebpf.ProgramSpec `ebpf:"shawk_ct_confirm"`
+	ShawkCtDestroy         *ebpf.ProgramSpec `ebpf:"shawk_ct_destroy"`
+	ShawkInetSockSetState  *ebpf.ProgramSpec `ebpf:"shawk_inet_sock_set_state"`
+	ShawkIp6SendSkb        *ebpf.ProgramSpec `ebpf:"shawk_ip6_send_skb"`
+	ShawkIpSendSkb         *ebpf.ProgramSpec `ebpf:"shawk_ip_send_skb"`
+	ShawkIterTaskFile      *ebpf.ProgramSpec `ebpf:"shawk_iter_task_file"`
+	ShawkIterTcp           *ebpf.ProgramSpec `ebpf:"shawk_iter_tcp"`
+	ShawkIterUdp           *ebpf.ProgramSpec `ebpf:"shawk_iter_udp"`
+	ShawkSkbConsumeUdp     *ebpf.ProgramSpec `ebpf:"shawk_skb_consume_udp"`
+	ShawkUnixRelease       *ebpf.ProgramSpec `ebpf:"shawk_unix_release"`
+	ShawkUnixStreamConnect *ebpf.ProgramSpec `ebpf:"shawk_unix_stream_connect"`
 }
 
 // bpfMapSpecs contains maps before they are loaded into the kernel.
@@ -253,6 +291,10 @@ type bpfMapSpecs struct {
 	SockStates     *ebpf.MapSpec `ebpf:"sock_states"`
 	UdpListenPorts *ebpf.MapSpec `ebpf:"udp_listen_ports"`
 	UdpStates      *ebpf.MapSpec `ebpf:"udp_states"`
+	UnixConns      *ebpf.MapSpec `ebpf:"unix_conns"`
+	UnixFlows      *ebpf.MapSpec `ebpf:"unix_flows"`
+	UnixFlows0     *ebpf.MapSpec `ebpf:"unix_flows_0"`
+	UnixFlows1     *ebpf.MapSpec `ebpf:"unix_flows_1"`
 	XlatConns      *ebpf.MapSpec `ebpf:"xlat_conns"`
 	Xlats          *ebpf.MapSpec `ebpf:"xlats"`
 }
@@ -277,6 +319,7 @@ type bpfVariableSpecs struct {
 	SelfTgid          *ebpf.VariableSpec `ebpf:"self_tgid"`
 	StorageFails      *ebpf.VariableSpec `ebpf:"storage_fails"`
 	TargetNetns       *ebpf.VariableSpec `ebpf:"target_netns"`
+	UnixTraced        *ebpf.VariableSpec `ebpf:"unix_traced"`
 	UnusedCgroupEvent *ebpf.VariableSpec `ebpf:"unused_cgroup_event"`
 	UnusedIterRec     *ebpf.VariableSpec `ebpf:"unused_iter_rec"`
 	UnusedXlatConn    *ebpf.VariableSpec `ebpf:"unused_xlat_conn"`
@@ -316,6 +359,10 @@ type bpfMaps struct {
 	SockStates     *ebpf.Map `ebpf:"sock_states"`
 	UdpListenPorts *ebpf.Map `ebpf:"udp_listen_ports"`
 	UdpStates      *ebpf.Map `ebpf:"udp_states"`
+	UnixConns      *ebpf.Map `ebpf:"unix_conns"`
+	UnixFlows      *ebpf.Map `ebpf:"unix_flows"`
+	UnixFlows0     *ebpf.Map `ebpf:"unix_flows_0"`
+	UnixFlows1     *ebpf.Map `ebpf:"unix_flows_1"`
 	XlatConns      *ebpf.Map `ebpf:"xlat_conns"`
 	Xlats          *ebpf.Map `ebpf:"xlats"`
 }
@@ -332,6 +379,10 @@ func (m *bpfMaps) Close() error {
 		m.SockStates,
 		m.UdpListenPorts,
 		m.UdpStates,
+		m.UnixConns,
+		m.UnixFlows,
+		m.UnixFlows0,
+		m.UnixFlows1,
 		m.XlatConns,
 		m.Xlats,
 	)
@@ -357,6 +408,7 @@ type bpfVariables struct {
 	SelfTgid          *ebpf.Variable `ebpf:"self_tgid"`
 	StorageFails      *ebpf.Variable `ebpf:"storage_fails"`
 	TargetNetns       *ebpf.Variable `ebpf:"target_netns"`
+	UnixTraced        *ebpf.Variable `ebpf:"unix_traced"`
 	UnusedCgroupEvent *ebpf.Variable `ebpf:"unused_cgroup_event"`
 	UnusedIterRec     *ebpf.Variable `ebpf:"unused_iter_rec"`
 	UnusedXlatConn    *ebpf.Variable `ebpf:"unused_xlat_conn"`
@@ -370,16 +422,18 @@ type bpfVariables struct {
 //
 // It can be passed to loadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type bpfPrograms struct {
-	ShawkCgroupMkdir      *ebpf.Program `ebpf:"shawk_cgroup_mkdir"`
-	ShawkCtConfirm        *ebpf.Program `ebpf:"shawk_ct_confirm"`
-	ShawkCtDestroy        *ebpf.Program `ebpf:"shawk_ct_destroy"`
-	ShawkInetSockSetState *ebpf.Program `ebpf:"shawk_inet_sock_set_state"`
-	ShawkIp6SendSkb       *ebpf.Program `ebpf:"shawk_ip6_send_skb"`
-	ShawkIpSendSkb        *ebpf.Program `ebpf:"shawk_ip_send_skb"`
-	ShawkIterTaskFile     *ebpf.Program `ebpf:"shawk_iter_task_file"`
-	ShawkIterTcp          *ebpf.Program `ebpf:"shawk_iter_tcp"`
-	ShawkIterUdp          *ebpf.Program `ebpf:"shawk_iter_udp"`
-	ShawkSkbConsumeUdp    *ebpf.Program `ebpf:"shawk_skb_consume_udp"`
+	ShawkCgroupMkdir       *ebpf.Program `ebpf:"shawk_cgroup_mkdir"`
+	ShawkCtConfirm         *ebpf.Program `ebpf:"shawk_ct_confirm"`
+	ShawkCtDestroy         *ebpf.Program `ebpf:"shawk_ct_destroy"`
+	ShawkInetSockSetState  *ebpf.Program `ebpf:"shawk_inet_sock_set_state"`
+	ShawkIp6SendSkb        *ebpf.Program `ebpf:"shawk_ip6_send_skb"`
+	ShawkIpSendSkb         *ebpf.Program `ebpf:"shawk_ip_send_skb"`
+	ShawkIterTaskFile      *ebpf.Program `ebpf:"shawk_iter_task_file"`
+	ShawkIterTcp           *ebpf.Program `ebpf:"shawk_iter_tcp"`
+	ShawkIterUdp           *ebpf.Program `ebpf:"shawk_iter_udp"`
+	ShawkSkbConsumeUdp     *ebpf.Program `ebpf:"shawk_skb_consume_udp"`
+	ShawkUnixRelease       *ebpf.Program `ebpf:"shawk_unix_release"`
+	ShawkUnixStreamConnect *ebpf.Program `ebpf:"shawk_unix_stream_connect"`
 }
 
 func (p *bpfPrograms) Close() error {
@@ -394,6 +448,8 @@ func (p *bpfPrograms) Close() error {
 		p.ShawkIterTcp,
 		p.ShawkIterUdp,
 		p.ShawkSkbConsumeUdp,
+		p.ShawkUnixRelease,
+		p.ShawkUnixStreamConnect,
 	)
 }
 

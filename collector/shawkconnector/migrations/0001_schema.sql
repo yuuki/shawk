@@ -44,6 +44,7 @@ CREATE TABLE shawk.agent_sessions (
   started_at       timestamptz NOT NULL,     -- shawk.agent.segment.start
   last_heartbeat   timestamptz NOT NULL,     -- observations up to here are written
   udp_traced       boolean NOT NULL,
+  unix_traced      boolean,                  -- whether it traces Unix sockets; NULL if it does not tell
   netns_scope      text NOT NULL,            -- 'all' or the inode of the traced netns
   dropped_flows    bigint NOT NULL DEFAULT 0,
   clock_skew       interval NOT NULL DEFAULT '0',  -- how far the clock of the host is behind the connector
@@ -176,6 +177,45 @@ CREATE INDEX listener_owners_process ON shawk.listener_owners (process_id);
 CREATE INDEX listener_owners_last_seen ON shawk.listener_owners (last_seen);
 CREATE INDEX listener_owners_kernel_chosen ON shawk.listener_owners (kernel_chosen_seen)
   WHERE kernel_chosen_seen IS NOT NULL;
+
+-- A dependency of a local process on a Unix socket of its host: agents
+-- trace the clients of Unix stream sockets only, since a socket has a name
+-- rather than an address and a port and both sides of its connections are
+-- on one host. path is the name of the socket as the server bound it, a
+-- path, or @ followed by an abstract name; netns is the network namespace
+-- of the client socket. The server is the owner of a listener of the name
+-- on the same host (unix_listeners): in the namespace of the client edge,
+-- else, for a path, in the only namespace that has one, for a socket
+-- reached from another namespace through a mount, such as /run/docker.sock
+-- in a container; an abstract name is reached in its namespace only.
+CREATE TABLE shawk.unix_edges (
+  id          bigserial PRIMARY KEY,
+  host_id     text NOT NULL REFERENCES shawk.hosts,
+  process_id  bigint NOT NULL REFERENCES shawk.processes,
+  path        text NOT NULL CHECK (path <> ''),
+  netns       bigint NOT NULL,
+  first_seen  timestamptz NOT NULL,
+  last_seen   timestamptz NOT NULL,
+  UNIQUE (host_id, path, netns, process_id)
+);
+CREATE INDEX unix_edges_last_seen ON shawk.unix_edges (last_seen);
+CREATE INDEX unix_edges_first_seen ON shawk.unix_edges (first_seen);
+CREATE INDEX unix_edges_process ON shawk.unix_edges (process_id);
+
+-- Every known owner of a listening Unix socket, with the period it owned
+-- it, like listener_owners: netns is the network namespace of the
+-- listening socket.
+CREATE TABLE shawk.unix_listeners (
+  host_id    text NOT NULL REFERENCES shawk.hosts,
+  process_id bigint NOT NULL REFERENCES shawk.processes,
+  path       text NOT NULL CHECK (path <> ''),
+  netns      bigint NOT NULL,
+  first_seen timestamptz NOT NULL,
+  last_seen  timestamptz NOT NULL,
+  PRIMARY KEY (host_id, path, netns, process_id)
+);
+CREATE INDEX unix_listeners_process ON shawk.unix_listeners (process_id);
+CREATE INDEX unix_listeners_last_seen ON shawk.unix_listeners (last_seen);
 
 -- Named address ranges of peers, written by the connector from its
 -- peer_cidrs, so that PostgreSQL names a peer without a known service like
@@ -392,18 +432,20 @@ $$;
 -- The name of a peer without a known service: the narrowest range of
 -- peer_cidrs that holds it, ~unresolved for an address not routed on the
 -- Internet, ~external otherwise, including the networks of folded peers.
+-- A peer without an address is the server of a Unix socket without a
+-- known service, which is on the host of its client: ~unresolved.
 -- Prometheus has the same names in service.peer.name (except ~other, which
 -- folds peers beyond max_peers).
 CREATE FUNCTION shawk_v1.peer_class(addr inet) RETURNS text
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
-  SELECT coalesce(
+  SELECT CASE WHEN addr IS NULL THEN '~unresolved' ELSE coalesce(
     (SELECT c.name FROM shawk.peer_cidrs c WHERE addr <<= c.prefix
      ORDER BY masklen(c.prefix) DESC, c.prefix LIMIT 1),
     CASE WHEN addr <<= inet '10.0.0.0/8' OR addr <<= inet '172.16.0.0/12' OR addr <<= inet '192.168.0.0/16'
            OR addr <<= inet '127.0.0.0/8' OR addr <<= inet '169.254.0.0/16' OR addr <<= inet '100.64.0.0/10'
            OR addr <<= inet 'fc00::/7' OR addr <<= inet 'fe80::/10' OR addr = inet '::1'
            OR addr = inet '0.0.0.0' OR addr = inet '::'
-         THEN '~unresolved' ELSE '~external' END)
+         THEN '~unresolved' ELSE '~external' END) END
 $$;
 
 -- The port of a dependency between services: 0 for a server service of
@@ -532,6 +574,26 @@ WHERE EXISTS (
 --     other side to tell, so that a stopped agent does not make the
 --     dependency look removed.
 --
+-- The client edges of Unix sockets (unix_edges) are matched with the
+-- owners of the listeners of their names (unix_listeners) whose periods
+-- overlap them, within 2 minutes:
+--
+--   - a matched row is the dependency of the client on the owner over the
+--     part of the period of the client edge that the owner held the
+--     listener, within the margin, except that the row of the first owner
+--     starts with the client edge and that of the last owner ends with it,
+--     as the row of a TCP connection spans both its edges: a client keeps
+--     the connections it opened, or keeps trying, after the listener closed.
+--     A row never lasts longer than its client edge, so that a listener that
+--     stays does not make its former clients look active. Both sides are
+--     observed by the agent of the host, so both observed_until are its
+--     latest heartbeat;
+--   - a client edge that matches no owner is a row of its own, observed by
+--     the client: a socket whose listener was not seen, such as one that
+--     refused the connections, or one whose name is ambiguous;
+--   - addresses are NULL and the port is 0; path, the last column, is the
+--     name of the socket, NULL on the rows of TCP and UDP.
+--
 -- client_observed_until and server_observed_until are the latest heartbeats
 -- of the hosts: an old last_seen with a recent observed_until means no
 -- longer used; both old means no longer observed.
@@ -541,7 +603,7 @@ RETURNS TABLE (
   server_host text, server_service text, server_unit text, server_addr inet,
   port integer, proto text, first_seen timestamptz, last_seen timestamptz,
   observed_by text, client_observed_until timestamptz, server_observed_until timestamptz,
-  virtual_addr inet, virtual_port integer, translation text)
+  virtual_addr inet, virtual_port integer, translation text, path text)
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
 WITH shared AS (SELECT addr FROM shawk.shared_addrs),
 e AS (
@@ -563,6 +625,36 @@ e AS (
 observed AS (
   SELECT host_id, max(last_heartbeat) AS observed_until
   FROM shawk.agent_sessions GROUP BY host_id
+),
+-- The client edges of Unix sockets, and the owners of the listeners of
+-- their names on their hosts that overlap them: those in the namespace of
+-- the client if any, else, for a path, those of the only namespace that has
+-- any. An abstract name (@) is reached in the namespace of its client only.
+-- earliest and latest tell the first and the last owner of each edge.
+ue AS (
+  SELECT u.id, u.host_id, u.path, u.netns, u.first_seen, u.last_seen, p.service_name, p.unit, h.hostname
+  FROM shawk.unix_edges u
+  JOIN shawk.processes p ON p.id = u.process_id
+  JOIN shawk.hosts h ON h.id = u.host_id
+  WHERE u.last_seen >= since - interval '15 minutes' AND u.first_seen <= until + interval '15 minutes'
+),
+uo AS (
+  SELECT x.edge_id, x.process_id, x.first_seen, x.last_seen,
+         row_number() OVER (PARTITION BY x.edge_id ORDER BY x.first_seen, x.process_id) = 1 AS earliest,
+         row_number() OVER (PARTITION BY x.edge_id ORDER BY x.last_seen DESC, x.process_id) = 1 AS latest
+  FROM (
+    SELECT ue.id AS edge_id, l.process_id, l.first_seen, l.last_seen, l.netns = ue.netns AS in_netns,
+           left(ue.path, 1) = '@' AS abstract,
+           bool_or(l.netns = ue.netns) OVER w AS any_in_netns,
+           min(l.netns) OVER w = max(l.netns) OVER w AS one_netns
+    FROM ue
+    JOIN shawk.unix_listeners l
+      ON  l.host_id = ue.host_id AND l.path = ue.path
+      AND l.first_seen <= ue.last_seen + interval '2 minutes'
+      AND ue.first_seen <= l.last_seen + interval '2 minutes'
+    WINDOW w AS (PARTITION BY ue.id)
+  ) x
+  WHERE x.in_netns OR (NOT x.any_in_netns AND x.one_netns AND NOT x.abstract)
 ),
 -- Client edges to a virtual address, read through the index of client
 -- edges. client_scope is the scope of the address of the client alone,
@@ -834,7 +926,8 @@ SELECT
        ELSE so.observed_until END               AS server_observed_until,
   NULL::inet                                    AS virtual_addr,
   NULL::integer                                 AS virtual_port,
-  NULL::text                                    AS translation
+  NULL::text                                    AS translation,
+  NULL::text                                    AS path
 FROM (SELECT * FROM e WHERE role = 'client') c
 FULL JOIN (SELECT * FROM e WHERE role = 'server') s
   ON  c.local_addr = s.remote_addr
@@ -864,10 +957,28 @@ SELECT
   t.s_port, t.proto, t.p_first, t.p_last, 'both',
   CASE WHEN t.c_last <= t.p_last + interval '2 minutes' THEN co.observed_until END,
   CASE WHEN t.s_last <= t.p_last + interval '2 minutes' THEN so.observed_until END,
-  t.c_remote, t.c_port, t.translation
+  t.c_remote, t.c_port, t.translation, NULL::text
 FROM translated t
 LEFT JOIN observed co ON co.host_id = t.c_host_id
 LEFT JOIN observed so ON so.host_id = t.s_host_id
+UNION ALL
+-- The dependencies over Unix sockets.
+SELECT
+  u.hostname, u.service_name, u.unit, NULL::inet,
+  CASE WHEN o.edge_id IS NOT NULL THEN u.hostname END, ps.service_name, ps.unit, NULL::inet,
+  0, 'unix'::text,
+  CASE WHEN o.edge_id IS NULL OR o.earliest THEN u.first_seen
+       ELSE greatest(u.first_seen, o.first_seen - interval '2 minutes') END,
+  CASE WHEN o.edge_id IS NULL OR o.latest THEN u.last_seen
+       ELSE least(u.last_seen, o.last_seen + interval '2 minutes') END,
+  CASE WHEN o.edge_id IS NULL THEN 'client' ELSE 'both' END,
+  ob.observed_until,
+  CASE WHEN o.edge_id IS NOT NULL THEN ob.observed_until END,
+  NULL::inet, NULL::integer, NULL::text, u.path
+FROM ue u
+LEFT JOIN uo o ON o.edge_id = u.id
+LEFT JOIN shawk.processes ps ON ps.id = o.process_id
+LEFT JOIN observed ob ON ob.host_id = u.host_id
 )
 SELECT * FROM d WHERE d.last_seen >= since AND d.first_seen <= until
 $$;
@@ -911,7 +1022,9 @@ SELECT
   d.client_service || ' -> ' || d.server_service,
   d.client_service,
   d.server_service,
-  string_agg(d.port::text || '/' || d.proto, ', ' ORDER BY d.port, d.proto),
+  -- A dependency over a Unix socket has no port.
+  string_agg(CASE WHEN d.proto = 'unix' THEN d.proto ELSE d.port::text || '/' || d.proto END, ', '
+             ORDER BY d.port, d.proto),
   min(d.first_seen),
   max(d.last_seen)
 FROM shawk.service_dependencies_between(since, until) d
@@ -996,6 +1109,35 @@ e AS (
 observed AS (
   SELECT host_id, max(last_heartbeat) AS observed_until
   FROM shawk.agent_sessions GROUP BY host_id
+),
+-- The client edges of Unix sockets, and the owners of the listeners of
+-- their names on their hosts that overlap them: those in the namespace of
+-- the client if any, else, for a path, those of the only namespace that has
+-- any. An abstract name (@) is reached in the namespace of its client only.
+-- earliest and latest tell the first and the last owner of each edge.
+ue AS (
+  SELECT u.id, u.host_id, u.path, u.netns, u.first_seen, u.last_seen, p.service_name, p.unit, h.hostname
+  FROM shawk.unix_edges u
+  JOIN shawk.processes p ON p.id = u.process_id
+  JOIN shawk.hosts h ON h.id = u.host_id
+),
+uo AS (
+  SELECT x.edge_id, x.process_id, x.first_seen, x.last_seen,
+         row_number() OVER (PARTITION BY x.edge_id ORDER BY x.first_seen, x.process_id) = 1 AS earliest,
+         row_number() OVER (PARTITION BY x.edge_id ORDER BY x.last_seen DESC, x.process_id) = 1 AS latest
+  FROM (
+    SELECT ue.id AS edge_id, l.process_id, l.first_seen, l.last_seen, l.netns = ue.netns AS in_netns,
+           left(ue.path, 1) = '@' AS abstract,
+           bool_or(l.netns = ue.netns) OVER w AS any_in_netns,
+           min(l.netns) OVER w = max(l.netns) OVER w AS one_netns
+    FROM ue
+    JOIN shawk.unix_listeners l
+      ON  l.host_id = ue.host_id AND l.path = ue.path
+      AND l.first_seen <= ue.last_seen + interval '2 minutes'
+      AND ue.first_seen <= l.last_seen + interval '2 minutes'
+    WINDOW w AS (PARTITION BY ue.id)
+  ) x
+  WHERE x.in_netns OR (NOT x.any_in_netns AND x.one_netns AND NOT x.abstract)
 ),
 -- Client edges to a virtual address, read through the index of client
 -- edges. client_scope is the scope of the address of the client alone,
@@ -1255,7 +1397,8 @@ SELECT
        ELSE so.observed_until END               AS server_observed_until,
   NULL::inet                                    AS virtual_addr,
   NULL::integer                                 AS virtual_port,
-  NULL::text                                    AS translation
+  NULL::text                                    AS translation,
+  NULL::text                                    AS path
 FROM (SELECT * FROM e WHERE role = 'client') c
 FULL JOIN (SELECT * FROM e WHERE role = 'server') s
   ON  c.local_addr = s.remote_addr
@@ -1285,10 +1428,28 @@ SELECT
   t.s_port, t.proto, t.p_first, t.p_last, 'both',
   CASE WHEN t.c_last <= t.p_last + interval '2 minutes' THEN co.observed_until END,
   CASE WHEN t.s_last <= t.p_last + interval '2 minutes' THEN so.observed_until END,
-  t.c_remote, t.c_port, t.translation
+  t.c_remote, t.c_port, t.translation, NULL::text
 FROM translated t
 LEFT JOIN observed co ON co.host_id = t.c_host_id
-LEFT JOIN observed so ON so.host_id = t.s_host_id;
+LEFT JOIN observed so ON so.host_id = t.s_host_id
+UNION ALL
+-- The dependencies over Unix sockets.
+SELECT
+  u.hostname, u.service_name, u.unit, NULL::inet,
+  CASE WHEN o.edge_id IS NOT NULL THEN u.hostname END, ps.service_name, ps.unit, NULL::inet,
+  0, 'unix'::text,
+  CASE WHEN o.edge_id IS NULL OR o.earliest THEN u.first_seen
+       ELSE greatest(u.first_seen, o.first_seen - interval '2 minutes') END,
+  CASE WHEN o.edge_id IS NULL OR o.latest THEN u.last_seen
+       ELSE least(u.last_seen, o.last_seen + interval '2 minutes') END,
+  CASE WHEN o.edge_id IS NULL THEN 'client' ELSE 'both' END,
+  ob.observed_until,
+  CASE WHEN o.edge_id IS NOT NULL THEN ob.observed_until END,
+  NULL::inet, NULL::integer, NULL::text, u.path
+FROM ue u
+LEFT JOIN uo o ON o.edge_id = u.id
+LEFT JOIN shawk.processes ps ON ps.id = o.process_id
+LEFT JOIN observed ob ON ob.host_id = u.host_id;
 
 -- Dependencies between services over the whole history, as
 -- service_dependencies_between.
@@ -1317,7 +1478,8 @@ SELECT
   client_service || ' -> ' || server_service  AS id,
   client_service                              AS source,
   server_service                              AS target,
-  string_agg(port::text || '/' || proto, ', ' ORDER BY port, proto) AS mainstat,
+  string_agg(CASE WHEN proto = 'unix' THEN proto ELSE port::text || '/' || proto END, ', '
+             ORDER BY port, proto) AS mainstat,
   min(first_seen)                             AS first_seen,
   max(last_seen)                              AS last_seen
 FROM shawk.service_dependencies
@@ -1414,6 +1576,7 @@ SELECT DISTINCT ON (h.id)
   s.started_at,
   s.last_heartbeat,
   s.udp_traced,
+  s.unix_traced,    -- whether the agent traces Unix sockets; NULL if it does not tell
   s.netns_scope,
   s.dropped_flows,
   s.last_heartbeat > now() - shawk.alive_window() AS alive,
@@ -1634,10 +1797,20 @@ $$;
 -- from the connector and Grafana, which read the rest of shawk_v1, and the
 -- grants that default privileges give other roles as it is created are
 -- revoked here, so that only its owner reads it until then.
+-- The edges to Unix sockets have NULL addresses, port 0, and path the name
+-- of the socket, which is NULL for the others.
 CREATE VIEW shawk_v1.job_edges AS
 SELECT h.hostname AS host, e.host_id, p.unit, p.service_name AS service, p.exe, p.user_id,
-       e.role, e.proto, e.local_addr, e.remote_addr, e.port, e.netns, e.first_seen, e.last_seen
+       e.role, e.proto, e.local_addr, e.remote_addr, e.port, e.netns, e.first_seen, e.last_seen,
+       NULL::text AS path
 FROM shawk.edges e
+JOIN shawk.processes p ON p.id = e.process_id
+JOIN shawk.hosts h ON h.id = e.host_id
+WHERE p.unit LIKE 'slurm/%'
+UNION ALL
+SELECT h.hostname, e.host_id, p.unit, p.service_name, p.exe, p.user_id,
+       'client', 'unix', NULL::inet, NULL::inet, 0, e.netns, e.first_seen, e.last_seen, e.path
+FROM shawk.unix_edges e
 JOIN shawk.processes p ON p.id = e.process_id
 JOIN shawk.hosts h ON h.id = e.host_id
 WHERE p.unit LIKE 'slurm/%';
@@ -1755,6 +1928,26 @@ JOIN shawk.hosts h ON h.id = e.host_id
 WHERE e.role = 'client'
   AND e.last_seen > now() - interval '1 hour';
 
+-- The names of the Unix sockets services listen on, used by the shawk
+-- connector to name the peers of the client edges of Unix sockets, like
+-- service_endpoints: the listeners seen within an hour of the latest
+-- listener of Unix sockets of each host, of hosts that reported in the
+-- last 30 days. slurm_job tells that a process of a Slurm job (unit
+-- slurm/*) listens on it, which the connector names slurm-job as a peer.
+CREATE VIEW shawk_v1.unix_endpoints AS
+WITH latest AS (
+  SELECT host_id, max(last_seen) AS last_seen FROM shawk.unix_listeners GROUP BY host_id
+)
+SELECT l.path, l.netns, h.hostname AS host, l.host_id, p.service_name AS service, max(l.last_seen) AS last_seen,
+       bool_or(p.unit LIKE 'slurm/%') AS slurm_job
+FROM shawk.unix_listeners l
+JOIN shawk.processes p ON p.id = l.process_id
+JOIN shawk.hosts h ON h.id = l.host_id
+JOIN latest ON latest.host_id = l.host_id
+WHERE l.last_seen >= latest.last_seen - interval '1 hour'
+  AND h.last_seen > now() - interval '30 days'
+GROUP BY l.path, l.netns, h.hostname, l.host_id, p.service_name;
+
 -- Addresses of hosts whose agent is alive, with what the latest session
 -- says the agent traces and folds, used by the shawk connector to mark the
 -- peers of edges whose other side has its own agent. An agent is alive by
@@ -1861,12 +2054,20 @@ BEGIN
     SELECT id FROM shawk.edges WHERE last_seen < cutoff LIMIT max_rows);
   GET DIAGNOSTICS n = ROW_COUNT; total := total + n;
 
+  DELETE FROM shawk.unix_edges WHERE last_seen < cutoff AND id IN (
+    SELECT id FROM shawk.unix_edges WHERE last_seen < cutoff LIMIT max_rows);
+  GET DIAGNOSTICS n = ROW_COUNT; total := total + n;
+
   DELETE FROM shawk.listeners WHERE last_seen < cutoff AND ctid IN (
     SELECT ctid FROM shawk.listeners WHERE last_seen < cutoff LIMIT max_rows);
   GET DIAGNOSTICS n = ROW_COUNT; total := total + n;
 
   DELETE FROM shawk.listener_owners WHERE last_seen < cutoff AND ctid IN (
     SELECT ctid FROM shawk.listener_owners WHERE last_seen < cutoff LIMIT max_rows);
+  GET DIAGNOSTICS n = ROW_COUNT; total := total + n;
+
+  DELETE FROM shawk.unix_listeners WHERE last_seen < cutoff AND ctid IN (
+    SELECT ctid FROM shawk.unix_listeners WHERE last_seen < cutoff LIMIT max_rows);
   GET DIAGNOSTICS n = ROW_COUNT; total := total + n;
 
   DELETE FROM shawk.host_addrs WHERE last_seen < cutoff AND ctid IN (
@@ -1891,14 +2092,18 @@ BEGIN
 
   DELETE FROM shawk.processes p WHERE p.last_seen < cutoff
     AND NOT EXISTS (SELECT FROM shawk.edges e WHERE e.process_id = p.id)
+    AND NOT EXISTS (SELECT FROM shawk.unix_edges e WHERE e.process_id = p.id)
     AND NOT EXISTS (SELECT FROM shawk.listeners l WHERE l.process_id = p.id)
     AND NOT EXISTS (SELECT FROM shawk.listener_owners o WHERE o.process_id = p.id)
+    AND NOT EXISTS (SELECT FROM shawk.unix_listeners u WHERE u.process_id = p.id)
     AND p.id IN (
       SELECT p2.id FROM shawk.processes p2
       WHERE p2.last_seen < cutoff
         AND NOT EXISTS (SELECT FROM shawk.edges e WHERE e.process_id = p2.id)
+        AND NOT EXISTS (SELECT FROM shawk.unix_edges e WHERE e.process_id = p2.id)
         AND NOT EXISTS (SELECT FROM shawk.listeners l WHERE l.process_id = p2.id)
         AND NOT EXISTS (SELECT FROM shawk.listener_owners o WHERE o.process_id = p2.id)
+        AND NOT EXISTS (SELECT FROM shawk.unix_listeners u WHERE u.process_id = p2.id)
       LIMIT max_rows);
   GET DIAGNOSTICS n = ROW_COUNT; total := total + n;
 
@@ -1908,8 +2113,10 @@ BEGIN
     AND NOT EXISTS (SELECT FROM shawk.host_addrs a WHERE a.host_id = h.id)
     AND NOT EXISTS (SELECT FROM shawk.processes p WHERE p.host_id = h.id)
     AND NOT EXISTS (SELECT FROM shawk.edges e WHERE e.host_id = h.id)
+    AND NOT EXISTS (SELECT FROM shawk.unix_edges e WHERE e.host_id = h.id)
     AND NOT EXISTS (SELECT FROM shawk.listeners l WHERE l.host_id = h.id)
     AND NOT EXISTS (SELECT FROM shawk.listener_owners o WHERE o.host_id = h.id)
+    AND NOT EXISTS (SELECT FROM shawk.unix_listeners u WHERE u.host_id = h.id)
     AND NOT EXISTS (SELECT FROM shawk.learned_translations t WHERE t.host_id = h.id)
     AND h.id IN (SELECT h2.id FROM shawk.hosts h2 WHERE h2.last_seen < cutoff LIMIT max_rows);
   GET DIAGNOSTICS n = ROW_COUNT; total := total + n;

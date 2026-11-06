@@ -60,8 +60,38 @@ func TestGoldenRequest(t *testing.T) {
 	if !hb.droppedSince.Equal(t0.Add(-time.Hour)) {
 		t.Errorf("dropped since %v", hb.droppedSince)
 	}
-	if len(hb.edges) != 4 || len(hb.listeners) != 3 {
+	if len(hb.edges) != 5 || len(hb.listeners) != 4 {
 		t.Fatalf("%d edges, %d listeners", len(hb.edges), len(hb.listeners))
+	}
+	if hb.unixTraced == nil || !*hb.unixTraced {
+		t.Errorf("unix traced = %v", hb.unixTraced)
+	}
+	// The client of a Unix socket: its name, no addresses or port, and its
+	// connections only.
+	app := process{unit: "app.service", comm: "puma", exe: "/usr/bin/ruby", service: "app", svcNS: "shop"}
+	unix := hb.edges[edgeID{role: roleClient, proto: transportUnix, path: "/run/postgresql/.s.PGSQL.5432",
+		netns: 4026531840, process: app}]
+	if unix == nil {
+		t.Fatalf("no Unix client edge in %v", slices.Collect(maps.Keys(hb.edges)))
+	}
+	if !maps.Equal(maps.Collect(func(yield func(valueKey, float64) bool) {
+		for k, p := range unix.values {
+			if !yield(k, p.value) {
+				return
+			}
+		}
+	}), map[valueKey]float64{
+		{metric: metricConnOpened}: 4, {metric: metricConnFailed}: 2, {metric: metricConnCount}: 1,
+		{metric: metricConnFailedByReason, errType: "refused"}: 2,
+	}) {
+		t.Errorf("Unix client edge values = %v", unix.values)
+	}
+	if !unix.first.Equal(t0.Add(15*time.Second)) || !unix.last.Equal(unix.first) {
+		t.Errorf("Unix client edge seen %v..%v", unix.first, unix.last)
+	}
+	if l := hb.listeners[listenerID{proto: transportUnix, path: "@app/control", netns: 4026531840, process: app}]; l == nil ||
+		!l.last.Equal(t0.Add(15*time.Second)) {
+		t.Errorf("Unix listener = %+v of %v", l, slices.Collect(maps.Keys(hb.listeners)))
 	}
 	// srun listens on a port the kernel chose, the other listeners on
 	// ports they were bound to.
@@ -153,7 +183,7 @@ func TestGoldenRequest(t *testing.T) {
 	for i := range hb.agent.Len() {
 		names = append(names, hb.agent.At(i).Name())
 	}
-	if got := strings.Join(names, ","); got != "shawk.agent.up,shawk.agent.udp.traced,shawk.agent.flows.dropped,shawk.agent.cgroup_events.dropped,shawk.agent.container_reads.dropped,shawk.agent.export.failures,shawk.agent.translations.traced,shawk.agent.translations.dropped,shawk.agent.rdma.io,shawk.agent.bpf.run_count,shawk.agent.bpf.run_time" {
+	if got := strings.Join(names, ","); got != "shawk.agent.up,shawk.agent.udp.traced,shawk.agent.unix.traced,shawk.agent.flows.dropped,shawk.agent.cgroup_events.dropped,shawk.agent.container_reads.dropped,shawk.agent.export.failures,shawk.agent.translations.traced,shawk.agent.translations.dropped,shawk.agent.rdma.io,shawk.agent.bpf.run_count,shawk.agent.bpf.run_time" {
 		t.Errorf("forwarded agent metrics = %s", got)
 	}
 	// kube-proxy translates a ClusterIP to a pod, and the host masquerades a

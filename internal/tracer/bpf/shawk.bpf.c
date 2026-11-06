@@ -35,6 +35,14 @@
  *     bundle datagrams in process context. The direction of a socket is
  *     decided by its first datagram (see udp_direction()).
  *
+ * Unix stream and seqpacket sockets
+ *   - fexit/unix_stream_connect counts the connections and failed connects
+ *     of clients to named sockets, in the process that connects, and
+ *     fentry/unix_release the connections that are still open (see
+ *     shawk_unix_stream_connect).
+ *   - iter/task_file reports the listening sockets with their owners, and
+ *     adopts connections established before the tracer started.
+ *
  * Translations of addresses (conntrack, module nf_conntrack)
  *   - kprobe/__nf_conntrack_confirm learns the translations of new
  *     connections, and kprobe/nf_ct_destroy (destroy_conntrack before Linux
@@ -61,17 +69,28 @@
  */
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
+#define AF_UNIX 1
 #define AF_INET 2
 #define AF_INET6 10
+#define EPERM 1
+#define ENOENT 2
+#define EINTR 4
+#define EAGAIN 11
+#define ENOMEM 12
 #define EACCES 13
 #define EBUSY 16
 #define EEXIST 17
+#define ENOTDIR 20
+#define EINVAL 22
 #define ENONET 64
 #define ENETUNREACH 101
+#define ENOBUFS 105
+#define EISCONN 106
 #define ETIMEDOUT 110
 #define ECONNREFUSED 111
 #define EHOSTDOWN 112
 #define EHOSTUNREACH 113
+#define ERESTARTSYS 512
 #define SOCK_DGRAM 2
 #define SOCK_BINDPORT_LOCK 8
 /*
@@ -112,6 +131,8 @@ char LICENSE[] SEC("license") = "Dual BSD/GPL";
 #define IPPROTO_MPTCP_ 262
 
 #define MAX_FLOWS 16384 /* overridden by user space */
+#define MAX_UNIX_FLOWS 4096 /* overridden by user space */
+#define MAX_UNIX_CONNS 8192 /* overridden by user space */
 
 /* Configuration set by user space before loading. */
 const volatile bool learn_self = true; /* false to trace the tracer itself */
@@ -137,6 +158,12 @@ volatile __u32 initial_scan = 0;
 volatile __u32 self_tgid = 0xffffffff;
 /* Incremented by user space before each walk of iter/task_file. */
 volatile __u32 owner_scan = 0;
+/*
+ * Set by user space once the programs of Unix sockets are attached: only
+ * then does iter/task_file adopt their connections, which fentry/unix_release
+ * must count as closed, and report their listeners.
+ */
+volatile __u32 unix_traced = 0;
 /* Flow updates dropped because the flow table could not be updated. */
 __u64 flow_drops = 0;
 /*
@@ -287,6 +314,41 @@ struct {
 	__type(key, struct shawk_peer_prefix);
 	__type(value, __u8);
 } internal_peers SEC(".maps");
+
+/* Bundled flows of Unix sockets, flipped with the flows. */
+struct shawk_unix_flow_map {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, MAX_UNIX_FLOWS);
+	__type(key, struct shawk_unix_key);
+	__type(value, struct shawk_unix_stats);
+} unix_flows_0 SEC(".maps"), unix_flows_1 SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
+	__uint(max_entries, 2);
+	__type(key, __u32);
+	__array(values, struct shawk_unix_flow_map);
+} unix_flows SEC(".maps") = {
+	.values = {&unix_flows_0, &unix_flows_1},
+};
+
+/*
+ * The open connections of Unix flows, by the address of their client
+ * socket: added when a client connects, or when a walk of the processes
+ * adopts its connection, and deleted when the client closes it. A
+ * connection is an entry rather than a count, so that the programs that
+ * add it at once insert it once, and nothing that is missed or raced can
+ * leave a count that never returns to zero. connect(2) and the walk both
+ * hold a reference to the file of the socket, so it cannot be released
+ * while they add it. Tracing programs need preallocated hash maps before
+ * Linux 6.1.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, MAX_UNIX_CONNS);
+	__type(key, __u64);
+	__type(value, struct shawk_unix_conn);
+} unix_conns SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -1751,6 +1813,364 @@ int shawk_iter_udp(struct bpf_iter__udp *ctx)
 	return 0;
 }
 
+/* --------------------------------------------------------------- Unix --- */
+
+/*
+ * Unix stream and seqpacket sockets have no state changes that a tracepoint
+ * reports, and keep no counters of what they carry, so their connections
+ * are counted at connect(2) and close(2) of the client, and their traffic
+ * is not: a hook on every message would cost as much as for TCP (see
+ * research/kernel-hooks). A client connects in its own process, the only
+ * side where it has a name to connect to; the server is the owner of the
+ * listener of that name, which user space finds by iter/task_file. Unnamed
+ * pairs (socketpair(2)) and datagram sockets are not traced.
+ */
+
+static __always_inline bool unix_stream(struct sock *sk)
+{
+	__u16 type = BPF_CORE_READ(sk, sk_type);
+
+	return type == SOCK_STREAM || type == SOCK_SEQPACKET;
+}
+
+/*
+ * Reads n bytes of sun_path at src into a name of struct shawk_unix_key: an
+ * abstract name, which starts with a NUL and may hold any byte, whole, and
+ * a path up to its NUL. The kernel stores the NUL of a path in the address
+ * of a bound socket, and puts one after the address that a connect(2)
+ * passes, within its struct sockaddr_storage, so a path is read as a string
+ * of at most sun_path. A path of the full length of sun_path, which has no
+ * room for its NUL there, loses its last byte.
+ */
+static __always_inline int read_unix_name(char *dst, __u16 *dst_len,
+					  const void *src, int n)
+{
+	__u32 size;
+	char first = 0;
+	long len;
+
+	if (n <= 0 || bpf_probe_read_kernel(&first, 1, src))
+		return -1;
+	if (first) {
+		len = bpf_probe_read_kernel_str(dst, UNIX_PATH_LEN, src);
+		if (len <= 1)
+			return -1;
+		*dst_len = len - 1;
+		return 0;
+	}
+	size = n < UNIX_PATH_LEN ? n : UNIX_PATH_LEN;
+	/* Keeps the bound that the verifier checks on the size it is given. */
+	barrier_var(size);
+	if (size > UNIX_PATH_LEN)
+		return -1;
+	if (bpf_probe_read_kernel(dst, size, src))
+		return -1;
+	*dst_len = size;
+	return 0;
+}
+
+/* Reads the name of a bound Unix socket from its address. */
+static __always_inline int read_unix_addr(char *dst, __u16 *dst_len,
+					  struct unix_address *a)
+{
+	void *name;
+	int len;
+
+	if (!a)
+		return -1;
+	/* The length counts the family before sun_path. */
+	len = BPF_CORE_READ(a, len) - (int)sizeof(__kernel_sa_family_t);
+	name = (void *)a + bpf_core_field_offset(a->name) +
+	       __builtin_offsetof(struct sockaddr_un, sun_path);
+	return read_unix_name(dst, dst_len, name, len);
+}
+
+static __always_inline struct unix_address *unix_addr(struct sock *sk)
+{
+	return BPF_CORE_READ((struct unix_sock *)sk, addr);
+}
+
+/* Records task as the owner, named after its thread group leader. */
+static __always_inline void set_task_owner(__u64 *cgroup_id,
+					   char (*dst)[TASK_COMM_LEN],
+					   struct task_struct *task)
+{
+	*cgroup_id = task_cgroup_id(task);
+	BPF_CORE_READ_STR_INTO(dst, task, group_leader, comm);
+}
+
+/* The value of a new Unix flow, as zero_stats for the flows. */
+static const struct shawk_unix_stats zero_unix_stats = {};
+
+/* Looks up or creates the bundled Unix flow in the active map. */
+static __always_inline struct shawk_unix_stats *
+unix_flow_get(const struct shawk_unix_key *key)
+{
+	struct shawk_unix_stats *fs;
+	__u32 idx = active_idx & 1;
+	void *map;
+	int err; /* see flow_get() */
+
+	map = bpf_map_lookup_elem(&unix_flows, &idx);
+	if (!map)
+		return NULL;
+	fs = bpf_map_lookup_elem(map, key);
+	if (fs)
+		return fs;
+	err = bpf_map_update_elem(map, key, &zero_unix_stats, BPF_NOEXIST);
+	if (err && err != -EEXIST) {
+		if (err == -EBUSY)
+			__sync_fetch_and_add(&flow_busy, 1);
+		__sync_fetch_and_add(&flow_drops, 1);
+		return NULL;
+	}
+	return bpf_map_lookup_elem(map, key);
+}
+
+/*
+ * Adds the open connection of the client socket sk to unix_conns, replacing
+ * an entry of the same socket with flags BPF_ANY, or not with BPF_NOEXIST.
+ * A connection that does not fit is a dropped update: its flow may look
+ * unused while it is open.
+ */
+static __always_inline void unix_add_conn(struct sock *sk,
+					  const struct shawk_unix_conn *c,
+					  __u64 flags)
+{
+	__u64 k = (__u64)sk;
+	int err; /* see flow_get() */
+
+	err = bpf_map_update_elem(&unix_conns, &k, c, flags);
+	if (err && err != -EEXIST)
+		__sync_fetch_and_add(&flow_drops, 1);
+}
+
+/*
+ * The reason of a failed connect, as for TCP (see fail_reason()), or -1 for
+ * _OTHER, or -2 for an error that is no attempt to connect.
+ *
+ * - refused: nothing listens on the name: no such path (ENOENT, ENOTDIR),
+ *   or no listener there (ECONNREFUSED), also a stale socket file whose
+ *   server is gone.
+ * - timeout: the backlog of the listener is full (EAGAIN), the server does
+ *   not accept fast enough; a blocking connect waits for it first.
+ * - unreachable: permission denied on the path or by an LSM (EACCES,
+ *   EPERM).
+ * - local: no memory for the socket of the server or for the request.
+ * - aborted: a signal interrupted a connect that waited (EINTR). One that
+ *   the kernel restarts (ERESTARTSYS) is counted when it ends.
+ */
+static __always_inline int unix_fail_reason(int err)
+{
+	switch (err) {
+	case ENOENT:
+	case ENOTDIR:
+	case ECONNREFUSED:
+		return FAIL_REFUSED;
+	case EAGAIN:
+		return FAIL_TIMEOUT;
+	case EACCES:
+	case EPERM:
+		return FAIL_UNREACHABLE;
+	case ENOMEM:
+	case ENOBUFS:
+		return FAIL_LOCAL;
+	case EINTR:
+		return FAIL_ABORTED;
+	case EISCONN:
+	case EINVAL:
+	case ERESTARTSYS:
+		return -2;
+	}
+	return -1;
+}
+
+/*
+ * unix_stream_connect() is the connect of Unix stream and seqpacket sockets,
+ * called in connect(2) by the client process; a stable function that the
+ * operations of both point to, so it is never inlined. Once it returns 0
+ * the socket is connected to a socket that the kernel created for the
+ * server and queued to the listener, and which shares the address of the
+ * listener: the name the server bound. A failed connect has only the name
+ * the client asked for, which differs from the name of the server when the
+ * client reached it through a link or another mount.
+ *
+ * The connection is open in unix_conns until the client closes it
+ * (shawk_unix_release); what the server does with its end is not seen.
+ */
+SEC("fexit/unix_stream_connect")
+int BPF_PROG(shawk_unix_stream_connect, struct socket *sock,
+	     struct sockaddr *uaddr, int addr_len, int flags, int ret)
+{
+	__u32 tgid = bpf_get_current_pid_tgid() >> 32;
+	struct shawk_unix_conn c = {};
+	struct shawk_unix_key *key = &c.key;
+	struct shawk_unix_stats *fs;
+	struct sock *sk, *peer;
+	int r = 0;
+
+	if (tgid == self_tgid)
+		return 0;
+	sk = BPF_CORE_READ(sock, sk);
+	if (!sk)
+		return 0;
+	key->netns = sock_netns(sk);
+	if (!netns_ok(key->netns))
+		return 0;
+	if (ret == 0) {
+		peer = BPF_CORE_READ((struct unix_sock *)sk, peer);
+		if (!peer || read_unix_addr(key->path, &key->path_len, unix_addr(peer)))
+			return 0;
+	} else {
+		r = unix_fail_reason(-ret);
+		if (r == -2 ||
+		    read_unix_name(key->path, &key->path_len,
+				   (void *)uaddr + __builtin_offsetof(struct sockaddr_un, sun_path),
+				   addr_len - (int)sizeof(__kernel_sa_family_t)))
+			return 0;
+	}
+	set_task_owner(&key->cgroup_id, &key->comm, bpf_get_current_task_btf());
+
+	fs = unix_flow_get(key);
+	if (fs) {
+		if (ret == 0) {
+			__sync_fetch_and_add(&fs->conns, 1);
+		} else {
+			__sync_fetch_and_add(&fs->conn_fails, 1);
+			if (r >= 0 && r < FAIL_REASONS)
+				__sync_fetch_and_add(&fs->fails[r], 1);
+		}
+		fs->pid = tgid;
+	}
+	if (ret)
+		return 0;
+	/*
+	 * Replaces what a walk of the processes adopted meanwhile, or what a
+	 * former socket at the same address left.
+	 */
+	c.pid = tgid;
+	unix_add_conn(sk, &c, BPF_ANY);
+	return 0;
+}
+
+/*
+ * A socket is closed: its last file is released. The connection of a
+ * client is no longer open. The lookup spares the lock of a deletion to
+ * the other sockets.
+ */
+SEC("fentry/unix_release")
+int BPF_PROG(shawk_unix_release, struct socket *sock)
+{
+	__u64 k = (__u64)BPF_CORE_READ(sock, sk);
+
+	if (k && bpf_map_lookup_elem(&unix_conns, &k))
+		bpf_map_delete_elem(&unix_conns, &k);
+	return 0;
+}
+
+/*
+ * An address that unix_autobind() gives a socket without one, e.g. to a
+ * client with SO_PASSCRED: an abstract name of five hex digits.
+ */
+static __always_inline bool unix_autobound(struct unix_address *a)
+{
+	char first = 1;
+
+	if (BPF_CORE_READ(a, len) != sizeof(__kernel_sa_family_t) + 6)
+		return false;
+	bpf_probe_read_kernel(&first, 1, (void *)a + bpf_core_field_offset(a->name) +
+			      __builtin_offsetof(struct sockaddr_un, sun_path));
+	return first == 0;
+}
+
+/*
+ * Whether a connected Unix socket that predates the tracer is the client
+ * side of its connection. The socket the kernel created for the server
+ * shares the address of the listener, while a client rarely has a name of
+ * its own: the side whose peer has a name and that has none, or only one
+ * the kernel gave it, is the client. When both have names they bound, the
+ * address of the server is also the listener's, so it is held more than
+ * once while the listener is open. A pair without names (socketpair(2)), or
+ * whose sides cannot be told apart, is not adopted.
+ */
+static __always_inline bool unix_client(struct sock *sk, struct sock *peer)
+{
+	struct unix_address *a = unix_addr(sk), *pa = unix_addr(peer);
+	bool auto_a, auto_pa;
+
+	if (!pa)
+		return false;
+	if (!a)
+		return true;
+	auto_a = unix_autobound(a);
+	auto_pa = unix_autobound(pa);
+	if (auto_a != auto_pa)
+		return auto_a;
+	return BPF_CORE_READ(pa, refcnt.refs.counter) > 1 &&
+	       BPF_CORE_READ(a, refcnt.refs.counter) == 1;
+}
+
+/*
+ * Adopts the client side of a Unix connection established before the
+ * tracer started, held by task: it is open from now on, not counted as a
+ * connection. A connection that connect(2) added meanwhile is kept.
+ */
+static __always_inline void unix_adopt(struct sock *sk,
+				       struct task_struct *task, __u32 tgid,
+				       __u32 netns)
+{
+	struct shawk_unix_conn c = {};
+	__u64 k = (__u64)sk;
+	struct sock *peer;
+
+	if (tgid == self_tgid || bpf_map_lookup_elem(&unix_conns, &k))
+		return;
+	peer = BPF_CORE_READ((struct unix_sock *)sk, peer);
+	if (!peer || !unix_client(sk, peer))
+		return;
+	if (read_unix_addr(c.key.path, &c.key.path_len, unix_addr(peer)))
+		return;
+	c.key.netns = netns;
+	set_task_owner(&c.key.cgroup_id, &c.key.comm, task);
+	c.pid = tgid;
+	unix_add_conn(sk, &c, BPF_NOEXIST);
+}
+
+/*
+ * Reports a listening Unix socket held by task with its name, or adopts the
+ * client side of a connection, for iter/task_file.
+ */
+static __always_inline void unix_task_file(struct seq_file *seq,
+					   struct shawk_iter_rec *rec,
+					   struct task_struct *task,
+					   struct file *file, struct sock *sk)
+{
+	__u32 netns, tgid;
+	__u8 state;
+
+	if (!unix_traced || !unix_stream(sk))
+		return;
+	netns = sock_netns(sk);
+	if (!netns_ok(netns))
+		return;
+	tgid = BPF_CORE_READ(task, tgid);
+	state = BPF_CORE_READ(sk, __sk_common.skc_state);
+	if (state == TCP_ESTABLISHED) {
+		unix_adopt(sk, task, tgid, netns);
+		return;
+	}
+	if (state != TCP_LISTEN ||
+	    read_unix_addr(rec->path, &rec->path_len, unix_addr(sk)))
+		return;
+	set_task_owner(&rec->cgroup_id, &rec->comm, task);
+	rec->type = REC_OWNER;
+	rec->proto = PROTO_UNIX;
+	rec->netns = netns;
+	rec->pid = tgid;
+	rec->ino = BPF_CORE_READ(file, f_inode, i_ino);
+	bpf_seq_write(seq, rec, sizeof(*rec));
+}
+
 /* ------------------------------------------------------------ cgroups --- */
 
 /*
@@ -1843,7 +2263,7 @@ static __always_inline void account_skipped(struct shawk_sock_state *ss,
 /*
  * Walks the file descriptors of all processes to find the owners of
  * adopted outgoing TCP connections, of MPTCP connections and of listening
- * sockets.
+ * sockets, Unix sockets included (see unix_task_file()).
  *
  * Applications using MPTCP (Go listens with it by default since 1.24) hold
  * an MPTCP socket whose TCP subflows carry the traffic. Its listeners are
@@ -1877,6 +2297,10 @@ int shawk_iter_task_file(struct bpf_iter__task_file *ctx)
 	if (!sk)
 		return 0;
 	family = BPF_CORE_READ(sk, __sk_common.skc_family);
+	if (family == AF_UNIX) {
+		unix_task_file(seq, &rec, task, file, sk);
+		return 0;
+	}
 	if (family != AF_INET && family != AF_INET6)
 		return 0;
 	netns = sock_netns(sk);

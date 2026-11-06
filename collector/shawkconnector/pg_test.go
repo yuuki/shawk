@@ -393,6 +393,9 @@ func TestPGReaderRole(t *testing.T) {
 		"SELECT count(*) FROM shawk_v1.graph_edges_between(now() - interval '1 day', now())",
 		"SELECT count(*) FROM shawk_v1.graph_nodes_between(now() - interval '1 day', now())",
 		"SELECT count(*) FROM shawk_v1.dependency_changes_between(now() - interval '1 day', now())",
+		"SELECT count(*) FROM shawk_v1.unix_endpoints",
+		"SELECT count(path) FROM shawk_v1.dependencies",
+		"SELECT count(path) FROM shawk_v1.dependencies_between(now() - interval '1 day', now())",
 	} {
 		var n int
 		if err := conn.QueryRow(ctx, q).Scan(&n); err != nil {

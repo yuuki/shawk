@@ -1,9 +1,11 @@
 package tracer
 
 import (
+	"cmp"
 	"errors"
 	"net/netip"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/cilium/ebpf"
@@ -20,6 +22,16 @@ type owner struct {
 	pid      uint32
 	comm     string
 	cgroupID uint64
+}
+
+// unixListenerKey identifies a listening Unix socket by its name (see
+// UnixName) and its network namespace. Names of paths belong to file
+// systems rather than to namespaces, but a name is mostly bound in the
+// namespace of its server, and the netns tells apart the servers of
+// containers that bind the same path in file systems of their own.
+type unixListenerKey struct {
+	netns uint32
+	path  string
 }
 
 // scanSockets walks TCP and UDP sockets and returns the listeners and the
@@ -152,10 +164,18 @@ func (t *Tracer) scanOwners() error {
 		return err
 	}
 	owners := make(map[sockAddrKey][]owner, len(recs))
+	unixOwners := map[unixListenerKey][]owner{}
 	held := make(map[uint64]bool, len(recs))
 	for i := range recs {
 		r := &recs[i]
 		if r.Type != recOwner {
+			continue
+		}
+		if Proto(r.Proto) == ProtoUnix {
+			k := unixListenerKey{netns: r.Netns, path: UnixName(recPath(r))}
+			if !slices.ContainsFunc(unixOwners[k], func(o owner) bool { return o.pid == r.Pid }) {
+				unixOwners[k] = append(unixOwners[k], owner{pid: r.Pid, comm: commString(r.Comm), cgroupID: r.CgroupId})
+			}
 			continue
 		}
 		if r.Ino != 0 {
@@ -168,6 +188,7 @@ func (t *Tracer) scanOwners() error {
 		owners[k] = append(owners[k], owner{pid: r.Pid, comm: commString(r.Comm), cgroupID: r.CgroupId})
 	}
 	t.owners = owners
+	t.unixOwners = unixOwners
 	t.held = held
 	t.lastOwnScan = time.Now()
 	return nil
@@ -195,6 +216,46 @@ func (t *Tracer) hasNewListener(listeners []Listener, inos []uint64) bool {
 	}
 	for ino := range t.listening {
 		if !current[ino] {
+			return true
+		}
+	}
+	return false
+}
+
+// recPath returns the bytes of the name of a Unix socket of a record.
+func recPath(r *bpfShawkIterRec) []byte {
+	b := make([]byte, min(int(r.PathLen), len(r.Path)))
+	for i := range b {
+		b[i] = byte(r.Path[i])
+	}
+	return b
+}
+
+// unixListeners returns the listening Unix sockets that the last owner scan
+// found, each with its preferred owner: the service rather than systemd for
+// socket activation, the parent among forked workers. They are found by the
+// walks of the processes only, since iter/unix is not available on every
+// kernel: a listener is reported from the scan after it appeared until the
+// scan after it closed.
+func (t *Tracer) unixListeners() []Listener {
+	out := make([]Listener, 0, len(t.unixOwners))
+	for k, owners := range t.unixOwners {
+		if o, ok := preferredOwner(owners); ok {
+			out = append(out, Listener{Proto: ProtoUnix, Path: k.path, NetNS: k.netns, PID: o.pid, Comm: o.comm, CgroupID: o.cgroupID})
+		}
+	}
+	slices.SortFunc(out, func(a, b Listener) int {
+		return cmp.Or(strings.Compare(a.Path, b.Path), cmp.Compare(a.NetNS, b.NetNS))
+	})
+	return out
+}
+
+// hasUnixListener reports whether the last owner scan found a listener of
+// the name path in any network namespace: a client may reach a path
+// through a mount from another namespace than that of its server.
+func (t *Tracer) hasUnixListener(path string) bool {
+	for k := range t.unixOwners {
+		if k.path == path {
 			return true
 		}
 	}

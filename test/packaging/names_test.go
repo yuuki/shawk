@@ -34,6 +34,7 @@ func TestPrometheusNames(t *testing.T) {
 		{"shawk.host.tcp.retransmits", "{segment}", otlptranslator.MetricTypeMonotonicCounter, "shawk_host_tcp_retransmits_total"},
 		{"shawk.agent.up", "", otlptranslator.MetricTypeGauge, "shawk_agent_up"},
 		{"shawk.agent.udp.traced", "", otlptranslator.MetricTypeGauge, "shawk_agent_udp_traced"},
+		{"shawk.agent.unix.traced", "", otlptranslator.MetricTypeGauge, "shawk_agent_unix_traced"},
 		{"shawk.agent.flows.dropped", "{update}", otlptranslator.MetricTypeMonotonicCounter, "shawk_agent_flows_dropped_total"},
 		{"shawk.agent.cgroup_events.dropped", "{event}", otlptranslator.MetricTypeMonotonicCounter, "shawk_agent_cgroup_events_dropped_total"},
 		{"shawk.agent.container_reads.dropped", "{read}", otlptranslator.MetricTypeMonotonicCounter, "shawk_agent_container_reads_dropped_total"},

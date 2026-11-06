@@ -55,8 +55,9 @@ type Config struct {
 	// host then carry the network of the local address of their edges
 	// (shawk.local.network) and that of the peer address
 	// (shawk.peer.network); other addresses are ~unknown if not routed on
-	// the Internet and ~external otherwise. It needs peer_hosts, and the
-	// other outputs do not change.
+	// the Internet and ~external otherwise. Those of Unix sockets, which
+	// have no address, carry no network. It needs peer_hosts, and the other
+	// outputs do not change.
 	Networks map[string]string `mapstructure:"networks"`
 	// Retention is how long rows are kept in PostgreSQL after they were
 	// last seen; zero keeps them forever. The connector deletes older rows

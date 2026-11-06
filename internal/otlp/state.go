@@ -26,8 +26,11 @@ type Process struct {
 
 // EdgeKey identifies an edge series.
 type EdgeKey struct {
-	Role      string // RoleClient or RoleServer
-	Proto     string // "tcp" or "udp"
+	Role  string // RoleClient or RoleServer
+	Proto string // "tcp", "udp" or TransportUnix
+	// Path is the name of the Unix socket a client edge of TransportUnix
+	// connected to, which has no addresses or port; empty for TCP and UDP.
+	Path      string
 	LocalAddr netip.Addr
 	PeerAddr  netip.Addr
 	// PeerFolded tells that the edge bundles the peers outside the internal
@@ -116,6 +119,9 @@ func (s *EdgeStats) add(o *EdgeStats) {
 // ListenerKey identifies a listener series.
 type ListenerKey struct {
 	Proto string
+	// Path is the name of a listening Unix socket (TransportUnix), which
+	// has no address or port; empty for TCP and UDP.
+	Path  string
 	Addr  netip.Addr
 	Port  uint16
 	NetNS uint32

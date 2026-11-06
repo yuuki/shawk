@@ -47,8 +47,11 @@ type procRow struct {
 	span
 }
 
+// edgeRowKey identifies an edge in PostgreSQL: a row of shawk.edges, or of
+// shawk.unix_edges for transportUnix, which has a path and no addresses.
 type edgeRowKey struct {
 	role, proto string
+	path        string // of transportUnix
 	local, peer netip.Addr
 	folded      bool // the peer is the network of peer, as in edgeID
 	port        uint16
@@ -57,11 +60,13 @@ type edgeRowKey struct {
 }
 
 // listenerRowKey identifies a listener and its owner: a listener that
-// changes hands has a row per owner, which keeps its history. kernelChosen
-// tells that the kernel chose the port; the row of the owner keeps when it
-// last did, of the keys that differ only by it.
+// changes hands has a row per owner, which keeps its history. A listener
+// of transportUnix has a path and no address. kernelChosen tells that the
+// kernel chose the port; the row of the owner keeps when it last did, of
+// the keys that differ only by it.
 type listenerRowKey struct {
 	proto        string
+	path         string
 	addr         netip.Addr
 	port         uint16
 	netns        uint64
@@ -73,8 +78,11 @@ type sessionRow struct {
 	lastHeartbeat time.Time
 	// clockSkew is how far the clock of the connector is ahead of the clock
 	// of the agent, from the latest request.
-	clockSkew  time.Duration
-	udpTraced  bool
+	clockSkew time.Duration
+	udpTraced bool
+	// unixTraced tells whether the agent traces Unix sockets, nil if it
+	// does not tell.
+	unixTraced *bool
 	netnsScope string
 	dropped    int64
 	// countersStarted is when the counters of the agent started, by the
@@ -303,7 +311,7 @@ func (c *changes) add(b *hostBatch, now time.Time) {
 		if start.Before(f.start) {
 			start = f.start
 		}
-		s := sessionRow{lastHeartbeat: now, clockSkew: skew, udpTraced: b.udpTraced,
+		s := sessionRow{lastHeartbeat: now, clockSkew: skew, udpTraced: b.udpTraced, unixTraced: b.unixTraced,
 			netnsScope: b.netnsScope, dropped: b.dropped, peerFold: b.peerFold, peerInternal: b.peerInternal}
 		s.countersStarted = b.droppedSince
 		h.addSession(start, s)
@@ -358,7 +366,7 @@ func (c *changes) addEdges(b *hostBatch, h *hostChanges, latest, now time.Time) 
 		}
 		s := observedSpan(e.first, e.last, latest)
 		pk := c.procKey(&e.id.process)
-		k := edgeRowKey{role: e.id.role, proto: e.id.proto, local: e.id.local, peer: e.id.peer, folded: e.id.folded,
+		k := edgeRowKey{role: e.id.role, proto: e.id.proto, path: e.id.path, local: e.id.local, peer: e.id.peer, folded: e.id.folded,
 			port: e.id.port, netns: e.id.netns, procKey: pk}
 		if !accept(edges, k, s, now) {
 			continue
@@ -378,7 +386,7 @@ func (c *changes) addListeners(b *hostBatch, h *hostChanges, latest, now time.Ti
 			continue
 		}
 		s := observedSpan(l.first, l.last, latest)
-		k := listenerRowKey{proto: l.id.proto, addr: l.id.addr, port: l.id.port, netns: l.id.netns,
+		k := listenerRowKey{proto: l.id.proto, path: l.id.path, addr: l.id.addr, port: l.id.port, netns: l.id.netns,
 			kernelChosen: l.id.kernelChosen}
 		if l.id.unit != "" || l.id.comm != "" {
 			k.procKey = c.procKey(&l.id.process)

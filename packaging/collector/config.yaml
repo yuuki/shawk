@@ -87,7 +87,8 @@ connectors:
     # The networks of the local and the peer address of each edge, on the
     # metrics per peer host (shawk_local_network, shawk_peer_network), e.g.
     # to see NFS traffic that goes over the management network; they need
-    # peer_hosts. They name addresses, not paths or interfaces.
+    # peer_hosts. They name addresses, not paths or interfaces; those of
+    # Unix sockets, which have no address, carry none.
     # networks:
     #   mgmt: 10.0.0.0/16
     #   ib: 10.10.0.0/16

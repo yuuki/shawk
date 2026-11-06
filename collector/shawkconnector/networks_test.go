@@ -236,3 +236,20 @@ func TestParseRanges(t *testing.T) {
 		}
 	}
 }
+
+// TestNetworksUnix: the outputs per peer host of a Unix socket, which has
+// no address and uses no network, carry no network.
+func TestNetworksUnix(t *testing.T) {
+	c, _, sink, _ := testConnector(t, func(cfg *Config) {
+		cfg.PeerHosts = true
+		cfg.Networks = clusterNetworks
+	})
+	out := consume(t, c, sink, tAgent{host: "node-01", addrs: []string{"10.0.2.1"}, time: t0.Add(15 * time.Second),
+		listeners: []tListener{{proto: transportUnix, path: "/run/munge/munge.socket.2", svc: "munged", unit: "munge.service", comm: "munged"}},
+		edges: []tEdge{{role: roleClient, proto: transportUnix, path: "/run/munge/munge.socket.2", svc: "slurmd",
+			unit: "slurmd.service", comm: "slurmd", opened: 3}}})
+	got := networksOf(out, metricHostConnOpened, "slurmd", roleClient, "")
+	if want := map[string]float64{"node-01 munged >": 3}; !maps.Equal(got, want) {
+		t.Errorf("outputs per peer host = %v, want %v", got, want)
+	}
+}

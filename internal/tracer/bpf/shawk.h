@@ -117,6 +117,55 @@ struct shawk_flow_stats {
 	__u32 fails[FAIL_REASONS]; /* failed active opens by reason */
 };
 
+/*
+ * The protocol of the records of Unix sockets (struct shawk_iter_rec): not
+ * an IP protocol number but IPPROTO_RAW, which shawk never traces.
+ */
+#define PROTO_UNIX 255
+
+/* The length of sun_path of struct sockaddr_un. */
+#define UNIX_PATH_LEN 108
+
+/*
+ * unix_key identifies a bundled flow of Unix stream or seqpacket sockets:
+ * the connections of a client process to the socket of a name. The name of
+ * the client's own socket, which it rarely has or which the kernel gives it
+ * (autobind), is dropped like an ephemeral port, so the flows grow with the
+ * clients and the services of the host, not with the connections.
+ */
+struct shawk_unix_key {
+	/*
+	 * The name of the socket the client connected to, as its server bound
+	 * it: path_len bytes of sun_path, a path without its NUL, or an abstract
+	 * name from its leading NUL. The rest is zero.
+	 */
+	char path[UNIX_PATH_LEN];
+	__u16 path_len;
+	__u16 _pad0;
+	__u32 netns;              /* network namespace of the client socket */
+	__u32 _pad1;
+	__u64 cgroup_id;          /* cgroup v2 id of the client process */
+	char comm[TASK_COMM_LEN]; /* command name of the client process */
+};
+
+struct shawk_unix_stats {
+	__u32 conns;      /* connections established in the interval */
+	__u32 conn_fails; /* connects that failed in the interval */
+	__u32 fails[FAIL_REASONS];
+	__u32 pid;        /* last observed process id */
+};
+
+/*
+ * An open connection of a Unix flow: the client socket, by its address, is
+ * in the flow of key until it closes. User space counts the connections of
+ * each flow.
+ */
+struct shawk_unix_conn {
+	struct shawk_unix_key key;
+	__u32 pid; /* the process that connected, or that held it when adopted */
+	__u32 _pad;
+};
+
 enum shawk_iter_rec_type {
 	REC_LISTENER = 1, /* a listening/bound socket (from iter/tcp, iter/udp) */
 	REC_OWNER = 2,    /* the owner process of a listening socket (from iter/task_file) */
@@ -145,6 +194,13 @@ struct shawk_iter_rec {
 	 * socket.
 	 */
 	__u64 ino;
+	/*
+	 * The name of a listening Unix socket (proto PROTO_UNIX), as in struct
+	 * shawk_unix_key; such a record has no address or port.
+	 */
+	char path[UNIX_PATH_LEN];
+	__u16 path_len;
+	__u16 _pad2;
 };
 
 #define CGROUP_PATH_LEN 512

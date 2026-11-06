@@ -187,6 +187,92 @@ func TestRequest(t *testing.T) {
 	}
 }
 
+// TestRequestUnix: the edges and listeners of Unix sockets carry the name
+// of the socket in server.address instead of addresses and a port, and
+// their edges the connections only.
+func TestRequestUnix(t *testing.T) {
+	s := NewState(15 * time.Minute)
+	app := Process{Unit: "app.service", Comm: "puma", Exe: "/usr/bin/ruby", Service: "app"}
+	end := t0.Add(15 * time.Second)
+	s.AddEdge(EdgeKey{Role: RoleClient, Proto: TransportUnix, Path: "/run/postgresql/.s.PGSQL.5432", NetNS: 1, Process: app},
+		EdgeStats{Conns: 3, ConnFails: 2, OpenConns: 1, Fails: [len(FailReasons)]uint64{0: 1}}, t0, end)
+	s.AddListener(ListenerKey{Proto: TransportUnix, Path: "@app", NetNS: 1, Process: app}, end)
+	req := s.Request(Resource{Hostname: "app-01"}, AgentStatus{Started: t0, SegmentStart: t0, UnixTraced: true}, end)
+
+	metrics := map[string]*metricspb.Metric{}
+	for _, m := range req.ResourceMetrics[0].ScopeMetrics[0].Metrics {
+		metrics[m.Name] = m
+	}
+	for _, name := range []string{MetricNetworkIO, MetricRetransmits, MetricRTT, MetricHandshake, MetricSynRetransmits, MetricUDPDatagrams} {
+		if metrics[name] != nil {
+			t.Errorf("%s of a Unix socket", name)
+		}
+	}
+	want := map[string]int64{MetricConnOpened: 3, MetricConnFailed: 2, MetricConnCount: 1}
+	for name, v := range want {
+		p := metrics[name].GetSum().GetDataPoints()
+		if len(p) != 1 || p[0].GetAsInt() != v {
+			t.Errorf("%s = %v, want %d", name, p, v)
+			continue
+		}
+		a := attrMap(p[0].Attributes)
+		for k, v := range map[string]any{"shawk.role": "client", "network.transport": "unix",
+			"server.address": "/run/postgresql/.s.PGSQL.5432", "shawk.netns": "1", "service.name": "app"} {
+			if a[k] != v {
+				t.Errorf("%s: attribute %s = %v, want %v", name, k, a[k], v)
+			}
+		}
+		for _, k := range []string{"network.local.address", "network.peer.address", "server.port"} {
+			if _, ok := a[k]; ok {
+				t.Errorf("%s: attribute %s of a Unix socket", name, k)
+			}
+		}
+	}
+	reasons := metrics[MetricConnFailedByReason].GetSum().GetDataPoints()
+	if len(reasons) != 2 {
+		t.Fatalf("failures by reason = %v", reasons)
+	}
+	for _, p := range reasons {
+		switch attrMap(p.Attributes)["error.type"] {
+		case "refused", ErrorOther:
+			if p.GetAsInt() != 1 {
+				t.Errorf("failures by reason = %v", p)
+			}
+		default:
+			t.Errorf("failures by reason = %v", p)
+		}
+	}
+	l := metrics[MetricListenerLast].GetGauge().GetDataPoints()
+	if len(l) != 1 {
+		t.Fatalf("listener.last_seen = %v", l)
+	}
+	a := attrMap(l[0].Attributes)
+	if a["server.address"] != "@app" || a["network.transport"] != "unix" || a["shawk.netns"] != "1" {
+		t.Errorf("listener attributes = %v", a)
+	}
+	if _, ok := a["server.port"]; ok {
+		t.Error("server.port of a Unix listener")
+	}
+	if g := metrics[MetricAgentUnixTraced].GetGauge().GetDataPoints(); len(g) != 1 || g[0].GetAsInt() != 1 {
+		t.Errorf("unix.traced = %v", g)
+	}
+	// The bound of the size of the edge holds.
+	for k, e := range s.edges {
+		size := 0
+		for _, m := range req.ResourceMetrics[0].ScopeMetrics[0].Metrics {
+			if m.Name == MetricListenerFirst || m.Name == MetricListenerLast || strings.HasPrefix(m.Name, "shawk.agent.") {
+				continue
+			}
+			var b []byte
+			b, _ = proto.Marshal(m)
+			size += len(b)
+		}
+		if n := edgeSize(&k, e, edgeAttrs(&k)); n < size {
+			t.Errorf("edgeSize = %d, the points take %d bytes", n, size)
+		}
+	}
+}
+
 // TestRequestRDMA: the data of the RDMA ports is sent by hosts that have
 // them, zero included.
 func TestRequestRDMA(t *testing.T) {

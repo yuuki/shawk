@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 
 	"github.com/yuuki/shawk/internal/tracer"
@@ -81,5 +82,24 @@ func TestFlowColumns(t *testing.T) {
 	s.HandshakeSumUs = 1_000_200
 	if got, want := meanHandshake(&s), "500.1ms"; got != want {
 		t.Errorf("mean handshake = %q, want %q", got, want)
+	}
+}
+
+func TestPrintUnixFlows(t *testing.T) {
+	var out bytes.Buffer
+	printFlows(&out, []tracer.Flow{{
+		FlowKey: tracer.FlowKey{Direction: tracer.DirOut, Proto: tracer.ProtoUnix, Path: "/run/docker.sock",
+			Comm: "docker"},
+		FlowStats: tracer.FlowStats{Conns: 2, ConnFails: 1, OpenConns: 1, PID: 42,
+			Fails: [tracer.NumFailReasons]uint64{tracer.FailRefused: 1}},
+	}})
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("output = %q", out.String())
+	}
+	got := strings.Fields(lines[2])
+	want := []string{"-->", "unix", "-", "/run/docker.sock", "-", "docker", "42", "2", "1", "(refused:1)", "-", "-", "1", "-", "-"}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Errorf("row = %q, want %q", got, want)
 	}
 }

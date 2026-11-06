@@ -1,5 +1,6 @@
 // Package tracer discovers network service dependencies by bundling TCP/UDP
-// flows in the Linux kernel with eBPF.
+// flows and the connections of Unix stream sockets in the Linux kernel
+// with eBPF.
 package tracer
 
 import (
@@ -33,6 +34,16 @@ const (
 // they are preallocated, and hosts rarely listen on many ports.
 var minListenPorts, maxListenPorts uint32 = 8192, 65536
 
+// The tables of the flows of Unix sockets hold a quarter of MaxFlows, and
+// that of their open connections half of it, at least minUnixFlows each:
+// they are preallocated, their keys are twice as large, and their flows
+// grow with the clients and the services of the host, not with its peers.
+const minUnixFlows = 1024
+
+func unixFlowCapacity(maxFlows uint32) uint32 { return max(maxFlows/4, minUnixFlows) }
+
+func unixConnCapacity(maxFlows uint32) uint32 { return max(maxFlows/2, minUnixFlows) }
+
 // Options configures a Tracer.
 type Options struct {
 	// NetNS restricts tracing to the network namespace with this inode
@@ -40,7 +51,9 @@ type Options struct {
 	NetNS uint32
 	// MaxFlows is the capacity of the in-kernel flow table per interval. It
 	// also sizes the tables of listening TCP and UDP ports and of the owners
-	// of MPTCP connections, between 8192 and 65536.
+	// of MPTCP connections, between 8192 and 65536, and those of the flows
+	// of Unix sockets, a quarter of it, and of their open connections, half
+	// of it, at least 1024 each.
 	MaxFlows uint32
 	// OwnerScanInterval is how often the owners of listening sockets are
 	// resolved by walking the file descriptors of all processes.
@@ -79,8 +92,12 @@ type Tracer struct {
 	progs map[string]*ebpf.Program
 	links []link.Link
 	udp   bool
+	unix  bool
 
 	flowMaps       [2]*ebpf.Map
+	unixFlowMaps   [2]*ebpf.Map
+	unixConns      *ebpf.Map
+	unixTraced     *ebpf.Variable
 	flowsOuter     *ebpf.Map
 	listenPorts    *ebpf.Map
 	udpListenPorts *ebpf.Map
@@ -123,6 +140,13 @@ type Tracer struct {
 	mu     sync.Mutex
 	idx    uint32
 	owners map[sockAddrKey][]owner
+	// unixOwners are the holders of the listening Unix sockets at the last
+	// owner scan, by namespace and name. unixMissing are the names that
+	// Unix flows connected to and that the last periodic scan, or one they
+	// requested since, found no listener of: they request no other scan
+	// until the next periodic one.
+	unixOwners  map[unixListenerKey][]owner
+	unixMissing map[string]bool
 	// held are the inodes of the sockets held by the processes at the last
 	// owner scan.
 	held map[uint64]bool
@@ -165,14 +189,25 @@ type Tracer struct {
 	xlatConnsMap   *ebpf.Map
 }
 
-// udpPrograms hook kernel functions with BPF trampolines (fentry). They are
-// loaded separately so that TCP tracing keeps working on kernels that do not
-// support trampolines (e.g. arm64 before Linux 6.0).
-var udpPrograms = []struct{ prog, target string }{
-	{bpfProgShawkIpSendSkb, "ip_send_skb"},
-	{bpfProgShawkIp6SendSkb, "ip6_send_skb"},
-	{bpfProgShawkSkbConsumeUdp, "skb_consume_udp"},
-}
+// tracingProgram is a program that hooks a kernel function with a BPF
+// trampoline (fentry, fexit).
+type tracingProgram struct{ prog, target string }
+
+// udpPrograms and unixPrograms hook kernel functions with BPF trampolines.
+// Each set is loaded separately so that TCP tracing, and the other set,
+// keep working on kernels that do not support trampolines (e.g. arm64
+// before Linux 6.0) or lack a target.
+var (
+	udpPrograms = []tracingProgram{
+		{bpfProgShawkIpSendSkb, "ip_send_skb"},
+		{bpfProgShawkIp6SendSkb, "ip6_send_skb"},
+		{bpfProgShawkSkbConsumeUdp, "skb_consume_udp"},
+	}
+	unixPrograms = []tracingProgram{
+		{bpfProgShawkUnixStreamConnect, "unix_stream_connect"},
+		{bpfProgShawkUnixRelease, "unix_release"},
+	}
+)
 
 // New loads and attaches the BPF programs. It requires CAP_BPF and
 // CAP_PERFMON (or root) and a kernel with BTF.
@@ -201,9 +236,11 @@ func New(opts Options) (*Tracer, error) {
 		return nil, err
 	}
 	t := &Tracer{
-		opts:   opts,
-		log:    opts.Logger,
-		owners: map[sockAddrKey][]owner{},
+		opts:        opts,
+		log:         opts.Logger,
+		owners:      map[sockAddrKey][]owner{},
+		unixOwners:  map[unixListenerKey][]owner{},
+		unixMissing: map[string]bool{},
 	}
 	var st unix.Stat_t
 	if err := unix.Stat("/proc/self/ns/net", &st); err != nil {
@@ -218,19 +255,22 @@ func New(opts Options) (*Tracer, error) {
 		t.Close()
 		return nil, err
 	}
-	if err := t.loadUDP(spec); err != nil {
-		t.log.Warn("UDP tracing is disabled", "error", err)
+	// The walk of the processes below adopts the connections of Unix
+	// sockets once their close is traced.
+	if err := t.loadTracing(spec, unixPrograms); err != nil {
+		t.log.Warn("Unix socket tracing is disabled", "error", err)
+	} else if err := t.unixTraced.Set(uint32(1)); err != nil {
+		t.Close()
+		return nil, err
 	} else {
-		t.udp = true
-	}
-	if opts.LearnTranslations {
-		t.conntrackSpec = spec
-		t.tryConntrack(time.Now())
+		t.unix = true
 	}
 
 	// Adopt connections and listeners that existed before the tracer
 	// started, then resolve their owners. The first walk also tells the
-	// programs which process the tracer is, and marks the UDP server sockets.
+	// programs which process the tracer is, and marks the UDP server
+	// sockets: before the UDP programs attach, so that a server whose first
+	// datagram they see is a reply is not taken for a client.
 	if err := t.initialScan.Set(uint32(1)); err != nil {
 		t.Close()
 		return nil, err
@@ -247,6 +287,15 @@ func New(opts Options) (*Tracer, error) {
 	if err := t.selfTgid.Get(&t.self); err != nil {
 		t.Close()
 		return nil, err
+	}
+	if err := t.loadTracing(spec, udpPrograms); err != nil {
+		t.log.Warn("UDP tracing is disabled", "error", err)
+	} else {
+		t.udp = true
+	}
+	if opts.LearnTranslations {
+		t.conntrackSpec = spec
+		t.tryConntrack(time.Now())
 	}
 	if err := t.refreshOwners(listeners, inos); err != nil {
 		t.Close()
@@ -278,6 +327,11 @@ func (t *Tracer) configure(spec *ebpf.CollectionSpec) error {
 		spec.Maps[name].MaxEntries = min(max(t.opts.MaxFlows, minListenPorts), maxListenPorts)
 	}
 	spec.Maps[bpfMapFlows].InnerMap.MaxEntries = t.opts.MaxFlows
+	for _, name := range []string{bpfMapUnixFlows0, bpfMapUnixFlows1} {
+		spec.Maps[name].MaxEntries = unixFlowCapacity(t.opts.MaxFlows)
+	}
+	spec.Maps[bpfMapUnixConns].MaxEntries = unixConnCapacity(t.opts.MaxFlows)
+	spec.Maps[bpfMapUnixFlows].InnerMap.MaxEntries = unixFlowCapacity(t.opts.MaxFlows)
 	spec.Maps[bpfMapXlats].MaxEntries = t.opts.MaxFlows
 	spec.Maps[bpfMapXlatConns].MaxEntries = xlatConnsPerFlow * t.opts.MaxFlows
 	return nil
@@ -305,7 +359,7 @@ func ephemeralPortRange() (uint16, uint16) {
 // loadCore loads the maps, the TCP programs and the iterators.
 func (t *Tracer) loadCore(spec *ebpf.CollectionSpec) error {
 	core := spec.Copy()
-	for _, p := range udpPrograms {
+	for _, p := range slices.Concat(udpPrograms, unixPrograms) {
 		delete(core.Programs, p.prog)
 	}
 	withoutConntrack(core)
@@ -316,6 +370,9 @@ func (t *Tracer) loadCore(spec *ebpf.CollectionSpec) error {
 	t.colls = append(t.colls, coll)
 	t.progs = maps.Clone(coll.Programs)
 	t.flowMaps = [2]*ebpf.Map{coll.Maps[bpfMapFlows0], coll.Maps[bpfMapFlows1]}
+	t.unixFlowMaps = [2]*ebpf.Map{coll.Maps[bpfMapUnixFlows0], coll.Maps[bpfMapUnixFlows1]}
+	t.unixConns = coll.Maps[bpfMapUnixConns]
+	t.unixTraced = coll.Variables[bpfVarUnixTraced]
 	t.flowsOuter = coll.Maps[bpfMapFlows]
 	t.listenPorts = coll.Maps[bpfMapListenPorts]
 	t.udpListenPorts = coll.Maps[bpfMapUdpListenPorts]
@@ -407,25 +464,26 @@ func (t *Tracer) watchCgroups(coll *ebpf.Collection) error {
 	return nil
 }
 
-// loadUDP loads the UDP programs sharing the maps of the core collection.
-func (t *Tracer) loadUDP(spec *ebpf.CollectionSpec) error {
-	udp := spec.Copy()
-	withoutConntrack(udp)
+// loadTracing loads and attaches a set of programs with BPF trampolines,
+// sharing the maps of the core collection: all of them, or none.
+func (t *Tracer) loadTracing(spec *ebpf.CollectionSpec, progs []tracingProgram) error {
+	sub := spec.Copy()
+	withoutConntrack(sub)
 	want := map[string]bool{}
-	for _, p := range udpPrograms {
+	for _, p := range progs {
 		want[p.prog] = true
 	}
-	for name := range udp.Programs {
+	for name := range sub.Programs {
 		if !want[name] {
-			delete(udp.Programs, name)
+			delete(sub.Programs, name)
 		}
 	}
-	coll, err := ebpf.NewCollectionWithOptions(udp, ebpf.CollectionOptions{MapReplacements: t.colls[0].Maps})
+	coll, err := ebpf.NewCollectionWithOptions(sub, ebpf.CollectionOptions{MapReplacements: t.colls[0].Maps})
 	if err != nil {
-		return fmt.Errorf("loading UDP programs: %w", verifierError(err))
+		return fmt.Errorf("loading programs: %w", verifierError(err))
 	}
 	var links []link.Link
-	for _, p := range udpPrograms {
+	for _, p := range progs {
 		l, err := link.AttachTracing(link.TracingOptions{Program: coll.Programs[p.prog]})
 		if err != nil {
 			for _, l := range links {
@@ -459,6 +517,10 @@ func (t *Tracer) SelfPID() uint32 { return t.self }
 
 // UDPEnabled reports whether UDP datagrams are traced.
 func (t *Tracer) UDPEnabled() bool { return t.udp }
+
+// UnixEnabled reports whether the connections of Unix stream sockets are
+// traced.
+func (t *Tracer) UnixEnabled() bool { return t.unix }
 
 // Close detaches and unloads the BPF programs.
 func (t *Tracer) Close() error {

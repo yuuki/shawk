@@ -33,6 +33,18 @@ type clientKey struct {
 	proto          string
 }
 
+// unixKey is a name of a listening Unix socket on a host.
+type unixKey struct {
+	host, path string
+}
+
+// unixEndpoint is a service listening on a Unix socket, in the network
+// namespace of the socket.
+type unixEndpoint struct {
+	netns   uint64
+	service string
+}
+
 // endpoint is a service seen on an endpoint, or a client service seen on
 // the client side of connections.
 type endpoint struct {
@@ -151,6 +163,12 @@ type resolver struct {
 	dbClients   map[clientKey][]endpoint
 	dbAddrs     map[netip.Addr]map[string]time.Time // address -> host -> last seen
 	dbAgents    map[string]agentHost
+	// dbUnix are the services listening on Unix sockets, from
+	// shawk_v1.unix_endpoints, with when they were last seen, by the clock
+	// of the agents as of loaded; localUnix those this connector saw, with
+	// when it saw them.
+	dbUnix    map[unixKey]map[unixEndpoint]time.Time
+	localUnix map[unixKey]map[unixEndpoint]time.Time
 	// Seen by this connector, with the time they were last seen.
 	localEndpoints map[endpointKey]map[endpoint]time.Time
 	localClients   map[clientKey]map[endpoint]time.Time
@@ -248,6 +266,8 @@ func newResolver(cidrs []namedPrefix, translations []translation) *resolver {
 		localClients:   map[clientKey]map[endpoint]time.Time{},
 		localAddrs:     map[netip.Addr]map[string]time.Time{},
 		localAgents:    map[string]agentHost{},
+		dbUnix:         map[unixKey]map[unixEndpoint]time.Time{},
+		localUnix:      map[unixKey]map[unixEndpoint]time.Time{},
 
 		dbLearned:           map[learnedClientKey]map[learnedBackend]time.Time{},
 		dbLearnedServers:    map[learnedServerKey]map[learnedClient]time.Time{},
@@ -282,11 +302,20 @@ type agentAddrRow struct {
 	agent agentHost
 }
 
+// unixEndpointRow is a row of shawk_v1.unix_endpoints: a service listening
+// on a Unix socket of a host, last seen at lastSeen.
+type unixEndpointRow struct {
+	key unixKey
+	unixEndpoint
+	lastSeen time.Time
+}
+
 // peerRows are the rows the resolver loads from PostgreSQL.
 type peerRows struct {
 	endpoints []endpointRow
 	clients   []clientRow
 	agents    []agentAddrRow
+	unix      []unixEndpointRow
 	learned   []learnedRow
 	// former are read with peer_hosts only.
 	former []formerHolderRow
@@ -321,6 +350,10 @@ func (r *resolver) load(rows peerRows, now time.Time) {
 			agents[a.host] = a.agent
 		}
 	}
+	unix := make(map[unixKey]map[unixEndpoint]time.Time, len(rows.unix))
+	for _, u := range rows.unix {
+		learnTimed(unix, u.key, u.unixEndpoint, u.lastSeen)
+	}
 	learned, learnedServers := loadLearned(rows.learned)
 	former := make(map[netip.Addr]formerHolder, len(rows.former))
 	names := map[string]string{}
@@ -331,6 +364,7 @@ func (r *resolver) load(rows peerRows, now time.Time) {
 	r.mu.Lock()
 	r.loaded = now
 	r.dbEndpoints, r.dbClients, r.dbAddrs, r.dbAgents = eps, cls, addrs, agents
+	r.dbUnix = unix
 	r.dbFormer, r.dbNames = former, names
 	r.dbLearned, r.dbLearnedServers = learned, learnedServers
 	r.clearRanges()
@@ -392,6 +426,20 @@ func (r *resolver) learnListeners(b *hostBatch, now time.Time) {
 	budget := r.maxInferred
 	for _, l := range b.listeners {
 		svc := l.id.peerName()
+		if l.id.proto == transportUnix {
+			// As learnInto: a socket without a known owner names no service.
+			// The agent sends a listener for its idle TTL after it was last
+			// seen, which tells a socket that is gone from one replaced, as
+			// for translations.
+			if svc != "" && svc != unknownService {
+				at := now
+				if !l.last.IsZero() && !b.time.IsZero() && l.last.Before(b.time) {
+					at = now.Add(l.last.Sub(b.time))
+				}
+				learnTimed(r.localUnix, unixKey{b.key, l.id.path}, unixEndpoint{l.id.netns, svc}, at)
+			}
+			continue
+		}
 		if !l.id.addr.IsUnspecified() {
 			learnInto(r.localEndpoints, endpointKey{l.id.addr, l.id.port, l.id.proto},
 				endpoint{host: b.key, service: svc, exact: true}, now)
@@ -427,6 +475,11 @@ func (r *resolver) inferListener(b *hostBatch, id *listenerID, svc string, budge
 // sides of its client edges whose peers are not folded. r.mu is held.
 func (r *resolver) learnEdges(b *hostBatch, now time.Time) {
 	for _, e := range b.edges {
+		if e.id.proto == transportUnix {
+			// The client of a Unix socket names no peer: its server is on the
+			// same host, the owner of the listener of the name.
+			continue
+		}
 		switch e.id.role {
 		case roleServer:
 			learnInto(r.localEndpoints, endpointKey{e.id.local, e.id.port, e.id.proto},
@@ -564,6 +617,7 @@ func (r *resolver) expire(t, now time.Time) {
 	expireLearned(r.localLearned, t)
 	expireLearned(r.localLearnedServers, t)
 	expireLearned(r.localServed, t)
+	expireLearned(r.localUnix, t)
 	expireLearned(r.localAddrs, now.Add(-aliveWindow))
 	expireLearned(r.localHeld, now.Add(-formerHolderWindow))
 	r.forgetNames()
@@ -599,6 +653,9 @@ func (r *resolver) expire(t, now time.Time) {
 // virtual address has the address of the client. Behind a translation with
 // sources, the server sees the relay, which is named after its address.
 func (r *resolver) peer(host string, id *edgeID, now time.Time) peer {
+	if id.proto == transportUnix {
+		return r.unixPeer(host, id, now)
+	}
 	if id.folded {
 		p := peer{name: r.classifyFolded(id.peer)}
 		if r.peerHosts {
@@ -636,6 +693,68 @@ func (r *resolver) peer(host string, id *edgeID, now time.Time) peer {
 		} else {
 			p.host, p.self = r.addrHost(host, id.peer, now)
 		}
+	}
+	return p
+}
+
+// unixPeer names the peer of the client edge of a Unix socket of host: the
+// service listening on its name on the same host, in the network
+// namespace of the edge if one does, else, for a path, in the only
+// namespace where services listen on it (a socket reached from another
+// namespace through a mount, such as /run/docker.sock in a container),
+// else ~unresolved. An abstract name is reached in its namespace only. Only
+// the listeners seen within backendWindow of the most recently seen one
+// count, so that a socket replaced in another namespace leaves the former
+// one; among the services chosen, the most recently seen, then the first
+// by name. The agent of the host records the server side, and the peer is
+// the host itself.
+func (r *resolver) unixPeer(host string, id *edgeID, now time.Time) peer {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	k := unixKey{host, id.path}
+	seen := map[unixEndpoint]time.Time{}
+	var newest time.Time
+	add := func(e unixEndpoint, t time.Time) {
+		if t.After(seen[e]) {
+			seen[e] = t
+		}
+		if t.After(newest) {
+			newest = t
+		}
+	}
+	for e, t := range r.localUnix[k] {
+		add(e, t)
+	}
+	age := r.dbAge(now)
+	for e, t := range r.dbUnix[k] {
+		add(e, t.Add(age))
+	}
+	netns := map[uint64]bool{}
+	for e, t := range seen {
+		if t.Before(newest.Add(-backendWindow)) {
+			delete(seen, e)
+			continue
+		}
+		netns[e.netns] = true
+	}
+	var best unixEndpoint
+	var bestSeen time.Time
+	// An abstract name (@) is reached in the namespace of its client only.
+	abstract := strings.HasPrefix(id.path, "@")
+	for e, t := range seen {
+		if e.netns != id.netns && (abstract || netns[id.netns] || len(netns) > 1) {
+			continue
+		}
+		if best.service == "" || t.After(bestSeen) || t.Equal(bestSeen) && e.service < best.service {
+			best, bestSeen = e, t
+		}
+	}
+	p := peer{name: best.service, agent: true}
+	if p.name == "" {
+		p.name = peerUnresolved
+	}
+	if r.peerHosts {
+		p.self = true
 	}
 	return p
 }

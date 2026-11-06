@@ -415,7 +415,7 @@ not observed.
 
 - **Fixed ports.** slurmctld (6817), slurmd (6818), slurmdbd (6819) and the
   database behind it are recorded as they are. munge uses a Unix socket,
-  out of scope.
+  which shawk traces since #210 (`docs/design.md` §3.8).
 - **PostgreSQL** already has both hosts and the period of each dependency.
 - **Existing outputs.** The outputs to Prometheus and the recording rules
   (`src`, `dst`, `server_port`, `network_transport`) do not change.
