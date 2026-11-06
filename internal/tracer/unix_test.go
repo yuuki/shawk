@@ -374,12 +374,32 @@ func TestUnixOpenUnderChurn(t *testing.T) {
 	paths := make([]string, names)
 	for i := range paths {
 		paths[i] = filepath.Join(dir, fmt.Sprintf("%d.sock", i))
-		echoServer(t, "unix", paths[i])
+		if i > 0 {
+			echoServer(t, "unix", paths[i])
+		}
 	}
-	// Short connections to the first name all along.
+	// Short connections to the first name all along, which its server closes
+	// as it accepts them, and at most a few at a time: the files of
+	// connections that an echo server closes once it reads their end would
+	// pile up faster than a slow VM closes them, up to the limit of open
+	// files of the process.
+	ln, err := net.Listen("unix", paths[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
 	stop := make(chan struct{})
 	var churn sync.WaitGroup
-	for range 4 {
+	for range 2 {
 		churn.Add(1)
 		go func() {
 			defer churn.Done()
@@ -392,6 +412,7 @@ func TestUnixOpenUnderChurn(t *testing.T) {
 				if c, err := net.Dial("unix", paths[0]); err == nil {
 					c.Close()
 				}
+				time.Sleep(100 * time.Microsecond)
 			}
 		}()
 	}
