@@ -59,8 +59,9 @@ LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 # bpf is not in @system-service, nor perf_event_open, which attaches the
-# kprobes that learn translations from conntrack. Other calls fail with
-# EPERM rather than killing the agent.
+# kprobes that learn translations from conntrack and record the ICMP errors
+# of failed connects. Other calls fail with EPERM rather than killing the
+# agent.
 SystemCallFilter=@system-service bpf perf_event_open setns
 SystemCallErrorNumber=EPERM
 UMask=0077

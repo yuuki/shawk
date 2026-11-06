@@ -975,8 +975,44 @@ static __always_inline bool connect_deferred(struct sock *sk)
 }
 
 /*
+ * The error that ends an active open, recorded where the kernel produces it
+ * by connect_err_record(), keyed by the socket: kprobes have no socket local
+ * storage. It is taken when the socket leaves SYN_SENT (#166).
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 8192);
+	__type(key, __u64);
+	__type(value, __s32);
+} connect_errs SEC(".maps");
+
+/*
+ * Takes the error recorded for a socket that leaves SYN_SENT, or 0: at
+ * SYN_SENT -> CLOSE it is the reason of the failure, and a connect that
+ * goes on leaves none behind for another socket at the same address.
+ */
+static __always_inline int take_connect_err(struct sock *sk)
+{
+	__u64 key = (__u64)sk;
+	__s32 *e;
+	int err;
+
+	e = bpf_map_lookup_elem(&connect_errs, &key);
+	if (!e)
+		return 0;
+	err = *e;
+	bpf_map_delete_elem(&connect_errs, &key);
+	return err;
+}
+
+/*
  * Returns why an active open failed (SYN_SENT -> CLOSE), or -1 for _OTHER.
  *
+ * - An error recorded where the kernel produced it (connect_err_record()):
+ *   a reset (ECONNREFUSED), or an ICMP error that ended the connect. A task
+ *   that reads SO_ERROR takes sk_err without the socket lock (sock_error())
+ *   as soon as it is set, before the state changes, on every kernel; the
+ *   failure would otherwise count as a timeout (#166).
  * - No segment sent: the connect was deferred by TCP_FASTOPEN_CONNECT and
  *   the socket closed before its first write, or tcp_connect() did not get
  *   as far as building a SYN, e.g. without a free local port (EADDRNOTAVAIL
@@ -1004,7 +1040,8 @@ static __always_inline bool connect_deferred(struct sock *sk)
  * - No error, on a socket that a process holds: the application closed it
  *   or disconnected it first, usually after its own connect timeout.
  */
-static __always_inline int fail_reason(struct sock *sk, struct tcp_sock *tp)
+static __always_inline int fail_reason(struct sock *sk, struct tcp_sock *tp,
+					int recorded)
 {
 	bool join;
 	__u64 msk;
@@ -1015,6 +1052,8 @@ static __always_inline int fail_reason(struct sock *sk, struct tcp_sock *tp)
 			return FAIL_ABORTED;
 		return FAIL_LOCAL;
 	}
+	if (recorded)
+		return errno_reason(recorded);
 	err = BPF_CORE_READ(sk, sk_err);
 	if (err)
 		return errno_reason(err);
@@ -1033,10 +1072,11 @@ static __always_inline int fail_reason(struct sock *sk, struct tcp_sock *tp)
 
 /*
  * Counts the reason of a failed active open and the SYNs it retransmitted,
- * which total_retrans holds alone in SYN_SENT.
+ * which total_retrans holds alone in SYN_SENT. recorded is the error taken
+ * from connect_errs, or 0.
  */
 static __always_inline void count_failure(struct shawk_flow_stats *fs,
-					  struct sock *sk)
+					  struct sock *sk, int recorded)
 {
 	struct tcp_sock *tp = bpf_skc_to_tcp_sock(sk);
 	__u32 retrans;
@@ -1047,7 +1087,7 @@ static __always_inline void count_failure(struct shawk_flow_stats *fs,
 	retrans = BPF_CORE_READ(tp, total_retrans);
 	if (retrans)
 		__sync_fetch_and_add(&fs->syn_retrans, retrans);
-	r = fail_reason(sk, tp);
+	r = fail_reason(sk, tp, recorded);
 	if (r >= 0 && r < FAIL_REASONS)
 		__sync_fetch_and_add(&fs->fails[r], 1);
 }
@@ -1207,6 +1247,7 @@ int BPF_PROG(shawk_inet_sock_set_state, const struct sock *csk, int oldstate,
 	struct shawk_sock_state *ss;
 	struct shawk_flow_stats *fs;
 	struct tcp_sock *tp;
+	int recorded = 0;
 	__u16 proto;
 	bool join;
 	__u64 msk;
@@ -1226,6 +1267,8 @@ int BPF_PROG(shawk_inet_sock_set_state, const struct sock *csk, int oldstate,
 		on_active_open(sk);
 		return 0;
 	}
+	if (oldstate == TCP_SYN_SENT)
+		recorded = take_connect_err(sk);
 
 	ss = bpf_sk_storage_get(&sock_states, sk, NULL, 0);
 	/*
@@ -1271,7 +1314,7 @@ int BPF_PROG(shawk_inet_sock_set_state, const struct sock *csk, int oldstate,
 			if (fs) {
 				__sync_fetch_and_add(&fs->conn_fails, 1);
 				if (oldstate == TCP_SYN_SENT)
-					count_failure(fs, sk);
+					count_failure(fs, sk, recorded);
 				fs->pid = ss->pid;
 			}
 		}
@@ -2434,12 +2477,13 @@ const struct shawk_xlat_stats *unused_xlat_stats __attribute__((unused));
 const struct shawk_xlat_conn *unused_xlat_conn __attribute__((unused));
 
 /*
- * The registers of the first argument of a kprobe, by architecture. The
+ * The registers of the arguments of a kprobe, by architecture. The
  * object is shared by x86_64 and arm64, so the registers are found by CO-RE
  * in the BTF of the running kernel.
  */
 struct pt_regs___x86 {
 	unsigned long di;
+	unsigned long dx;
 } __attribute__((preserve_access_index));
 
 struct pt_regs___arm64 {
@@ -2459,6 +2503,17 @@ static __always_inline __u64 kprobe_arg1(struct pt_regs *ctx)
 	if (bpf_core_field_exists(x86->di))
 		return BPF_CORE_READ(x86, di);
 	return BPF_CORE_READ(arm64, regs[0]);
+}
+
+/* The third argument of a kprobe, as kprobe_arg1(). */
+static __always_inline __u64 kprobe_arg3(struct pt_regs *ctx)
+{
+	struct pt_regs___x86 *x86 = (void *)ctx;
+	struct pt_regs___arm64 *arm64 = (void *)ctx;
+
+	if (bpf_core_field_exists(x86->dx))
+		return BPF_CORE_READ(x86, dx);
+	return BPF_CORE_READ(arm64, regs[2]);
 }
 
 /* Reads an address of a tuple of conntrack as an IPv6 address. */
@@ -2638,4 +2693,72 @@ int shawk_ct_destroy(struct pt_regs *ctx)
 	xlat_release(c);
 	bpf_map_delete_elem(&xlat_conns, &ct);
 	return 0;
+}
+
+/* ------------------------------------------ errors of active opens --- */
+
+/*
+ * Records the error that ends an active open before the kernel stores it in
+ * sk_err, where a task that reads SO_ERROR may take it before the state
+ * change, which then sees none and counts a timeout (#166, fail_reason()).
+ * Only an error that ends the connect is recorded: an ICMP error that
+ * arrives while a task holds the socket is a soft error (sk_err_soft),
+ * which no task takes, and the connect goes on.
+ */
+static __always_inline void connect_err_record(struct sock *sk, int err)
+{
+	__u64 key = (__u64)sk;
+	__s32 e = err;
+
+	if (err <= 0 || BPF_CORE_READ(sk, sk_protocol) != IPPROTO_TCP ||
+	    BPF_CORE_READ(sk, sk_type) != SOCK_STREAM ||
+	    BPF_CORE_READ(sk, __sk_common.skc_state) != TCP_SYN_SENT)
+		return;
+	if (!netns_ok(sock_netns(sk)))
+		return;
+	bpf_map_update_elem(&connect_errs, &key, &e, BPF_ANY);
+}
+
+/* tcp_reset() fires it first, before it sets sk_err: ECONNREFUSED in SYN_SENT. */
+SEC("tp_btf/tcp_receive_reset")
+int BPF_PROG(shawk_tcp_receive_reset, struct sock *sk)
+{
+	connect_err_record(sk, ECONNREFUSED);
+	return 0;
+}
+
+/*
+ * tcp_v4_err() and tcp_v6_err() call ip_icmp_error() and ipv6_icmp_error()
+ * in SYN_SENT with the error, before they end the connect and set sk_err if
+ * no task holds the socket, or set sk_err_soft. The functions also queue
+ * the ICMP errors of UDP and raw sockets with IP_RECVERR, which
+ * connect_err_record() leaves out. Kprobes need no BPF trampolines, so they
+ * work on arm64 before Linux 6.0 too.
+ */
+static __always_inline int icmp_error(struct pt_regs *ctx)
+{
+	struct sock *sk = (struct sock *)kprobe_arg1(ctx);
+
+	if (!sk || BPF_CORE_READ(sk, sk_lock.owned))
+		return 0;
+	connect_err_record(sk, (int)kprobe_arg3(ctx));
+	return 0;
+}
+
+/*
+ * KPROBE(shawk_ip_icmp_error, struct sock *sk, struct sk_buff *skb, int err, __be16 port, u32 info, unsigned char *payload)
+ */
+SEC("kprobe/ip_icmp_error")
+int shawk_ip_icmp_error(struct pt_regs *ctx)
+{
+	return icmp_error(ctx);
+}
+
+/*
+ * KPROBE(shawk_ipv6_icmp_error, struct sock *sk, struct sk_buff *skb, int err, __be16 port, __u32 info, unsigned char *payload)
+ */
+SEC("kprobe/ipv6_icmp_error")
+int shawk_ipv6_icmp_error(struct pt_regs *ctx)
+{
+	return icmp_error(ctx);
 }

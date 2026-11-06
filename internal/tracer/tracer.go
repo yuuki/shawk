@@ -187,6 +187,9 @@ type Tracer struct {
 	// xlatConnsMap the entries counted live; for tests.
 	conntrackLinks []link.Link
 	xlatConnsMap   *ebpf.Map
+
+	// connectErrHooks are the targets of connectErrorPrograms attached.
+	connectErrHooks []string
 }
 
 // tracingProgram is a program that hooks a kernel function with a BPF
@@ -254,6 +257,12 @@ func New(opts Options) (*Tracer, error) {
 	if err := t.loadCore(spec); err != nil {
 		t.Close()
 		return nil, err
+	}
+	attached, err := t.loadConnectErrors(spec)
+	t.connectErrHooks = attached
+	if err != nil {
+		t.log.Warn("the reasons of some failed connects are read when the socket closes, and an application that reads the error first makes them count as timeouts",
+			"error", err)
 	}
 	// The walk of the processes below adopts the connections of Unix
 	// sockets once their close is traced.
@@ -363,6 +372,7 @@ func (t *Tracer) loadCore(spec *ebpf.CollectionSpec) error {
 		delete(core.Programs, p.prog)
 	}
 	withoutConntrack(core)
+	withoutConnectErrors(core)
 	coll, err := ebpf.NewCollection(core)
 	if err != nil {
 		return fmt.Errorf("loading BPF objects: %w", verifierError(err))
