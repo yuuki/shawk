@@ -285,14 +285,113 @@ func TestUnitsVerify(t *testing.T) {
 	}
 	units, _ := filepath.Glob(filepath.Join(root, "packaging/systemd/*.service"))
 	for _, u := range units {
-		out, _ := exec.Command(analyze, "verify", u).CombinedOutput()
-		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-			// The binaries are not installed here.
-			if line == "" || strings.Contains(line, "is not executable") {
-				continue
-			}
+		abs, err := filepath.Abs(u)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, _ := exec.Command(analyze, "verify", abs).CombinedOutput()
+		for _, line := range unitProblems(string(out), abs) {
 			t.Errorf("%s: %s", filepath.Base(u), line)
 		}
+	}
+}
+
+// The lines of systemd-analyze verify that name what they concern: a file
+// and a line of it, or a unit.
+var (
+	verifyFileLine = regexp.MustCompile(`^(/[^:]+):\d+: `)
+	verifyUnitLine = regexp.MustCompile(`^([^\s/:]+\.(?:service|socket|device|mount|automount|swap|target|path|timer|slice|scope)): `)
+)
+
+// unitProblems returns the lines of the output of systemd-analyze verify of
+// the unit file that concern it. systemd-analyze also loads the units of the
+// host that the unit pulls in, and the drop-ins of the host for its name, and
+// reports their problems, e.g. a PIDFile= under /var/run/ of munge.service on
+// Rocky Linux 9 (#196): such a line starts with the path of another file or
+// the name of another unit, and is left out. Lines that name neither are
+// kept. "is not executable" is left out, since the binaries are not
+// installed here.
+func unitProblems(out, file string) []string {
+	self, _ := os.Stat(file)
+	var lines []string
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if line == "" || strings.Contains(line, "is not executable") {
+			continue
+		}
+		if m := verifyFileLine.FindStringSubmatch(line); m != nil {
+			if fi, err := os.Stat(m[1]); err != nil || self == nil || !os.SameFile(fi, self) {
+				continue
+			}
+		} else if m := verifyUnitLine.FindStringSubmatch(line); m != nil && m[1] != filepath.Base(file) {
+			continue
+		}
+		lines = append(lines, line)
+	}
+	return lines
+}
+
+// TestUnitProblems checks that the problems of the units of the host, which
+// systemd-analyze reports with those of the unit verified, are left out,
+// and that those of the unit are kept, with systemd-analyze when the host
+// has it.
+func TestUnitProblems(t *testing.T) {
+	dir := t.TempDir()
+	unit := filepath.Join(dir, "shawk-agent.service")
+	b, err := os.ReadFile(filepath.Join(root, "packaging/systemd/shawk-agent.service"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	typo := strings.Replace(string(b), "\nProtectSystem=", "\nProtectSytem=", 1)
+	if typo == string(b) {
+		t.Fatal("no ProtectSystem= in shawk-agent.service")
+	}
+	if err := os.WriteFile(unit, []byte(typo), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := unit + ":40: Unknown key name 'ProtectSytem' in section 'Service', ignoring.\n" +
+		"/usr/lib/systemd/system/munge.service:10: PIDFile= references a path below legacy directory /var/run/, updating /var/run/munge/munged.pid → /run/munge/munged.pid; please update the unit file accordingly.\n" +
+		"/etc/systemd/system/shawk-agent.service.d/override.conf:2: Unknown key name 'Foo' in section 'Service', ignoring.\n" +
+		"munge.service: Command /usr/sbin/munged is not executable: No such file or directory\n" +
+		"foo@1.service: Service has more than one ExecStart= setting, which is only allowed for Type=oneshot services. Refusing.\n" +
+		"shawk-agent.service: Service has no ExecStart=, ExecStop=, or SuccessAction=. Refusing.\n" +
+		"shawk-agent.service: Command /usr/bin/shawk is not executable: No such file or directory\n" +
+		"Failed to start transaction: Unit sysinit.target not found.\n"
+	want := []string{
+		unit + ":40: Unknown key name 'ProtectSytem' in section 'Service', ignoring.",
+		"shawk-agent.service: Service has no ExecStart=, ExecStop=, or SuccessAction=. Refusing.",
+		"Failed to start transaction: Unit sysinit.target not found.",
+	}
+	if got := unitProblems(out, unit); !slices.Equal(got, want) {
+		t.Errorf("unitProblems =\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+
+	analyze, err := exec.LookPath("systemd-analyze")
+	if err != nil {
+		t.Skip("systemd-analyze is not available")
+	}
+	// A unit of the host that warns, pulled in by network-online.target,
+	// which shawk-agent.service wants, as munge.service is on Rocky Linux 9.
+	host := filepath.Join(dir, "host")
+	if err := os.MkdirAll(filepath.Join(host, "network-online.target.wants"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(host, "hostwarn.service"),
+		[]byte("[Service]\nExecStart=/bin/true\nBogus=1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../hostwarn.service", filepath.Join(host, "network-online.target.wants/hostwarn.service")); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(analyze, "verify", unit)
+	// The trailing colon appends the default unit path.
+	cmd.Env = append(os.Environ(), "SYSTEMD_UNIT_PATH="+host+":")
+	raw, _ := cmd.CombinedOutput()
+	if !strings.Contains(string(raw), "hostwarn.service") {
+		t.Skipf("systemd-analyze did not load the unit of the host:\n%s", raw)
+	}
+	got := unitProblems(string(raw), unit)
+	if len(got) != 1 || !strings.Contains(got[0], "ProtectSytem") {
+		t.Errorf("unitProblems of\n%s= %q, want the misspelt ProtectSytem only", raw, got)
 	}
 }
 
