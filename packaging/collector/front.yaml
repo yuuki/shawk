@@ -1,0 +1,85 @@
+# Configuration of a front collector that spreads the agents over several
+# collectors with the shawk connector (config.yaml), for a fleet larger than
+# one connector takes. It needs only components of otelcol-contrib: the
+# otlp receiver and the load_balancing exporter.
+#
+# Prefer giving each agent the endpoint of one connector in its own
+# configuration (-otlp-endpoint), e.g. per group of hosts: a host then moves
+# only when its configuration changes, and the connectors keep checking the
+# certificate of every agent (host_identity: certificate). Use this file
+# only where that cannot be done, knowing what it gives up (docs/design.md,
+# section 5.3):
+#
+# - The connectors behind it see the certificate of this collector, not
+#   that of the agent, so they must run with host_identity: none: any agent
+#   this collector accepts can write as any host.
+# - A connector keeps the state of each host (the last value of every
+#   input), so a host must reach the same connector all the time. A host
+#   routed elsewhere and back within idle_ttl is counted twice (#128). The
+#   route is a hash of host.id and host.name over the list of connectors,
+#   so changing the list moves hosts: keep it static, and change it
+#   rarely.
+# - The connector relies on the order of the requests of a host: listeners
+#   and translations before the edges, the agent's metrics last. Nothing
+#   here queues, batches or retries, so the requests of an agent are
+#   forwarded one at a time in their order, and a failure reaches the
+#   agent, which makes up for it at the next interval.
+receivers:
+  # The receiver of agents, as otlp/shawk in config.yaml.
+  otlp/shawk:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4327
+        max_recv_msg_size_mib: 16
+        tls:
+          cert_file: /etc/shawk/tls/front.crt
+          key_file: /etc/shawk/tls/front.key
+          client_ca_file: /etc/shawk/tls/agents-ca.crt
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 20
+
+exporters:
+  load_balancing/shawk:
+    # Route by the identity of the host, not by resource (routing_key:
+    # resource): the resource of an agent changes with host.ip (the
+    # addresses of its interfaces and of the recent series), service.version
+    # (the version of the agent) and shawk.peer.internal (#128). Every
+    # request of an agent carries both attributes; an agent without a
+    # machine id sends host.name alone, which routes as steadily.
+    routing_key: attributes
+    routing_attributes: [host.id, host.name]
+    # No queue: requests are forwarded in order, and their errors returned.
+    sending_queue:
+      enabled: false
+    resolver:
+      # A static list: the dns and k8s resolvers drop a connector while it
+      # restarts, which moves its hosts to the others and back.
+      static:
+        hostnames:
+          - connector-1.example:4327
+          - connector-2.example:4327
+    protocol:
+      otlp:
+        # The client certificate of this collector, from the CA that the
+        # connectors trust for agents (client_ca_file of their otlp/shawk).
+        tls:
+          ca_file: /etc/shawk/tls/collector-ca.crt
+          cert_file: /etc/shawk/tls/front-client.crt
+          key_file: /etc/shawk/tls/front-client.key
+        timeout: 10s
+        sending_queue:
+          enabled: false
+        retry_on_failure:
+          enabled: false
+
+service:
+  pipelines:
+    # No batch processor: one request of an agent stays one request.
+    metrics/shawk:
+      receivers: [otlp/shawk]
+      processors: [memory_limiter]
+      exporters: [load_balancing/shawk]
