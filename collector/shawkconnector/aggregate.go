@@ -470,9 +470,11 @@ func (a *aggregator) addEdge(b *hostBatch, h *hostOutputs, e *edgeInput, peerOf 
 		base.peerAddr = e.id.peerString()
 	}
 	// The networks of the addresses of the edge, for its outputs per peer
-	// host. They classify the addresses, not the path or the interface.
+	// host. They classify the addresses, not the path or the interface. A
+	// Unix socket has no address and uses no network: its outputs carry
+	// none.
 	var localNet, peerNet string
-	if peerHost != "" && a.networks != nil {
+	if peerHost != "" && a.networks != nil && e.id.proto != transportUnix {
 		localNet, peerNet = a.networkOf(e.id.local, false), a.networkOf(e.id.peer, e.id.folded)
 	}
 	for vk, pt := range e.values {

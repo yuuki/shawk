@@ -1013,7 +1013,8 @@ the networks of the local and the peer address of each edge, so that NFS
 traffic over the management network rather than the storage network
 shows. The narrowest range wins. An address in none is `~unknown` if it is
 not routed on the Internet, loopback included, and `~external` otherwise,
-as is a folded peer unless a range holds its whole network. The ranges are
+as is a folded peer unless a range holds its whole network. A Unix socket
+has no address and uses no network: its outputs carry none. The ranges are
 parsed as those of `peer_cidrs` (`ranges.go`): names neither empty nor
 starting with `~`, one name per prefix, IPv4-mapped prefixes unmapped. A
 host and service reach a peer host over one pair of networks as a rule, so
