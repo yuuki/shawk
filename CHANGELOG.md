@@ -52,6 +52,20 @@
   did in a VM once the agent loaded more programs at start: the walk now
   runs before the UDP programs attach.
 
+### Security
+
+* **One certificate can no longer take every host of `max_hosts`.** With
+  `host_identity: certificate` the certificate names the `host.name` of
+  an agent, but not its `host.id`, nor the case of the name or a final
+  dot, which all make another host: an agent could send made-up
+  `host.id` values until the connector held `max_hosts` hosts and refused
+  the others (#145, finding 6). The connector holds at most 4 hosts per
+  client certificate, whatever names it has, which leaves room for hosts
+  whose machine id changes at a reinstall or every boot, and refuses
+  further ones like hosts beyond `max_hosts` until one has not sent for
+  `idle_ttl` (`docs/design.md` §5.5). Machines that share one certificate
+  share the 4.
+
 **Upgrading.** The tables and views of Unix sockets are in
 `0001_schema.sql`, which `shawk-migrate` does not apply again to a database
 that has it: create the database of v0.8.1 again as for the first build of

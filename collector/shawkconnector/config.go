@@ -94,8 +94,9 @@ type Config struct {
 	// from an agent whose verified client certificate names the host.name
 	// it sends (as a DNS name, or as the common name of a certificate
 	// without DNS names), so that an agent cannot write as another host;
-	// the receiver must require client certificates. "none" (the default)
-	// believes the host.name and host.id of every request.
+	// the receiver must require client certificates. It then holds at most
+	// 4 hosts of a certificate, whatever their host.id. "none" (the
+	// default) believes the host.name and host.id of every request.
 	HostIdentity string `mapstructure:"host_identity"`
 	// MaxHosts bounds the hosts the connector holds: those that sent within
 	// idle_ttl. The requests of further hosts are refused until hosts

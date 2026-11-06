@@ -705,7 +705,10 @@ which include containers.
   host's metrics only from an agent whose verified certificate names its
   `host.name` (a DNS name, else the common name; no wildcards), so one
   certificate cannot write as another host; the receiver passes
-  certificates over gRPC only, so HTTP requests are then refused. With
+  certificates over gRPC only, so HTTP requests are then refused. The
+  certificate names neither the `host.id` nor the case of `host.name` or a
+  final dot, which make other hosts (§4.1), so the connector holds at most
+  4 hosts of a certificate (§5.5). With
   `none`, the default, the connector believes every request. OBI's receiver
   trusts another CA than the agents' (`packaging/collector/config.yaml`), so
   OBI's certificates cannot send as an agent.
@@ -1133,6 +1136,19 @@ connector holds, so the connector bounds it:
   `idle_ttl`. At the bound, requests of new hosts are refused with a
   non-permanent error (the agent counts a failed export); held hosts are
   never evicted.
+- Hosts of a certificate, with `host_identity: certificate`: at most 4
+  per client certificate (by its SHA-256), whatever their `host.id`, the
+  name of the certificate they send or how `host.name` is spelt in case or
+  with a final dot, refused beyond like hosts beyond `max_hosts`.
+  Otherwise one certificate could take every host of `max_hosts` with
+  made-up `host.id` values. Four leave room for a host whose machine id
+  changes, as at a reinstall or the boots of a stateless node (§4.1): the
+  former host is held until `idle_ttl` after it stopped, so a longer
+  `idle_ttl` leaves room for fewer boots. Machines that share a name and
+  each have a certificate of their own, as in two clusters, do not share
+  the bound; machines that share one certificate do. The bound is of what
+  one connector holds: a certificate can still make 4 new hosts every
+  `idle_ttl`, which PostgreSQL keeps for `retention`.
 - Series per host (`max_series_per_host`, 100000): edges, listeners,
   translations and addresses, each held until `idle_ttl` after its latest
   request. New ones beyond the bound are dropped, and since a dropped
@@ -1153,6 +1169,8 @@ large host sends (16384 flows per interval by default; a much larger
 `-max-flows` may need a larger `max_series_per_host`). To bound memory more
 tightly, lower `max_hosts` to the fleet size with room: the connector holds
 about 5 KB per edge with its metrics and about 300 bytes per pending row.
+With `host_identity: none` an agent may send any `host.name`, and only
+`max_hosts` bounds its hosts.
 
 ### 5.6 Static inventory
 

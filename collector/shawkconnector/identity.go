@@ -2,7 +2,9 @@ package shawkconnector
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/x509"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -62,6 +64,14 @@ func certifiedHost(cert *x509.Certificate, hostname string) error {
 		}
 	}
 	return fmt.Errorf("the client certificate names %q, not the host %q", names, hostname)
+}
+
+// certificateID identifies a client certificate by the SHA-256 of its DER
+// encoding, which `openssl x509 -fingerprint -sha256` prints with colons:
+// a certificate stands for one host, whatever names it has.
+func certificateID(cert *x509.Certificate) string {
+	sum := sha256.Sum256(cert.Raw)
+	return hex.EncodeToString(sum[:])
 }
 
 // cleanString makes a string from an agent acceptable to PostgreSQL, which
