@@ -69,9 +69,9 @@ func requireRoot(t *testing.T) {
 }
 
 // requireUDP skips a test of UDP tracing when the kernel cannot trace UDP,
-// which needs BPF trampolines. SHAWK_TEST_NO_UDP=1 declares a kernel without
-// them, such as Rocky Linux 9 on aarch64: UDP tracing must then be reported
-// unavailable, and the test is skipped even in strict mode.
+// which needs BPF trampolines or else kprobes. SHAWK_TEST_NO_UDP=1 declares
+// a kernel with neither: UDP tracing must then be reported unavailable, and
+// the test is skipped even in strict mode.
 func requireUDP(t *testing.T, tr *Tracer) {
 	t.Helper()
 	noUDP, _ := strconv.ParseBool(os.Getenv("SHAWK_TEST_NO_UDP"))

@@ -3,6 +3,8 @@ package tracer
 import (
 	"net"
 	"net/netip"
+	"os"
+	"strconv"
 	"syscall"
 	"testing"
 	"time"
@@ -207,5 +209,35 @@ func TestUDPIPv6ExtensionHeaders(t *testing.T) {
 	in := findFlow(snap.Flows, DirIn, ProtoUDP, srvAddr.Port(), addr)
 	if in == nil || in.MsgsRecv != 1 || in.MsgsSent != 1 || in.BytesSent != 100 || in.BytesRecv != 100 {
 		t.Errorf("server flow = %+v", in)
+	}
+}
+
+// TestUDPKprobes runs the tests of UDP with the kprobes that stand in for
+// the fentry programs where BPF trampolines do not attach (#118), on any
+// kernel with kprobes: the direction of a socket is then kept in a hash
+// rather than in socket local storage.
+func TestUDPKprobes(t *testing.T) {
+	if noUDP, _ := strconv.ParseBool(os.Getenv("SHAWK_TEST_NO_UDP")); noUDP {
+		t.Skip("UDP tracing is unavailable on this kernel, as SHAWK_TEST_NO_UDP declares")
+	}
+	forceUDPKprobes = true
+	t.Cleanup(func() { forceUDPKprobes = false })
+	tr := newTestTracer(t)
+	if !tr.UDPEnabled() {
+		skipUnavailable(t, "UDP is not traced with kprobes")
+	}
+	if !tr.udpKprobes {
+		t.Fatal("UDP is traced, but not with kprobes")
+	}
+	for name, test := range map[string]func(*testing.T){
+		"UDP":                     TestUDP,
+		"UDPDirection":            TestUDPDirection,
+		"UDPSegmentation":         TestUDPSegmentation,
+		"UDPPeek":                 TestUDPPeek,
+		"UDPIPv6ExtensionHeaders": TestUDPIPv6ExtensionHeaders,
+		"FoldUDP":                 TestFoldUDP,
+		"ListenerKernelChosen":    TestListenerKernelChosen,
+	} {
+		t.Run(name, test)
 	}
 }

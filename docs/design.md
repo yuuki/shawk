@@ -262,11 +262,16 @@ fentry rather than kprobes: on arm64 a kprobe doubles the cost per datagram
 storage for the direction. cgroup_skb costs less (0.06 µs) but runs outside
 the task, so the process of a flow would not be known, and it runs on every
 TCP packet too
-([research/kernel-hooks](research/kernel-hooks/kernel_hooks.md)). UDP thus
+([research/kernel-hooks](research/kernel-hooks/kernel_hooks.md)). fentry
 needs BPF trampolines, which arm64 has since Linux 6.0 and RHEL 9 since
-kernel 5.14.0-621 (Rocky Linux 9.8, not 9.6); without them the agent
-traces TCP and reports that UDP is not traced. Misattributions are listed
-in §10.
+kernel 5.14.0-621 (Rocky Linux 9.8, not 9.6). Where the fentry programs do
+not attach, kprobes on the same functions stand in for them (#118), with
+the same work: the direction of a socket is then kept in an LRU hash keyed
+by the socket, with its inode, which tells it from a former socket at the
+same address (`udp_kstates`, sized as the listening ports); a socket whose
+entry the LRU evicted is decided again by its next datagram. The agent
+logs that UDP is traced with kprobes. Without either it traces TCP and
+reports that UDP is not traced. Misattributions are listed in §10.
 
 ### 3.4 Reading flows without losing updates
 
@@ -291,14 +296,16 @@ Linux 5.14 or later with BTF (`CONFIG_DEBUG_INFO_BTF`):
 | `bpf_sock_from_file`, `bpf_get_current_task_btf` | 5.11 |
 | cgroup pointer in `sock_cgroup_data` (else the owner of accepted connections is resolved in user space only) | 5.15, RHEL 9 |
 | TCP iterator that locks each socket (else rare double counting) | 5.19, RHEL 9 |
-| fentry, fexit (UDP and Unix sockets only) | 5.5 on x86_64, 6.0 on arm64 (RHEL 9 on arm64: 5.14.0-621, in 9.8, not in 9.6) |
+| fentry, fexit (UDP and Unix sockets only) | 5.5 on x86_64, 6.0 on arm64 (RHEL 9 on arm64: 5.14.0-621, in 9.8, not in 9.6); UDP falls back to kprobes (`CONFIG_KPROBES`, `perf_event_open`) |
 | kprobes on the module nf_conntrack (translations, §3.7; `CONFIG_KPROBES`, the system call `perf_event_open`) | `__nf_conntrack_confirm`, and `nf_ct_destroy` since 5.19 and in RHEL 9, `destroy_conntrack` before |
 | kprobes on `ip_icmp_error` and `ipv6_icmp_error` (the ICMP errors of failed connects, §3.2; `CONFIG_KPROBES`, `perf_event_open`) | any; without them, the reasons of such failures race with `SO_ERROR` |
 
 CI loads the programs on the Ubuntu runner kernels (6.8 to 7.0, x86_64 and
 arm64) and in VMs (`make vm-test`) on Rocky Linux 9.6 (x86_64, aarch64),
 upstream 5.14 (x86_64) and 5.15 (x86_64, aarch64); on aarch64 before 6.0
-the tests check that UDP and Unix sockets are reported as not traced. All struct accesses use CO-RE. `make compat`
+the tests of UDP run with kprobes, and check that Unix sockets are
+reported as not traced; `TestUDPKprobes` runs them with kprobes on the
+other kernels too. All struct accesses use CO-RE. `make compat`
 checks every attach target, helper, CO-RE relocation and `BPF_PROG`
 parameter list against the BTF of Rocky Linux 9.6 and its nf_conntrack
 module (the verifier does not check arguments read through

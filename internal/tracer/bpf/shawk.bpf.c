@@ -275,6 +275,27 @@ struct {
 	__type(value, struct shawk_udp_state);
 } udp_states SEC(".maps");
 
+/*
+ * The direction of UDP sockets for the kprobes that stand in for the fentry
+ * programs where BPF trampolines are missing (arm64 before Linux 6.0,
+ * Rocky Linux 9.6 on arm64; #118): kprobes have no socket local storage.
+ * Keyed by the socket, with the inode of the socket, which tells it from a
+ * former socket at the same address; sized by user space. An entry the LRU
+ * evicts is decided again by the next datagram, as for a new socket.
+ */
+struct shawk_udp_kstate {
+	__u64 ino;
+	__u32 dir;
+	__u32 _pad;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 1);
+	__type(key, __u64);
+	__type(value, struct shawk_udp_kstate);
+} udp_kstates SEC(".maps");
+
 /* The process an MPTCP connection belongs to. */
 struct shawk_owner {
 	char comm[TASK_COMM_LEN];
@@ -1547,7 +1568,68 @@ int shawk_iter_tcp(struct bpf_iter__tcp *ctx)
 	return 0;
 }
 
+/*
+ * The registers of the arguments of a kprobe, by architecture. The
+ * object is shared by x86_64 and arm64, so the registers are found by CO-RE
+ * in the BTF of the running kernel.
+ */
+struct pt_regs___x86 {
+	unsigned long di;
+	unsigned long si;
+	unsigned long dx;
+} __attribute__((preserve_access_index));
+
+struct pt_regs___arm64 {
+	unsigned long regs[31];
+} __attribute__((preserve_access_index));
+
+/*
+ * The registers are read with bpf_probe_read_kernel(): the compiler merges
+ * direct loads of the two flavors into arithmetic on the context, which the
+ * verifier rejects.
+ */
+static __always_inline __u64 kprobe_arg1(struct pt_regs *ctx)
+{
+	struct pt_regs___x86 *x86 = (void *)ctx;
+	struct pt_regs___arm64 *arm64 = (void *)ctx;
+
+	if (bpf_core_field_exists(x86->di))
+		return BPF_CORE_READ(x86, di);
+	return BPF_CORE_READ(arm64, regs[0]);
+}
+
+/* The second argument of a kprobe, as kprobe_arg1(). */
+static __always_inline __u64 kprobe_arg2(struct pt_regs *ctx)
+{
+	struct pt_regs___x86 *x86 = (void *)ctx;
+	struct pt_regs___arm64 *arm64 = (void *)ctx;
+
+	if (bpf_core_field_exists(x86->si))
+		return BPF_CORE_READ(x86, si);
+	return BPF_CORE_READ(arm64, regs[1]);
+}
+
+/* The third argument of a kprobe, as kprobe_arg1(). */
+static __always_inline __u64 kprobe_arg3(struct pt_regs *ctx)
+{
+	struct pt_regs___x86 *x86 = (void *)ctx;
+	struct pt_regs___arm64 *arm64 = (void *)ctx;
+
+	if (bpf_core_field_exists(x86->dx))
+		return BPF_CORE_READ(x86, dx);
+	return BPF_CORE_READ(arm64, regs[2]);
+}
+
 /* ---------------------------------------------------------------- UDP --- */
+
+/*
+ * The inode of a socket, which the kprobes of UDP keep with its direction
+ * (udp_kstates); 0 for a socket without a file, as those of the kernel.
+ */
+static __always_inline __u64 sock_ino(struct sock *sk)
+{
+	return BPF_CORE_READ(sk, sk_socket, file, f_inode, i_ino);
+}
 
 /*
  * The direction of a UDP socket is decided by its first datagram: a socket
@@ -1569,17 +1651,27 @@ int shawk_iter_tcp(struct bpf_iter__tcp *ctx)
  * client.
  */
 static __always_inline __u32 udp_direction(struct sock *sk, __u32 netns,
-					   __u16 lport, bool sending)
+					   __u16 lport, bool sending,
+					   bool kprobe)
 {
 	struct shawk_listen_key lk = {.netns = netns, .port = lport};
+	struct shawk_udp_kstate *ks, kst = {};
 	struct shawk_udp_state *us;
+	__u64 skp = (__u64)sk;
 	bool listening, bound;
 	__u32 dir = DIR_IN;
 	__u8 one = 1;
 
-	us = bpf_sk_storage_get(&udp_states, sk, NULL, 0);
-	if (us)
-		return us->dir;
+	if (kprobe) {
+		kst.ino = sock_ino(sk);
+		ks = bpf_map_lookup_elem(&udp_kstates, &skp);
+		if (ks && ks->ino == kst.ino)
+			return ks->dir;
+	} else {
+		us = bpf_sk_storage_get(&udp_states, sk, NULL, 0);
+		if (us)
+			return us->dir;
+	}
 	listening = bpf_map_lookup_elem(&udp_listen_ports, &lk) != NULL;
 	bound = port_bound(sk);
 	if (sending) {
@@ -1592,6 +1684,11 @@ static __always_inline __u32 udp_direction(struct sock *sk, __u32 netns,
 		if (bpf_map_update_elem(&udp_listen_ports, &lk, &one, BPF_ANY))
 			__sync_fetch_and_add(&listen_port_drops, 1);
 	}
+	if (kprobe) {
+		kst.dir = dir;
+		bpf_map_update_elem(&udp_kstates, &skp, &kst, BPF_ANY);
+		return dir;
+	}
 	us = bpf_sk_storage_get(&udp_states, sk, NULL,
 				BPF_SK_STORAGE_GET_F_CREATE);
 	if (us)
@@ -1602,13 +1699,18 @@ static __always_inline __u32 udp_direction(struct sock *sk, __u32 netns,
 /* Whether a UDP socket is an unconnected server socket worth listing. */
 static __always_inline bool udp_listener(struct sock *sk, __u16 port)
 {
+	struct shawk_udp_kstate *ks;
 	struct shawk_udp_state *us;
+	__u64 skp = (__u64)sk;
 
 	if (!port || BPF_CORE_READ(sk, __sk_common.skc_dport))
 		return false;
 	us = bpf_sk_storage_get(&udp_states, sk, NULL, 0);
 	if (us)
 		return us->dir == DIR_IN;
+	ks = bpf_map_lookup_elem(&udp_kstates, &skp);
+	if (ks && ks->ino == sock_ino(sk))
+		return ks->dir == DIR_IN;
 	/* Idle since the tracer started: trust an explicitly bound port. */
 	return port_bound(sk) && !ephemeral(port);
 }
@@ -1714,18 +1816,16 @@ static __always_inline __u32 udp_segments(struct sk_buff *skb, __u16 ulen)
 	return (data + size - 1) / size;
 }
 
-static __always_inline int handle_udp_send(struct sk_buff *skb)
+static __always_inline int handle_udp_send(struct sk_buff *skb,
+					   struct sock *sk, bool kprobe)
 {
 	__u32 tgid = bpf_get_current_pid_tgid() >> 32;
 	struct shawk_flow_key key = {};
 	struct shawk_flow_stats *fs;
 	struct shawk_l3l4 h = {};
-	struct sock *sk;
 
 	if (tgid == self_tgid)
 		return 0;
-	/* A direct access keeps the pointer usable with socket storage. */
-	sk = skb->sk;
 	if (!sk || !is_udp_sock(sk))
 		return 0;
 	key.netns = sock_netns(sk);
@@ -1736,7 +1836,7 @@ static __always_inline int handle_udp_send(struct sk_buff *skb)
 
 	__builtin_memcpy(key.laddr, h.saddr, 16);
 	__builtin_memcpy(key.raddr, h.daddr, 16);
-	key.direction = udp_direction(sk, key.netns, h.sport, true);
+	key.direction = udp_direction(sk, key.netns, h.sport, true, kprobe);
 	key.port = key.direction == DIR_IN ? h.sport : h.dport;
 	key.proto = IPPROTO_UDP;
 	tgid = set_udp_owner(&key, sk, tgid);
@@ -1755,16 +1855,17 @@ static __always_inline int handle_udp_send(struct sk_buff *skb)
 	return 0;
 }
 
+/* A direct access to skb->sk keeps the pointer usable with socket storage. */
 SEC("fentry/ip_send_skb")
 int BPF_PROG(shawk_ip_send_skb, struct net *net, struct sk_buff *skb)
 {
-	return handle_udp_send(skb);
+	return handle_udp_send(skb, skb->sk, false);
 }
 
 SEC("fentry/ip6_send_skb")
 int BPF_PROG(shawk_ip6_send_skb, struct sk_buff *skb)
 {
-	return handle_udp_send(skb);
+	return handle_udp_send(skb, skb->sk, false);
 }
 
 /*
@@ -1773,9 +1874,9 @@ int BPF_PROG(shawk_ip6_send_skb, struct sk_buff *skb)
  * one that is read was unlinked from it: this also tells a peek at an empty
  * datagram (-0) from its read.
  */
-SEC("fentry/skb_consume_udp")
-int BPF_PROG(shawk_skb_consume_udp, struct sock *sk, struct sk_buff *skb,
-	     int len)
+static __always_inline int handle_udp_recv(struct sock *sk,
+					   struct sk_buff *skb, int len,
+					   bool kprobe)
 {
 	__u32 tgid = bpf_get_current_pid_tgid() >> 32;
 	struct shawk_flow_key key = {};
@@ -1795,7 +1896,7 @@ int BPF_PROG(shawk_skb_consume_udp, struct sock *sk, struct sk_buff *skb,
 
 	__builtin_memcpy(key.laddr, h.daddr, 16);
 	__builtin_memcpy(key.raddr, h.saddr, 16);
-	key.direction = udp_direction(sk, key.netns, h.dport, false);
+	key.direction = udp_direction(sk, key.netns, h.dport, false, kprobe);
 	key.port = key.direction == DIR_IN ? h.dport : h.sport;
 	key.proto = IPPROTO_UDP;
 	tgid = set_udp_owner(&key, sk, tgid);
@@ -1811,6 +1912,50 @@ int BPF_PROG(shawk_skb_consume_udp, struct sock *sk, struct sk_buff *skb,
 	return 0;
 }
 
+SEC("fentry/skb_consume_udp")
+int BPF_PROG(shawk_skb_consume_udp, struct sock *sk, struct sk_buff *skb,
+	     int len)
+{
+	return handle_udp_recv(sk, skb, len, false);
+}
+
+/*
+ * The same with kprobes, where BPF trampolines are missing (arm64 before
+ * Linux 6.0, including Rocky Linux 9.6; #118). User space attaches them only
+ * if the fentry programs do not attach: a kprobe costs twice as much per
+ * datagram on arm64 (docs/research/kernel-hooks §3).
+ * KPROBE(shawk_ip_send_skb_k, struct net *net, struct sk_buff *skb)
+ */
+SEC("kprobe/ip_send_skb")
+int shawk_ip_send_skb_k(struct pt_regs *ctx)
+{
+	struct sk_buff *skb = (struct sk_buff *)kprobe_arg2(ctx);
+
+	return handle_udp_send(skb, BPF_CORE_READ(skb, sk), true);
+}
+
+/*
+ * KPROBE(shawk_ip6_send_skb_k, struct sk_buff *skb)
+ */
+SEC("kprobe/ip6_send_skb")
+int shawk_ip6_send_skb_k(struct pt_regs *ctx)
+{
+	struct sk_buff *skb = (struct sk_buff *)kprobe_arg1(ctx);
+
+	return handle_udp_send(skb, BPF_CORE_READ(skb, sk), true);
+}
+
+/*
+ * KPROBE(shawk_skb_consume_udp_k, struct sock *sk, struct sk_buff *skb, int len)
+ */
+SEC("kprobe/skb_consume_udp")
+int shawk_skb_consume_udp_k(struct pt_regs *ctx)
+{
+	return handle_udp_recv((struct sock *)kprobe_arg1(ctx),
+			       (struct sk_buff *)kprobe_arg2(ctx),
+			       (int)kprobe_arg3(ctx), true);
+}
+
 /*
  * Emits UDP server sockets and records their ports. At startup it marks the
  * bound, unconnected sockets as servers, since their first datagram after
@@ -1821,9 +1966,11 @@ int shawk_iter_udp(struct bpf_iter__udp *ctx)
 {
 	struct udp_sock *udp = ctx->udp_sk;
 	struct seq_file *seq = ctx->meta->seq;
+	struct shawk_udp_kstate ks = {};
 	struct shawk_listen_key lk = {};
 	struct shawk_udp_state *us;
 	struct sock *sk;
+	__u64 skp;
 	__u16 family, port;
 	__u32 netns;
 	__u8 one = 1;
@@ -1845,6 +1992,11 @@ int shawk_iter_udp(struct bpf_iter__udp *ctx)
 					BPF_SK_STORAGE_GET_F_CREATE);
 		if (us && !us->dir)
 			us->dir = DIR_IN;
+		/* For the kprobes, if they stand in for fentry. */
+		ks.ino = sock_ino(sk);
+		ks.dir = DIR_IN;
+		skp = (__u64)sk;
+		bpf_map_update_elem(&udp_kstates, &skp, &ks, BPF_NOEXIST);
 	}
 	if (!udp_listener(sk, port))
 		return 0;
@@ -2475,46 +2627,6 @@ __u64 xlat_drops = 0;
 const struct shawk_xlat_key *unused_xlat_key __attribute__((unused));
 const struct shawk_xlat_stats *unused_xlat_stats __attribute__((unused));
 const struct shawk_xlat_conn *unused_xlat_conn __attribute__((unused));
-
-/*
- * The registers of the arguments of a kprobe, by architecture. The
- * object is shared by x86_64 and arm64, so the registers are found by CO-RE
- * in the BTF of the running kernel.
- */
-struct pt_regs___x86 {
-	unsigned long di;
-	unsigned long dx;
-} __attribute__((preserve_access_index));
-
-struct pt_regs___arm64 {
-	unsigned long regs[31];
-} __attribute__((preserve_access_index));
-
-/*
- * The registers are read with bpf_probe_read_kernel(): the compiler merges
- * direct loads of the two flavors into arithmetic on the context, which the
- * verifier rejects.
- */
-static __always_inline __u64 kprobe_arg1(struct pt_regs *ctx)
-{
-	struct pt_regs___x86 *x86 = (void *)ctx;
-	struct pt_regs___arm64 *arm64 = (void *)ctx;
-
-	if (bpf_core_field_exists(x86->di))
-		return BPF_CORE_READ(x86, di);
-	return BPF_CORE_READ(arm64, regs[0]);
-}
-
-/* The third argument of a kprobe, as kprobe_arg1(). */
-static __always_inline __u64 kprobe_arg3(struct pt_regs *ctx)
-{
-	struct pt_regs___x86 *x86 = (void *)ctx;
-	struct pt_regs___arm64 *arm64 = (void *)ctx;
-
-	if (bpf_core_field_exists(x86->dx))
-		return BPF_CORE_READ(x86, dx);
-	return BPF_CORE_READ(arm64, regs[2]);
-}
 
 /* Reads an address of a tuple of conntrack as an IPv6 address. */
 static __always_inline void ct_addr(__u8 *dst, union nf_inet_addr *a,

@@ -51,9 +51,10 @@ The design is in [docs/design.md](docs/design.md).
 ## Requirements
 
 - Linux with BTF (`/sys/kernel/btf/vmlinux`): RHEL / Rocky Linux 9, or
-  upstream 5.14 or later. UDP and Unix sockets need BPF trampolines
-  (fentry, fexit), which arm64 has only since 6.0; without them only TCP is
-  traced. The tested kernels
+  upstream 5.14 or later. Unix sockets need BPF trampolines (fentry,
+  fexit), which arm64 has only since 6.0 (Rocky Linux 9.8); without them
+  they are not traced, and UDP is traced with kprobes, at about twice the
+  cost per datagram. The tested kernels
   are listed in
   [design §3.5](docs/design.md#35-kernel-requirements-and-features-used).
   The agent runs as root with the capabilities that
