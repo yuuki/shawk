@@ -22,10 +22,11 @@
 # few minutes for aarch64 on x86_64).
 #
 # The tests run with SHAWK_TEST_STRICT=1, so that a skip fails, unless the
-# environment sets it. On kernels without BPF trampolines (aarch64 before
-# 6.0, including Rocky Linux 9.6), UDP is traced with kprobes, and the
-# tests of UDP run with them; SHAWK_TEST_NO_UDP=1 declares a kernel with
-# neither, where UDP tracing must be reported unavailable. The initramfs holds the modules of
+# environment sets it. Kernels without BPF trampolines (aarch64 before 6.0,
+# including Rocky Linux 9.6) run with SHAWK_TEST_NO_TRAMPOLINES=1: Unix
+# sockets must be reported as not traced, and UDP must be traced with
+# kprobes. SHAWK_TEST_NO_UDP=1 declares a kernel with neither trampolines
+# nor kprobes, where UDP tracing must be reported unavailable. The initramfs holds the modules of
 # the NFS client for Rocky Linux 9 (from kernel-modules-core), which init
 # loads; the other kernels run with SHAWK_TEST_NO_NFS=1. It also holds the
 # modules of conntrack and nf_tables with NAT, from kernel-modules-core or
@@ -82,6 +83,7 @@ deb_extract() {
 # The environment may declare a kernel that traces UDP neither with BPF
 # trampolines nor with kprobes, e.g. one given by its path.
 no_udp="${SHAWK_TEST_NO_UDP:-}"
+no_trampolines="${SHAWK_TEST_NO_TRAMPOLINES:-}"
 # The package holding the modules of the NFS client, if any (Rocky Linux),
 # and the package of the netfilter modules that the tests of translations
 # load (conntrack and nf_tables with NAT).
@@ -104,6 +106,7 @@ rocky9/aarch64)
 	# arm64 has BPF trampolines since Linux 6.0, and RHEL 9.6 did not
 	# backport them: fentry programs load but do not attach, and UDP is
 	# traced with kprobes.
+	: "${no_trampolines:=1}"
 	pkg=$(fetch $rocky/aarch64/os/Packages/k/kernel-core-5.14.0-570.58.1.el9_6.aarch64.rpm \
 		f0eb542737285c1a7fd386a2cbb5f464228b847762d585d8bd47aa013512d7dd)
 	modules=$(fetch $rocky/aarch64/os/Packages/k/kernel-modules-core-5.14.0-570.58.1.el9_6.aarch64.rpm \
@@ -120,6 +123,7 @@ rocky9/aarch64)
 	nfmodules=$(fetch $mainline/v5.15.224/amd64/linux-modules-5.15.224-0515224-generic_5.15.224-0515224.202610301525_amd64.deb \
 		9c03f8b68f2f8be55e1847ad477182faf1e8f14fb9d2b3e7aa6df08a97c6577a) ;;
 5.15/aarch64)
+	: "${no_trampolines:=1}"
 	pkg=$(fetch $mainline/v5.15.224/arm64/linux-image-unsigned-5.15.224-0515224-generic_5.15.224-0515224.202610301525_arm64.deb \
 		dee11976dee32b5e762a74fa027a17619b9c425135f84fae6be1d0c6bc1fb7bd)
 	nfmodules=$(fetch $mainline/v5.15.224/arm64/linux-modules-5.15.224-0515224-generic_5.15.224-0515224.202610301525_arm64.deb \
@@ -211,7 +215,7 @@ EOF
 
 # Unknown parameters of the kernel command line are passed to init as
 # environment variables.
-cmdline="console=$console panic=-1 quiet SHAWK_TEST_STRICT=${SHAWK_TEST_STRICT:-1} SHAWK_TEST_NO_UDP=${no_udp:-0} SHAWK_TEST_NO_NFS=${SHAWK_TEST_NO_NFS:-$no_nfs} SHAWK_TEST_NO_CONNTRACK=${SHAWK_TEST_NO_CONNTRACK:-$no_conntrack}"
+cmdline="console=$console panic=-1 quiet SHAWK_TEST_STRICT=${SHAWK_TEST_STRICT:-1} SHAWK_TEST_NO_UDP=${no_udp:-0} SHAWK_TEST_NO_TRAMPOLINES=${no_trampolines:-0} SHAWK_TEST_NO_NFS=${SHAWK_TEST_NO_NFS:-$no_nfs} SHAWK_TEST_NO_CONNTRACK=${SHAWK_TEST_NO_CONNTRACK:-$no_conntrack}"
 opts=(-m 2G -smp 2 -nographic -no-reboot -kernel "$image" -initrd "$WORK/initramfs.gz" -append "$cmdline")
 host="$(uname -m)"
 host="${host/arm64/aarch64}"

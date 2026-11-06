@@ -40,16 +40,19 @@ func TestUnixName(t *testing.T) {
 }
 
 // requireUnix skips a test of the tracing of Unix sockets when the kernel
-// cannot trace them: their programs need BPF trampolines, as UDP does, so
-// SHAWK_TEST_NO_UDP=1 declares a kernel without them for both.
+// cannot trace them: their programs need BPF trampolines, which
+// SHAWK_TEST_NO_TRAMPOLINES=1 declares the kernel has not, as
+// SHAWK_TEST_NO_UDP=1 does.
 func requireUnix(t *testing.T, tr *Tracer) {
 	t.Helper()
-	noTrampolines, _ := strconv.ParseBool(os.Getenv("SHAWK_TEST_NO_UDP"))
+	noTrampolines, _ := strconv.ParseBool(os.Getenv("SHAWK_TEST_NO_TRAMPOLINES"))
+	noUDP, _ := strconv.ParseBool(os.Getenv("SHAWK_TEST_NO_UDP"))
+	noTrampolines = noTrampolines || noUDP
 	switch {
 	case noTrampolines && tr.UnixEnabled():
-		t.Fatal("Unix sockets are traced, but SHAWK_TEST_NO_UDP declares a kernel without BPF trampolines")
+		t.Fatal("Unix sockets are traced, but the kernel is declared without BPF trampolines")
 	case noTrampolines:
-		t.Skip("Unix sockets are not traced on this kernel, as SHAWK_TEST_NO_UDP declares")
+		t.Skip("Unix sockets are not traced on this kernel, which is declared without BPF trampolines")
 	case !tr.UnixEnabled():
 		skipUnavailable(t, "Unix sockets are not traced on this kernel")
 	}
