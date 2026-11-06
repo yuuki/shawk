@@ -5,9 +5,16 @@ import (
 	"path/filepath"
 )
 
-// containerdTasks is where containerd keeps the OCI bundles of the running
-// containers, one directory per namespace (k8s.io for Kubernetes).
-const containerdTasks = "/run/containerd/io.containerd.runtime.v2.task"
+// containerdTasks are where containerd keeps the OCI bundles of the running
+// containers, one directory per namespace (k8s.io for Kubernetes), under
+// its state directory: that of containerd, then those of the containerd
+// that k3s and rke2 run (state /run/k3s/containerd), and of microk8s
+// (state $SNAP_COMMON/run/containerd), which have their own (#125).
+var containerdTasks = []string{
+	"/run/containerd/io.containerd.runtime.v2.task",
+	"/run/k3s/containerd/io.containerd.runtime.v2.task",
+	"/var/snap/microk8s/common/run/containerd/io.containerd.runtime.v2.task",
+}
 
 // readContainerd reads the annotations of the OCI bundle of a container of
 // containerd: those of the CRI plugin for Kubernetes, nerdctl/name for
@@ -15,12 +22,23 @@ const containerdTasks = "/run/containerd/io.containerd.runtime.v2.task"
 // a name, such as a container of Docker (namespace moby), which Docker
 // names.
 func (c *Containers) readContainerd(id string) *Container {
-	nss, err := os.ReadDir(filepath.Join(c.root, containerdTasks))
+	for _, tasks := range containerdTasks {
+		if ctr := c.readContainerdTasks(tasks, id); ctr != nil {
+			return ctr
+		}
+	}
+	return nil
+}
+
+// readContainerdTasks reads the bundle of a container of the containerd
+// whose bundles are in tasks.
+func (c *Containers) readContainerdTasks(tasks, id string) *Container {
+	nss, err := os.ReadDir(filepath.Join(c.root, tasks))
 	if err != nil {
 		return nil
 	}
 	for _, ns := range nss {
-		a := c.readBundle(filepath.Join(containerdTasks, ns.Name(), id, "config.json"))
+		a := c.readBundle(filepath.Join(tasks, ns.Name(), id, "config.json"))
 		if a == nil {
 			continue
 		}
@@ -39,7 +57,7 @@ func (c *Containers) readContainerd(id string) *Container {
 			continue
 		}
 		if ctr.PodName != "" {
-			ctr.Pod = c.containerdSandbox(ctr, ns.Name(), a)
+			ctr.Pod = c.containerdSandbox(ctr, filepath.Join(tasks, ns.Name()), a)
 		}
 		return ctr
 	}
@@ -51,7 +69,8 @@ func (c *Containers) readContainerd(id string) *Container {
 // which has those of the annotations of the pod that pod_annotations of
 // the runtime handler lets through. containerd keeps the labels of the
 // pod only in its metadata store, out of reach. The sandbox is believed
-// only if it names the same pod.
+// only if it names the same pod. ns is the directory of the namespace of
+// the bundles.
 func (c *Containers) containerdSandbox(ctr *Container, ns string, a map[string]string) *PodMeta {
 	sb := a
 	if a["io.kubernetes.cri.container-type"] != "sandbox" {
@@ -59,7 +78,7 @@ func (c *Containers) containerdSandbox(ctr *Container, ns string, a map[string]s
 		if !containerIDHex.MatchString(id) {
 			return nil
 		}
-		if sb = c.readBundle(filepath.Join(containerdTasks, ns, id, "config.json")); sb == nil {
+		if sb = c.readBundle(filepath.Join(ns, id, "config.json")); sb == nil {
 			return nil
 		}
 	}

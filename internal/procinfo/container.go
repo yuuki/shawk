@@ -30,6 +30,8 @@ type Container struct {
 	Name string
 	// The service and project of a container of Docker Compose.
 	ComposeProject, ComposeService string
+	// The service of Docker Swarm of the container of a task.
+	SwarmService string
 	// The pod of a container of Kubernetes.
 	PodNamespace, PodName, ContainerName string
 	// Pod holds what the runtime keeps of the labels and annotations of
@@ -124,12 +126,14 @@ const shortID = 12
 
 // Unit names a container after what stays the same when it is recreated:
 // the namespace, workload and container of a pod of Kubernetes, the project
-// and service of Docker Compose, or the name of the container. Without any
+// and service of Docker Compose, the service of Docker Swarm, or the name
+// of the container. Without any
 // of them, the name has the abbreviated id, which changes at every
 // recreation.
 //
 //	k8s/default/web/nginx       a container nginx of a pod of the Deployment web
 //	docker/shop/db              the service db of the Compose project shop
+//	docker/swarm/shop_web       a task of the service shop_web of Swarm
 //	podman/redis                a container named redis
 //	docker-0123456789ab         a container whose state could not be read
 //	user@1000.service/podman-0123456789ab
@@ -146,6 +150,8 @@ func (c *Container) Unit() string {
 			u += "/" + namePart(c.ContainerName)
 		}
 		return u
+	case c.SwarmService != "":
+		return c.Runtime + "/swarm/" + namePart(c.SwarmService)
 	case c.ComposeService != "":
 		if c.ComposeProject == "" {
 			return c.Runtime + "/" + namePart(c.ComposeService)
@@ -403,8 +409,9 @@ type Containers struct {
 	podmanMu sync.Mutex // guards podman, read again when its lists change
 	podman   podmanIndex
 
-	dockerOnce sync.Once
-	dockerRoot string
+	dockerMu    sync.Mutex // guards dockerRoots and dockerRead
+	dockerRoots []string
+	dockerRead  time.Time
 }
 
 // containerRead is a read of the state of a container in flight, which

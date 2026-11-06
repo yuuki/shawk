@@ -34,6 +34,18 @@
   sockets without a listener: glibc tries the socket of nscd from every
   process that looks up a user or a host, and most hosts do not run nscd.
 * `shawk flows` shows the flows of Unix sockets.
+* Containers keep their names across recreation on more hosts (#125):
+  - the pods of k3s and rke2, and of microk8s, whose containerd keeps its
+    bundles under `/run/k3s/containerd` and
+    `/var/snap/microk8s/common/run/containerd`;
+  - the containers of a Docker whose data root is on the command line of
+    `dockerd` (`--data-root`, or `data-root` in the file of
+    `--config-file`): the agent reads the command line of every `dockerd`
+    of root in the mount namespace of PID 1, every minute at most, and
+    keeps only these two flags; with several daemons, each data root;
+  - the tasks of Docker Swarm, named `docker/swarm/<service>` rather than
+    after their container, `<service>.<slot>.<task id>`, when the labels
+    `com.docker.swarm.*` match that name.
 
 ### Changed
 
