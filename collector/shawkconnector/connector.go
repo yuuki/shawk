@@ -98,6 +98,10 @@ type shawkConnector struct {
 	lastHostsLog                 time.Time
 	seriesDropped, inputsDropped int
 	lastSeriesLog                time.Time
+	// Requests of hosts refused by maxHostsPerCertificate, logged at most
+	// once a minute.
+	certificateRefused int
+	lastCertificateLog time.Time
 
 	// foldWarned holds, by host whose agent folds the edges of hosts that run
 	// an agent and by side it folds, when it was last logged and the hosts
@@ -561,9 +565,9 @@ func (c *shawkConnector) ConsumeMetrics(ctx context.Context, md pmetric.Metrics)
 			refused = err
 			continue
 		}
-		admitted, dropped := c.limits.admit(b, now)
-		if !admitted {
-			full = c.refuseHost(b, now)
+		admission, dropped := c.limits.admit(b, now)
+		if admission != admitted {
+			full = c.refuseHost(b, admission, now)
 			continue
 		}
 		if b.invalid > 0 {
@@ -609,9 +613,13 @@ func (c *shawkConnector) ConsumeMetrics(ctx context.Context, md pmetric.Metrics)
 	return nil
 }
 
-// refuseHost logs a batch of a new host refused by max_hosts, at most once
-// a minute, and returns the error for the agent.
-func (c *shawkConnector) refuseHost(b *hostBatch, now time.Time) error {
+// refuseHost logs a batch of a new host refused by max_hosts, or by
+// maxHostsPerCertificate, at most once a minute each, and returns the error
+// for the agent.
+func (c *shawkConnector) refuseHost(b *hostBatch, why admission, now time.Time) error {
+	if why == certificateFull {
+		return c.refuseCertificate(b, now)
+	}
 	err := fmt.Errorf("refusing the metrics of a new host: the connector holds max_hosts (%d) hosts", c.cfg.MaxHosts)
 	c.mu.Lock()
 	c.hostsRefused++
@@ -624,6 +632,28 @@ func (c *shawkConnector) refuseHost(b *hostBatch, now time.Time) error {
 	c.mu.Unlock()
 	c.log.Error("refusing the metrics of new hosts beyond max_hosts, until hosts held stop sending for idle_ttl",
 		zap.String("host", b.hostname), zap.Int("refused", n), zap.Int("max_hosts", c.cfg.MaxHosts))
+	return err
+}
+
+// refuseCertificate logs a batch of a new host refused by
+// maxHostsPerCertificate, at most once a minute, and returns the error for
+// the agent.
+func (c *shawkConnector) refuseCertificate(b *hostBatch, now time.Time) error {
+	err := fmt.Errorf("refusing the metrics of a new host: the connector holds %d hosts of the client certificate, "+
+		"with other host.id values or spellings of host.name", maxHostsPerCertificate)
+	c.mu.Lock()
+	c.certificateRefused++
+	n := c.certificateRefused
+	if !c.lastCertificateLog.IsZero() && now.Sub(c.lastCertificateLog) < time.Minute {
+		c.mu.Unlock()
+		return err
+	}
+	c.lastCertificateLog, c.certificateRefused = now, 0
+	c.mu.Unlock()
+	c.log.Error("refusing the metrics of new hosts of a client certificate that has the most hosts held, "+
+		"by host.id or the spelling of host.name, until one stops sending for idle_ttl",
+		zap.String("host", b.hostname), zap.String("host_id", b.machineID), zap.String("certificate_sha256", b.certificate),
+		zap.Int("refused", n), zap.Int("max_hosts_per_certificate", maxHostsPerCertificate))
 	return err
 }
 
@@ -648,7 +678,8 @@ func (c *shawkConnector) dropSeries(b *hostBatch, series, inputs int, now time.T
 }
 
 // checkIdentity checks, with host_identity: certificate, that the client
-// certificate of the request names the host of a batch.
+// certificate of the request names the host of a batch, and sets its
+// certificate.
 func (c *shawkConnector) checkIdentity(ctx context.Context, b *hostBatch) error {
 	if c.cfg.HostIdentity != hostIdentityCertificate {
 		return nil
@@ -657,7 +688,11 @@ func (c *shawkConnector) checkIdentity(ctx context.Context, b *hostBatch) error 
 	if err != nil {
 		return err
 	}
-	return certifiedHost(cert, b.hostname)
+	if err := certifiedHost(cert, b.hostname); err != nil {
+		return err
+	}
+	b.certificate = certificateID(cert)
+	return nil
 }
 
 // refuse logs a batch refused by host_identity, at most once a minute.

@@ -151,6 +151,9 @@ type hostBatch struct {
 	agentVersion string
 	addrs        []netip.Addr
 	time         time.Time // of the latest data point
+	// certificate identifies, with host_identity: certificate, the client
+	// certificate that names hostname (certificateID); "" otherwise.
+	certificate string
 
 	edges        map[edgeID]*edgeInput
 	listeners    map[listenerID]*listenerInput
