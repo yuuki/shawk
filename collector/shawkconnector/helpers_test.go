@@ -578,6 +578,7 @@ type series struct {
 	transport                              string
 	errType                                string
 	peerHost                               string // shawk.peer.host
+	localNet, peerNet                      string // shawk.local.network, shawk.peer.network
 	agent                                  bool
 	port                                   int64
 	value                                  float64
@@ -606,6 +607,7 @@ func flatten(md pmetric.Metrics) []series {
 					agent, _ := a.Get(attrPeerAgent)
 					out = append(out, series{job: job, instance: inst, metric: m.Name(), peer: getString(a, attrPeerService),
 						agent: agent.Bool(), errType: getString(a, attrErrorType), peerHost: getString(a, attrPeerHost),
+						localNet: getString(a, attrLocalNetwork), peerNet: getString(a, attrPeerNetwork),
 						role: getString(a, attrRole), dir: getString(a, attrIODirection), port: port, value: v, count: c,
 						transport: getString(a, attrTransport)})
 				}

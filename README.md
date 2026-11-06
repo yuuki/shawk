@@ -118,7 +118,8 @@ The Grafana dashboards:
 - **Dependency details**: traffic, failures by reason, RTT and connect time
   of each dependency, with its first and last seen times.
 - **Peer hosts**: with `peer_hosts` in the connector, the hosts towards
-  the selected services, and failures and connect time by peer host.
+  the selected services, and failures and connect time by peer host; with
+  `networks`, the networks the connections use.
 - **Changes**: dependencies that appeared or disappeared.
 - **Application layer (OBI)**: OBI's RED metrics next to the dependencies of
   the same service.

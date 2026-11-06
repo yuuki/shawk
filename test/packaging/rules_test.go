@@ -270,6 +270,46 @@ eval instant at 10m ` + r("shawk:host_dependency_retransmits:rate5m") + `
 	promqltest.RunTest(t, script, promqltest.NewTestEngine(t, false, 0, promqltest.DefaultMaxSamplesPerQuery))
 }
 
+// The family per peer host with networks in the connector: slurmctld on
+// ctl-01 reaches the slurmd of node-01 over the management network and
+// over IPoIB, and node-01 serves a client without an agent over IPoIB at an
+// address in no network.
+const hostNetworkSeries = `
+load 1m
+  shawk_host_connection_opened_total{job="slurmctld", instance="ctl-01", shawk_role="client", service_peer_name="slurmd", shawk_peer_agent="true", shawk_peer_host="node-01", shawk_local_network="mgmt", shawk_peer_network="mgmt", server_port="6818", network_transport="tcp"} 0+60x10
+  shawk_host_connection_opened_total{job="slurmctld", instance="ctl-01", shawk_role="client", service_peer_name="slurmd", shawk_peer_agent="true", shawk_peer_host="node-01", shawk_local_network="ib", shawk_peer_network="ib", server_port="6818", network_transport="tcp"} 0+120x10
+  shawk_host_connection_opened_total{job="slurmd", instance="node-01", shawk_role="server", service_peer_name="slurmctld", shawk_peer_agent="true", shawk_peer_host="ctl-01", shawk_local_network="mgmt", shawk_peer_network="mgmt", server_port="6818", network_transport="tcp"} 0+60x10
+  shawk_host_connection_opened_total{job="slurmd", instance="node-01", shawk_role="server", service_peer_name="slurmctld", shawk_peer_agent="true", shawk_peer_host="ctl-01", shawk_local_network="ib", shawk_peer_network="ib", server_port="6818", network_transport="tcp"} 0+120x10
+  shawk_host_connection_opened_total{job="slurmd", instance="node-01", shawk_role="server", service_peer_name="~unresolved", shawk_peer_agent="false", shawk_peer_host="~unknown", shawk_local_network="ib", shawk_peer_network="~unknown", server_port="6818", network_transport="tcp"} 0+180x10
+  shawk_host_tcp_retransmits_total{job="slurmd", instance="node-01", shawk_role="server", service_peer_name="~unresolved", shawk_peer_agent="false", shawk_peer_host="~unknown", shawk_local_network="ib", shawk_peer_network="~unknown", server_port="6818", network_transport="tcp"} 0+60x10
+`
+
+// TestHostRecordingRulesNetworks: the rules of the family per peer host keep
+// the networks of the client and of the server, from either side, as
+// src_network and dst_network.
+func TestHostRecordingRulesNetworks(t *testing.T) {
+	records, _ := loadRules(t)
+	r := func(name string) string {
+		e, ok := records[name]
+		if !ok {
+			t.Fatalf("no recording rule %s", name)
+		}
+		return inline(e, nil)
+	}
+	node1 := `src_host="ctl-01", src="slurmctld", dst_host="node-01", dst="slurmd", server_port="6818", network_transport="tcp"`
+	unknown := `src_host="~unknown", src="~unresolved", dst_host="node-01", dst="slurmd", server_port="6818", network_transport="tcp"`
+	script := hostNetworkSeries + `
+eval instant at 10m ` + r("shawk:host_dependency_connections:rate5m") + `
+  {` + node1 + `, src_network="mgmt", dst_network="mgmt"} 1
+  {` + node1 + `, src_network="ib", dst_network="ib"} 2
+  {` + unknown + `, src_network="~unknown", dst_network="ib"} 3
+
+eval instant at 10m ` + r("shawk:host_dependency_retransmits:rate5m") + `
+  {` + unknown + `, src_network="~unknown", dst_network="ib", shawk_role="server"} 1
+`
+	promqltest.RunTest(t, script, promqltest.NewTestEngine(t, false, 0, promqltest.DefaultMaxSamplesPerQuery))
+}
+
 func TestAlerts(t *testing.T) {
 	records, alerts := loadRules(t)
 	a := func(name string) string {

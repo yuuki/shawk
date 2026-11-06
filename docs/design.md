@@ -1004,6 +1004,23 @@ compute nodes of a cluster costs about 12 series per pair, service and
 port, so measure the label combinations before enabling the family widely.
 A series lives until both idle TTLs pass after its last activity.
 
+A node of an HPC cluster has addresses on several networks (management,
+IPoIB or fast Ethernet, storage, BMC), and the peer host does not tell
+which one a connection used. `networks` names their ranges (e.g. `mgmt:
+10.0.0.0/16`, `ib: 10.10.0.0/16, fd00:10::/32`) and needs `peer_hosts`:
+the family then carries `shawk.local.network` and `shawk.peer.network`,
+the networks of the local and the peer address of each edge, so that NFS
+traffic over the management network rather than the storage network
+shows. The narrowest range wins. An address in none is `~unknown` if it is
+not routed on the Internet, loopback included, and `~external` otherwise,
+as is a folded peer unless a range holds its whole network. The ranges are
+parsed as those of `peer_cidrs` (`ranges.go`): names neither empty nor
+starting with `~`, one name per prefix, IPv4-mapped prefixes unmapped. A
+host and service reach a peer host over one pair of networks as a rule, so
+the networks add series only for the dependencies that use several; the
+outputs outside the family, and the family without `networks`, do not
+change.
+
 Prometheus needs `--web.enable-otlp-receiver`,
 `otlp.promote_resource_attributes: [host.id, host.name]` and a 30-minute
 out-of-order window.
@@ -1416,10 +1433,13 @@ dependency is counted right, but the sum into the server counts those
 clients twice, since the server cannot tell its clients apart.
 
 The family per peer host (§5.3) is counted once the same way, per metric,
-by `shawk:host_dependency_…{src_host, src, dst_host, dst, server_port,
-network_transport}`: `src_host` is the host of the client and `dst_host`
-that of the server, on the client side its `instance` (the host name) and
-its `shawk_peer_host`, on the server side the other way round.
+by `shawk:host_dependency_…{src_host, src, src_network, dst_host, dst,
+dst_network, server_port, network_transport}`: `src_host` is the host of
+the client and `dst_host` that of the server, on the client side its
+`instance` (the host name) and its `shawk_peer_host`, on the server side
+the other way round. `src_network` and `dst_network` are the networks of
+their addresses likewise, from `shawk_local_network` and
+`shawk_peer_network`, and are not set without `networks`.
 
 | metric | per dependency | recording rules (`shawk:host_dependency_…`) |
 |---|---|---|
@@ -1437,7 +1457,9 @@ dependency details, peer hosts, changes, application layer of OBI) and
 alert rules. The peer hosts dashboard needs `peer_hosts` (§5.3): the hosts
 towards the selected services, and failures, connect times and traffic by
 peer host; a host that accepts no connection, such as one that is down,
-shows a failure ratio of 100%.
+shows a failure ratio of 100%. With `networks`, a table gives the
+connections and bytes of the selected services by the networks of the
+client and the server.
 
 PostgreSQL alerts use the time series format, with every row at `now()` so
 each series has a value at the last time; a query that finds nothing
@@ -1605,6 +1627,11 @@ only the protocols it parses. shawk runs beside it:
   (§4.3). Node states map to hosts through the inventory, and alerts in
   Prometheus stop only for the states of a Slurm exporter, not for the
   windows of `maintenance_file` (§5.7, §8).
+- **Networks** (§5.3) classify the addresses at the two ends of an edge,
+  not the path or the interface: they do not tell apart the NICs of one
+  subnet or of a bond, and a connection routed between two networks has
+  the network of each end. A container behind NAT has the network of its
+  own address, not of its host's.
 - **Flow table capacity**: when more distinct flows than `-max-flows` occur
   in one interval, updates are dropped and counted in
   `shawk.agent.flows.dropped`, and the period is partly observed

@@ -187,102 +187,117 @@ groups:
   # dst_host that of the server: on the client side its instance (the host
   # name) and its shawk_peer_host, on the server side the other way round.
   # A peer whose host is not certain is ~unknown, or ~external for a public
-  # address.
+  # address. With networks in the connector, src_network and dst_network
+  # are the networks of the addresses of the client and of the server, from
+  # shawk_local_network and shawk_peer_network of the side counted; without
+  # networks, they are not set.
   - name: shawk-host-dependencies
     rules:
       - record: shawk:host_dependency_connections:rate5m
         expr: |
-          sum by (src_host, src, dst_host, dst, server_port, network_transport) (
-              label_replace(label_replace(label_replace(label_replace(
+          sum by (src_host, src, src_network, dst_host, dst, dst_network, server_port, network_transport) (
+              label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(
                 rate(shawk_host_connection_opened_total{shawk_role="client"}[5m]),
                 "src_host", "$1", "instance", "(.*)"), "src", "$1", "job", "(.*)"),
-                "dst_host", "$1", "shawk_peer_host", "(.*)"), "dst", "$1", "service_peer_name", "(.*)")
+                "dst_host", "$1", "shawk_peer_host", "(.*)"), "dst", "$1", "service_peer_name", "(.*)"),
+                "src_network", "$1", "shawk_local_network", "(.*)"), "dst_network", "$1", "shawk_peer_network", "(.*)")
             or
-              label_replace(label_replace(label_replace(label_replace(
+              label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(
                 rate(shawk_host_connection_opened_total{shawk_role="server", shawk_peer_agent="false"}[5m]),
                 "dst_host", "$1", "instance", "(.*)"), "dst", "$1", "job", "(.*)"),
-                "src_host", "$1", "shawk_peer_host", "(.*)"), "src", "$1", "service_peer_name", "(.*)")
+                "src_host", "$1", "shawk_peer_host", "(.*)"), "src", "$1", "service_peer_name", "(.*)"),
+                "src_network", "$1", "shawk_peer_network", "(.*)"), "dst_network", "$1", "shawk_local_network", "(.*)")
           )
 
       # Failures exist on the client side only, by reason.
       - record: shawk:host_dependency_connection_failures_by_reason:rate5m
         expr: |
-          sum by (src_host, src, dst_host, dst, server_port, network_transport, error_type) (
-            label_replace(label_replace(label_replace(label_replace(
+          sum by (src_host, src, src_network, dst_host, dst, dst_network, server_port, network_transport, error_type) (
+            label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(
               rate(shawk_host_connection_failed_by_reason_total{shawk_role="client"}[5m]),
               "src_host", "$1", "instance", "(.*)"), "src", "$1", "job", "(.*)"),
-              "dst_host", "$1", "shawk_peer_host", "(.*)"), "dst", "$1", "service_peer_name", "(.*)")
+              "dst_host", "$1", "shawk_peer_host", "(.*)"), "dst", "$1", "service_peer_name", "(.*)"),
+              "src_network", "$1", "shawk_local_network", "(.*)"), "dst_network", "$1", "shawk_peer_network", "(.*)")
           )
 
       # The mean time to connect is handshake_sum / handshake_count.
       - record: shawk:host_dependency_handshake_seconds_sum:rate5m
         expr: |
-          sum by (src_host, src, dst_host, dst, server_port, network_transport) (
-            label_replace(label_replace(label_replace(label_replace(
+          sum by (src_host, src, src_network, dst_host, dst, dst_network, server_port, network_transport) (
+            label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(
               rate(shawk_host_tcp_handshake_seconds_sum{shawk_role="client"}[5m]),
               "src_host", "$1", "instance", "(.*)"), "src", "$1", "job", "(.*)"),
-              "dst_host", "$1", "shawk_peer_host", "(.*)"), "dst", "$1", "service_peer_name", "(.*)")
+              "dst_host", "$1", "shawk_peer_host", "(.*)"), "dst", "$1", "service_peer_name", "(.*)"),
+              "src_network", "$1", "shawk_local_network", "(.*)"), "dst_network", "$1", "shawk_peer_network", "(.*)")
           )
       - record: shawk:host_dependency_handshake_seconds_count:rate5m
         expr: |
-          sum by (src_host, src, dst_host, dst, server_port, network_transport) (
-            label_replace(label_replace(label_replace(label_replace(
+          sum by (src_host, src, src_network, dst_host, dst, dst_network, server_port, network_transport) (
+            label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(
               rate(shawk_host_tcp_handshake_seconds_count{shawk_role="client"}[5m]),
               "src_host", "$1", "instance", "(.*)"), "src", "$1", "job", "(.*)"),
-              "dst_host", "$1", "shawk_peer_host", "(.*)"), "dst", "$1", "service_peer_name", "(.*)")
+              "dst_host", "$1", "shawk_peer_host", "(.*)"), "dst", "$1", "service_peer_name", "(.*)"),
+              "src_network", "$1", "shawk_local_network", "(.*)"), "dst_network", "$1", "shawk_peer_network", "(.*)")
           )
 
       - record: shawk:host_dependency_syn_retransmits:rate5m
         expr: |
-          sum by (src_host, src, dst_host, dst, server_port, network_transport) (
-            label_replace(label_replace(label_replace(label_replace(
+          sum by (src_host, src, src_network, dst_host, dst, dst_network, server_port, network_transport) (
+            label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(
               rate(shawk_host_tcp_syn_retransmits_total{shawk_role="client"}[5m]),
               "src_host", "$1", "instance", "(.*)"), "src", "$1", "job", "(.*)"),
-              "dst_host", "$1", "shawk_peer_host", "(.*)"), "dst", "$1", "service_peer_name", "(.*)")
+              "dst_host", "$1", "shawk_peer_host", "(.*)"), "dst", "$1", "service_peer_name", "(.*)"),
+              "src_network", "$1", "shawk_local_network", "(.*)"), "dst_network", "$1", "shawk_peer_network", "(.*)")
           )
 
       # Bytes from the client to the server, and from the server to the
       # client.
       - record: shawk:host_dependency_request_bytes:rate5m
         expr: |
-          sum by (src_host, src, dst_host, dst, server_port, network_transport) (
-              label_replace(label_replace(label_replace(label_replace(
+          sum by (src_host, src, src_network, dst_host, dst, dst_network, server_port, network_transport) (
+              label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(
                 rate(shawk_host_network_io_bytes_total{shawk_role="client", network_io_direction="transmit"}[5m]),
                 "src_host", "$1", "instance", "(.*)"), "src", "$1", "job", "(.*)"),
-                "dst_host", "$1", "shawk_peer_host", "(.*)"), "dst", "$1", "service_peer_name", "(.*)")
+                "dst_host", "$1", "shawk_peer_host", "(.*)"), "dst", "$1", "service_peer_name", "(.*)"),
+                "src_network", "$1", "shawk_local_network", "(.*)"), "dst_network", "$1", "shawk_peer_network", "(.*)")
             or
-              label_replace(label_replace(label_replace(label_replace(
+              label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(
                 rate(shawk_host_network_io_bytes_total{shawk_role="server", shawk_peer_agent="false", network_io_direction="receive"}[5m]),
                 "dst_host", "$1", "instance", "(.*)"), "dst", "$1", "job", "(.*)"),
-                "src_host", "$1", "shawk_peer_host", "(.*)"), "src", "$1", "service_peer_name", "(.*)")
+                "src_host", "$1", "shawk_peer_host", "(.*)"), "src", "$1", "service_peer_name", "(.*)"),
+                "src_network", "$1", "shawk_peer_network", "(.*)"), "dst_network", "$1", "shawk_local_network", "(.*)")
           )
       - record: shawk:host_dependency_response_bytes:rate5m
         expr: |
-          sum by (src_host, src, dst_host, dst, server_port, network_transport) (
-              label_replace(label_replace(label_replace(label_replace(
+          sum by (src_host, src, src_network, dst_host, dst, dst_network, server_port, network_transport) (
+              label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(
                 rate(shawk_host_network_io_bytes_total{shawk_role="client", network_io_direction="receive"}[5m]),
                 "src_host", "$1", "instance", "(.*)"), "src", "$1", "job", "(.*)"),
-                "dst_host", "$1", "shawk_peer_host", "(.*)"), "dst", "$1", "service_peer_name", "(.*)")
+                "dst_host", "$1", "shawk_peer_host", "(.*)"), "dst", "$1", "service_peer_name", "(.*)"),
+                "src_network", "$1", "shawk_local_network", "(.*)"), "dst_network", "$1", "shawk_peer_network", "(.*)")
             or
-              label_replace(label_replace(label_replace(label_replace(
+              label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(
                 rate(shawk_host_network_io_bytes_total{shawk_role="server", shawk_peer_agent="false", network_io_direction="transmit"}[5m]),
                 "dst_host", "$1", "instance", "(.*)"), "dst", "$1", "job", "(.*)"),
-                "src_host", "$1", "shawk_peer_host", "(.*)"), "src", "$1", "service_peer_name", "(.*)")
+                "src_host", "$1", "shawk_peer_host", "(.*)"), "src", "$1", "service_peer_name", "(.*)"),
+                "src_network", "$1", "shawk_peer_network", "(.*)"), "dst_network", "$1", "shawk_local_network", "(.*)")
           )
 
       # Retransmissions from both sides; shawk_role is the sender.
       - record: shawk:host_dependency_retransmits:rate5m
         expr: |
-          sum by (src_host, src, dst_host, dst, server_port, network_transport, shawk_role) (
-              label_replace(label_replace(label_replace(label_replace(
+          sum by (src_host, src, src_network, dst_host, dst, dst_network, server_port, network_transport, shawk_role) (
+              label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(
                 rate(shawk_host_tcp_retransmits_total{shawk_role="client"}[5m]),
                 "src_host", "$1", "instance", "(.*)"), "src", "$1", "job", "(.*)"),
-                "dst_host", "$1", "shawk_peer_host", "(.*)"), "dst", "$1", "service_peer_name", "(.*)")
+                "dst_host", "$1", "shawk_peer_host", "(.*)"), "dst", "$1", "service_peer_name", "(.*)"),
+                "src_network", "$1", "shawk_local_network", "(.*)"), "dst_network", "$1", "shawk_peer_network", "(.*)")
             or
-              label_replace(label_replace(label_replace(label_replace(
+              label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(
                 rate(shawk_host_tcp_retransmits_total{shawk_role="server"}[5m]),
                 "dst_host", "$1", "instance", "(.*)"), "dst", "$1", "job", "(.*)"),
-                "src_host", "$1", "shawk_peer_host", "(.*)"), "src", "$1", "service_peer_name", "(.*)")
+                "src_host", "$1", "shawk_peer_host", "(.*)"), "src", "$1", "service_peer_name", "(.*)"),
+                "src_network", "$1", "shawk_peer_network", "(.*)"), "dst_network", "$1", "shawk_local_network", "(.*)")
           )
 
   - name: shawk-alerts

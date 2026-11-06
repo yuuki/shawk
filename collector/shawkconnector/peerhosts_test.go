@@ -440,22 +440,30 @@ func TestPeerHostLocalMove(t *testing.T) {
 	}
 }
 
-// TestPackagedPeerHostsExample: the example of the outputs per peer host
-// commented out in the packaged configuration is valid.
+// TestPackagedPeerHostsExample: the example of the outputs per peer host and
+// their networks commented out in the packaged configuration is valid.
 func TestPackagedPeerHostsExample(t *testing.T) {
 	b, err := os.ReadFile(filepath.Join(packaging, "collector/config.yaml"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	var lines []string
+	inNetworks := false
 	for _, l := range strings.Split(string(b), "\n") {
-		for _, k := range []string{"peer_hosts:", "max_peer_hosts:", "peer_host_services:"} {
+		// The ranges of networks follow it, indented.
+		if inNetworks && strings.HasPrefix(l, "    #   ") {
+			lines = append(lines, strings.TrimPrefix(l, "    # "))
+			continue
+		}
+		inNetworks = false
+		for _, k := range []string{"peer_hosts:", "max_peer_hosts:", "peer_host_services:", "networks:"} {
 			if strings.HasPrefix(l, "    # "+k) {
 				lines = append(lines, strings.TrimPrefix(l, "    # "))
+				inNetworks = k == "networks:"
 			}
 		}
 	}
-	if len(lines) != 3 {
+	if len(lines) != 7 {
 		t.Fatalf("example = %q", lines)
 	}
 	var raw map[string]any
@@ -470,7 +478,8 @@ func TestPackagedPeerHostsExample(t *testing.T) {
 	if err := cfg.Validate(); err != nil {
 		t.Error(err)
 	}
-	if !cfg.PeerHosts || cfg.MaxPeerHosts != 500 || !slices.Equal(cfg.PeerHostServices, []string{"slurmctld", "prometheus"}) {
+	if !cfg.PeerHosts || cfg.MaxPeerHosts != 500 || !slices.Equal(cfg.PeerHostServices, []string{"slurmctld", "prometheus"}) ||
+		len(cfg.Networks) != 3 {
 		t.Errorf("config = %+v", cfg)
 	}
 }

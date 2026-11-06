@@ -1,6 +1,7 @@
 package shawkconnector
 
 import (
+	"net/netip"
 	"time"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -124,6 +125,9 @@ type outKey struct {
 	port      uint16
 	peerAddr  string // with keep_peer_address
 	peerHost  string // shawk.peer.host, of the outputs per peer host
+	// localNet and peerNet are shawk.local.network and shawk.peer.network,
+	// of the outputs per peer host with networks.
+	localNet, peerNet string
 }
 
 type outSeries struct {
@@ -198,6 +202,10 @@ type aggregator struct {
 	maxPeerHosts     int
 	peerHostServices map[string]bool
 	peerHostsUsed    map[peerHostGroup]map[string]time.Time
+	// networks are the ranges of networks, narrowest first, whose names the
+	// outputs per peer host carry for the addresses of their edges; nil
+	// without networks.
+	networks []namedPrefix
 
 	// maxInputs bounds the input series of a host (0: unbounded); dropped
 	// counts the new ones dropped beyond it, until they are taken.
@@ -235,6 +243,38 @@ func (a *aggregator) setPeerHosts(maxPeerHosts int, services []string) {
 			a.peerHostServices[s] = true
 		}
 	}
+}
+
+// setNetworks makes the outputs per peer host carry the networks of the
+// local and the peer address of their edges, after ranges sorted narrowest
+// first.
+func (a *aggregator) setNetworks(ranges []namedPrefix) {
+	a.networks = make([]namedPrefix, len(ranges))
+	for i, p := range ranges {
+		a.networks[i] = namedPrefix{name: cutLabel(p.name, maxLabelValue), prefix: p.prefix}
+	}
+}
+
+// networkOf names the network of an address of an edge (shawk.local.network,
+// shawk.peer.network): the narrowest range of networks that holds it,
+// ~unknown for another address not routed on the Internet, and ~external
+// otherwise. A folded peer, which stands for every address outside the
+// internal ranges of its agent, is in a range that holds the whole network
+// of its family, or ~external.
+func (a *aggregator) networkOf(addr netip.Addr, folded bool) string {
+	if folded {
+		if name, ok := wholeRangeOf(a.networks, addr); ok {
+			return name
+		}
+		return networkExternal
+	}
+	if name, ok := rangeOf(a.networks, addr); ok {
+		return name
+	}
+	if isPrivate(addr) {
+		return networkUnknown
+	}
+	return networkExternal
 }
 
 // peerHostsOf tells whether the edges of a local service to a peer service
@@ -429,6 +469,12 @@ func (a *aggregator) addEdge(b *hostBatch, h *hostOutputs, e *edgeInput, peerOf 
 		// address of the host it is.
 		base.peerAddr = e.id.peerString()
 	}
+	// The networks of the addresses of the edge, for its outputs per peer
+	// host. They classify the addresses, not the path or the interface.
+	var localNet, peerNet string
+	if peerHost != "" && a.networks != nil {
+		localNet, peerNet = a.networkOf(e.id.local, false), a.networkOf(e.id.peer, e.id.folded)
+	}
 	for vk, pt := range e.values {
 		m, ok := outMetrics[vk.metric]
 		if !ok {
@@ -446,7 +492,7 @@ func (a *aggregator) addEdge(b *hostBatch, h *hostOutputs, e *edgeInput, peerOf 
 		start := clampTime(toConnector(pt.start.AsTime()), a.started, now)
 		r.account(key, m, ik, pt, dv, dc, start, now)
 		if hm, ok := hostMetrics[vk.metric]; ok && peerHost != "" {
-			key.metric, key.peerHost = hm, peerHost
+			key.metric, key.peerHost, key.localNet, key.peerNet = hm, peerHost, localNet, peerNet
 			r.account(key, outMetrics[hm], ik, pt, dv, dc, start, now)
 		}
 	}
@@ -798,6 +844,10 @@ func putPointAttrs(attrs pcommon.Map, key outKey) {
 	}
 	if key.peerHost != "" {
 		attrs.PutStr(attrPeerHost, key.peerHost)
+	}
+	if key.localNet != "" {
+		attrs.PutStr(attrLocalNetwork, key.localNet)
+		attrs.PutStr(attrPeerNetwork, key.peerNet)
 	}
 }
 
