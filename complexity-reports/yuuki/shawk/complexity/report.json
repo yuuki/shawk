@@ -1,9 +1,9 @@
 {
   "repository": "yuuki/shawk/complexity",
   "ref": "refs/heads/main",
-  "commit": "e8ec464efc717a14c5cb59c32a463e9ff7593bc0",
+  "commit": "a22638315c785e7b1f58b215fae2a64869e541fa",
   "base_ref": "refs/heads/main",
-  "timestamp": "2026-11-06T13:19:09.80821474Z",
+  "timestamp": "2026-11-07T01:37:54.526077272Z",
   "custom_metrics": [
     {
       "key": "code_complexity",
@@ -12,12 +12,12 @@
         {
           "key": "function_count",
           "name": "Function count",
-          "value": 617
+          "value": 619
         },
         {
           "key": "cognitive_sum",
           "name": "Cognitive: total",
-          "value": 2738
+          "value": 2744
         },
         {
           "key": "cognitive_max",
@@ -37,7 +37,7 @@
         {
           "key": "cyclomatic_sum",
           "name": "Cyclomatic: total",
-          "value": 2798
+          "value": 2804
         },
         {
           "key": "cyclomatic_max",
