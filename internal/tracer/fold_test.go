@@ -97,6 +97,20 @@ func checkFolded(t *testing.T, flows []Flow, dir Direction, proto Proto, port ui
 	return f
 }
 
+// logFlows logs the flows of a snapshot on port, and its drops, so that a
+// failed check shows what was collected.
+func logFlows(t *testing.T, what string, snap *Snapshot, port uint16) {
+	t.Helper()
+	t.Logf("%s: drops %d (contended %d), flows on port %d:", what, snap.Drops, snap.Contended, port)
+	for _, f := range snap.Flows {
+		if f.Port == port {
+			t.Logf("  %s %s %s %s netns %d cgroup %d comm %q folded %t: conns %d open %d sent %d recv %d",
+				f.Direction, f.Proto, f.LocalAddr, f.RemoteAddr, f.NetNS, f.CgroupID, f.Comm, f.Folded,
+				f.Conns, f.OpenConns, f.BytesSent, f.BytesRecv)
+		}
+	}
+}
+
 // TestFoldIncomingTCP checks that the external clients of a local server
 // are folded into one flow, also a connection adopted at startup, while an
 // internal client and the client side keep their addresses; and that
@@ -120,6 +134,18 @@ func TestFoldIncomingTCP(t *testing.T) {
 			}
 			roundTrip(t, adopted, 1000)
 			snap := collect(t, tr)
+			// The adopted connection had no flow once on 5.15 (#131): show
+			// what was collected instead, and whether the next interval
+			// has it, as it would if the walk of New() missed the socket
+			// and that of the first Collect adopted it.
+			defer func() {
+				if !t.Failed() {
+					return
+				}
+				logFlows(t, "first collection", snap, srv.Port())
+				roundTrip(t, adopted, 1)
+				logFlows(t, "next collection", collect(t, tr), srv.Port())
+			}()
 
 			checkFolded(t, snap.Flows, DirIn, ProtoTCP, srv.Port(), netip.MustParseAddr("10.9.0.1"), false)
 			if out := checkFolded(t, snap.Flows, DirOut, ProtoTCP, srv.Port(), srv.Addr(), false); out != nil && out.Conns != 4 {

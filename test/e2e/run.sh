@@ -405,7 +405,30 @@ wait_for 30 "the agent of all namespaces to report" node_alive
 node_sql="$(deps_sql "client_host = 'node-01' AND server_host = 'node-01'")"
 node_want="$(want_deps node-01 node-01 node-01 node-01)"
 node_written() { [[ "$(sql "$node_sql" 2>/dev/null)" == "$node_want" ]]; }
-poll 60 node_written || true
+# node_udp_diag: what node-01 recorded of the UDP dependency puma → named,
+# whose row it sometimes misses (#162): its edges of port 5353 by role, its
+# listeners of the port, and the UDP sockets of app and db, so that a
+# failure tells which side is missing, or whether both are and they were
+# not matched.
+node_udp_diag() {
+	echo "--- UDP edges of node-01 on port 5353" >&2
+	sql "SELECT e.role, host(e.local_addr), host(e.remote_addr), e.netns, p.unit, p.comm, p.service_name,
+       e.first_seen, e.last_seen
+FROM shawk.edges e JOIN shawk.hosts h ON h.id = e.host_id JOIN shawk.processes p ON p.id = e.process_id
+WHERE h.hostname = 'node-01' AND e.proto = 'udp' AND e.port = 5353
+ORDER BY e.role, e.first_seen" >&2 || true
+	echo "--- UDP listeners of node-01 on port 5353" >&2
+	sql "SELECT host(l.addr), l.netns, coalesce(p.unit, '-'), coalesce(p.comm, '-'), l.first_seen, l.last_seen
+FROM shawk.listeners l JOIN shawk.hosts h ON h.id = l.host_id LEFT JOIN shawk.processes p ON p.id = l.process_id
+WHERE h.hostname = 'node-01' AND l.proto = 'udp' AND l.port = 5353" >&2 || true
+	for h in app db; do
+		echo "--- UDP sockets of $h" >&2
+		ip netns exec "$PREFIX-$h" ss -Huanp >&2 || true
+	done
+}
+if ! poll 60 node_written && $UDP && ! sql "$node_sql" | grep -q ' udp 5353 '; then
+	node_udp_diag
+fi
 check "dependencies on a host whose namespaces are all traced" "$node_sql" "$node_want"
 
 echo "PASS"
