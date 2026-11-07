@@ -53,7 +53,9 @@ measured on a cluster yet.**
   export take longer never sends the last request of an interval, which
   carries the metrics of the agent. It happened in every interval with
   48 384 and 96 768 edges when the host was busy, and not once when it was
-  not; it is a bug of the agent, #194.
+  not; it is a bug of the agent, #194, fixed since: each request has a
+  deadline of its own, and the requests of an interval together 4
+  intervals.
 - **Jobs on all CPUs are slowed by the agent; jobs off a reserved CPU are
   not, measurably.** An `MPI_Allreduce` loop over TCP on all 8 CPUs ran
   3.7 % longer (median of 5) with the agent and had 184 instead of 38

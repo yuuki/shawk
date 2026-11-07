@@ -487,7 +487,8 @@ functions that the socket operations point to, and so are never inlined:
   (alert `ShawkCgroupEventsDropped`), and such a cgroup is named by its id.
 - A container is named after what survives its recreation:
   `k8s/<namespace>/<workload>/<container>` for Kubernetes,
-  `docker/<project>/<service>` for Docker Compose, otherwise
+  `docker/<project>/<service>` for Docker Compose,
+  `docker/swarm/<service>` for Docker Swarm, otherwise
   `docker/<name>`, `podman/<name>` or `containerd/<name>` (nerdctl); its id
   is `container.id`. The id comes from the cgroup path and the names from
   the state the runtime keeps on disk (`internal/procinfo`), because the
@@ -520,11 +521,25 @@ functions that the socket operations point to, and so are never inlined:
   unit (`user@1000.service/podman-0123456789ab`). Name parts are limited to
   `[A-Za-z0-9_.-]` and 253 characters, so they cannot add a level to the
   unit or the `job`.
+- The state is read where the runtimes of the host keep it: the bundles of
+  containerd under `/run/containerd`, and under `/run/k3s/containerd` (k3s,
+  rke2) and `/var/snap/microk8s/common/run/containerd` (microk8s), which
+  run their own; containers/storage of Podman and CRI-O; and the data root
+  of every `dockerd` of root in the mount namespace of PID 1, from
+  `--data-root` on its command line or `data-root` in its configuration
+  file (`--config-file`, `/etc/docker/daemon.json`), found again every
+  minute. The agent reads no other command line, and keeps nothing else of
+  it; a process of a user, or the `dockerd` of a container, does not tell
+  where to read.
+- The tasks of a service of Docker Swarm are named `docker/swarm/<service>`
+  when their container has the name Swarm gives it,
+  `<service>.<slot>.<task id>`, and the labels `com.docker.swarm.*` that
+  match it, which Swarm sets over those of the image.
 - A container whose state cannot be read is named
   `<runtime>-<12 hex digits>`, which changes when it is recreated: rootless
-  containers, runtimes with another state directory (`data-root` on the
-  `dockerd` command line, k3s, rke2, microk8s), `ctr run`. A container in a
-  container (Docker in Docker, kind) is named after the outer one.
+  containers, runtimes with another state directory (containerd with
+  `--state`), `ctr run`. A container in a container (Docker in Docker,
+  kind) is named after the outer one.
 - The workload of a pod is its name without the suffixes Kubernetes appends
   (`web-5d8f7c9b6-x7z2k` → `web`, `db-0` → `db`); a long workload name may
   lose its end where the API server cut the generated name.
@@ -692,6 +707,14 @@ which include containers.
   the interval; after a failed request the rest is not sent. Translations of
   other hosts may arrive later, so a client edge may lack its translation
   for an interval.
+- Each request has a deadline of 2/3 of the interval (at least a second)
+  from when it is sent, so that a host with many requests sends them all
+  when they take longer together; the requests of an interval together
+  take at most 4 intervals. A collection waits for the requests of the
+  previous interval, so the intervals of a host whose requests take longer
+  than an interval are as long as its requests take, which the agent logs
+  (at most every 10 minutes). In a VM of 8 vCPUs, 96 768 edges took 149
+  requests and 4.7 s to a local sink, and 9 s on a busy host.
 - Counters are cumulative, so a failed request is made up for by the next
   one, and requests are not retried.
 - A series idle (no connections, bytes, datagrams or open connections) for
@@ -967,11 +990,21 @@ the host name; `host.id` and `host.name` are promoted to labels.
   the connector's time, so one host with a wrong clock does not make
   Prometheus reject a batch. Errors downstream are logged, not returned to
   the agent, since the request was taken for PostgreSQL.
-- This state requires the data of a host to reach the same connector, so
-  run one connector per fleet. Spreading hosts over connectors (the
-  loadbalancing exporter routing by resource) is not reliable yet: the
-  resource changes with `host.ip`, `service.version` and
-  `shawk.peer.internal`, so a host may move and be counted twice (#128).
+- This state requires the data of a host to reach the same connector: a
+  host that moves to another connector and back within `idle_ttl` is
+  counted twice, since the first still holds the values it saw before.
+  Run one connector per fleet, or spread the hosts over connectors by the
+  configuration of the agents, each with the endpoint of one connector
+  (e.g. per group of hosts), so that a host moves only when its
+  configuration changes. A front collector with the `load_balancing`
+  exporter (`packaging/collector/front.yaml`) must route by `host.id` and
+  `host.name` (`routing_key: attributes`), not by resource, which changes
+  with `host.ip`, `service.version` and `shawk.peer.internal` (#128); over
+  a static list of connectors, since a change of the list moves hosts;
+  and without the queues of the exporter and of its OTLP exporters, which
+  would reorder the requests of a host (§4.3). The connectors behind it
+  see its certificate, not the agent's, so they run with
+  `host_identity: none` (§5.5).
 - The agents' metrics (§4.2) except `shawk.agent.segment.start` are
   forwarded under `job="shawk-agent"`, rebuilt with only the expected type,
   unit and attributes (`shawk.netns.scope`, `shawk.bpf.program`), so an

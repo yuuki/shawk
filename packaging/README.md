@@ -8,6 +8,7 @@ order of the steps and what the files leave out.
 |---|---|
 | `systemd/` | units of the agent and the collector, and their environment files |
 | `collector/config.yaml` | the collector: `otlp/shawk` for agents, `otlp` for OBI, the shawk connector, exporters to Prometheus and a trace store |
+| `collector/front.yaml` | a front collector that spreads agents over several connectors by `host.id` and `host.name`; read its caveats first |
 | `postgres/` | roles (`shawk_owner`, `shawk_connector`, `shawk_grafana`), database and privileges |
 | `prometheus/` | settings for the OTLP push, TLS and users (`web.yml`), recording rules and alerts (`shawk-rules.yml`) |
 | `grafana/` | data sources (uids `shawk-postgres`, `shawk-prometheus`), dashboards and alert rules |

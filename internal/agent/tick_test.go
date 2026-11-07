@@ -451,3 +451,111 @@ func TestTickTranslations(t *testing.T) {
 		t.Errorf("traced = %d, dropped = %d", traced, dropped)
 	}
 }
+
+// slowExporter takes delay for every request, or until the deadline of the
+// request, and records the time each request had left when it was sent.
+type slowExporter struct {
+	delay time.Duration
+	left  []time.Duration
+	sent  []*colmetricspb.ExportMetricsServiceRequest
+}
+
+func (e *slowExporter) Export(ctx context.Context, req *colmetricspb.ExportMetricsServiceRequest) error {
+	if d, ok := ctx.Deadline(); ok {
+		e.left = append(e.left, time.Until(d))
+	}
+	select {
+	case <-time.After(e.delay):
+		e.sent = append(e.sent, req)
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (e *slowExporter) Close() error { return nil }
+
+// slowAgent returns an agent with an interval of 600 ms, so that a request
+// may take a second (exportTimeout) and the requests of an interval 2.4 s
+// (sendTimeout), which sends flows to as many ports as given, one series
+// per request.
+func slowAgent(t *testing.T, exp otlp.Exporter, ports int) *Agent {
+	t.Helper()
+	var flows []tracer.Flow
+	for i := range ports {
+		flows = append(flows, flow(tracer.DirOut, uint16(5000+i), unknownCgroup, 1))
+	}
+	a := newTestAgent(&fakeSource{snaps: []*tracer.Snapshot{{Flows: flows}}}, exp, 1, time.Now())
+	a.cfg.Interval = 600 * time.Millisecond
+	if a.exportTimeout() != time.Second || a.sendTimeout() != 2400*time.Millisecond {
+		t.Fatalf("exportTimeout %s, sendTimeout %s", a.exportTimeout(), a.sendTimeout())
+	}
+	return a
+}
+
+// segmentClosed tells whether the requests sent close the interval: the
+// last request carries the metrics of the agent.
+func segmentClosed(reqs []*colmetricspb.ExportMetricsServiceRequest) bool {
+	if len(reqs) == 0 {
+		return false
+	}
+	for _, m := range reqs[len(reqs)-1].ResourceMetrics[0].ScopeMetrics[0].Metrics {
+		if m.Name == otlp.MetricAgentSegmentStart {
+			return true
+		}
+	}
+	return false
+}
+
+// TestTickRequestDeadlines checks that every request of an interval has a
+// deadline of its own, so that a host whose requests take longer together
+// than a request may delivers them all, the last one with the metrics of
+// the agent included (#194).
+func TestTickRequestDeadlines(t *testing.T) {
+	exp := &slowExporter{delay: 250 * time.Millisecond}
+	a := slowAgent(t, exp, 6)
+	if err := a.tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(exp.sent) < 6 {
+		t.Fatalf("%d requests, want one per series", len(exp.sent))
+	}
+	if total := time.Duration(len(exp.sent)) * exp.delay; total <= a.exportTimeout() || total >= a.sendTimeout() {
+		t.Fatalf("the requests take %s, want more than a request may and less than an interval may", total)
+	}
+	if !segmentClosed(exp.sent) {
+		t.Error("the interval was not closed")
+	}
+	for i, left := range exp.left {
+		// Each request had a full exportTimeout, until sendTimeout is near.
+		if left < a.exportTimeout()-100*time.Millisecond {
+			t.Errorf("request %d had %s left, want %s", i+1, left, a.exportTimeout())
+		}
+	}
+}
+
+// TestTickSendTimeout checks that the requests of an interval are bounded
+// together, also when each is answered within its deadline, and that the
+// interval is then not closed.
+func TestTickSendTimeout(t *testing.T) {
+	exp := &slowExporter{delay: 900 * time.Millisecond}
+	a := slowAgent(t, exp, 6)
+	start := time.Now()
+	err := a.tick(context.Background())
+	took := time.Since(start)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("tick = %v, want a deadline exceeded", err)
+	}
+	if len(exp.sent) != 2 {
+		t.Errorf("%d requests sent, want the 2 that fit in %s", len(exp.sent), a.sendTimeout())
+	}
+	if took < a.sendTimeout() || took > a.sendTimeout()+500*time.Millisecond {
+		t.Errorf("tick took %s, want %s", took, a.sendTimeout())
+	}
+	if segmentClosed(exp.sent) {
+		t.Error("the interval was closed")
+	}
+	if a.failures != 1 {
+		t.Errorf("failures = %d", a.failures)
+	}
+}

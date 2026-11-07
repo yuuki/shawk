@@ -105,6 +105,8 @@ type Agent struct {
 	// reads skipped then.
 	stuckLogged  time.Time
 	stuckSkipped uint64
+	// When an interval that took longer than the interval was last logged.
+	slowLogged time.Time
 }
 
 // withDefaults returns cfg with the defaults of the fields left unset.
@@ -234,11 +236,9 @@ func Run(ctx context.Context, cfg Config) error {
 			}
 			return nil
 		case <-ticker.C:
-			tickCtx, cancel := context.WithTimeout(ctx, a.exportTimeout())
-			if err := a.tick(tickCtx); err != nil {
+			if err := a.tick(ctx); err != nil {
 				a.log.Error("collecting and sending flows", "error", err)
 			}
-			cancel()
 		}
 	}
 }
@@ -267,9 +267,24 @@ func (a *Agent) exportTimeout() time.Duration {
 	return max(a.cfg.Interval*2/3, time.Second)
 }
 
+// sendTimeout bounds the requests of an interval together, so that a
+// collector that answers each request just in time does not delay the next
+// collection indefinitely. It leaves a host whose requests take longer than
+// an interval several intervals to send them (#194), and is shorter than
+// the 5 minutes the connector counts an agent alive after the interval it
+// closed last, also at the longest interval.
+func (a *Agent) sendTimeout() time.Duration {
+	return max(4*a.cfg.Interval, a.exportTimeout())
+}
+
+// slowLogEvery is how often at most an interval that took longer than the
+// interval is logged.
+const slowLogEvery = 10 * time.Minute
+
 // tick closes an interval of the tracer and sends all live series. A failed
 // request is made up for by the next one, since the series are cumulative.
 func (a *Agent) tick(ctx context.Context) error {
+	begin := time.Now()
 	// The addresses of the host are internal: a host may connect to its own
 	// public address. They are refreshed before the interval is closed.
 	// A failed listing keeps the addresses known before.
@@ -301,19 +316,40 @@ func (a *Agent) tick(ctx context.Context) error {
 	// The last request carries the metrics of the agent and closes the
 	// interval; after a failure the rest is not sent, and the next interval
 	// makes up for it since the series are cumulative. Every request has its
-	// own deadline, which starts once the interval is collected, so that a
-	// host with many requests delivers them all.
+	// own deadline, which starts when it is sent, so that a host with many
+	// requests delivers them all; sendTimeout bounds them together.
+	sctx, cancel := context.WithTimeout(ctx, a.sendTimeout())
+	defer cancel()
 	for i, req := range reqs {
-		rctx, cancel := context.WithTimeout(ctx, a.exportTimeout())
+		rctx, cancel := context.WithTimeout(sctx, a.exportTimeout())
 		err := a.exporter.Export(rctx, req)
 		cancel()
 		if err != nil {
 			a.failures++
+			if sctx.Err() != nil && ctx.Err() == nil {
+				err = fmt.Errorf("the requests of an interval take at most %s: %w", a.sendTimeout(), err)
+			}
 			return fmt.Errorf("sending request %d of %d to %s: %w", i+1, len(reqs), a.cfg.Exporter.Endpoint, err)
 		}
 	}
 	a.segment.Succeeded(segStart, now)
+	a.logSlowInterval(len(reqs), time.Since(begin), now)
 	return nil
+}
+
+// logSlowInterval logs, at most every slowLogEvery, an interval whose
+// collection and requests took longer than the interval: the next
+// collection waited for them, so the intervals of the host are as long as
+// its requests take.
+func (a *Agent) logSlowInterval(requests int, took time.Duration, now time.Time) {
+	if took <= a.cfg.Interval || now.Sub(a.slowLogged) < slowLogEvery {
+		return
+	}
+	a.log.Warn("collecting and sending an interval took longer than the interval, which delays the next collection; "+
+		"raise -interval if it lasts",
+		"requests", requests, "took", took.Round(time.Millisecond), "interval", a.cfg.Interval,
+		"limit", a.sendTimeout())
+	a.slowLogged = now
 }
 
 // stuckLogEvery is how often at most the reads of environments that hang

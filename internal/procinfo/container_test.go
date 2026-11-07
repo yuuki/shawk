@@ -243,6 +243,128 @@ func TestContainersDockerDataRoot(t *testing.T) {
 	}
 }
 
+// fakeProcess writes the files of /proc/PID that dockerdArgs reads: a
+// process with comm, user id uid and the command line args, in the mount
+// namespace mnt.
+func fakeProcess(t *testing.T, root string, pid int, comm string, uid int, mnt string, args ...string) {
+	t.Helper()
+	dir := fmt.Sprintf("/proc/%d", pid)
+	writeFile(t, root, dir+"/comm", comm+"\n")
+	writeFile(t, root, dir+"/status", fmt.Sprintf("Name:\t%s\nUid:\t%d\t%d\t%d\t%d\nGid:\t0\t0\t0\t0\n", comm, uid, uid, uid, uid))
+	writeFile(t, root, dir+"/cmdline", strings.Join(args, "\x00")+"\x00")
+	if err := os.MkdirAll(filepath.Join(root, dir, "ns"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(mnt, filepath.Join(root, dir, "ns/mnt")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestContainersDockerdDataRoot checks that the containers of Docker are
+// found under the data root on the command line of dockerd (#125), or in
+// the configuration file it names, for every dockerd of root in the mount
+// namespace of PID 1, and not where another process named dockerd points.
+func TestContainersDockerdDataRoot(t *testing.T) {
+	root := t.TempDir()
+	const host, other = "mnt:[4026531841]", "mnt:[4026532500]"
+	fakeProcess(t, root, 1, "systemd", 0, host, "/sbin/init")
+	fakeProcess(t, root, 812, "dockerd", 0, host, "/usr/bin/dockerd", "-H", "fd://", "--data-root", "/srv/docker")
+	fakeProcess(t, root, 913, "dockerd", 0, host, "/usr/bin/dockerd", "--config-file=/etc/docker/d2.json", "-H", "unix:///run/d2.sock")
+	writeFile(t, root, "/etc/docker/d2.json", `{"data-root": "/srv/d2"}`)
+	// daemon.json is not that of the dockerd processes.
+	writeFile(t, root, "/etc/docker/daemon.json", `{"data-root": "/srv/unused"}`)
+	// A user's process, and the dockerd of a container.
+	fakeProcess(t, root, 2001, "dockerd", 1000, host, "dockerd", "--data-root=/var/tmp/evil")
+	fakeProcess(t, root, 2002, "dockerd", 0, other, "dockerd", "--data-root=/var/tmp/evil")
+	ids := map[string]string{"/srv/docker": "web", "/srv/d2": "db", "/var/tmp/evil": "forged", "/srv/unused": "unused"}
+	idOf := map[string]string{}
+	var i int
+	for dir, name := range ids {
+		i++
+		id := fmt.Sprintf("%064x", i)
+		idOf[name] = id
+		writeFile(t, root, dir+"/containers/"+id+"/config.v2.json", `{"Name": "/`+name+`", "Config": {}}`)
+	}
+	c := newContainers(root)
+	if got := c.dockerDataRoots(); !slices.Equal(got, []string{"/srv/docker", "/srv/d2"}) {
+		t.Errorf("data roots = %q", got)
+	}
+	for name, want := range map[string]string{"web": "docker/web", "db": "docker/db",
+		"forged": "docker-" + idOf["forged"][:shortID], "unused": "docker-" + idOf["unused"][:shortID]} {
+		if got, _ := c.Lookup(RuntimeDocker, idOf[name]); got.Unit() != want {
+			t.Errorf("%s: Unit = %q, want %q", name, got.Unit(), want)
+		}
+	}
+
+	// The data roots are found again after dockerRootsTTL: dockerd was
+	// restarted with daemon.json alone.
+	os.RemoveAll(filepath.Join(root, "proc/812"))
+	os.RemoveAll(filepath.Join(root, "proc/913"))
+	if got := c.dockerDataRoots(); !slices.Equal(got, []string{"/srv/docker", "/srv/d2"}) {
+		t.Errorf("data roots within the TTL = %q", got)
+	}
+	c.dockerRead = c.dockerRead.Add(-dockerRootsTTL)
+	if got := c.dockerDataRoots(); !slices.Equal(got, []string{"/srv/unused"}) {
+		t.Errorf("data roots after the TTL = %q", got)
+	}
+}
+
+func TestDockerdFlags(t *testing.T) {
+	for _, tc := range []struct {
+		args         []string
+		root, config string
+	}{
+		{[]string{"dockerd"}, "", ""},
+		{[]string{"dockerd", "--data-root", "/a"}, "/a", ""},
+		{[]string{"dockerd", "--data-root=/a/../b/", "--config-file", "/etc/c.json"}, "/b", "/etc/c.json"},
+		{[]string{"dockerd", "-g", "/a"}, "/a", ""},
+		{[]string{"dockerd", "-g=/a"}, "/a", ""},
+		{[]string{"dockerd", "-g/a"}, "/a", ""},
+		{[]string{"dockerd", "--graph", "/a", "--data-root", "/b"}, "/b", ""},
+		{[]string{"dockerd", "--data-root", "relative", "--config-file=x.json"}, "", ""},
+		{[]string{"dockerd", "-H", "fd://", "--debug", "--data-root"}, "", ""},
+		{[]string{"/usr/bin/dockerd", "--data-root", "/a", "-G", "docker"}, "/a", ""},
+	} {
+		root, config := dockerdFlags(tc.args)
+		if root != tc.root || config != tc.config {
+			t.Errorf("dockerdFlags(%q) = %q, %q, want %q, %q", tc.args, root, config, tc.root, tc.config)
+		}
+	}
+}
+
+// TestContainersDockerSwarm checks that the containers of the tasks of a
+// service of Docker Swarm are named after the service (#125), and that the
+// labels of Swarm, which an image may carry too, name a service only with
+// the name Swarm gives the container.
+func TestContainersDockerSwarm(t *testing.T) {
+	root := t.TempDir()
+	const task, node = "3x2ke8c1k0gsdmhwx1w4vjp2u", "q6ymazaxr8gn5yqvzvm7d6o1i"
+	swarm := func(service, name string) string {
+		return `{"com.docker.swarm.service.name": "` + service + `", "com.docker.swarm.task.id": "` + task +
+			`", "com.docker.swarm.task.name": "` + name + `", "com.docker.swarm.task": ""}`
+	}
+	for i, tc := range []struct{ name, labels, want string }{
+		{"/shop_web.1." + task, swarm("shop_web", "shop_web.1."+task), "docker/swarm/shop_web"},
+		{"/shop_web.12." + task, swarm("shop_web", "shop_web.12."+task), "docker/swarm/shop_web"},
+		// A task of a global service, on a node.
+		{"/agent." + node + "." + task, swarm("agent", "agent."+node+"."+task), "docker/swarm/agent"},
+		// Labels of an image: the name is not that of a task.
+		{"/web", swarm("shop_web", "shop_web.1."+task), "docker/web"},
+		{"/shop_web.1." + task, swarm("shop_web", "web"), "docker/shop_web.1." + task},
+		{"/shop_web.1." + task, swarm("shop", "shop_web.1."+task), "docker/shop_web.1." + task},
+		{"/shop_web.1.x." + task, swarm("shop_web", "shop_web.1.x."+task), "docker/shop_web.1.x." + task},
+		{"/shop_web.1.short", strings.ReplaceAll(swarm("shop_web", "shop_web.1.short"), task, "short"),
+			"docker/shop_web.1.short"},
+	} {
+		id := fmt.Sprintf("%064x", i+1)
+		writeFile(t, root, "/var/lib/docker/containers/"+id+"/config.v2.json",
+			`{"Name": "`+tc.name+`", "Config": {"Labels": `+tc.labels+`}}`)
+		if got, _ := newContainers(root).Lookup(RuntimeDocker, id); got.Unit() != tc.want {
+			t.Errorf("%s: Unit = %q, want %q", tc.name, got.Unit(), tc.want)
+		}
+	}
+}
+
 // Docker merges the labels of the image into those of the container: they
 // name a pod or a Compose service only with the name cri-dockerd or Compose
 // gives the container.
@@ -278,7 +400,7 @@ func TestContainersCRIDockerd(t *testing.T) {
 			"io.kubernetes.pod.namespace": "shop", "io.kubernetes.container.name": "app"}}}`)
 	// The runtime is not in a cgroupfs path of kubelet: every one is tried.
 	// Docker runs its containers with containerd, whose bundle has no name.
-	writeFile(t, root, containerdTasks+"/moby/"+id1+"/config.json", `{"annotations": {}}`)
+	writeFile(t, root, containerdTasks[0]+"/moby/"+id1+"/config.json", `{"annotations": {}}`)
 	got, _ := newContainers(root).Lookup("", id1)
 	if got.Unit() != "k8s/shop/cart/app" || got.Workload() != (Service{"cart", "shop"}) || got.Runtime != RuntimeDocker {
 		t.Errorf("Lookup = %+v", got)
@@ -317,17 +439,41 @@ func TestContainersPodman(t *testing.T) {
 	}
 }
 
+// TestContainersContainerdDistributions checks that the containers of the
+// containerd of k3s and rke2, and of microk8s, are read from their state
+// directories, with the sandbox of their pod (#125).
+func TestContainersContainerdDistributions(t *testing.T) {
+	for _, tasks := range containerdTasks[1:] {
+		root := t.TempDir()
+		writeFile(t, root, tasks+"/k8s.io/"+id1+"/config.json", `{
+			"annotations": {"io.kubernetes.cri.container-type": "container",
+				"io.kubernetes.cri.sandbox-id": "`+id2+`",
+				"io.kubernetes.cri.sandbox-name": "web-5d8f7c9b6-x7z2k",
+				"io.kubernetes.cri.sandbox-namespace": "shop",
+				"io.kubernetes.cri.container-name": "nginx"}}`)
+		writeFile(t, root, tasks+"/k8s.io/"+id2+"/config.json", `{
+			"annotations": {"io.kubernetes.cri.container-type": "sandbox",
+				"io.kubernetes.cri.sandbox-name": "web-5d8f7c9b6-x7z2k",
+				"io.kubernetes.cri.sandbox-namespace": "shop",
+				"resource.opentelemetry.io/service.name": "storefront"}}`)
+		got, found := newContainers(root).Lookup("", id1)
+		if !found || got.Unit() != "k8s/shop/web/nginx" || got.Workload() != (Service{"storefront", "shop"}) {
+			t.Errorf("%s: Lookup = %+v, %t", tasks, got, found)
+		}
+	}
+}
+
 func TestContainersContainerd(t *testing.T) {
 	root := t.TempDir()
-	writeFile(t, root, containerdTasks+"/k8s.io/"+id1+"/config.json", `{
+	writeFile(t, root, containerdTasks[0]+"/k8s.io/"+id1+"/config.json", `{
 		"annotations": {"io.kubernetes.cri.container-type": "container",
 			"io.kubernetes.cri.sandbox-name": "web-5d8f7c9b6-x7z2k",
 			"io.kubernetes.cri.sandbox-namespace": "default",
 			"io.kubernetes.cri.container-name": "nginx"}}`)
-	writeFile(t, root, containerdTasks+"/default/"+id2+"/config.json", `{
+	writeFile(t, root, containerdTasks[0]+"/default/"+id2+"/config.json", `{
 		"annotations": {"nerdctl/name": "proxy"}}`)
 	id3 := strings.Repeat("ef", 32)
-	writeFile(t, root, containerdTasks+"/default/"+id3+"/config.json", `{"annotations": {"other": "x"}}`)
+	writeFile(t, root, containerdTasks[0]+"/default/"+id3+"/config.json", `{"annotations": {"other": "x"}}`)
 	c := newContainers(root)
 	if got, _ := c.Lookup("", id1); got.Unit() != "k8s/default/web/nginx" || got.Runtime != RuntimeContainerd {
 		t.Errorf("Lookup k8s = %+v", got)
@@ -521,12 +667,12 @@ func TestContainersCRIOPodMeta(t *testing.T) {
 // through on the bundle of its sandbox, and not its labels.
 func TestContainersContainerdPodMeta(t *testing.T) {
 	root := t.TempDir()
-	writeFile(t, root, containerdTasks+"/k8s.io/"+id2+"/config.json", `{
+	writeFile(t, root, containerdTasks[0]+"/k8s.io/"+id2+"/config.json", `{
 		"annotations": {"io.kubernetes.cri.container-type": "sandbox",
 			"io.kubernetes.cri.sandbox-name": "web-5d8f7c9b6-x7z2k",
 			"io.kubernetes.cri.sandbox-namespace": "default",
 			"resource.opentelemetry.io/service.name": "frontend"}}`)
-	writeFile(t, root, containerdTasks+"/k8s.io/"+id1+"/config.json", `{
+	writeFile(t, root, containerdTasks[0]+"/k8s.io/"+id1+"/config.json", `{
 		"annotations": {"io.kubernetes.cri.container-type": "container",
 			"io.kubernetes.cri.sandbox-id": "`+id2+`",
 			"io.kubernetes.cri.sandbox-name": "web-5d8f7c9b6-x7z2k",

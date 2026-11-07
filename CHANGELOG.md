@@ -34,6 +34,18 @@
   sockets without a listener: glibc tries the socket of nscd from every
   process that looks up a user or a host, and most hosts do not run nscd.
 * `shawk flows` shows the flows of Unix sockets.
+* Containers keep their names across recreation on more hosts (#125):
+  - the pods of k3s and rke2, and of microk8s, whose containerd keeps its
+    bundles under `/run/k3s/containerd` and
+    `/var/snap/microk8s/common/run/containerd`;
+  - the containers of a Docker whose data root is on the command line of
+    `dockerd` (`--data-root`, or `data-root` in the file of
+    `--config-file`): the agent reads the command line of every `dockerd`
+    of root in the mount namespace of PID 1, every minute at most, and
+    keeps only these two flags; with several daemons, each data root;
+  - the tasks of Docker Swarm, named `docker/swarm/<service>` rather than
+    after their container, `<service>.<slot>.<task id>`, when the labels
+    `com.docker.swarm.*` match that name.
 * UDP is traced on kernels without BPF trampolines, such as arm64 before
   Linux 6.0 and Rocky Linux 9.6 on arm64 (#118): where the fentry programs
   do not attach, kprobes on the same functions stand in for them, at about
@@ -71,6 +83,16 @@
   UDP programs and the walk that marks the servers, as the end-to-end test
   did in a VM once the agent loaded more programs at start: the walk now
   runs before the UDP programs attach.
+* A host whose requests of an interval took longer together than 2/3 of
+  the interval (10 s) never sent the last ones, nor the last request, with
+  the metrics of the agent, which closes the interval: the deadline of each
+  request derived from one of the whole interval, collection included,
+  although the agent meant to give every request its own (#194). It
+  happened with 48 384 and 96 768 edges on a busy VM. Each request now has
+  its own deadline of 2/3 of the interval from when it is sent, and the
+  requests of an interval together at most 4 intervals; an interval that
+  takes longer than the interval delays the next collection, which the
+  agent logs at most every 10 minutes.
 
 ### Security
 
@@ -85,6 +107,19 @@
   further ones like hosts beyond `max_hosts` until one has not sent for
   `idle_ttl` (`docs/design.md` §5.5). Machines that share one certificate
   share the 4.
+
+### Documentation
+
+* With several connectors, a host must reach the same one all the time
+  (#128). `docs/design.md` §5.3 said to route by resource with the
+  `loadbalancing` exporter, which moves a host whenever its `host.ip`
+  changes, and counts its outputs twice when it comes back within
+  `idle_ttl`. It now says to give each agent one connector in its
+  configuration, or to route by `host.id` and `host.name`, over a static
+  list of connectors and without queues, which reorder the requests of a
+  host; `packaging/collector/front.yaml` is an example of such a front
+  collector. Behind it the connectors see its certificate, not the
+  agent's, and run with `host_identity: none`.
 
 **Upgrading.** The tables and views of Unix sockets are in
 `0001_schema.sql`, which `shawk-migrate` does not apply again to a database
