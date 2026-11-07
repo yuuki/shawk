@@ -15,6 +15,7 @@ updates:
         patterns: ["*"]
     commit-message:
       prefix: ci
+      include: scope
   # Every Go module: the agent, the connector, and the modules of the tests
   # of packaging/ and of the costs of the hooks.
   - package-ecosystem: gomod
@@ -27,7 +28,8 @@ updates:
       go-modules:
         patterns: ["*"]
     commit-message:
-      prefix: chore
+      prefix: build
+      include: scope
   # The base image of the collector image that releases publish, pinned by
   # its digest.
   - package-ecosystem: docker
@@ -40,4 +42,5 @@ updates:
       docker:
         patterns: ["*"]
     commit-message:
-      prefix: chore
+      prefix: build
+      include: scope

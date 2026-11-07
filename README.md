@@ -190,9 +190,9 @@ make slurm-up      # a Slurm cluster in a VM of Lima: SLURM_VERSION=26.05.5 SLUR
 make slurm-check   # run jobs and check the units of their processes (make slurm-down removes it)
 ```
 
-The other targets are described in the [Makefile](Makefile), and every
-command with what it needs in [AGENTS.md](AGENTS.md); see
-[CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md). The compiled
+The other targets are described in the [Makefile](Makefile); see
+[CONTRIBUTING.md](CONTRIBUTING.md), [AGENTS.md](AGENTS.md) and
+[SECURITY.md](SECURITY.md). The compiled
 BPF object is committed, so building needs only Go. There are three Go
 modules: the agent (`.`), the connector (`collector/`, kept separate so the
 agent does not depend on the collector) and the tests of `packaging/`
