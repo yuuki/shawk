@@ -972,11 +972,21 @@ the host name; `host.id` and `host.name` are promoted to labels.
   the connector's time, so one host with a wrong clock does not make
   Prometheus reject a batch. Errors downstream are logged, not returned to
   the agent, since the request was taken for PostgreSQL.
-- This state requires the data of a host to reach the same connector, so
-  run one connector per fleet. Spreading hosts over connectors (the
-  loadbalancing exporter routing by resource) is not reliable yet: the
-  resource changes with `host.ip`, `service.version` and
-  `shawk.peer.internal`, so a host may move and be counted twice (#128).
+- This state requires the data of a host to reach the same connector: a
+  host that moves to another connector and back within `idle_ttl` is
+  counted twice, since the first still holds the values it saw before.
+  Run one connector per fleet, or spread the hosts over connectors by the
+  configuration of the agents, each with the endpoint of one connector
+  (e.g. per group of hosts), so that a host moves only when its
+  configuration changes. A front collector with the `load_balancing`
+  exporter (`packaging/collector/front.yaml`) must route by `host.id` and
+  `host.name` (`routing_key: attributes`), not by resource, which changes
+  with `host.ip`, `service.version` and `shawk.peer.internal` (#128); over
+  a static list of connectors, since a change of the list moves hosts;
+  and without the queues of the exporter and of its OTLP exporters, which
+  would reorder the requests of a host (§4.3). The connectors behind it
+  see its certificate, not the agent's, so they run with
+  `host_identity: none` (§5.5).
 - The agents' metrics (§4.2) except `shawk.agent.segment.start` are
   forwarded under `job="shawk-agent"`, rebuilt with only the expected type,
   unit and attributes (`shawk.netns.scope`, `shawk.bpf.program`), so an

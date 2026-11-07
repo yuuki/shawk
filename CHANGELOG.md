@@ -88,6 +88,19 @@
   `idle_ttl` (`docs/design.md` §5.5). Machines that share one certificate
   share the 4.
 
+### Documentation
+
+* With several connectors, a host must reach the same one all the time
+  (#128). `docs/design.md` §5.3 said to route by resource with the
+  `loadbalancing` exporter, which moves a host whenever its `host.ip`
+  changes, and counts its outputs twice when it comes back within
+  `idle_ttl`. It now says to give each agent one connector in its
+  configuration, or to route by `host.id` and `host.name`, over a static
+  list of connectors and without queues, which reorder the requests of a
+  host; `packaging/collector/front.yaml` is an example of such a front
+  collector. Behind it the connectors see its certificate, not the
+  agent's, and run with `host_identity: none`.
+
 **Upgrading.** The tables and views of Unix sockets are in
 `0001_schema.sql`, which `shawk-migrate` does not apply again to a database
 that has it: create the database of v0.8.1 again as for the first build of
