@@ -185,7 +185,7 @@ func Run(ctx context.Context, cfg Config) error {
 			"pid", os.Getpid(), "host_pid", tr.SelfPID())
 	}
 	if !tr.UDPEnabled() {
-		cfg.Logger.Warn("UDP is not traced; see the error above (UDP tracing needs BPF trampolines, fentry)")
+		cfg.Logger.Warn("UDP is not traced; see the error above (UDP tracing needs BPF trampolines, fentry, or else kprobes)")
 	}
 	if !tr.UnixEnabled() {
 		cfg.Logger.Warn("Unix sockets are not traced; see the error above (their tracing needs BPF trampolines, fexit)")

@@ -34,6 +34,13 @@
   sockets without a listener: glibc tries the socket of nscd from every
   process that looks up a user or a host, and most hosts do not run nscd.
 * `shawk flows` shows the flows of Unix sockets.
+* UDP is traced on kernels without BPF trampolines, such as arm64 before
+  Linux 6.0 and Rocky Linux 9.6 on arm64 (#118): where the fentry programs
+  do not attach, kprobes on the same functions stand in for them, at about
+  twice the cost per datagram on arm64, and keep the direction of each
+  socket in an LRU hash instead of socket local storage, which kprobes
+  have not. The agent logs that UDP is traced with kprobes, and reports
+  `shawk.agent.udp.traced` 1. Unix sockets still need trampolines.
 
 ### Changed
 

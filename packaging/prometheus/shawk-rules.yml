@@ -378,7 +378,7 @@ groups:
           severity: info
         annotations:
           summary: "shawk agent on {{ $labels.host_name }} does not trace UDP"
-          description: "The kernel lacks BPF trampolines (fentry); UDP dependencies of the host are not observed."
+          description: "The kernel lacks BPF trampolines (fentry), and the kprobes that stand in for them did not attach; UDP dependencies of the host are not observed."
 
       - alert: ShawkUnixNotTraced
         expr: shawk_agent_unix_traced == 0
