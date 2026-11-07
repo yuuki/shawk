@@ -1,0 +1,43 @@
+# Version updates arrive monthly, grouped into one pull request per
+# ecosystem, and only after a release has been public for a week
+# (compromised releases are usually pulled within days). Security updates
+# are not delayed by this schedule.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    groups:
+      github-actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci
+  # Every Go module: the agent, the connector, and the modules of the tests
+  # of packaging/ and of the costs of the hooks.
+  - package-ecosystem: gomod
+    directories: ["/", "/collector", "/test/packaging", "/test/hookcost"]
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    groups:
+      go-modules:
+        patterns: ["*"]
+    commit-message:
+      prefix: chore
+  # The base image of the collector image that releases publish, pinned by
+  # its digest.
+  - package-ecosystem: docker
+    directory: /collector
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    groups:
+      docker:
+        patterns: ["*"]
+    commit-message:
+      prefix: chore

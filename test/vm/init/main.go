@@ -18,6 +18,7 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -86,7 +87,8 @@ func run() (status int) {
 			fmt.Printf("init: %s: %v\n", fields[1], err)
 			if status == 0 {
 				status = 1
-				if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() > 0 {
+				var ee *exec.ExitError
+				if errors.As(err, &ee) && ee.ExitCode() > 0 {
 					status = ee.ExitCode()
 				}
 			}

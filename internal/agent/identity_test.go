@@ -3,7 +3,9 @@ package agent
 import (
 	"bytes"
 	"log/slog"
+	"maps"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -406,9 +408,18 @@ func TestIdentitiesUsers(t *testing.T) {
 	uids := map[uint32]uint32{100: 1001, 200: 0}
 	cgroups := map[uint32]uint64{100: step, 200: 22}
 	comms := map[uint32]string{100: "a.out", 200: "slurmstepd"}
+	// The readers of prefetch call users concurrently.
+	var uidMu sync.Mutex
 	uidReads := map[uint32]int{}
+	reads := func() map[uint32]int {
+		uidMu.Lock()
+		defer uidMu.Unlock()
+		return maps.Clone(uidReads)
+	}
 	users := func(pid uint32) (uint32, uint64, bool) {
+		uidMu.Lock()
 		uidReads[pid]++
+		uidMu.Unlock()
 		u, ok := uids[pid]
 		return u, cgroups[pid], ok && exes[pid] != ""
 	}
@@ -435,8 +446,8 @@ func TestIdentitiesUsers(t *testing.T) {
 	if got := r.resolve(200, "slurmstepd", flowCgroup{id: 22}, procinfo.SlurmStepd, nil, now); got.HasUserID {
 		t.Errorf("slurmstepd = %+v, want no user", got)
 	}
-	if uidReads[100] != 1 {
-		t.Errorf("user ids read %v, want once per process", uidReads)
+	if got := reads(); got[100] != 1 {
+		t.Errorf("user ids read %v, want once per process", got)
 	}
 	// A process asked for with its environment too, as one that
 	// pam_slurm_adopt moved into a job, carries its user on the flows of
@@ -480,11 +491,13 @@ func TestIdentitiesUsers(t *testing.T) {
 
 	// Without users, no user id is read.
 	comms[100] = "a.out"
+	uidMu.Lock()
 	clear(uidReads)
+	uidMu.Unlock()
 	r = newResolver(nil)
 	r.beginInterval()
 	r.prefetch([]procRequest{{100, false}})
-	if got := r.resolve(100, "a.out", flowCgroup{id: step}, "slurm/batch", nil, now); got.HasUserID || len(uidReads) != 0 {
-		t.Errorf("job process without users = %+v, user ids read %v", got, uidReads)
+	if got := r.resolve(100, "a.out", flowCgroup{id: step}, "slurm/batch", nil, now); got.HasUserID || len(reads()) != 0 {
+		t.Errorf("job process without users = %+v, user ids read %v", got, reads())
 	}
 }

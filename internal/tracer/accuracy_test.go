@@ -2,6 +2,7 @@ package tracer
 
 import (
 	"encoding/binary"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -277,7 +278,7 @@ func TestTCPCloseWithoutTraffic(t *testing.T) {
 
 	c.Close()
 	s.SetReadDeadline(time.Now().Add(time.Second))
-	if n, err := s.Read(make([]byte, 1)); n != 0 || err != io.EOF {
+	if n, err := s.Read(make([]byte, 1)); n != 0 || !errors.Is(err, io.EOF) {
 		t.Fatalf("read after the peer closed = %d, %v", n, err)
 	}
 	s.Close()
@@ -330,7 +331,7 @@ func TestTCPExactBytes(t *testing.T) {
 			first.Close()
 			// Wait for the FIN before closing the other side.
 			second.SetReadDeadline(time.Now().Add(time.Second))
-			if n, err := second.Read(make([]byte, 1)); n != 0 || err != io.EOF {
+			if n, err := second.Read(make([]byte, 1)); n != 0 || !errors.Is(err, io.EOF) {
 				t.Fatalf("read after the peer closed = %d, %v", n, err)
 			}
 			second.Close()
@@ -757,7 +758,10 @@ func TestTCPManyShortConnections(t *testing.T) {
 					errs <- err
 					return
 				}
-				if _, err := c.Write(buf); err == nil {
+				// Assigned to err, not to a variable of the if, so that an error
+				// of the write or the read is reported below.
+				_, err = c.Write(buf)
+				if err == nil {
 					_, err = io.ReadFull(c, buf)
 				}
 				c.Close()

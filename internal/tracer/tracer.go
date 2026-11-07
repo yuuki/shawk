@@ -556,7 +556,7 @@ func (t *Tracer) loadTracing(spec *ebpf.CollectionSpec, progs []tracingProgram) 
 func verifierError(err error) error {
 	var verr *ebpf.VerifierError
 	if errors.As(err, &verr) {
-		return fmt.Errorf("%+v", verr)
+		return fmt.Errorf("%+v", verr) //nolint:errorlint // %+v keeps the log of the verifier, which %w does not print
 	}
 	return err
 }

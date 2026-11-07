@@ -114,7 +114,7 @@ func parseFlags(fs *flag.FlagSet, args []string, stderr io.Writer) error {
 		if errors.Is(err, flag.ErrHelp) {
 			return err
 		}
-		return fmt.Errorf("%w: %v", errFlags, err)
+		return fmt.Errorf("%w: %w", errFlags, err)
 	}
 	if fs.NArg() > 0 {
 		return fmt.Errorf("%w: unexpected argument %q", errUsage, fs.Arg(0))
@@ -155,24 +155,24 @@ func runAgent(ctx context.Context, args []string, _, stderr io.Writer) error {
 	}
 	var lvl slog.Level
 	if err := lvl.UnmarshalText([]byte(*logLevel)); err != nil {
-		return fmt.Errorf("%w: -log-level: %v", errUsage, err)
+		return fmt.Errorf("%w: -log-level: %w", errUsage, err)
 	}
 	logger := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: lvl}))
 	ns, err := agent.ParseNetNS(*netns)
 	if err != nil {
-		return fmt.Errorf("%w: %v", errUsage, err)
+		return fmt.Errorf("%w: %w", errUsage, err)
 	}
 	fb, err := procinfo.ParseFallback(*fallback)
 	if err != nil {
-		return fmt.Errorf("%w: %v", errUsage, err)
+		return fmt.Errorf("%w: %w", errUsage, err)
 	}
 	foldMode, err := tracer.ParseFoldMode(*fold)
 	if err != nil {
-		return fmt.Errorf("%w: -fold-external: %v", errUsage, err)
+		return fmt.Errorf("%w: -fold-external: %w", errUsage, err)
 	}
 	internalPeers, err := agent.ParseInternalPeers(*internal)
 	if err != nil {
-		return fmt.Errorf("%w: -internal-peers: %v", errUsage, err)
+		return fmt.Errorf("%w: -internal-peers: %w", errUsage, err)
 	}
 	if *endpoint == "" {
 		*endpoint = otlp.DefaultEndpoint(*protocol)
@@ -197,7 +197,7 @@ func runAgent(ctx context.Context, args []string, _, stderr io.Writer) error {
 		Logger:              logger,
 	}
 	if err := cfg.Validate(); err != nil {
-		return fmt.Errorf("%w: %v", errUsage, err)
+		return fmt.Errorf("%w: %w", errUsage, err)
 	}
 	return agent.Run(ctx, cfg)
 }
@@ -228,7 +228,7 @@ func runFlows(ctx context.Context, args []string, w, stderr io.Writer) error {
 	}
 	ns, err := agent.ParseNetNS(*netns)
 	if err != nil {
-		return fmt.Errorf("%w: %v", errUsage, err)
+		return fmt.Errorf("%w: %w", errUsage, err)
 	}
 	tr, err := tracer.New(tracer.Options{NetNS: ns, OwnerScanInterval: *interval})
 	if err != nil {

@@ -10,3 +10,4 @@
 /collector/_build/
 /shawk-migrate
 /collector/_release-builder-config.yaml
+/bench.txt

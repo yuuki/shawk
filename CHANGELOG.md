@@ -93,6 +93,16 @@
   requests of an interval together at most 4 intervals; an interval that
   takes longer than the interval delays the next collection, which the
   agent logs at most every 10 minutes.
+* The connector panicked on a request whose resource has no
+  `service.name`, before it checked the identity of the host: such a
+  resource is now ignored as one that does not come from an agent.
+* A data point of an edge whose value is not a number, or beyond the int64
+  counts of agents, stayed in the outputs it was added to (a NaN sum of RTTs
+  in every later point of its dependency): the connector now counts it as
+  an invalid data point.
+* A service name longer than 255 bytes made of bytes that start no UTF-8
+  character, e.g. in `OTEL_SERVICE_NAME`, was cut to an empty name; it is
+  now cut to 252 to 255 bytes.
 
 ### Security
 

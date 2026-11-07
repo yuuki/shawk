@@ -12,6 +12,7 @@ require (
 	go.opentelemetry.io/collector/consumer/consumererror v0.164.0
 	go.opentelemetry.io/collector/consumer/consumertest v0.164.0
 	go.opentelemetry.io/collector/pdata v1.70.0
+	go.uber.org/goleak v1.3.0
 	go.uber.org/zap v1.28.0
 	go.yaml.in/yaml/v3 v3.0.5
 	google.golang.org/grpc v1.85.0

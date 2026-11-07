@@ -315,6 +315,30 @@ func TestPGPipeline(t *testing.T) {
 	}
 }
 
+// TestPGInvalidStrings: names that are not valid UTF-8 or hold a NUL,
+// which the environment and cgroups of a process may have, are written to
+// PostgreSQL, whose text takes neither, as cleaned strings rather than
+// making the changes of the host fail.
+func TestPGInvalidStrings(t *testing.T) {
+	c, sink, conn := pgConnector(t)
+	base := time.Now().UTC().Truncate(time.Second).Add(-time.Minute)
+	consume(t, c, sink, tAgent{host: "app-\xff01", machineID: "m\x00", addrs: []string{"10.0.0.11"}, time: base,
+		segment: base.Add(-time.Hour),
+		edges: []tEdge{
+			{role: "client", proto: "tcp", local: "10.0.0.11", peer: "10.0.0.10", port: 5432, svc: "サービ\xe3\x83", ns: "a\x00b",
+				unit: "user@1000.service/\xfe.service", comm: "\xc0x", exe: "/home/u/\xffbin", opened: 1},
+			{role: "client", proto: transportUnix, path: "/run/\xff\x00.sock", svc: "app", unit: "app.service", comm: "puma", opened: 1},
+		}})
+	if !c.flush(context.Background()) {
+		t.Fatal("flush failed")
+	}
+	got := queryStrings(t, conn, `SELECT client_host, client_service, client_unit, path FROM shawk_v1.dependencies`)
+	want := []string{"app-�01 app app.service /run/��.sock", "app-�01 a�b/サービ� user@1000.service/�.service <nil>"}
+	if !slices.Equal(got, want) {
+		t.Errorf("dependencies = %q, want %q", got, want)
+	}
+}
+
 func TestPGUnobserved(t *testing.T) {
 	c, sink, conn := pgConnector(t)
 	ctx := context.Background()

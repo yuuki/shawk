@@ -186,7 +186,7 @@ func (e *httpExporter) Export(ctx context.Context, req *colmetricspb.ExportMetri
 	}
 	var buf bytes.Buffer
 	zw := gzip.NewWriter(&buf)
-	zw.Write(body)
+	zw.Write(body) //nolint:errcheck // a gzip.Writer keeps the error of a write, which Close returns
 	if err := zw.Close(); err != nil {
 		return err
 	}

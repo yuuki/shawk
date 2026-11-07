@@ -337,13 +337,15 @@ func ServiceName(env map[string]string, exe, comm, unit string, workload Service
 const maxServiceName = 255
 
 // truncateName cuts a name to maxServiceName bytes, at the start of a
-// character.
+// character. A character starts at most utf8.UTFMax-1 bytes before the
+// cut; further back is not UTF-8, which the agent replaces when it sends
+// the name, and which must not cut the name to nothing.
 func truncateName(s string) string {
 	if len(s) <= maxServiceName {
 		return s
 	}
 	n := maxServiceName
-	for n > 0 && !utf8.RuneStart(s[n]) {
+	for n > maxServiceName-(utf8.UTFMax-1) && !utf8.RuneStart(s[n]) {
 		n--
 	}
 	return s[:n]

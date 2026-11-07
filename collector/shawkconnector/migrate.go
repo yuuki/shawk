@@ -60,7 +60,9 @@ func Migrate(ctx context.Context, conn *pgx.Conn) ([]string, error) {
 	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, migrationLock); err != nil {
 		return nil, err
 	}
-	defer conn.Exec(context.WithoutCancel(ctx), `SELECT pg_advisory_unlock($1)`, migrationLock)
+	// The lock is of the session: an unlock fails only with the connection,
+	// whose end releases it.
+	defer conn.Exec(context.WithoutCancel(ctx), `SELECT pg_advisory_unlock($1)`, migrationLock) //nolint:errcheck // see above
 	if _, err := conn.Exec(ctx, `
 CREATE SCHEMA IF NOT EXISTS shawk;
 CREATE TABLE IF NOT EXISTS shawk.schema_migrations (

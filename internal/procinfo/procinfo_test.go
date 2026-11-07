@@ -203,3 +203,21 @@ func TestLearn(t *testing.T) {
 		t.Errorf("CgroupPath(43) = %q", got)
 	}
 }
+
+// BenchmarkUnit names the cgroups of a host of services, sessions,
+// containers and Slurm jobs, as every new cgroup is named.
+func BenchmarkUnit(b *testing.B) {
+	paths := []string{
+		"/system.slice/nginx.service",
+		"/user.slice/user-1000.slice/session-3.scope",
+		"/user.slice/user-1000.slice/user@1000.service/app.slice/foo.service",
+		"/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod1234.slice/cri-containerd-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.scope",
+		"/system.slice/slurmstepd.scope/job_42/step_0/user/task_0",
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		for _, p := range paths {
+			Unit(p)
+		}
+	}
+}
