@@ -123,6 +123,10 @@ func TestServiceNameTruncated(t *testing.T) {
 	if got.Name != want || got.Namespace != want {
 		t.Errorf("ServiceName = %d and %d bytes, want %q", len(got.Name), len(got.Namespace), want)
 	}
+	// Bytes that start no character are cut too, not to an empty name.
+	if got := ServiceName(map[string]string{"OTEL_SERVICE_NAME": strings.Repeat("\x8d", 300)}, "", "", "", Service{}, FallbackExe); len(got.Name) < maxServiceName-3 || len(got.Name) > maxServiceName {
+		t.Errorf("ServiceName of bytes that are not UTF-8 = %d bytes", len(got.Name))
+	}
 	short := strings.Repeat("a", 253) + "é"
 	if got := ServiceName(map[string]string{"OTEL_SERVICE_NAME": short}, "", "", "", Service{}, FallbackExe); got.Name != short {
 		t.Errorf("ServiceName = %q, want %q", got.Name, short)

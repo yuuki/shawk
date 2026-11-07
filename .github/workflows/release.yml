@@ -12,30 +12,33 @@ permissions: {}
 # with the token that publishes the release.
 jobs:
   test:
-    uses: ./.github/workflows/test.yml
+    # zizmor prefers $/ to ./, which actionlint does not take yet; a
+    # reusable workflow of ./ is read from the commit of this run anyway.
+    uses: ./.github/workflows/test.yml # zizmor: ignore[self-repository] actionlint v1.7.12 rejects the $/ form
     permissions:
       contents: read
   goreleaser:
     needs: test
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     permissions:
       contents: write      # the release and its assets
       packages: write      # the image of the collector on ghcr.io, and its attestation
       id-token: write      # the certificate that signs the attestations
       attestations: write  # the attestations of build provenance
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           # The release is built from modules checked against go.sum, not
           # from a cache that other runs write.
           cache: false
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}

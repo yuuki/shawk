@@ -93,7 +93,7 @@ func runMesh(args []string) error {
 		shortRate  = fs.Float64("short-rate", 0, "short jobs started per minute")
 		shortRanks = fs.Int("short-ranks", 4, "ranks of a short job")
 		shortPeers = fs.Int("short-peers", 8, "peer nodes a short job talks to")
-		shortSecs  = fs.Duration("short-secs", 10*time.Second, "how long a short job runs")
+		shortLen   = fs.Duration("short-secs", 10*time.Second, "how long a short job runs")
 		ready      = fs.String("ready", "", "file created once all ranks are connected")
 	)
 	fs.Parse(args)
@@ -165,7 +165,7 @@ func runMesh(args []string) error {
 				j := &job{root: filepath.Join(*cgroot, fmt.Sprintf("job_%d", id))}
 				defer j.stop()
 				for i := range *shortRanks {
-					ra := append([]string{"-id", strconv.Itoa(i), "-traffic", "1s", "-hold", shortSecs.String()}, st.args()...)
+					ra := append([]string{"-id", strconv.Itoa(i), "-traffic", "1s", "-hold", shortLen.String()}, st.args()...)
 					if err := j.start(i, ra); err != nil {
 						logf("short job %d: %v", id, err)
 						return

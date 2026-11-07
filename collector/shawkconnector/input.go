@@ -206,10 +206,22 @@ const maxInternalPeers = 4096
 // below PATH_MAX (4096 bytes).
 const maxStringBytes = 4096
 
+// maxValue bounds the values of the edges of agents, which are counts of
+// int64 (sums of microseconds for the histograms). A value beyond, or not a
+// number, would stay in every output it is added to: an output series is
+// the sum of the increases of its inputs.
+const maxValue = 1 << 63
+
+// validValue tells whether v, the value of a point of an edge, is within
+// maxValue; NaN is not.
+func validValue(v float64) bool { return math.Abs(v) < maxValue }
+
 // parseResource decodes the metrics of one agent.
 func parseResource(rm pmetric.ResourceMetrics) (*hostBatch, error) {
 	res := rm.Resource().Attributes()
-	if s, _ := res.Get(attrServiceName); s.AsString() != agentServiceName {
+	// Get returns a zero Value, whose methods panic, for a resource
+	// without service.name, which other senders may send.
+	if s, ok := res.Get(attrServiceName); !ok || s.AsString() != agentServiceName {
 		return nil, errNotAgent
 	}
 	b := &hostBatch{
@@ -331,11 +343,16 @@ func (b *hostBatch) addSums(m pmetric.Metric, name string) {
 				continue
 			}
 		}
+		v := numberValue(dp)
+		if !validValue(v) {
+			b.invalid++
+			continue
+		}
 		e := b.edge(dp.Attributes())
 		if e == nil {
 			continue
 		}
-		e.values[k] = point{start: dp.StartTimestamp(), time: dp.Timestamp(), value: numberValue(dp)}
+		e.values[k] = point{start: dp.StartTimestamp(), time: dp.Timestamp(), value: v}
 	}
 }
 
@@ -350,6 +367,10 @@ func (b *hostBatch) addHistograms(m pmetric.Metric, name string) {
 		dp := dps.At(i)
 		b.observe(dp.Timestamp())
 		p := point{start: dp.StartTimestamp(), time: dp.Timestamp(), value: dp.Sum(), count: dp.Count()}
+		if !validValue(p.value) {
+			b.invalid++
+			continue
+		}
 		if name == metricHandshake {
 			// The buckets of an agent with other bounds would not add
 			// up with those of the others.

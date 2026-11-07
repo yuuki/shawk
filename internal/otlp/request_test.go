@@ -507,3 +507,22 @@ func TestContainerIDAttribute(t *testing.T) {
 		t.Errorf("attributes = %v", a)
 	}
 }
+
+// BenchmarkRequests builds the requests of an interval of a host with
+// thousands of edges, as the agent does every interval.
+func BenchmarkRequests(b *testing.B) {
+	s := NewState(15 * time.Minute)
+	for i := range 5000 {
+		k := clientEdge()
+		k.PeerAddr = netip.AddrFrom4([4]byte{10, 1, byte(i >> 8), byte(i)})
+		if i%2 == 1 {
+			k.Proto = "udp"
+		}
+		s.AddEdge(k, EdgeStats{Conns: 1, BytesSent: 100, BytesRecv: 200, RTTSamples: 1, RTTSumUs: 100, MsgsSent: 1}, t0, t0.Add(15*time.Second))
+	}
+	st := AgentStatus{Started: t0, SegmentStart: t0, NetNSScope: "all"}
+	b.ReportAllocs()
+	for b.Loop() {
+		s.Requests(Resource{Hostname: "h"}, st, t0.Add(15*time.Second), 1000)
+	}
+}

@@ -1,7 +1,10 @@
 package shawkconnector
 
 import (
+	"math"
+	"os"
 	"testing"
+	"time"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
@@ -71,5 +74,64 @@ func TestInvalidMetricTypes(t *testing.T) {
 	}
 	if len(names) != 3 || names[2] != metricAgentFlowsDropped {
 		t.Errorf("forwarded agent metrics = %v", names)
+	}
+}
+
+// TestValuesNotNumbers: a value of an edge that is not a number, or beyond
+// the int64 counts of agents, is an invalid point. It would otherwise stay
+// in the outputs it is added to, e.g. a NaN sum of RTTs in every later
+// point of the series of its dependency.
+func TestValuesNotNumbers(t *testing.T) {
+	c, _, sink, now := testConnector(t, nil)
+	request := func(opened float64, rttSum float64) pmetric.Metrics {
+		md := tAgent{host: "app-01", addrs: []string{"10.0.0.11"}, time: now.Add(-time.Second), edges: []tEdge{{
+			role: roleClient, proto: "tcp", local: "10.0.0.11", peer: "10.0.0.10", port: 5432, svc: "app", comm: "puma",
+			opened: 1, rttSum: rttSum, rttCount: 2}}}.metrics()
+		ms := md.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics()
+		for i := range ms.Len() {
+			if m := ms.At(i); m.Name() == metricConnOpened {
+				m.Sum().DataPoints().At(0).SetDoubleValue(opened)
+			}
+		}
+		return md
+	}
+	b, err := parseResource(request(math.NaN(), math.Inf(1)).ResourceMetrics().At(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.invalid != 2 {
+		t.Errorf("%d invalid data points, want 2", b.invalid)
+	}
+	*now = now.Add(15 * time.Second)
+	consumeRequest(t, c, sink, request(1, 0.1))
+	for _, v := range []float64{math.NaN(), math.Inf(-1), 1 << 63, -1 << 63} {
+		*now = now.Add(15 * time.Second)
+		consumeRequest(t, c, sink, request(v, v))
+	}
+	*now = now.Add(15 * time.Second)
+	out := consumeRequest(t, c, sink, request(5, 0.25))
+	opened := find(out, metricConnOpened, "app", "*", roleClient, "")
+	rtt := find(out, metricRTT, "app", "*", roleClient, "")
+	if len(opened) != 1 || opened[0].value != 5 || len(rtt) != 1 || rtt[0].value != 0.25 {
+		t.Errorf("opened %+v, rtt %+v; want 5 and 0.25", opened, rtt)
+	}
+}
+
+// BenchmarkParseResource decodes the request written by the agent's tests,
+// as the connector decodes every request.
+func BenchmarkParseResource(b *testing.B) {
+	data, err := os.ReadFile("testdata/agent-request.json")
+	if err != nil {
+		b.Fatal(err)
+	}
+	md, err := (&pmetric.JSONUnmarshaler{}).UnmarshalMetrics(data)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, err := parseResource(md.ResourceMetrics().At(0)); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

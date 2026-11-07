@@ -192,6 +192,7 @@ func (r *Resolver) CgroupPath(id uint64) string {
 // inode number of its directory.
 func (r *Resolver) scan() {
 	paths := make(map[uint64]string, len(r.paths))
+	//nolint:errcheck // the function skips what cannot be read and returns no error, so neither does WalkDir
 	filepath.WalkDir(r.root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil || !d.IsDir() {
 			return nil

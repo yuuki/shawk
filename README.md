@@ -169,8 +169,10 @@ collector.
 ## Development
 
 ```bash
+make check         # lint, audit the workflows, tests with the race detector: before a pull request
 make generate      # compile the BPF programs (clang, llvm-strip)
 make vet test      # BPF tests need root; PostgreSQL tests need SHAWK_TEST_POSTGRES_DSN
+make test-fuzz     # the fuzz targets, FUZZTIME each (30s)
 make vm-test       # BPF tests in a VM: KERNEL=rocky9|5.14|5.15 ARCH=x86_64|aarch64
 make e2e           # multi-host test (sudo, SHAWK_E2E_POSTGRES_DSN)
 make complexity    # rank the most complex functions (needs cccc, see below)
@@ -188,7 +190,9 @@ make slurm-up      # a Slurm cluster in a VM of Lima: SLURM_VERSION=26.05.5 SLUR
 make slurm-check   # run jobs and check the units of their processes (make slurm-down removes it)
 ```
 
-The other targets are described in the [Makefile](Makefile). The compiled
+The other targets are described in the [Makefile](Makefile); see
+[CONTRIBUTING.md](CONTRIBUTING.md), [AGENTS.md](AGENTS.md) and
+[SECURITY.md](SECURITY.md). The compiled
 BPF object is committed, so building needs only Go. There are three Go
 modules: the agent (`.`), the connector (`collector/`, kept separate so the
 agent does not depend on the collector) and the tests of `packaging/`

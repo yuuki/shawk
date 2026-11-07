@@ -572,10 +572,10 @@ func ParseInternalPeers(s string) ([]netip.Prefix, error) {
 	var out []netip.Prefix
 	for item := range strings.SplitSeq(s, ",") {
 		item = strings.TrimSpace(item)
-		switch {
-		case item == "":
+		switch item {
+		case "":
 			continue
-		case item == "private":
+		case "private":
 			out = append(out, PrivatePeers...)
 			continue
 		}

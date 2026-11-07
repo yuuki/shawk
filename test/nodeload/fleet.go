@@ -85,7 +85,7 @@ func runFleet(args []string) error {
 		duration = fs.Duration("duration", 20*time.Minute, "how long to send")
 		mpiPeers = fs.Int("mpi-peers", 0, "compute nodes the ranks of a compute node talk to")
 		mpiRanks = fs.Int("mpi-ranks", 1, "connections, each to a port of its own, from a compute node to each of its -mpi-peers")
-		jobSecs  = fs.Duration("job", 10*time.Minute, "how long a job runs, after which the ports of the ranks change")
+		jobLen   = fs.Duration("job", 10*time.Minute, "how long a job runs, after which the ports of the ranks change")
 	)
 	fs.Parse(args)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
@@ -239,7 +239,7 @@ func runFleet(args []string) error {
 		}()
 	}
 	if *mpiPeers > 0 {
-		tick := time.NewTicker(*jobSecs)
+		tick := time.NewTicker(*jobLen)
 		defer tick.Stop()
 	loop:
 		for {
