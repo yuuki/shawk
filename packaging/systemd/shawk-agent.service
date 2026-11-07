@@ -31,11 +31,13 @@ LimitMEMLOCK=infinity
 NoNewPrivileges=yes
 # The agent reads the kernel BTF, the cgroup hierarchy, ip_local_port_range,
 # the machine id, /proc, the port counters of RDMA devices
-# (/sys/class/infiniband, which ProtectKernelTunables leaves readable) and
-# the state of the container runtimes (under /var/lib/docker,
-# /var/lib/containers, /run/containers and /run/containerd), and resolves
-# executables by reading /proc/PID/exe, whose path does not depend on what
-# this unit hides. Rootless containers keep their state in the home
+# (/sys/class/infiniband, which ProtectKernelTunables leaves readable), the
+# state of the container runtimes (under /var/lib/docker or the data root
+# on the command line of dockerd, /var/lib/containers, /run/containers,
+# /run/containerd, /run/k3s/containerd and
+# /var/snap/microk8s/common/run/containerd), and resolves executables by
+# reading /proc/PID/exe, whose path does not depend on what this unit
+# hides. Rootless containers keep their state in the home
 # directories hidden by ProtectHome, and are named by id.
 ProtectSystem=strict
 ProtectHome=yes

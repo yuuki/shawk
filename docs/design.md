@@ -469,7 +469,8 @@ functions that the socket operations point to, and so are never inlined:
   (alert `ShawkCgroupEventsDropped`), and such a cgroup is named by its id.
 - A container is named after what survives its recreation:
   `k8s/<namespace>/<workload>/<container>` for Kubernetes,
-  `docker/<project>/<service>` for Docker Compose, otherwise
+  `docker/<project>/<service>` for Docker Compose,
+  `docker/swarm/<service>` for Docker Swarm, otherwise
   `docker/<name>`, `podman/<name>` or `containerd/<name>` (nerdctl); its id
   is `container.id`. The id comes from the cgroup path and the names from
   the state the runtime keeps on disk (`internal/procinfo`), because the
@@ -502,11 +503,25 @@ functions that the socket operations point to, and so are never inlined:
   unit (`user@1000.service/podman-0123456789ab`). Name parts are limited to
   `[A-Za-z0-9_.-]` and 253 characters, so they cannot add a level to the
   unit or the `job`.
+- The state is read where the runtimes of the host keep it: the bundles of
+  containerd under `/run/containerd`, and under `/run/k3s/containerd` (k3s,
+  rke2) and `/var/snap/microk8s/common/run/containerd` (microk8s), which
+  run their own; containers/storage of Podman and CRI-O; and the data root
+  of every `dockerd` of root in the mount namespace of PID 1, from
+  `--data-root` on its command line or `data-root` in its configuration
+  file (`--config-file`, `/etc/docker/daemon.json`), found again every
+  minute. The agent reads no other command line, and keeps nothing else of
+  it; a process of a user, or the `dockerd` of a container, does not tell
+  where to read.
+- The tasks of a service of Docker Swarm are named `docker/swarm/<service>`
+  when their container has the name Swarm gives it,
+  `<service>.<slot>.<task id>`, and the labels `com.docker.swarm.*` that
+  match it, which Swarm sets over those of the image.
 - A container whose state cannot be read is named
   `<runtime>-<12 hex digits>`, which changes when it is recreated: rootless
-  containers, runtimes with another state directory (`data-root` on the
-  `dockerd` command line, k3s, rke2, microk8s), `ctr run`. A container in a
-  container (Docker in Docker, kind) is named after the outer one.
+  containers, runtimes with another state directory (containerd with
+  `--state`), `ctr run`. A container in a container (Docker in Docker,
+  kind) is named after the outer one.
 - The workload of a pod is its name without the suffixes Kubernetes appends
   (`web-5d8f7c9b6-x7z2k` → `web`, `db-0` → `db`); a long workload name may
   lose its end where the API server cut the generated name.
