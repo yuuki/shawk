@@ -51,6 +51,16 @@
   UDP programs and the walk that marks the servers, as the end-to-end test
   did in a VM once the agent loaded more programs at start: the walk now
   runs before the UDP programs attach.
+* A host whose requests of an interval took longer together than 2/3 of
+  the interval (10 s) never sent the last ones, nor the last request, with
+  the metrics of the agent, which closes the interval: the deadline of each
+  request derived from one of the whole interval, collection included,
+  although the agent meant to give every request its own (#194). It
+  happened with 48 384 and 96 768 edges on a busy VM. Each request now has
+  its own deadline of 2/3 of the interval from when it is sent, and the
+  requests of an interval together at most 4 intervals; an interval that
+  takes longer than the interval delays the next collection, which the
+  agent logs at most every 10 minutes.
 
 ### Security
 
