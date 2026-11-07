@@ -46,6 +46,13 @@
   - the tasks of Docker Swarm, named `docker/swarm/<service>` rather than
     after their container, `<service>.<slot>.<task id>`, when the labels
     `com.docker.swarm.*` match that name.
+* UDP is traced on kernels without BPF trampolines, such as arm64 before
+  Linux 6.0 and Rocky Linux 9.6 on arm64 (#118): where the fentry programs
+  do not attach, kprobes on the same functions stand in for them, at about
+  twice the cost per datagram on arm64, and keep the direction of each
+  socket in an LRU hash instead of socket local storage, which kprobes
+  have not. The agent logs that UDP is traced with kprobes, and reports
+  `shawk.agent.udp.traced` 1. Unix sockets still need trampolines.
 
 ### Changed
 
@@ -58,6 +65,19 @@
 
 ### Fixed
 
+* The failure reason of a connect (`error.type`) was read from the error
+  of the socket when it left SYN_SENT, and an application that read the
+  error with `SO_ERROR` meanwhile took it first, on every kernel: the
+  failure then counted as `timeout` (#166). On Linux 6.18 a client that
+  busy-polls its socket had 35 of 40 refused connects counted so. The
+  error is now recorded where the kernel produces it, before it stores
+  it: a reset with the tracepoint `tcp_receive_reset`, an ICMP error with
+  kprobes on `ip_icmp_error` and `ipv6_icmp_error` (`docs/design.md`
+  §3.2). Each hook attaches on its own; without the kprobes (no
+  `CONFIG_KPROBES`, or `perf_event_open` denied) the agent warns, and the
+  failures of ICMP errors race as before. The connector forwards the run
+  counts and times of the new programs with `-bpf-stats`
+  (`shawk.bpf.program`); an older one leaves them out.
 * A UDP server that existed before the agent started could be taken for a
   client of its own clients when it sent a reply between the attach of the
   UDP programs and the walk that marks the servers, as the end-to-end test

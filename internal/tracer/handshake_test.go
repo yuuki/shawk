@@ -8,6 +8,8 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"runtime"
+	"slices"
 	"strconv"
 	"testing"
 	"time"
@@ -469,6 +471,117 @@ func TestConnectFailureReasons(t *testing.T) {
 			out.SynRetrans != 0 || out.HandshakeCount() != 0 {
 			t.Errorf("%s: flow = %+v, want a failure %v", a.name, out, a.reason)
 		}
+	}
+}
+
+// sendReset sends a reset with an ACK of the SYN quoted, from its
+// destination to its source, which a socket in SYN_SENT takes: in SYN_SENT
+// a reset is acceptable when it acknowledges the SYN.
+func sendReset(t *testing.T, quoted []byte) {
+	t.Helper()
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_RAW|unix.SOCK_CLOEXEC, unix.IPPROTO_TCP)
+	if err != nil {
+		skipUnavailable(t, "raw socket: %v", err)
+	}
+	defer unix.Close(fd)
+	ihl := int(quoted[0]&0xf) * 4
+	syn := quoted[ihl:]
+	src, dst := [4]byte(quoted[16:20]), [4]byte(quoted[12:16])
+	if err := unix.Bind(fd, &unix.SockaddrInet4{Addr: src}); err != nil {
+		t.Fatal(err)
+	}
+	seg := make([]byte, 20)
+	copy(seg[0:], syn[2:4]) // from the port of the SYN
+	copy(seg[2:], syn[0:2]) // to its source port
+	binary.BigEndian.PutUint32(seg[8:], binary.BigEndian.Uint32(syn[4:])+1)
+	seg[12] = 5 << 4
+	seg[13] = tcpRST | tcpACK
+	binary.BigEndian.PutUint16(seg[16:], tcpChecksum(src, dst, seg))
+	if err := unix.Sendto(fd, seg, 0, &unix.SockaddrInet4{Addr: dst}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// spinError reads SO_ERROR of a socket in a loop on a thread of its own,
+// as a client that busy-polls its connect does, until it takes an error,
+// which it sends. Such a client takes the error as soon as the kernel sets
+// it, before the socket leaves SYN_SENT.
+func spinError(fd int) <-chan error {
+	started, done := make(chan struct{}), make(chan error, 1)
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		close(started)
+		for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
+			errno, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_ERROR)
+			if err != nil {
+				done <- err
+				return
+			}
+			if errno != 0 {
+				done <- unix.Errno(errno)
+				return
+			}
+		}
+		done <- errors.New("no error within 5s")
+	}()
+	<-started
+	return done
+}
+
+// TestConnectFailureRace checks the reasons of connects that a reset or an
+// ICMP error fails while the application reads SO_ERROR in a loop: it may
+// take the error before the socket leaves SYN_SENT, which then shows none,
+// and the failures counted as timeouts (#166). The ICMP errors need the
+// kprobes on ip_icmp_error.
+func TestConnectFailureRace(t *testing.T) {
+	const attempts = 40
+	tr, run := handshakeTracer(t, 0)
+	for _, c := range []struct {
+		name   string
+		src    netip.Addr
+		send   func(t *testing.T, quoted []byte)
+		hook   string
+		errno  unix.Errno
+		reason FailReason
+	}{
+		{"reset", loopback4(40), sendReset, "tcp_receive_reset", unix.ECONNREFUSED, FailRefused},
+		{"ICMP host unreachable", loopback4(41), func(t *testing.T, q []byte) { sendICMPUnreachable(t, 1, q) },
+			"ip_icmp_error", unix.EHOSTUNREACH, FailUnreachable},
+		{"ICMP port unreachable", loopback4(42), func(t *testing.T, q []byte) { sendICMPUnreachable(t, 3, q) },
+			"ip_icmp_error", unix.ECONNREFUSED, FailRefused},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if !slices.Contains(tr.connectErrHooks, c.hook) {
+				skipUnavailable(t, "%s is not hooked", c.hook)
+			}
+			var hole netip.AddrPort
+			run(func() {
+				hole, _ = blackhole(t)
+				syns := newSYNReader(t)
+				for range attempts {
+					s := newSock(t, c.src, true, nil)
+					if err := s.connect(hole); !errors.Is(err, unix.EINPROGRESS) {
+						t.Fatalf("connect: %v", err)
+					}
+					quoted := syns.next(t, c.src, hole.Port())
+					got := spinError(s.fd)
+					c.send(t, quoted)
+					if err := <-got; !errors.Is(err, c.errno) {
+						t.Fatalf("connect: %v, want %v", err, c.errno)
+					}
+					s.close()
+				}
+			})
+			snap, err := tr.Collect()
+			if err != nil {
+				t.Fatal(err)
+			}
+			out := clientFlow(c.src, hole, snap)
+			if out == nil || out.ConnFails != attempts || out.Fails[c.reason] != attempts {
+				t.Errorf("flow = %+v, want %d failures %v", out, attempts, c.reason)
+			}
+		})
 	}
 }
 

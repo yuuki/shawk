@@ -106,6 +106,13 @@ type bpfShawkSockState struct {
 	Pad         uint32
 }
 
+type bpfShawkUdpKstate struct {
+	_   structs.HostLayout
+	Ino uint64
+	Dir uint32
+	Pad uint32
+}
+
 type bpfShawkUdpState struct {
 	_   structs.HostLayout
 	Dir uint32
@@ -168,6 +175,7 @@ type bpfShawkXlatStats struct {
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
 	bpfMapCgroupEvents            = "cgroup_events"
+	bpfMapConnectErrs             = "connect_errs"
 	bpfMapFlows                   = "flows"
 	bpfMapFlows0                  = "flows_0"
 	bpfMapFlows1                  = "flows_1"
@@ -175,6 +183,7 @@ const (
 	bpfMapListenPorts             = "listen_ports"
 	bpfMapMptcpOwners             = "mptcp_owners"
 	bpfMapSockStates              = "sock_states"
+	bpfMapUdpKstates              = "udp_kstates"
 	bpfMapUdpListenPorts          = "udp_listen_ports"
 	bpfMapUdpStates               = "udp_states"
 	bpfMapUnixConns               = "unix_conns"
@@ -188,11 +197,17 @@ const (
 	bpfProgShawkCtDestroy         = "shawk_ct_destroy"
 	bpfProgShawkInetSockSetState  = "shawk_inet_sock_set_state"
 	bpfProgShawkIp6SendSkb        = "shawk_ip6_send_skb"
+	bpfProgShawkIp6SendSkbK       = "shawk_ip6_send_skb_k"
+	bpfProgShawkIpIcmpError       = "shawk_ip_icmp_error"
 	bpfProgShawkIpSendSkb         = "shawk_ip_send_skb"
+	bpfProgShawkIpSendSkbK        = "shawk_ip_send_skb_k"
+	bpfProgShawkIpv6IcmpError     = "shawk_ipv6_icmp_error"
 	bpfProgShawkIterTaskFile      = "shawk_iter_task_file"
 	bpfProgShawkIterTcp           = "shawk_iter_tcp"
 	bpfProgShawkIterUdp           = "shawk_iter_udp"
 	bpfProgShawkSkbConsumeUdp     = "shawk_skb_consume_udp"
+	bpfProgShawkSkbConsumeUdpK    = "shawk_skb_consume_udp_k"
+	bpfProgShawkTcpReceiveReset   = "shawk_tcp_receive_reset"
 	bpfProgShawkUnixRelease       = "shawk_unix_release"
 	bpfProgShawkUnixStreamConnect = "shawk_unix_stream_connect"
 	bpfVarActiveIdx               = "active_idx"
@@ -268,11 +283,17 @@ type bpfProgramSpecs struct {
 	ShawkCtDestroy         *ebpf.ProgramSpec `ebpf:"shawk_ct_destroy"`
 	ShawkInetSockSetState  *ebpf.ProgramSpec `ebpf:"shawk_inet_sock_set_state"`
 	ShawkIp6SendSkb        *ebpf.ProgramSpec `ebpf:"shawk_ip6_send_skb"`
+	ShawkIp6SendSkbK       *ebpf.ProgramSpec `ebpf:"shawk_ip6_send_skb_k"`
+	ShawkIpIcmpError       *ebpf.ProgramSpec `ebpf:"shawk_ip_icmp_error"`
 	ShawkIpSendSkb         *ebpf.ProgramSpec `ebpf:"shawk_ip_send_skb"`
+	ShawkIpSendSkbK        *ebpf.ProgramSpec `ebpf:"shawk_ip_send_skb_k"`
+	ShawkIpv6IcmpError     *ebpf.ProgramSpec `ebpf:"shawk_ipv6_icmp_error"`
 	ShawkIterTaskFile      *ebpf.ProgramSpec `ebpf:"shawk_iter_task_file"`
 	ShawkIterTcp           *ebpf.ProgramSpec `ebpf:"shawk_iter_tcp"`
 	ShawkIterUdp           *ebpf.ProgramSpec `ebpf:"shawk_iter_udp"`
 	ShawkSkbConsumeUdp     *ebpf.ProgramSpec `ebpf:"shawk_skb_consume_udp"`
+	ShawkSkbConsumeUdpK    *ebpf.ProgramSpec `ebpf:"shawk_skb_consume_udp_k"`
+	ShawkTcpReceiveReset   *ebpf.ProgramSpec `ebpf:"shawk_tcp_receive_reset"`
 	ShawkUnixRelease       *ebpf.ProgramSpec `ebpf:"shawk_unix_release"`
 	ShawkUnixStreamConnect *ebpf.ProgramSpec `ebpf:"shawk_unix_stream_connect"`
 }
@@ -282,6 +303,7 @@ type bpfProgramSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type bpfMapSpecs struct {
 	CgroupEvents   *ebpf.MapSpec `ebpf:"cgroup_events"`
+	ConnectErrs    *ebpf.MapSpec `ebpf:"connect_errs"`
 	Flows          *ebpf.MapSpec `ebpf:"flows"`
 	Flows0         *ebpf.MapSpec `ebpf:"flows_0"`
 	Flows1         *ebpf.MapSpec `ebpf:"flows_1"`
@@ -289,6 +311,7 @@ type bpfMapSpecs struct {
 	ListenPorts    *ebpf.MapSpec `ebpf:"listen_ports"`
 	MptcpOwners    *ebpf.MapSpec `ebpf:"mptcp_owners"`
 	SockStates     *ebpf.MapSpec `ebpf:"sock_states"`
+	UdpKstates     *ebpf.MapSpec `ebpf:"udp_kstates"`
 	UdpListenPorts *ebpf.MapSpec `ebpf:"udp_listen_ports"`
 	UdpStates      *ebpf.MapSpec `ebpf:"udp_states"`
 	UnixConns      *ebpf.MapSpec `ebpf:"unix_conns"`
@@ -350,6 +373,7 @@ func (o *bpfObjects) Close() error {
 // It can be passed to loadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type bpfMaps struct {
 	CgroupEvents   *ebpf.Map `ebpf:"cgroup_events"`
+	ConnectErrs    *ebpf.Map `ebpf:"connect_errs"`
 	Flows          *ebpf.Map `ebpf:"flows"`
 	Flows0         *ebpf.Map `ebpf:"flows_0"`
 	Flows1         *ebpf.Map `ebpf:"flows_1"`
@@ -357,6 +381,7 @@ type bpfMaps struct {
 	ListenPorts    *ebpf.Map `ebpf:"listen_ports"`
 	MptcpOwners    *ebpf.Map `ebpf:"mptcp_owners"`
 	SockStates     *ebpf.Map `ebpf:"sock_states"`
+	UdpKstates     *ebpf.Map `ebpf:"udp_kstates"`
 	UdpListenPorts *ebpf.Map `ebpf:"udp_listen_ports"`
 	UdpStates      *ebpf.Map `ebpf:"udp_states"`
 	UnixConns      *ebpf.Map `ebpf:"unix_conns"`
@@ -370,6 +395,7 @@ type bpfMaps struct {
 func (m *bpfMaps) Close() error {
 	return _BpfClose(
 		m.CgroupEvents,
+		m.ConnectErrs,
 		m.Flows,
 		m.Flows0,
 		m.Flows1,
@@ -377,6 +403,7 @@ func (m *bpfMaps) Close() error {
 		m.ListenPorts,
 		m.MptcpOwners,
 		m.SockStates,
+		m.UdpKstates,
 		m.UdpListenPorts,
 		m.UdpStates,
 		m.UnixConns,
@@ -427,11 +454,17 @@ type bpfPrograms struct {
 	ShawkCtDestroy         *ebpf.Program `ebpf:"shawk_ct_destroy"`
 	ShawkInetSockSetState  *ebpf.Program `ebpf:"shawk_inet_sock_set_state"`
 	ShawkIp6SendSkb        *ebpf.Program `ebpf:"shawk_ip6_send_skb"`
+	ShawkIp6SendSkbK       *ebpf.Program `ebpf:"shawk_ip6_send_skb_k"`
+	ShawkIpIcmpError       *ebpf.Program `ebpf:"shawk_ip_icmp_error"`
 	ShawkIpSendSkb         *ebpf.Program `ebpf:"shawk_ip_send_skb"`
+	ShawkIpSendSkbK        *ebpf.Program `ebpf:"shawk_ip_send_skb_k"`
+	ShawkIpv6IcmpError     *ebpf.Program `ebpf:"shawk_ipv6_icmp_error"`
 	ShawkIterTaskFile      *ebpf.Program `ebpf:"shawk_iter_task_file"`
 	ShawkIterTcp           *ebpf.Program `ebpf:"shawk_iter_tcp"`
 	ShawkIterUdp           *ebpf.Program `ebpf:"shawk_iter_udp"`
 	ShawkSkbConsumeUdp     *ebpf.Program `ebpf:"shawk_skb_consume_udp"`
+	ShawkSkbConsumeUdpK    *ebpf.Program `ebpf:"shawk_skb_consume_udp_k"`
+	ShawkTcpReceiveReset   *ebpf.Program `ebpf:"shawk_tcp_receive_reset"`
 	ShawkUnixRelease       *ebpf.Program `ebpf:"shawk_unix_release"`
 	ShawkUnixStreamConnect *ebpf.Program `ebpf:"shawk_unix_stream_connect"`
 }
@@ -443,11 +476,17 @@ func (p *bpfPrograms) Close() error {
 		p.ShawkCtDestroy,
 		p.ShawkInetSockSetState,
 		p.ShawkIp6SendSkb,
+		p.ShawkIp6SendSkbK,
+		p.ShawkIpIcmpError,
 		p.ShawkIpSendSkb,
+		p.ShawkIpSendSkbK,
+		p.ShawkIpv6IcmpError,
 		p.ShawkIterTaskFile,
 		p.ShawkIterTcp,
 		p.ShawkIterUdp,
 		p.ShawkSkbConsumeUdp,
+		p.ShawkSkbConsumeUdpK,
+		p.ShawkTcpReceiveReset,
 		p.ShawkUnixRelease,
 		p.ShawkUnixStreamConnect,
 	)

@@ -598,6 +598,8 @@ func TestTCPFastOpenChildClosed(t *testing.T) {
 const (
 	tcpFIN = 0x01
 	tcpSYN = 0x02
+	tcpRST = 0x04
+	tcpACK = 0x10
 )
 
 // sendRawSYN sends a SYN with data from 127.0.0.1 to dst through a raw socket,

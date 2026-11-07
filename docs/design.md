@@ -180,8 +180,18 @@ first write) have no duration; simultaneous opens, adopted connections,
 additional MPTCP subflows and the agent's own connections have no
 handshake. The failure reason, `error.type`, is decided at SYN_SENT→CLOSE
 (`fail_reason()` in shawk.bpf.c). A task that reads the error (`SO_ERROR`)
-while the kernel closes the socket takes it first, on every kernel, and the
-failure then counts as `timeout` (§10):
+while the kernel closes the socket takes it first, on every kernel, so the
+error that ends a connect is recorded before the kernel stores it (#166):
+a reset by `tp_btf/tcp_receive_reset`, first in `tcp_reset()`, and an ICMP
+error by kprobes on `ip_icmp_error()` and `ipv6_icmp_error()`, which
+`tcp_v4_err()` and `tcp_v6_err()` call in SYN_SENT with the error. Kprobes
+have no socket local storage, so the error is kept in an LRU hash keyed by
+the socket, which the state change takes when the socket leaves SYN_SENT.
+An ICMP error that arrives while a task holds the socket is soft
+(`sk_err_soft`, read at the close) and the connect goes on, so it is not
+recorded. The hooks run only on failed connects; the state change of every
+connect looks the hash up once. Without them (no kprobes, §10) the reason
+is read from `sk_err` as before:
 
 | reason | meaning |
 |---|---|
@@ -252,11 +262,16 @@ fentry rather than kprobes: on arm64 a kprobe doubles the cost per datagram
 storage for the direction. cgroup_skb costs less (0.06 µs) but runs outside
 the task, so the process of a flow would not be known, and it runs on every
 TCP packet too
-([research/kernel-hooks](research/kernel-hooks/kernel_hooks.md)). UDP thus
+([research/kernel-hooks](research/kernel-hooks/kernel_hooks.md)). fentry
 needs BPF trampolines, which arm64 has since Linux 6.0 and RHEL 9 since
-kernel 5.14.0-621 (Rocky Linux 9.8, not 9.6); without them the agent
-traces TCP and reports that UDP is not traced. Misattributions are listed
-in §10.
+kernel 5.14.0-621 (Rocky Linux 9.8, not 9.6). Where the fentry programs do
+not attach, kprobes on the same functions stand in for them (#118), with
+the same work: the direction of a socket is then kept in an LRU hash keyed
+by the socket, with its inode, which tells it from a former socket at the
+same address (`udp_kstates`, sized as the listening ports); a socket whose
+entry the LRU evicted is decided again by its next datagram. The agent
+logs that UDP is traced with kprobes. Without either it traces TCP and
+reports that UDP is not traced. Misattributions are listed in §10.
 
 ### 3.4 Reading flows without losing updates
 
@@ -281,13 +296,16 @@ Linux 5.14 or later with BTF (`CONFIG_DEBUG_INFO_BTF`):
 | `bpf_sock_from_file`, `bpf_get_current_task_btf` | 5.11 |
 | cgroup pointer in `sock_cgroup_data` (else the owner of accepted connections is resolved in user space only) | 5.15, RHEL 9 |
 | TCP iterator that locks each socket (else rare double counting) | 5.19, RHEL 9 |
-| fentry, fexit (UDP and Unix sockets only) | 5.5 on x86_64, 6.0 on arm64 (RHEL 9 on arm64: 5.14.0-621, in 9.8, not in 9.6) |
+| fentry, fexit (UDP and Unix sockets only) | 5.5 on x86_64, 6.0 on arm64 (RHEL 9 on arm64: 5.14.0-621, in 9.8, not in 9.6); UDP falls back to kprobes (`CONFIG_KPROBES`, `perf_event_open`) |
 | kprobes on the module nf_conntrack (translations, §3.7; `CONFIG_KPROBES`, the system call `perf_event_open`) | `__nf_conntrack_confirm`, and `nf_ct_destroy` since 5.19 and in RHEL 9, `destroy_conntrack` before |
+| kprobes on `ip_icmp_error` and `ipv6_icmp_error` (the ICMP errors of failed connects, §3.2; `CONFIG_KPROBES`, `perf_event_open`) | any; without them, the reasons of such failures race with `SO_ERROR` |
 
 CI loads the programs on the Ubuntu runner kernels (6.8 to 7.0, x86_64 and
 arm64) and in VMs (`make vm-test`) on Rocky Linux 9.6 (x86_64, aarch64),
 upstream 5.14 (x86_64) and 5.15 (x86_64, aarch64); on aarch64 before 6.0
-the tests check that UDP and Unix sockets are reported as not traced. All struct accesses use CO-RE. `make compat`
+the tests of UDP run with kprobes, and check that Unix sockets are
+reported as not traced; `TestUDPKprobes` runs them with kprobes on the
+other kernels too. All struct accesses use CO-RE. `make compat`
 checks every attach target, helper, CO-RE relocation and `BPF_PROG`
 parameter list against the BTF of Rocky Linux 9.6 and its nf_conntrack
 module (the verifier does not check arguments read through
@@ -1719,13 +1737,17 @@ only the protocols it parses. shawk runs beside it:
   seen. A firewall that rejects with a reset or port unreachable gives
   `refused`, which reads as a service that is down; an application connect
   timeout below a second turns losses into `aborted`, as does a SYN an LSM
-  denies on output. An application that reads the error while the kernel
-  closes the socket takes it first, on every kernel, and the failure is
-  counted as `timeout`: 0.01 to 0.05 % of the connects that an ICMP error
-  failed, for a client that waits in poll(2) or epoll, but up to 60 % of
-  all failures, resets included, for one that busy-polls the socket
+  denies on output. The errors of resets and ICMP errors are recorded
+  where the kernel produces them (§3.2): without the kprobes on
+  `ip_icmp_error()` (no `CONFIG_KPROBES`, or `perf_event_open` denied), an
+  application that reads the error while the kernel closes the socket
+  takes it first, and a failure an ICMP error caused is counted as
+  `timeout`: 0.01 to 0.05 % of them for a client that waits in poll(2) or
+  epoll, up to 60 % for one that busy-polls the socket
   ([research/kernel-hooks](research/kernel-hooks/kernel_hooks.md) §5,
-  #166). UDP and QUIC have no kernel handshake.
+  #166). A recorded error that the LRU hash evicted, among more than 8192
+  sockets in SYN_SENT with one at once, falls back the same way. UDP and
+  QUIC have no kernel handshake.
 - **Connections that predate the agent** are counted from the adoption on.
   One accepted by a listener with a backlog of 0 that is gone is recorded
   as outgoing.

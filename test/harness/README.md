@@ -126,7 +126,7 @@ the pinned release of Lima if `limactl` is missing, and needs QEMU and
 | `SHAWK_TEST_POSTGRES_DSN` | the `TestPG*` tests of `collector/shawkconnector` (`make test`, `make pg-test`); skipped without it | `postgres.sh env`, `run` |
 | `SHAWK_E2E_POSTGRES_DSN` | `test/e2e/run.sh` (`make e2e`), which drops and recreates its schemas | `postgres.sh env`, `run` (database `shawke2e`) |
 | `SHAWK_TEST_STRICT` | the BPF tests (`make test-root`, `vm-test`, `e2e`): a skip fails | `test/vm/run.sh` (1 unless set) |
-| `SHAWK_TEST_NO_UDP`, `SHAWK_TEST_NO_NFS`, `SHAWK_TEST_NO_CONNTRACK` | the BPF tests: what the kernel lacks | `test/vm/run.sh` from the kernel |
+| `SHAWK_TEST_NO_TRAMPOLINES`, `SHAWK_TEST_NO_UDP`, `SHAWK_TEST_NO_NFS`, `SHAWK_TEST_NO_CONNTRACK` | the BPF tests: what the kernel lacks | `test/vm/run.sh` from the kernel |
 | `SHAWK_TARGET_BTF`, `SHAWK_TARGET_MODULE_BTF`, `SHAWK_FRESH_OBJECT` | `TestKernelCompatibility` and the check of the committed object | `make compat`, `make check-object` |
 | `VM_TEST_ARGS`, `VM_TIMEOUT` | `test/vm/run.sh`: arguments of the test binaries, a deadline | the user |
 | `SLURM_*`, `SHAWK_VM_*` | `slurm.sh up` (above) | the user |

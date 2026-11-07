@@ -93,6 +93,8 @@ type Tracer struct {
 	links []link.Link
 	udp   bool
 	unix  bool
+	// udpKprobes tells that UDP is traced with udpKprobePrograms.
+	udpKprobes bool
 
 	flowMaps       [2]*ebpf.Map
 	unixFlowMaps   [2]*ebpf.Map
@@ -187,27 +189,43 @@ type Tracer struct {
 	// xlatConnsMap the entries counted live; for tests.
 	conntrackLinks []link.Link
 	xlatConnsMap   *ebpf.Map
+
+	// connectErrHooks are the targets of connectErrorPrograms attached.
+	connectErrHooks []string
 }
 
 // tracingProgram is a program that hooks a kernel function with a BPF
-// trampoline (fentry, fexit).
-type tracingProgram struct{ prog, target string }
+// trampoline (fentry, fexit), or with a kprobe.
+type tracingProgram struct {
+	prog, target string
+	kprobe       bool
+}
 
 // udpPrograms and unixPrograms hook kernel functions with BPF trampolines.
 // Each set is loaded separately so that TCP tracing, and the other set,
 // keep working on kernels that do not support trampolines (e.g. arm64
-// before Linux 6.0) or lack a target.
+// before Linux 6.0) or lack a target. udpKprobePrograms stand in for
+// udpPrograms where these do not attach (#118): a kprobe costs twice as
+// much per datagram on arm64, so they are not the first choice.
 var (
 	udpPrograms = []tracingProgram{
-		{bpfProgShawkIpSendSkb, "ip_send_skb"},
-		{bpfProgShawkIp6SendSkb, "ip6_send_skb"},
-		{bpfProgShawkSkbConsumeUdp, "skb_consume_udp"},
+		{prog: bpfProgShawkIpSendSkb, target: "ip_send_skb"},
+		{prog: bpfProgShawkIp6SendSkb, target: "ip6_send_skb"},
+		{prog: bpfProgShawkSkbConsumeUdp, target: "skb_consume_udp"},
+	}
+	udpKprobePrograms = []tracingProgram{
+		{prog: bpfProgShawkIpSendSkbK, target: "ip_send_skb", kprobe: true},
+		{prog: bpfProgShawkIp6SendSkbK, target: "ip6_send_skb", kprobe: true},
+		{prog: bpfProgShawkSkbConsumeUdpK, target: "skb_consume_udp", kprobe: true},
 	}
 	unixPrograms = []tracingProgram{
-		{bpfProgShawkUnixStreamConnect, "unix_stream_connect"},
-		{bpfProgShawkUnixRelease, "unix_release"},
+		{prog: bpfProgShawkUnixStreamConnect, target: "unix_stream_connect"},
+		{prog: bpfProgShawkUnixRelease, target: "unix_release"},
 	}
 )
+
+// forceUDPKprobes makes New trace UDP with udpKprobePrograms; for tests.
+var forceUDPKprobes = false
 
 // New loads and attaches the BPF programs. It requires CAP_BPF and
 // CAP_PERFMON (or root) and a kernel with BTF.
@@ -255,6 +273,12 @@ func New(opts Options) (*Tracer, error) {
 		t.Close()
 		return nil, err
 	}
+	attached, err := t.loadConnectErrors(spec)
+	t.connectErrHooks = attached
+	if err != nil {
+		t.log.Warn("the reasons of some failed connects are read when the socket closes, and an application that reads the error first makes them count as timeouts",
+			"error", err)
+	}
 	// The walk of the processes below adopts the connections of Unix
 	// sockets once their close is traced.
 	if err := t.loadTracing(spec, unixPrograms); err != nil {
@@ -288,10 +312,8 @@ func New(opts Options) (*Tracer, error) {
 		t.Close()
 		return nil, err
 	}
-	if err := t.loadTracing(spec, udpPrograms); err != nil {
+	if err := t.loadUDP(spec); err != nil {
 		t.log.Warn("UDP tracing is disabled", "error", err)
-	} else {
-		t.udp = true
 	}
 	if opts.LearnTranslations {
 		t.conntrackSpec = spec
@@ -323,7 +345,7 @@ func (t *Tracer) configure(spec *ebpf.CollectionSpec) error {
 	for _, name := range []string{bpfMapFlows0, bpfMapFlows1} {
 		spec.Maps[name].MaxEntries = t.opts.MaxFlows
 	}
-	for _, name := range []string{bpfMapListenPorts, bpfMapUdpListenPorts, bpfMapMptcpOwners} {
+	for _, name := range []string{bpfMapListenPorts, bpfMapUdpListenPorts, bpfMapMptcpOwners, bpfMapUdpKstates} {
 		spec.Maps[name].MaxEntries = min(max(t.opts.MaxFlows, minListenPorts), maxListenPorts)
 	}
 	spec.Maps[bpfMapFlows].InnerMap.MaxEntries = t.opts.MaxFlows
@@ -359,10 +381,11 @@ func ephemeralPortRange() (uint16, uint16) {
 // loadCore loads the maps, the TCP programs and the iterators.
 func (t *Tracer) loadCore(spec *ebpf.CollectionSpec) error {
 	core := spec.Copy()
-	for _, p := range slices.Concat(udpPrograms, unixPrograms) {
+	for _, p := range slices.Concat(udpPrograms, udpKprobePrograms, unixPrograms) {
 		delete(core.Programs, p.prog)
 	}
 	withoutConntrack(core)
+	withoutConnectErrors(core)
 	coll, err := ebpf.NewCollection(core)
 	if err != nil {
 		return fmt.Errorf("loading BPF objects: %w", verifierError(err))
@@ -464,8 +487,28 @@ func (t *Tracer) watchCgroups(coll *ebpf.Collection) error {
 	return nil
 }
 
-// loadTracing loads and attaches a set of programs with BPF trampolines,
-// sharing the maps of the core collection: all of them, or none.
+// loadUDP attaches the programs of UDP: those with BPF trampolines, or else
+// the kprobes.
+func (t *Tracer) loadUDP(spec *ebpf.CollectionSpec) error {
+	err := errors.New("forced to use kprobes")
+	if !forceUDPKprobes {
+		err = t.loadTracing(spec, udpPrograms)
+	}
+	if err == nil {
+		t.udp = true
+		return nil
+	}
+	if kerr := t.loadTracing(spec, udpKprobePrograms); kerr != nil {
+		return fmt.Errorf("with BPF trampolines: %w; with kprobes: %w", err, kerr)
+	}
+	t.udp, t.udpKprobes = true, true
+	t.log.Info("UDP is traced with kprobes, which cost more per datagram than BPF trampolines, which do not attach",
+		"error", err)
+	return nil
+}
+
+// loadTracing loads and attaches a set of programs with BPF trampolines or
+// kprobes, sharing the maps of the core collection: all of them, or none.
 func (t *Tracer) loadTracing(spec *ebpf.CollectionSpec, progs []tracingProgram) error {
 	sub := spec.Copy()
 	withoutConntrack(sub)
@@ -484,7 +527,15 @@ func (t *Tracer) loadTracing(spec *ebpf.CollectionSpec, progs []tracingProgram) 
 	}
 	var links []link.Link
 	for _, p := range progs {
-		l, err := link.AttachTracing(link.TracingOptions{Program: coll.Programs[p.prog]})
+		var (
+			l   link.Link
+			err error
+		)
+		if p.kprobe {
+			l, err = link.Kprobe(p.target, coll.Programs[p.prog], nil)
+		} else {
+			l, err = link.AttachTracing(link.TracingOptions{Program: coll.Programs[p.prog]})
+		}
 		if err != nil {
 			for _, l := range links {
 				l.Close()
