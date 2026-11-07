@@ -220,6 +220,12 @@ func TestUDPKprobes(t *testing.T) {
 	if noUDP, _ := strconv.ParseBool(os.Getenv("SHAWK_TEST_NO_UDP")); noUDP {
 		t.Skip("UDP tracing is unavailable on this kernel, as SHAWK_TEST_NO_UDP declares")
 	}
+	// The other tests of UDP run with the kprobes there already, which
+	// requireUDP checks; running them twice in an emulated VM brings its
+	// job close to the timeout of CI.
+	if noTrampolines, _ := strconv.ParseBool(os.Getenv("SHAWK_TEST_NO_TRAMPOLINES")); noTrampolines {
+		t.Skip("the tests of UDP run with kprobes on this kernel, as SHAWK_TEST_NO_TRAMPOLINES declares")
+	}
 	forceUDPKprobes = true
 	t.Cleanup(func() { forceUDPKprobes = false })
 	tr := newTestTracer(t)
