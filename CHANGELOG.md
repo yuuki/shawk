@@ -103,6 +103,12 @@
 * A service name longer than 255 bytes made of bytes that start no UTF-8
   character, e.g. in `OTEL_SERVICE_NAME`, was cut to an empty name; it is
   now cut to 252 to 255 bytes.
+* A request of a host that arrived while the connector wrote its changes,
+  which PostgreSQL then rejected, kept its session from before the drop:
+  the session covered the time of the dropped edges that agents do not
+  send again, and `unobserved()` left it out. Such a session now starts
+  no earlier than the next one, like any after a drop, and is not written
+  if it ended before (`docs/design.md` §5.1).
 
 ### Security
 

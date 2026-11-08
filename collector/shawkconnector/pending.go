@@ -144,6 +144,22 @@ func (h *hostChanges) addSession(start time.Time, s sessionRow) {
 	}
 }
 
+// floorSessions makes the sessions start no earlier than floor, by the
+// clock of the agent: a session whose last heartbeat is before the floor
+// is not written, and the others start at the floor if they started
+// before.
+func (h *hostChanges) floorSessions(floor time.Time) {
+	for start, s := range h.sessions {
+		if !start.Before(floor) {
+			continue
+		}
+		delete(h.sessions, start)
+		if !s.lastHeartbeat.Add(-s.clockSkew).Before(floor) {
+			h.addSession(floor, *s)
+		}
+	}
+}
+
 func (h *hostChanges) addAddr(a netip.Addr, s span) {
 	cur := h.addrs[a]
 	cur.merge(s)
@@ -465,14 +481,21 @@ func (c *changes) restore(h *hostChanges) {
 // forget is called when changes of a host were dropped at now. The spans
 // accepted for writing are forgotten, so that the edges and listeners the
 // agent still sends are written again, and the next session of the host
-// starts no earlier than the idle TTL of an agent before now.
+// starts no earlier than the idle TTL of an agent before now. So do the
+// sessions already pending, of requests received while the dropped changes
+// were being written: those requests skipped the edges the changes held.
 func (c *changes) forget(key string, now time.Time) {
 	delete(c.acceptedEdges, key)
 	delete(c.acceptedListeners, key)
 	delete(c.acceptedTranslations, key)
-	if f, ok := c.floors[key]; ok {
-		f.start = now.Add(-f.skew).Add(-minAgentIdleTTL).Truncate(time.Second)
-		c.floors[key] = f
+	f, ok := c.floors[key]
+	if !ok {
+		return
+	}
+	f.start = now.Add(-f.skew).Add(-minAgentIdleTTL).Truncate(time.Second)
+	c.floors[key] = f
+	if h := c.pending[key]; h != nil {
+		h.floorSessions(f.start)
 	}
 }
 

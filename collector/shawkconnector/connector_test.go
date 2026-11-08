@@ -632,6 +632,87 @@ func TestDataErrorForgetsAcceptedSpans(t *testing.T) {
 	}
 }
 
+// TestDataErrorWhileWriting: requests of a host that arrive while its
+// changes are being written skip the edges those changes hold as accepted.
+// When PostgreSQL then rejects the changes, the sessions of those requests,
+// already pending, start no earlier than the next one does, and one that
+// ended before is not written: otherwise the session would cover the time
+// of edges dropped that the agent does not send again.
+func TestDataErrorWhileWriting(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		write time.Duration // how long the rejected write takes
+	}{
+		{"slow", 5 * time.Minute}, // the floor passes the heartbeat of the pending session
+		{"fast", time.Minute},     // the floor stays before it
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, st, sink, now := testConnector(t, nil)
+			edge := tEdge{role: "client", proto: "tcp", local: "10.0.0.11", peer: "10.0.0.10", port: 5432,
+				svc: "app", comm: "app", opened: 1, last: t0}
+			ta := tAgent{host: "app-01", addrs: []string{"10.0.0.11"}, time: *now, segment: t0.Add(-time.Hour), edges: []tEdge{edge}}
+			consume(t, c, sink, ta)
+			c.flush(context.Background())
+
+			// An edge active once, in the changes PostgreSQL will reject.
+			*now = t0.Add(15 * time.Second)
+			ta.time = *now
+			ta.edges = append(ta.edges, tEdge{role: "client", proto: "tcp", local: "10.0.0.11", peer: "10.0.0.20", port: 443,
+				svc: "app", comm: "app", opened: 1, last: *now})
+			consume(t, c, sink, ta)
+
+			entered := make(chan struct{})
+			release := make(chan error)
+			st.mu.Lock()
+			st.hold = func(*hostChanges) error {
+				entered <- struct{}{}
+				return <-release
+			}
+			st.mu.Unlock()
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				c.flush(context.Background())
+			}()
+			<-entered // the changes were taken and are being written
+
+			*now = t0.Add(30 * time.Second)
+			ta.time = *now
+			consume(t, c, sink, ta)
+
+			*now = t0.Add(15*time.Second + tc.write)
+			release <- &pgconn.PgError{Code: "22021"}
+			<-done
+			st.mu.Lock()
+			st.hold = nil
+			st.mu.Unlock()
+			// The floor the drop set, by the clock of the agent (no skew).
+			floor := now.Add(-minAgentIdleTTL)
+
+			c.flush(context.Background())
+			*now = now.Add(15 * time.Second)
+			ta.time = *now
+			consume(t, c, sink, ta)
+			c.flush(context.Background())
+
+			resumed := false
+			for i, w := range st.writes[1:] {
+				for start, s := range w.sessions {
+					t.Logf("write %d: session started %v, last heartbeat %v", i+2, start.Sub(t0), s.lastHeartbeat.Sub(t0))
+					if start.Before(floor) {
+						t.Errorf("a session written after the drop starts at %v, before the floor %v: it covers the dropped changes",
+							start.Sub(t0), floor.Sub(t0))
+					}
+					resumed = resumed || start.Equal(floor)
+				}
+			}
+			if !resumed {
+				t.Errorf("no session starts at the floor %v after the drop", floor.Sub(t0))
+			}
+		})
+	}
+}
+
 // TestDownstreamErrorNotReturned: an error of the pipeline to Prometheus is
 // not returned to the agent, which would count a failed export although
 // PostgreSQL has the data.

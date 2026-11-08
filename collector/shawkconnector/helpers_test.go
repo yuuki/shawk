@@ -424,6 +424,9 @@ type fakeStore struct {
 	nodes       []nodeState
 	windowSyncs int
 	windows     []maintenanceWindow
+	// hold, when not nil, is called by write before it writes, outside the
+	// lock: it may block, and the error it returns fails the write.
+	hold func(*hostChanges) error
 }
 
 func (s *fakeStore) schemaVersion(context.Context) (int, error) {
@@ -509,6 +512,14 @@ func (s *fakeStore) migrate(context.Context) ([]string, error) {
 }
 
 func (s *fakeStore) write(_ context.Context, h *hostChanges) error {
+	s.mu.Lock()
+	hold := s.hold
+	s.mu.Unlock()
+	if hold != nil {
+		if err := hold(h); err != nil {
+			return err
+		}
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.fail {
