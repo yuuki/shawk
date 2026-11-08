@@ -1666,9 +1666,14 @@ only the protocols it parses. shawk runs beside it:
   its client (socat, DTLS). A socket that is both client and server on its
   port, like ntpd, has the direction of its first datagram for all peers.
 - **MPTCP**: subflows opened by the server side (not by the default path
-  manager) are recorded as outgoing from the server, and data resent on
-  another subflow is counted on both. With more open MPTCP connections than
-  the owner map holds, the agent scans processes every interval.
+  manager) are recorded as outgoing from the server, and data that the
+  MPTCP level resends is counted again, on another subflow or on the same
+  one, which carries it as new data. A receiver can acknowledge data on its
+  subflow before its MPTCP socket takes it; when the connection then goes
+  idle, the sender resends that data after its retransmission timeout
+  (`MPTCPRetrans`, and `DuplicateData` at the receiver, in
+  `/proc/net/netstat`). With more open MPTCP connections than the owner
+  map holds, the agent scans processes every interval.
 - **Sockets of the kernel** are named after their port (§4.1), so a
   subsystem on another's port is named after that one, and one on an
   unlisted port is `~kernel`; NFSv3 also talks to `lockd` and `mountd` on
