@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
@@ -84,12 +85,25 @@ func TestMPTCPAdopted(t *testing.T) {
 	requireRoot(t)
 	enableMPTCP(t)
 	ln := listenMPTCP(t, "tcp4", "127.0.0.1:0")
-	go acceptEcho(ln)
+	accepted := make(chan net.Conn, 2)
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			accepted <- c
+			go echo(c)
+		}
+	}()
 	srv := ln.Addr().(*net.TCPAddr).AddrPort()
 
 	pre := dialMPTCP(t, "tcp4", srv.String())
 	defer pre.Close()
 	roundTrip(t, pre, 5000)
+	// Otherwise the MPTCP level may resend the echo while the tracer
+	// starts, which the subflows count as new traffic.
+	waitMPTCPAcked(t, <-accepted)
 
 	tr := newTestTracer(t)
 	post := dialMPTCP(t, "tcp4", srv.String())
@@ -204,6 +218,56 @@ func acceptEcho(ln net.Listener) {
 				}
 			}
 		}()
+	}
+}
+
+// MPTCP_INFO of SOL_MPTCP, and the offsets of mptcpi_write_seq and
+// mptcpi_snd_una in struct mptcp_info (include/uapi/linux/mptcp.h).
+const (
+	mptcpInfo         = 1
+	mptcpInfoWriteSeq = 16
+	mptcpInfoSndUna   = 24
+)
+
+// waitMPTCPAcked waits until the peer of the MPTCP socket c acknowledged, at
+// the MPTCP level, all that c sent. A receiver can acknowledge data on its
+// subflow before its MPTCP socket takes it, with the DATA_ACK of before.
+// When nothing follows, the MPTCP level resends the data once its
+// retransmission timeout expires (MPTCPRetrans, and DuplicateData at the
+// receiver), and the subflow carries it as new data: its bytes_acked and
+// bytes_received count it again.
+func waitMPTCPAcked(t *testing.T, c net.Conn) {
+	t.Helper()
+	rc, err := c.(syscall.Conn).SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var (
+			info  [mptcpInfoSndUna + 8]byte
+			size  = uint32(len(info))
+			errno syscall.Errno
+		)
+		if err := rc.Control(func(fd uintptr) {
+			_, _, errno = unix.Syscall6(unix.SYS_GETSOCKOPT, fd, unix.SOL_MPTCP, mptcpInfo,
+				uintptr(unsafe.Pointer(&info[0])), uintptr(unsafe.Pointer(&size)), 0)
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if errno != 0 || size < uint32(len(info)) {
+			// Linux before 5.16, but RHEL 9, has no MPTCP_INFO: wait out the
+			// retransmission timeout (TCP_RTO_MIN, 200 ms, on loopback).
+			time.Sleep(time.Second)
+			return
+		}
+		if binary.NativeEndian.Uint64(info[mptcpInfoSndUna:]) == binary.NativeEndian.Uint64(info[mptcpInfoWriteSeq:]) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the MPTCP level did not acknowledge the data within 5s")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
