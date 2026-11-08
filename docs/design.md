@@ -791,7 +791,10 @@ lost when the connector crashes, or stops while the database is down, and
 agents resend only edges within their idle TTL, so a session starts no
 earlier than 2 minutes (the shortest idle TTL) before the first request the
 connector received from the host, and again after it dropped changes of the
-host; the gap since the previous heartbeat shows as not observed.
+host; the gap since the previous heartbeat shows as not observed. So does a
+session already pending from requests received while the dropped changes
+were being written, which skipped the edges those changes held; one that
+ended before that start is not written.
 
 The session also keeps `peer_fold`, `peer_internal`, `unix_traced` (NULL
 for an agent that does not send it) and `counters_started`
