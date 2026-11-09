@@ -16,6 +16,7 @@ GOLANGCI_LINT_VERSION ?= v2.15.0
 GOVULNCHECK_VERSION ?= v1.9.0
 ACTIONLINT_VERSION ?= v1.7.12
 ZIZMOR_VERSION ?= 1.32.0
+GH_ACTIONS_LOCK_VERSION ?= v0.4.1
 FUZZTIME ?= 30s
 # New inputs of the corpus are minimized for at most this long, so that a
 # short run spends its time fuzzing (the inputs of the connector are
@@ -30,6 +31,8 @@ GO_RUN_TOOL = GOTOOLCHAIN=$(GO_TOOLCHAIN) $(GO) run
 GOLANGCI_LINT ?= $(GO_RUN_TOOL) github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
 # uvx or pipx (preinstalled on GitHub-hosted runners) runs the pinned zizmor.
 ZIZMOR ?= $(if $(shell command -v uvx 2>/dev/null),uvx zizmor@$(ZIZMOR_VERSION),pipx run zizmor==$(ZIZMOR_VERSION))
+# gh-actions-lock (the `gh actions-lock` extension) runs through `go run` too.
+GH_ACTIONS_LOCK ?= $(GO_RUN_TOOL) github.com/github/gh-actions-lock/cmd/gh-actions-lock@$(GH_ACTIONS_LOCK_VERSION)
 
 .PHONY: all
 all: build
@@ -77,10 +80,19 @@ lint: ## golangci-lint (.golangci.yml) in every module, and go.mod and go.sum ti
 fmt: ## format the Go code of every module (gofmt, through golangci-lint)
 	@set -e; for m in $(MODULES); do (cd $$m && $(GOLANGCI_LINT) fmt ./...); done
 
+# gh-actions-lock checks that .github/workflows/actions.lock pins every
+# action the workflows use; with GH_TOKEN it also verifies each pin upstream.
 .PHONY: lint-actions
-lint-actions: ## lint (actionlint) and audit (zizmor) the workflows of .github
+lint-actions: ## lint (actionlint) and audit (zizmor) the workflows of .github, and check their lockfile
 	$(GO_RUN_TOOL) github.com/rhysd/actionlint/cmd/actionlint@$(ACTIONLINT_VERSION)
 	$(ZIZMOR) $(if $(GH_TOKEN),,--offline) .
+	$(GH_ACTIONS_LOCK) $(if $(GH_TOKEN),--verify,--verify-local)
+
+# Pin the actions in .github/workflows/actions.lock after a `uses:` changed,
+# then review the diff. Needs a GitHub token (GH_TOKEN or `gh auth login`).
+.PHONY: lock-actions
+lock-actions: ## Update .github/workflows/actions.lock after changing a uses: line
+	$(GH_ACTIONS_LOCK)
 
 .PHONY: test-fuzz
 test-fuzz: ## run every fuzz target for FUZZTIME (default 30s)
