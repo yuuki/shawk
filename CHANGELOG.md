@@ -62,6 +62,9 @@
 * `-max-flows` also sizes the in-kernel tables of the flows of Unix
   sockets, to a quarter of it, and of their open connections, to a half,
   at least 1024 each (about 3.6 MiB at the default).
+* The collector is built with the components of the OpenTelemetry
+  Collector v0.165.0 (v1.71.0 for the stable modules), and the Go
+  modules are updated to their latest versions.
 
 ### Fixed
 
