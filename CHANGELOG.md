@@ -62,6 +62,9 @@
 * `-max-flows` also sizes the in-kernel tables of the flows of Unix
   sockets, to a quarter of it, and of their open connections, to a half,
   at least 1024 each (about 3.6 MiB at the default).
+* The collector is built with the components of the OpenTelemetry
+  Collector v0.165.0 (v1.71.0 for the stable modules), and the Go
+  modules are updated to their latest versions.
 
 ### Fixed
 
@@ -123,6 +126,12 @@
   further ones like hosts beyond `max_hosts` until one has not sent for
   `idle_ttl` (`docs/design.md` §5.5). Machines that share one certificate
   share the 4.
+* The agent, the collector and `shawk-migrate` build with Go 1.27.4, the
+  security release of 2026-11-10: a race of `http.MaxBytesReader` with
+  the handler in the HTTP/1 server of `net/http` (CVE-2026-97054), and
+  code execution at build time through cgo flags and directives
+  (CVE-2026-97033 to CVE-2026-97043). The VM of `test/harness/slurm.sh`
+  installs the same release.
 
 ### Documentation
 

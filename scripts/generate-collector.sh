@@ -5,7 +5,7 @@
 # Usage: scripts/generate-collector.sh VERSION
 set -eu
 version="${1:?usage: generate-collector.sh VERSION}"
-ocb_version="${OCB_VERSION:-v0.164.0}"
+ocb_version="${OCB_VERSION:-v0.165.0}"
 cd "$(dirname "$0")/../collector"
 manifest=_release-builder-config.yaml
 trap 'rm -f "$manifest"' EXIT

@@ -74,8 +74,8 @@ go_tarball() {
 	arch="$(platform)"
 	arch="${arch#*-}"
 	case "$version-$arch" in
-	1.27.3-amd64) sum=65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40 ;;
-	1.27.3-arm64) sum=a06e99309dbcbdca1a8ccd2282c3ee146e55930886e26b4f1193269587165f49 ;;
+	1.27.4-amd64) sum=7226736c2339719cda28fbf3a54d71aa63bcefe376e98cef00034268dab24840 ;;
+	1.27.4-arm64) sum=3392582988a273a87ab5043ee1b2c9c17a2c3c00580bf9326c47a2e0aaaeac92 ;;
 	*) die "Go $version of go.mod is not in the table of slurm.sh: add its SHA-256 from https://go.dev/dl/?mode=json" ;;
 	esac
 	fetch "https://go.dev/dl/go$version.linux-$arch.tar.gz" "$sum"

@@ -100,7 +100,7 @@ srun listens in `SrunPortRange`; then that an MPI program runs with two
 ranks through srun.
 
 The VM is also a Linux host with systemd for the tests that need one. It
-has the Go of `go.mod` (1.27.3, the release of go.dev pinned by its SHA-256,
+has the Go of `go.mod` (1.27.4, the release of go.dev pinned by its SHA-256,
 with `GOTOOLCHAIN=local`), `make`, `psql` and the tools of `make e2e`, and
 its own state of `test/harness` (`/var/tmp/shawk-harness`), so the
 PostgreSQL of `postgres.sh` runs in it beside that of the host:
