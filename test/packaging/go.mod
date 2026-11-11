@@ -1,6 +1,6 @@
 module github.com/yuuki/shawk/test/packaging
 
-go 1.27.3
+go 1.27.4
 
 require (
 	github.com/prometheus/common v0.71.0

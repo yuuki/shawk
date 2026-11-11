@@ -1,6 +1,6 @@
 module github.com/yuuki/shawk
 
-go 1.27.3
+go 1.27.4
 
 tool github.com/cilium/ebpf/cmd/bpf2go
 

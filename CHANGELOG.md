@@ -123,6 +123,12 @@
   further ones like hosts beyond `max_hosts` until one has not sent for
   `idle_ttl` (`docs/design.md` §5.5). Machines that share one certificate
   share the 4.
+* The agent, the collector and `shawk-migrate` build with Go 1.27.4, the
+  security release of 2026-11-10: a race of `http.MaxBytesReader` with
+  the handler in the HTTP/1 server of `net/http` (CVE-2026-97054), and
+  code execution at build time through cgo flags and directives
+  (CVE-2026-97033 to CVE-2026-97043). The VM of `test/harness/slurm.sh`
+  installs the same release.
 
 ### Documentation
 
