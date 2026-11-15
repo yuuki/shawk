@@ -1,5 +1,6 @@
 # shawk
 
+[![AI Generated](https://img.shields.io/badge/AI%20Generated-Claude-orange?logo=anthropic)](https://claude.ai/claude-code)
 [![CI](https://github.com/yuuki/shawk/actions/workflows/test.yml/badge.svg)](https://github.com/yuuki/shawk/actions/workflows/test.yml)
 [![Security](https://github.com/yuuki/shawk/actions/workflows/security.yml/badge.svg)](https://github.com/yuuki/shawk/actions/workflows/security.yml)
 [![Release](https://img.shields.io/github/v/release/yuuki/shawk)](https://github.com/yuuki/shawk/releases)
