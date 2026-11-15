@@ -1,5 +1,11 @@
 # shawk
 
+[![CI](https://github.com/yuuki/shawk/actions/workflows/test.yml/badge.svg)](https://github.com/yuuki/shawk/actions/workflows/test.yml)
+[![Security](https://github.com/yuuki/shawk/actions/workflows/security.yml/badge.svg)](https://github.com/yuuki/shawk/actions/workflows/security.yml)
+[![Release](https://img.shields.io/github/v/release/yuuki/shawk)](https://github.com/yuuki/shawk/releases)
+[![License](https://img.shields.io/github/license/yuuki/shawk)](LICENSE)
+[![Go version](https://img.shields.io/github/go-mod/go-version/yuuki/shawk)](go.mod)
+
 shawk records the network dependencies of your servers: which process talks
 to which TCP/UDP service on every host, or to which local service on its
 Unix socket, since when, until when, and how much.
