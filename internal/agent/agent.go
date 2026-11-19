@@ -48,7 +48,11 @@ type Config struct {
 	// JobUsers sends the user ids of the processes of Slurm jobs
 	// (process.user.id), which PostgreSQL keeps if the connector is told to.
 	JobUsers bool
-	Logger   *slog.Logger
+	// ClassifyProtocols classifies the wire protocol of every new TCP
+	// connection from its first payload, and sends the protocols of the
+	// edges (tracer.Options.ClassifyProtocols).
+	ClassifyProtocols bool
+	Logger            *slog.Logger
 
 	traceSelf bool // trace the agent's own flows; for tests
 }
@@ -171,6 +175,7 @@ func Run(ctx context.Context, cfg Config) error {
 		InternalPeers:     cfg.InternalPeers,
 		LocalAddrs:        local,
 		LearnTranslations: cfg.LearnTranslations,
+		ClassifyProtocols: cfg.ClassifyProtocols,
 		Logger:            cfg.Logger,
 	})
 	if err != nil {
@@ -191,6 +196,9 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	if !tr.UnixEnabled() {
 		cfg.Logger.Warn("Unix sockets are not traced; see the error above (their tracing needs BPF trampolines, fexit)")
+	}
+	if cfg.ClassifyProtocols && !tr.ProtocolsEnabled() {
+		cfg.Logger.Warn("wire protocols are not classified; see the error above (their classification needs BPF trampolines, fentry)")
 	}
 	if cfg.NetNS != 0 && cfg.NetNS == procinfo.NetNSOf(1) {
 		cfg.Logger.Warn("only the initial network namespace is traced: connections of containers in other namespaces are not, " +
@@ -429,6 +437,8 @@ func (a *Agent) observe(snap *tracer.Snapshot, start, end time.Time) {
 			HandshakeSumUs: f.HandshakeSumUs,
 			SynRetrans:     f.SynRetrans,
 			Fails:          f.Fails,
+			// The bits of the tracer are those of otlp.WireProtocols.
+			Protocols: uint32(f.Protocols),
 		}, start, end)
 	}
 	for _, x := range snap.Translations {

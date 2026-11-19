@@ -199,11 +199,26 @@ var errorTypeSize = func() int {
 	return n
 }()
 
+// wireProtocolSize bounds the size of the attribute shawk.wire_protocol.
+var wireProtocolSize = func() int {
+	n := 0
+	for _, p := range WireProtocols {
+		n = max(n, attrsSize([]*commonpb.KeyValue{str(AttrWireProtocol, p)}))
+	}
+	return n
+}()
+
 // edgeSize bounds the encoded size of the data points of an edge.
 func edgeSize(k *EdgeKey, e *Edge, attrs []*commonpb.KeyValue) int {
 	a := attrsSize(attrs)
 	// Two gauges, first and last seen.
 	n := 2 * (a + pointOverhead)
+	// Two gauges per wire protocol seen.
+	for _, p := range e.Protocols {
+		if !p.First.IsZero() {
+			n += 2 * (a + wireProtocolSize + pointOverhead)
+		}
+	}
 	// The reasons of failure that occurred.
 	reasons := 0
 	for _, t := range e.FailStart {
@@ -281,6 +296,20 @@ func (s *State) addEdge(b *builder, k *EdgeKey, attrs []*commonpb.KeyValue) {
 	}
 	b.gauge(MetricEdgeFirst, "s", e.FirstSeen.Unix(), attrs)
 	b.gauge(MetricEdgeLast, "s", e.LastSeen.Unix(), attrs)
+	addWireProtocols(b, e, attrs)
+}
+
+// addWireProtocols adds when the wire protocols seen on an edge were first
+// and last seen, for those seen.
+func addWireProtocols(b *builder, e *Edge, attrs []*commonpb.KeyValue) {
+	for i, p := range e.Protocols {
+		if p.First.IsZero() {
+			continue
+		}
+		a := with(attrs, AttrWireProtocol, WireProtocols[i])
+		b.gauge(MetricEdgeWireFirst, "s", p.First.Unix(), a)
+		b.gauge(MetricEdgeWireLast, "s", p.Last.Unix(), a)
+	}
 }
 
 // addFailReasons adds the failures of a client edge by error.type, for the

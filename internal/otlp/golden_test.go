@@ -29,15 +29,19 @@ func goldenRequest() *colmetricspb.ExportMetricsServiceRequest {
 			// failures for every reason, which the connector must know,
 			// two by timeout and one for another reason.
 			Handshakes: [len(HandshakeBounds) + 1]uint64{2: 2, 9: 1}, HandshakeSumUs: 1_200_600, SynRetrans: 3,
-			Fails: [len(FailReasons)]uint64{1, 2, 1, 1, 1}},
+			Fails: [len(FailReasons)]uint64{1, 2, 1, 1, 1},
+			// The client asks PostgreSQL for TLS (postgres, 9).
+			Protocols: 1 << 9},
 		t0, t0.Add(15*time.Second))
 	s.AddEdge(EdgeKey{Role: RoleServer, Proto: "tcp", LocalAddr: netip.MustParseAddr("10.0.0.11"),
 		PeerAddr: netip.MustParseAddr("10.0.0.5"), Port: 8080, NetNS: 4026531840, Process: app},
-		EdgeStats{Conns: 10, BytesSent: 1000, BytesRecv: 500}, t0, t0.Add(15*time.Second))
-	// The clients outside the internal ranges, folded into one edge.
+		EdgeStats{Conns: 10, BytesSent: 1000, BytesRecv: 500, Protocols: 1 << 6}, t0, t0.Add(15*time.Second)) // http1
+	// The clients outside the internal ranges, folded into one edge, which
+	// the server answers with TLS 1.2 and 1.3.
 	s.AddEdge(EdgeKey{Role: RoleServer, Proto: "tcp", LocalAddr: netip.MustParseAddr("10.0.0.11"),
 		PeerAddr: netip.MustParseAddr("0.0.0.0"), PeerFolded: true, Port: 443, NetNS: 4026531840, Process: app},
-		EdgeStats{Conns: 250, OpenConns: 40, BytesSent: 90000, BytesRecv: 12000}, t0, t0.Add(15*time.Second))
+		EdgeStats{Conns: 250, OpenConns: 40, BytesSent: 90000, BytesRecv: 12000, Protocols: 1<<4 | 1<<5},
+		t0, t0.Add(15*time.Second))
 	s.AddEdge(EdgeKey{Role: RoleClient, Proto: "udp", LocalAddr: netip.MustParseAddr("10.0.0.11"),
 		PeerAddr: netip.MustParseAddr("8.8.8.8"), Port: 53, NetNS: 4026531840,
 		Process: Process{Unit: "app.service", Comm: "puma", Exe: "/usr/bin/ruby", Service: "app", ServiceNamespace: "shop"}},
@@ -79,7 +83,8 @@ func goldenRequest() *colmetricspb.ExportMetricsServiceRequest {
 		FlowsDropped: 7, CgroupEventsDropped: 3, ContainerReadsDrops: 2, ExportFailures: 1,
 		TranslationsTraced: true, TranslationsDropped: 2,
 		RDMA: true, RDMAData: 1 << 32,
-		BPFPrograms: []BPFProgram{{Name: "shawk_inet_sock_set_state", RunCount: 42, RunTime: 3 * time.Millisecond}},
+		BPFPrograms: []BPFProgram{{Name: "shawk_inet_sock_set_state", RunCount: 42, RunTime: 3 * time.Millisecond},
+			{Name: "shawk_tcp_sendmsg", RunCount: 1000, RunTime: 20 * time.Microsecond}},
 	}, t0.Add(15*time.Second))
 }
 

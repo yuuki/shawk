@@ -25,6 +25,11 @@ const (
 	metricConnFailedByReason = "shawk.connection.failed.by_reason"
 	metricEdgeFirst          = "shawk.edge.first_seen"
 	metricEdgeLast           = "shawk.edge.last_seen"
+	// Of TCP edges: when a connection whose first payload showed a wire
+	// protocol (attrWireProtocol) was first and last seen. They are written
+	// to PostgreSQL only.
+	metricEdgeWireFirst = "shawk.edge.wire_protocol.first_seen"
+	metricEdgeWireLast  = "shawk.edge.wire_protocol.last_seen"
 
 	metricListenerFirst = "shawk.listener.first_seen"
 	metricListenerLast  = "shawk.listener.last_seen"
@@ -99,6 +104,8 @@ const (
 	attrNetNSScope  = "shawk.netns.scope"
 	attrBPFProgram  = "shawk.bpf.program"
 	attrErrorType   = "error.type"
+	// attrWireProtocol is one of wireProtocols.
+	attrWireProtocol = "shawk.wire_protocol"
 	// attrPeerFolded marks an edge whose peer is folded: every peer outside
 	// the internal ranges of the agent, sent as the address 0.0.0.0 or ::.
 	attrPeerFolded = "shawk.peer.folded"
@@ -147,6 +154,16 @@ func outErrorType(t string) string {
 		return t
 	}
 	return errorTypeOther
+}
+
+// wireProtocols are the values of shawk.wire_protocol that agents send:
+// the protocols the first payload of a TCP connection shows, a copy of
+// those of internal/otlp, which must be kept in sync, and of the check of
+// shawk.edge_protocols. A point with another value is invalid, so that an
+// agent cannot make a row per value.
+var wireProtocols = map[string]bool{
+	"unknown": true, "tls": true, "tls_1_0": true, "tls_1_1": true, "tls_1_2": true, "tls_1_3": true, "http1": true,
+	"http2_grpc": true, "ssh": true, "postgres": true, "mysql": true, "redis": true, "slurm_rpc": true,
 }
 
 // Values of network.io.direction that agents send.
@@ -220,6 +237,7 @@ var bpfPrograms = map[string]bool{
 	"shawk_skb_consume_udp":     true,
 	"shawk_skb_consume_udp_k":   true,
 	"shawk_tcp_receive_reset":   true,
+	"shawk_tcp_sendmsg":         true,
 	"shawk_unix_release":        true,
 	"shawk_unix_stream_connect": true,
 }

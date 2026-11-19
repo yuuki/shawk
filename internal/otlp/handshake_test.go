@@ -117,6 +117,7 @@ func TestEdgeSizeBound(t *testing.T) {
 				st.Fails[i] = math.MaxInt64 / 8
 			}
 			st.ConnFails = math.MaxInt64
+			st.Protocols = 1<<len(WireProtocols) - 1
 			k := clientEdge()
 			k.Role, k.Proto = role, transport
 			k.PeerAddr = netip.MustParseAddr("2001:db8::1")

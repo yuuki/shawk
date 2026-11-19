@@ -185,6 +185,9 @@ ON CONFLICT (host_id, unit, comm, service_name, (coalesce(user_id, -1))) DO UPDA
 	if len(h.edges) > 0 {
 		queueEdges(b, h)
 	}
+	if len(h.wire) > 0 {
+		queueWire(b, h)
+	}
 	if len(h.listeners) > 0 {
 		queueListeners(b, h)
 		queueUnixListeners(b, h)
@@ -260,6 +263,45 @@ ON CONFLICT (host_id, path, netns, process_id) DO UPDATE SET
   last_seen  = greatest(e.last_seen, excluded.last_seen)`,
 			h.key, unix.units, unix.comms, unix.services, unix.users, unix.paths, unix.netns, unix.firsts, unix.lasts)
 	}
+}
+
+// queueWire writes the wire protocols of the TCP edges of a host, after
+// their edges, which the batch holds or PostgreSQL has: a protocol whose
+// edge is in neither is left out, as the edge was.
+func queueWire(b *pgx.Batch, h *hostChanges) {
+	var units, comms, services, users, roles, locals, peers, protocols []string
+	var ports []int32
+	var netns []int64
+	var firsts, lasts []time.Time
+	for k, s := range h.wire {
+		e := k.edge
+		units = append(units, e.unit)
+		comms = append(comms, e.comm)
+		services = append(services, e.service)
+		users = append(users, e.user)
+		roles = append(roles, e.role)
+		locals = append(locals, e.local.String())
+		peers = append(peers, peerString(e.peer, e.folded))
+		ports = append(ports, int32(e.port))
+		netns = append(netns, int64(e.netns))
+		protocols = append(protocols, k.protocol)
+		firsts = append(firsts, s.first)
+		lasts = append(lasts, s.last)
+	}
+	b.Queue(`
+INSERT INTO shawk.edge_protocols AS w (edge_id, protocol, first_seen, last_seen)
+SELECT e.id, u.protocol, u.f, u.l
+FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::text[],
+            $9::integer[], $10::bigint[], $11::text[], $12::timestamptz[], $13::timestamptz[])
+  AS u(unit, comm, service, uid, role, local, peer, port, netns, protocol, f, l)
+JOIN shawk.processes p ON p.host_id = $1 AND p.unit = u.unit AND p.comm = u.comm AND p.service_name = u.service
+  AND coalesce(p.user_id, -1) = coalesce(nullif(u.uid, '')::bigint, -1)
+JOIN shawk.edges e ON e.host_id = $1 AND e.role = u.role AND e.proto = 'tcp' AND e.local_addr = u.local::inet
+  AND e.remote_addr = u.peer::inet AND e.port = u.port AND e.netns = u.netns AND e.process_id = p.id
+ON CONFLICT (edge_id, protocol) DO UPDATE SET
+  first_seen = least(w.first_seen, excluded.first_seen),
+  last_seen  = greatest(w.last_seen, excluded.last_seen)`,
+		h.key, units, comms, services, users, roles, locals, peers, ports, netns, protocols, firsts, lasts)
 }
 
 // queueSessions writes the sessions of a host, and the periods in which its

@@ -115,6 +115,36 @@ struct shawk_flow_stats {
 	 */
 	__u32 syn_retrans;
 	__u32 fails[FAIL_REASONS]; /* failed active opens by reason */
+	/*
+	 * The wire protocols of the TCP connections whose first payload the
+	 * local socket sent in the interval: a bit (1 << enum
+	 * shawk_wire_proto) per protocol (see shawk_tcp_sendmsg).
+	 */
+	__u32 protos;
+};
+
+/*
+ * The protocol a TCP connection speaks, as the first payload that the local
+ * socket sends shows it (see wire_classify()): the request of a client, the
+ * answer or the greeting of a server. TLS has the version a client offers
+ * at most, or the version a server chose; WIRE_TLS is TLS whose version the
+ * bytes read do not tell. User space has the same values (WireProtocol).
+ */
+enum shawk_wire_proto {
+	WIRE_UNKNOWN = 0,  /* read, but none of the others */
+	WIRE_TLS = 1,      /* TLS of an unknown version */
+	WIRE_TLS_1_0 = 2,  /* TLS 1.0, or SSL 3.0 */
+	WIRE_TLS_1_1 = 3,
+	WIRE_TLS_1_2 = 4,
+	WIRE_TLS_1_3 = 5,
+	WIRE_HTTP1 = 6,    /* HTTP/1.x in clear text */
+	WIRE_HTTP2 = 7,    /* HTTP/2 in clear text (h2c), as gRPC without TLS */
+	WIRE_SSH = 8,
+	WIRE_POSTGRES = 9, /* the PostgreSQL protocol, before any TLS it asks for */
+	WIRE_MYSQL = 10,   /* the MySQL protocol, before any TLS it asks for */
+	WIRE_REDIS = 11,   /* RESP, the protocol of Redis and Valkey */
+	WIRE_SLURM = 12,   /* the RPCs of Slurm */
+	WIRE_PROTOS = 13,
 };
 
 /*

@@ -274,10 +274,12 @@ func (t *Tracer) attribute(flows []Flow) []Flow {
 	return out
 }
 
-// The buckets and reasons of struct shawk_flow_stats are those of FlowStats.
+// The buckets, reasons and wire protocols of struct shawk_flow_stats are
+// those of FlowStats.
 var (
 	_ [len(bpfShawkFlowStats{}.HsBuckets)]struct{} = [len(FlowStats{}.Handshakes)]struct{}{}
 	_ [len(bpfShawkFlowStats{}.Fails)]struct{}     = [len(FlowStats{}.Fails)]struct{}{}
+	_ [bpfShawkWireProtoWIRE_PROTOS]struct{}       = [NumWireProtocols]struct{}{}
 )
 
 func convertFlow(k *bpfShawkFlowKey, v *bpfShawkFlowStats) Flow {
@@ -306,6 +308,7 @@ func convertFlow(k *bpfShawkFlowKey, v *bpfShawkFlowStats) Flow {
 			RTTSamples:     uint64(v.RttSamples),
 			HandshakeSumUs: v.HsSumUs,
 			SynRetrans:     uint64(v.SynRetrans),
+			Protocols:      WireProtocols(v.Protos) & allWireProtocols,
 			PID:            v.Pid,
 		},
 	}

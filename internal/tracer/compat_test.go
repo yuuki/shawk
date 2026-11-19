@@ -32,6 +32,11 @@ var optionalTypes = map[string]bool{
 	"tcp_sock___smc":    true, // syn_smc, with CONFIG_SMC only (not in RHEL 9)
 	"inet_sock___defer": true, // defer_connect, a bitfield before Linux 6.6
 	"inet_sock___flags": true, // inet_flags, since Linux 6.6 (not in RHEL 9)
+	// The iovecs of struct iov_iter, iov before Linux 6.4 and __iov since,
+	// and the buffer of ITER_UBUF, since Linux 6.0.
+	"iov_iter___iov":   true,
+	"iov_iter___iov64": true,
+	"iov_iter___ubuf":  true,
 	// The registers of the arguments of kprobes, of one architecture each.
 	"pt_regs___x86":   true,
 	"pt_regs___arm64": true,
@@ -113,20 +118,27 @@ func TestKernelCompatibility(t *testing.T) {
 					t.Logf("%v => %v", relos[i], fx.String())
 				}
 			}
-			// defer_connect is in one of its flavors in every kernel.
-			deferConnect := false
+			// defer_connect, and the iovecs of struct iov_iter, are in one of
+			// their flavors in every kernel.
+			deferConnect, iovecs := false, false
 			for i, fx := range fixups {
 				if strings.Contains(fx.String(), "poison") && !optionalRelocation(relos[i]) {
 					t.Errorf("unresolvable CO-RE relocation %v", relos[i])
 				}
 				r := relos[i].String()
-				if strings.Contains(r, "byte_off") && (strings.Contains(r, `"inet_sock___defer"`) || strings.Contains(r, `"inet_sock___flags"`)) &&
-					!strings.Contains(fx.String(), "poison") {
+				resolved := strings.Contains(r, "byte_off") && !strings.Contains(fx.String(), "poison")
+				if resolved && (strings.Contains(r, `"inet_sock___defer"`) || strings.Contains(r, `"inet_sock___flags"`)) {
 					deferConnect = true
+				}
+				if resolved && (strings.Contains(r, `"iov_iter___iov"`) || strings.Contains(r, `"iov_iter___iov64"`)) {
+					iovecs = true
 				}
 			}
 			if name == "shawk_inet_sock_set_state" && !deferConnect {
 				t.Error("neither flavor of defer_connect of struct inet_sock exists")
+			}
+			if name == "shawk_tcp_sendmsg" && !iovecs {
+				t.Error("neither flavor of the iovecs of struct iov_iter exists")
 			}
 		})
 	}

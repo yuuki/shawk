@@ -5,7 +5,7 @@ This product is licensed under the Apache License, Version 2.0 (see LICENSE),
 except for the following files in internal/tracer/bpf, which are loaded into
 the Linux kernel:
 
-* shawk.bpf.c and shawk.h (the eBPF programs) are dual-licensed under
+* shawk.bpf.c, shawk.h and wire.h (the eBPF programs) are dual-licensed under
   GPL-2.0-only OR BSD-2-Clause (see LICENSES/). The kernel only accepts
   programs that declare a GPL-compatible license when they use GPL-only
   helpers, so the programs declare "Dual BSD/GPL". The BSD-2-Clause option

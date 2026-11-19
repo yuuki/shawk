@@ -101,6 +101,9 @@ type edgeInput struct {
 	id          edgeID
 	first, last time.Time
 	values      map[valueKey]point
+	// wire are when connections of the edge showed each wire protocol, of
+	// wireProtocols; nil if none did.
+	wire map[string]span
 }
 
 // translationID identifies a translation of addresses that a host made:
@@ -294,6 +297,10 @@ func (b *hostBatch) addMetric(m pmetric.Metric) {
 				}
 			}
 		})
+	case metricEdgeWireFirst, metricEdgeWireLast:
+		forGauge(b, m, func(dp pmetric.NumberDataPoint, t time.Time) {
+			b.addWire(dp.Attributes(), name == metricEdgeWireFirst, t)
+		})
 	case metricListenerFirst, metricListenerLast:
 		forGauge(b, m, func(dp pmetric.NumberDataPoint, t time.Time) {
 			if l := b.listener(dp.Attributes()); l != nil {
@@ -319,6 +326,30 @@ func (b *hostBatch) addMetric(m pmetric.Metric) {
 			b.addAgent(m, name)
 		}
 	}
+}
+
+// addWire records when a TCP edge, of the attributes of a point, first or
+// last saw a wire protocol.
+func (b *hostBatch) addWire(a pcommon.Map, first bool, t time.Time) {
+	p := getString(a, attrWireProtocol)
+	if !wireProtocols[p] || getString(a, attrTransport) != "tcp" {
+		b.invalid++
+		return
+	}
+	e := b.edge(a)
+	if e == nil {
+		return
+	}
+	if e.wire == nil {
+		e.wire = map[string]span{}
+	}
+	s := e.wire[p]
+	if first {
+		s.first = t
+	} else {
+		s.last = t
+	}
+	e.wire[p] = s
 }
 
 // addSums decodes the points of m, a sum of the edges named name.

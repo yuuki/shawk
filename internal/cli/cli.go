@@ -148,6 +148,8 @@ func runAgent(ctx context.Context, args []string, _, stderr io.Writer) error {
 			"learn the translations of addresses the host makes (DNAT, SNAT, IPVS) from conntrack, so that dependencies through them are matched")
 		jobUsers = fs.Bool("job-users", false,
 			"send the user ids of the processes of Slurm jobs (process.user.id), which PostgreSQL keeps with job_users of the connector; for administrators only")
+		classify = fs.Bool("classify-protocols", false,
+			"classify the wire protocol of every new TCP connection (TLS version, HTTP, SSH, PostgreSQL, ...) from the first bytes each side sends, kept in PostgreSQL; adds a small cost to every TCP send")
 		logLevel = fs.String("log-level", "info", "log level: debug, info, warn or error")
 	)
 	if err := parseFlags(fs, args, stderr); err != nil {
@@ -194,6 +196,7 @@ func runAgent(ctx context.Context, args []string, _, stderr io.Writer) error {
 		BPFStats:            *bpfStats,
 		LearnTranslations:   *learn,
 		JobUsers:            *jobUsers,
+		ClassifyProtocols:   *classify,
 		Logger:              logger,
 	}
 	if err := cfg.Validate(); err != nil {
@@ -216,6 +219,8 @@ func runFlows(ctx context.Context, args []string, w, stderr io.Writer) error {
 		count    = fs.Int("count", 0, "number of intervals to show; 0 means forever")
 		netns    = fs.String("netns", "all", `network namespaces to trace: "all", "self" or an inode number`)
 		asJSON   = fs.Bool("json", false, "output JSON lines")
+		classify = fs.Bool("classify-protocols", false,
+			"classify the wire protocol of every new TCP connection from the first bytes each side sends (column WIRE)")
 	)
 	if err := parseFlags(fs, args, stderr); err != nil {
 		return err
@@ -230,11 +235,14 @@ func runFlows(ctx context.Context, args []string, w, stderr io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("%w: %w", errUsage, err)
 	}
-	tr, err := tracer.New(tracer.Options{NetNS: ns, OwnerScanInterval: *interval})
+	tr, err := tracer.New(tracer.Options{NetNS: ns, OwnerScanInterval: *interval, ClassifyProtocols: *classify})
 	if err != nil {
 		return err
 	}
 	defer tr.Close()
+	if *classify && !tr.ProtocolsEnabled() {
+		fmt.Fprintln(stderr, "warning: wire protocols are not classified: their program could not be loaded (it needs BPF trampolines, fentry)")
+	}
 	if !tr.UDPEnabled() {
 		fmt.Fprintln(stderr, "warning: UDP is not traced: its programs could not be loaded (they need BPF trampolines, fentry)")
 	}
@@ -259,12 +267,12 @@ func runFlows(ctx context.Context, args []string, w, stderr io.Writer) error {
 			}
 			continue
 		}
-		printFlows(w, snap.Flows)
+		printFlows(w, snap.Flows, *classify)
 	}
 	return nil
 }
 
-func printFlows(w io.Writer, flows []tracer.Flow) {
+func printFlows(w io.Writer, flows []tracer.Flow, wire bool) {
 	sort.Slice(flows, func(i, j int) bool {
 		a, b := flows[i], flows[j]
 		if a.Direction != b.Direction {
@@ -283,7 +291,11 @@ func printFlows(w io.Writer, flows []tracer.Flow) {
 	})
 	fmt.Fprintf(w, "--- %s\n", time.Now().Format(time.TimeOnly))
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "DIR\tPROTO\tLOCAL\tREMOTE\tPORT\tPROCESS\tPID\tCONNS\tFAILED\tHANDSHAKE\tSYN-RETRANS\tOPEN\tSENT\tRECV")
+	header := "DIR\tPROTO\tLOCAL\tREMOTE\tPORT\tPROCESS\tPID\tCONNS\tFAILED\tHANDSHAKE\tSYN-RETRANS\tOPEN\tSENT\tRECV"
+	if wire {
+		header += "\tWIRE"
+	}
+	fmt.Fprintln(tw, header)
 	for _, f := range flows {
 		local, remote := f.LocalAddr.String(), f.RemoteAddr.String()
 		port := strconv.FormatUint(uint64(f.Port), 10)
@@ -309,8 +321,18 @@ func printFlows(w io.Writer, flows []tracer.Flow) {
 		case f.Proto == tracer.ProtoUnix:
 			failed, sent, recv = failures(&f.FlowStats), "-", "-"
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\t%d\t%s\t%s\n", arrow, f.Proto, local, remote, port, f.Comm,
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\t%d\t%s\t%s", arrow, f.Proto, local, remote, port, f.Comm,
 			f.PID, conns, failed, handshake, synRetrans, f.OpenConns, sent, recv)
+		if wire {
+			// The protocols of the connections whose first payload was
+			// sent in the interval.
+			protocols := f.Protocols.String()
+			if protocols == "" {
+				protocols = "-"
+			}
+			fmt.Fprintf(tw, "\t%s", protocols)
+		}
+		fmt.Fprintln(tw)
 	}
 	tw.Flush()
 }

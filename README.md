@@ -33,6 +33,11 @@ this host in the last 90 days, and were we watching?*
   RDMA are not seen, even when their control connections over TCP are; TCP
   over IPoIB is. See [packaging/README.md](packaging/README.md#hpc-clusters)
   for HPC clusters.
+- Optionally (`-classify-protocols`), the first bytes that each side of a
+  new TCP connection sends tell its protocol: the version of TLS, HTTP/1 or
+  HTTP/2, SSH, PostgreSQL, MySQL, Redis or Slurm, kept in PostgreSQL, so
+  that clients still on TLS 1.0 or in clear text are found. Its program
+  runs on every TCP send, so it is off by default.
 - Agents send OTLP to an OpenTelemetry Collector. Services are named the
   way OBI (OpenTelemetry eBPF Instrumentation) names them, so shawk's
   dependencies and OBI's application metrics share the same `job`.
@@ -158,6 +163,14 @@ SELECT client_host, client_service, port, last_seen, client_observed_until, obse
 FROM shawk_v1.dependencies_between(now() - interval '90 days', now())
 WHERE server_host = 'db-01' AND server_service = 'postgres';
 
+-- Which clients reach 10.0.0.5:5432 in clear text or below TLS 1.2
+-- (agents with -classify-protocols)? Rows of the server side name the
+-- client by its address.
+SELECT role, host, service, client_addr, protocol, last_seen
+FROM shawk_v1.edge_protocols
+WHERE server_addr = '10.0.0.5' AND port = 5432 AND last_seen > now() - interval '30 days'
+  AND protocol NOT IN ('tls_1_2', 'tls_1_3');
+
 -- When was db-01 not observed, or only partly?
 SELECT * FROM shawk_v1.unobserved(now() - interval '90 days', now()) WHERE host = 'db-01';
 SELECT * FROM shawk_v1.partly_observed(now() - interval '90 days', now()) WHERE host = 'db-01';
@@ -235,7 +248,7 @@ rewritten from scratch in 2026.
 ## License
 
 [Apache License 2.0](LICENSE). The eBPF programs
-(`internal/tracer/bpf/shawk.bpf.c`, `shawk.h`) are dual-licensed
+(`internal/tracer/bpf/shawk.bpf.c`, `shawk.h`, `wire.h`) are dual-licensed
 [GPL-2.0-only](LICENSES/GPL-2.0-only.txt) OR
 [BSD-2-Clause](LICENSES/BSD-2-Clause.txt), because the kernel loads only
 GPL-compatible programs and the compiled object ships in the Apache-2.0

@@ -1,6 +1,7 @@
 package tracer
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/netip"
 	"strings"
@@ -204,6 +205,92 @@ func (r FailReason) String() string {
 	return fmt.Sprintf("reason(%d)", uint8(r))
 }
 
+// WireProtocol is the protocol a TCP connection speaks, as the first
+// payload that the local socket sent shows it: the request of a client, the
+// answer or the greeting of a server. Of TLS, a client tells the highest
+// version it offers, a server the version it chose. It matches enum
+// shawk_wire_proto of the BPF programs.
+type WireProtocol uint8
+
+const (
+	// WireUnknown is a first payload of none of the protocols below.
+	WireUnknown WireProtocol = iota
+	// WireTLS is TLS whose version the bytes read do not tell.
+	WireTLS
+	// WireTLS10 is TLS 1.0, or SSL 3.0.
+	WireTLS10
+	WireTLS11
+	WireTLS12
+	WireTLS13
+	// WireHTTP1 is HTTP/1.x in clear text.
+	WireHTTP1
+	// WireHTTP2 is HTTP/2 in clear text (h2c), as gRPC without TLS.
+	WireHTTP2
+	WireSSH
+	// WirePostgres and WireMySQL are the protocols of PostgreSQL and MySQL
+	// before any TLS they ask for, which their first payload does not show.
+	WirePostgres
+	WireMySQL
+	// WireRedis is RESP, the protocol of Redis and Valkey.
+	WireRedis
+	// WireSlurm is the RPCs of Slurm.
+	WireSlurm
+
+	// NumWireProtocols is the number of wire protocols.
+	NumWireProtocols = 13
+)
+
+// wireNames are the names of the wire protocols, as the agent sends them.
+var wireNames = [NumWireProtocols]string{
+	"unknown", "tls", "tls_1_0", "tls_1_1", "tls_1_2", "tls_1_3", "http1", "http2_grpc", "ssh", "postgres", "mysql",
+	"redis", "slurm_rpc",
+}
+
+func (p WireProtocol) String() string {
+	if p < NumWireProtocols {
+		return wireNames[p]
+	}
+	return fmt.Sprintf("wire(%d)", uint8(p))
+}
+
+// WireProtocols is a set of wire protocols, a bit (1 << WireProtocol) each.
+type WireProtocols uint32
+
+// allWireProtocols has the bits of every wire protocol.
+const allWireProtocols WireProtocols = 1<<NumWireProtocols - 1
+
+// Has tells whether the set holds p.
+func (s WireProtocols) Has(p WireProtocol) bool { return p < NumWireProtocols && s&(1<<p) != 0 }
+
+// List returns the protocols of the set in order.
+func (s WireProtocols) List() []WireProtocol {
+	var out []WireProtocol
+	for p := range WireProtocol(NumWireProtocols) {
+		if s.Has(p) {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// String joins the names of the protocols of the set with commas.
+func (s WireProtocols) String() string {
+	names := make([]string, 0, NumWireProtocols)
+	for _, p := range s.List() {
+		names = append(names, p.String())
+	}
+	return strings.Join(names, ",")
+}
+
+// MarshalJSON encodes the set as the list of the names of its protocols.
+func (s WireProtocols) MarshalJSON() ([]byte, error) {
+	names := make([]string, 0, NumWireProtocols)
+	for _, p := range s.List() {
+		names = append(names, p.String())
+	}
+	return json.Marshal(names)
+}
+
 // FlowStats holds the statistics of a bundled flow in an interval.
 type FlowStats struct {
 	Conns      uint64 // TCP and Unix connections established
@@ -229,7 +316,10 @@ type FlowStats struct {
 	// Fails are the TCP active opens and Unix connects that failed, by
 	// FailReason. ConnFails minus their sum failed for another reason.
 	Fails [NumFailReasons]uint64
-	PID   uint32 // last observed process id
+	// Protocols are the wire protocols of the TCP connections whose first
+	// payload the local socket sent (Options.ClassifyProtocols).
+	Protocols WireProtocols
+	PID       uint32 // last observed process id
 }
 
 // Add accumulates o into s.
@@ -252,6 +342,7 @@ func (s *FlowStats) Add(o FlowStats) {
 	for i := range s.Fails {
 		s.Fails[i] += o.Fails[i]
 	}
+	s.Protocols |= o.Protocols
 	if o.PID != 0 {
 		s.PID = o.PID
 	}
