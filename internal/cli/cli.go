@@ -149,7 +149,7 @@ func runAgent(ctx context.Context, args []string, _, stderr io.Writer) error {
 		jobUsers = fs.Bool("job-users", false,
 			"send the user ids of the processes of Slurm jobs (process.user.id), which PostgreSQL keeps with job_users of the connector; for administrators only")
 		classify = fs.Bool("classify-protocols", false,
-			"classify the wire protocol of every new TCP connection (TLS version, HTTP, SSH, PostgreSQL, ...) from the first bytes each side sends, kept in PostgreSQL; adds a small cost to every TCP send")
+			"classify the wire protocol of new TCP connections (TLS version, HTTP, SSH, PostgreSQL, ...) from the first payload each side sends, kept in PostgreSQL; needs BPF trampolines, and adds a hook to every TCP send (design §3.9)")
 		logLevel = fs.String("log-level", "info", "log level: debug, info, warn or error")
 	)
 	if err := parseFlags(fs, args, stderr); err != nil {
@@ -220,7 +220,7 @@ func runFlows(ctx context.Context, args []string, w, stderr io.Writer) error {
 		netns    = fs.String("netns", "all", `network namespaces to trace: "all", "self" or an inode number`)
 		asJSON   = fs.Bool("json", false, "output JSON lines")
 		classify = fs.Bool("classify-protocols", false,
-			"classify the wire protocol of every new TCP connection from the first bytes each side sends (column WIRE)")
+			"classify the wire protocol of new TCP connections from the first payload each side sends (column WIRE)")
 	)
 	if err := parseFlags(fs, args, stderr); err != nil {
 		return err

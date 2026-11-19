@@ -128,7 +128,9 @@ TLS (§3.9).
 | `iter/task_file` | owners of adopted connections, MPTCP connections and listeners; stands in for `iter/tcp` where its walk skips connections (below) |
 
 Compared with the original kprobes (`tcp_v4_connect`, `inet_csk_accept`,
-`tcp_sendmsg`, `tcp_cleanup_rbuf`), this costs nothing per message: in the
+`tcp_sendmsg`, `tcp_cleanup_rbuf`), this costs nothing per message (the
+classification of wire protocols, which is opt-in, is the one exception,
+§3.9): in the
 paper the streaming method was cheapest for persistent connections and
 bundling paid on every message, while shawk pays per state change, about
 0.11 to 0.16 µs each and 1.1 to 1.6 µs per connection on Rocky Linux 9.8
@@ -144,8 +146,7 @@ stay (for `Accept=yes`, connections never accepted or adopted, listeners of
 the kernel). What the tracepoint does not see is left to the walks: the
 traffic and RTT of a connection between its state changes, and the
 connections that predate the agent (connection pools, gRPC channels).
-IPv6 and MPTCP are handled. The one hook on the data path, which reads the
-first payload of each connection once, is opt-in (§3.9).
+IPv6 and MPTCP are handled.
 
 Bytes are read from the cumulative counters of `struct tcp_sock`
 (`bytes_acked`, `bytes_received`, `total_retrans`) at close and at every
@@ -752,7 +753,7 @@ are sent as `shawk.translation.first_seen`/`last_seen` with the client,
 virtual, source and backend addresses and ports. The agent's own
 metrics are `shawk.agent.up` (with `shawk.netns.scope`),
 `shawk.agent.segment.start`, `shawk.agent.udp.traced`,
-`shawk.agent.unix.traced`, the drop counters
+`shawk.agent.unix.traced`, `shawk.agent.protocols.classified` (§3.9), the drop counters
 `shawk.agent.flows.dropped`, `shawk.agent.cgroup_events.dropped`,
 `shawk.agent.container_reads.dropped` and
 `shawk.agent.translations.dropped`, `shawk.agent.translations.traced`,
@@ -880,8 +881,9 @@ session already pending from requests received while the dropped changes
 were being written, which skipped the edges those changes held; one that
 ended before that start is not written.
 
-The session also keeps `peer_fold`, `peer_internal`, `unix_traced` (NULL
-for an agent that does not send it) and `counters_started`
+The session also keeps `peer_fold`, `peer_internal`, `unix_traced` and
+`protocols_classified` (NULL for an agent that does not send them) and
+`counters_started`
 (the start of the agent's drop counter, by its clock), which identifies one
 run of the agent across the sessions that several connectors, a connector
 restart or a clock step create. When the drops of a run exceed the most
@@ -1469,14 +1471,14 @@ which must be run again after every `shawk-migrate` that applies migrations.
 ```
 hosts(id, machine_id, hostname, kernel, agent_version, first_seen, last_seen)
 agent_sessions(host_id, started_at, last_heartbeat, udp_traced, netns_scope, dropped_flows, clock_skew,
-               peer_fold, peer_internal, counters_started, unix_traced)
+               peer_fold, peer_internal, counters_started, unix_traced, protocols_classified)
 partial_observations(host_id, started_at, period_start, period_end, dropped_flows)  -- periods with drops
 host_addrs(host_id, addr, first_seen, last_seen)  -- one row per period
 processes(id, host_id, unit, comm, exe, service_name, user_id, first_seen, last_seen)
   -- unique (host_id, unit, comm, service_name, user_id); user_id only for processes of jobs (job_users)
 edges(id, host_id, process_id, role, proto, local_addr, remote_addr, port, netns, first_seen, last_seen)
   -- remote_addr is the network 0.0.0.0/0 or ::/0 for folded peers
-edge_protocols(edge_id, protocol, first_seen, last_seen)  -- wire protocols of TCP edges (§3.9), deleted with their edge
+edge_protocols(edge_id, protocol, first_seen, last_seen)  -- wire protocols of TCP edges (§3.9), pruned alone or with their edge
 unix_edges(id, host_id, process_id, path, netns, first_seen, last_seen)  -- clients of Unix sockets (§3.8)
 unix_listeners(host_id, process_id, path, netns, first_seen, last_seen)  -- every known owner of a listening Unix socket
 listeners(host_id, process_id, proto, addr, port, netns, first_seen, last_seen)  -- the latest owner
@@ -1533,7 +1535,7 @@ names in PostgreSQL and Prometheus match.
 | `unix_endpoints` | the names of the Unix sockets services listen on (`path`, `netns`, host, service, `slurm_job`), seen within an hour of the latest listener of Unix sockets of the host, for hosts that reported in the last 30 days; used by the connector (§5.2) |
 | `client_endpoints` | the client sides of connections in the last hour (client address, server address, port, client service, `slurm_job` if the client is a process of a Slurm job); used by the connector to name the peer of a server edge |
 | `agent_addrs` | addresses of hosts whose agent closed an interval in the last 5 minutes, with what the agent traces and folds; used by the connector |
-| `agents` | the latest segment of every host and whether its agent is alive; the last columns, `peer_fold` and `peer_internal`, tell what the agent folds and the ranges it keeps exact, and `unix_traced` whether it traces Unix sockets (NULL if it does not tell) |
+| `agents` | the latest segment of every host and whether its agent is alive; the last columns, `peer_fold` and `peer_internal`, tell what the agent folds and the ranges it keeps exact, `unix_traced` whether it traces Unix sockets, and `protocols_classified`, last, whether it classifies wire protocols (§3.9; both NULL if it does not tell) |
 | `unobserved(since, until, tolerance)` | the periods in which each host was not observed; Grafana overlays them as annotations |
 | `unobserved_by_name(since, until, tolerance)` | the same over the sessions of all the host ids of each host name, for nodes whose machine id changed (§4.1), where `unobserved()` reports the time after the last heartbeat of each old id; two machines that share a name hide each other's gaps |
 | `unobserved_reasons(since, until, tolerance)` | the periods of `unobserved_by_name()` cut by what explains them (§5.7): `cause` is `maintenance` or `power_saving` for a planned stop and NULL otherwise, `node_state` the state of Slurm then (flags joined by `+`, NULL if none was read or it was stale) and `reason` that of Slurm or of the maintenance window, which takes precedence. The gaps are per host name, as the states and windows are, since a node that power saving boots often may get a new host id at every boot. `unobserved()` and `unobserved_by_name()` do not change |

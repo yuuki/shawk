@@ -20,8 +20,9 @@ this host in the last 90 days, and were we watching?*
 - Every process is covered without instrumentation, whatever its language
   or protocol, cron jobs and third-party software included.
 - Flows to the same service are bundled in the kernel and TCP is traced only
-  at connection state changes, so the agent can always run and does not
-  sample: a job that runs once a month is still seen.
+  at connection state changes (unless wire protocols are classified, below),
+  so the agent can always run and does not sample: a job that runs once a
+  month is still seen.
 - Each host's observation periods and the periods its agent dropped flows
   are recorded, so "not used" can be told apart from "not observed".
 - TCP and UDP sockets are observed, and the connections of Unix stream
@@ -66,7 +67,8 @@ The design is in [docs/design.md](docs/design.md).
   upstream 5.14 or later. Unix sockets need BPF trampolines (fentry,
   fexit), which arm64 has only since 6.0 (Rocky Linux 9.8); without them
   they are not traced, and UDP is traced with kprobes, at about twice the
-  cost per datagram. The tested kernels
+  cost per datagram. Wire protocols (`-classify-protocols`) need them too;
+  without them they are not classified. The tested kernels
   are listed in
   [design §3.5](docs/design.md#35-kernel-requirements-and-features-used).
   The agent runs as root with the capabilities that

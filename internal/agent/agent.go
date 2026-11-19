@@ -74,6 +74,7 @@ type source interface {
 	Collect() (*tracer.Snapshot, error)
 	UDPEnabled() bool
 	UnixEnabled() bool
+	ProtocolsEnabled() bool
 	TranslationsTraced() bool
 	ProgramStats() ([]tracer.ProgramStat, error)
 }
@@ -509,6 +510,7 @@ func (a *Agent) request(now time.Time) ([]*colmetricspb.ExportMetricsServiceRequ
 		NetNSScope:          a.netnsScope(),
 		UDPTraced:           a.tracer.UDPEnabled(),
 		UnixTraced:          a.tracer.UnixEnabled(),
+		ProtocolsClassified: a.tracer.ProtocolsEnabled(),
 		FlowsDropped:        a.drops,
 		CgroupEventsDropped: a.cgroupDrops,
 		ContainerReadsDrops: a.cgroups.ReadsDropped(),

@@ -161,6 +161,12 @@ func FuzzParseResource(f *testing.F) {
 						t.Fatalf("edge %+v: %s of %v", id, k.metric, p.value)
 					}
 				}
+				// Wire protocols are of TCP edges, one per known value.
+				for p := range e.wire {
+					if id.proto != "tcp" || !wireProtocols[p] {
+						t.Fatalf("%s edge %+v with the wire protocol %q", id.proto, id, p)
+					}
+				}
 			}
 			for id := range b.listeners {
 				checkProcess(t, &id.process)

@@ -68,8 +68,8 @@ type EdgeStats struct {
 	Fails          [len(FailReasons)]uint64
 	// Protocols are the wire protocols of the connections of a TCP edge
 	// whose first payload was sent in the interval: bit i for
-	// WireProtocols[i]. A series keeps when each was seen instead
-	// (Edge.Protocols).
+	// WireProtocols[i]. Input only: a series keeps when each was seen
+	// (Edge.Protocols), not their bits in Total.
 	Protocols uint32
 }
 
@@ -120,7 +120,6 @@ func (s *EdgeStats) add(o *EdgeStats) {
 	for i := range s.Fails {
 		s.Fails[i] += o.Fails[i]
 	}
-	s.Protocols |= o.Protocols
 }
 
 // ListenerKey identifies a listener series.

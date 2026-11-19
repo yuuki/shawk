@@ -38,6 +38,34 @@ JOIN shawk.edges e ON e.id = w.edge_id
 JOIN shawk.processes p ON p.id = e.process_id
 JOIN shawk.hosts h ON h.id = e.host_id;
 
+-- Whether the agent of a session classifies wire protocols
+-- (-classify-protocols, shawk.agent.protocols.classified): an edge without
+-- protocols tells nothing otherwise. NULL for agents that do not tell.
+ALTER TABLE shawk.agent_sessions ADD COLUMN protocols_classified boolean;
+
+-- shawk_v1.agents of 0001_schema.sql, with protocols_classified last.
+CREATE OR REPLACE VIEW shawk_v1.agents AS
+SELECT DISTINCT ON (h.id)
+  h.hostname        AS host,
+  h.id              AS host_id,
+  h.machine_id,
+  h.kernel,
+  h.agent_version,
+  s.started_at,
+  s.last_heartbeat,
+  s.udp_traced,
+  s.unix_traced,    -- whether the agent traces Unix sockets; NULL if it does not tell
+  s.netns_scope,
+  s.dropped_flows,
+  s.last_heartbeat > now() - shawk.alive_window() AS alive,
+  s.clock_skew,     -- how far the clock of the host is behind the connector
+  s.peer_fold,      -- the peers the agent folds: none, in or all
+  s.peer_internal,  -- the ranges of peers the agent keeps exact
+  s.protocols_classified  -- whether the agent classifies wire protocols; NULL if it does not tell
+FROM shawk.hosts h
+JOIN shawk.agent_sessions s ON s.host_id = h.id
+ORDER BY h.id, s.last_heartbeat DESC;
+
 -- shawk.prune() of 0001_schema.sql, which also deletes the wire protocols
 -- last seen before the cutoff, of edges seen since.
 CREATE OR REPLACE FUNCTION shawk.prune(cutoff timestamptz, max_rows integer DEFAULT 10000) RETURNS bigint

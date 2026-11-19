@@ -87,11 +87,13 @@ type sessionRow struct {
 	// of the agent, from the latest request.
 	clockSkew time.Duration
 	udpTraced bool
-	// unixTraced tells whether the agent traces Unix sockets, nil if it
+	// unixTraced tells whether the agent traces Unix sockets, and
+	// protocolsClassified whether it classifies wire protocols, nil if it
 	// does not tell.
-	unixTraced *bool
-	netnsScope string
-	dropped    int64
+	unixTraced          *bool
+	protocolsClassified *bool
+	netnsScope          string
+	dropped             int64
 	// countersStarted is when the counters of the agent started, by the
 	// clock of the agent as it sends it: the same for every session of one
 	// run of the agent, whatever connector writes them and however its clock
@@ -255,8 +257,10 @@ type changes struct {
 	pending  map[string]*hostChanges
 	// accepted are the spans last accepted for writing, with when they were
 	// last reported.
-	acceptedEdges        map[string]map[edgeRowKey]acceptedSpan
-	acceptedWire         map[string]map[wireRowKey]acceptedSpan
+	acceptedEdges map[string]map[edgeRowKey]acceptedSpan
+	// acceptedWire are those of the wire protocols of edges, by edge and
+	// protocol, so that an edge is held once whatever its protocols.
+	acceptedWire         map[string]map[edgeRowKey]map[string]acceptedSpan
 	acceptedListeners    map[string]map[listenerRowKey]acceptedSpan
 	acceptedTranslations map[string]map[translationID]acceptedSpan
 	// floors bound the start of the sessions of hosts.
@@ -302,7 +306,7 @@ func newChanges(ttl time.Duration, jobUsers bool) *changes {
 		jobUsers:             jobUsers,
 		pending:              map[string]*hostChanges{},
 		acceptedEdges:        map[string]map[edgeRowKey]acceptedSpan{},
-		acceptedWire:         map[string]map[wireRowKey]acceptedSpan{},
+		acceptedWire:         map[string]map[edgeRowKey]map[string]acceptedSpan{},
 		acceptedListeners:    map[string]map[listenerRowKey]acceptedSpan{},
 		acceptedTranslations: map[string]map[translationID]acceptedSpan{},
 		floors:               map[string]sessionFloor{},
@@ -350,7 +354,8 @@ func (c *changes) add(b *hostBatch, now time.Time) {
 			start = f.start
 		}
 		s := sessionRow{lastHeartbeat: now, clockSkew: skew, udpTraced: b.udpTraced, unixTraced: b.unixTraced,
-			netnsScope: b.netnsScope, dropped: b.dropped, peerFold: b.peerFold, peerInternal: b.peerInternal}
+			protocolsClassified: b.protocolsClassified,
+			netnsScope:          b.netnsScope, dropped: b.dropped, peerFold: b.peerFold, peerInternal: b.peerInternal}
 		s.countersStarted = b.droppedSince
 		h.addSession(start, s)
 	}
@@ -400,7 +405,11 @@ func (c *changes) advanceFloor(b *hostBatch, skew time.Duration, now time.Time) 
 // protocol finds the row of its edge.
 func (c *changes) addEdges(b *hostBatch, h *hostChanges, latest, now time.Time) {
 	edges := acceptedOf(c.acceptedEdges, b.key)
-	wire := acceptedOf(c.acceptedWire, b.key)
+	wire := c.acceptedWire[b.key]
+	if wire == nil {
+		wire = map[edgeRowKey]map[string]acceptedSpan{}
+		c.acceptedWire[b.key] = wire
+	}
 	for _, e := range b.edges {
 		if e.last.IsZero() {
 			continue
@@ -414,9 +423,13 @@ func (c *changes) addEdges(b *hostBatch, h *hostChanges, latest, now time.Time) 
 			if ws.last.IsZero() {
 				continue
 			}
-			wk := wireRowKey{edge: k, protocol: p}
-			if ws := observedSpan(ws.first, ws.last, latest); accept(wire, wk, ws, now) {
-				h.addWire(wk, ws)
+			acc := wire[k]
+			if acc == nil {
+				acc = map[string]acceptedSpan{}
+				wire[k] = acc
+			}
+			if ws := observedSpan(ws.first, ws.last, latest); accept(acc, p, ws, now) {
+				h.addWire(wireRowKey{edge: k, protocol: p}, ws)
 				changed = true
 			}
 		}
@@ -564,7 +577,21 @@ func (c *changes) bound(max int, now time.Time) (hosts, rows int) {
 // expire forgets accepted spans not reported for the TTL.
 func (c *changes) expire(now time.Time) {
 	expireAccepted(c.acceptedEdges, now, c.ttl)
-	expireAccepted(c.acceptedWire, now, c.ttl)
+	for host, edges := range c.acceptedWire {
+		for k, acc := range edges {
+			for p, a := range acc {
+				if now.Sub(a.seen) > c.ttl {
+					delete(acc, p)
+				}
+			}
+			if len(acc) == 0 {
+				delete(edges, k)
+			}
+		}
+		if len(edges) == 0 {
+			delete(c.acceptedWire, host)
+		}
+	}
 	for host, m := range c.acceptedListeners {
 		for k, a := range m {
 			if now.Sub(a.seen) > c.ttl {

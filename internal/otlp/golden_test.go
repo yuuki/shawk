@@ -36,11 +36,12 @@ func goldenRequest() *colmetricspb.ExportMetricsServiceRequest {
 	s.AddEdge(EdgeKey{Role: RoleServer, Proto: "tcp", LocalAddr: netip.MustParseAddr("10.0.0.11"),
 		PeerAddr: netip.MustParseAddr("10.0.0.5"), Port: 8080, NetNS: 4026531840, Process: app},
 		EdgeStats{Conns: 10, BytesSent: 1000, BytesRecv: 500, Protocols: 1 << 6}, t0, t0.Add(15*time.Second)) // http1
-	// The clients outside the internal ranges, folded into one edge, which
-	// the server answers with TLS 1.2 and 1.3.
+	// The clients outside the internal ranges, folded into one edge, with
+	// every wire protocol, so that the connector checks that it knows them
+	// all.
 	s.AddEdge(EdgeKey{Role: RoleServer, Proto: "tcp", LocalAddr: netip.MustParseAddr("10.0.0.11"),
 		PeerAddr: netip.MustParseAddr("0.0.0.0"), PeerFolded: true, Port: 443, NetNS: 4026531840, Process: app},
-		EdgeStats{Conns: 250, OpenConns: 40, BytesSent: 90000, BytesRecv: 12000, Protocols: 1<<4 | 1<<5},
+		EdgeStats{Conns: 250, OpenConns: 40, BytesSent: 90000, BytesRecv: 12000, Protocols: 1<<len(WireProtocols) - 1},
 		t0, t0.Add(15*time.Second))
 	s.AddEdge(EdgeKey{Role: RoleClient, Proto: "udp", LocalAddr: netip.MustParseAddr("10.0.0.11"),
 		PeerAddr: netip.MustParseAddr("8.8.8.8"), Port: 53, NetNS: 4026531840,
@@ -80,7 +81,8 @@ func goldenRequest() *colmetricspb.ExportMetricsServiceRequest {
 		},
 	}, AgentStatus{
 		Started: t0.Add(-time.Hour), SegmentStart: t0.Add(-time.Hour), NetNSScope: "all", UDPTraced: true, UnixTraced: true,
-		FlowsDropped: 7, CgroupEventsDropped: 3, ContainerReadsDrops: 2, ExportFailures: 1,
+		ProtocolsClassified: true,
+		FlowsDropped:        7, CgroupEventsDropped: 3, ContainerReadsDrops: 2, ExportFailures: 1,
 		TranslationsTraced: true, TranslationsDropped: 2,
 		RDMA: true, RDMAData: 1 << 32,
 		BPFPrograms: []BPFProgram{{Name: "shawk_inet_sock_set_state", RunCount: 42, RunTime: 3 * time.Millisecond},

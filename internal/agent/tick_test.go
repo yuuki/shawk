@@ -37,6 +37,7 @@ func (f *fakeSource) Collect() (*tracer.Snapshot, error) {
 
 func (f *fakeSource) UDPEnabled() bool                            { return true }
 func (f *fakeSource) UnixEnabled() bool                           { return true }
+func (f *fakeSource) ProtocolsEnabled() bool                      { return false }
 func (f *fakeSource) TranslationsTraced() bool                    { return true }
 func (f *fakeSource) ProgramStats() ([]tracer.ProgramStat, error) { return nil, nil }
 

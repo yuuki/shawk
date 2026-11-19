@@ -41,8 +41,11 @@ type AgentStatus struct {
 	UDPTraced    bool
 	// UnixTraced tells whether the connections of Unix stream sockets are
 	// traced.
-	UnixTraced   bool
-	FlowsDropped uint64 // cumulative
+	UnixTraced bool
+	// ProtocolsClassified tells whether the wire protocols of TCP
+	// connections are classified.
+	ProtocolsClassified bool
+	FlowsDropped        uint64 // cumulative
 	// CgroupEventsDropped counts the cgroups created whose event the
 	// kernel dropped (cumulative).
 	CgroupEventsDropped uint64
@@ -353,6 +356,11 @@ func addAgent(b *builder, st *AgentStatus) {
 		unixTraced = 1
 	}
 	b.gauge(MetricAgentUnixTraced, "", unixTraced, nil)
+	classified := int64(0)
+	if st.ProtocolsClassified {
+		classified = 1
+	}
+	b.gauge(MetricAgentProtocolsClassified, "", classified, nil)
 	b.sum(MetricAgentFlowsDropped, "{update}", true, st.Started, st.FlowsDropped, nil)
 	b.sum(MetricAgentCgroupsDropped, "{event}", true, st.Started, st.CgroupEventsDropped, nil)
 	b.sum(MetricAgentReadsDropped, "{read}", true, st.Started, st.ContainerReadsDrops, nil)

@@ -2,11 +2,14 @@ package shawkconnector
 
 import (
 	"context"
+	"maps"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 )
 
@@ -28,22 +31,27 @@ func TestWireProtocolsOfTheAgent(t *testing.T) {
 	if b.invalid != 0 {
 		t.Errorf("%d invalid points", b.invalid)
 	}
+	if b.agentDropped != 0 {
+		t.Errorf("%d points dropped, the first of %s", b.agentDropped, b.agentDroppedName)
+	}
+	// The agent sends every protocol on an edge of its tests, so that the
+	// protocols of the agent and of the connector are the same.
 	seen := t0.Add(15 * time.Second)
-	want := map[uint16][]string{5432: {"postgres"}, 8080: {"http1"}, 443: {"tls_1_2", "tls_1_3"}}
+	all := map[string]bool{}
 	for _, e := range b.edges {
-		protocols := want[e.id.port]
-		if e.id.proto != "tcp" {
-			protocols = nil
+		if e.id.proto != "tcp" && e.wire != nil {
+			t.Errorf("%s edge with wire protocols %v", e.id.proto, e.wire)
 		}
-		if len(e.wire) != len(protocols) {
-			t.Errorf("%s edge to port %d: wire protocols %v, want %v", e.id.proto, e.id.port, e.wire, protocols)
-			continue
-		}
-		for _, p := range protocols {
-			if s := e.wire[p]; !s.first.Equal(seen) || !s.last.Equal(seen) {
+		for p, s := range e.wire {
+			all[p] = true
+			if !s.first.Equal(seen) || !s.last.Equal(seen) {
 				t.Errorf("edge to port %d: %s seen %v to %v, want %v", e.id.port, p, s.first, s.last, seen)
 			}
 		}
+	}
+	if !maps.Equal(all, wireProtocols) {
+		t.Errorf("the agent sends the wire protocols %v, the connector knows %v", slices.Sorted(maps.Keys(all)),
+			slices.Sorted(maps.Keys(wireProtocols)))
 	}
 }
 
@@ -61,9 +69,15 @@ func TestWireProtocolsInvalid(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Two points (first and last seen) of each invalid protocol.
-	if b.invalid != 4 {
-		t.Errorf("%d invalid points, want 4", b.invalid)
+	// Two points, first and last seen: those of the UDP edge are invalid,
+	// those of the protocol it does not know, as of a newer agent, are
+	// dropped like the metrics of the agent it does not know, which are
+	// logged at most once a minute.
+	if b.invalid != 2 {
+		t.Errorf("%d invalid points, want 2", b.invalid)
+	}
+	if b.agentDropped != 2 || b.agentDroppedName != "shawk.wire_protocol=gopher" {
+		t.Errorf("%d points dropped, the first of %q; want 2 of shawk.wire_protocol=gopher", b.agentDropped, b.agentDroppedName)
 	}
 	for _, e := range b.edges {
 		switch e.id.proto {
@@ -89,22 +103,28 @@ func TestWireProtocolsWritten(t *testing.T) {
 		wire: map[string]span{"postgres": {t0.Add(15 * time.Second), t0.Add(15 * time.Second)}}}
 	ta := tAgent{host: "app-01", machineID: "m1", addrs: []string{"10.0.0.11"}, time: t0.Add(15 * time.Second),
 		segment: t0.Add(-time.Hour), edges: []tEdge{edge}}
-	out := consume(t, c, sink, ta)
-	for _, s := range out {
-		if strings.Contains(s.metric, "wire_protocol") {
-			t.Errorf("forwarded %+v", s)
-		}
+	consume(t, c, sink, ta)
+	if len(sink.AllMetrics()) == 0 {
+		t.Fatal("nothing forwarded")
 	}
 	for _, md := range sink.AllMetrics() {
 		rms := md.ResourceMetrics()
 		for i := range rms.Len() {
+			if _, ok := rms.At(i).Resource().Attributes().Get(attrWireProtocol); ok {
+				t.Errorf("forwarded a resource with %s", attrWireProtocol)
+			}
 			sms := rms.At(i).ScopeMetrics()
 			for j := range sms.Len() {
 				ms := sms.At(j).Metrics()
 				for k := range ms.Len() {
 					m := ms.At(k)
-					if strings.Contains(m.Name(), "wire_protocol") || strings.Contains(m.Name(), "wire.protocol") {
+					if strings.Contains(m.Name(), "wire_protocol") {
 						t.Errorf("forwarded the metric %s", m.Name())
+					}
+					for _, a := range pointAttributes(m) {
+						if _, ok := a.Get(attrWireProtocol); ok {
+							t.Errorf("forwarded %s with %s", m.Name(), attrWireProtocol)
+						}
 					}
 				}
 			}
@@ -271,8 +291,51 @@ func TestPGEdgeProtocols(t *testing.T) {
 	if n := len(read()); n != 2 {
 		t.Errorf("%d rows after the edge was deleted, want 2", n)
 	}
-	// A value the agents do not send is refused.
+	// A value the agents do not send is refused, and every value of the
+	// connector is accepted: one refused would fail the writes of its host.
 	if _, err := conn.Exec(ctx, `INSERT INTO shawk.edge_protocols SELECT id, 'gopher', now(), now() FROM shawk.edges LIMIT 1`); err == nil {
 		t.Error("a protocol of another value was written")
 	}
+	h3 := newHostChanges(h.key)
+	h3.setHost("m", "db-01", "6.8", "test", now)
+	h3.addProcess(pg, "/usr/bin/postgres", span{old, now})
+	h3.addEdge(server, span{old, now})
+	for p := range wireProtocols {
+		h3.addWire(wireRowKey{server, p}, span{now, now})
+	}
+	if err := st.write(ctx, h3); err != nil {
+		t.Fatalf("writing every wire protocol: %v", err)
+	}
+	var n int
+	if err := conn.QueryRow(ctx, `SELECT count(*) FROM shawk_v1.edge_protocols WHERE port = 5432`).Scan(&n); err != nil || n != len(wireProtocols) {
+		t.Errorf("%d protocols of the edge, want %d (%v)", n, len(wireProtocols), err)
+	}
+	// The protocols of an edge that the retention prunes go with it.
+	execAll(t, conn, `UPDATE shawk.edges SET first_seen = now() - interval '9 days', last_seen = now() - interval '9 days' WHERE port = 5432`)
+	if _, err := st.prune(ctx, 24*time.Hour, 1000); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.QueryRow(ctx, `SELECT count(*) FROM shawk.edge_protocols`).Scan(&n); err != nil || n != 1 {
+		t.Errorf("%d protocols after the edge was pruned, want the one of port 8443 (%v)", n, err)
+	}
+}
+
+// pointAttributes returns the attributes of the data points of a metric.
+func pointAttributes(m pmetric.Metric) []pcommon.Map {
+	var out []pcommon.Map
+	switch m.Type() {
+	case pmetric.MetricTypeGauge:
+		for i := range m.Gauge().DataPoints().Len() {
+			out = append(out, m.Gauge().DataPoints().At(i).Attributes())
+		}
+	case pmetric.MetricTypeSum:
+		for i := range m.Sum().DataPoints().Len() {
+			out = append(out, m.Sum().DataPoints().At(i).Attributes())
+		}
+	case pmetric.MetricTypeHistogram:
+		for i := range m.Histogram().DataPoints().Len() {
+			out = append(out, m.Histogram().DataPoints().At(i).Attributes())
+		}
+	}
+	return out
 }

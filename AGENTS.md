@@ -5,7 +5,7 @@
 - The connector (`collector/`) is a separate module so the agent never depends on the collector: add nothing it needs to the agent's module.
 - Everything the connector holds per agent is bounded (design §5.5): give any new state a bound too.
 - Strings from agents go through `cleanString` and the size cuts before PostgreSQL; the agent sends valid UTF-8 only.
-- BPF programs run for every process: trace TCP at state changes and walks, never per message; keep the per-datagram UDP programs short, and the opt-in program of wire protocols (design §3.9), the one hook on every TCP send, returning at once for connections that sent.
+- BPF programs run for every process: trace TCP at state changes and walks, never per message, except the opt-in program of wire protocols (design §3.9), which must return at once for connections that sent; keep the per-datagram UDP programs short.
 - Prometheus outputs carry no addresses (unless `keep_peer_address`); every new label needs a bound on its cardinality.
 
 ## Compatibility contracts
