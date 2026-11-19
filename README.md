@@ -34,11 +34,12 @@ this host in the last 90 days, and were we watching?*
   RDMA are not seen, even when their control connections over TCP are; TCP
   over IPoIB is. See [packaging/README.md](packaging/README.md#hpc-clusters)
   for HPC clusters.
-- Optionally (`-classify-protocols`), the first bytes that each side of a
-  new TCP connection sends tell its protocol: the version of TLS, HTTP/1 or
-  HTTP/2, SSH, PostgreSQL, MySQL, Redis or Slurm, kept in PostgreSQL, so
-  that clients still on TLS 1.0 or in clear text are found. Its program
-  runs on every TCP send, so it is off by default.
+- Optionally (`-classify-protocols`), the first payload that each side of
+  a new TCP connection sends tells its protocol: the version of TLS, HTTP/1
+  or HTTP/2 in clear text, SSH, PostgreSQL and MySQL with or without a
+  request of TLS, Redis or Slurm, kept in PostgreSQL, so that clients still
+  on TLS 1.0 or in clear text are found. Its program runs on every TCP
+  send, so it is off by default.
 - Agents send OTLP to an OpenTelemetry Collector. Services are named the
   way OBI (OpenTelemetry eBPF Instrumentation) names them, so shawk's
   dependencies and OBI's application metrics share the same `job`.
@@ -165,13 +166,14 @@ SELECT client_host, client_service, port, last_seen, client_observed_until, obse
 FROM shawk_v1.dependencies_between(now() - interval '90 days', now())
 WHERE server_host = 'db-01' AND server_service = 'postgres';
 
--- Which clients reach 10.0.0.5:5432 in clear text or below TLS 1.2
--- (agents with -classify-protocols)? Rows of the server side name the
--- client by its address.
-SELECT role, host, service, client_addr, protocol, last_seen
+-- Which clients of PostgreSQL on 10.0.0.5 do not ask for TLS, and which
+-- clients of 10.0.0.5:443 offer TLS below 1.2 (agents with
+-- -classify-protocols)? Rows of the server side name the client by its
+-- address.
+SELECT role, host, service, client_addr, port, protocol, last_seen
 FROM shawk_v1.edge_protocols
-WHERE server_addr = '10.0.0.5' AND port = 5432 AND last_seen > now() - interval '30 days'
-  AND protocol NOT IN ('tls_1_2', 'tls_1_3');
+WHERE server_addr = '10.0.0.5' AND last_seen > now() - interval '30 days'
+  AND ((port = 5432 AND protocol = 'postgres') OR (port = 443 AND protocol IN ('tls_1_0', 'tls_1_1')));
 
 -- When was db-01 not observed, or only partly?
 SELECT * FROM shawk_v1.unobserved(now() - interval '90 days', now()) WHERE host = 'db-01';

@@ -50,7 +50,8 @@ type bpfShawkFlowStats struct {
 	HsBuckets  [11]uint32
 	SynRetrans uint32
 	Fails      [5]uint32
-	Protos     uint32
+	Protos     [16]uint8
+	_          [4]byte
 }
 
 type bpfShawkIterRec struct {
@@ -86,14 +87,9 @@ type bpfShawkOwner struct {
 	Scan     uint32
 }
 
-type bpfShawkPeekSlot struct {
-	_    structs.HostLayout
-	Peek struct {
-		_   structs.HostLayout
-		Buf [1024]uint8
-	}
-	Busy uint32
-	Pad  uint32
+type bpfShawkPeek struct {
+	_   structs.HostLayout
+	Buf [1024]uint8
 }
 
 type bpfShawkPeerPrefix struct {
@@ -114,6 +110,8 @@ type bpfShawkSockState struct {
 	HsUs        uint32
 	Walked      uint32
 	Peek        uint32
+	PeekPrefix  uint32
+	Pad         uint32
 }
 
 type bpfShawkUdpKstate struct {
@@ -157,20 +155,22 @@ type bpfShawkUnixStats struct {
 type bpfShawkWireProto uint32
 
 const (
-	bpfShawkWireProtoWIRE_UNKNOWN  bpfShawkWireProto = 0
-	bpfShawkWireProtoWIRE_TLS      bpfShawkWireProto = 1
-	bpfShawkWireProtoWIRE_TLS_10   bpfShawkWireProto = 2
-	bpfShawkWireProtoWIRE_TLS_11   bpfShawkWireProto = 3
-	bpfShawkWireProtoWIRE_TLS_12   bpfShawkWireProto = 4
-	bpfShawkWireProtoWIRE_TLS_13   bpfShawkWireProto = 5
-	bpfShawkWireProtoWIRE_HTTP1    bpfShawkWireProto = 6
-	bpfShawkWireProtoWIRE_HTTP2    bpfShawkWireProto = 7
-	bpfShawkWireProtoWIRE_SSH      bpfShawkWireProto = 8
-	bpfShawkWireProtoWIRE_POSTGRES bpfShawkWireProto = 9
-	bpfShawkWireProtoWIRE_MYSQL    bpfShawkWireProto = 10
-	bpfShawkWireProtoWIRE_REDIS    bpfShawkWireProto = 11
-	bpfShawkWireProtoWIRE_SLURM    bpfShawkWireProto = 12
-	bpfShawkWireProtoWIRE_PROTOS   bpfShawkWireProto = 13
+	bpfShawkWireProtoWIRE_UNKNOWN      bpfShawkWireProto = 0
+	bpfShawkWireProtoWIRE_TLS          bpfShawkWireProto = 1
+	bpfShawkWireProtoWIRE_TLS_10       bpfShawkWireProto = 2
+	bpfShawkWireProtoWIRE_TLS_11       bpfShawkWireProto = 3
+	bpfShawkWireProtoWIRE_TLS_12       bpfShawkWireProto = 4
+	bpfShawkWireProtoWIRE_TLS_13       bpfShawkWireProto = 5
+	bpfShawkWireProtoWIRE_HTTP1        bpfShawkWireProto = 6
+	bpfShawkWireProtoWIRE_HTTP2        bpfShawkWireProto = 7
+	bpfShawkWireProtoWIRE_SSH          bpfShawkWireProto = 8
+	bpfShawkWireProtoWIRE_POSTGRES     bpfShawkWireProto = 9
+	bpfShawkWireProtoWIRE_MYSQL        bpfShawkWireProto = 10
+	bpfShawkWireProtoWIRE_REDIS        bpfShawkWireProto = 11
+	bpfShawkWireProtoWIRE_SLURM        bpfShawkWireProto = 12
+	bpfShawkWireProtoWIRE_POSTGRES_TLS bpfShawkWireProto = 13
+	bpfShawkWireProtoWIRE_MYSQL_TLS    bpfShawkWireProto = 14
+	bpfShawkWireProtoWIRE_PROTOS       bpfShawkWireProto = 15
 )
 
 type bpfShawkXlatConn struct {

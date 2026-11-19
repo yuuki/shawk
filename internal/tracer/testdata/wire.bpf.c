@@ -26,10 +26,10 @@ struct wire_run {
 	__u8 server;  /* in */
 	__u8 answer;  /* in */
 	__u8 fill;    /* in: the bytes the buffer holds before the copy */
-	__u8 _pad;
+	__u8 held;    /* in: a first send of 4 bytes, prefix, was held */
 	__s32 proto;  /* out: enum shawk_wire_proto */
-	__u32 peeked; /* out: the bytes copied */
-	__u32 _pad2;
+	__u32 peeked; /* out: the end of the bytes in the buffer */
+	__u32 prefix; /* in: the bytes of the held send */
 	struct iovec iov[PEEK_SEGS]; /* in: in the memory of the test */
 };
 
@@ -50,15 +50,20 @@ SEC("syscall")
 int wire_run(struct wire_run *ctx)
 {
 	struct wire_scratch *s;
-	__u32 zero = 0;
+	__u32 zero = 0, off = 0;
 
 	s = bpf_map_lookup_elem(&scratch, &zero);
 	if (!s)
 		return 1;
 	__builtin_memset(s->peek.buf, ctx->fill, sizeof(s->peek.buf));
 	__builtin_memcpy(s->iov, ctx->iov, sizeof(s->iov));
-	ctx->peeked = peek_iovecs(s->peek.buf, s->iov, ctx->nr, ctx->skip, ctx->size);
-	ctx->proto = wire_classify(s->peek.buf, ctx->peeked, ctx->size, ctx->server,
-				   ctx->answer);
+	/* As shawk_tcp_sendmsg classifies the send after a held one. */
+	if (ctx->held) {
+		*(__u32 *)s->peek.buf = ctx->prefix;
+		off = 4;
+	}
+	ctx->peeked = peek_iovecs(s->peek.buf, off, s->iov, ctx->nr, ctx->skip, ctx->size);
+	ctx->proto = ctx->peeked > off ? wire_classify(s->peek.buf, ctx->peeked, ctx->size + off,
+						       ctx->server, ctx->answer) : -1;
 	return 0;
 }

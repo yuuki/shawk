@@ -140,5 +140,5 @@ const ErrorOther = "_OTHER"
 // EdgeStats.Protocols and of tracer.WireProtocol.
 var WireProtocols = [...]string{
 	"unknown", "tls", "tls_1_0", "tls_1_1", "tls_1_2", "tls_1_3", "http1", "http2_grpc", "ssh", "postgres", "mysql",
-	"redis", "slurm_rpc",
+	"redis", "slurm_rpc", "postgres_tls", "mysql_tls",
 }

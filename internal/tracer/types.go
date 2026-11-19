@@ -217,7 +217,7 @@ const (
 	WireUnknown WireProtocol = iota
 	// WireTLS is TLS whose version the bytes read do not tell.
 	WireTLS
-	// WireTLS10 is TLS 1.0, or SSL 3.0.
+	// WireTLS10 is TLS 1.0, or SSL 3.0 or 2.0.
 	WireTLS10
 	WireTLS11
 	WireTLS12
@@ -227,23 +227,30 @@ const (
 	// WireHTTP2 is HTTP/2 in clear text (h2c), as gRPC without TLS.
 	WireHTTP2
 	WireSSH
-	// WirePostgres and WireMySQL are the protocols of PostgreSQL and MySQL
-	// before any TLS they ask for, which their first payload does not show.
+	// WirePostgres is PostgreSQL in clear text: a client that starts
+	// without TLS, or a server that refuses it.
 	WirePostgres
+	// WireMySQL is MySQL without a request of TLS, or the greeting of its
+	// server, which does not tell.
 	WireMySQL
 	// WireRedis is RESP, the protocol of Redis and Valkey.
 	WireRedis
 	// WireSlurm is the RPCs of Slurm.
 	WireSlurm
+	// WirePostgresTLS is PostgreSQL whose client asks for TLS, or whose
+	// server accepts it; the version of TLS is not seen.
+	WirePostgresTLS
+	// WireMySQLTLS is MySQL whose client asks for TLS.
+	WireMySQLTLS
 
-	// NumWireProtocols is the number of wire protocols.
-	NumWireProtocols = 13
+	// NumWireProtocols is the number of wire protocols, at most 16.
+	NumWireProtocols = 15
 )
 
 // wireNames are the names of the wire protocols, as the agent sends them.
 var wireNames = [NumWireProtocols]string{
 	"unknown", "tls", "tls_1_0", "tls_1_1", "tls_1_2", "tls_1_3", "http1", "http2_grpc", "ssh", "postgres", "mysql",
-	"redis", "slurm_rpc",
+	"redis", "slurm_rpc", "postgres_tls", "mysql_tls",
 }
 
 func (p WireProtocol) String() string {
@@ -255,9 +262,6 @@ func (p WireProtocol) String() string {
 
 // WireProtocols is a set of wire protocols, a bit (1 << WireProtocol) each.
 type WireProtocols uint32
-
-// allWireProtocols has the bits of every wire protocol.
-const allWireProtocols WireProtocols = 1<<NumWireProtocols - 1
 
 // Has tells whether the set holds p.
 func (s WireProtocols) Has(p WireProtocol) bool { return p < NumWireProtocols && s&(1<<p) != 0 }
@@ -318,8 +322,8 @@ type FlowStats struct {
 	Fails [NumFailReasons]uint64
 	// Protocols are the wire protocols of the TCP connections whose first
 	// payload the local socket sent (Options.ClassifyProtocols).
-	Protocols WireProtocols
-	PID       uint32 // last observed process id
+	Protocols WireProtocols `json:",omitempty"`
+	PID       uint32        // last observed process id
 }
 
 // Add accumulates o into s.

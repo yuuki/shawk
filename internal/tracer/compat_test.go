@@ -42,12 +42,30 @@ var optionalTypes = map[string]bool{
 	"pt_regs___arm64": true,
 }
 
+// optionalEnumValues are the values of enums that only some kernels have,
+// which the programs read behind bpf_core_enum_value_exists.
+var optionalEnumValues = map[string][]string{
+	"iter_type": {"ITER_UBUF"}, // since Linux 6.0, and in RHEL 9
+}
+
 // optionalRelocation reports whether a relocation is of a field of
-// optionalTypes, which its string names: Struct:"name"[...].
-func optionalRelocation(r *btf.CORERelocation) bool {
+// optionalTypes, which its string names: Struct:"name"[...], or of a value
+// of optionalEnumValues: Enum:"name"[index of the value in the local type].
+func optionalRelocation(spec *btf.Spec, r *btf.CORERelocation) bool {
 	for name := range optionalTypes {
 		if strings.Contains(r.String(), `"`+name+`"`) {
 			return true
+		}
+	}
+	for name, values := range optionalEnumValues {
+		var e *btf.Enum
+		if spec.TypeByName(name, &e) != nil {
+			continue
+		}
+		for i, v := range e.Values {
+			if slices.Contains(values, v.Name) && strings.Contains(r.String(), fmt.Sprintf(`Enum:"%s"[%d]`, name, i)) {
+				return true
+			}
 		}
 	}
 	return false
@@ -122,7 +140,7 @@ func TestKernelCompatibility(t *testing.T) {
 			// their flavors in every kernel.
 			deferConnect, iovecs := false, false
 			for i, fx := range fixups {
-				if strings.Contains(fx.String(), "poison") && !optionalRelocation(relos[i]) {
+				if strings.Contains(fx.String(), "poison") && !optionalRelocation(spec.Types, relos[i]) {
 					t.Errorf("unresolvable CO-RE relocation %v", relos[i])
 				}
 				r := relos[i].String()

@@ -11,6 +11,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"math/big"
 	"net"
@@ -35,7 +36,8 @@ func TestWireProtocolNames(t *testing.T) {
 		WireHTTP1: bpfShawkWireProtoWIRE_HTTP1, WireHTTP2: bpfShawkWireProtoWIRE_HTTP2,
 		WireSSH: bpfShawkWireProtoWIRE_SSH, WirePostgres: bpfShawkWireProtoWIRE_POSTGRES,
 		WireMySQL: bpfShawkWireProtoWIRE_MYSQL, WireRedis: bpfShawkWireProtoWIRE_REDIS,
-		WireSlurm: bpfShawkWireProtoWIRE_SLURM,
+		WireSlurm: bpfShawkWireProtoWIRE_SLURM, WirePostgresTLS: bpfShawkWireProtoWIRE_POSTGRES_TLS,
+		WireMySQLTLS: bpfShawkWireProtoWIRE_MYSQL_TLS,
 	}
 	if len(want) != NumWireProtocols {
 		t.Fatalf("%d protocols checked, want %d", len(want), NumWireProtocols)
@@ -60,13 +62,12 @@ func TestWireProtocolNames(t *testing.T) {
 
 // wireRun is the context of the program of testdata/wire.bpf.c.
 type wireRun struct {
-	Size, Nr, Skip       uint64
-	Server, Answer, Fill uint8
-	_                    uint8
-	Proto                int32
-	Peeked               uint32
-	_                    uint32
-	Iov                  [4]struct{ Base, Len uint64 }
+	Size, Nr, Skip             uint64
+	Server, Answer, Fill, Held uint8
+	Proto                      int32
+	Peeked                     uint32
+	Prefix                     uint32
+	Iov                        [4]struct{ Base, Len uint64 }
 }
 
 // wireClassifier runs the classifier of wire protocols of the BPF programs,
@@ -111,28 +112,52 @@ func newWireClassifier(t *testing.T) *wireClassifier {
 	return &wireClassifier{t: t, prog: coll.Programs["wire_run"]}
 }
 
+// wireNone is what run returns when nothing was classified.
+const wireNone = WireProtocol(255)
+
+// wireSend is a send to classify: its segments, the bytes to skip into
+// the first, the side and whether it answers, and the 4 bytes of a first
+// send held before it, if any.
+type wireSend struct {
+	segs           [][]byte
+	skip           int
+	server, answer bool
+	held           []byte
+}
+
 // classify runs the classifier on a send of segments, skipping skip bytes
-// into the first, and returns the protocol and the bytes copied. Each send
-// is classified with the buffer filled with zeros and with 0xff before,
-// which must not change the result.
+// into the first, and returns the protocol and the bytes copied.
 func (c *wireClassifier) classify(segs [][]byte, skip int, server, answer bool) (WireProtocol, int) {
 	c.t.Helper()
+	return c.run(wireSend{segs: segs, skip: skip, server: server, answer: answer})
+}
+
+// run classifies a send, with the buffer filled with zeros, with 0xff and
+// with $ before, which must not change the result: the bytes beyond what
+// was copied are those of an earlier send, which the agent wipes, or
+// garbage. It returns -1 as WireProtocol(255) when nothing was classified.
+func (c *wireClassifier) run(w wireSend) (WireProtocol, int) {
+	c.t.Helper()
 	var (
-		results [2]wireRun
+		results [3]wireRun
 		size    int
 	)
-	for _, s := range segs[:min(len(segs), 4)] {
+	for _, s := range w.segs {
 		size += len(s)
 	}
-	for i, fill := range []uint8{0, 0xff} {
-		run := wireRun{Size: uint64(size - skip), Nr: uint64(len(segs)), Skip: uint64(skip), Fill: fill}
-		if server {
+	for i, fill := range []uint8{0, 0xff, '$'} {
+		run := wireRun{Size: uint64(size - w.skip), Nr: uint64(len(w.segs)), Skip: uint64(w.skip), Fill: fill}
+		if w.server {
 			run.Server = 1
 		}
-		if answer {
+		if w.answer {
 			run.Answer = 1
 		}
-		for j, s := range segs[:min(len(segs), len(run.Iov))] {
+		if w.held != nil {
+			run.Held = 1
+			run.Prefix = binary.NativeEndian.Uint32(w.held)
+		}
+		for j, s := range w.segs[:min(len(w.segs), len(run.Iov))] {
 			if len(s) > 0 {
 				run.Iov[j].Base = uint64(uintptr(unsafe.Pointer(&s[0])))
 			}
@@ -144,7 +169,7 @@ func (c *wireClassifier) classify(segs [][]byte, skip int, server, answer bool) 
 		}
 		out := make([]byte, in.Len())
 		ret, err := c.prog.Run(&ebpf.RunOptions{Context: in.Bytes(), ContextOut: out})
-		runtime.KeepAlive(segs)
+		runtime.KeepAlive(w.segs)
 		if err != nil || ret != 0 {
 			c.t.Fatalf("running the classifier: %d, %v", ret, err)
 		}
@@ -152,11 +177,13 @@ func (c *wireClassifier) classify(segs [][]byte, skip int, server, answer bool) 
 			c.t.Fatal(err)
 		}
 	}
-	if results[0].Proto != results[1].Proto || results[0].Peeked != results[1].Peeked {
-		c.t.Errorf("the result depends on the bytes beyond the payload: %d (%d bytes) with zeros, %d (%d bytes) with 0xff",
-			results[0].Proto, results[0].Peeked, results[1].Proto, results[1].Peeked)
+	for _, r := range results[1:] {
+		if r.Proto != results[0].Proto || r.Peeked != results[0].Peeked {
+			c.t.Errorf("the result depends on the bytes beyond the payload: %+v", results)
+			break
+		}
 	}
-	return WireProtocol(results[0].Proto), int(results[0].Peeked)
+	return WireProtocol(uint8(results[0].Proto)), int(results[0].Peeked)
 }
 
 // tlsCertificate returns a self-signed certificate for the servers of TLS.
@@ -283,6 +310,61 @@ func mysqlPacket(seq byte, payload []byte) []byte {
 	return append([]byte{byte(n), byte(n >> 8), byte(n >> 16), seq}, payload...)
 }
 
+// serverHello builds a ServerHello of version 1.2 that chose a cipher
+// suite, after a session id of 32 bytes.
+func serverHello(cipher uint16) []byte {
+	body := []byte{3, 3}
+	body = append(body, make([]byte, 32)...)
+	body = append(body, 32)
+	body = append(body, make([]byte, 32)...)
+	body = binary.BigEndian.AppendUint16(body, cipher)
+	body = append(body, 0, 0, 0)
+	hs := append([]byte{2, 0, byte(len(body) >> 8), byte(len(body))}, body...)
+	return append([]byte{0x16, 3, 3, byte(len(hs) >> 8), byte(len(hs))}, hs...)
+}
+
+// tlsRecords splits the handshake of a record of TLS into records of n
+// bytes, as clients that evade inspection do.
+func tlsRecords(record []byte, n int) []byte {
+	var out []byte
+	for hs := record[5:]; len(hs) > 0; {
+		k := min(n, len(hs))
+		out = append(out, record[0], record[1], record[2], byte(k>>8), byte(k))
+		out = append(out, hs[:k]...)
+		hs = hs[k:]
+	}
+	return out
+}
+
+// sslv2Hello builds a ClientHello in the format of SSL 2.0 that offers up
+// to version.
+func sslv2Hello(version uint16) []byte {
+	body := []byte{1}
+	body = binary.BigEndian.AppendUint16(body, version)
+	body = append(body, 0, 6, 0, 0, 0, 16)      // cipher specs, session id, challenge
+	body = append(body, 0, 0, 0x2f, 0, 0, 0x35) // two cipher specs
+	body = append(body, make([]byte, 16)...)
+	return append([]byte{0x80 | byte(len(body)>>8), byte(len(body))}, body...)
+}
+
+// mysqlGreeting is the greeting of a server of MySQL 8.0.
+func mysqlGreeting() []byte {
+	return mysqlPacket(0, append([]byte("\x0a8.0.36\x00\x01\x00\x00\x00abcdefgh\x00\xff\xff\x21\x02\x00\xff\xdf\x15"),
+		append(make([]byte, 10), []byte("ijklmnopqrstu\x00caching_sha2_password\x00")...)...))
+}
+
+// mysqlResponse is the HandshakeResponse41 of a client of MySQL without
+// TLS, and mysqlSSLRequest the SSLRequest of one that asks for it
+// (CLIENT_SSL).
+func mysqlResponse() []byte {
+	return mysqlPacket(1, append(append([]byte("\x85\xa6\xff\x19\x00\x00\x00\x01\x21"), make([]byte, 23)...),
+		[]byte("root\x00\x14abcdefghijklmnopqrst")...))
+}
+
+func mysqlSSLRequest() []byte {
+	return mysqlPacket(1, append([]byte("\x85\xae\xff\x19\x00\x00\x00\x01\x21"), make([]byte, 23)...))
+}
+
 func TestWireClassify(t *testing.T) {
 	c := newWireClassifier(t)
 	cert := tlsCertificate(t)
@@ -290,25 +372,29 @@ func TestWireClassify(t *testing.T) {
 		name           string
 		segs           [][]byte
 		server, answer bool
+		held           []byte
 		want           WireProtocol
 	}
 	one := func(s string) [][]byte { return [][]byte{[]byte(s)} }
-	var cases []tc
+	var (
+		cases      []tc
+		tls13Hello []byte
+	)
 	for _, v := range []struct {
 		version uint16
 		want    WireProtocol
 	}{{tls.VersionTLS13, WireTLS13}, {tls.VersionTLS12, WireTLS12}, {tls.VersionTLS11, WireTLS11}, {tls.VersionTLS10, WireTLS10}} {
 		client, server := tlsHellos(t, cert, v.version)
+		if v.want == WireTLS13 {
+			tls13Hello = client
+		}
 		cases = append(cases,
 			tc{name: "ClientHello up to " + v.want.String(), segs: [][]byte{client}, want: v.want},
 			tc{name: "ServerHello of " + v.want.String(), segs: [][]byte{server}, server: true, answer: true, want: v.want})
 	}
 	startup := []byte("\x00\x00\x00\x00\x00\x03\x00\x00user\x00postgres\x00database\x00app\x00\x00")
 	binary.BigEndian.PutUint32(startup, uint32(len(startup)))
-	greeting := mysqlPacket(0, append([]byte("\x0a8.0.36\x00\x01\x00\x00\x00abcdefgh\x00\xff\xff\x21\x02\x00\xff\xdf\x15"),
-		append(make([]byte, 10), []byte("ijklmnopqrstu\x00caching_sha2_password\x00")...)...))
-	response := mysqlPacket(1, append(append([]byte("\x85\xa6\xff\x19\x00\x00\x00\x01\x21"), make([]byte, 23)...),
-		[]byte("root\x00\x14abcdefghijklmnopqrst")...))
+	greeting, response, sslRequest := mysqlGreeting(), mysqlResponse(), mysqlSSLRequest()
 	settings := []byte("\x00\x00\x12\x04\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00\xfa\x00\x04\x00\x10\x00\x00\x00\x06\x00\x10\x01\x40")
 	ping := []byte("body of the ping")
 	cases = append(cases,
@@ -323,6 +409,11 @@ func TestWireClassify(t *testing.T) {
 			want: WireTLS12},
 		tc{name: "ClientHello without extensions", segs: [][]byte{clientHello()}, want: WireTLS12},
 		tc{name: "alert", segs: [][]byte{{0x15, 3, 3, 0, 2, 2, 70}}, server: true, answer: true, want: WireTLS},
+		tc{name: "ServerHello of SM4 (RFC 8998)", segs: [][]byte{serverHello(0x00c6)}, server: true, answer: true, want: WireTLS13},
+		tc{name: "ServerHello of TLS 1.2", segs: [][]byte{serverHello(0xc02f)}, server: true, answer: true, want: WireTLS12},
+		tc{name: "ClientHello in records of 60 bytes", segs: [][]byte{tlsRecords(tls13Hello, 60)}, want: WireTLS},
+		tc{name: "SSL 2.0 ClientHello up to TLS 1.0", segs: [][]byte{sslv2Hello(0x0301)}, want: WireTLS10},
+		tc{name: "SSL 2.0 ClientHello up to TLS 1.2", segs: [][]byte{sslv2Hello(0x0303)}, want: WireTLS12},
 		// HTTP.
 		tc{name: "HTTP/1.1 request", segs: one("GET / HTTP/1.1\r\nHost: app\r\n\r\n"), want: WireHTTP1},
 		tc{name: "HTTP/1.1 request in iovecs", segs: [][]byte{[]byte("POST /v1/x HTTP/1.1\r\n"), []byte("Host: app\r\n\r\n")},
@@ -335,10 +426,19 @@ func TestWireClassify(t *testing.T) {
 		tc{name: "SSH client", segs: one("SSH-2.0-OpenSSH_9.6\r\n"), answer: true, want: WireSSH},
 		tc{name: "SSH server", segs: one("SSH-2.0-OpenSSH_8.7\r\n"), server: true, want: WireSSH},
 		// PostgreSQL.
-		tc{name: "PostgreSQL SSLRequest", segs: [][]byte{{0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f}}, want: WirePostgres},
+		tc{name: "PostgreSQL SSLRequest", segs: [][]byte{{0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f}}, want: WirePostgresTLS},
 		tc{name: "PostgreSQL GSSENCRequest", segs: [][]byte{{0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x30}}, want: WirePostgres},
+		tc{name: "PostgreSQL CancelRequest", segs: [][]byte{{0, 0, 0, 16, 0x04, 0xd2, 0x16, 0x2e, 0, 0, 1, 2, 3, 4, 5, 6}},
+			want: WirePostgres},
+		tc{name: "PostgreSQL CancelRequest of protocol 3.2", segs: [][]byte{append([]byte{0, 0, 0, 44, 0x04, 0xd2, 0x16, 0x2e,
+			0, 0, 1, 2}, make([]byte, 32)...)}, want: WirePostgres},
 		tc{name: "PostgreSQL StartupMessage", segs: [][]byte{startup}, want: WirePostgres},
-		tc{name: "PostgreSQL accepts TLS", segs: one("S"), server: true, answer: true, want: WirePostgres},
+		tc{name: "PostgreSQL accepts TLS", segs: one("S"), server: true, answer: true, want: WirePostgresTLS},
+		tc{name: "PostgreSQL refuses TLS", segs: one("N"), server: true, answer: true, want: WirePostgres},
+		// A request of Kafka without ApiVersions first: Metadata (3) of
+		// version 1, a number and a client id.
+		tc{name: "Kafka Metadata", segs: [][]byte{append(binary.BigEndian.AppendUint32(nil, 20),
+			[]byte("\x00\x03\x00\x01\x00\x00\x00\x07\x00\x06client\xff\xff\xff\xff")...)}, want: WireUnknown},
 		tc{name: "PostgreSQL asks for SCRAM", segs: one("R\x00\x00\x00\x17\x00\x00\x00\x0aSCRAM-SHA-256\x00\x00"), server: true,
 			answer: true, want: WirePostgres},
 		tc{name: "PostgreSQL refuses", segs: one("E\x00\x00\x00\x40SFATAL\x00VFATAL\x00C28000\x00Mno pg_hba.conf entry\x00\x00"),
@@ -346,11 +446,19 @@ func TestWireClassify(t *testing.T) {
 		// MySQL.
 		tc{name: "MySQL greeting", segs: [][]byte{greeting}, server: true, want: WireMySQL},
 		tc{name: "MySQL handshake response", segs: [][]byte{response}, answer: true, want: WireMySQL},
-		tc{name: "MySQL greeting taken for an answer", segs: [][]byte{greeting}, server: true, answer: true, want: WireUnknown},
+		tc{name: "MySQL SSLRequest", segs: [][]byte{sslRequest}, answer: true, want: WireMySQLTLS},
+		// A load balancer sent the header of the PROXY protocol first.
+		tc{name: "MySQL greeting after a PROXY header", segs: [][]byte{greeting}, server: true, answer: true, want: WireMySQL},
+		tc{name: "POP3 greeting after a PROXY header", segs: one("+OK POP3 server ready\r\n"), server: true, answer: true,
+			want: WireUnknown},
 		// RESP.
 		tc{name: "Redis command", segs: one("*1\r\n$4\r\nPING\r\n"), want: WireRedis},
 		tc{name: "Redis command of many arguments", segs: one("*12\r\n$4\r\nHSET\r\n$3\r\nkey\r\n"), want: WireRedis},
 		tc{name: "Redis reply", segs: one("+PONG\r\n"), server: true, answer: true, want: WireRedis},
+		tc{name: "Redis OK", segs: one("+OK\r\n"), server: true, answer: true, want: WireRedis},
+		// 8 bytes: the byte after them, which a $ would make a command, is
+		// not read.
+		tc{name: "Redis array of 8 bytes", segs: one("*12345\r\n"), want: WireUnknown},
 		tc{name: "Redis error", segs: one("-NOAUTH Authentication required.\r\n"), server: true, answer: true, want: WireRedis},
 		tc{name: "Redis map of HELLO 3", segs: one("%7\r\n$6\r\nserver\r\n$5\r\nredis\r\n"), server: true, answer: true,
 			want: WireRedis},
@@ -365,22 +473,26 @@ func TestWireClassify(t *testing.T) {
 		tc{name: "slurmdbd", segs: slurmSend(slurmHeader(1407, 0x2, len(ping)), []byte("cred"), ping), want: WireSlurm},
 		tc{name: "Slurm length that is not the send's", segs: [][]byte{append(binary.BigEndian.AppendUint32(nil, 99),
 			slurmHeader(1008, 0, 4)...)}, want: WireUnknown},
+		// Slurm before 24.05 sends the length apart, which is held: the
+		// next send is classified after it.
+		tc{name: "Slurm after its length held", segs: [][]byte{slurmHeader(1008, 0, len(ping)), []byte("auth"), ping},
+			held: binary.BigEndian.AppendUint32(nil, uint32(len(slurmHeader(1008, 0, len(ping)))+4+len(ping))), want: WireSlurm},
 		// Others.
 		tc{name: "text", segs: one("hello\n"), want: WireUnknown},
 		tc{name: "one byte", segs: one("x"), server: true, answer: true, want: WireUnknown},
 	)
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, n := c.classify(tc.segs, 0, tc.server, tc.answer)
+			got, n := c.run(wireSend{segs: tc.segs, server: tc.server, answer: tc.answer, held: tc.held})
 			if got != tc.want {
 				t.Errorf("classified as %v, want %v", got, tc.want)
 			}
-			size := 0
+			size := len(tc.held)
 			for _, s := range tc.segs {
 				size += len(s)
 			}
 			if want := min(size, 512); n != want {
-				t.Errorf("%d bytes copied, want %d", n, want)
+				t.Errorf("%d bytes in the buffer, want %d", n, want)
 			}
 		})
 	}
@@ -411,10 +523,11 @@ func TestWirePeek(t *testing.T) {
 			}
 		})
 	}
-	// A fifth segment is not read.
+	// A fifth segment is not read: a send of nothing else is not
+	// classified.
 	got, n := c.classify([][]byte{{}, {}, {}, {}, req}, 0, false, false)
-	if got != WireUnknown || n != 0 {
-		t.Errorf("a fifth segment: %v of %d bytes, want unknown of none", got, n)
+	if got != wireNone || n != 0 {
+		t.Errorf("a fifth segment: %v of %d bytes, want nothing", got, n)
 	}
 }
 
@@ -526,6 +639,58 @@ func TestWireProtocols(t *testing.T) {
 	plain := func(requests ...string) func(net.Conn) error {
 		return func(c net.Conn) error { return exchange(c, requests...) }
 	}
+	// A client of a server that greets first reads the greeting first.
+	greeted := func(requests ...string) func(net.Conn) error {
+		return func(c net.Conn) error {
+			if _, err := c.Read(make([]byte, 4096)); err != nil {
+				return err
+			}
+			return exchange(c, requests...)
+		}
+	}
+	greet := func(greeting string, answers ...string) func(net.Conn) {
+		return func(c net.Conn) {
+			if _, err := c.Write([]byte(greeting)); err == nil {
+				answer(answers...)(c)
+			}
+		}
+	}
+	// Slurm 24.05 and later write the length of a message with it, in one
+	// writev(2), which reaches the iovecs of the kernel; before, apart.
+	// Each side reads the whole message of the other.
+	ping := []byte("body of the ping")
+	slurmPing := slurmSend(slurmHeader(1008, 0, len(ping)), []byte("auth/munge credential"), ping)
+	slurmRC := slurmSend(slurmHeader(8001, 0, 4), nil, []byte{0, 0, 0, 0})
+	slurmWrite := func(c net.Conn, msg [][]byte, apart bool) error {
+		if apart {
+			if _, err := c.Write(msg[0]); err != nil {
+				return err
+			}
+			_, err := c.Write(bytes.Join(msg[1:], nil))
+			return err
+		}
+		_, err := (&net.Buffers{msg[0], msg[1], msg[2], msg[3]}).WriteTo(c)
+		return err
+	}
+	slurmRead := func(c net.Conn, msg [][]byte) error {
+		_, err := io.ReadFull(c, make([]byte, len(bytes.Join(msg, nil))))
+		return err
+	}
+	slurmClient := func(apart bool) func(net.Conn) error {
+		return func(c net.Conn) error {
+			if err := slurmWrite(c, slurmPing, apart); err != nil {
+				return err
+			}
+			return slurmRead(c, slurmRC)
+		}
+	}
+	slurmServer := func(apart bool) func(net.Conn) {
+		return func(c net.Conn) {
+			if slurmRead(c, slurmPing) == nil {
+				slurmWrite(c, slurmRC, apart)
+			}
+		}
+	}
 	cases := []struct {
 		name           string
 		serve          func(net.Conn)
@@ -540,6 +705,12 @@ func TestWireProtocols(t *testing.T) {
 		// Only the first payload counts.
 		{"HTTP/1.1, then RESP", answer("HTTP/1.1 200 OK\r\n\r\n", "+PONG\r\n"),
 			plain("GET / HTTP/1.1\r\n\r\n", "*1\r\n$4\r\nPING\r\n"), WireHTTP1, WireHTTP1},
+		{"PostgreSQL refusing TLS", answer("N"), plain("\x00\x00\x00\x08\x04\xd2\x16\x2f"), WirePostgresTLS, WirePostgres},
+		{"SSH", greet("SSH-2.0-OpenSSH_8.7\r\n", "\x00\x00\x01\x0c"), greeted("SSH-2.0-OpenSSH_9.6\r\n"), WireSSH, WireSSH},
+		{"MySQL", greet(string(mysqlGreeting()), "\x07\x00\x00\x02\x00\x00\x00\x02\x00\x00\x00"),
+			greeted(string(mysqlResponse())), WireMySQL, WireMySQL},
+		{"Slurm 24.05", slurmServer(false), slurmClient(false), WireSlurm, WireSlurm},
+		{"Slurm 23.11", slurmServer(true), slurmClient(true), WireSlurm, WireSlurm},
 	}
 	ports := map[string]uint16{}
 	for _, tc := range cases {

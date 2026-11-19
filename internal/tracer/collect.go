@@ -280,6 +280,8 @@ var (
 	_ [len(bpfShawkFlowStats{}.HsBuckets)]struct{} = [len(FlowStats{}.Handshakes)]struct{}{}
 	_ [len(bpfShawkFlowStats{}.Fails)]struct{}     = [len(FlowStats{}.Fails)]struct{}{}
 	_ [bpfShawkWireProtoWIRE_PROTOS]struct{}       = [NumWireProtocols]struct{}{}
+	// A byte per wire protocol.
+	_ [len(bpfShawkFlowStats{}.Protos) - NumWireProtocols]struct{}
 )
 
 func convertFlow(k *bpfShawkFlowKey, v *bpfShawkFlowStats) Flow {
@@ -308,7 +310,6 @@ func convertFlow(k *bpfShawkFlowKey, v *bpfShawkFlowStats) Flow {
 			RTTSamples:     uint64(v.RttSamples),
 			HandshakeSumUs: v.HsSumUs,
 			SynRetrans:     uint64(v.SynRetrans),
-			Protocols:      WireProtocols(v.Protos) & allWireProtocols,
 			PID:            v.Pid,
 		},
 	}
@@ -317,6 +318,11 @@ func convertFlow(k *bpfShawkFlowKey, v *bpfShawkFlowStats) Flow {
 	}
 	for i, n := range v.Fails {
 		f.Fails[i] = uint64(n)
+	}
+	for p, seen := range v.Protos[:NumWireProtocols] {
+		if seen != 0 {
+			f.Protocols |= 1 << p
+		}
 	}
 	return f
 }

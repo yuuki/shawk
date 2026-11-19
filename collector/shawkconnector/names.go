@@ -167,6 +167,7 @@ func outErrorType(t string) string {
 var wireProtocols = map[string]bool{
 	"unknown": true, "tls": true, "tls_1_0": true, "tls_1_1": true, "tls_1_2": true, "tls_1_3": true, "http1": true,
 	"http2_grpc": true, "ssh": true, "postgres": true, "mysql": true, "redis": true, "slurm_rpc": true,
+	"postgres_tls": true, "mysql_tls": true,
 }
 
 // Values of network.io.direction that agents send.

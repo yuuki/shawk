@@ -140,17 +140,19 @@ static __always_inline int tls_legacy(__u32 v)
 
 /*
  * A record of TLS: a type, a version 3.x and a length, then, for a
- * handshake, its type, length and version. A ServerHello tells the version
- * the server chose: its version field before TLS 1.3, and for TLS 1.3 the
- * version 1.2 and a cipher suite of TLS 1.3 (0x13xx), which no earlier
- * version has. A ClientHello tells the highest version the client offers:
- * its version field before TLS 1.2, then the extension supported_versions,
- * which only clients of TLS 1.3 send. Other records, such as an alert that
- * refuses a client, are TLS of an unknown version.
+ * handshake, its type, length of 3 bytes and version. A ServerHello tells
+ * the version the server chose: its version field before TLS 1.3, and for
+ * TLS 1.3 the version 1.2 and a cipher suite that only TLS 1.3 has (0x13xx,
+ * and the SM4 suites of RFC 8998, 0x00c6 and 0x00c7). A ClientHello tells
+ * the highest version the client offers: its version field before TLS 1.2,
+ * then the extension supported_versions, which clients of TLS 1.3 send, and
+ * some of TLS 1.2. A hello longer than its record (a client that splits its
+ * ClientHello, as some evade inspection) and other records, such as an
+ * alert that refuses a client, are TLS of an unknown version.
  */
 static __always_inline int wire_tls(const __u8 *b, __u32 len)
 {
-	__u32 off, end, ver, type, n, i;
+	__u32 off, end, rec, ver, type, n, i;
 
 	if (len < 11 || rd8(b, 0) != 0x16)
 		return WIRE_TLS;
@@ -160,15 +162,21 @@ static __always_inline int wire_tls(const __u8 *b, __u32 len)
 		return WIRE_TLS;
 	if (ver != 0x0303)
 		return tls_legacy(ver);
+	rec = 5 + rd16(b, 3);
+	if (9 + (rd8(b, 6) << 16 | rd16(b, 7)) > rec)
+		return WIRE_TLS;
 	/* The session id follows the version and the random of 32 bytes. */
 	off = 43;
 	if (off >= len)
 		return WIRE_TLS;
 	off += 1 + rd8(b, off);
 	if (type == 2) {
-		if (off + 2 > len)
+		if (off + 2 > len || off + 2 > rec)
 			return WIRE_TLS;
-		return rd8(b, off) == 0x13 ? WIRE_TLS_1_3 : WIRE_TLS_1_2;
+		n = rd16(b, off);
+		if ((n >> 8) == 0x13 || n == 0x00c6 || n == 0x00c7)
+			return WIRE_TLS_1_3;
+		return WIRE_TLS_1_2;
 	}
 	/* The cipher suites and the compression methods of a ClientHello. */
 	if (off + 2 > len)
@@ -178,7 +186,7 @@ static __always_inline int wire_tls(const __u8 *b, __u32 len)
 		return WIRE_TLS;
 	off += 1 + rd8(b, off);
 	/* A ClientHello without extensions, which ends its record. */
-	if (off >= 5 + rd16(b, 3))
+	if (off >= rec)
 		return WIRE_TLS_1_2;
 	if (off + 2 > len)
 		return WIRE_TLS;
@@ -198,6 +206,30 @@ static __always_inline int wire_tls(const __u8 *b, __u32 len)
 	return WIRE_TLS;
 }
 
+/*
+ * A ClientHello in the format of SSL 2.0, which clients of SSL 3.0 and TLS
+ * 1.0 to 1.2 could send to reach servers of SSL 2.0 (Java 6, OpenSSL 0.9.8
+ * by default): a length of 15 bits with the high bit set, which counts the
+ * rest of the send, the message 1 and the highest version offered.
+ * Returns -1 for another payload.
+ */
+static __always_inline int sslv2_hello(const __u8 *b, __u32 len, __u64 size)
+{
+	__u32 v;
+
+	if (len < 5 || !(rd8(b, 0) & 0x80) || rd8(b, 2) != 1 ||
+	    ((rd8(b, 0) & 0x7f) << 8 | rd8(b, 1)) + 2ULL != size)
+		return -1;
+	v = rd16(b, 3);
+	if (v == 0x0002 || v == 0x0300 || v == 0x0301)
+		return WIRE_TLS_1_0;
+	if (v == 0x0302)
+		return WIRE_TLS_1_1;
+	if (v == 0x0303)
+		return WIRE_TLS_1_2;
+	return -1;
+}
+
 /* The request line of HTTP/1.x. */
 static __always_inline bool http1_request(const __u8 *b, __u32 len)
 {
@@ -209,65 +241,81 @@ static __always_inline bool http1_request(const __u8 *b, __u32 len)
 }
 
 /*
- * The first message of a client of PostgreSQL: SSLRequest, GSSENCRequest
- * or CancelRequest, of fixed lengths and codes, or a StartupMessage of
- * protocol 3.x with its length.
+ * The first message of a client of PostgreSQL: SSLRequest, which asks for
+ * TLS, GSSENCRequest, which asks for the encryption of GSSAPI, and
+ * CancelRequest, of fixed codes, or a StartupMessage of protocol 3.x, in
+ * clear text, whose parameters start with a name (user, database, or _pq_.
+ * of protocol 3.2). A request of Kafka has a length and a type and version
+ * like a StartupMessage, but a number of the request after them, whose
+ * first byte is not a letter. Returns -1 for another payload.
  */
-static __always_inline bool postgres_request(const __u8 *b, __u32 len)
+static __always_inline int postgres_request(const __u8 *b, __u32 len)
 {
-	__u32 n, code;
+	__u32 n, code, c;
 
 	if (len < 8)
-		return false;
+		return -1;
 	n = rd32(b, 0);
 	code = rd32(b, 4);
-	if (n == 8 && (code == 80877103 || code == 80877104))
-		return true;
-	if (n == 16 && code == 80877102)
-		return true;
-	return n > 8 && n < 10000 && (code >> 16) == 3 && (code & 0xffff) < 16;
+	if (n == 8 && code == 80877103)
+		return WIRE_POSTGRES_TLS;
+	if (n == 8 && code == 80877104)
+		return WIRE_POSTGRES;
+	/* The key of protocol 3.2 has up to 256 bytes rather than 4. */
+	if (n >= 16 && n <= 12 + 256 && code == 80877102)
+		return WIRE_POSTGRES;
+	if (len < 9 || n <= 8 || n >= 10000 || (code >> 16) != 3 || (code & 0xffff) > 9)
+		return -1;
+	c = rd8(b, 8);
+	return (c >= 'a' && c <= 'z') || c == '_' ? WIRE_POSTGRES : -1;
 }
 
 /*
- * The answer of a server of PostgreSQL: S, N or G alone to a request of
- * TLS or GSSAPI, an authentication request (R, a length and a method up to
- * 12) or an error (E, a length and the field of its severity).
+ * The answer of a server of PostgreSQL: S alone, which accepts a request of
+ * TLS, N or G alone, which refuses it or accepts GSSAPI, an authentication
+ * request (R, a length and a method up to 12) or an error (E, a length and
+ * the field of its severity). Returns -1 for another payload.
  */
-static __always_inline bool postgres_answer(const __u8 *b, __u32 len,
-					    __u64 size)
+static __always_inline int postgres_answer(const __u8 *b, __u32 len, __u64 size)
 {
 	__u32 c = rd8(b, 0), n;
 
-	if (size == 1 && len == 1)
-		return c == 'S' || c == 'N' || c == 'G';
+	if (size == 1 && len == 1) {
+		if (c == 'S')
+			return WIRE_POSTGRES_TLS;
+		return c == 'N' || c == 'G' ? WIRE_POSTGRES : -1;
+	}
 	if (len < 9)
-		return false;
+		return -1;
 	n = rd32(b, 1);
-	if (c == 'R')
-		return n >= 8 && n <= 2048 && rd32(b, 5) <= 12;
-	if (c == 'E')
-		return n >= 8 && n <= 8192 && (rd8(b, 5) == 'S' || rd8(b, 5) == 'V');
-	return false;
+	if (c == 'R' && n >= 8 && n <= 2048 && rd32(b, 5) <= 12)
+		return WIRE_POSTGRES;
+	if (c == 'E' && n >= 8 && n <= 8192 && (rd8(b, 5) == 'S' || rd8(b, 5) == 'V'))
+		return WIRE_POSTGRES;
+	return -1;
 }
 
 /*
  * The packet a client of MySQL or MariaDB answers the greeting of the
  * server with, HandshakeResponse41 or SSLRequest: a length of 3 bytes, the
- * sequence number 1, capabilities with CLIENT_PROTOCOL_41, the size of a
- * packet, a character set and a filler of zeros, whose last 4 bytes MariaDB
- * uses.
+ * sequence number 1, capabilities with CLIENT_PROTOCOL_41, and CLIENT_SSL
+ * when the client asks for TLS, the size of a packet, a character set and a
+ * filler of zeros, whose last 4 bytes MariaDB uses. Returns -1 for another
+ * payload.
  */
-static __always_inline bool mysql_response(const __u8 *b, __u32 len)
+static __always_inline int mysql_response(const __u8 *b, __u32 len)
 {
-	__u32 i;
+	__u32 i, caps;
 
-	if (len < 36 || rd8(b, 3) != 1 || rd24le(b, 0) < 32 ||
-	    !(rd32le(b, 4) & 0x200))
-		return false;
+	if (len < 36 || rd8(b, 3) != 1 || rd24le(b, 0) < 32)
+		return -1;
+	caps = rd32le(b, 4);
+	if (!(caps & 0x200))
+		return -1;
 	for (i = 13; i < 32; i++)
 		if (rd8(b, i))
-			return false;
-	return true;
+			return -1;
+	return caps & 0x800 ? WIRE_MYSQL_TLS : WIRE_MYSQL;
 }
 
 /*
@@ -313,7 +361,7 @@ static __always_inline bool redis_command(const __u8 *b, __u32 len)
 {
 	__u32 i;
 
-	if (len < 8 || rd8(b, 0) != '*' || !resp_number(b, len, 1))
+	if (len < 9 || rd8(b, 0) != '*' || !resp_number(b, len, 1))
 		return false;
 	for (i = 2; i < 8; i++)
 		if (rd8(b, i) == '\n')
@@ -322,17 +370,31 @@ static __always_inline bool redis_command(const __u8 *b, __u32 len)
 }
 
 /*
- * The reply of a server of RESP: a simple string or an error of capitals
- * (+OK, +PONG, -ERR, -NOAUTH), or a number, a bulk string, an array or a
- * map of RESP3 (the reply to HELLO) with its length.
+ * The reply of a server of RESP: a simple string of capitals followed by CR
+ * LF (+OK, +PONG, +QUEUED; not the +OK of a greeting of POP3, which goes on
+ * with text), an error of capitals (-ERR, -NOAUTH), or a number, a bulk
+ * string, an array, a map or a set of RESP3 (the reply to HELLO) with its
+ * length.
  */
 static __always_inline bool redis_reply(const __u8 *b, __u32 len)
 {
-	__u32 c = rd8(b, 0);
+	__u32 c = rd8(b, 0), i;
 
 	if (len < 4)
 		return false;
-	if (c == '+' || c == '-')
+	if (c == '+') {
+		for (i = 1; i < 16; i++) {
+			if (i + 1 >= len)
+				return false;
+			c = rd8(b, i);
+			if (c == '\r')
+				return i > 2 && rd8(b, i + 1) == '\n';
+			if (!is_upper(c))
+				return false;
+		}
+		return false;
+	}
+	if (c == '-')
 		return is_upper(rd8(b, 1)) && is_upper(rd8(b, 2));
 	if (c == ':' || c == '$' || c == '*' || c == '%' || c == '~')
 		return resp_number(b, len, 1);
@@ -392,6 +454,7 @@ static __always_inline int wire_classify(const __u8 *b, __u32 len, __u64 size,
 					 bool server, bool answer)
 {
 	__u32 c;
+	int p;
 
 	/*
 	 * The copies leave len in ranges that differ by path; one range lets
@@ -413,10 +476,12 @@ static __always_inline int wire_classify(const __u8 *b, __u32 len, __u64 size,
 			return WIRE_HTTP1;
 		if (slurm_message(b, len, size))
 			return WIRE_SLURM;
-		if (postgres_request(b, len))
-			return WIRE_POSTGRES;
-		if (answer && mysql_response(b, len))
-			return WIRE_MYSQL;
+		if ((p = sslv2_hello(b, len, size)) >= 0)
+			return p;
+		if ((p = postgres_request(b, len)) >= 0)
+			return p;
+		if (answer && (p = mysql_response(b, len)) >= 0)
+			return p;
 		if (redis_command(b, len))
 			return WIRE_REDIS;
 		return WIRE_UNKNOWN;
@@ -427,10 +492,16 @@ static __always_inline int wire_classify(const __u8 *b, __u32 len, __u64 size,
 		return WIRE_SLURM;
 	if (http2_settings(b, len))
 		return WIRE_HTTP2;
+	/*
+	 * A greeting, also after the header of the PROXY protocol, which a
+	 * load balancer sends before its client speaks.
+	 */
+	if (mysql_greeting(b, len))
+		return WIRE_MYSQL;
 	if (!answer)
-		return mysql_greeting(b, len) ? WIRE_MYSQL : WIRE_UNKNOWN;
-	if (postgres_answer(b, len, size))
-		return WIRE_POSTGRES;
+		return WIRE_UNKNOWN;
+	if ((p = postgres_answer(b, len, size)) >= 0)
+		return p;
 	if (redis_reply(b, len))
 		return WIRE_REDIS;
 	return WIRE_UNKNOWN;
@@ -463,15 +534,16 @@ static __always_inline __u32 peek_user(__u8 *b, __u32 off, const void *src,
 
 /*
  * Copies the first bytes of a send from the user memory of its iovecs, the
- * kernel's copy of the array of writev(2) and sendmsg(2): up to PEEK_SEGS
- * of nr segments, the first skip bytes into its first one, count bytes in
- * all. Returns how many bytes were copied.
+ * kernel's copy of the array of writev(2) and sendmsg(2), to b from off:
+ * up to PEEK_SEGS of nr segments, the first skip bytes into its first one,
+ * count bytes in all. Returns the end of the bytes in b.
  */
-static __always_inline __u32 peek_iovecs(__u8 *b, const struct iovec *iov,
-					 __u64 nr, __u64 skip, __u64 count)
+static __always_inline __u32 peek_iovecs(__u8 *b, __u32 off,
+					 const struct iovec *iov, __u64 nr,
+					 __u64 skip, __u64 count)
 {
 	struct iovec v;
-	__u32 off = 0, got, i;
+	__u32 got, i;
 	__u64 n;
 
 	for (i = 0; i < PEEK_SEGS; i++) {

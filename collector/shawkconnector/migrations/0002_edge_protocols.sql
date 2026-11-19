@@ -12,7 +12,7 @@ CREATE TABLE shawk.edge_protocols (
   edge_id    bigint NOT NULL REFERENCES shawk.edges ON DELETE CASCADE,
   protocol   text NOT NULL CHECK (protocol IN ('unknown', 'tls', 'tls_1_0', 'tls_1_1', 'tls_1_2', 'tls_1_3',
                                                'http1', 'http2_grpc', 'ssh', 'postgres', 'mysql', 'redis',
-                                               'slurm_rpc')),
+                                               'slurm_rpc', 'postgres_tls', 'mysql_tls')),
   first_seen timestamptz NOT NULL,
   last_seen  timestamptz NOT NULL,
   PRIMARY KEY (edge_id, protocol)
