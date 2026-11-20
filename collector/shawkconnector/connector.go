@@ -570,30 +570,7 @@ func (c *shawkConnector) ConsumeMetrics(ctx context.Context, md pmetric.Metrics)
 			full = c.refuseHost(b, admission, now)
 			continue
 		}
-		if b.invalid > 0 {
-			c.log.Warn("ignoring invalid data points", zap.String("host", b.hostname), zap.Int("count", b.invalid))
-		}
-		if b.agentDropped > 0 {
-			c.droppedAgentMetrics(b, now)
-		}
-		c.resolver.learn(b, now)
-		c.mu.Lock()
-		c.foldedCIDRs(b, now)
-		c.inventoryConflicts(b, now)
-		c.changes.add(b, now)
-		c.agg.add(b, func(id *edgeID) peer {
-			p := c.resolver.peer(b.key, id, now)
-			if p.foldedBy != "" {
-				c.foldedAgentPeer(b, id, p, now)
-			}
-			return p
-		}, now, out)
-		inputs := c.agg.dropped
-		c.agg.dropped = 0
-		c.mu.Unlock()
-		if dropped > 0 || inputs > 0 {
-			c.dropSeries(b, dropped, inputs, now)
-		}
+		c.consumeHost(b, dropped, now, out)
 	}
 	if out.ResourceMetrics().Len() > 0 {
 		if err := c.next.ConsumeMetrics(ctx, out); err != nil {
@@ -611,6 +588,37 @@ func (c *shawkConnector) ConsumeMetrics(ctx context.Context, md pmetric.Metrics)
 		return full
 	}
 	return nil
+}
+
+// consumeHost takes the request of a host admitted at now, of which dropped
+// series were dropped by max_series_per_host: its changes are kept for
+// PostgreSQL and, if it closes an interval, the output series of the host
+// are appended to out.
+func (c *shawkConnector) consumeHost(b *hostBatch, dropped int, now time.Time, out pmetric.Metrics) {
+	if b.invalid > 0 {
+		c.log.Warn("ignoring invalid data points", zap.String("host", b.hostname), zap.Int("count", b.invalid))
+	}
+	if b.agentDropped > 0 {
+		c.droppedAgentMetrics(b, now)
+	}
+	c.resolver.learn(b, now)
+	c.mu.Lock()
+	c.foldedCIDRs(b, now)
+	c.inventoryConflicts(b, now)
+	c.changes.add(b, now)
+	c.agg.add(b, func(id *edgeID) peer {
+		p := c.resolver.peer(b.key, id, now)
+		if p.foldedBy != "" {
+			c.foldedAgentPeer(b, id, p, now)
+		}
+		return p
+	}, now, out)
+	inputs := c.agg.dropped
+	c.agg.dropped = 0
+	c.mu.Unlock()
+	if dropped > 0 || inputs > 0 {
+		c.dropSeries(b, dropped, inputs, now)
+	}
 }
 
 // refuseHost logs a batch of a new host refused by max_hosts, or by
