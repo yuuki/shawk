@@ -66,6 +66,59 @@ type wireRowKey struct {
 	protocol string
 }
 
+// activityHours is how many hours a month of the activity of an edge
+// holds: those of a month of 31 days.
+const activityHours = 31 * 24
+
+// activityRowKey identifies a row of shawk.edge_activity, or of
+// shawk.unix_edge_activity for an edge of transportUnix: a month of the
+// activity of an edge. month is the start of the month in UTC, in Unix
+// seconds.
+type activityRowKey struct {
+	edge  edgeRowKey
+	month int64
+}
+
+// activityBits are the hours of a month in which an edge was active: bit i,
+// from the left, is the hour that starts i hours after the month.
+type activityBits [activityHours / 8]byte
+
+// activityOf returns the month of a time and its hour in the month.
+func activityOf(t time.Time) (month int64, hour int) {
+	t = t.UTC()
+	start := time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, time.UTC)
+	return start.Unix(), int(t.Sub(start) / time.Hour)
+}
+
+func (b *activityBits) set(hour int) { b[hour/8] |= 0x80 >> (hour % 8) }
+
+func (b *activityBits) has(hour int) bool { return b[hour/8]&(0x80>>(hour%8)) != 0 }
+
+// merge adds the hours of o.
+func (b *activityBits) merge(o *activityBits) {
+	for i := range b {
+		b[i] |= o[i]
+	}
+}
+
+// String returns the hours as PostgreSQL reads a bit string: a character 0
+// or 1 per hour.
+func (b *activityBits) String() string {
+	out := make([]byte, activityHours)
+	for i := range out {
+		out[i] = '0'
+		if b.has(i) {
+			out[i] = '1'
+		}
+	}
+	return string(out)
+}
+
+// sameHour tells whether two times are in the same hour, in UTC.
+func sameHour(a, b time.Time) bool {
+	return a.Truncate(time.Hour).Equal(b.Truncate(time.Hour))
+}
+
 // listenerRowKey identifies a listener and its owner: a listener that
 // changes hands has a row per owner, which keeps its history. A listener
 // of transportUnix has a path and no address. kernelChosen tells that the
@@ -117,7 +170,8 @@ type hostChanges struct {
 	addrs        map[netip.Addr]span
 	processes    map[procKey]*procRow
 	edges        map[edgeRowKey]span
-	wire         map[wireRowKey]span // the wire protocols of edges, whose edges are in edges
+	wire         map[wireRowKey]span              // the wire protocols of edges, whose edges are in edges
+	activity     map[activityRowKey]*activityBits // the hours edges were active in, whose edges are in edges
 	listeners    map[listenerRowKey]span
 	translations map[translationID]span
 }
@@ -130,17 +184,18 @@ func newHostChanges(key string) *hostChanges {
 		processes:    map[procKey]*procRow{},
 		edges:        map[edgeRowKey]span{},
 		wire:         map[wireRowKey]span{},
+		activity:     map[activityRowKey]*activityBits{},
 		listeners:    map[listenerRowKey]span{},
 		translations: map[translationID]span{},
 	}
 }
 
 // size is the number of rows to write: the host, and its sessions,
-// addresses, processes, edges with their wire protocols, listeners and
-// translations.
+// addresses, processes, edges with their wire protocols and the months of
+// their activity, listeners and translations.
 func (h *hostChanges) size() int {
-	return 1 + len(h.sessions) + len(h.addrs) + len(h.processes) + len(h.edges) + len(h.wire) + len(h.listeners) +
-		len(h.translations)
+	return 1 + len(h.sessions) + len(h.addrs) + len(h.processes) + len(h.edges) + len(h.wire) + len(h.activity) +
+		len(h.listeners) + len(h.translations)
 }
 
 func (h *hostChanges) setHost(machineID, hostname, kernel, version string, t time.Time) {
@@ -203,6 +258,23 @@ func (h *hostChanges) addWire(k wireRowKey, s span) {
 	h.wire[k] = cur
 }
 
+// addActivity records that an edge was active at t: the hour of t in its
+// month.
+func (h *hostChanges) addActivity(k edgeRowKey, t time.Time) {
+	month, hour := activityOf(t)
+	h.activityOf(activityRowKey{edge: k, month: month}).set(hour)
+}
+
+// activityOf returns the hours pending of a month of an edge.
+func (h *hostChanges) activityOf(k activityRowKey) *activityBits {
+	bits := h.activity[k]
+	if bits == nil {
+		bits = new(activityBits)
+		h.activity[k] = bits
+	}
+	return bits
+}
+
 func (h *hostChanges) addListener(k listenerRowKey, s span) {
 	cur := h.listeners[k]
 	cur.merge(s)
@@ -238,6 +310,9 @@ func (h *hostChanges) merge(o *hostChanges) {
 	}
 	for k, s := range o.wire {
 		h.addWire(k, s)
+	}
+	for k, bits := range o.activity {
+		h.activityOf(k).merge(bits)
 	}
 	for k, s := range o.listeners {
 		h.addListener(k, s)
@@ -403,6 +478,14 @@ func (c *changes) advanceFloor(b *hostBatch, skew time.Duration, now time.Time) 
 // accepted for writing. Their times are no later than latest. An edge is
 // written with a wire protocol that changed, so that the row of the
 // protocol finds the row of its edge.
+//
+// An edge is last seen at the end of the latest interval in which its
+// agent saw it active, and first seen at the end of the first: the hours of
+// those times are the hours of its activity (shawk.edge_activity). They are
+// recorded when the edge is new here and when a time moves into another
+// hour, so that an edge active all along is written with its activity once
+// an hour, and an edge whose changes were dropped again with the hours the
+// agent still tells.
 func (c *changes) addEdges(b *hostBatch, h *hostChanges, latest, now time.Time) {
 	edges := acceptedOf(c.acceptedEdges, b.key)
 	wire := c.acceptedWire[b.key]
@@ -418,6 +501,7 @@ func (c *changes) addEdges(b *hostBatch, h *hostChanges, latest, now time.Time) 
 		pk := c.procKey(&e.id.process)
 		k := edgeRowKey{role: e.id.role, proto: e.id.proto, path: e.id.path, local: e.id.local, peer: e.id.peer, folded: e.id.folded,
 			port: e.id.port, netns: e.id.netns, procKey: pk}
+		prev, known := edges[k]
 		changed := accept(edges, k, s, now)
 		for p, ws := range e.wire {
 			if ws.last.IsZero() {
@@ -438,6 +522,12 @@ func (c *changes) addEdges(b *hostBatch, h *hostChanges, latest, now time.Time) 
 		}
 		h.addProcess(pk, e.id.exe, s)
 		h.addEdge(k, s)
+		if !known || s.first.Before(prev.first) && !sameHour(s.first, prev.first) {
+			h.addActivity(k, s.first)
+		}
+		if !known || s.last.After(prev.last) && !sameHour(s.last, prev.last) {
+			h.addActivity(k, s.last)
+		}
 	}
 }
 

@@ -200,7 +200,10 @@ ON CONFLICT (host_id, unit, comm, service_name, (coalesce(user_id, -1))) DO UPDA
 
 // queueEdges writes the edges of a host: those of TCP and UDP to
 // shawk.edges, and those of Unix sockets, which have a name rather than
-// addresses and a port, to shawk.unix_edges.
+// addresses and a port, to shawk.unix_edges. The hours in which they were
+// active follow their edges, which the batch holds: an hour written again
+// changes nothing, so replays and several connectors give the same result,
+// as for the times of the edges.
 func queueEdges(b *pgx.Batch, h *hostChanges) {
 	var units, comms, services, users, roles, protos, locals, peers []string
 	var ports []int32
@@ -210,6 +213,45 @@ func queueEdges(b *pgx.Batch, h *hostChanges) {
 		units, comms, services, users, paths []string
 		netns                                []int64
 		firsts, lasts                        []time.Time
+	}
+	// The months of activity, with the keys of their edges.
+	var act struct {
+		units, comms, services, users, roles, protos, locals, peers, hours []string
+		ports                                                              []int32
+		netns                                                              []int64
+		months                                                             []time.Time
+	}
+	var unixAct struct {
+		units, comms, services, users, paths, hours []string
+		netns                                       []int64
+		months                                      []time.Time
+	}
+	for k, bits := range h.activity {
+		e := k.edge
+		month := time.Unix(k.month, 0).UTC()
+		if e.proto == transportUnix {
+			unixAct.units = append(unixAct.units, e.unit)
+			unixAct.comms = append(unixAct.comms, e.comm)
+			unixAct.services = append(unixAct.services, e.service)
+			unixAct.users = append(unixAct.users, e.user)
+			unixAct.paths = append(unixAct.paths, e.path)
+			unixAct.netns = append(unixAct.netns, int64(e.netns))
+			unixAct.months = append(unixAct.months, month)
+			unixAct.hours = append(unixAct.hours, bits.String())
+			continue
+		}
+		act.units = append(act.units, e.unit)
+		act.comms = append(act.comms, e.comm)
+		act.services = append(act.services, e.service)
+		act.users = append(act.users, e.user)
+		act.roles = append(act.roles, e.role)
+		act.protos = append(act.protos, e.proto)
+		act.locals = append(act.locals, e.local.String())
+		act.peers = append(act.peers, peerString(e.peer, e.folded))
+		act.ports = append(act.ports, int32(e.port))
+		act.netns = append(act.netns, int64(e.netns))
+		act.months = append(act.months, month)
+		act.hours = append(act.hours, bits.String())
 	}
 	for k, s := range h.edges {
 		if k.proto == transportUnix {
@@ -250,6 +292,22 @@ ON CONFLICT (host_id, role, proto, local_addr, remote_addr, port, netns, process
   last_seen  = greatest(e.last_seen, excluded.last_seen)`,
 			h.key, units, comms, services, users, roles, protos, locals, peers, ports, netns, firsts, lasts)
 	}
+	if len(act.units) > 0 {
+		b.Queue(`
+INSERT INTO shawk.edge_activity AS a (edge_id, month, hours)
+SELECT e.id, u.month, u.hours::bit(744)
+FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::text[], $9::text[],
+            $10::integer[], $11::bigint[], $12::timestamptz[], $13::text[])
+  AS u(unit, comm, service, uid, role, proto, local, peer, port, netns, month, hours)
+JOIN shawk.processes p ON p.host_id = $1 AND p.unit = u.unit AND p.comm = u.comm AND p.service_name = u.service
+  AND coalesce(p.user_id, -1) = coalesce(nullif(u.uid, '')::bigint, -1)
+JOIN shawk.edges e ON e.host_id = $1 AND e.role = u.role AND e.proto = u.proto AND e.local_addr = u.local::inet
+  AND e.remote_addr = u.peer::inet AND e.port = u.port AND e.netns = u.netns AND e.process_id = p.id
+ON CONFLICT (edge_id, month) DO UPDATE SET hours = a.hours | excluded.hours
+WHERE a.hours <> (a.hours | excluded.hours)`,
+			h.key, act.units, act.comms, act.services, act.users, act.roles, act.protos, act.locals, act.peers, act.ports,
+			act.netns, act.months, act.hours)
+	}
 	if len(unix.units) > 0 {
 		b.Queue(`
 INSERT INTO shawk.unix_edges AS e (host_id, process_id, path, netns, first_seen, last_seen)
@@ -262,6 +320,20 @@ ON CONFLICT (host_id, path, netns, process_id) DO UPDATE SET
   first_seen = least(e.first_seen, excluded.first_seen),
   last_seen  = greatest(e.last_seen, excluded.last_seen)`,
 			h.key, unix.units, unix.comms, unix.services, unix.users, unix.paths, unix.netns, unix.firsts, unix.lasts)
+	}
+	if len(unixAct.units) > 0 {
+		b.Queue(`
+INSERT INTO shawk.unix_edge_activity AS a (edge_id, month, hours)
+SELECT e.id, u.month, u.hours::bit(744)
+FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::bigint[], $8::timestamptz[], $9::text[])
+  AS u(unit, comm, service, uid, path, netns, month, hours)
+JOIN shawk.processes p ON p.host_id = $1 AND p.unit = u.unit AND p.comm = u.comm AND p.service_name = u.service
+  AND coalesce(p.user_id, -1) = coalesce(nullif(u.uid, '')::bigint, -1)
+JOIN shawk.unix_edges e ON e.host_id = $1 AND e.path = u.path AND e.netns = u.netns AND e.process_id = p.id
+ON CONFLICT (edge_id, month) DO UPDATE SET hours = a.hours | excluded.hours
+WHERE a.hours <> (a.hours | excluded.hours)`,
+			h.key, unixAct.units, unixAct.comms, unixAct.services, unixAct.users, unixAct.paths, unixAct.netns,
+			unixAct.months, unixAct.hours)
 	}
 }
 
