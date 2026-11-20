@@ -204,14 +204,14 @@ DEPTH  CLIENT                         SERVER          PORT      SEEN BY  CADENCE
 and 1 more row (-limit 0 shows all)
 
 Observation of the hosts that tell
-HOST      ROLE    OBSERVED  NOT OBSERVED  GAPS  DROPPED FLOWS  NO UDP  NO UNIX  ONE NETNS
-db-01     target  99.98%    14m           12    9h             0s      0s       0s
-batch-01  client  50%       45d           1     0s             1h      2h       1m
-gone-01   client  no agent  -             -     -              -       -        -
+HOST      ROLE    OBSERVED  NOT OBSERVED  GAPS  PARTLY OBSERVED  NO UDP  NO UNIX  ONE NETNS
+db-01     target  99.98%    14m           12    9h               0s      0s       0s
+batch-01  client  50%       45d           1     0s               1h      2h       1m
+gone-01   client  no agent  -             -     -                -       -        -
 and 1 client observed all along
 
-Only TCP, UDP and Unix stream sockets are observed: a host used over RDMA, or by a
-host without an agent through a relay, may look unused (docs/design.md, sections 6.3 and 10).
+Only TCP, UDP and Unix stream sockets are observed: a host used over RDMA, or less
+often than the period, looks unused (docs/design.md, sections 6.3 and 10).
 `
 	if got := out.String(); got != want {
 		t.Errorf("report:\n%s\nwant:\n%s", got, want)
@@ -244,7 +244,7 @@ func TestWriteVerdicts(t *testing.T) {
 	}
 
 	// Safe with a gap that the caller accepts.
-	r.Caveats, r.MinCoverage, r.Coverage, r.coverage = []string{"not_observed"}, 0.999, 0.9998, "99.980000"
+	r.Caveats, r.MinCoverage, r.minCoverage, r.Coverage, r.coverage = []string{"not_observed"}, 0.999, "99.9000000000", 0.9998, "99.980000"
 	r.Observers[0].UnobservedSeconds, r.Observers[0].Gaps = 840, 2
 	out.Reset()
 	if err := writeText(&out, r, 50); err != nil {
@@ -309,5 +309,36 @@ func TestWriteJSON(t *testing.T) {
 	if ob := got.Observers[2]; ob["host"] != "batch-01" || ob["role"] != "client" || ob["unobserved_seconds"] != 45*86400.0 ||
 		ob["udp_untraced_seconds"] != 3600.0 {
 		t.Errorf("observer = %v", ob)
+	}
+}
+
+// TestPrintable: the names that agents send are written without their
+// control characters, which could redraw the terminal.
+func TestPrintable(t *testing.T) {
+	for in, want := range map[string]string{
+		"db-01":                   "db-01",
+		"shop/app":                "shop/app",
+		"データベース":                  "データベース",
+		"a\x1b[2K\rVerdict  SAFE": `a\x1b[2K\rVerdict  SAFE`,
+		"a\nb\tc":                 `a\nb\tc`,
+		"x\u202ey":                `x\u202ey`,
+		"":                        "",
+	} {
+		if got := printable(in); got != want {
+			t.Errorf("printable(%q) = %q, want %q", in, got, want)
+		}
+	}
+	r := testReport()
+	r.Dependents = r.Dependents[:1]
+	r.Dependents[0].ClientService = "app\x1b[1A\x1b[2KVerdict  SAFE"
+	r.Dependents[0].ClientHost = ptr("app-01\nVerdict  SAFE")
+	r.Target.Host = "db-01\x1b[31m"
+	var out bytes.Buffer
+	if err := writeText(&out, r, 0); err != nil {
+		t.Fatal(err)
+	}
+	if strings.ContainsRune(out.String(), 0x1b) || strings.Contains(out.String(), "\nVerdict  SAFE") ||
+		!strings.Contains(out.String(), `app-01\nVerdict  SAFE app\x1b[1A\x1b[2KVerdict  SAFE`) {
+		t.Errorf("report:\n%q", out.String())
 	}
 }

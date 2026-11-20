@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"math/big"
 	"slices"
 	"strconv"
 	"strings"
@@ -74,7 +75,8 @@ type report struct {
 
 	// coverage is Coverage in percent as PostgreSQL writes it, which is
 	// cut rather than rounded: 100 is a target watched all along.
-	coverage string
+	// minCoverage is MinCoverage in percent.
+	coverage, minCoverage string
 }
 
 // dependent is a row of shawk_v1.impact.
@@ -160,6 +162,9 @@ func build(ctx context.Context, conn *pgx.Conn, o options) (*report, error) {
 	r.Since = r.Until.Add(-o.lookback)
 	if r.MinCoverage, err = strconv.ParseFloat(o.minCoverage, 64); err != nil {
 		return nil, err
+	}
+	if p, ok := new(big.Rat).SetString(o.minCoverage); ok {
+		r.minCoverage = p.Mul(p, big.NewRat(100, 1)).FloatString(10)
 	}
 	period := []any{r.Since, r.Until}
 	t := o.target.args()

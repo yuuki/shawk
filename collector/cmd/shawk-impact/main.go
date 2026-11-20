@@ -13,8 +13,10 @@ import (
 	"io"
 	"math/big"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -46,7 +48,11 @@ const (
 )
 
 func main() {
-	os.Exit(run(context.Background(), os.Args[1:], os.Stdout, os.Stderr))
+	// An interrupt cancels the query in PostgreSQL too.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	code := run(ctx, os.Args[1:], os.Stdout, os.Stderr)
+	stop()
+	os.Exit(code)
 }
 
 // config is the command line.
@@ -228,7 +234,7 @@ func query(ctx context.Context, c *config) (*report, error) {
 		dsn = os.Getenv("SHAWK_POSTGRES_DSN")
 	}
 	if c.dsnFile != "" {
-		b, err := os.ReadFile(c.dsnFile)
+		b, err := os.ReadFile(c.dsnFile) //nolint:gosec // G703: the file that the command line names, read as its user
 		if err != nil {
 			return nil, err
 		}
@@ -256,6 +262,6 @@ func query(ctx context.Context, c *config) (*report, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close(context.WithoutCancel(ctx)) //nolint:errcheck // nothing was written
+	defer conn.Close(context.WithoutCancel(ctx))
 	return build(ctx, conn, c.options)
 }

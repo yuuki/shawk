@@ -152,12 +152,12 @@ DEPTH  CLIENT            SERVER           PORT      SEEN BY  CADENCE     LAST SE
 2      web-01 nginx      app-01 shop/app  8080/tcp  both     continuous  2026-10-30T00:00:00Z  now
 
 Observation of the hosts that tell
-HOST   ROLE    OBSERVED  NOT OBSERVED  GAPS  DROPPED FLOWS  NO UDP  NO UNIX  ONE NETNS
-db-01  target  100%      0s            0     0s             0s      0s       0s
+HOST   ROLE    OBSERVED  NOT OBSERVED  GAPS  PARTLY OBSERVED  NO UDP  NO UNIX  ONE NETNS
+db-01  target  100%      0s            0     0s               0s      0s       0s
 and 3 clients observed all along
 
-Only TCP, UDP and Unix stream sockets are observed: a host used over RDMA, or by a
-host without an agent through a relay, may look unused (docs/design.md, sections 6.3 and 10).
+Only TCP, UDP and Unix stream sockets are observed: a host used over RDMA, or less
+often than the period, looks unused (docs/design.md, sections 6.3 and 10).
 `
 	if code != exitUnsafe || out != want {
 		t.Errorf("db-01: exit status %d, want %d\n%s\nwant:\n%s", code, exitUnsafe, out, want)

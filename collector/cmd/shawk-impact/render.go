@@ -8,6 +8,7 @@ import (
 	"strings"
 	"text/tabwriter"
 	"time"
+	"unicode"
 )
 
 // writeJSON writes a report as one JSON document.
@@ -36,7 +37,7 @@ func writeText(w io.Writer, r *report, limit int) error {
 	fmt.Fprintf(&b, "Target   %s\n", describeTarget(r.Target))
 	fmt.Fprintf(&b, "Period   %s to %s (%s)\n\n", formatTime(r.Since), formatTime(r.Until), formatDuration(r.Until.Sub(r.Since)))
 
-	fmt.Fprintf(&b, "Verdict  %s\n", verdictLine(r))
+	fmt.Fprintf(&b, "Verdict  %s\n", printable(verdictLine(r)))
 	switch {
 	case r.Direct > 0:
 		fmt.Fprintf(&b, "         %s used it in the period", plural(r.Direct, "dependent"))
@@ -58,7 +59,7 @@ func writeText(w io.Writer, r *report, limit int) error {
 		if r.Verdict == verdictUnsafe {
 			b.WriteString("         The dependents below may not be all:\n")
 		} else {
-			fmt.Fprintf(&b, "         Accepted with a coverage of %s%% at least:\n", percent(strconv.FormatFloat(r.MinCoverage*100, 'f', -1, 64)))
+			fmt.Fprintf(&b, "         Accepted with a coverage of %s%% at least:\n", percent(r.minCoverage))
 		}
 		for _, caveat := range r.Caveats {
 			if s := describeShortfall(r, caveat); s != "" {
@@ -89,7 +90,7 @@ func writeText(w io.Writer, r *report, limit int) error {
 		fmt.Fprintln(tw, "DEPTH\tCLIENT\tSERVER\tPORT\tSEEN BY\tCADENCE\tLAST SEEN\tNEXT ACTIVITY")
 		for _, d := range shown {
 			fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", d.Depth, describeClient(d), describeServer(d), describePort(d),
-				d.ObservedBy, describeCadence(d), formatTime(d.LastSeen), nextActivity(d, r.Until))
+				printable(d.ObservedBy), describeCadence(d), formatTime(d.LastSeen), nextActivity(d, r.Until))
 		}
 		if err := tw.Flush(); err != nil {
 			return err
@@ -116,13 +117,13 @@ func writeText(w io.Writer, r *report, limit int) error {
 	if len(shown) > 0 {
 		fmt.Fprintf(w, "\nObservation of the hosts that tell\n")
 		tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(tw, "HOST\tROLE\tOBSERVED\tNOT OBSERVED\tGAPS\tDROPPED FLOWS\tNO UDP\tNO UNIX\tONE NETNS")
+		fmt.Fprintln(tw, "HOST\tROLE\tOBSERVED\tNOT OBSERVED\tGAPS\tPARTLY OBSERVED\tNO UDP\tNO UNIX\tONE NETNS")
 		for _, ob := range shown {
 			if !ob.Agent {
-				fmt.Fprintf(tw, "%s\t%s\tno agent\t-\t-\t-\t-\t-\t-\n", ob.Host, ob.Role)
+				fmt.Fprintf(tw, "%s\t%s\tno agent\t-\t-\t-\t-\t-\t-\n", printable(ob.Host), ob.Role)
 				continue
 			}
-			fmt.Fprintf(tw, "%s\t%s\t%s%%\t%s\t%d\t%s\t%s\t%s\t%s\n", ob.Host, ob.Role, percent(ob.observed),
+			fmt.Fprintf(tw, "%s\t%s\t%s%%\t%s\t%d\t%s\t%s\t%s\t%s\n", printable(ob.Host), ob.Role, percent(ob.observed),
 				seconds(ob.UnobservedSeconds), ob.Gaps, seconds(ob.PartlyObservedSeconds),
 				seconds(ob.UDPUntracedSeconds), seconds(ob.UnixUntracedSeconds), seconds(ob.NetnsLimitedSeconds))
 		}
@@ -136,13 +137,34 @@ func writeText(w io.Writer, r *report, limit int) error {
 			fmt.Fprintf(w, "and %s observed all along\n", plural(int64(complete), "client"))
 		}
 	}
-	_, err := fmt.Fprint(w, "\nOnly TCP, UDP and Unix stream sockets are observed: a host used over RDMA, or by a\n"+
-		"host without an agent through a relay, may look unused (docs/design.md, sections 6.3 and 10).\n")
+	_, err := fmt.Fprint(w, "\nOnly TCP, UDP and Unix stream sockets are observed: a host used over RDMA, or less\n"+
+		"often than the period, looks unused (docs/design.md, sections 6.3 and 10).\n")
 	return err
+}
+
+// printable returns a name with what is not printable escaped. The names
+// of hosts and services are what agents send, which may hold control
+// characters: written as they are, they could redraw the terminal, the
+// verdict included.
+func printable(s string) string {
+	if strings.IndexFunc(s, func(r rune) bool { return !unicode.IsPrint(r) }) < 0 {
+		return s
+	}
+	var b strings.Builder
+	for _, r := range s {
+		if unicode.IsPrint(r) {
+			b.WriteRune(r)
+			continue
+		}
+		q := strconv.QuoteRune(r)
+		b.WriteString(q[1 : len(q)-1])
+	}
+	return b.String()
 }
 
 // describeTarget names a target: the host, with what narrows it.
 func describeTarget(t target) string {
+	t.Host, t.Service = printable(t.Host), printable(t.Service)
 	var parts []string
 	if t.Service != "" {
 		parts = append(parts, "service "+t.Service)
@@ -169,9 +191,9 @@ func describeShortfall(r *report, code string) string {
 	case "active_dependents":
 		return ""
 	case "unknown_host":
-		return fmt.Sprintf("no agent ever reported as %s, and the inventory has no such host: check the name", r.Target.Host)
+		return fmt.Sprintf("no agent ever reported as %s, and the inventory has no such host: check the name", printable(r.Target.Host))
 	case "no_agent":
-		return fmt.Sprintf("%s runs no agent: its clients without an agent would not be seen", r.Target.Host)
+		return fmt.Sprintf("%s runs no agent: its clients without an agent would not be seen", printable(r.Target.Host))
 	case "not_observed":
 		return fmt.Sprintf("not observed for %s of the period, in %s", seconds(t.UnobservedSeconds), plural(int64(t.Gaps), "gap"))
 	case "dropped_flows":
@@ -184,29 +206,30 @@ func describeShortfall(r *report, code string) string {
 	case "netns_limited":
 		return fmt.Sprintf("its agent traced one network namespace only for %s", seconds(t.NetnsLimitedSeconds))
 	}
-	return code
+	return printable(code)
 }
 
 // describeClient names the client of a dependent: its host and service, or
 // its address and the name of its range for a client without an agent,
 // with the host the inventory gives the address.
 func describeClient(d dependent) string {
+	service := printable(d.ClientService)
 	switch {
 	case d.ClientAddr != nil && d.ClientHost != nil:
-		return fmt.Sprintf("%s (%s) %s", *d.ClientAddr, *d.ClientHost, d.ClientService)
+		return fmt.Sprintf("%s (%s) %s", printable(*d.ClientAddr), printable(*d.ClientHost), service)
 	case d.ClientAddr != nil:
-		return *d.ClientAddr + " " + d.ClientService
+		return printable(*d.ClientAddr) + " " + service
 	case d.ClientHost != nil:
-		return *d.ClientHost + " " + d.ClientService
+		return printable(*d.ClientHost) + " " + service
 	}
-	return d.ClientService
+	return service
 }
 
 func describeServer(d dependent) string {
 	if d.ServerService == nil {
-		return d.ServerHost + " -"
+		return printable(d.ServerHost) + " -"
 	}
-	return d.ServerHost + " " + *d.ServerService
+	return printable(d.ServerHost) + " " + printable(*d.ServerService)
 }
 
 // describePort is the port and transport: a Unix socket has no port, and
@@ -216,9 +239,9 @@ func describePort(d dependent) string {
 	case d.Proto == "unix":
 		return "unix"
 	case d.Port == 0:
-		return "*/" + d.Proto
+		return "*/" + printable(d.Proto)
 	}
-	return strconv.Itoa(d.Port) + "/" + d.Proto
+	return strconv.Itoa(d.Port) + "/" + printable(d.Proto)
 }
 
 // describeCadence is the cadence, with the period of one that has no name
@@ -227,7 +250,7 @@ func describeCadence(d dependent) string {
 	if d.Cadence == "periodic" && d.PeriodSeconds != nil {
 		return "every " + seconds(*d.PeriodSeconds)
 	}
-	return d.Cadence
+	return printable(d.Cadence)
 }
 
 // nextActivity tells when a dependent would next use its server, as far as
