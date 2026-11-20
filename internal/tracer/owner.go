@@ -64,35 +64,51 @@ func (t *Tracer) scanSockets() ([]Listener, []uint64, error) {
 			return nil, nil, err
 		}
 		for i := range recs {
-			if recs[i].Type != recListener {
+			r := &recs[i]
+			if r.Type != recListener {
 				continue
 			}
-			if recs[i].Ino != 0 {
-				inos = append(inos, recs[i].Ino)
+			if r.Ino != 0 {
+				inos = append(inos, r.Ino)
 			}
-			l := Listener{
-				Proto:        Proto(recs[i].Proto),
-				Addr:         addrFrom16(recs[i].Addr),
-				Port:         recs[i].Port,
-				NetNS:        recs[i].Netns,
-				KernelChosen: recs[i].KernelChosen != 0,
-			}
-			if commString(recs[i].Comm) == KernelComm {
-				l.Comm = KernelComm
-			}
-			k := listenerKey(&l)
-			if j, ok := seen[k]; ok {
-				if l.Comm != "" {
-					listeners[j].Comm = l.Comm
-				}
-				listeners[j].KernelChosen = listeners[j].KernelChosen || l.KernelChosen
-				continue
-			}
-			seen[k] = len(listeners)
-			listeners = append(listeners, l)
+			listeners = addListener(listeners, seen, listenerOf(r))
 		}
 	}
 	return listeners, inos, nil
+}
+
+// addListener adds a listener to those of a walk of the sockets, of which
+// seen holds the indexes: the sockets that share its address and its port
+// are one listener.
+func addListener(listeners []Listener, seen map[sockAddrKey]int, l Listener) []Listener {
+	k := listenerKey(&l)
+	j, ok := seen[k]
+	if !ok {
+		seen[k] = len(listeners)
+		return append(listeners, l)
+	}
+	if l.Comm != "" {
+		listeners[j].Comm = l.Comm
+	}
+	listeners[j].KernelChosen = listeners[j].KernelChosen || l.KernelChosen
+	return listeners
+}
+
+// listenerOf converts the record of a listening socket that a walk of the
+// sockets found. Its Comm is KernelComm if the kernel may hold the socket,
+// and empty otherwise.
+func listenerOf(r *bpfShawkIterRec) Listener {
+	l := Listener{
+		Proto:        Proto(r.Proto),
+		Addr:         addrFrom16(r.Addr),
+		Port:         r.Port,
+		NetNS:        r.Netns,
+		KernelChosen: r.KernelChosen != 0,
+	}
+	if commString(r.Comm) == KernelComm {
+		l.Comm = KernelComm
+	}
+	return l
 }
 
 func clearMap(m *ebpf.Map) error {
