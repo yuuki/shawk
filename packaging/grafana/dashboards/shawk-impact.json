@@ -194,7 +194,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT depth, client_host, client_service, client_addr, server_host, server_service, port, proto, observed_by,\n       cadence, period, runs, last_seen, next_expected\nFROM shawk_v1.impact(${host:sqlstring}, $__timeFrom(), $__timeTo(), max_depth => ${depth:sqlstring}::integer)\nLIMIT 1000"
+          "rawSql": "SELECT depth, client_host, client_service,\n       CASE WHEN masklen(client_addr) = 0 THEN text(client_addr) ELSE host(client_addr) END AS client_addr,\n       server_host, server_service, port, proto, observed_by, cadence, period, runs, last_seen, next_expected\nFROM shawk_v1.impact(${host:sqlstring}, $__timeFrom(), $__timeTo(), max_depth => ${depth:sqlstring}::integer)\nLIMIT 1000"
         }
       ],
       "options": {
