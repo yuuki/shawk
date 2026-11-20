@@ -1,3 +1,38 @@
+## [v0.10.0](https://github.com/yuuki/shawk/compare/v0.9.0...v0.10.0) (2026-11-20)
+
+### Added
+
+* Wire protocols of TCP connections (#263), off by default. With
+  `-classify-protocols`, the agent reads the first payload that each side
+  of a new TCP connection sends and tells its protocol: the version of TLS
+  (a client tells the highest version it offers, a server the version it
+  chose), HTTP/1, HTTP/2 or gRPC in clear text, SSH, PostgreSQL and MySQL
+  with or without a request of TLS, Redis and Slurm RPC. Clients still on
+  TLS 1.0 or in clear text can so be found. The program runs on every TCP
+  send and returns at once for connections that already sent, and it needs
+  BPF trampolines (fentry), as Unix sockets do; without them the protocols
+  are not classified. The agent reports `shawk.agent.protocols.classified`
+  (`docs/design.md` §3.9).
+* The connector writes the protocols to PostgreSQL, in the new migration
+  `0002_edge_protocols.sql`: the table `shawk.edge_protocols`, pruned with
+  its edges, and the view `shawk_v1.edge_protocols`, one row per edge and
+  protocol with the addresses of the client and of the server; `agents`
+  has the last column `protocols_classified`. Prometheus does not have the
+  protocols, so that they add no series.
+* The alert `ShawkProtocolsNotClassified`, for agents asked to classify
+  protocols that cannot, and `protocols_classified` in the fleet dashboard.
+* `shawk flows -classify-protocols` shows the protocols in the column `WIRE`.
+
+### Documentation
+
+* The README has status badges (#229), and an example query of
+  `shawk_v1.edge_protocols`.
+
+**Upgrading.** Apply the migration `0002_edge_protocols.sql` with
+`shawk-migrate`, or let the connector apply it with `postgres.migrate`: a
+connector of v0.10.0 waits at start until the schema has it. The database
+of v0.9.0 is kept. Upgrade the connectors with the agents.
+
 ## [v0.9.0](https://github.com/yuuki/shawk/compare/v0.8.1...v0.9.0) (2026-11-11)
 
 ### Added
