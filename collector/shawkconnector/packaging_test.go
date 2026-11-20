@@ -241,6 +241,9 @@ var dashboardVars = map[string][]string{
 	"dst":       {"postgres"},
 	"direction": {"both"},
 	"depth":     {"2"},
+	// The impact dashboard.
+	"host":         {"db-01"},
+	"min_coverage": {"100"},
 }
 
 var sqlstringVar = regexp.MustCompile(`\$\{(\w+):sqlstring\}`)
@@ -455,6 +458,10 @@ func TestPGPackaged(t *testing.T) {
 		"shawk-fleet.json/shawk / Fleet/Partly observed periods in the time range/A#0",
 		"shawk-dependency.json/shawk / Dependency details/Partly observed/Anno#0",
 		"shawk-changes.json/shawk / Changes/Partly observed/Anno#0",
+		"shawk-impact.json/shawk / Impact/Verdict/A#0",
+		"shawk-impact.json/shawk / Impact/Dependents/A#0",
+		"shawk-impact.json/shawk / Impact/Observation of the host/A#0",
+		"shawk-impact.json/shawk / Impact/Gaps of the host/A#0",
 	} {
 		if _, ok := rows[want]; !ok {
 			t.Errorf("no query %s; have %v", want, keys(rows))
@@ -727,5 +734,97 @@ func TestPGMapCraftedVariables(t *testing.T) {
 				t.Errorf("%s: depth %q: %v, %v; want invalid input syntax for type integer", name, depth, got, err)
 			}
 		}
+	}
+}
+
+// TestPGImpactDashboard: the variable of the impact dashboard lists the
+// hosts with an agent and those of the inventory, and the values of its
+// variables, which a link can set (?var-host=, ?var-depth=,
+// ?var-min_coverage=), stay values: a quote does not end a string, and a
+// depth or a coverage that is not a number fails the query.
+func TestPGImpactDashboard(t *testing.T) {
+	_, conn := migratedDB(t)
+	f := fixture{t, conn}
+	f.host("db-01", "postgres")
+	f.host("app-01", "app")
+	f.conn2("app-01", "app", "10.0.0.11", "db-01", "postgres", "10.0.0.10", 5432, "now()-interval '1 hour'", "now()")
+	execAll(t, conn, `INSERT INTO shawk.inventory_hosts (host, agent) VALUES ('sfa-01', false), ('db-01', true)`)
+
+	b, err := os.ReadFile(filepath.Join(packaging, "grafana/dashboards/shawk-impact.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dashboard struct {
+		Templating struct {
+			List []struct {
+				Name, Type, Query string
+			}
+		}
+	}
+	if err := json.Unmarshal(b, &dashboard); err != nil {
+		t.Fatal(err)
+	}
+	var hosts string
+	for _, v := range dashboard.Templating.List {
+		if v.Name == "host" && v.Type == "query" {
+			hosts = v.Query
+		}
+	}
+	if got := queryStrings(t, conn, hosts); !slices.Equal(got, []string{"app-01", "db-01", "sfa-01"}) {
+		t.Errorf("the hosts of the variable (%s) = %v, want app-01, db-01 and sfa-01", hosts, got)
+	}
+
+	all := packagedSQL(t)
+	const verdict = "shawk-impact.json/shawk / Impact/Verdict/A#0"
+	now := time.Now()
+	// run runs a query with the values of vars, or else those of db-01,
+	// and returns its first column.
+	run := func(name string, vars map[string][]string) ([]string, error) {
+		sql := expandVars(expandVars(all[name], vars), map[string][]string{"host": {"db-01"}, "depth": {"3"}, "min_coverage": {"100"}})
+		rows, err := conn.Query(context.Background(), expandMacros(sql, now.Add(-6*time.Hour), now))
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		var out []string
+		for rows.Next() {
+			vals, err := rows.Values()
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, fmt.Sprint(vals[0]))
+		}
+		return out, rows.Err()
+	}
+	if got, err := run(verdict, nil); err != nil || !slices.Equal(got, []string{"UNSAFE"}) {
+		t.Fatalf("verdict on db-01 = %v, %v; want UNSAFE", got, err)
+	}
+	if got, err := run(verdict, map[string][]string{"host": {"app-01"}}); err != nil || !slices.Equal(got, []string{"SAFE"}) {
+		t.Errorf("verdict on app-01 = %v, %v; want SAFE", got, err)
+	}
+	// Quoted, the value names no host: never safe.
+	if got, err := run(verdict, map[string][]string{"host": {"app-01' OR 'x' = 'x"}}); err != nil || !slices.Equal(got, []string{"INCONCLUSIVE"}) {
+		t.Errorf("crafted host: verdict = %v, %v; want INCONCLUSIVE", got, err)
+	}
+	for name, vars := range map[string]map[string][]string{
+		"depth":        {"depth": {"3) UNION SELECT 'SAFE' --"}},
+		"min_coverage": {"min_coverage": {"0 + 100"}},
+		"no coverage":  {"min_coverage": {"0"}},
+	} {
+		for _, q := range []string{verdict, "shawk-impact.json/shawk / Impact/Dependents/A#0"} {
+			if name != "depth" && q != verdict {
+				continue
+			}
+			if got, err := run(q, vars); err == nil {
+				t.Errorf("crafted %s: %s returned %v, want an error", name, q, got)
+			}
+		}
+	}
+	// The dependents and the observation of the host.
+	if got, err := run("shawk-impact.json/shawk / Impact/Dependents/A#0", nil); err != nil || !slices.Equal(got, []string{"1"}) {
+		t.Errorf("depths of the dependents of db-01 = %v, %v; want one of depth 1", got, err)
+	}
+	if got, err := run("shawk-impact.json/shawk / Impact/Observation of the host/A#0", nil); err != nil || !slices.Equal(got, []string{"db-01"}) {
+		t.Errorf("observation of db-01 = %v, %v", got, err)
 	}
 }

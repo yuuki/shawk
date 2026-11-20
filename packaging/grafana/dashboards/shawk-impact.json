@@ -1,0 +1,285 @@
+{
+  "uid": "shawk-impact",
+  "title": "shawk / Impact",
+  "description": "What removing a host would break: its dependents in the time range, how often they use it, and whether the host was watched. Only TCP, UDP and Unix stream sockets are observed; RDMA (InfiniBand, RoCE) is not.",
+  "tags": [
+    "shawk"
+  ],
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "version": 1,
+  "time": {
+    "from": "now-90d",
+    "to": "now"
+  },
+  "refresh": "",
+  "timezone": "",
+  "templating": {
+    "list": [
+      {
+        "name": "host",
+        "label": "Host",
+        "type": "query",
+        "datasource": {
+          "type": "grafana-postgresql-datasource",
+          "uid": "shawk-postgres"
+        },
+        "query": "SELECT host FROM shawk_v1.agents UNION SELECT host FROM shawk_v1.inventory ORDER BY 1",
+        "definition": "SELECT host FROM shawk_v1.agents UNION SELECT host FROM shawk_v1.inventory ORDER BY 1",
+        "refresh": 1,
+        "multi": false,
+        "includeAll": false,
+        "current": {},
+        "sort": 1
+      },
+      {
+        "name": "depth",
+        "label": "Depth",
+        "type": "custom",
+        "query": "1,2,3,5,10",
+        "current": {
+          "text": "3",
+          "value": "3"
+        },
+        "options": [
+          {
+            "text": "1",
+            "value": "1",
+            "selected": false
+          },
+          {
+            "text": "2",
+            "value": "2",
+            "selected": false
+          },
+          {
+            "text": "3",
+            "value": "3",
+            "selected": true
+          },
+          {
+            "text": "5",
+            "value": "5",
+            "selected": false
+          },
+          {
+            "text": "10",
+            "value": "10",
+            "selected": false
+          }
+        ]
+      },
+      {
+        "name": "min_coverage",
+        "label": "Coverage for SAFE (%)",
+        "type": "custom",
+        "query": "100,99.99,99.9,99",
+        "current": {
+          "text": "100",
+          "value": "100"
+        },
+        "options": [
+          {
+            "text": "100",
+            "value": "100",
+            "selected": true
+          },
+          {
+            "text": "99.99",
+            "value": "99.99",
+            "selected": false
+          },
+          {
+            "text": "99.9",
+            "value": "99.9",
+            "selected": false
+          },
+          {
+            "text": "99",
+            "value": "99",
+            "selected": false
+          }
+        ]
+      }
+    ]
+  },
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "links": [
+    {
+      "asDropdown": true,
+      "includeVars": false,
+      "keepTime": true,
+      "tags": [
+        "shawk"
+      ],
+      "title": "shawk",
+      "type": "dashboards"
+    }
+  ],
+  "panels": [
+    {
+      "id": 1,
+      "type": "table",
+      "title": "Verdict",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "shawk-postgres"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shawk-postgres"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT verdict, array_to_string(reasons, ', ') AS reasons, array_to_string(caveats, ', ') AS caveats,\n       direct AS dependents, transitive AS dependents_of_dependents, coverage * 100 AS coverage_percent,\n       unobserved AS not_observed, gaps, partly_observed AS dropped_flows_for\nFROM shawk_v1.impact_verdict(${host:sqlstring}, $__timeFrom(), $__timeTo(),\n       min_coverage => ${min_coverage:sqlstring}::numeric / 100, max_depth => ${depth:sqlstring}::integer)"
+        }
+      ],
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "description": "UNSAFE: the host has dependents in the time range. SAFE: it has none, and its agent observed it for the coverage asked of the time range. INCONCLUSIVE: none was seen, but the host was not watched enough to tell; reasons say what was missing (not_observed, dropped_flows, udp_not_traced, netns_limited; unknown_host or no_agent for a name no agent reported under). caveats are the same shortfalls where they did not decide the verdict. coverage_percent is cut, not rounded: 100 is all of the time range. Only TCP, UDP and Unix stream sockets are observed: a host used over RDMA is not seen to be used. For a service or a port of the host alone, use shawk-impact or shawk_v1.impact_verdict()."
+    },
+    {
+      "id": 2,
+      "type": "table",
+      "title": "Dependents",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "shawk-postgres"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 4,
+        "w": 24,
+        "h": 14
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shawk-postgres"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT depth, client_host, client_service, client_addr, server_host, server_service, port, proto, observed_by,\n       cadence, period, runs, last_seen, next_expected\nFROM shawk_v1.impact(${host:sqlstring}, $__timeFrom(), $__timeTo(), max_depth => ${depth:sqlstring}::integer)\nLIMIT 1000"
+        }
+      ],
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "description": "The clients of the host (depth 1), and the clients of its dependents after, each at the depth it is first reached. A client without an agent has client_addr, and the host the inventory gives the address. port 0 stands for the ports of a service under the rules of ports. cadence is read from the hours in which the dependency was active: continuous breaks at once; daily, weekly, monthly and periodic at their next run, which next_expected estimates; one-off and dormant stopped in the time range; unknown has too little history, or hours that were not recorded. At most 1000 rows."
+    },
+    {
+      "id": 3,
+      "type": "table",
+      "title": "Observation of the host",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "shawk-postgres"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 18,
+        "w": 12,
+        "h": 5
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shawk-postgres"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT host, agent, observed * 100 AS observed_percent, unobserved AS not_observed, gaps,\n       partly_observed AS dropped_flows_for, dropped_flows, udp_untraced AS without_udp,\n       unix_untraced AS without_unix_sockets, netns_limited AS one_netns_only\nFROM shawk_v1.coverage($__timeFrom(), $__timeTo(), ARRAY[${host:sqlstring}])"
+        }
+      ],
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "description": "How much of the time range the agent of the host observed, and what it did not trace. agent is false for a name no agent ever reported under: such a host is never SAFE."
+    },
+    {
+      "id": 4,
+      "type": "table",
+      "title": "Gaps of the host",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "shawk-postgres"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 18,
+        "w": 12,
+        "h": 9
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "shawk-postgres"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT gap_start, gap_end, gap_end - gap_start AS duration, cause, node_state, reason\nFROM shawk_v1.unobserved_reasons($__timeFrom(), $__timeTo())\nWHERE host = ${host:sqlstring}\nORDER BY gap_start DESC\nLIMIT 100"
+        }
+      ],
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "description": "The periods in which the host was not observed, with what explains them: cause is maintenance or power_saving for a planned stop. A planned stop is a gap all the same: nothing watched the host then."
+    }
+  ]
+}
