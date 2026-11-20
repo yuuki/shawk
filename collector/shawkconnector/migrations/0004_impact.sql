@@ -73,10 +73,10 @@ $$;
 --               to 8 days, monthly for 27 to 32 days, periodic otherwise;
 --   irregular   anything else.
 --
--- period is the median interval, for the last four cadences, and
--- next_expected the start of the last run plus the period: an estimate,
--- not a schedule. runs is the number of runs, and last_active the end of
--- the last one.
+-- A dependency of the last four cadences has a period, the median
+-- interval, and next_expected, the start of its last run plus the period:
+-- an estimate, not a schedule. runs is the number of runs, and last_active
+-- the end of the last one.
 CREATE FUNCTION shawk.cadence(active tstzmultirange, blind tstzmultirange, until timestamptz)
 RETURNS TABLE (cadence text, period interval, next_expected timestamptz, runs integer, last_active timestamptz)
 LANGUAGE sql STABLE AS $$
@@ -340,10 +340,13 @@ direct AS (
         r.cli_host IS NOT DISTINCT FROM dependents.target_host
         OR (r.cli_host IS NULL
             AND (r.client_addr << inet '127.0.0.0/8' OR r.client_addr = inet '::1'
+                 -- An address the target held when the dependency was
+                 -- last seen: one that another host took since is that
+                 -- host's.
                  OR EXISTS (SELECT FROM shawk.host_addrs a
                             WHERE a.host_id IN (SELECT t.id FROM t) AND a.addr = r.client_addr
-                              AND a.last_seen >= r.first_seen - shawk.alive_window()
-                              AND a.first_seen <= r.last_seen + shawk.alive_window())))
+                              AND a.first_seen <= r.last_seen + shawk.alive_window()
+                              AND a.last_seen >= least(r.last_seen, dependents.until) - shawk.alive_window())))
       ELSE r.client_host IS NOT DISTINCT FROM dependents.target_host
            AND r.client_service IS NOT DISTINCT FROM r.srv_service
     END

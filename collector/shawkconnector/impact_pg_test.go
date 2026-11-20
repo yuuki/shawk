@@ -814,3 +814,27 @@ func TestPGCoverage(t *testing.T) {
 		t.Errorf("%v rows of an empty period", got)
 	}
 }
+
+// TestPGImpactAddressTakenOver: an address of the target that a host
+// without an agent took since is that host's: its connections are not
+// those of the target to itself.
+func TestPGImpactAddressTakenOver(t *testing.T) {
+	_, conn := migratedDB(t)
+	f := impactFixture{t, conn}
+	f.watched("db-01", "10.0.0.10", "postgres")
+	// db-01 held 10.0.0.50 until day 10, and connected to its own postgres
+	// from it; since then another machine, without an agent, uses the
+	// address and connects to the same port: the same server edge.
+	f.exec(`INSERT INTO shawk.host_addrs VALUES ('db-01', '10.0.0.50', $1, $2)`, impactSince.Add(-24*time.Hour), day(10, 0))
+	f.edge("db-01", "postgres", "server", "10.0.0.10", "10.0.0.50", 5432, impactSince, day(10, 0))
+	if got, want := f.verdict(`'db-01', %s, %s`), "SAFE {} {} 0 0 1.000000"; got != want {
+		t.Errorf("db-01 while it held the address: %s, want %s", got, want)
+	}
+	f.exec(`UPDATE shawk.edges SET last_seen = $1 WHERE remote_addr = '10.0.0.50'`, day(60, 0))
+	checkRows(t, "dependents of db-01", f.impact(`'db-01', %s, %s`), []string{
+		"1 - ~unresolved 10.0.0.50 -> db-01 postgres 5432 server unknown",
+	})
+	if got, want := f.verdict(`'db-01', %s, %s`), "UNSAFE {active_dependents} {} 1 0 1.000000"; got != want {
+		t.Errorf("db-01 after another host took the address: %s, want %s", got, want)
+	}
+}

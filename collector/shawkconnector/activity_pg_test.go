@@ -167,3 +167,67 @@ SELECT 'unix', extract(epoch FROM month)::bigint, bit_count(hours), get_bit(hour
 		t.Errorf("activity = %v, want %v", got, want)
 	}
 }
+
+// TestPGCadenceThroughTheConnector: the hours that the connector records
+// from the requests of agents give the cadence of their dependencies. Over
+// four days, app keeps a connection to postgres open, and a job reads it
+// for five minutes at 2 every night.
+func TestPGCadenceThroughTheConnector(t *testing.T) {
+	c, sink, conn := pgConnector(t)
+	ctx := context.Background()
+	start := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	now := start
+	c.now = func() time.Time { return now }
+	app := tEdge{proto: "tcp", port: 5432, svc: "app", comm: "puma", unit: "app.service", count: 1, first: start}
+	job := tEdge{proto: "tcp", port: 5432, svc: "report", comm: "report", unit: "report.service", opened: 1}
+	// sides returns the client edge of a connection from an address to
+	// postgres and the server edge that matches it.
+	sides := func(e tEdge, from string) (client, server tEdge) {
+		client, server = e, e
+		client.role, client.local, client.peer = "client", from, "10.0.0.10"
+		server.role, server.local, server.peer = "server", "10.0.0.10", from
+		server.svc, server.comm, server.unit = "postgres", "postgres", "postgresql.service"
+		return client, server
+	}
+	for hour := 0; hour <= 4*24; hour++ {
+		now = start.Add(time.Duration(hour) * time.Hour)
+		app.last = now
+		appClient, appServer := sides(app, "10.0.0.11")
+		clients, servers := []tEdge{appClient}, []tEdge{appServer}
+		if hour%24 == 2 {
+			// The job ran from 2:00 to 2:05, and the agents still send it
+			// at 2:10; they have dropped it by 3:00.
+			now = now.Add(10 * time.Minute)
+			job.first, job.last = now.Add(-10*time.Minute), now.Add(-5*time.Minute)
+			jobClient, jobServer := sides(job, "10.0.0.12")
+			clients, servers = append(clients, jobClient), append(servers, jobServer)
+		}
+		consume(t, c, sink, tAgent{host: "db-01", machineID: "m-db", addrs: []string{"10.0.0.10"}, time: now,
+			segment: start.Add(-time.Hour), edges: servers})
+		consume(t, c, sink, tAgent{host: "app-01", machineID: "m-app", addrs: []string{"10.0.0.11", "10.0.0.12"}, time: now,
+			segment: start.Add(-time.Hour), edges: clients})
+		if hour%7 == 0 {
+			c.flush(ctx)
+		}
+	}
+	c.flush(ctx)
+	got := queryStrings(t, conn, `
+SELECT client_service, observed_by, cadence, period::text, runs,
+       to_char(next_expected AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI')
+FROM shawk_v1.impact('db-01', $1, $2)`, start, now)
+	want := []string{
+		"app both continuous <nil> 1 <nil>",
+		"report both daily 1 day 4 2026-10-05T02:00",
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("dependents of db-01 = %v, want %v", got, want)
+	}
+	if got := queryStrings(t, conn, `SELECT verdict, direct, coverage::text FROM shawk_v1.impact_verdict('db-01', $1, $2)`, start, now); !slices.Equal(got, []string{"UNSAFE 2 1.000000"}) {
+		t.Errorf("verdict on db-01 = %v", got)
+	}
+	// The hours of the job: one a day, on both sides.
+	if got := queryStrings(t, conn, `SELECT e.role, sum(bit_count(a.hours))::int FROM shawk.edge_activity a
+		JOIN shawk.edges e ON e.id = a.edge_id WHERE e.local_addr = '10.0.0.12' OR e.remote_addr = '10.0.0.12' GROUP BY e.role`); !slices.Equal(got, []string{"client 4", "server 4"}) {
+		t.Errorf("hours of the job = %v, want 4 on each side", got)
+	}
+}

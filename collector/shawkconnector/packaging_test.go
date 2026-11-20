@@ -338,8 +338,13 @@ func TestPGPackaged(t *testing.T) {
 		peerFold: foldIn, peerInternal: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}})
 	h.addAddr(addrOf("10.0.0.30"), span{now, now})
 	h.addProcess(procKey{"x.service", "x", "x", ""}, "/usr/bin/x", span{now, now})
-	h.addEdge(edgeRowKey{role: "client", proto: "tcp", local: addrOf("10.0.0.30"), peer: addrOf("10.0.0.10"), port: 5432,
-		netns: 1, procKey: procKey{"x.service", "x", "x", ""}}, span{now, now})
+	client := edgeRowKey{role: "client", proto: "tcp", local: addrOf("10.0.0.30"), peer: addrOf("10.0.0.10"), port: 5432,
+		netns: 1, procKey: procKey{"x.service", "x", "x", ""}}
+	h.addEdge(client, span{now, now})
+	h.addActivity(client, now)
+	sock := edgeRowKey{role: "client", proto: transportUnix, path: "/run/x.sock", netns: 1, procKey: procKey{"x.service", "x", "x", ""}}
+	h.addEdge(sock, span{now, now})
+	h.addActivity(sock, now)
 	h.addEdge(edgeRowKey{role: "server", proto: "tcp", local: addrOf("10.0.0.30"), peer: addrOf("0.0.0.0"), folded: true,
 		port: 9000, netns: 1, procKey: procKey{"x.service", "x", "x", ""}}, span{now, now})
 	h.addListener(listenerRowKey{proto: "tcp", addr: addrOf("0.0.0.0"), port: 9000, netns: 1, procKey: procKey{"x.service", "x", "x", ""}}, span{now, now})
