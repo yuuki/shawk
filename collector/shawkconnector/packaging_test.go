@@ -365,6 +365,23 @@ func TestPGPackaged(t *testing.T) {
 	if _, err := conn.Exec(ctx, "RESET ROLE; SET ROLE shawk_grafana"); err != nil {
 		t.Fatal(err)
 	}
+	// Grafana reads the impact of removing a host through the contract, and
+	// not the functions behind it: app and x use the postgres of db-01, and
+	// the clients of x depend on it in turn.
+	for q, want := range map[string]int{
+		`SELECT count(*) FROM shawk_v1.impact('db-01', now() - interval '6 hours', now())`:                   3,
+		`SELECT direct FROM shawk_v1.impact_verdict('db-01', now() - interval '6 hours', now())`:             2,
+		`SELECT count(*) FROM shawk_v1.coverage(now() - interval '6 hours', now(), ARRAY['db-01'])`:          1,
+		`SELECT count(*) FROM shawk_v1.impact('db-01', now() - interval '6 hours', now(), 'postgres', 5432)`: 3,
+	} {
+		var n int
+		if err := conn.QueryRow(ctx, q).Scan(&n); err != nil || n != want {
+			t.Errorf("%s as shawk_grafana: %d, %v; want %d", q, n, err, want)
+		}
+	}
+	if _, err := conn.Exec(ctx, `SELECT count(*) FROM shawk.dependents('db-01', now() - interval '6 hours', now(), NULL, NULL, NULL, 3)`); err == nil {
+		t.Error("shawk_grafana reads shawk.dependents")
+	}
 	queries := packagedSQL(t)
 	if len(queries) < 15 {
 		t.Errorf("only %d queries found", len(queries))
