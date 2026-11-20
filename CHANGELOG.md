@@ -12,8 +12,9 @@
   status: `SAFE` (0) when nothing used the target and its agent watched it
   over the whole period, `UNSAFE` (3) when it has dependents, and
   `INCONCLUSIVE` (4) when nothing was seen but the target was not watched
-  enough (a gap, dropped flows, UDP not traced, no agent), since a target
-  that nobody watched may have been used. `-min-coverage` accepts gaps,
+  enough (a gap, dropped flows, UDP not traced, no agent) or is not known
+  (a host, a service or a port that shawk never saw, as one mistyped),
+  since a target that nobody watched may have been used. `-min-coverage` accepts gaps,
   and `-json` writes the report for a script (`docs/design.md` §6.3).
 * PostgreSQL, migration `0004_impact.sql`: the functions
   `shawk_v1.impact()`, `impact_verdict()` and `coverage()`, which

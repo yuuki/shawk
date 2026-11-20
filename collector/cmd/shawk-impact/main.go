@@ -30,7 +30,8 @@ Usage:
 
 The verdict is SAFE when nothing used the target in the period and an agent
 watched it over the whole period, UNSAFE when it has dependents, and
-INCONCLUSIVE when nothing was seen but the target was not watched enough.
+INCONCLUSIVE when nothing was seen but the target was not watched enough, or
+is not known: a host, a service or a port that no agent reported.
 
 Exit status: 0 SAFE, 3 UNSAFE, 4 INCONCLUSIVE; 1 when the command fails and 2
 when the command line is invalid.

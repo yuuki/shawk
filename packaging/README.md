@@ -160,7 +160,8 @@ shawk-impact -dsn-file /etc/shawk/impact-dsn -host db-01 -json | jq .verdict
   pipeline can refuse to go on unless it is 0.
 - `SAFE` takes an agent on the host that observed over the whole period:
   a host without an agent, or a name that no agent reported under, is
-  `INCONCLUSIVE` at best. A period longer than the history of the agent
+  `INCONCLUSIVE` at best, and so is a service that the host does not run
+  or a port that nothing listens on, as a name mistyped would be. A period longer than the history of the agent
   is not watched in full either. `-min-coverage 99.9` accepts gaps, which
   the report then lists.
 - The period (`-lookback`, 90 days) must be longer than the rarest job

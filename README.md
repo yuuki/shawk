@@ -189,8 +189,9 @@ and 3 clients observed all along
   batch (an estimate from the hours in which it was active).
 - `SAFE`: nothing used it, and its agent watched it over the whole period.
 - `INCONCLUSIVE`: nothing was seen to use it, but it was not watched all
-  along (a gap, dropped flows, UDP not traced, no agent at all), so the
-  absence of dependents proves nothing. `-min-coverage 99.9` accepts gaps.
+  along (a gap, dropped flows, UDP not traced, no agent at all), or the
+  host has no such service or port, so the absence of dependents proves
+  nothing. `-min-coverage 99.9` accepts gaps.
 
 The exit status is 0, 3 or 4 for the three verdicts, and `-json` writes
 the report for a script. The cadences need the hours of activity that

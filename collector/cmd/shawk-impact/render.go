@@ -194,6 +194,11 @@ func describeShortfall(r *report, code string) string {
 		return fmt.Sprintf("no agent ever reported as %s, and the inventory has no such host: check the name", printable(r.Target.Host))
 	case "no_agent":
 		return fmt.Sprintf("%s runs no agent: its clients without an agent would not be seen", printable(r.Target.Host))
+	case "unknown_service":
+		return fmt.Sprintf("no process of %s had the service %s in the period: check the name", printable(r.Target.Host),
+			printable(r.Target.Service))
+	case "unknown_port":
+		return fmt.Sprintf("nothing listened on port %d of %s in the period: check the port", r.Target.Port, printable(r.Target.Host))
 	case "not_observed":
 		return fmt.Sprintf("not observed for %s of the period, in %s", seconds(t.UnobservedSeconds), plural(int64(t.Gaps), "gap"))
 	case "dropped_flows":

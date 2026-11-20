@@ -197,6 +197,16 @@ often than the period, looks unused (docs/design.md, sections 6.3 and 10).
 	if code != exitInconclusive || !strings.Contains(out, "no agent ever reported as db-O1, and the inventory has no such host: check the name") {
 		t.Errorf("db-O1: exit status %d, want %d\n%s", code, exitInconclusive, out)
 	}
+	// Nor is a service that the host does not have, or a port nothing
+	// listens on.
+	code, out = impact(t, dsn, "-host", "idle-01", "-service", "postgress")
+	if code != exitInconclusive || !strings.Contains(out, "no process of idle-01 had the service postgress in the period: check the name") {
+		t.Errorf("postgress on idle-01: exit status %d, want %d\n%s", code, exitInconclusive, out)
+	}
+	code, out = impact(t, dsn, "-host", "idle-01", "-port", "5433")
+	if code != exitInconclusive || !strings.Contains(out, "nothing listened on port 5433 of idle-01 in the period: check the port") {
+		t.Errorf("port 5433 of idle-01: exit status %d, want %d\n%s", code, exitInconclusive, out)
+	}
 	// A period before the agents: nothing was watched then.
 	if code, out = impact(t, dsn, "-host", "idle-01", "-lookback", "52w"); code != exitInconclusive {
 		t.Errorf("idle-01 over a year: exit status %d, want %d\n%s", code, exitInconclusive, out)

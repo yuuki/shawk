@@ -258,12 +258,14 @@ func TestWriteVerdicts(t *testing.T) {
 	for reason, want := range map[string]string{
 		"unknown_host":    "no agent ever reported as db-01, and the inventory has no such host: check the name",
 		"no_agent":        "db-01 runs no agent: its clients without an agent would not be seen",
+		"unknown_service": "no process of db-01 had the service postgres in the period: check the name",
+		"unknown_port":    "nothing listened on port 5432 of db-01 in the period: check the port",
 		"udp_not_traced":  "its agent did not trace UDP for 1h",
 		"unix_not_traced": "its agent did not trace Unix sockets, or did not tell, for 2h",
 		"netns_limited":   "its agent traced one network namespace only for 1m",
 		"a_new_reason":    "a_new_reason",
 	} {
-		r.Verdict, r.Reasons, r.Caveats = verdictInconclusive, []string{reason}, nil
+		r.Verdict, r.Reasons, r.Caveats, r.Target.Port = verdictInconclusive, []string{reason}, nil, 5432
 		r.Observers = []observer{{Host: "db-01", Role: "target", UDPUntracedSeconds: 3600, UnixUntracedSeconds: 7200, NetnsLimitedSeconds: 60}}
 		out.Reset()
 		if err := writeText(&out, r, 50); err != nil {

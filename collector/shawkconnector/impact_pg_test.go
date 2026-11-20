@@ -234,6 +234,15 @@ func (f impactFixture) watched(name, addr string, services ...string) {
 	f.observed(name, impactSince.Add(-time.Hour), impactUntil)
 }
 
+// listener adds a listener of the process of svc on host on a TCP port,
+// seen over the period of the tests.
+func (f impactFixture) listener(host, svc string, port int) {
+	f.t.Helper()
+	f.exec(`INSERT INTO shawk.listeners (host_id, process_id, proto, addr, port, netns, first_seen, last_seen)
+		VALUES ($1, (SELECT id FROM shawk.processes WHERE host_id = $1 AND service_name = $2), 'tcp', '0.0.0.0', $3, 1, $4, $5)`,
+		host, svc, port, impactSince, impactUntil)
+}
+
 // edge adds an edge of the process of svc on host, without activity.
 func (f impactFixture) edge(host, svc, role, local, remote string, port int, first, last time.Time) {
 	f.t.Helper()
@@ -515,15 +524,47 @@ func TestPGImpactVerdict(t *testing.T) {
 				VALUES ($1, $2, $3, true, NULL, 'all')`, h, impactSince, impactUntil)
 		}, "", "SAFE {} {} 0 0 1.000000"},
 		{"Unix sockets not traced, of a service", func(h string) {
-			f.host(h, "10.0.2.12")
+			f.host(h, "10.0.2.12", "postgres")
 			f.exec(`INSERT INTO shawk.agent_sessions (host_id, started_at, last_heartbeat, udp_traced, unix_traced, netns_scope)
 				VALUES ($1, $2, $3, true, NULL, 'all')`, h, impactSince, impactUntil)
 		}, ", 'postgres'", "INCONCLUSIVE {unix_not_traced} {} 0 0 0.000000"},
 		{"Unix sockets not traced, of a port", func(h string) {
-			f.host(h, "10.0.2.13")
+			f.host(h, "10.0.2.13", "postgres")
+			f.listener(h, "postgres", 5432)
 			f.exec(`INSERT INTO shawk.agent_sessions (host_id, started_at, last_heartbeat, udp_traced, unix_traced, netns_scope)
 				VALUES ($1, $2, $3, true, false, 'all')`, h, impactSince, impactUntil)
 		}, ", target_port => 5432", "SAFE {} {} 0 0 1.000000"},
+		// A service that the host does not run, or a name mistyped: nothing
+		// used it, which tells nothing.
+		{"a service the host does not have", func(h string) {
+			f.watched(h, "10.0.2.17", "postgres")
+		}, ", 'postgress'", "INCONCLUSIVE {unknown_service} {} 0 0 1.000000"},
+		{"a service the host had before the period", func(h string) {
+			f.watched(h, "10.0.2.18", "postgres")
+			f.exec(`UPDATE shawk.processes SET last_seen = $2 WHERE host_id = $1`, h, impactSince.Add(-time.Hour))
+		}, ", 'postgres'", "INCONCLUSIVE {unknown_service} {} 0 0 1.000000"},
+		{"a service that listens and has no client", func(h string) {
+			f.watched(h, "10.0.2.19", "postgres")
+			f.listener(h, "postgres", 5432)
+		}, ", 'postgres', 5432, 'tcp'", "SAFE {} {} 0 0 1.000000"},
+		{"a port nothing listens on", func(h string) {
+			f.watched(h, "10.0.2.21", "postgres")
+			f.listener(h, "postgres", 5432)
+		}, ", target_port => 5433", "INCONCLUSIVE {unknown_port} {} 0 0 1.000000"},
+		{"a port of another transport", func(h string) {
+			f.watched(h, "10.0.2.22", "postgres")
+			f.listener(h, "postgres", 5432)
+		}, ", target_port => 5432, target_proto => 'udp'", "INCONCLUSIVE {unknown_port} {} 0 0 1.000000"},
+		// A port known from the connections it served, those of the
+		// service to itself, of a listener that was not seen.
+		{"a port that served without a listener seen", func(h string) {
+			f.watched(h, "10.0.2.23", "postgres")
+			f.both(h, "postgres", "127.0.0.1", h, "postgres", "127.0.0.1", 5432, day(1, 0), day(2, 0))
+		}, ", target_port => 5432", "SAFE {} {} 0 0 1.000000"},
+		{"a service and a port that the host does not have, not observed all along", func(h string) {
+			f.host(h, "10.0.2.24")
+			f.observed(h, day(45, 0), impactUntil)
+		}, ", 'postgres', 5432", "INCONCLUSIVE {not_observed,unknown_service,unknown_port} {} 0 0 0.500000"},
 		{"a name no agent reported under", func(string) {}, "", "INCONCLUSIVE {unknown_host} {} 0 0 0.000000"},
 		{"a host of the inventory without an agent", func(h string) {
 			f.exec(`INSERT INTO shawk.inventory_hosts (host, agent) VALUES ($1, false)`, h)
@@ -560,6 +601,9 @@ func TestPGImpactVerdict(t *testing.T) {
 		`SELECT * FROM shawk_v1.impact_verdict(NULL, now() - interval '1 day', now())`,
 		`SELECT * FROM shawk_v1.impact_verdict('db-01', now() - interval '1 day', now(), min_coverage => 0)`,
 		`SELECT * FROM shawk_v1.impact_verdict('db-01', now() - interval '1 day', now(), min_coverage => 1.01)`,
+		`SELECT * FROM shawk_v1.impact_verdict('db-01', now() - interval '1 day', now(), target_proto => 'TCP')`,
+		`SELECT * FROM shawk_v1.impact_verdict('db-01', now() - interval '1 day', now(), target_port => 0)`,
+		`SELECT * FROM shawk_v1.impact_verdict('db-01', now() - interval '1 day', now(), target_port => 65536)`,
 	} {
 		if _, err := f.conn.Exec(context.Background(), q); err == nil {
 			t.Errorf("%s: no error", q)

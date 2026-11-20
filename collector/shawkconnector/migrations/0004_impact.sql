@@ -568,6 +568,11 @@ $$;
 -- inventory, whose clients without an agent nothing would tell.
 -- min_coverage is 1 by default: any gap makes the verdict INCONCLUSIVE.
 --
+-- A service that no process of the host had in the period
+-- (unknown_service), and a port that nothing listened on nor served there
+-- (unknown_port), are INCONCLUSIVE too, whatever the coverage: nothing
+-- used what shawk does not know of, a name or a port mistyped included.
+--
 -- direct and transitive count the dependents of depth 1 and of the depths
 -- after; caveats are the shortfalls of the coverage that did not decide
 -- the verdict, with which the dependents listed may not be all. unobserved,
@@ -587,6 +592,7 @@ DECLARE
   covered numeric;
   shortfalls text[];
   inventoried boolean;
+  unknown boolean := false;
 BEGIN
   IF since IS NULL OR until IS NULL OR since >= until THEN
     RAISE EXCEPTION 'the period is empty: % to %', since, until USING ERRCODE = 'invalid_parameter_value';
@@ -596,6 +602,12 @@ BEGIN
   END IF;
   IF min_coverage IS NULL OR min_coverage <= 0 OR min_coverage > 1 THEN
     RAISE EXCEPTION 'min_coverage is above 0, up to 1: %', min_coverage USING ERRCODE = 'invalid_parameter_value';
+  END IF;
+  IF target_proto NOT IN ('tcp', 'udp', 'unix') THEN
+    RAISE EXCEPTION 'target_proto is tcp, udp or unix: %', target_proto USING ERRCODE = 'invalid_parameter_value';
+  END IF;
+  IF target_port < 1 OR target_port > 65535 THEN
+    RAISE EXCEPTION 'target_port is from 1 to 65535: %', target_port USING ERRCODE = 'invalid_parameter_value';
   END IF;
   period := shawk.period(since, until);
 
@@ -628,6 +640,34 @@ BEGIN
     shortfalls := shortfalls || 'unix_not_traced'::text;
   END IF;
 
+  -- What the agent of the host does not know of was not seen to be used,
+  -- which tells nothing: a service or a port that is not there, or is
+  -- misspelt.
+  IF o.agent AND target_service IS NOT NULL AND NOT EXISTS (
+       SELECT FROM shawk.hosts h
+       JOIN shawk.processes p ON p.host_id = h.id
+       WHERE h.hostname = target_host AND p.service_name = target_service
+         AND p.last_seen >= since - interval '15 minutes') THEN
+    unknown := true;
+    shortfalls := shortfalls || 'unknown_service'::text;
+  END IF;
+  IF o.agent AND target_port IS NOT NULL
+     AND NOT EXISTS (
+       SELECT FROM shawk.hosts h
+       JOIN shawk.listeners l ON l.host_id = h.id
+       WHERE h.hostname = target_host AND l.port = target_port
+         AND (target_proto IS NULL OR l.proto = target_proto)
+         AND l.last_seen >= since - interval '15 minutes')
+     AND NOT EXISTS (
+       SELECT FROM shawk.hosts h
+       JOIN shawk.edges e ON e.host_id = h.id AND e.role = 'server'
+       WHERE h.hostname = target_host AND e.port = target_port
+         AND (target_proto IS NULL OR e.proto = target_proto)
+         AND e.last_seen >= since - interval '15 minutes') THEN
+    unknown := true;
+    shortfalls := shortfalls || 'unknown_port'::text;
+  END IF;
+
   -- The coverage is compared as it is and reported cut, not rounded, so
   -- that 1 is a target watched all along.
   covered := 1 - extract(epoch FROM shawk.duration(blind)) / extract(epoch FROM until - since);
@@ -639,7 +679,7 @@ BEGIN
     verdict := 'UNSAFE';
     reasons := ARRAY['active_dependents'];
     caveats := shortfalls;
-  ELSIF NOT o.agent OR covered < min_coverage THEN
+  ELSIF NOT o.agent OR unknown OR covered < min_coverage THEN
     verdict := 'INCONCLUSIVE';
     reasons := shortfalls;
     caveats := '{}';
