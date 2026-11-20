@@ -9,7 +9,7 @@ before:
     # The license texts of the Go modules linked into each binary, which
     # the archives, packages and image ship with them.
     - go run ./scripts/third-party-notices -o build/notices/shawk/THIRD_PARTY_NOTICES .=./cmd/shawk
-    - go run ./scripts/third-party-notices -o build/notices/shawk-collector/THIRD_PARTY_NOTICES collector/_build=. collector=./cmd/shawk-migrate
+    - go run ./scripts/third-party-notices -o build/notices/shawk-collector/THIRD_PARTY_NOTICES collector/_build=. collector=./cmd/shawk-migrate collector=./cmd/shawk-impact
 
 builds:
   - id: shawk
@@ -61,6 +61,24 @@ builds:
       - amd64
       - arm64
 
+  # Reads PostgreSQL only: it ships with the collector, where the database
+  # is reached from, and not in the agent, which has no database driver.
+  - id: shawk-impact
+    dir: collector
+    main: ./cmd/shawk-impact
+    binary: shawk-impact
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+
 archives:
   - id: shawk
     ids: [shawk]
@@ -75,7 +93,7 @@ archives:
       - packaging/systemd/shawk-agent.service
       - packaging/systemd/agent.env
   - id: shawk-collector
-    ids: [shawk-collector, shawk-migrate]
+    ids: [shawk-collector, shawk-migrate, shawk-impact]
     name_template: "shawk-collector_v{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     files:
       - README.md
@@ -143,7 +161,7 @@ nfpms:
         packager: deb
 
   - id: shawk-collector
-    ids: [shawk-collector, shawk-migrate]
+    ids: [shawk-collector, shawk-migrate, shawk-impact]
     package_name: shawk-collector
     file_name_template: "shawk-collector_v{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     vendor: Yuuki TSUBOUCHI
@@ -192,7 +210,7 @@ nfpms:
 
 dockers_v2:
   - id: shawk-collector
-    ids: [shawk-collector, shawk-migrate]
+    ids: [shawk-collector, shawk-migrate, shawk-impact]
     dockerfile: collector/Dockerfile
     extra_files:
       - LICENSE

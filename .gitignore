@@ -9,5 +9,6 @@
 *.db-wal
 /collector/_build/
 /shawk-migrate
+/shawk-impact
 /collector/_release-builder-config.yaml
 /bench.txt
