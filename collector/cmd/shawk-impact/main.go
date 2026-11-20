@@ -182,7 +182,8 @@ func parseLookback(s string) (time.Duration, error) {
 // as min_coverage, without the rounding of a float.
 func parseCoverage(s string) (string, error) {
 	p, ok := new(big.Rat).SetString(s)
-	if !ok || strings.ContainsAny(s, "/eE") || p.Sign() <= 0 || p.Cmp(big.NewRat(100, 1)) > 0 {
+	// A ten billionth of a percent is the least that 12 decimals tell from 0.
+	if !ok || strings.ContainsAny(s, "/eE") || p.Cmp(big.NewRat(1, 1e10)) < 0 || p.Cmp(big.NewRat(100, 1)) > 0 {
 		return "", fmt.Errorf("-min-coverage must be a number above 0, up to 100: %q", s)
 	}
 	return p.Quo(p, big.NewRat(100, 1)).FloatString(12), nil

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -44,20 +45,38 @@ func FuzzParseLookback(f *testing.F) {
 
 func TestParseCoverage(t *testing.T) {
 	for in, want := range map[string]string{
-		"100":    "1.000000000000",
-		"99.9":   "0.999000000000",
-		"99.999": "0.999990000000",
-		"0.1":    "0.001000000000",
+		"100":          "1.000000000000",
+		"99.9":         "0.999000000000",
+		"99.999":       "0.999990000000",
+		"0.1":          "0.001000000000",
+		"0.0000000001": "0.000000000001",
 	} {
 		if got, err := parseCoverage(in); err != nil || got != want {
 			t.Errorf("parseCoverage(%q) = %q, %v; want %q", in, got, err, want)
 		}
 	}
-	for _, in := range []string{"", "0", "-1", "100.1", "101", "99%", "1/2", "1e2", "all"} {
+	for _, in := range []string{"", "0", "-1", "100.1", "101", "99%", "1/2", "1e2", "all", "0.00000000000001"} {
 		if got, err := parseCoverage(in); err == nil {
 			t.Errorf("parseCoverage(%q) = %q, want an error", in, got)
 		}
 	}
+}
+
+func FuzzParseCoverage(f *testing.F) {
+	for _, s := range []string{"100", "99.9", "0.1", "0", "100.1", "1/2", "1e2", "-1", ""} {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, s string) {
+		c, err := parseCoverage(s)
+		if err != nil {
+			return
+		}
+		// What impact_verdict takes: a decimal above 0, up to 1.
+		v, perr := strconv.ParseFloat(c, 64)
+		if perr != nil || v <= 0 || v > 1 || strings.ContainsAny(c, "eE/") {
+			t.Errorf("parseCoverage(%q) = %q", s, c)
+		}
+	})
 }
 
 // TestUsage: an invalid command line is refused before anything is read.
