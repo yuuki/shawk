@@ -228,7 +228,8 @@ const (
 	WireHTTP2
 	WireSSH
 	// WirePostgres is PostgreSQL in clear text: a client that starts
-	// without TLS, or a server that refuses it.
+	// without TLS, or a server that refuses it. A request of GSSAPI or a
+	// CancelRequest, and a server that accepts GSSAPI, add no protocol.
 	WirePostgres
 	// WireMySQL is MySQL without a request of TLS, or the greeting of its
 	// server, which does not tell.

@@ -30,7 +30,7 @@ func goldenRequest() *colmetricspb.ExportMetricsServiceRequest {
 			// two by timeout and one for another reason.
 			Handshakes: [len(HandshakeBounds) + 1]uint64{2: 2, 9: 1}, HandshakeSumUs: 1_200_600, SynRetrans: 3,
 			Fails: [len(FailReasons)]uint64{1, 2, 1, 1, 1},
-			// The client asks PostgreSQL for TLS (postgres, 9).
+			// A client of PostgreSQL in clear text (postgres, 9).
 			Protocols: 1 << 9},
 		t0, t0.Add(15*time.Second))
 	s.AddEdge(EdgeKey{Role: RoleServer, Proto: "tcp", LocalAddr: netip.MustParseAddr("10.0.0.11"),
@@ -81,8 +81,8 @@ func goldenRequest() *colmetricspb.ExportMetricsServiceRequest {
 		},
 	}, AgentStatus{
 		Started: t0.Add(-time.Hour), SegmentStart: t0.Add(-time.Hour), NetNSScope: "all", UDPTraced: true, UnixTraced: true,
-		ProtocolsClassified: true,
-		FlowsDropped:        7, CgroupEventsDropped: 3, ContainerReadsDrops: 2, ExportFailures: 1,
+		ProtocolsRequested: true, ProtocolsClassified: true,
+		FlowsDropped: 7, CgroupEventsDropped: 3, ContainerReadsDrops: 2, ExportFailures: 1,
 		TranslationsTraced: true, TranslationsDropped: 2,
 		RDMA: true, RDMAData: 1 << 32,
 		BPFPrograms: []BPFProgram{{Name: "shawk_inet_sock_set_state", RunCount: 42, RunTime: 3 * time.Millisecond},

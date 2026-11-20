@@ -132,8 +132,10 @@ struct shawk_flow_stats {
  * at most, or the version a server chose; WIRE_TLS is TLS whose version the
  * bytes read do not tell. PostgreSQL and MySQL start in clear text and may
  * switch to TLS: their values tell whether a client asks for TLS, and
- * whether a server of PostgreSQL accepts it. User space has the same values
- * (WireProtocol). At most 16, the bytes of shawk_flow_stats.protos.
+ * whether a server of PostgreSQL accepts it; a request of GSSAPI or of
+ * cancelling, which adds no protocol, is WIRE_SKIP (wire.h). User space has
+ * the same values (WireProtocol). At most 16, the bytes of
+ * shawk_flow_stats.protos.
  */
 enum shawk_wire_proto {
 	WIRE_UNKNOWN = 0,  /* read, but none of the others */
@@ -145,7 +147,7 @@ enum shawk_wire_proto {
 	WIRE_HTTP1 = 6,    /* HTTP/1.x in clear text */
 	WIRE_HTTP2 = 7,    /* HTTP/2 in clear text (h2c), as gRPC without TLS */
 	WIRE_SSH = 8,
-	WIRE_POSTGRES = 9, /* PostgreSQL in clear text, or refusing TLS */
+	WIRE_POSTGRES = 9, /* PostgreSQL in clear text: a StartupMessage, or a server refusing TLS */
 	WIRE_MYSQL = 10,   /* MySQL without a request of TLS, or its greeting */
 	WIRE_REDIS = 11,   /* RESP, the protocol of Redis and Valkey */
 	WIRE_SLURM = 12,   /* the RPCs of Slurm */

@@ -2,6 +2,7 @@ package shawkconnector
 
 import (
 	"context"
+	"fmt"
 	"maps"
 	"os"
 	"slices"
@@ -34,6 +35,9 @@ func TestWireProtocolsOfTheAgent(t *testing.T) {
 	if b.agentDropped != 0 {
 		t.Errorf("%d points dropped, the first of %s", b.agentDropped, b.agentDroppedName)
 	}
+	if b.protocolsClassified == nil || !*b.protocolsClassified {
+		t.Errorf("protocols classified = %v, want true", b.protocolsClassified)
+	}
 	// The agent sends every protocol on an edge of its tests, so that the
 	// protocols of the agent and of the connector are the same.
 	seen := t0.Add(15 * time.Second)
@@ -56,32 +60,34 @@ func TestWireProtocolsOfTheAgent(t *testing.T) {
 }
 
 // TestWireProtocolsInvalid: a wire protocol of a value the agents do not
-// send, or of an edge that is not of TCP, is an invalid point and left out,
-// so that an agent cannot make a row per value.
+// send, or of an edge that is not of TCP, is left out, so that an agent
+// cannot make a row per value; so is one without a protocol or a time.
 func TestWireProtocolsInvalid(t *testing.T) {
-	w := map[string]span{"tls_1_3": {t0, t0}, "gopher": {t0, t0}}
+	w := map[string]span{"tls_1_3": {t0, t0}, "gopher": {t0, t0}, "": {t0, t0}}
 	md := tAgent{host: "app-01", time: t0, edges: []tEdge{
 		{role: roleClient, proto: "tcp", local: "10.0.0.11", peer: "10.0.0.10", port: 443, svc: "app", comm: "app", opened: 1, wire: w},
 		{role: roleClient, proto: "udp", local: "10.0.0.11", peer: "10.0.0.10", port: 53, svc: "app", comm: "app",
 			wire: map[string]span{"unknown": {t0, t0}}},
+		{role: roleClient, proto: "tcp", local: "10.0.0.11", peer: "10.0.0.10", port: 6379, svc: "app", comm: "app", opened: 1,
+			wire: map[string]span{"redis": {time.Unix(-1, 0), time.Unix(-1, 0)}}},
 	}}.metrics()
 	b, err := parseResource(md.ResourceMetrics().At(0))
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Two points, first and last seen: those of the UDP edge are invalid,
-	// those of the protocol it does not know, as of a newer agent, are
-	// dropped like the metrics of the agent it does not know, which are
-	// logged at most once a minute.
-	if b.invalid != 2 {
-		t.Errorf("%d invalid points, want 2", b.invalid)
+	// Two points each, first and last seen: those of the UDP edge, of no
+	// protocol and of a time before 1970 are invalid; those of the protocol
+	// it does not know, as of a newer agent, are dropped like the metrics of
+	// the agent it does not know, which are logged at most once a minute.
+	if b.invalid != 6 {
+		t.Errorf("%d invalid points, want 6", b.invalid)
 	}
 	if b.agentDropped != 2 || b.agentDroppedName != "shawk.wire_protocol=gopher" {
 		t.Errorf("%d points dropped, the first of %q; want 2 of shawk.wire_protocol=gopher", b.agentDropped, b.agentDroppedName)
 	}
 	for _, e := range b.edges {
-		switch e.id.proto {
-		case "tcp":
+		switch e.id.port {
+		case 443:
 			if _, ok := e.wire["tls_1_3"]; !ok || len(e.wire) != 1 {
 				t.Errorf("wire protocols of the TCP edge = %v", e.wire)
 			}
@@ -317,6 +323,134 @@ func TestPGEdgeProtocols(t *testing.T) {
 	}
 	if err := conn.QueryRow(ctx, `SELECT count(*) FROM shawk.edge_protocols`).Scan(&n); err != nil || n != 1 {
 		t.Errorf("%d protocols after the edge was pruned, want the one of port 8443 (%v)", n, err)
+	}
+}
+
+// TestProtocolsClassifiedSession: whether the agent classifies wire
+// protocols goes to its session, and is unknown (nil) if it does not tell.
+func TestProtocolsClassifiedSession(t *testing.T) {
+	yes, no := true, false
+	for _, c := range []struct {
+		name       string
+		classified *bool
+	}{{"not told", nil}, {"no", &no}, {"yes", &yes}} {
+		t.Run(c.name, func(t *testing.T) {
+			b := testBatch(t, tAgent{host: "app-01", time: t0, classified: c.classified})
+			if !equalBool(b.protocolsClassified, c.classified) {
+				t.Errorf("decoded %v, want %v", ptrString(b.protocolsClassified), ptrString(c.classified))
+			}
+			ch := newChanges(15*time.Minute, false)
+			ch.add(b, t0)
+			h := ch.take()[b.key]
+			if len(h.sessions) != 1 {
+				t.Fatalf("%d sessions", len(h.sessions))
+			}
+			for _, s := range h.sessions {
+				if !equalBool(s.protocolsClassified, c.classified) {
+					t.Errorf("session %v, want %v", ptrString(s.protocolsClassified), ptrString(c.classified))
+				}
+			}
+		})
+	}
+}
+
+func equalBool(a, b *bool) bool { return (a == nil) == (b == nil) && (a == nil || *a == *b) }
+
+func ptrString(p *bool) string {
+	if p == nil {
+		return "nil"
+	}
+	return fmt.Sprint(*p)
+}
+
+// TestWireProtocolsPending: the wire protocols of an edge count in the rows
+// pending, are kept when failed writes are put back, and are written again
+// once the connector forgets them: when the changes of their host are
+// dropped, or when the agent has not reported them for the TTL. The
+// protocols forgotten leave nothing of their host behind.
+func TestWireProtocolsPending(t *testing.T) {
+	seen := t0.Add(-time.Minute)
+	edge := tEdge{role: roleClient, proto: "tcp", local: "10.0.0.11", peer: "10.0.0.10", port: 5432, svc: "app",
+		unit: "app.service", comm: "app", first: seen, last: seen}
+	bare := testBatch(t, tAgent{host: "app-01", time: t0, edges: []tEdge{edge}})
+	edge.wire = map[string]span{"postgres": {seen, seen}, "tls_1_3": {seen, seen}}
+	b := testBatch(t, tAgent{host: "app-01", time: t0, edges: []tEdge{edge}})
+
+	ch := newChanges(15*time.Minute, false)
+	ch.add(bare, t0)
+	without := ch.pendingSize()
+	ch = newChanges(15*time.Minute, false)
+	ch.add(b, t0)
+	if n := ch.pendingSize(); n != without+2 {
+		t.Errorf("%d rows pending, want %d: those of the edge and its 2 protocols", n, without+2)
+	}
+	wire := func(at time.Time) int {
+		t.Helper()
+		ch.add(b, at)
+		h := ch.take()[b.key]
+		if h == nil {
+			return 0
+		}
+		return len(h.wire)
+	}
+	h := ch.take()[b.key]
+	if len(h.wire) != 2 {
+		t.Fatalf("wire protocols %v", h.wire)
+	}
+	ch.restore(h)
+	if h := ch.take()[b.key]; h == nil || len(h.wire) != 2 {
+		t.Errorf("wire protocols put back = %v", h)
+	}
+	if n := wire(t0); n != 0 {
+		t.Errorf("%d wire protocols written again", n)
+	}
+	ch.forget(b.key, t0)
+	if n := wire(t0); n != 2 {
+		t.Errorf("%d wire protocols written after their host was dropped, want 2", n)
+	}
+	later := t0.Add(20 * time.Minute)
+	ch.expire(later)
+	if len(ch.acceptedWire) != 0 {
+		t.Errorf("accepted after the TTL: %v", ch.acceptedWire)
+	}
+	if n := wire(later); n != 2 {
+		t.Errorf("%d wire protocols written after the TTL, want 2", n)
+	}
+}
+
+// TestPGProtocolsClassified: shawk_v1.agents tells whether the agent
+// classifies wire protocols as of its latest heartbeat, NULL if it does
+// not tell.
+func TestPGProtocolsClassified(t *testing.T) {
+	dsn, conn := migratedDB(t)
+	ctx := context.Background()
+	st, err := newPGStore(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+	now := time.Now().UTC().Truncate(time.Second)
+	yes, no := true, false
+	for _, c := range []struct {
+		beat       time.Duration
+		classified *bool
+		want       string
+	}{
+		{-3 * time.Minute, nil, "<nil>"},
+		{-2 * time.Minute, &yes, "true"},
+		{-150 * time.Second, &no, "true"}, // an older heartbeat
+		{-time.Minute, &no, "false"},
+	} {
+		h := newHostChanges("h1")
+		h.setHost("m", "h1", "k", "v", now.Add(c.beat))
+		h.addSession(now.Add(-time.Hour), sessionRow{lastHeartbeat: now.Add(c.beat), netnsScope: "all",
+			peerFold: foldNone, protocolsClassified: c.classified})
+		if err := st.write(ctx, h); err != nil {
+			t.Fatal(err)
+		}
+		if got := queryStrings(t, conn, `SELECT protocols_classified FROM shawk_v1.agents`); !slices.Equal(got, []string{c.want}) {
+			t.Errorf("after a heartbeat at %v told %s: %q, want %s", c.beat, ptrString(c.classified), got, c.want)
+		}
 	}
 }
 

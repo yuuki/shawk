@@ -4,8 +4,8 @@
 /*
  * In-kernel flow bundling for discovering network service dependencies.
  *
- * TCP (tracepoint and iterators only; no hook on the data path, but the one
- * of wire protocols, which user space attaches only when asked)
+ * TCP (a tracepoint and iterators; the one hook on the data path is that of
+ * wire protocols, which user space attaches only when asked)
  *   - tp_btf/inet_sock_set_state
  *       CLOSE -> SYN_SENT       active open. It runs inside connect(2), so the
  *                               current task is the client process. The
@@ -226,16 +226,18 @@ struct shawk_sock_state {
 	__u32 walked; /* walk_gen of the last walk that visited the connection */
 	/*
 	 * PEEK_FIRST while the first payload of the connection, which tells its
-	 * wire protocol, is still to be sent, PEEK_HELD after a first send of 4
-	 * bytes, held in peek_prefix, and 0 then (see shawk_tcp_sendmsg).
+	 * wire protocol, is still to be sent, PEEK_HELD or PEEK_HELD_ANSWER
+	 * after a first send of 4 bytes, held in peek_prefix, and 0 then (see
+	 * shawk_tcp_sendmsg).
 	 */
 	__u32 peek;
 	__u32 peek_prefix;
-	__u32 _pad;
+	__u32 peek_seq; /* write_seq after the send held, with PEEK_HELD */
 };
 
 #define PEEK_FIRST 1
-#define PEEK_HELD 2
+#define PEEK_HELD 2        /* a first send of a client, or of a server that greets */
+#define PEEK_HELD_ANSWER 3 /* a first send of a socket that had received data */
 
 struct {
 	__uint(type, BPF_MAP_TYPE_SK_STORAGE);
@@ -1427,55 +1429,6 @@ struct {
 	__type(value, struct shawk_peek);
 } peeks SEC(".maps");
 
-/* The members of struct iov_iter that moved or came since Linux 5.14. */
-struct iov_iter___iov {
-	const struct iovec *iov; /* before Linux 6.4 */
-} __attribute__((preserve_access_index));
-
-struct iov_iter___iov64 {
-	const struct iovec *__iov; /* since Linux 6.4 */
-} __attribute__((preserve_access_index));
-
-struct iov_iter___ubuf {
-	void *ubuf; /* of ITER_UBUF, since Linux 6.0 */
-} __attribute__((preserve_access_index));
-
-/*
- * Copies the first bytes of the data of a send into b from off, and returns
- * the end of the bytes in b: from the user memory of send(2), write(2),
- * writev(2) or sendmsg(2), a buffer (ITER_UBUF) or iovecs (ITER_IOVEC). The
- * data of the kernel (ITER_KVEC) and of pages, as sendfile(2) and splice(2)
- * send them (ITER_BVEC), are not read.
- */
-static __always_inline __u32 peek_msg(__u8 *b, __u32 off, struct msghdr *msg)
-{
-	struct iov_iter *it = &msg->msg_iter;
-	struct iov_iter___iov64 *it64 = (void *)it;
-	struct iov_iter___iov *old = (void *)it;
-	struct iov_iter___ubuf *ub = (void *)it;
-	const struct iovec *iov;
-	__u64 skip, count;
-	__u8 type;
-
-	type = BPF_CORE_READ(it, iter_type);
-	skip = BPF_CORE_READ(it, iov_offset);
-	count = BPF_CORE_READ(it, count);
-	if (bpf_core_enum_value_exists(enum iter_type, ITER_UBUF) &&
-	    bpf_core_field_exists(ub->ubuf) &&
-	    type == bpf_core_enum_value(enum iter_type, ITER_UBUF))
-		return off + peek_user(b, off, (const __u8 *)BPF_CORE_READ(ub, ubuf) + skip,
-				       count);
-	if (type != bpf_core_enum_value(enum iter_type, ITER_IOVEC))
-		return off;
-	if (bpf_core_field_exists(it64->__iov))
-		iov = BPF_CORE_READ(it64, __iov);
-	else if (bpf_core_field_exists(old->iov))
-		iov = BPF_CORE_READ(old, iov);
-	else
-		return off;
-	return peek_iovecs(b, off, iov, BPF_CORE_READ(it, nr_segs), skip, count);
-}
-
 /*
  * The first send of a connection that the tracepoint marked (peek): its
  * data is the first payload of the local socket, whose wire protocol
@@ -1493,9 +1446,11 @@ static __always_inline __u32 peek_msg(__u8 *b, __u32 off, struct msghdr *msg)
  *   sockets of a sockmap with sk_msg programs send in tcp_bpf_sendmsg(). A
  *   connection that queued or sent data before (write_seq beyond snd_nxt,
  *   or data segments out) is not classified, rather than by the middle of
- *   its stream.
- * - A first send of 4 bytes is held (PEEK_HELD) and classified with the
- *   next send: Slurm before 24.05 sends the length of a message apart.
+ *   its stream. Since Linux 6.5, sendfile(2) and splice(2) send pages
+ *   (ITER_BVEC) in tcp_sendmsg(), which peek_msg() does not read.
+ * - A first send of 4 bytes that matches no signature is held (PEEK_HELD)
+ *   and classified with the next send, if nothing was sent in between:
+ *   Slurm before 24.05 sends the length of a message apart.
  * - Two threads that send on a new connection at once may both read it.
  * - The bytes read are wiped once classified: they may hold credentials.
  */
@@ -1506,7 +1461,7 @@ int BPF_PROG(shawk_tcp_sendmsg, struct sock *sk, struct msghdr *msg, size_t size
 	struct shawk_flow_stats *fs;
 	struct shawk_peek *p;
 	struct tcp_sock *tp;
-	__u32 zero = 0, len, off = 0;
+	__u32 zero = 0, len, off = 0, seq, peek;
 	bool server, answer, held;
 	int proto, state;
 
@@ -1517,31 +1472,35 @@ int BPF_PROG(shawk_tcp_sendmsg, struct sock *sk, struct msghdr *msg, size_t size
 	state = BPF_CORE_READ(sk, __sk_common.skc_state);
 	if (!server && state != TCP_ESTABLISHED && state != TCP_CLOSE_WAIT)
 		return 0;
-	held = ss->peek == PEEK_HELD;
+	peek = ss->peek;
+	held = peek == PEEK_HELD || peek == PEEK_HELD_ANSWER;
 	ss->peek = 0;
 	if (!ss_ready(ss))
 		return 0;
 	tp = bpf_skc_to_tcp_sock(sk);
 	if (!tp)
 		return 0;
-	if (!held && (BPF_CORE_READ(tp, write_seq) != BPF_CORE_READ(tp, snd_nxt) ||
-		      BPF_CORE_READ(tp, data_segs_out)))
+	/* Nothing else sent since the start, or since the send held. */
+	seq = BPF_CORE_READ(tp, write_seq);
+	if (held ? seq != ss->peek_seq :
+		   seq != BPF_CORE_READ(tp, snd_nxt) || BPF_CORE_READ(tp, data_segs_out))
 		return 0;
-	answer = BPF_CORE_READ(tp, bytes_received) != 0;
+	answer = held ? peek == PEEK_HELD_ANSWER : BPF_CORE_READ(tp, bytes_received) != 0;
 	p = bpf_map_lookup_elem(&peeks, &zero);
 	if (!p)
 		return 0;
 	if (held) {
 		*(__u32 *)p->buf = ss->peek_prefix;
+		ss->peek_prefix = 0;
 		off = 4;
 	}
 	len = peek_msg(p->buf, off, msg);
-	if (!held && len == 4 && size == 4) {
+	proto = len > off ? wire_classify(p->buf, len, size + off, server, answer, held) : -1;
+	if (proto == WIRE_UNKNOWN && !held && len == 4 && size == 4) {
 		ss->peek_prefix = *(__u32 *)p->buf;
-		ss->peek = PEEK_HELD;
+		ss->peek_seq = seq + 4;
+		ss->peek = answer ? PEEK_HELD_ANSWER : PEEK_HELD;
 		proto = -1;
-	} else {
-		proto = len > off ? wire_classify(p->buf, len, size + off, server, answer) : -1;
 	}
 	/*
 	 * Through the map value, which the verifier does not track: it would

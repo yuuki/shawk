@@ -31,9 +31,17 @@
 /* The segments of a writev(2) read: Slurm writes its length apart. */
 #define PEEK_SEGS 4
 
+/* Aligned, so that clang wipes it with stores of 8 bytes rather than 1. */
 struct shawk_peek {
 	__u8 buf[PEEK_BUF];
-};
+} __attribute__((aligned(8)));
+
+/*
+ * A payload that matched a signature but adds no protocol to its flow, as a
+ * CancelRequest of PostgreSQL, which libpq sends in clear text whatever
+ * sslmode says: past the values of enum shawk_wire_proto.
+ */
+#define WIRE_SKIP WIRE_PROTOS
 
 /*
  * The barrier keeps the mask of a computed offset: clang drops a mask it
@@ -128,6 +136,37 @@ static __always_inline int tls_offered(const __u8 *b, __u32 len, __u32 off,
 	return WIRE_TLS;
 }
 
+/*
+ * The version a ServerHello of version field 1.2 chose: that of its
+ * extension supported_versions, whose list of extensions starts at off and
+ * which only TLS 1.3 sends, else guess, from the cipher suite, for a
+ * ServerHello whose extensions the bytes read do not hold or that has
+ * none.
+ */
+static __always_inline int tls_chosen(const __u8 *b, __u32 len, __u32 rec,
+				      __u32 off, int guess)
+{
+	__u32 end, type, n, i;
+
+	if (off + 2 > len || off + 2 > rec)
+		return guess;
+	end = off + 2 + rd16(b, off);
+	off += 2;
+	for (i = 0; i < 8; i++) {
+		if (off >= end || off + 4 > len)
+			return guess;
+		type = rd16(b, off);
+		n = rd16(b, off + 2);
+		if (type == 0x002b) {
+			if (n != 2 || off + 6 > len)
+				return guess;
+			return rd16(b, off + 4) >= 0x0304 ? WIRE_TLS_1_3 : WIRE_TLS_1_2;
+		}
+		off += 4 + n;
+	}
+	return guess;
+}
+
 /* The protocol of the version field of a TLS hello, before TLS 1.2. */
 static __always_inline int tls_legacy(__u32 v)
 {
@@ -142,8 +181,9 @@ static __always_inline int tls_legacy(__u32 v)
  * A record of TLS: a type, a version 3.x and a length, then, for a
  * handshake, its type, length of 3 bytes and version. A ServerHello tells
  * the version the server chose: its version field before TLS 1.3, and for
- * TLS 1.3 the version 1.2 and a cipher suite that only TLS 1.3 has (0x13xx,
- * and the SM4 suites of RFC 8998, 0x00c6 and 0x00c7). A ClientHello tells
+ * TLS 1.3 the version 1.2 and the extension supported_versions, else a
+ * cipher suite that only TLS 1.3 has (0x13xx, and the SM4 suites of RFC
+ * 8998, 0x00c6 and 0x00c7; not the suites of RFC 9150). A ClientHello tells
  * the highest version the client offers: its version field before TLS 1.2,
  * then the extension supported_versions, which clients of TLS 1.3 send, and
  * some of TLS 1.2. A hello longer than its record (a client that splits its
@@ -174,9 +214,10 @@ static __always_inline int wire_tls(const __u8 *b, __u32 len)
 		if (off + 2 > len || off + 2 > rec)
 			return WIRE_TLS;
 		n = rd16(b, off);
-		if ((n >> 8) == 0x13 || n == 0x00c6 || n == 0x00c7)
-			return WIRE_TLS_1_3;
-		return WIRE_TLS_1_2;
+		/* After the cipher suite and the compression method. */
+		return tls_chosen(b, len, rec, off + 3,
+				  (n >> 8) == 0x13 || n == 0x00c6 || n == 0x00c7 ?
+					  WIRE_TLS_1_3 : WIRE_TLS_1_2);
 	}
 	/* The cipher suites and the compression methods of a ClientHello. */
 	if (off + 2 > len)
@@ -230,24 +271,56 @@ static __always_inline int sslv2_hello(const __u8 *b, __u32 len, __u64 size)
 	return -1;
 }
 
-/* The request line of HTTP/1.x. */
+/* The length of the method of HTTP/1.x a request starts with and its space, or 0. */
+static __always_inline __u32 http1_method(const __u8 *b, __u32 len)
+{
+	if (starts(b, len, "GET ", 4) || starts(b, len, "PUT ", 4))
+		return 4;
+	if (starts(b, len, "POST ", 5) || starts(b, len, "HEAD ", 5))
+		return 5;
+	if (starts(b, len, "PATCH ", 6) || starts(b, len, "TRACE ", 6))
+		return 6;
+	if (starts(b, len, "DELETE ", 7))
+		return 7;
+	if (starts(b, len, "OPTIONS ", 8) || starts(b, len, "CONNECT ", 8))
+		return 8;
+	return 0;
+}
+
+/*
+ * The request line of HTTP/1.x: a method and a target in one of the forms
+ * of HTTP (RFC 9112, 3.2): a path, an absolute URI of http or https, * for
+ * OPTIONS, or a host and port for CONNECT. Other protocols share the
+ * methods with other targets: the CONNECT of NATS (CONNECT {...}), the
+ * OPTIONS of RTSP and SIP (rtsp://, sip:), the inline commands of Redis
+ * (GET key).
+ */
 static __always_inline bool http1_request(const __u8 *b, __u32 len)
 {
-	return starts(b, len, "GET ", 4) || starts(b, len, "POST ", 5) ||
-	       starts(b, len, "PUT ", 4) || starts(b, len, "HEAD ", 5) ||
-	       starts(b, len, "DELETE ", 7) || starts(b, len, "OPTIONS ", 8) ||
-	       starts(b, len, "PATCH ", 6) || starts(b, len, "CONNECT ", 8) ||
-	       starts(b, len, "TRACE ", 6);
+	__u32 m = http1_method(b, len), c;
+
+	if (!m || m >= len)
+		return false;
+	c = rd8(b, m);
+	if (c == '/')
+		return true;
+	if (c == '*')
+		return m == 8 && rd8(b, 0) == 'O';
+	if (starts(b + (m & 15), len - m, "http://", 7) || starts(b + (m & 15), len - m, "https://", 8))
+		return true;
+	/* A letter in either case or a digit of a host, or an address of IPv6. */
+	return m == 8 && rd8(b, 0) == 'C' && (is_upper(c & ~0x20U) || is_digit(c) || c == '[');
 }
 
 /*
  * The first message of a client of PostgreSQL: SSLRequest, which asks for
  * TLS, GSSENCRequest, which asks for the encryption of GSSAPI, and
  * CancelRequest, of fixed codes, or a StartupMessage of protocol 3.x, in
- * clear text, whose parameters start with a name (user, database, or _pq_.
- * of protocol 3.2). A request of Kafka has a length and a type and version
- * like a StartupMessage, but a number of the request after them, whose
- * first byte is not a letter. Returns -1 for another payload.
+ * clear text, whose parameters start with a name (user, database, or the
+ * reserved prefix _pq_.). A request of Kafka starts with a length, an API
+ * key of 3 and a version, which look like the protocol 3.x, but then the
+ * number of the request, whose first byte is not a letter. Returns -1 for
+ * another payload.
  */
 static __always_inline int postgres_request(const __u8 *b, __u32 len)
 {
@@ -259,11 +332,16 @@ static __always_inline int postgres_request(const __u8 *b, __u32 len)
 	code = rd32(b, 4);
 	if (n == 8 && code == 80877103)
 		return WIRE_POSTGRES_TLS;
+	/*
+	 * GSSAPI encryption, which a client may follow with an SSLRequest the
+	 * bytes read do not hold, and a CancelRequest, which libpq sends in
+	 * clear text whatever sslmode says (the key of protocol 3.2 has up to
+	 * 256 bytes rather than 4), add no protocol.
+	 */
 	if (n == 8 && code == 80877104)
-		return WIRE_POSTGRES;
-	/* The key of protocol 3.2 has up to 256 bytes rather than 4. */
+		return WIRE_SKIP;
 	if (n >= 16 && n <= 12 + 256 && code == 80877102)
-		return WIRE_POSTGRES;
+		return WIRE_SKIP;
 	if (len < 9 || n <= 8 || n >= 10000 || (code >> 16) != 3 || (code & 0xffff) > 9)
 		return -1;
 	c = rd8(b, 8);
@@ -272,9 +350,10 @@ static __always_inline int postgres_request(const __u8 *b, __u32 len)
 
 /*
  * The answer of a server of PostgreSQL: S alone, which accepts a request of
- * TLS, N or G alone, which refuses it or accepts GSSAPI, an authentication
- * request (R, a length and a method up to 12) or an error (E, a length and
- * the field of its severity). Returns -1 for another payload.
+ * TLS, N alone, which refuses TLS or GSSAPI, G alone, which accepts GSSAPI
+ * and adds no protocol, an authentication request (R, a length and a method
+ * up to 12) or an error (E, a length and the field of its severity).
+ * Returns -1 for another payload.
  */
 static __always_inline int postgres_answer(const __u8 *b, __u32 len, __u64 size)
 {
@@ -283,7 +362,9 @@ static __always_inline int postgres_answer(const __u8 *b, __u32 len, __u64 size)
 	if (size == 1 && len == 1) {
 		if (c == 'S')
 			return WIRE_POSTGRES_TLS;
-		return c == 'N' || c == 'G' ? WIRE_POSTGRES : -1;
+		if (c == 'G')
+			return WIRE_SKIP;
+		return c == 'N' ? WIRE_POSTGRES : -1;
 	}
 	if (len < 9)
 		return -1;
@@ -415,16 +496,24 @@ static __always_inline bool slurm_type(__u32 t)
 
 /*
  * A message of Slurm: its length in 4 bytes, which counts the rest of the
- * send, then a header of the version, flags and type, or, on the
- * connections of slurmdbd (SLURMDBD_CONNECTION), of the type first.
+ * send, then a header of the version, flags, and the type, after an index
+ * of 2 bytes before Slurm 22.05 (38 << 8), or, on the connections of
+ * slurmdbd (SLURMDBD_CONNECTION), of the type first. After a length held
+ * (see shawk_tcp_sendmsg), the message may go on in more sends: Slurm 22.05
+ * to 23.11 send the length, the header, the credential and the body apart.
  */
-static __always_inline bool slurm_message(const __u8 *b, __u32 len, __u64 size)
+static __always_inline bool slurm_message(const __u8 *b, __u32 len, __u64 size,
+					  bool held)
 {
-	if (len < 12 || rd32(b, 0) + 4ULL != size)
+	__u64 n;
+
+	if (len < 12)
 		return false;
-	if (slurm_version(rd8(b, 4), rd8(b, 5)) && rd16(b, 6) < 0x200 &&
-	    slurm_type(rd16(b, 8)))
-		return true;
+	n = rd32(b, 0) + 4ULL;
+	if (held ? n < size : n != size)
+		return false;
+	if (slurm_version(rd8(b, 4), rd8(b, 5)) && rd16(b, 6) < 0x200)
+		return slurm_type(rd16(b, rd8(b, 4) < 38 ? 10 : 8));
 	return slurm_type(rd16(b, 4)) && slurm_version(rd8(b, 6), rd8(b, 7)) &&
 	       (rd16(b, 8) & 0x2);
 }
@@ -444,14 +533,15 @@ static __always_inline bool http2_settings(const __u8 *b, __u32 len)
 }
 
 /*
- * Returns the enum shawk_wire_proto of the first payload of a connection:
- * len bytes of it in b, of size in all. server tells the server side, and
- * answer that the local socket received data before, so that a server
- * answers a request rather than greets: a client of PostgreSQL, Redis or
- * HTTP speaks first, a server of MySQL or SSH greets first.
+ * Returns the enum shawk_wire_proto of the first payload of a connection, or
+ * WIRE_SKIP: len bytes of it in b, of size in all. server tells the server
+ * side, answer that the local socket received data before, so that a
+ * server answers a request rather than greets (a client of PostgreSQL,
+ * Redis or HTTP speaks first, a server of MySQL or SSH greets first), and
+ * held that the first 4 bytes are a send held before this one.
  */
 static __always_inline int wire_classify(const __u8 *b, __u32 len, __u64 size,
-					 bool server, bool answer)
+					 bool server, bool answer, bool held)
 {
 	__u32 c;
 	int p;
@@ -464,9 +554,17 @@ static __always_inline int wire_classify(const __u8 *b, __u32 len, __u64 size,
 	if (!len || len > PEEK_LEN)
 		return WIRE_UNKNOWN;
 	c = rd8(b, 0);
-	/* Handshake, alert, change_cipher_spec or data, version 3.x. */
-	if (c >= 0x14 && c <= 0x17 && len >= 3 && rd8(b, 1) == 3 && rd8(b, 2) <= 4)
+	/*
+	 * A hello of TLS, version 3.x, or the alert of 2 bytes of a server that
+	 * refuses a client. Other records as a first payload are more likely
+	 * the length of another protocol (788 to 791 bytes of MongoDB).
+	 */
+	if (c == 0x16 && len >= 6 && rd8(b, 1) == 3 && rd8(b, 2) <= 4 &&
+	    (rd8(b, 5) == 1 || rd8(b, 5) == 2))
 		return wire_tls(b, len);
+	if (server && c == 0x15 && len >= 7 && rd8(b, 1) == 3 && rd8(b, 2) <= 4 &&
+	    rd16(b, 3) == 2)
+		return WIRE_TLS;
 	if (starts(b, len, "SSH-", 4))
 		return WIRE_SSH;
 	if (!server) {
@@ -474,7 +572,7 @@ static __always_inline int wire_classify(const __u8 *b, __u32 len, __u64 size,
 			return WIRE_HTTP2;
 		if (http1_request(b, len))
 			return WIRE_HTTP1;
-		if (slurm_message(b, len, size))
+		if (slurm_message(b, len, size, held))
 			return WIRE_SLURM;
 		if ((p = sslv2_hello(b, len, size)) >= 0)
 			return p;
@@ -488,7 +586,7 @@ static __always_inline int wire_classify(const __u8 *b, __u32 len, __u64 size,
 	}
 	if (starts(b, len, "HTTP/1.", 7))
 		return WIRE_HTTP1;
-	if (slurm_message(b, len, size))
+	if (slurm_message(b, len, size, held))
 		return WIRE_SLURM;
 	if (http2_settings(b, len))
 		return WIRE_HTTP2;
@@ -570,6 +668,55 @@ static __always_inline __u32 peek_iovecs(__u8 *b, __u32 off,
 			break;
 	}
 	return off;
+}
+
+/* The members of struct iov_iter that moved or came since Linux 5.14. */
+struct iov_iter___iov {
+	const struct iovec *iov; /* before Linux 6.4 */
+} __attribute__((preserve_access_index));
+
+struct iov_iter___iov64 {
+	const struct iovec *__iov; /* since Linux 6.4 */
+} __attribute__((preserve_access_index));
+
+struct iov_iter___ubuf {
+	void *ubuf; /* of ITER_UBUF, since Linux 6.0 */
+} __attribute__((preserve_access_index));
+
+/*
+ * Copies the first bytes of the data of a send into b from off, and returns
+ * the end of the bytes in b: from the user memory of send(2), write(2),
+ * writev(2) or sendmsg(2), a buffer (ITER_UBUF) or iovecs (ITER_IOVEC). The
+ * data of the kernel (ITER_KVEC) and of pages, as sendfile(2) and splice(2)
+ * send them (ITER_BVEC), are not read.
+ */
+static __always_inline __u32 peek_msg(__u8 *b, __u32 off, struct msghdr *msg)
+{
+	struct iov_iter *it = &msg->msg_iter;
+	struct iov_iter___iov64 *it64 = (void *)it;
+	struct iov_iter___iov *old = (void *)it;
+	struct iov_iter___ubuf *ub = (void *)it;
+	const struct iovec *iov;
+	__u64 skip, count;
+	__u8 type;
+
+	type = BPF_CORE_READ(it, iter_type);
+	skip = BPF_CORE_READ(it, iov_offset);
+	count = BPF_CORE_READ(it, count);
+	if (bpf_core_enum_value_exists(enum iter_type, ITER_UBUF) &&
+	    bpf_core_field_exists(ub->ubuf) &&
+	    type == bpf_core_enum_value(enum iter_type, ITER_UBUF))
+		return off + peek_user(b, off, (const __u8 *)BPF_CORE_READ(ub, ubuf) + skip,
+				       count);
+	if (type != bpf_core_enum_value(enum iter_type, ITER_IOVEC))
+		return off;
+	if (bpf_core_field_exists(it64->__iov))
+		iov = BPF_CORE_READ(it64, __iov);
+	else if (bpf_core_field_exists(old->iov))
+		iov = BPF_CORE_READ(old, iov);
+	else
+		return off;
+	return peek_iovecs(b, off, iov, BPF_CORE_READ(it, nr_segs), skip, count);
 }
 
 #endif /* __SHAWK_WIRE_H */

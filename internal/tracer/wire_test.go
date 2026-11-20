@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 	"unsafe"
@@ -73,8 +74,8 @@ type wireRun struct {
 // wireClassifier runs the classifier of wire protocols of the BPF programs,
 // compiled with the test program of testdata/wire.bpf.c.
 type wireClassifier struct {
-	t    *testing.T
-	prog *ebpf.Program
+	t          *testing.T
+	prog, peek *ebpf.Program
 }
 
 func newWireClassifier(t *testing.T) *wireClassifier {
@@ -109,11 +110,16 @@ func newWireClassifier(t *testing.T) *wireClassifier {
 		skipUnavailable(t, "loading the classifier: %v", err)
 	}
 	t.Cleanup(func() { coll.Close() })
-	return &wireClassifier{t: t, prog: coll.Programs["wire_run"]}
+	return &wireClassifier{t: t, prog: coll.Programs["wire_run"], peek: coll.Programs["peek_run"]}
 }
 
-// wireNone is what run returns when nothing was classified.
-const wireNone = WireProtocol(255)
+// wireNone is what run returns when nothing was classified, and wireSkip
+// what the classifier returns for a payload that adds no protocol
+// (WIRE_SKIP).
+const (
+	wireNone = WireProtocol(255)
+	wireSkip = WireProtocol(NumWireProtocols)
+)
 
 // wireSend is a send to classify: its segments, the bytes to skip into
 // the first, the side and whether it answers, and the 4 bytes of a first
@@ -297,6 +303,19 @@ func slurmHeader(msgType uint16, flags uint16, body int) []byte {
 	return append(b, 0, 0)
 }
 
+// slurmHeader2108 builds the header of a message of Slurm 21.08, which has
+// an index between the flags and the type.
+func slurmHeader2108(msgType uint16, body int) []byte {
+	b := binary.BigEndian.AppendUint16(nil, 37<<8)
+	b = binary.BigEndian.AppendUint16(b, 0)
+	b = binary.BigEndian.AppendUint16(b, 0)
+	b = binary.BigEndian.AppendUint16(b, msgType)
+	b = binary.BigEndian.AppendUint32(b, uint32(body))
+	b = binary.BigEndian.AppendUint16(b, 0)
+	b = binary.BigEndian.AppendUint16(b, 0)
+	return append(b, 0, 0)
+}
+
 // slurmSend returns the iovecs Slurm writes a message with (slurm_bufs_sendto):
 // the length of the rest, the header, the credential and the body.
 func slurmSend(header, auth, body []byte) [][]byte {
@@ -312,13 +331,19 @@ func mysqlPacket(seq byte, payload []byte) []byte {
 
 // serverHello builds a ServerHello of version 1.2 that chose a cipher
 // suite, after a session id of 32 bytes.
-func serverHello(cipher uint16) []byte {
+func serverHello(cipher uint16, exts ...[]byte) []byte {
 	body := []byte{3, 3}
 	body = append(body, make([]byte, 32)...)
 	body = append(body, 32)
 	body = append(body, make([]byte, 32)...)
 	body = binary.BigEndian.AppendUint16(body, cipher)
-	body = append(body, 0, 0, 0)
+	body = append(body, 0)
+	var ext []byte
+	for _, e := range exts {
+		ext = append(ext, e...)
+	}
+	body = binary.BigEndian.AppendUint16(body, uint16(len(ext)))
+	body = append(body, ext...)
 	hs := append([]byte{2, 0, byte(len(body) >> 8), byte(len(body))}, body...)
 	return append([]byte{0x16, 3, 3, byte(len(hs) >> 8), byte(len(hs))}, hs...)
 }
@@ -411,6 +436,14 @@ func TestWireClassify(t *testing.T) {
 		tc{name: "alert", segs: [][]byte{{0x15, 3, 3, 0, 2, 2, 70}}, server: true, answer: true, want: WireTLS},
 		tc{name: "ServerHello of SM4 (RFC 8998)", segs: [][]byte{serverHello(0x00c6)}, server: true, answer: true, want: WireTLS13},
 		tc{name: "ServerHello of TLS 1.2", segs: [][]byte{serverHello(0xc02f)}, server: true, answer: true, want: WireTLS12},
+		// Integrity only (RFC 9150): supported_versions tells TLS 1.3.
+		tc{name: "ServerHello of TLS 1.3 without encryption", segs: [][]byte{serverHello(0xc0b4,
+			extension(0x0033, make([]byte, 36)), extension(0x002b, []byte{3, 4}))}, server: true, answer: true, want: WireTLS13},
+		tc{name: "ServerHello of TLS 1.2 with extensions", segs: [][]byte{serverHello(0xc02f, extension(0xff01, []byte{0}))},
+			server: true, answer: true, want: WireTLS12},
+		// A message of MongoDB of 789 bytes starts like a record of TLS.
+		tc{name: "MongoDB", segs: [][]byte{append([]byte{0x15, 0x03, 0x00, 0x00, 1, 0, 0, 0, 0, 0, 0, 0, 0xdd, 0x07, 0, 0},
+			make([]byte, 773)...)}, want: WireUnknown},
 		tc{name: "ClientHello in records of 60 bytes", segs: [][]byte{tlsRecords(tls13Hello, 60)}, want: WireTLS},
 		tc{name: "SSL 2.0 ClientHello up to TLS 1.0", segs: [][]byte{sslv2Hello(0x0301)}, want: WireTLS10},
 		tc{name: "SSL 2.0 ClientHello up to TLS 1.2", segs: [][]byte{sslv2Hello(0x0303)}, want: WireTLS12},
@@ -420,6 +453,17 @@ func TestWireClassify(t *testing.T) {
 			want: WireHTTP1},
 		tc{name: "HTTP/1.1 response", segs: one("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"), server: true, answer: true,
 			want: WireHTTP1},
+		tc{name: "HTTP/1.1 request of a proxy", segs: one("CONNECT db.example:5432 HTTP/1.1\r\nHost: db.example\r\n\r\n"),
+			want: WireHTTP1},
+		tc{name: "HTTP/1.1 OPTIONS *", segs: one("OPTIONS * HTTP/1.1\r\nHost: app\r\n\r\n"), want: WireHTTP1},
+		tc{name: "HTTP/1.1 request with a long target", segs: one("GET /" + strings.Repeat("a", 600) + " HTTP/1.1\r\n"),
+			want: WireHTTP1},
+		// Other protocols with the methods of HTTP.
+		tc{name: "NATS", segs: one("CONNECT {\"verbose\":false,\"pedantic\":false}\r\nPING\r\n"), answer: true,
+			want: WireUnknown},
+		tc{name: "RTSP", segs: one("OPTIONS rtsp://cam.example/stream RTSP/1.0\r\nCSeq: 1\r\n\r\n"), want: WireUnknown},
+		tc{name: "SIP", segs: one("OPTIONS sip:alice@example.com SIP/2.0\r\nVia: SIP/2.0/TCP host\r\n\r\n"), want: WireUnknown},
+		tc{name: "Redis inline command", segs: one("GET key\r\n"), want: WireUnknown},
 		tc{name: "HTTP/2 preface", segs: [][]byte{append([]byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"), settings...)}, want: WireHTTP2},
 		tc{name: "HTTP/2 settings of a server", segs: [][]byte{settings}, server: true, want: WireHTTP2},
 		// SSH.
@@ -427,11 +471,14 @@ func TestWireClassify(t *testing.T) {
 		tc{name: "SSH server", segs: one("SSH-2.0-OpenSSH_8.7\r\n"), server: true, want: WireSSH},
 		// PostgreSQL.
 		tc{name: "PostgreSQL SSLRequest", segs: [][]byte{{0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f}}, want: WirePostgresTLS},
-		tc{name: "PostgreSQL GSSENCRequest", segs: [][]byte{{0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x30}}, want: WirePostgres},
+		// GSSAPI, and the cancels libpq sends in clear text whatever
+		// sslmode says, add no protocol.
+		tc{name: "PostgreSQL GSSENCRequest", segs: [][]byte{{0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x30}}, want: wireSkip},
 		tc{name: "PostgreSQL CancelRequest", segs: [][]byte{{0, 0, 0, 16, 0x04, 0xd2, 0x16, 0x2e, 0, 0, 1, 2, 3, 4, 5, 6}},
-			want: WirePostgres},
+			want: wireSkip},
 		tc{name: "PostgreSQL CancelRequest of protocol 3.2", segs: [][]byte{append([]byte{0, 0, 0, 44, 0x04, 0xd2, 0x16, 0x2e,
-			0, 0, 1, 2}, make([]byte, 32)...)}, want: WirePostgres},
+			0, 0, 1, 2}, make([]byte, 32)...)}, want: wireSkip},
+		tc{name: "PostgreSQL accepts GSSAPI", segs: one("G"), server: true, answer: true, want: wireSkip},
 		tc{name: "PostgreSQL StartupMessage", segs: [][]byte{startup}, want: WirePostgres},
 		tc{name: "PostgreSQL accepts TLS", segs: one("S"), server: true, answer: true, want: WirePostgresTLS},
 		tc{name: "PostgreSQL refuses TLS", segs: one("N"), server: true, answer: true, want: WirePostgres},
@@ -456,6 +503,8 @@ func TestWireClassify(t *testing.T) {
 		tc{name: "Redis command of many arguments", segs: one("*12\r\n$4\r\nHSET\r\n$3\r\nkey\r\n"), want: WireRedis},
 		tc{name: "Redis reply", segs: one("+PONG\r\n"), server: true, answer: true, want: WireRedis},
 		tc{name: "Redis OK", segs: one("+OK\r\n"), server: true, answer: true, want: WireRedis},
+		// A reply of 4 bytes is classified at once rather than held.
+		tc{name: "Redis integer of 4 bytes", segs: one(":1\r\n"), server: true, answer: true, want: WireRedis},
 		// 8 bytes: the byte after them, which a $ would make a command, is
 		// not read.
 		tc{name: "Redis array of 8 bytes", segs: one("*12345\r\n"), want: WireUnknown},
@@ -474,9 +523,18 @@ func TestWireClassify(t *testing.T) {
 		tc{name: "Slurm length that is not the send's", segs: [][]byte{append(binary.BigEndian.AppendUint32(nil, 99),
 			slurmHeader(1008, 0, 4)...)}, want: WireUnknown},
 		// Slurm before 24.05 sends the length apart, which is held: the
-		// next send is classified after it.
+		// next send is classified after it, the whole message before
+		// 22.05, its header alone from 22.05 to 23.11.
 		tc{name: "Slurm after its length held", segs: [][]byte{slurmHeader(1008, 0, len(ping)), []byte("auth"), ping},
 			held: binary.BigEndian.AppendUint32(nil, uint32(len(slurmHeader(1008, 0, len(ping)))+4+len(ping))), want: WireSlurm},
+		tc{name: "Slurm header after its length held", segs: [][]byte{slurmHeader(1008, 0, len(ping))},
+			held: binary.BigEndian.AppendUint32(nil, uint32(len(slurmHeader(1008, 0, len(ping)))+4+len(ping))), want: WireSlurm},
+		tc{name: "Slurm header longer than its length held", segs: [][]byte{slurmHeader(1008, 0, len(ping))},
+			held: binary.BigEndian.AppendUint32(nil, 8), want: WireUnknown},
+		tc{name: "Slurm 21.08", segs: slurmSend(slurmHeader2108(1008, len(ping)), []byte("auth"), ping), want: WireSlurm},
+		tc{name: "Slurm 21.08 reply after its length held", segs: [][]byte{append(slurmHeader2108(8001, 4), 0, 0, 0, 0)},
+			held: binary.BigEndian.AppendUint32(nil, uint32(len(slurmHeader2108(8001, 4))+4)), server: true, answer: true,
+			want: WireSlurm},
 		// Others.
 		tc{name: "text", segs: one("hello\n"), want: WireUnknown},
 		tc{name: "one byte", segs: one("x"), server: true, answer: true, want: WireUnknown},
@@ -528,6 +586,75 @@ func TestWirePeek(t *testing.T) {
 	got, n := c.classify([][]byte{{}, {}, {}, {}, req}, 0, false, false)
 	if got != wireNone || n != 0 {
 		t.Errorf("a fifth segment: %v of %d bytes, want nothing", got, n)
+	}
+}
+
+// peekRun is the context of peek_run of testdata/wire.bpf.c.
+type peekRun struct {
+	Size, Nr, Skip uint64
+	Ubuf           uint8
+	_              [3]uint8
+	Proto          int32
+	Peeked         uint32
+	_              uint32
+	Iov            [4]struct{ Base, Len uint64 }
+}
+
+// TestWirePeekMsg runs peek_msg() of the agent, which reads the iov_iter of
+// a send, on a msghdr made up for the running kernel: a buffer
+// (ITER_UBUF, since Linux 6.0) or iovecs, from an offset into the first.
+func TestWirePeekMsg(t *testing.T) {
+	c := newWireClassifier(t)
+	req := []byte("GET / HTTP/1.1\r\nHost: app\r\n\r\n")
+	for _, tc := range []struct {
+		name string
+		ubuf bool
+		segs [][]byte
+		skip int
+	}{
+		{"ITER_UBUF", true, [][]byte{req}, 0},
+		{"ITER_UBUF from an offset", true, [][]byte{append([]byte("xxx"), req...)}, 3},
+		{"ITER_IOVEC", false, [][]byte{req[:5], {}, req[5:]}, 0},
+		{"ITER_IOVEC from an offset", false, [][]byte{append([]byte("xx"), req[:7]...), req[7:]}, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			size := -tc.skip
+			for _, s := range tc.segs {
+				size += len(s)
+			}
+			run := peekRun{Size: uint64(size), Nr: uint64(len(tc.segs)), Skip: uint64(tc.skip)}
+			if tc.ubuf {
+				run.Ubuf = 1
+			}
+			for j, s := range tc.segs {
+				if len(s) > 0 {
+					run.Iov[j].Base = uint64(uintptr(unsafe.Pointer(&s[0])))
+				}
+				run.Iov[j].Len = uint64(len(s))
+			}
+			var in bytes.Buffer
+			if err := binary.Write(&in, binary.NativeEndian, &run); err != nil {
+				t.Fatal(err)
+			}
+			out := make([]byte, in.Len())
+			ret, err := c.peek.Run(&ebpf.RunOptions{Context: in.Bytes(), ContextOut: out})
+			runtime.KeepAlive(tc.segs)
+			switch {
+			case err != nil:
+				t.Fatal(err)
+			case ret == 3:
+				t.Skip("the kernel has no ITER_UBUF")
+			case ret != 0:
+				t.Fatalf("peek_run returned %d", ret)
+			}
+			var got peekRun
+			if err := binary.Read(bytes.NewReader(out), binary.NativeEndian, &got); err != nil {
+				t.Fatal(err)
+			}
+			if got.Peeked != uint32(len(req)) || WireProtocol(got.Proto) != WireHTTP1 {
+				t.Errorf("%d bytes read as %v, want %d as http1", got.Peeked, WireProtocol(got.Proto), len(req))
+			}
+		})
 	}
 }
 
@@ -656,40 +783,71 @@ func TestWireProtocols(t *testing.T) {
 		}
 	}
 	// Slurm 24.05 and later write the length of a message with it, in one
-	// writev(2), which reaches the iovecs of the kernel; before, apart.
-	// Each side reads the whole message of the other.
+	// writev(2), which reaches the iovecs of the kernel; 22.05 to 23.11 send
+	// the length, the header, the credential and the body apart; before,
+	// the length and the rest, whose header has an index. Each side reads
+	// the whole message of the other.
 	ping := []byte("body of the ping")
 	slurmPing := slurmSend(slurmHeader(1008, 0, len(ping)), []byte("auth/munge credential"), ping)
 	slurmRC := slurmSend(slurmHeader(8001, 0, 4), nil, []byte{0, 0, 0, 0})
-	slurmWrite := func(c net.Conn, msg [][]byte, apart bool) error {
-		if apart {
-			if _, err := c.Write(msg[0]); err != nil {
+	slurmPing2108 := slurmSend(slurmHeader2108(1008, len(ping)), []byte("auth/munge credential"), ping)
+	slurmRC2108 := slurmSend(slurmHeader2108(8001, 4), nil, []byte{0, 0, 0, 0})
+	slurmWrite := func(c net.Conn, msg [][]byte, sends int) error {
+		switch sends {
+		case 1:
+			_, err := (&net.Buffers{msg[0], msg[1], msg[2], msg[3]}).WriteTo(c)
+			return err
+		case 2:
+			msg = [][]byte{msg[0], bytes.Join(msg[1:], nil)}
+		}
+		for _, part := range msg {
+			if len(part) == 0 {
+				continue
+			}
+			if _, err := c.Write(part); err != nil {
 				return err
 			}
-			_, err := c.Write(bytes.Join(msg[1:], nil))
-			return err
 		}
-		_, err := (&net.Buffers{msg[0], msg[1], msg[2], msg[3]}).WriteTo(c)
-		return err
+		return nil
 	}
 	slurmRead := func(c net.Conn, msg [][]byte) error {
 		_, err := io.ReadFull(c, make([]byte, len(bytes.Join(msg, nil))))
 		return err
 	}
-	slurmClient := func(apart bool) func(net.Conn) error {
+	slurmClient := func(req, rc [][]byte, sends int) func(net.Conn) error {
 		return func(c net.Conn) error {
-			if err := slurmWrite(c, slurmPing, apart); err != nil {
+			if err := slurmWrite(c, req, sends); err != nil {
 				return err
 			}
-			return slurmRead(c, slurmRC)
+			return slurmRead(c, rc)
 		}
 	}
-	slurmServer := func(apart bool) func(net.Conn) {
+	slurmServer := func(req, rc [][]byte, sends int) func(net.Conn) {
 		return func(c net.Conn) {
-			if slurmRead(c, slurmPing) == nil {
-				slurmWrite(c, slurmRC, apart)
+			if slurmRead(c, req) == nil {
+				slurmWrite(c, rc, sends)
 			}
 		}
+	}
+	// A first payload sent with sendfile(2), pages that are not read:
+	// the connection is not classified, also by what it writes next.
+	request := filepath.Join(t.TempDir(), "request")
+	if err := os.WriteFile(request, []byte("GET / HTTP/1.1\r\nHost: app\r\n\r\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sendfile := func(c net.Conn) error {
+		f, err := os.Open(request)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		if _, err := io.Copy(c, f); err != nil {
+			return err
+		}
+		if _, err := c.Read(make([]byte, 4096)); err != nil {
+			return err
+		}
+		return exchange(c, "GET /next HTTP/1.1\r\nHost: app\r\n\r\n")
 	}
 	cases := []struct {
 		name           string
@@ -709,8 +867,12 @@ func TestWireProtocols(t *testing.T) {
 		{"SSH", greet("SSH-2.0-OpenSSH_8.7\r\n", "\x00\x00\x01\x0c"), greeted("SSH-2.0-OpenSSH_9.6\r\n"), WireSSH, WireSSH},
 		{"MySQL", greet(string(mysqlGreeting()), "\x07\x00\x00\x02\x00\x00\x00\x02\x00\x00\x00"),
 			greeted(string(mysqlResponse())), WireMySQL, WireMySQL},
-		{"Slurm 24.05", slurmServer(false), slurmClient(false), WireSlurm, WireSlurm},
-		{"Slurm 23.11", slurmServer(true), slurmClient(true), WireSlurm, WireSlurm},
+		{"Slurm 24.05", slurmServer(slurmPing, slurmRC, 1), slurmClient(slurmPing, slurmRC, 1), WireSlurm, WireSlurm},
+		{"Slurm 23.11", slurmServer(slurmPing, slurmRC, 4), slurmClient(slurmPing, slurmRC, 4), WireSlurm, WireSlurm},
+		{"Slurm 21.08", slurmServer(slurmPing2108, slurmRC2108, 2), slurmClient(slurmPing2108, slurmRC2108, 2),
+			WireSlurm, WireSlurm},
+		{"sendfile first", answer("HTTP/1.1 204 No Content\r\n\r\n", "HTTP/1.1 204 No Content\r\n\r\n"), sendfile,
+			wireNone, WireHTTP1},
 	}
 	ports := map[string]uint16{}
 	for _, tc := range cases {
@@ -746,7 +908,11 @@ func TestWireProtocols(t *testing.T) {
 				if f == nil {
 					t.Fatalf("no %v flow to port %d in %+v", side.dir, ports[tc.name], snap.Flows)
 				}
-				if want := WireProtocols(1 << side.want); f.Protocols != want {
+				want := WireProtocols(1 << side.want)
+				if side.want == wireNone {
+					want = 0
+				}
+				if f.Protocols != want {
 					t.Errorf("%v flow: protocols %v, want %v", side.dir, f.Protocols, want)
 				}
 			}

@@ -67,7 +67,10 @@ JOIN shawk.agent_sessions s ON s.host_id = h.id
 ORDER BY h.id, s.last_heartbeat DESC;
 
 -- shawk.prune() of 0001_schema.sql, which also deletes the wire protocols
--- last seen before the cutoff, of edges seen since.
+-- last seen before the cutoff, of edges seen since. They are deleted after
+-- the edges, in the order the connector writes them, so that a write and a
+-- prune do not deadlock; the protocols of the edges deleted go with them
+-- (ON DELETE CASCADE), up to 15 rows each, which ROW_COUNT does not count.
 CREATE OR REPLACE FUNCTION shawk.prune(cutoff timestamptz, max_rows integer DEFAULT 10000) RETURNS bigint
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -76,12 +79,12 @@ DECLARE
 BEGIN
   PERFORM pg_advisory_xact_lock_shared(1936220535);  -- 0x73686177, see Migrate
 
-  DELETE FROM shawk.edge_protocols WHERE last_seen < cutoff AND ctid IN (
-    SELECT ctid FROM shawk.edge_protocols WHERE last_seen < cutoff LIMIT max_rows);
-  GET DIAGNOSTICS n = ROW_COUNT; total := total + n;
-
   DELETE FROM shawk.edges WHERE last_seen < cutoff AND id IN (
     SELECT id FROM shawk.edges WHERE last_seen < cutoff LIMIT max_rows);
+  GET DIAGNOSTICS n = ROW_COUNT; total := total + n;
+
+  DELETE FROM shawk.edge_protocols WHERE last_seen < cutoff AND ctid IN (
+    SELECT ctid FROM shawk.edge_protocols WHERE last_seen < cutoff LIMIT max_rows);
   GET DIAGNOSTICS n = ROW_COUNT; total := total + n;
 
   DELETE FROM shawk.unix_edges WHERE last_seen < cutoff AND id IN (

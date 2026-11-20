@@ -338,7 +338,7 @@ func (b *hostBatch) addMetric(m pmetric.Metric) {
 // logged as rarely; a protocol of another edge than TCP is invalid.
 func (b *hostBatch) addWire(a pcommon.Map, first bool, t time.Time) {
 	p := getString(a, attrWireProtocol)
-	if getString(a, attrTransport) != "tcp" {
+	if getString(a, attrTransport) != "tcp" || p == "" {
 		b.invalid++
 		return
 	}
@@ -587,7 +587,14 @@ func forGauge(b *hostBatch, m pmetric.Metric, f func(pmetric.NumberDataPoint, ti
 	for i := range dps.Len() {
 		dp := dps.At(i)
 		b.observe(dp.Timestamp())
-		f(dp, time.Unix(int64(numberValue(dp)), 0).UTC())
+		// A time before 1970 is no time an agent sends, and one far before
+		// would make PostgreSQL refuse the changes of the host.
+		v := numberValue(dp)
+		if !(v >= 0) || !validValue(v) {
+			b.invalid++
+			continue
+		}
+		f(dp, time.Unix(int64(v), 0).UTC())
 	}
 }
 

@@ -166,13 +166,15 @@ SELECT client_host, client_service, port, last_seen, client_observed_until, obse
 FROM shawk_v1.dependencies_between(now() - interval '90 days', now())
 WHERE server_host = 'db-01' AND server_service = 'postgres';
 
--- Which clients of PostgreSQL on 10.0.0.5 do not ask for TLS, and which
--- clients of 10.0.0.5:443 offer TLS below 1.2 (agents with
--- -classify-protocols)? Rows of the server side name the client by its
--- address.
-SELECT role, host, service, client_addr, port, protocol, last_seen
+-- Which clients of PostgreSQL on 10.0.0.5 opened connections without
+-- asking for TLS in the last 30 days, and which clients of 10.0.0.5:443
+-- offered TLS below 1.2 (agents with -classify-protocols)? last_seen is
+-- the last new connection that showed the protocol. Rows of role 'server'
+-- tell what the server chose instead, and also name the clients without
+-- an agent by their address.
+SELECT host, service, client_addr, port, protocol, last_seen
 FROM shawk_v1.edge_protocols
-WHERE server_addr = '10.0.0.5' AND last_seen > now() - interval '30 days'
+WHERE role = 'client' AND server_addr = '10.0.0.5' AND last_seen > now() - interval '30 days'
   AND ((port = 5432 AND protocol = 'postgres') OR (port = 443 AND protocol IN ('tls_1_0', 'tls_1_1')));
 
 -- When was db-01 not observed, or only partly?

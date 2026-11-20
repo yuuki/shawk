@@ -42,8 +42,9 @@ const (
 	MetricAgentSegmentStart = "shawk.agent.segment.start"
 	MetricAgentUDPTraced    = "shawk.agent.udp.traced"
 	MetricAgentUnixTraced   = "shawk.agent.unix.traced"
-	// MetricAgentProtocolsClassified tells whether the agent classifies
-	// the wire protocols of TCP connections (-classify-protocols).
+	// MetricAgentProtocolsClassified tells, of an agent asked to classify
+	// the wire protocols of TCP connections (-classify-protocols), whether
+	// it does; others do not send it.
 	MetricAgentProtocolsClassified = "shawk.agent.protocols.classified"
 	MetricAgentFlowsDropped        = "shawk.agent.flows.dropped"
 	MetricAgentCgroupsDropped      = "shawk.agent.cgroup_events.dropped"

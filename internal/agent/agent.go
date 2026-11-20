@@ -510,6 +510,7 @@ func (a *Agent) request(now time.Time) ([]*colmetricspb.ExportMetricsServiceRequ
 		NetNSScope:          a.netnsScope(),
 		UDPTraced:           a.tracer.UDPEnabled(),
 		UnixTraced:          a.tracer.UnixEnabled(),
+		ProtocolsRequested:  a.cfg.ClassifyProtocols,
 		ProtocolsClassified: a.tracer.ProtocolsEnabled(),
 		FlowsDropped:        a.drops,
 		CgroupEventsDropped: a.cgroupDrops,

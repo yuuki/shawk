@@ -162,8 +162,10 @@ func outErrorType(t string) string {
 // wireProtocols are the values of shawk.wire_protocol that agents send:
 // the protocols the first payload of a TCP connection shows, a copy of
 // those of internal/otlp, which must be kept in sync, and of the check of
-// shawk.edge_protocols. A point with another value is invalid, so that an
-// agent cannot make a row per value.
+// shawk.edge_protocols. A point with another value is left out, so that an
+// agent cannot make a row per value: it is dropped like a metric of the
+// agent the connector does not know, as of a newer agent, and a point
+// without a value is invalid.
 var wireProtocols = map[string]bool{
 	"unknown": true, "tls": true, "tls_1_0": true, "tls_1_1": true, "tls_1_2": true, "tls_1_3": true, "http1": true,
 	"http2_grpc": true, "ssh": true, "postgres": true, "mysql": true, "redis": true, "slurm_rpc": true,

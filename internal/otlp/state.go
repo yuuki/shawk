@@ -174,8 +174,9 @@ type Edge struct {
 	FailStart [len(FailReasons) + 1]time.Time
 	// Protocols are when a connection of each of WireProtocols was first
 	// and last seen, at the end of the intervals that saw them; zero for
-	// those not seen.
-	Protocols [len(WireProtocols)]Seen
+	// those not seen. Nil until the edge sees one, so that the edges of an
+	// agent that does not classify hold a pointer only.
+	Protocols *[len(WireProtocols)]Seen
 }
 
 // Seen is when something was first and last seen.
@@ -228,7 +229,10 @@ func (s *State) AddEdge(k EdgeKey, st EdgeStats, start, end time.Time) {
 			e.FailStart[i] = start
 		}
 	}
-	for i := range e.Protocols {
+	if st.Protocols != 0 && e.Protocols == nil {
+		e.Protocols = new([len(WireProtocols)]Seen)
+	}
+	for i := range len(WireProtocols) {
 		if st.Protocols&(1<<i) == 0 {
 			continue
 		}

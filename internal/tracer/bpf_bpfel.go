@@ -111,7 +111,7 @@ type bpfShawkSockState struct {
 	Walked      uint32
 	Peek        uint32
 	PeekPrefix  uint32
-	Pad         uint32
+	PeekSeq     uint32
 }
 
 type bpfShawkUdpKstate struct {
