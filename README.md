@@ -182,6 +182,9 @@ Observation of the hosts that tell
 HOST   ROLE    OBSERVED  NOT OBSERVED  GAPS  PARTLY OBSERVED  NO UDP  NO UNIX  ONE NETNS
 db-01  target  100%      0s            0     0s               0s      0s       0s
 and 3 clients observed all along
+
+Only TCP, UDP and Unix stream sockets are observed: a host used over RDMA, or less
+often than the period, looks unused (docs/design.md, sections 6.3 and 10).
 ```
 
 - `UNSAFE`: something used the target in the period. The cadence of each
