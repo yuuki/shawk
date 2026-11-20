@@ -37,6 +37,21 @@ func (c *Containers) podmanNames() map[string]string {
 	c.podmanMu.Lock()
 	defer c.podmanMu.Unlock()
 	ix := &c.podman
+	stamps := c.storageLists()
+	if ix.names != nil && maps.Equal(stamps, ix.files) {
+		return ix.names
+	}
+	names := map[string]string{}
+	for p := range stamps {
+		c.addStorageNames(names, p)
+	}
+	ix.files, ix.names = stamps, names
+	return names
+}
+
+// storageLists returns the lists of the containers of containers/storage
+// that exist, by path, each with what tells whether it changed.
+func (c *Containers) storageLists() map[string]fileStamp {
 	stamps := map[string]fileStamp{}
 	for _, root := range storageRoots {
 		for _, list := range []string{"containers.json", "volatile-containers.json"} {
@@ -53,25 +68,25 @@ func (c *Containers) podmanNames() map[string]string {
 			}
 		}
 	}
-	if ix.names != nil && maps.Equal(stamps, ix.files) {
-		return ix.names
+	return stamps
+}
+
+// addStorageNames adds to names the names of the containers that the list
+// of containers/storage at p holds, by id. A list that cannot be read or
+// decoded adds none.
+func (c *Containers) addStorageNames(names map[string]string, p string) {
+	var list []struct {
+		ID    string   `json:"id"`
+		Names []string `json:"names"`
 	}
-	names := map[string]string{}
-	for p := range stamps {
-		var list []struct {
-			ID    string   `json:"id"`
-			Names []string `json:"names"`
-		}
-		if b := c.readFile(p); b != nil && json.Unmarshal(b, &list) == nil {
-			for _, e := range list {
-				if len(e.Names) > 0 {
-					names[e.ID] = e.Names[0]
-				}
-			}
+	if b := c.readFile(p); b == nil || json.Unmarshal(b, &list) != nil {
+		return
+	}
+	for _, e := range list {
+		if len(e.Names) > 0 {
+			names[e.ID] = e.Names[0]
 		}
 	}
-	ix.files, ix.names = stamps, names
-	return names
 }
 
 // readPodman reads the name of a container from the lists of
