@@ -578,40 +578,13 @@ func (c *changes) bound(max int, now time.Time) (hosts, rows int) {
 func (c *changes) expire(now time.Time) {
 	expireAccepted(c.acceptedEdges, now, c.ttl)
 	for host, edges := range c.acceptedWire {
-		for k, acc := range edges {
-			for p, a := range acc {
-				if now.Sub(a.seen) > c.ttl {
-					delete(acc, p)
-				}
-			}
-			if len(acc) == 0 {
-				delete(edges, k)
-			}
-		}
+		expireAccepted(edges, now, c.ttl)
 		if len(edges) == 0 {
 			delete(c.acceptedWire, host)
 		}
 	}
-	for host, m := range c.acceptedListeners {
-		for k, a := range m {
-			if now.Sub(a.seen) > c.ttl {
-				delete(m, k)
-			}
-		}
-		if len(m) == 0 {
-			delete(c.acceptedListeners, host)
-		}
-	}
-	for host, m := range c.acceptedTranslations {
-		for k, a := range m {
-			if now.Sub(a.seen) > c.ttl {
-				delete(m, k)
-			}
-		}
-		if len(m) == 0 {
-			delete(c.acceptedTranslations, host)
-		}
-	}
+	expireAccepted(c.acceptedListeners, now, c.ttl)
+	expireAccepted(c.acceptedTranslations, now, c.ttl)
 	for host, f := range c.floors {
 		if now.Sub(f.seen) > c.ttl {
 			delete(c.floors, host)
@@ -619,17 +592,17 @@ func (c *changes) expire(now time.Time) {
 	}
 }
 
-// expireAccepted forgets the spans of m not reported for ttl, and the hosts
-// left without any.
-func expireAccepted[K comparable](m map[string]map[K]acceptedSpan, now time.Time, ttl time.Duration) {
-	for host, acc := range m {
+// expireAccepted forgets the spans of m not reported for ttl, and the owners
+// left without any: the hosts, or the edges of the wire protocols of a host.
+func expireAccepted[O, K comparable](m map[O]map[K]acceptedSpan, now time.Time, ttl time.Duration) {
+	for owner, acc := range m {
 		for k, a := range acc {
 			if now.Sub(a.seen) > ttl {
 				delete(acc, k)
 			}
 		}
 		if len(acc) == 0 {
-			delete(m, host)
+			delete(m, owner)
 		}
 	}
 }
