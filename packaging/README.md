@@ -140,12 +140,63 @@ Set `SHAWK_GRAFANA_PROMETHEUS_PASSWORD` and put the CA of Prometheus at
 `/etc/grafana/tls/prometheus-ca.crt`, then adjust the URLs and credentials
 in `grafana/provisioning/datasources/shawk.yaml`.
 
+## Before removing a host
+
+`shawk-impact`, in the `shawk-collector` packages and the image, tells
+what removing a host, or a service or a port of it, would break, from
+PostgreSQL ([design §6.3](../docs/design.md#63-impact-of-removing-a-host-or-a-service)):
+
+```sh
+shawk-impact -dsn-file /etc/shawk/impact-dsn -host db-01                       # the whole host, over 90 days
+shawk-impact -dsn-file /etc/shawk/impact-dsn -host db-01 -service postgres -port 5432 -lookback 26w
+shawk-impact -dsn-file /etc/shawk/impact-dsn -host db-01 -json | jq .verdict
+```
+
+- It reads `shawk_v1` and writes nothing: give it the connection string
+  of a role with the privileges of `shawk_grafana`, in a file only its
+  users read, not that of `shawk_connector`.
+- Its exit status is the verdict: 0 `SAFE`, 3 `UNSAFE`, 4 `INCONCLUSIVE`
+  (1 for a failure, 2 for an invalid command line), so a runbook or a
+  pipeline can refuse to go on unless it is 0.
+- `SAFE` takes an agent on the host that observed over the whole period:
+  a host without an agent, or a name that no agent reported under, is
+  `INCONCLUSIVE` at best. A period longer than the history of the agent
+  is not watched in full either. `-min-coverage 99.9` accepts gaps, which
+  the report then lists.
+- The period (`-lookback`, 90 days) must be longer than the rarest job
+  that matters: a job of every quarter is not a dependent over 90 days in
+  which it did not run.
+- The cadence of a dependent (`continuous`, `daily`, `weekly`, `monthly`,
+  ...) is read from the hours in which it was active, which connectors
+  record from this version on: it is `unknown` for what was last active
+  before the connectors were upgraded, and until a dependency has a day,
+  or three runs, of hours.
+
+The dashboard **shawk / Impact** shows the same for a whole host over the
+time range, and the functions take the place of both in SQL:
+
+```sql
+SELECT * FROM shawk_v1.impact_verdict('db-01', now() - interval '90 days', now(), target_service => 'postgres');
+SELECT * FROM shawk_v1.impact('db-01', now() - interval '90 days', now(), target_service => 'postgres');
+SELECT * FROM shawk_v1.coverage(now() - interval '90 days', now(), ARRAY['db-01', 'app-01']);
+```
+
+A period of months over a large fleet may take longer than the 30
+seconds `setup.sql` gives the statements of `shawk_grafana`: the panels
+then fail, and `shawk-impact` sets its own limit (`-timeout`).
+
 ## Upgrading
 
 The connector of the example does not migrate (`migrate: false`). It waits
 until the schema is at least its own version, and warns when the schema is
 newer. Run `shawk-migrate` and `grants.sql` before or while upgrading the
 collectors, and upgrade all of them, along with the agents.
+
+Migration 0003 adds the hours in which each dependency was active
+(`shawk.edge_activity`), which the connectors record from then on: about
+190 bytes per edge, a side of a dependency, and month in which it was
+active, for the retention. A connector of an earlier version writes none, so upgrade all
+the connectors before reading cadences (`shawk-impact`).
 
 ## HPC clusters
 

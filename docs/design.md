@@ -70,7 +70,8 @@ throughout and still be used (§10).
   `service.peer.name`, `server.port`, `network.transport`, `host.id`),
   never by a cross-database join.
 - Grafana is the user interface; dashboards and alerts are in `packaging/`
-  (§8).
+  (§8). `shawk-impact` reads PostgreSQL to tell what removing a host would
+  break (§6.3).
 
 shawk promises two contracts: the views and functions of the PostgreSQL
 schema `shawk_v1`, and the names and labels of its metrics in Prometheus.
@@ -925,6 +926,42 @@ name rather than addresses and a port; a listener of a Unix socket
 whose owner is not known is not written, and a server edge of a Unix
 socket is invalid.
 
+An edge keeps when it was first and last seen, not what happened in
+between: a job of every month and a connection that never closes are the
+same row. The hours in which an edge was active are therefore kept beside
+it, in `edge_activity` (`unix_edge_activity` for Unix sockets): a row per
+edge and month with a bit per hour of the month, in UTC. An agent sends
+the time it last saw an edge active, the end of an interval, in every
+request, and the time it first did; the connector sets the hours of those
+times when the edge is new to it and whenever a time moves into another
+hour, so an edge that stays active is written with its hour once an hour
+rather than at every write. The upsert sets bits and clears none: replays,
+reordering and several connectors give the same result, as for the times
+of the edges, and the hours of changes that were dropped are set again
+from what the agent still sends. The cadence of a dependency is read from
+these hours (§6.3).
+
+- **Why a bit per hour and a row per month.** A row per run of activity
+  would have no bound (26000 rows a year for a job of every 20 minutes),
+  and a row per edge and day costs 30 times the rows for an edge that is
+  always active. A month of hours is at most one row per edge and month,
+  about 190 bytes with its index: 12 rows a year for an edge active all
+  along, and one for an edge seen once.
+  `shawk.prune()` deletes the months that ended before the retention, and
+  the months of an edge go with it.
+- **What a bit tells.** A bit that is not set tells that no agent
+  reported the edge active in that hour. That is not idle where the host
+  was not observed (§6.3), nor before the first bit of an edge written
+  before migration 0003: the hours of the past cannot be derived. An hour
+  is the resolution: a job of every hour sets every bit, like a connection
+  that stays open, whose edge is active in every interval, also without
+  traffic.
+- **What is not set.** The hours between two requests more than an hour
+  apart that the agent sent in one session, as when its requests fail
+  for longer while its idle TTL is above an hour: the agent then tells
+  only when the edge was last active. With the default idle TTL of 15
+  minutes the session ends first, and the time shows as not observed.
+
 The request that closes an interval upserts the segment into
 `agent_sessions`, with `last_heartbeat` the time the connector received it,
 and the host's addresses, one row per period held (a period ends after 5
@@ -1375,7 +1412,9 @@ connector holds, so the connector bounds it:
   of an edge that is not of TCP is invalid.
 - Pending rows (`max_pending_rows`, 10 million), kept while writes fail or
   the schema is not ready. Beyond the bound, the changes of the hosts
-  pending longest are dropped whole, as with rejected rows (§5.1).
+  pending longest are dropped whole, as with rejected rows (§5.1). The
+  hours of activity of an edge (§5.1) are a pending row of 93 bytes of
+  bits per month, however long the writes fail within the month.
 
 Agent strings are cut to 4096 bytes and `shawk.peer.internal` to 4096
 ranges. The defaults are far above what one connector serves and what a
@@ -1549,7 +1588,9 @@ processes(id, host_id, unit, comm, exe, service_name, user_id, first_seen, last_
 edges(id, host_id, process_id, role, proto, local_addr, remote_addr, port, netns, first_seen, last_seen)
   -- remote_addr is the network 0.0.0.0/0 or ::/0 for folded peers
 edge_protocols(edge_id, protocol, first_seen, last_seen)  -- wire protocols of TCP edges (§3.9), pruned alone or with their edge
+edge_activity(edge_id, month, hours)  -- the hours of a month in which an edge was active, a bit each (§5.1)
 unix_edges(id, host_id, process_id, path, netns, first_seen, last_seen)  -- clients of Unix sockets (§3.8)
+unix_edge_activity(edge_id, month, hours)  -- the same for the edges of Unix sockets
 unix_listeners(host_id, process_id, path, netns, first_seen, last_seen)  -- every known owner of a listening Unix socket
 listeners(host_id, process_id, proto, addr, port, netns, first_seen, last_seen)  -- the latest owner
 listener_owners(host_id, process_id, proto, addr, port, netns, first_seen, last_seen, kernel_chosen_seen)
@@ -1617,6 +1658,9 @@ names in PostgreSQL and Prometheus match.
 | `edge_protocols` | the wire protocols of TCP edges (§3.9), one row per edge and protocol: `host`, `host_id`, `service`, `unit`, `role` and `proto` of the side that saw it, `client_addr` and `server_addr` whichever side that was (a network for folded peers), `port`, `netns`, `protocol`, `first_seen`, `last_seen`. A client tells what it offers or asks for, a server what it chose. `last_seen` is the end of the last interval in which a new connection showed the protocol, not the last use of the edge. An edge without rows had no connection classified; `protocols_classified` of `agents` tells whether its agent classifies. The clients of PostgreSQL at 10.0.0.5 that do not ask for TLS: `WHERE role = 'client' AND server_addr = '10.0.0.5' AND port = 5432 AND protocol = 'postgres'`. Rows of `role` `server` tell what the server chose (`postgres` also for a client that asked for TLS and was refused), and give the address of the client, also of one without an agent, which `dependencies` names on `client_addr`, `server_addr` and `port` |
 | `job_edges` | the edges of the processes of Slurm jobs, those to Unix sockets included (with `path`), with the user of the process (`user_id`, NULL if unknown), host, unit, service and executable: which users connected to what, and when. For administrators: only its owner reads it (below) |
 | `dependencies_between(since, until)`, `graph_edges_between`, `graph_nodes_between`, `dependency_changes_between` | the same for the dependencies active in a period. They take the edges active in the period with a margin of 15 minutes before matching, so a recent window does not scan the history (about 0.3 s instead of 3 s with a million edges) and both sides of a connection are matched at the edges of the period; the dashboards and alerts use them. A dependency appeared in a period when it was first seen in it and is not in `known_dependencies` from before it, so one that comes back on new edges (a new container, an hourly job) did not appear |
+| `impact(target_host, since, until, target_service, target_port, target_proto, max_depth)` | what removing a host would break (§6.3): its dependents in the period, one row per dependent, server and port. `depth` is 1 for the clients of the target and n for the clients of a dependent of depth n-1, up to `max_depth` (3; 1 to 10); `client_host`, `client_service` and, for a client without an agent, `client_addr`, with the name of its address as its service and the host the inventory gives the address; `server_host`, `server_service` (NULL if unknown), `port` (0 under the rules of ports, §5.3) and `proto`; `first_seen`, `last_seen`, `observed_by`; `cadence` (`continuous`, `daily`, `weekly`, `monthly`, `periodic`, `irregular`, `one-off`, `dormant` or `unknown`), `period` and `next_expected` of a dependent with a period, and `runs`. `target_service`, `target_port` and `target_proto` (NULL by default) narrow the target to a service, a port and a transport |
+| `impact_verdict(target_host, since, until, target_service, target_port, target_proto, min_coverage, max_depth, tolerance)` | whether the target can be removed (§6.3), one row: `verdict` is `UNSAFE` (it has dependents), `INCONCLUSIVE` (none was seen, but its agent did not observe it for `min_coverage` of the period, 1 by default) or `SAFE`; `reasons` tell why (`active_dependents`; `unknown_host`, `no_agent`, `not_observed`, `dropped_flows`, `netns_limited`, `udp_not_traced`, `unix_not_traced`) and `caveats` the same shortfalls where they did not decide the verdict; `direct` and `transitive` count the dependents of depth 1 and beyond; `coverage` is the part of the period, from 0 to 1 and cut rather than rounded, in which the target was observed in full; `unobserved`, `gaps` and `partly_observed` as in `coverage()`. It fails for a period that is empty and for a `min_coverage` that is not above 0 and up to 1 |
+| `coverage(since, until, hosts, tolerance)` | how much of a period each host of `hosts` (every host that reported since `since` if NULL) was observed, by name as `unobserved_by_name()`: `host`, `agent` (false for a name no agent reported under), `observed` (from 0 to 1, cut), `unobserved` and its `gaps`, `partly_observed` and `dropped_flows` (`partly_observed()`), and the time observed without UDP (`udp_untraced`), without Unix sockets or by an agent that does not tell (`unix_untraced`), or in one network namespace only (`netns_limited`) |
 
 The connector role writes `shawk` and reads `shawk_v1`; Grafana reads
 `shawk_v1` only (`packaging/postgres`). Neither may create objects in the
@@ -1639,6 +1683,162 @@ different users are rows of their own, and so are their edges:
 they would have one, so their readers, Grafana included, can count the
 users of the executable of a job and tell when each was active. Views of
 their own jobs for users would be designed separately.
+
+### 6.3 Impact of removing a host or a service
+
+Before a host or a service is removed, three questions are asked together:
+what used it, how often, and was anyone watching? `impact()`,
+`impact_verdict()` and `coverage()` answer them over a period, and
+`shawk-impact` prints the answers (§8).
+
+They are in the contract, in SQL, so that Grafana, psql and the command
+give the same answer and nothing holds a second copy of the rules: the
+command only formats. It is a command of the collector module, shipped
+with the collector like `shawk-migrate`, not a subcommand of `shawk`: the
+agent has no database driver and holds no database credentials (§2), and a
+subcommand would add both to the binary that runs as root on every host.
+
+**The target** is a host by name, the `host.name` of its agent or its name
+in the inventory, narrowed or not to a service (`[namespace/]name`), a port
+and a transport. A name stands for all the host ids that had it, as in
+`unobserved_by_name()`.
+
+**Dependents.** The dependencies of the period are those of
+`dependencies_between()`, read once: the matching of the two sides, the
+translations and the Unix sockets are those of the dashboards, with their
+limits (§10), and so is the cost, about twice: where
+`dependencies_between()` takes 2 seconds for the 270000 dependencies of 90
+days, the verdict takes 4, and the dependents with their cadences 6 for
+7000 of them. The edges, the hours, the sessions and the addresses of the
+hosts found are read through their indexes. From the dependencies:
+
+- **The server of a dependency that its client alone saw**, as when the
+  server has no agent or its agent did not observe then, is found by its
+  address: the host that held the address while the dependency was active
+  in the period, the host of the client for loopback and for an address
+  the client holds too (the gateway of a container bridge), or the host
+  the inventory gives the address. Its service is the latest owner of a
+  listener on the port seen since the start of the period, none if no
+  listener is known. Such a dependency counts for the host and for the
+  port, and for a service only if that service owned the port, so that a
+  probe of a port nothing listens on is not a dependent of every service
+  of the host; on a target without an agent, of which no listener is
+  known, it counts for any service.
+- **A client is a dependent unless it is part of the target.** With the
+  whole host as the target, a client on the host is part of it: by its
+  name, by loopback, or by an address the host held when the dependency
+  was last seen, so that an address another host took since is that
+  host's. Otherwise every host would depend on itself (a resolver, sshd).
+  With a service or a port as the target, only the service itself is: its
+  clients on the same host, a backup over loopback or an application on
+  the Unix socket, break when it goes and the host stays.
+- **A dependent with an agent is followed**: the clients of its service on
+  its host are the dependents of the next depth, up to `max_depth`. Each
+  dependent is reported once, at the depth it is first reached, with the
+  dependencies that reach it there; a cycle ends at a dependent already
+  reached. The walk reads the dependencies of the period once per depth,
+  10 at most, so they bound its size. A client without an agent, an
+  address or the folded clients `~external`, is a dependent and is not
+  followed: what depends on it is not known.
+
+**Cadence.** How often a dependent uses its server is read from the hours
+of activity of its edges (§5.1), the client's and the server's together,
+in the period:
+
+- *blind* time is the time in which no agent that sees the dependency
+  observed its host, widened to whole hours: an hour that was not observed
+  in full is neither active nor idle;
+- a *run* is a stretch of active hours that follow each other; blind time
+  between two active hours does not end it, since the dependency may have
+  been active then;
+- the *gap* of two runs is the time between the end of one and the start
+  of the next, their *interval* the time between their starts;
+- *idle* is the time observed since the end of the last run, and *duty*
+  the part of the time observed since the start of the first run in which
+  the dependency was active.
+
+The first rule that holds gives the cadence (`shawk.cadence()`):
+
+| cadence | rule |
+|---|---|
+| `unknown` | no run: no hour was recorded |
+| `continuous` | idle for an hour at most, observed for a day at least since the first run, and a duty of 0.9 at least |
+| `unknown` | one run, idle for an hour at most: too recent to tell |
+| `one-off` | one run, shorter than a day, that ended |
+| `dormant` | one run of a day at least that ended; or several runs, and idle for longer than a day and than twice the longest gap |
+| `unknown` | two runs: one interval tells no period |
+| `daily`, `weekly`, `monthly`, `periodic` | two thirds of the intervals at least are within 25% of their median, and the median run lasts half of it at most: `daily` for a median of 20 to 28 hours, `weekly` for 6 to 8 days, `monthly` for 27 to 32 days, `periodic` otherwise |
+| `irregular` | anything else |
+
+A dependent of the last four has a `period`, the median interval, and
+`next_expected`, the start of its last run plus the period.
+
+- **An hour is the resolution**, so a job of every hour or more often is
+  `continuous`: for a removal both break within the hour. A job of every
+  two hours is `periodic`.
+- **`unknown` rather than a guess** when there is too little to tell: no
+  hour recorded, as for edges written before the hours were; fewer than
+  three runs; less than a day observed. It is also the cadence of a
+  dependency whose hours end before it was last seen: a connector that
+  does not record them wrote the edge since, and the hours would read as
+  idle.
+- **The period is the evidence.** A job of every month is `monthly` over
+  three months, `unknown` over two, and absent over a week in which it did
+  not run: the period must be longer than the cadences that matter.
+- **`next_expected` is an estimate**, for telling what breaks first, not a
+  schedule: a job of the weekdays is expected on Saturday, and the first
+  of the month is 28 to 31 days away. One that is past is overdue, or was
+  not observed.
+- **`dormant` and `one-off` are still dependents**: they used the target
+  in the period. Their cadence tells that they stopped, which is for the
+  reader to weigh.
+
+**Verdict.** `impact_verdict()` gives, in this order:
+
+| verdict | when |
+|---|---|
+| `UNSAFE` | the target has a dependent of depth 1 |
+| `INCONCLUSIVE` | no dependent was seen, and the target was not watched for `min_coverage` of the period, or no agent ever reported under its name |
+| `SAFE` | no dependent was seen, and the target was watched |
+
+- **A dependent is evidence whatever the coverage**, so `UNSAFE` comes
+  first; with gaps the dependents listed may not be all, which `caveats`
+  tells.
+- **No dependent is evidence only where someone watched**: what nobody
+  observed may have been used. Who must have watched is the agent of the
+  target. It sees every connection the target accepts, from clients with
+  and without an agent, so its observation can show that nothing used the
+  target. The agents of the clients cannot, however many they are: a
+  client without an agent, or one never seen before, would be missed. So a
+  target no agent ever reported under is never `SAFE`: the reason is
+  `unknown_host`, which a misspelt name gives too, or `no_agent` for a
+  host of the inventory, whose clients with an agent still make it
+  `UNSAFE`.
+- **The coverage** is the part of the period in which the agent of the
+  target observed all that the target covers: observed (the gaps of
+  `unobserved_by_name()`, so a period that starts before the first agent
+  or before the retention has a gap), without dropped flows
+  (`partly_observed()`), in every network namespace, with UDP unless the
+  target is of another transport, and with Unix sockets when the target is
+  a service without a port, whose clients on the host may use one.
+- **`min_coverage` is 1 by default**: any gap beyond the tolerance of the
+  delay of writes (3 minutes, as in `unobserved()`) makes the verdict
+  `INCONCLUSIVE`, and the gaps are listed. A gap of minutes in 90 days may
+  hold the only run of a job of every month, and nothing tells that it does
+  not. A caller who accepts the gaps says so (`min_coverage => 0.999`) and
+  gets `SAFE` with the shortfalls as `caveats`. The coverage is compared
+  as it is and reported cut, not rounded: 1 is all of the period.
+- **Planned stops (§5.7) are gaps like the others.** An agent stopped on
+  purpose did not observe either, and only a host that was off could not
+  be used, which a maintenance window does not tell. The reasons of the
+  gaps are in `unobserved_reasons()`.
+- **The observation of the hosts of the dependents** does not decide the
+  verdict. `coverage()` reports it: where the agent of a dependent did not
+  observe, its cadence and what depends on it may be wrong.
+
+The verdict is of what shawk observes (§10): a host used over RDMA, or
+less often than the period, is not seen to be used, and what uses it
+through a relay that no translation describes shows as the relay.
 
 ## 7. Counting each dependency once
 
@@ -1689,11 +1889,11 @@ side also counts the clients that run an agent.
 ## 8. Grafana
 
 `packaging/grafana` holds data sources, dashboards (fleet, dependency map,
-dependency details, peer hosts, changes, application layer of OBI) and
-alert rules. The peer hosts dashboard needs `peer_hosts` (§5.3): the hosts
-towards the selected services, and failures, connect times and traffic by
-peer host; a host that accepts no connection, such as one that is down,
-shows a failure ratio of 100%. With `networks`, a table gives the
+dependency details, peer hosts, changes, impact, application layer of OBI)
+and alert rules. The peer hosts dashboard needs `peer_hosts` (§5.3): the
+hosts towards the selected services, and failures, connect times and
+traffic by peer host; a host that accepts no connection, such as one that
+is down, shows a failure ratio of 100%. With `networks`, a table gives the
 connections and bytes of the selected services by the networks of the
 client and the server.
 
@@ -1752,6 +1952,23 @@ services on ports the kernel chose that no rule of ports covers
 range. The fleet dashboard shows the traffic of the RDMA
 ports of each host (`shawk.agent.rdma.io`) below the observation periods,
 as a hint only (§10).
+
+The impact dashboard answers, for a host and the time range (90 days by
+default), what `shawk_v1.impact_verdict()`, `impact()` and `coverage()`
+tell (§6.3): the verdict with its reasons, the dependents with their
+cadence, how the host was observed, and its gaps with their reasons
+(`unobserved_reasons()`). It does not refresh by itself: the verdict and
+the dependents each cost about twice the dependencies of the whole time
+range (§6.3).
+
+`shawk-impact` prints the same for a host, or for a service or a port of
+it, as text or JSON, and exits with the verdict: 0 for `SAFE`, 3 for
+`UNSAFE` and 4 for `INCONCLUSIVE`, so that a script can make a removal wait
+for it. It reads the three functions in one read-only transaction, as any
+role that reads `shawk_v1` (`shawk_grafana`), with the end of the period
+at the clock of the database, with which the heartbeats are compared. It
+sets its own `statement_timeout` (`-timeout`, 2 minutes), since the 30
+seconds of Grafana are short for months of a large fleet.
 
 ## 9. OBI
 
@@ -1955,6 +2172,25 @@ only the protocols it parses. shawk runs beside it:
   without a protocol is no evidence of clear text, even from an agent that
   classifies. The signatures are matched on the first bytes, so a protocol
   that starts like another one is taken for it, and others are `unknown`.
+- **The impact of removing a host** (§6.3) is told from what was observed
+  in the period asked for. A client that used the target before it, or
+  that uses it less often than the period, is not a dependent, and the
+  verdict is `SAFE` if the target was watched; the period must be longer
+  than the rarest job that matters. A target is never `SAFE` without an
+  agent of its own, however well its clients were observed. A client
+  behind a relay that no translation describes (§5.4) is a dependent of
+  the relay, not of the servers behind it, and the relay shows as a
+  client of the server by its address. The servers of a dependency that
+  only its client saw are found by the addresses hosts held, which agents
+  report unverified (below). Names stand for hosts: two machines that share
+  a name are one target, and hide each other's gaps. Cadences have the
+  resolution of an hour and start when the connectors were upgraded to
+  record the hours (migration 0003): a dependency is `unknown` until it
+  has three runs, or a day, of hours; a connector of an earlier version
+  that still writes makes the cadences of its hosts `unknown`. Planned
+  stops count as gaps. The walk follows the dependents of dependents by
+  service and host, not by request: a dependent of depth 2 uses a service
+  that uses the target, which need not be on its path.
 - **Clocks**: first and last seen times come from each host's clock, capped
   at 2 minutes ahead of the connector (§5.1), as does the segment start;
   heartbeats come from the connector's clock, compared with PostgreSQL's.
