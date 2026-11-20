@@ -1037,8 +1037,31 @@ FROM (SELECT now() - make_interval(secs => $1) AS c) t`,
 
 func (s *pgStore) peers(ctx context.Context, learnedTTL, formerWindow time.Duration) (peerRows, error) {
 	var out peerRows
-	// The endpoints name the peers of the outputs only, so the processes of
-	// Slurm jobs are named as Prometheus names them (process.peerName).
+	var err error
+	if out.endpoints, err = s.serviceEndpoints(ctx); err != nil {
+		return out, err
+	}
+	if out.clients, err = s.clientEndpoints(ctx); err != nil {
+		return out, err
+	}
+	if out.agents, err = s.agentAddrs(ctx); err != nil {
+		return out, err
+	}
+	if out.unix, err = s.unixEndpoints(ctx); err != nil {
+		return out, err
+	}
+	if out.learned, err = s.learnedTranslations(ctx, learnedTTL); err != nil || formerWindow == 0 {
+		return out, err
+	}
+	out.former, err = s.formerHolders(ctx, formerWindow)
+	return out, err
+}
+
+// serviceEndpoints reads the endpoints of services. The endpoints name the
+// peers of the outputs only, so the processes of Slurm jobs are named as
+// Prometheus names them (process.peerName).
+func (s *pgStore) serviceEndpoints(ctx context.Context) ([]endpointRow, error) {
+	var out []endpointRow
 	err := queryRows(ctx, s.pool, `SELECT host(addr), port, proto, host_id, service, last_seen, exact, slurm_job
 FROM shawk_v1.service_endpoints`,
 		func(rows pgx.Rows) error {
@@ -1054,15 +1077,18 @@ FROM shawk_v1.service_endpoints`,
 			}
 			if a, err := netip.ParseAddr(addr); err == nil {
 				e.key.addr, e.key.port = a.Unmap(), uint16(port)
-				out.endpoints = append(out.endpoints, e)
+				out = append(out, e)
 			}
 			return nil
 		})
-	if err != nil {
-		return out, err
-	}
-	// A folded server address, a network, is no server.
-	err = queryRows(ctx, s.pool, `SELECT host(client_addr), host(server_addr), port, proto, host_id, service, last_seen, slurm_job
+	return out, err
+}
+
+// clientEndpoints reads the client sides of connections, named like the
+// endpoints of services. A folded server address, a network, is no server.
+func (s *pgStore) clientEndpoints(ctx context.Context) ([]clientRow, error) {
+	var out []clientRow
+	err := queryRows(ctx, s.pool, `SELECT host(client_addr), host(server_addr), port, proto, host_id, service, last_seen, slurm_job
 FROM shawk_v1.client_endpoints
 WHERE masklen(server_addr) = CASE family(server_addr) WHEN 4 THEN 32 ELSE 128 END`,
 		func(rows pgx.Rows) error {
@@ -1081,14 +1107,18 @@ WHERE masklen(server_addr) = CASE family(server_addr) WHEN 4 THEN 32 ELSE 128 EN
 			if err1 == nil && err2 == nil {
 				c.key.client, c.key.server, c.key.port = ca.Unmap(), sa.Unmap(), uint16(port)
 				c.exact = true
-				out.clients = append(out.clients, c)
+				out = append(out, c)
 			}
 			return nil
 		})
-	if err != nil {
-		return out, err
-	}
-	err = queryRows(ctx, s.pool, `SELECT host(addr), host_id, last_seen, last_heartbeat, udp_traced, host,
+	return out, err
+}
+
+// agentAddrs reads the addresses of agents, with what each agent traces and
+// folds.
+func (s *pgStore) agentAddrs(ctx context.Context) ([]agentAddrRow, error) {
+	var out []agentAddrRow
+	err := queryRows(ctx, s.pool, `SELECT host(addr), host_id, last_seen, last_heartbeat, udp_traced, host,
   peer_fold, peer_internal::text[]
 FROM shawk_v1.agent_addrs`,
 		func(rows pgx.Rows) error {
@@ -1104,16 +1134,18 @@ FROM shawk_v1.agent_addrs`,
 			}
 			if a, err := netip.ParseAddr(addr); err == nil {
 				r.addr = a.Unmap()
-				out.agents = append(out.agents, r)
+				out = append(out, r)
 			}
 			return nil
 		})
-	if err != nil {
-		return out, err
-	}
-	// The services listening on Unix sockets, named as Prometheus names them
-	// like the endpoints above.
-	err = queryRows(ctx, s.pool, `SELECT host_id, path, netns, service, last_seen, slurm_job FROM shawk_v1.unix_endpoints`,
+	return out, err
+}
+
+// unixEndpoints reads the services listening on Unix sockets, named as
+// Prometheus names them like the endpoints of services.
+func (s *pgStore) unixEndpoints(ctx context.Context) ([]unixEndpointRow, error) {
+	var out []unixEndpointRow
+	err := queryRows(ctx, s.pool, `SELECT host_id, path, netns, service, last_seen, slurm_job FROM shawk_v1.unix_endpoints`,
 		func(rows pgx.Rows) error {
 			var u unixEndpointRow
 			var netns int64
@@ -1125,13 +1157,17 @@ FROM shawk_v1.agent_addrs`,
 				u.service = slurmJobService
 			}
 			u.netns = uint64(netns)
-			out.unix = append(out.unix, u)
+			out = append(out, u)
 			return nil
 		})
-	if err != nil {
-		return out, err
-	}
-	err = queryRows(ctx, s.pool, `SELECT host_id, proto, netns, host(client_addr), host(virtual_addr), virtual_port,
+	return out, err
+}
+
+// learnedTranslations reads the translations that agents learned and last
+// saw within ttl, by the clock of the database.
+func (s *pgStore) learnedTranslations(ctx context.Context, ttl time.Duration) ([]learnedRow, error) {
+	var out []learnedRow
+	err := queryRows(ctx, s.pool, `SELECT host_id, proto, netns, host(client_addr), host(virtual_addr), virtual_port,
   host(source_addr), host(backend_addr), backend_port, last_seen
 FROM shawk.learned_translations
 WHERE last_seen > now() - make_interval(secs => $1)`,
@@ -1154,13 +1190,9 @@ WHERE last_seen > now() - make_interval(secs => $1)`,
 			}
 			r.id.netns, r.id.vport, r.id.bport = uint64(netns), uint16(vport), uint16(bport)
 			r.id.client, r.id.virtual, r.id.source, r.id.backend = addrs[0], addrs[1], addrs[2], addrs[3]
-			out.learned = append(out.learned, r)
+			out = append(out, r)
 			return nil
-		}, learnedTTL.Seconds())
-	if err != nil || formerWindow == 0 {
-		return out, err
-	}
-	out.former, err = s.formerHolders(ctx, formerWindow)
+		}, ttl.Seconds())
 	return out, err
 }
 
