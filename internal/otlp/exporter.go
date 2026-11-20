@@ -103,6 +103,32 @@ func (cfg ExporterConfig) CleartextRemote() bool {
 	return ip == nil || !ip.IsLoopback()
 }
 
+// tlsConfig returns the TLS configuration of an https:// endpoint, with
+// the client certificate and the CA of the configuration, if any, read
+// from their files.
+func (cfg ExporterConfig) tlsConfig() (*tls.Config, error) {
+	tlsConf := &tls.Config{MinVersion: tls.VersionTLS12}
+	if cfg.CertFile != "" {
+		cert, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("loading the client certificate: %w", err)
+		}
+		tlsConf.Certificates = []tls.Certificate{cert}
+	}
+	if cfg.CAFile != "" {
+		pem, err := os.ReadFile(cfg.CAFile)
+		if err != nil {
+			return nil, err
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("no certificates in %s", cfg.CAFile)
+		}
+		tlsConf.RootCAs = pool
+	}
+	return tlsConf, nil
+}
+
 // NewExporter returns an exporter. It does not connect yet.
 func NewExporter(cfg ExporterConfig) (Exporter, error) {
 	u, err := cfg.endpoint()
@@ -111,24 +137,8 @@ func NewExporter(cfg ExporterConfig) (Exporter, error) {
 	}
 	var tlsConf *tls.Config
 	if u.Scheme == "https" {
-		tlsConf = &tls.Config{MinVersion: tls.VersionTLS12}
-		if cfg.CertFile != "" {
-			cert, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
-			if err != nil {
-				return nil, fmt.Errorf("loading the client certificate: %w", err)
-			}
-			tlsConf.Certificates = []tls.Certificate{cert}
-		}
-		if cfg.CAFile != "" {
-			pem, err := os.ReadFile(cfg.CAFile)
-			if err != nil {
-				return nil, err
-			}
-			pool := x509.NewCertPool()
-			if !pool.AppendCertsFromPEM(pem) {
-				return nil, fmt.Errorf("no certificates in %s", cfg.CAFile)
-			}
-			tlsConf.RootCAs = pool
+		if tlsConf, err = cfg.tlsConfig(); err != nil {
+			return nil, err
 		}
 	}
 	switch cfg.Protocol {
