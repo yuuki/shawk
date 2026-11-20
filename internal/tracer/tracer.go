@@ -241,9 +241,8 @@ var (
 // forceUDPKprobes makes New trace UDP with udpKprobePrograms; for tests.
 var forceUDPKprobes = false
 
-// New loads and attaches the BPF programs. It requires CAP_BPF and
-// CAP_PERFMON (or root) and a kernel with BTF.
-func New(opts Options) (*Tracer, error) {
+// withDefaults returns the options with the defaults of those left unset.
+func (opts Options) withDefaults() Options {
 	if opts.MaxFlows == 0 {
 		opts.MaxFlows = defaultMaxFlows
 	}
@@ -253,6 +252,13 @@ func New(opts Options) (*Tracer, error) {
 	if opts.Logger == nil {
 		opts.Logger = slog.New(slog.DiscardHandler)
 	}
+	return opts
+}
+
+// New loads and attaches the BPF programs. It requires CAP_BPF and
+// CAP_PERFMON (or root) and a kernel with BTF.
+func New(opts Options) (*Tracer, error) {
+	opts = opts.withDefaults()
 	for _, p := range opts.InternalPeers {
 		if err := CheckInternalPeer(p); err != nil {
 			return nil, err
@@ -282,10 +288,19 @@ func New(opts Options) (*Tracer, error) {
 	if err := t.configure(spec); err != nil {
 		return nil, err
 	}
-
-	if err := t.loadCore(spec); err != nil {
+	if err := t.start(spec); err != nil {
 		t.Close()
 		return nil, err
+	}
+	return t, nil
+}
+
+// start loads and attaches the programs of spec, and adopts the connections
+// and listeners that existed before. After an error, the tracer holds what
+// was loaded until then and is to be closed.
+func (t *Tracer) start(spec *ebpf.CollectionSpec) error {
+	if err := t.loadCore(spec); err != nil {
+		return err
 	}
 	attached, err := t.loadConnectErrors(spec)
 	t.connectErrHooks = attached
@@ -293,62 +308,70 @@ func New(opts Options) (*Tracer, error) {
 		t.log.Warn("the reasons of some failed connects are read when the socket closes, and an application that reads the error first makes them count as timeouts",
 			"error", err)
 	}
-	// The walk of the processes below adopts the connections of Unix
+	// The first walk of the processes adopts the connections of Unix
 	// sockets once their close is traced.
-	if err := t.loadTracing(spec, unixPrograms); err != nil {
-		t.log.Warn("Unix socket tracing is disabled", "error", err)
-	} else if err := t.unixTraced.Set(uint32(1)); err != nil {
-		t.Close()
-		return nil, err
-	} else {
-		t.unix = true
+	if t.unix, err = t.loadOptional(spec, unixPrograms, t.unixTraced, "Unix socket tracing is disabled"); err != nil {
+		return err
 	}
 
 	// Adopt connections and listeners that existed before the tracer
-	// started, then resolve their owners. The first walk also tells the
-	// programs which process the tracer is, and marks the UDP server
-	// sockets: before the UDP programs attach, so that a server whose first
-	// datagram they see is a reply is not taken for a client.
-	if err := t.initialScan.Set(uint32(1)); err != nil {
-		t.Close()
-		return nil, err
-	}
-	listeners, inos, err := t.scanSockets()
+	// started, then resolve their owners. The first walk comes before the
+	// UDP programs attach, so that a server whose first datagram they see
+	// is a reply is not taken for a client.
+	listeners, inos, err := t.firstWalk()
 	if err != nil {
-		t.Close()
-		return nil, err
-	}
-	if err := t.initialScan.Set(uint32(0)); err != nil {
-		t.Close()
-		return nil, err
-	}
-	if err := t.selfTgid.Get(&t.self); err != nil {
-		t.Close()
-		return nil, err
+		return err
 	}
 	if err := t.loadUDP(spec); err != nil {
 		t.log.Warn("UDP tracing is disabled", "error", err)
 	}
-	if opts.ClassifyProtocols {
+	if t.opts.ClassifyProtocols {
 		// Connections are marked for it once the program is attached.
-		if err := t.loadTracing(spec, protocolPrograms); err != nil {
-			t.log.Warn("wire protocols are not classified", "error", err)
-		} else if err := t.wireTraced.Set(uint32(1)); err != nil {
-			t.Close()
-			return nil, err
-		} else {
-			t.wire = true
+		if t.wire, err = t.loadOptional(spec, protocolPrograms, t.wireTraced, "wire protocols are not classified"); err != nil {
+			return err
 		}
 	}
-	if opts.LearnTranslations {
+	if t.opts.LearnTranslations {
 		t.conntrackSpec = spec
 		t.tryConntrack(time.Now())
 	}
-	if err := t.refreshOwners(listeners, inos); err != nil {
-		t.Close()
-		return nil, err
+	return t.refreshOwners(listeners, inos)
+}
+
+// loadOptional loads and attaches a set of programs the tracer works
+// without, and then tells the programs loaded before, through traced, that
+// they are attached. It reports whether they are, and logs with msg why
+// they are not.
+func (t *Tracer) loadOptional(spec *ebpf.CollectionSpec, progs []tracingProgram, traced *ebpf.Variable, msg string) (bool, error) {
+	if err := t.loadTracing(spec, progs); err != nil {
+		t.log.Warn(msg, "error", err)
+		return false, nil
 	}
-	return t, nil
+	if err := traced.Set(uint32(1)); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// firstWalk walks the sockets that existed before the tracer started, which
+// the programs adopt, and returns the listeners and the inodes of their
+// sockets (scanSockets). The walk also tells the programs which process
+// the tracer is, and marks the UDP server sockets.
+func (t *Tracer) firstWalk() ([]Listener, []uint64, error) {
+	if err := t.initialScan.Set(uint32(1)); err != nil {
+		return nil, nil, err
+	}
+	listeners, inos, err := t.scanSockets()
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := t.initialScan.Set(uint32(0)); err != nil {
+		return nil, nil, err
+	}
+	if err := t.selfTgid.Get(&t.self); err != nil {
+		return nil, nil, err
+	}
+	return listeners, inos, nil
 }
 
 // configure sets the load-time variables and the map sizes.
