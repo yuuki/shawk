@@ -882,3 +882,21 @@ func TestPGImpactAddressTakenOver(t *testing.T) {
 		t.Errorf("db-01 after another host took the address: %s, want %s", got, want)
 	}
 }
+
+// TestPGImpactUnknownOwner: the sockets without a known owner of a host
+// are dependents, and the clients of the others of the host are not
+// theirs.
+func TestPGImpactUnknownOwner(t *testing.T) {
+	_, conn := migratedDB(t)
+	f := impactFixture{t, conn}
+	f.watched("db-01", "10.0.0.10", "postgres")
+	f.watched("app-01", "10.0.0.11", "~unknown")
+	f.watched("web-01", "10.0.0.12", "web")
+	// A socket of app-01 without a known owner uses postgres, and another
+	// one serves web.
+	f.both("app-01", "~unknown", "10.0.0.11", "db-01", "postgres", "10.0.0.10", 5432, impactSince, impactUntil)
+	f.both("web-01", "web", "10.0.0.12", "app-01", "~unknown", "10.0.0.11", 8080, impactSince, impactUntil)
+	checkRows(t, "dependents of db-01", f.impact(`'db-01', %s, %s`), []string{
+		"1 app-01 ~unknown - -> db-01 postgres 5432 both continuous",
+	})
+}

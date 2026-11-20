@@ -351,16 +351,19 @@ direct AS (
            AND r.client_service IS NOT DISTINCT FROM r.srv_service
     END
 ),
--- The dependents with an agent, by the depths they are reached at.
+-- The dependents with an agent, by the depths they are reached at. The
+-- sockets without a known owner of a host (~unknown) are no service: their
+-- clients are not those of the socket that used the target.
 walk (depth, host, service) AS (
-  SELECT 1, x.client_host, x.client_service FROM direct x WHERE x.client_host IS NOT NULL
+  SELECT 1, x.client_host, x.client_service FROM direct x
+  WHERE x.client_host IS NOT NULL AND x.client_service <> '~unknown'
   UNION
   SELECT w.depth + 1, r.client_host, r.client_service
   FROM walk w
   JOIN r ON r.srv_host = w.host AND r.srv_service = w.service
   CROSS JOIN arg
   WHERE w.depth < arg.max_depth
-    AND r.client_host IS NOT NULL
+    AND r.client_host IS NOT NULL AND r.client_service <> '~unknown'
     AND NOT (r.client_host = w.host AND r.client_service = w.service)
     AND NOT (r.client_host = dependents.target_host
              AND (arg.whole_host OR r.client_service IS NOT DISTINCT FROM dependents.target_service))
@@ -427,8 +430,9 @@ $$;
 -- itself otherwise. A dependent with an agent is followed: the clients of
 -- its service on its host are dependents of the next depth, unless they
 -- are part of the target or already dependents of a lesser depth, so that
--- every dependent is reported once, at the depth it is first reached.
--- The dependencies of the period are followed at most once per depth.
+-- a dependent with an agent is reported once, at the depth it is first
+-- reached; one without an agent is reported with each server it uses. The
+-- dependencies of the period are followed at most once per depth.
 --
 -- cadence, period, next_expected and runs are those of shawk.cadence() over
 -- the hours of activity of its edges (shawk.edge_activity), with the time

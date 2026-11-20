@@ -1738,8 +1738,10 @@ hosts found are read through their indexes. From the dependencies:
   dependencies that reach it there; a cycle ends at a dependent already
   reached. The walk reads the dependencies of the period once per depth,
   10 at most, so they bound its size. A client without an agent, an
-  address or the folded clients `~external`, is a dependent and is not
-  followed: what depends on it is not known.
+  address or the folded clients `~external`, is a dependent of each server
+  it uses and is not followed: what depends on it is not known. Nor are
+  the sockets without a known owner of a host (`~unknown`), which are no
+  one service.
 
 **Cadence.** How often a dependent uses its server is read from the hours
 of activity of its edges (§5.1), the client's and the server's together,
