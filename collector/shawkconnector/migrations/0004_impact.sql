@@ -326,12 +326,14 @@ r AS MATERIALIZED (
   LEFT JOIN srv s ON s.id = d.id
   LEFT JOIN shawk.inventory_addrs ci ON d.client_host IS NULL AND ci.addr = d.client_addr
 ),
--- The dependencies on the target, without those of its own clients.
+-- The dependencies on the target, without those of its own clients. A
+-- connection that a socket without a known owner accepted (~unknown) may
+-- be of any service of the host: it counts for the one asked for.
 direct AS (
   SELECT r.*
   FROM r CROSS JOIN arg
   WHERE r.srv_host = dependents.target_host
-    AND (dependents.target_service IS NULL OR r.srv_service = dependents.target_service
+    AND (dependents.target_service IS NULL OR r.srv_service IN (dependents.target_service, '~unknown')
          OR (r.srv_service IS NULL AND NOT EXISTS (SELECT FROM t)))
     AND (dependents.target_port IS NULL OR r.port = dependents.target_port)
     AND (dependents.target_proto IS NULL OR r.proto = dependents.target_proto)
@@ -347,8 +349,10 @@ direct AS (
                             WHERE a.host_id IN (SELECT t.id FROM t) AND a.addr = r.client_addr
                               AND a.first_seen <= r.last_seen + shawk.alive_window()
                               AND a.last_seen >= least(r.last_seen, dependents.until) - shawk.alive_window())))
+      -- The service itself, as a client of its own port.
       ELSE r.client_host IS NOT DISTINCT FROM dependents.target_host
-           AND r.client_service IS NOT DISTINCT FROM r.srv_service
+           AND r.client_service IS NOT DISTINCT FROM coalesce(dependents.target_service, r.srv_service)
+           AND r.client_service IS DISTINCT FROM '~unknown'
     END
 ),
 -- The dependents with an agent, by the depths they are reached at. The
@@ -423,7 +427,9 @@ $$;
 -- address; its service is the latest known owner of a listener on the
 -- port, NULL if none. Such a dependency counts for a service of a host
 -- only if that service owned the port, except on a target without an
--- agent, of which nothing else is known.
+-- agent, of which nothing else is known. A connection that a socket
+-- without a known owner accepted (~unknown) counts for every service of
+-- its host.
 --
 -- A client is a dependent of the target unless it is part of it: a client
 -- on the target itself when the whole host is the target, the service

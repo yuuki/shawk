@@ -885,11 +885,32 @@ func TestPGImpactAddressTakenOver(t *testing.T) {
 
 // TestPGImpactUnknownOwner: the sockets without a known owner of a host
 // are dependents, and the clients of the others of the host are not
-// theirs.
+// theirs; a connection that such a socket accepted counts for every
+// service of its host.
 func TestPGImpactUnknownOwner(t *testing.T) {
 	_, conn := migratedDB(t)
 	f := impactFixture{t, conn}
-	f.watched("db-01", "10.0.0.10", "postgres")
+	f.watched("db-01", "10.0.0.10", "postgres", "redis", "~unknown")
+	f.listener("db-01", "redis", 6379)
+	// A connection to db-01 that a socket without a known owner accepted,
+	// as one that predates the agent, and one of such a socket of db-01
+	// itself to another.
+	f.edge("db-01", "~unknown", "server", "10.0.0.10", "10.0.0.13", 6379, day(1, 0), day(2, 0))
+	f.both("db-01", "~unknown", "127.0.0.1", "db-01", "~unknown", "127.0.0.1", 7000, day(1, 0), day(2, 0))
+	accepted := "1 - ~unresolved 10.0.0.13 -> db-01 ~unknown 6379 server unknown"
+	checkRows(t, "dependents of redis on db-01", f.impact(`'db-01', %s, %s, 'redis'`), []string{
+		accepted,
+		"1 db-01 ~unknown - -> db-01 ~unknown 7000 both dormant",
+	})
+	// Its port leaves the other sockets out.
+	checkRows(t, "dependents of redis on port 6379 of db-01", f.impact(`'db-01', %s, %s, 'redis', 6379`), []string{accepted})
+	checkRows(t, "dependents of port 6379 of db-01", f.impact(`'db-01', %s, %s, target_port => 6379`), []string{accepted})
+	if got, want := f.verdict(`'db-01', %s, %s, 'redis'`), "UNSAFE {active_dependents} {} 2 0 1.000000"; got != want {
+		t.Errorf("redis of db-01: %s, want %s", got, want)
+	}
+	// The host as a whole: its own sockets go with it.
+	checkRows(t, "dependents of db-01", f.impact(`'db-01', %s, %s`), []string{accepted})
+	execAll(t, conn, `DELETE FROM shawk.edges WHERE host_id = 'db-01'`)
 	f.watched("app-01", "10.0.0.11", "~unknown")
 	f.watched("web-01", "10.0.0.12", "web")
 	// A socket of app-01 without a known owner uses postgres, and another

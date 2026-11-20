@@ -1724,6 +1724,10 @@ hosts found are read through their indexes. From the dependencies:
   probe of a port nothing listens on is not a dependent of every service
   of the host; on a target without an agent, of which no listener is
   known, it counts for any service.
+- **A connection that a socket without a known owner accepted**
+  (`~unknown`, §4.1) counts for every service of its host: it may be the
+  one asked for, and leaving it out could call a service that is used
+  `SAFE`. A port narrows it.
 - **A client is a dependent unless it is part of the target.** With the
   whole host as the target, a client on the host is part of it: by its
   name, by loopback, or by an address the host held when the dependency
