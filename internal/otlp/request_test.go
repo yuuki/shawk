@@ -2,7 +2,9 @@ package otlp
 
 import (
 	"fmt"
+	"maps"
 	"net/netip"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -289,6 +291,69 @@ func TestRequestRDMA(t *testing.T) {
 		return
 	}
 	t.Error("no rdma.io")
+}
+
+// TestRequestWireProtocols: an interval whose only activity is a connection
+// classified makes an edge; each protocol is sent with when it was first
+// and last seen; an edge without protocols holds no times of them; and the
+// agent tells whether it classifies them only when it was asked to.
+func TestRequestWireProtocols(t *testing.T) {
+	index := func(name string) int {
+		t.Helper()
+		i := slices.Index(WireProtocols[:], name)
+		if i < 0 {
+			t.Fatalf("no wire protocol %s", name)
+		}
+		return i
+	}
+	tls, pg := index("tls_1_3"), index("postgres")
+	t1, t2 := t0.Add(15*time.Second), t0.Add(30*time.Second)
+	s := NewState(15 * time.Minute)
+	k := clientEdge()
+	other := k
+	other.Port = 6379
+	s.BeginInterval()
+	s.AddEdge(k, EdgeStats{Protocols: 1 << tls}, t0, t1)
+	s.BeginInterval()
+	s.AddEdge(k, EdgeStats{Conns: 1, Protocols: 1<<tls | 1<<pg}, t1, t2)
+	s.AddEdge(other, EdgeStats{Conns: 1}, t1, t2)
+	e := s.Edges()[k]
+	if e == nil {
+		t.Fatal("no edge of a connection classified alone")
+	}
+	if e.FirstSeen != t1 || e.Total.Protocols != 0 {
+		t.Errorf("edge first seen %v, total protocols %b", e.FirstSeen, e.Total.Protocols)
+	}
+	if s.Edges()[other].Protocols != nil {
+		t.Error("an edge without wire protocols holds their times")
+	}
+	for _, requested := range []bool{false, true} {
+		req := s.Request(Resource{Hostname: "h"}, AgentStatus{Started: t0, SegmentStart: t0, ProtocolsRequested: requested,
+			ProtocolsClassified: true}, t2)
+		seen := map[string]int64{}
+		gauge := false
+		for _, m := range req.ResourceMetrics[0].ScopeMetrics[0].Metrics {
+			switch m.Name {
+			case MetricEdgeWireFirst, MetricEdgeWireLast:
+				for _, p := range m.GetGauge().GetDataPoints() {
+					a := attrMap(p.Attributes)
+					seen[fmt.Sprint(m.Name, " ", a["server.port"], " ", a[AttrWireProtocol])] = p.GetAsInt()
+				}
+			case MetricAgentProtocolsClassified:
+				gauge = len(m.GetGauge().GetDataPoints()) == 1 && m.GetGauge().GetDataPoints()[0].GetAsInt() == 1
+			}
+		}
+		want := map[string]int64{
+			MetricEdgeWireFirst + " 5432 tls_1_3": t1.Unix(), MetricEdgeWireLast + " 5432 tls_1_3": t2.Unix(),
+			MetricEdgeWireFirst + " 5432 postgres": t2.Unix(), MetricEdgeWireLast + " 5432 postgres": t2.Unix(),
+		}
+		if !maps.Equal(seen, want) {
+			t.Errorf("wire protocols sent %v, want %v", seen, want)
+		}
+		if gauge != requested {
+			t.Errorf("requested %v: %s sent %v", requested, MetricAgentProtocolsClassified, gauge)
+		}
+	}
 }
 
 func TestRequestWithoutMachineID(t *testing.T) {

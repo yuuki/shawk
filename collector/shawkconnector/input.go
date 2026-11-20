@@ -101,6 +101,9 @@ type edgeInput struct {
 	id          edgeID
 	first, last time.Time
 	values      map[valueKey]point
+	// wire are when connections of the edge showed each wire protocol, of
+	// wireProtocols; nil if none did.
+	wire map[string]span
 }
 
 // translationID identifies a translation of addresses that a host made:
@@ -164,8 +167,12 @@ type hostBatch struct {
 	// unixTraced tells whether the agent traces Unix sockets, nil if it
 	// does not tell (an agent before shawk.agent.unix.traced).
 	unixTraced *bool
-	netnsScope string
-	dropped    int64
+	// protocolsClassified tells whether the agent classifies the wire
+	// protocols of TCP connections, nil if it does not tell (an agent
+	// before shawk.agent.protocols.classified).
+	protocolsClassified *bool
+	netnsScope          string
+	dropped             int64
 	// droppedSince is the start of the counter of dropped flows, when the
 	// agent started, by the clock of the agent; zero if unknown.
 	droppedSince time.Time
@@ -294,6 +301,10 @@ func (b *hostBatch) addMetric(m pmetric.Metric) {
 				}
 			}
 		})
+	case metricEdgeWireFirst, metricEdgeWireLast:
+		forGauge(b, m, func(dp pmetric.NumberDataPoint, t time.Time) {
+			b.addWire(dp.Attributes(), name == metricEdgeWireFirst, t)
+		})
 	case metricListenerFirst, metricListenerLast:
 		forGauge(b, m, func(dp pmetric.NumberDataPoint, t time.Time) {
 			if l := b.listener(dp.Attributes()); l != nil {
@@ -319,6 +330,36 @@ func (b *hostBatch) addMetric(m pmetric.Metric) {
 			b.addAgent(m, name)
 		}
 	}
+}
+
+// addWire records when a TCP edge, of the attributes of a point, first or
+// last saw a wire protocol. A protocol the connector does not know, as of a
+// newer agent, is dropped like a metric of the agent it does not know, and
+// logged as rarely; a protocol of another edge than TCP is invalid.
+func (b *hostBatch) addWire(a pcommon.Map, first bool, t time.Time) {
+	p := getString(a, attrWireProtocol)
+	if getString(a, attrTransport) != "tcp" || p == "" {
+		b.invalid++
+		return
+	}
+	if !wireProtocols[p] {
+		b.dropAgent(attrWireProtocol + "=" + p)
+		return
+	}
+	e := b.edge(a)
+	if e == nil {
+		return
+	}
+	if e.wire == nil {
+		e.wire = map[string]span{}
+	}
+	s := e.wire[p]
+	if first {
+		s.first = t
+	} else {
+		s.last = t
+	}
+	e.wire[p] = s
 }
 
 // addSums decodes the points of m, a sum of the edges named name.
@@ -402,6 +443,11 @@ func (b *hostBatch) addAgent(m pmetric.Metric, name string) {
 			traced := numberValue(dp) != 0
 			b.unixTraced = &traced
 		})
+	case metricAgentProtocolsClassified:
+		forGauge(b, m, func(dp pmetric.NumberDataPoint, _ time.Time) {
+			classified := numberValue(dp) != 0
+			b.protocolsClassified = &classified
+		})
 	case metricAgentUp:
 		b.final = true
 		forGauge(b, m, func(dp pmetric.NumberDataPoint, _ time.Time) {
@@ -439,6 +485,7 @@ var agentMetrics = map[string]agentMetric{
 	metricAgentUp:                  {gauge: true, attr: attrNetNSScope, valid: netnsScope},
 	metricAgentUDPTraced:           {gauge: true},
 	metricAgentUnixTraced:          {gauge: true},
+	metricAgentProtocolsClassified: {gauge: true},
 	metricAgentFlowsDropped:        {unit: "{update}"},
 	metricAgentCgroupsDropped:      {unit: "{event}"},
 	metricAgentReadsDropped:        {unit: "{read}"},
@@ -540,7 +587,14 @@ func forGauge(b *hostBatch, m pmetric.Metric, f func(pmetric.NumberDataPoint, ti
 	for i := range dps.Len() {
 		dp := dps.At(i)
 		b.observe(dp.Timestamp())
-		f(dp, time.Unix(int64(numberValue(dp)), 0).UTC())
+		// A time before 1970 is no time an agent sends, and one far before
+		// would make PostgreSQL refuse the changes of the host.
+		v := numberValue(dp)
+		if !(v >= 0) || !validValue(v) {
+			b.invalid++
+			continue
+		}
+		f(dp, time.Unix(int64(v), 0).UTC())
 	}
 }
 

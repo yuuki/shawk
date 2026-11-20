@@ -81,6 +81,11 @@ type Options struct {
 	// makes (DNAT, SNAT, IPVS) from conntrack, once the module
 	// nf_conntrack is loaded (see Snapshot.Translations).
 	LearnTranslations bool
+	// ClassifyProtocols reads the first payload that the local socket of
+	// every new TCP connection sends, once, and records the wire protocol
+	// it shows (FlowStats.Protocols). Its program runs on every send of
+	// TCP, which costs a little on hosts that send many small messages.
+	ClassifyProtocols bool
 	Logger            *slog.Logger
 }
 
@@ -93,6 +98,8 @@ type Tracer struct {
 	links []link.Link
 	udp   bool
 	unix  bool
+	// wire tells that wire protocols are classified (protocolPrograms).
+	wire bool
 	// udpKprobes tells that UDP is traced with udpKprobePrograms.
 	udpKprobes bool
 
@@ -100,6 +107,7 @@ type Tracer struct {
 	unixFlowMaps   [2]*ebpf.Map
 	unixConns      *ebpf.Map
 	unixTraced     *ebpf.Variable
+	wireTraced     *ebpf.Variable
 	flowsOuter     *ebpf.Map
 	listenPorts    *ebpf.Map
 	udpListenPorts *ebpf.Map
@@ -222,6 +230,12 @@ var (
 		{prog: bpfProgShawkUnixStreamConnect, target: "unix_stream_connect"},
 		{prog: bpfProgShawkUnixRelease, target: "unix_release"},
 	}
+	// protocolPrograms classify the first payloads of TCP connections
+	// (Options.ClassifyProtocols). Without trampolines they are not traced:
+	// a kprobe has no socket storage and costs more on every send.
+	protocolPrograms = []tracingProgram{
+		{prog: bpfProgShawkTcpSendmsg, target: "tcp_sendmsg"},
+	}
 )
 
 // forceUDPKprobes makes New trace UDP with udpKprobePrograms; for tests.
@@ -315,6 +329,17 @@ func New(opts Options) (*Tracer, error) {
 	if err := t.loadUDP(spec); err != nil {
 		t.log.Warn("UDP tracing is disabled", "error", err)
 	}
+	if opts.ClassifyProtocols {
+		// Connections are marked for it once the program is attached.
+		if err := t.loadTracing(spec, protocolPrograms); err != nil {
+			t.log.Warn("wire protocols are not classified", "error", err)
+		} else if err := t.wireTraced.Set(uint32(1)); err != nil {
+			t.Close()
+			return nil, err
+		} else {
+			t.wire = true
+		}
+	}
 	if opts.LearnTranslations {
 		t.conntrackSpec = spec
 		t.tryConntrack(time.Now())
@@ -381,7 +406,7 @@ func ephemeralPortRange() (uint16, uint16) {
 // loadCore loads the maps, the TCP programs and the iterators.
 func (t *Tracer) loadCore(spec *ebpf.CollectionSpec) error {
 	core := spec.Copy()
-	for _, p := range slices.Concat(udpPrograms, udpKprobePrograms, unixPrograms) {
+	for _, p := range slices.Concat(udpPrograms, udpKprobePrograms, unixPrograms, protocolPrograms) {
 		delete(core.Programs, p.prog)
 	}
 	withoutConntrack(core)
@@ -396,6 +421,7 @@ func (t *Tracer) loadCore(spec *ebpf.CollectionSpec) error {
 	t.unixFlowMaps = [2]*ebpf.Map{coll.Maps[bpfMapUnixFlows0], coll.Maps[bpfMapUnixFlows1]}
 	t.unixConns = coll.Maps[bpfMapUnixConns]
 	t.unixTraced = coll.Variables[bpfVarUnixTraced]
+	t.wireTraced = coll.Variables[bpfVarWireTraced]
 	t.flowsOuter = coll.Maps[bpfMapFlows]
 	t.listenPorts = coll.Maps[bpfMapListenPorts]
 	t.udpListenPorts = coll.Maps[bpfMapUdpListenPorts]
@@ -572,6 +598,10 @@ func (t *Tracer) UDPEnabled() bool { return t.udp }
 // UnixEnabled reports whether the connections of Unix stream sockets are
 // traced.
 func (t *Tracer) UnixEnabled() bool { return t.unix }
+
+// ProtocolsEnabled reports whether the wire protocols of TCP connections
+// are classified (Options.ClassifyProtocols).
+func (t *Tracer) ProtocolsEnabled() bool { return t.wire }
 
 // Close detaches and unloads the BPF programs.
 func (t *Tracer) Close() error {

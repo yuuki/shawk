@@ -25,6 +25,11 @@ const (
 	metricConnFailedByReason = "shawk.connection.failed.by_reason"
 	metricEdgeFirst          = "shawk.edge.first_seen"
 	metricEdgeLast           = "shawk.edge.last_seen"
+	// Of TCP edges: when a connection whose first payload showed a wire
+	// protocol (attrWireProtocol) was first and last seen. They are written
+	// to PostgreSQL only.
+	metricEdgeWireFirst = "shawk.edge.wire_protocol.first_seen"
+	metricEdgeWireLast  = "shawk.edge.wire_protocol.last_seen"
 
 	metricListenerFirst = "shawk.listener.first_seen"
 	metricListenerLast  = "shawk.listener.last_seen"
@@ -32,17 +37,20 @@ const (
 	metricTranslationFirst = "shawk.translation.first_seen"
 	metricTranslationLast  = "shawk.translation.last_seen"
 
-	metricAgentPrefix         = "shawk.agent."
-	metricAgentUp             = "shawk.agent.up"
-	metricAgentSegmentStart   = "shawk.agent.segment.start"
-	metricAgentUDPTraced      = "shawk.agent.udp.traced"
-	metricAgentUnixTraced     = "shawk.agent.unix.traced"
-	metricAgentFlowsDropped   = "shawk.agent.flows.dropped"
-	metricAgentCgroupsDropped = "shawk.agent.cgroup_events.dropped"
-	metricAgentReadsDropped   = "shawk.agent.container_reads.dropped"
-	metricAgentExportFailures = "shawk.agent.export.failures"
-	metricAgentBPFRunCount    = "shawk.agent.bpf.run_count"
-	metricAgentBPFRunTime     = "shawk.agent.bpf.run_time"
+	metricAgentPrefix       = "shawk.agent."
+	metricAgentUp           = "shawk.agent.up"
+	metricAgentSegmentStart = "shawk.agent.segment.start"
+	metricAgentUDPTraced    = "shawk.agent.udp.traced"
+	metricAgentUnixTraced   = "shawk.agent.unix.traced"
+	// metricAgentProtocolsClassified tells whether the agent classifies the
+	// wire protocols of TCP connections.
+	metricAgentProtocolsClassified = "shawk.agent.protocols.classified"
+	metricAgentFlowsDropped        = "shawk.agent.flows.dropped"
+	metricAgentCgroupsDropped      = "shawk.agent.cgroup_events.dropped"
+	metricAgentReadsDropped        = "shawk.agent.container_reads.dropped"
+	metricAgentExportFailures      = "shawk.agent.export.failures"
+	metricAgentBPFRunCount         = "shawk.agent.bpf.run_count"
+	metricAgentBPFRunTime          = "shawk.agent.bpf.run_time"
 
 	metricAgentTranslationsTraced  = "shawk.agent.translations.traced"
 	metricAgentTranslationsDropped = "shawk.agent.translations.dropped"
@@ -99,6 +107,8 @@ const (
 	attrNetNSScope  = "shawk.netns.scope"
 	attrBPFProgram  = "shawk.bpf.program"
 	attrErrorType   = "error.type"
+	// attrWireProtocol is one of wireProtocols.
+	attrWireProtocol = "shawk.wire_protocol"
 	// attrPeerFolded marks an edge whose peer is folded: every peer outside
 	// the internal ranges of the agent, sent as the address 0.0.0.0 or ::.
 	attrPeerFolded = "shawk.peer.folded"
@@ -147,6 +157,19 @@ func outErrorType(t string) string {
 		return t
 	}
 	return errorTypeOther
+}
+
+// wireProtocols are the values of shawk.wire_protocol that agents send:
+// the protocols the first payload of a TCP connection shows, a copy of
+// those of internal/otlp, which must be kept in sync, and of the check of
+// shawk.edge_protocols. A point with another value is left out, so that an
+// agent cannot make a row per value: it is dropped like a metric of the
+// agent the connector does not know, as of a newer agent, and a point
+// without a value is invalid.
+var wireProtocols = map[string]bool{
+	"unknown": true, "tls": true, "tls_1_0": true, "tls_1_1": true, "tls_1_2": true, "tls_1_3": true, "http1": true,
+	"http2_grpc": true, "ssh": true, "postgres": true, "mysql": true, "redis": true, "slurm_rpc": true,
+	"postgres_tls": true, "mysql_tls": true,
 }
 
 // Values of network.io.direction that agents send.
@@ -220,6 +243,7 @@ var bpfPrograms = map[string]bool{
 	"shawk_skb_consume_udp":     true,
 	"shawk_skb_consume_udp_k":   true,
 	"shawk_tcp_receive_reset":   true,
+	"shawk_tcp_sendmsg":         true,
 	"shawk_unix_release":        true,
 	"shawk_unix_stream_connect": true,
 }

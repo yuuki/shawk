@@ -4,7 +4,8 @@
 /*
  * In-kernel flow bundling for discovering network service dependencies.
  *
- * TCP (tracepoint and iterators only; no hook on the data path)
+ * TCP (a tracepoint and iterators; the one hook on the data path is that of
+ * wire protocols, which user space attaches only when asked)
  *   - tp_btf/inet_sock_set_state
  *       CLOSE -> SYN_SENT       active open. It runs inside connect(2), so the
  *                               current task is the client process. The
@@ -29,6 +30,11 @@
  *     started.
  *   - iter/task_file resolves the owners of adopted connections and of
  *     listening sockets.
+ *   - fentry/tcp_sendmsg, with -classify-protocols only, reads the first
+ *     payload that the local socket of a new connection sends, once, and
+ *     records the wire protocol it shows in the flow (see
+ *     shawk_tcp_sendmsg). It runs on every send of TCP, but returns at once
+ *     for the connections already classified.
  *
  * UDP
  *   - fentry/ip_send_skb, fentry/ip6_send_skb and fentry/skb_consume_udp
@@ -60,6 +66,7 @@
 #include <bpf_endian.h>
 
 #include "shawk.h"
+#include "wire.h"
 
 /*
  * The kernel rejects programs without a GPL-compatible license when they use
@@ -164,6 +171,11 @@ volatile __u32 owner_scan = 0;
  * must count as closed, and report their listeners.
  */
 volatile __u32 unix_traced = 0;
+/*
+ * Set by user space once shawk_tcp_sendmsg is attached: only then are the
+ * new connections marked for the classification of their first payload.
+ */
+volatile __u32 wire_traced = 0;
 /* Flow updates dropped because the flow table could not be updated. */
 __u64 flow_drops = 0;
 /*
@@ -212,8 +224,20 @@ struct shawk_sock_state {
 	__u32 flags;
 	__u32 hs_us; /* duration of the handshake, with SS_HS_TIME */
 	__u32 walked; /* walk_gen of the last walk that visited the connection */
-	__u32 _pad;
+	/*
+	 * PEEK_FIRST while the first payload of the connection, which tells its
+	 * wire protocol, is still to be sent, PEEK_HELD or PEEK_HELD_ANSWER
+	 * after a first send of 4 bytes, held in peek_prefix, and 0 then (see
+	 * shawk_tcp_sendmsg).
+	 */
+	__u32 peek;
+	__u32 peek_prefix;
+	__u32 peek_seq; /* write_seq after the send held, with PEEK_HELD */
 };
+
+#define PEEK_FIRST 1
+#define PEEK_HELD 2        /* a first send of a client, or of a server that greets */
+#define PEEK_HELD_ANSWER 3 /* a first send of a socket that had received data */
 
 struct {
 	__uint(type, BPF_MAP_TYPE_SK_STORAGE);
@@ -381,6 +405,8 @@ __u64 cgroup_event_drops = 0;
 /* Make bpf2go emit Go types for the records read by user space. */
 const struct shawk_iter_rec *unused_iter_rec __attribute__((unused));
 const struct shawk_cgroup_event *unused_cgroup_event __attribute__((unused));
+/* And for the values of wire protocols, which user space mirrors. */
+const enum shawk_wire_proto *unused_wire_proto __attribute__((unused));
 
 static __always_inline void learn_self_tgid(void)
 {
@@ -684,7 +710,7 @@ static __always_inline __u64 task_cgroup_id(struct task_struct *task)
 }
 
 /*
- * The value of a new flow. On the stack, it would take 136 bytes of the 512
+ * The value of a new flow. On the stack, it would take 152 bytes of the 512
  * of every program that creates flows.
  */
 static const struct shawk_flow_stats zero_stats = {};
@@ -1147,7 +1173,7 @@ static __always_inline void on_active_open(struct sock *sk)
 	struct shawk_sock_state *ss;
 	struct shawk_owner *o;
 	__u32 flags = SS_READY;
-	bool join;
+	bool join, peek = false;
 	__u64 msk;
 
 	if (build_tcp_key(&key, sk, DIR_OUT))
@@ -1174,6 +1200,18 @@ static __always_inline void on_active_open(struct sock *sk)
 		set_current_owner(&key);
 		if (msk)
 			record_mptcp_owner(msk, &key, tgid);
+		/*
+		 * The first payload of a connection tells its wire protocol,
+		 * unless the SYN carries it: sendmsg(2) with MSG_FASTOPEN
+		 * connects in tcp_sendmsg(), after shawk_tcp_sendmsg ran, with
+		 * the request of Fast Open allocated. An MPTCP connection sends
+		 * through its MPTCP socket, which tcp_sendmsg() does not see. A
+		 * socket in TCP_REPAIR (CRIU) is restored in the middle of its
+		 * stream, and its queues are sent again.
+		 */
+		peek = wire_traced && !msk &&
+		       !BPF_CORE_READ((struct tcp_sock *)sk, fastopen_req) &&
+		       !BPF_CORE_READ_BITFIELD_PROBED((struct tcp_sock *)sk, repair);
 	}
 	fold_peer(&key);
 
@@ -1193,6 +1231,7 @@ static __always_inline void on_active_open(struct sock *sk)
 	ss->hs_us = 0;
 	/* The next walk accounts it first (see account_skipped()). */
 	ss->walked = walk_gen;
+	ss->peek = peek && !(ss->flags & SS_IGNORE) ? PEEK_FIRST : 0;
 }
 
 /*
@@ -1226,6 +1265,7 @@ static __always_inline struct shawk_sock_state *on_passive_open(struct sock *sk)
 	struct shawk_sock_state *ss;
 	struct tcp_sock *tp;
 	bool join;
+	__u64 msk;
 
 	if (build_tcp_key(&key, sk, DIR_IN))
 		return NULL;
@@ -1253,8 +1293,11 @@ static __always_inline struct shawk_sock_state *on_passive_open(struct sock *sk)
 	ss->pid = 0;
 	ss->flags = SS_READY;
 	/* An additional MPTCP subflow is not another connection. */
-	if (subflow_msk(sk, &join) && join)
+	msk = subflow_msk(sk, &join);
+	if (msk && join)
 		ss->flags |= SS_COUNTED | SS_JOIN;
+	/* The server sends through the MPTCP socket of a subflow. */
+	ss->peek = wire_traced && !msk ? PEEK_FIRST : 0;
 	count_conn(ss);
 	return ss;
 }
@@ -1367,6 +1410,113 @@ int BPF_PROG(shawk_inet_sock_set_state, const struct sock *csk, int oldstate,
 		if (ss->pid)
 			fs->pid = ss->pid;
 	}
+	return 0;
+}
+
+/* ----------------------------------------------------- Wire protocols --- */
+
+/*
+ * The buffer a first payload is read into (wire.h), one per CPU. A BPF
+ * trampoline does not run a program on a CPU where it is running already
+ * (the recursion guard of programs, since Linux 5.12): a task that preempts
+ * another in this program skips it, and its connection stays marked, which
+ * the check of its next send leaves unclassified.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct shawk_peek);
+} peeks SEC(".maps");
+
+/*
+ * The first send of a connection that the tracepoint marked (peek): its
+ * data is the first payload of the local socket, whose wire protocol
+ * (wire_classify()) is added to the flow. Every send of TCP runs this
+ * program, which returns at once for the others: once a connection sent,
+ * it is not read again, so the cost per message is that of the trampoline
+ * and of the lookup of the socket storage.
+ *
+ * - A client is classified once established, when its key is final: a
+ *   send in SYN_SENT waits in tcp_sendmsg() for the handshake, or carries
+ *   its data in the SYN (TCP_FASTOPEN_CONNECT), and the check below leaves
+ *   the connection unclassified at its next send.
+ * - The first payload may have bypassed tcp_sendmsg(): sendfile(2) and
+ *   splice(2) before Linux 6.5 send pages with tcp_sendpage(), and the
+ *   sockets of a sockmap with sk_msg programs send in tcp_bpf_sendmsg(). A
+ *   connection that queued or sent data before (write_seq beyond snd_nxt,
+ *   or data segments out) is not classified, rather than by the middle of
+ *   its stream. Since Linux 6.5, sendfile(2) and splice(2) send pages
+ *   (ITER_BVEC) in tcp_sendmsg(), which peek_msg() does not read.
+ * - A first send of 4 bytes that matches no signature is held (PEEK_HELD)
+ *   and classified with the next send, if nothing was sent in between:
+ *   Slurm before 24.05 sends the length of a message apart.
+ * - Two threads that send on a new connection at once may both read it.
+ * - The bytes read are wiped once classified: they may hold credentials.
+ */
+SEC("fentry/tcp_sendmsg")
+int BPF_PROG(shawk_tcp_sendmsg, struct sock *sk, struct msghdr *msg, size_t size)
+{
+	struct shawk_sock_state *ss;
+	struct shawk_flow_stats *fs;
+	struct shawk_peek *p;
+	struct tcp_sock *tp;
+	__u32 zero = 0, len, off = 0, seq, peek;
+	bool server, answer, held;
+	int proto, state;
+
+	ss = bpf_sk_storage_get(&sock_states, sk, NULL, 0);
+	if (!ss || !ss->peek || !size)
+		return 0;
+	server = ss->key.direction == DIR_IN;
+	state = BPF_CORE_READ(sk, __sk_common.skc_state);
+	if (!server && state != TCP_ESTABLISHED && state != TCP_CLOSE_WAIT)
+		return 0;
+	peek = ss->peek;
+	held = peek == PEEK_HELD || peek == PEEK_HELD_ANSWER;
+	ss->peek = 0;
+	if (!ss_ready(ss))
+		return 0;
+	tp = bpf_skc_to_tcp_sock(sk);
+	if (!tp)
+		return 0;
+	/* Nothing else sent since the start, or since the send held. */
+	seq = BPF_CORE_READ(tp, write_seq);
+	if (held ? seq != ss->peek_seq :
+		   seq != BPF_CORE_READ(tp, snd_nxt) || BPF_CORE_READ(tp, data_segs_out))
+		return 0;
+	answer = held ? peek == PEEK_HELD_ANSWER : BPF_CORE_READ(tp, bytes_received) != 0;
+	p = bpf_map_lookup_elem(&peeks, &zero);
+	if (!p)
+		return 0;
+	if (held) {
+		*(__u32 *)p->buf = ss->peek_prefix;
+		ss->peek_prefix = 0;
+		off = 4;
+	}
+	len = peek_msg(p->buf, off, msg);
+	proto = len > off ? wire_classify(p->buf, len, size + off, server, answer, held) : -1;
+	if (proto == WIRE_UNKNOWN && !held && len == 4 && size == 4) {
+		ss->peek_prefix = *(__u32 *)p->buf;
+		ss->peek_seq = seq + 4;
+		ss->peek = answer ? PEEK_HELD_ANSWER : PEEK_HELD;
+		proto = -1;
+	}
+	/*
+	 * Through the map value, which the verifier does not track: it would
+	 * otherwise check what follows once per value the classifier returns.
+	 */
+	*(volatile __s32 *)&p->buf[PEEK_LEN] = proto;
+	proto = *(volatile __s32 *)&p->buf[PEEK_LEN];
+	__builtin_memset(p->buf, 0, PEEK_LEN);
+	if (proto < 0 || proto >= WIRE_PROTOS)
+		return 0;
+	fs = flow_get(&ss->key);
+	if (!fs)
+		return 0;
+	fs->protos[proto & 15] = 1;
+	if (ss->pid)
+		fs->pid = ss->pid;
 	return 0;
 }
 

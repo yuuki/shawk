@@ -338,6 +338,8 @@ load 1m
   shawk_agent_udp_traced{job="shawk-agent", host_name="app-03"} 0x30
   shawk_agent_unix_traced{job="shawk-agent", host_name="app-01"} 1x30
   shawk_agent_unix_traced{job="shawk-agent", host_name="app-03"} 0x30
+  shawk_agent_protocols_classified{job="shawk-agent", host_name="app-01"} 1x30
+  shawk_agent_protocols_classified{job="shawk-agent", host_name="app-03"} 0x30
   shawk_agent_export_failures_total{job="shawk-agent", host_name="app-01"} 0x30
   shawk_agent_export_failures_total{job="shawk-agent", host_name="app-03"} 0+1x30
   shawk_agent_cgroup_events_dropped_total{job="shawk-agent", host_name="app-01"} 0x30
@@ -350,6 +352,9 @@ eval instant at 20m ` + a("ShawkUDPNotTraced") + `
 
 eval instant at 20m ` + a("ShawkUnixNotTraced") + `
   shawk_agent_unix_traced{job="shawk-agent", host_name="app-03"} 0
+
+eval instant at 20m ` + a("ShawkProtocolsNotClassified") + `
+  shawk_agent_protocols_classified{job="shawk-agent", host_name="app-03"} 0
 
 # One failure a minute.
 eval instant at 20m ` + a("ShawkExportFailures") + `

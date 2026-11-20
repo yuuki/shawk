@@ -185,6 +185,9 @@ ON CONFLICT (host_id, unit, comm, service_name, (coalesce(user_id, -1))) DO UPDA
 	if len(h.edges) > 0 {
 		queueEdges(b, h)
 	}
+	if len(h.wire) > 0 {
+		queueWire(b, h)
+	}
 	if len(h.listeners) > 0 {
 		queueListeners(b, h)
 		queueUnixListeners(b, h)
@@ -262,6 +265,45 @@ ON CONFLICT (host_id, path, netns, process_id) DO UPDATE SET
 	}
 }
 
+// queueWire writes the wire protocols of the TCP edges of a host, after
+// their edges, which the batch holds or PostgreSQL has: a protocol whose
+// edge is in neither is left out, as the edge was.
+func queueWire(b *pgx.Batch, h *hostChanges) {
+	var units, comms, services, users, roles, locals, peers, protocols []string
+	var ports []int32
+	var netns []int64
+	var firsts, lasts []time.Time
+	for k, s := range h.wire {
+		e := k.edge
+		units = append(units, e.unit)
+		comms = append(comms, e.comm)
+		services = append(services, e.service)
+		users = append(users, e.user)
+		roles = append(roles, e.role)
+		locals = append(locals, e.local.String())
+		peers = append(peers, peerString(e.peer, e.folded))
+		ports = append(ports, int32(e.port))
+		netns = append(netns, int64(e.netns))
+		protocols = append(protocols, k.protocol)
+		firsts = append(firsts, s.first)
+		lasts = append(lasts, s.last)
+	}
+	b.Queue(`
+INSERT INTO shawk.edge_protocols AS w (edge_id, protocol, first_seen, last_seen)
+SELECT e.id, u.protocol, u.f, u.l
+FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::text[],
+            $9::integer[], $10::bigint[], $11::text[], $12::timestamptz[], $13::timestamptz[])
+  AS u(unit, comm, service, uid, role, local, peer, port, netns, protocol, f, l)
+JOIN shawk.processes p ON p.host_id = $1 AND p.unit = u.unit AND p.comm = u.comm AND p.service_name = u.service
+  AND coalesce(p.user_id, -1) = coalesce(nullif(u.uid, '')::bigint, -1)
+JOIN shawk.edges e ON e.host_id = $1 AND e.role = u.role AND e.proto = 'tcp' AND e.local_addr = u.local::inet
+  AND e.remote_addr = u.peer::inet AND e.port = u.port AND e.netns = u.netns AND e.process_id = p.id
+ON CONFLICT (edge_id, protocol) DO UPDATE SET
+  first_seen = least(w.first_seen, excluded.first_seen),
+  last_seen  = greatest(w.last_seen, excluded.last_seen)`,
+		h.key, units, comms, services, users, roles, locals, peers, ports, netns, protocols, firsts, lasts)
+}
+
 // queueSessions writes the sessions of a host, and the periods in which its
 // agent dropped flows.
 //
@@ -287,7 +329,7 @@ func queueSessions(b *pgx.Batch, h *hostChanges) {
 	var starts, beats []time.Time
 	var runs []*time.Time // nil if unknown
 	var udp []bool
-	var unixTraced []*bool // nil if the agent does not tell
+	var unixTraced, classified []*bool // nil if the agent does not tell
 	var scopes, folds []string
 	var internals []*string
 	var dropped []int64
@@ -298,6 +340,7 @@ func queueSessions(b *pgx.Batch, h *hostChanges) {
 		beats = append(beats, s.lastHeartbeat)
 		udp = append(udp, s.udpTraced)
 		unixTraced = append(unixTraced, s.unixTraced)
+		classified = append(classified, s.protocolsClassified)
 		scopes = append(scopes, s.netnsScope)
 		dropped = append(dropped, s.dropped)
 		skews = append(skews, s.clockSkew.Seconds())
@@ -376,23 +419,25 @@ ON CONFLICT (host_id, started_at, period_start) DO UPDATE SET
 	// What the agent traces and folds is kept as of the latest heartbeat.
 	b.Queue(`
 INSERT INTO shawk.agent_sessions AS s (host_id, started_at, last_heartbeat, udp_traced, netns_scope, dropped_flows, clock_skew,
-                                       peer_fold, peer_internal, counters_started, unix_traced)
+                                       peer_fold, peer_internal, counters_started, unix_traced, protocols_classified)
 SELECT $1, u.started, u.beat, u.udp, u.scope, u.dropped, make_interval(secs => u.skew),
-       coalesce(nullif(u.fold, ''), 'none'), string_to_array(u.internal, ',')::cidr[], u.run, u.unix
+       coalesce(nullif(u.fold, ''), 'none'), string_to_array(u.internal, ',')::cidr[], u.run, u.unix, u.classified
 FROM unnest($2::timestamptz[], $3::timestamptz[], $4::boolean[], $5::text[], $6::bigint[], $7::float8[],
-            $8::text[], $9::text[], $10::timestamptz[], $11::boolean[])
-  AS u(started, beat, udp, scope, dropped, skew, fold, internal, run, unix)
+            $8::text[], $9::text[], $10::timestamptz[], $11::boolean[], $12::boolean[])
+  AS u(started, beat, udp, scope, dropped, skew, fold, internal, run, unix, classified)
 ON CONFLICT (host_id, started_at) DO UPDATE SET
   clock_skew       = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat THEN excluded.clock_skew ELSE s.clock_skew END,
   udp_traced       = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat THEN excluded.udp_traced ELSE s.udp_traced END,
   unix_traced      = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat THEN excluded.unix_traced ELSE s.unix_traced END,
+  protocols_classified = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat THEN excluded.protocols_classified
+                         ELSE s.protocols_classified END,
   netns_scope      = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat THEN excluded.netns_scope ELSE s.netns_scope END,
   peer_fold        = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat THEN excluded.peer_fold ELSE s.peer_fold END,
   peer_internal    = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat THEN excluded.peer_internal ELSE s.peer_internal END,
   counters_started = coalesce(s.counters_started, excluded.counters_started),
   dropped_flows    = greatest(s.dropped_flows, excluded.dropped_flows),
   last_heartbeat   = greatest(s.last_heartbeat, excluded.last_heartbeat)`,
-		h.key, starts, beats, udp, scopes, dropped, skews, folds, internals, runs, unixTraced)
+		h.key, starts, beats, udp, scopes, dropped, skews, folds, internals, runs, unixTraced, classified)
 }
 
 // queueListeners writes the listeners of a host: a row per listener with

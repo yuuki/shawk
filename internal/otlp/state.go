@@ -66,6 +66,11 @@ type EdgeStats struct {
 	HandshakeSumUs uint64
 	SynRetrans     uint64
 	Fails          [len(FailReasons)]uint64
+	// Protocols are the wire protocols of the connections of a TCP edge
+	// whose first payload was sent in the interval: bit i for
+	// WireProtocols[i]. Input only: a series keeps when each was seen
+	// (Edge.Protocols), not their bits in Total.
+	Protocols uint32
 }
 
 // fails returns the failures for reason i of FailReasons, or for ErrorOther
@@ -92,7 +97,8 @@ func (s *EdgeStats) handshakes() uint64 {
 
 // active tells whether the statistics of an interval show activity.
 func (s *EdgeStats) active() bool {
-	return s.Conns|s.ConnFails|s.OpenConns|s.BytesSent|s.BytesRecv|s.MsgsSent|s.MsgsRecv|s.Retrans|s.RTTSamples != 0
+	return s.Conns|s.ConnFails|s.OpenConns|s.BytesSent|s.BytesRecv|s.MsgsSent|s.MsgsRecv|s.Retrans|s.RTTSamples != 0 ||
+		s.Protocols != 0
 }
 
 func (s *EdgeStats) add(o *EdgeStats) {
@@ -166,6 +172,16 @@ type Edge struct {
 	// a data point for every reason, and the connector takes its first
 	// value as new rather than as a baseline.
 	FailStart [len(FailReasons) + 1]time.Time
+	// Protocols are when a connection of each of WireProtocols was first
+	// and last seen, at the end of the intervals that saw them; zero for
+	// those not seen. Nil until the edge sees one, so that the edges of an
+	// agent that does not classify hold a pointer only.
+	Protocols *[len(WireProtocols)]Seen
+}
+
+// Seen is when something was first and last seen.
+type Seen struct {
+	First, Last time.Time
 }
 
 // Listener is the state of a listener series.
@@ -211,6 +227,21 @@ func (s *State) AddEdge(k EdgeKey, st EdgeStats, start, end time.Time) {
 	for i := range e.FailStart {
 		if e.FailStart[i].IsZero() && st.fails(i) > 0 {
 			e.FailStart[i] = start
+		}
+	}
+	if st.Protocols != 0 && e.Protocols == nil {
+		e.Protocols = new([len(WireProtocols)]Seen)
+	}
+	for i := range len(WireProtocols) {
+		if st.Protocols&(1<<i) == 0 {
+			continue
+		}
+		p := &e.Protocols[i]
+		if p.First.IsZero() {
+			p.First = end
+		}
+		if end.After(p.Last) {
+			p.Last = end
 		}
 	}
 	if st.active() && end.After(e.LastSeen) {

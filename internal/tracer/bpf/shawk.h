@@ -115,6 +115,45 @@ struct shawk_flow_stats {
 	 */
 	__u32 syn_retrans;
 	__u32 fails[FAIL_REASONS]; /* failed active opens by reason */
+	/*
+	 * The wire protocols of the TCP connections whose first payload the
+	 * local socket sent in the interval: protos[p] is 1 for each enum
+	 * shawk_wire_proto p seen (see shawk_tcp_sendmsg). A byte each, so that
+	 * connections of the flow classified at once on several CPUs set their
+	 * protocols without atomic operations and none is lost.
+	 */
+	__u8 protos[16];
+};
+
+/*
+ * The protocol a TCP connection speaks, as the first payload that the local
+ * socket sends shows it (see wire_classify()): the request of a client, the
+ * answer or the greeting of a server. TLS has the version a client offers
+ * at most, or the version a server chose; WIRE_TLS is TLS whose version the
+ * bytes read do not tell. PostgreSQL and MySQL start in clear text and may
+ * switch to TLS: their values tell whether a client asks for TLS, and
+ * whether a server of PostgreSQL accepts it; a request of GSSAPI or of
+ * cancelling, which adds no protocol, is WIRE_SKIP (wire.h). User space has
+ * the same values (WireProtocol). At most 16, the bytes of
+ * shawk_flow_stats.protos.
+ */
+enum shawk_wire_proto {
+	WIRE_UNKNOWN = 0,  /* read, but none of the others */
+	WIRE_TLS = 1,      /* TLS of an unknown version */
+	WIRE_TLS_1_0 = 2,  /* TLS 1.0, or SSL 3.0 or 2.0 */
+	WIRE_TLS_1_1 = 3,
+	WIRE_TLS_1_2 = 4,
+	WIRE_TLS_1_3 = 5,
+	WIRE_HTTP1 = 6,    /* HTTP/1.x in clear text */
+	WIRE_HTTP2 = 7,    /* HTTP/2 in clear text (h2c), as gRPC without TLS */
+	WIRE_SSH = 8,
+	WIRE_POSTGRES = 9, /* PostgreSQL in clear text: a StartupMessage, or a server refusing TLS */
+	WIRE_MYSQL = 10,   /* MySQL without a request of TLS, or its greeting */
+	WIRE_REDIS = 11,   /* RESP, the protocol of Redis and Valkey */
+	WIRE_SLURM = 12,   /* the RPCs of Slurm */
+	WIRE_POSTGRES_TLS = 13, /* PostgreSQL asking for TLS, or accepting it */
+	WIRE_MYSQL_TLS = 14,    /* MySQL asking for TLS */
+	WIRE_PROTOS = 15,
 };
 
 /*
