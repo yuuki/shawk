@@ -104,8 +104,12 @@ jobs:
       - uses: actions/setup-go@v7.0.0
         with:
           go-version-file: go.mod
+      # The mirrors of the runners are slow at times: the install has a time
+      # limit and retries of its own, so that a slow mirror does not take
+      # the time of the tests.
       - name: Install tools
-        run: sudo apt-get update && sudo apt-get install -y clang llvm rpm2cpio cpio
+        timeout-minutes: 10
+        run: scripts/apt-install.sh clang llvm rpm2cpio cpio
       - name: Vet
         run: make vet
       - name: Unit tests with the race detector (agent, connector with PostgreSQL, packaging examples)
@@ -167,8 +171,11 @@ jobs:
       - uses: actions/setup-go@v7.0.0
         with:
           go-version-file: go.mod
+      # As in the job test; the tests of an emulated aarch64 kernel alone
+      # take up to half of the time of the job.
       - name: Install QEMU
-        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.qemu }} rpm2cpio cpio
+        timeout-minutes: 10
+        run: scripts/apt-install.sh ${{ matrix.qemu }} rpm2cpio cpio
       # The runners have KVM, which only its group may open.
       - name: Enable KVM
         run: |
