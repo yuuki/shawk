@@ -213,6 +213,7 @@ func queueEdges(b *pgx.Batch, h *hostChanges) {
 		units, comms, services, users, paths []string
 		netns                                []int64
 		firsts, lasts                        []time.Time
+		established                          []bool
 	}
 	// The months of activity, with the keys of their edges.
 	var act struct {
@@ -263,6 +264,8 @@ func queueEdges(b *pgx.Batch, h *hostChanges) {
 			unix.netns = append(unix.netns, int64(k.netns))
 			unix.firsts = append(unix.firsts, s.first)
 			unix.lasts = append(unix.lasts, s.last)
+			_, ok := h.established[k]
+			unix.established = append(unix.established, ok)
 			continue
 		}
 		units = append(units, k.unit)
@@ -310,16 +313,19 @@ WHERE a.hours <> (a.hours | excluded.hours)`,
 	}
 	if len(unix.units) > 0 {
 		b.Queue(`
-INSERT INTO shawk.unix_edges AS e (host_id, process_id, path, netns, first_seen, last_seen)
-SELECT $1, p.id, u.path, u.netns, u.f, u.l
-FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::bigint[], $8::timestamptz[], $9::timestamptz[])
-  AS u(unit, comm, service, uid, path, netns, f, l)
+INSERT INTO shawk.unix_edges AS e (host_id, process_id, path, netns, first_seen, last_seen, established)
+SELECT $1, p.id, u.path, u.netns, u.f, u.l, u.established
+FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::bigint[], $8::timestamptz[], $9::timestamptz[],
+            $10::boolean[])
+  AS u(unit, comm, service, uid, path, netns, f, l, established)
 JOIN shawk.processes p ON p.host_id = $1 AND p.unit = u.unit AND p.comm = u.comm AND p.service_name = u.service
   AND coalesce(p.user_id, -1) = coalesce(nullif(u.uid, '')::bigint, -1)
 ON CONFLICT (host_id, path, netns, process_id) DO UPDATE SET
-  first_seen = least(e.first_seen, excluded.first_seen),
-  last_seen  = greatest(e.last_seen, excluded.last_seen)`,
-			h.key, unix.units, unix.comms, unix.services, unix.users, unix.paths, unix.netns, unix.firsts, unix.lasts)
+  first_seen  = least(e.first_seen, excluded.first_seen),
+  last_seen   = greatest(e.last_seen, excluded.last_seen),
+  established = CASE WHEN excluded.established THEN true ELSE e.established END`,
+			h.key, unix.units, unix.comms, unix.services, unix.users, unix.paths, unix.netns, unix.firsts, unix.lasts,
+			unix.established)
 	}
 	if len(unixAct.units) > 0 {
 		b.Queue(`

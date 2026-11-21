@@ -286,7 +286,8 @@ $$;
 -- its server and the port as impact() reports them: cli_host, cli_service,
 -- cli_addr, srv_host, srv_service and dep_port. gid numbers the rows of
 -- impact(). The other columns are those of the dependency, which find its
--- edges.
+-- edges; a client that the target relays (srv_service ~relay) has the
+-- virtual address and port as those of its server.
 CREATE FUNCTION shawk.dependents(target_host text, since timestamptz, until timestamptz,
                                  target_service text, target_port integer, target_proto text, max_depth integer)
 RETURNS TABLE (
@@ -305,6 +306,12 @@ arg AS (
 -- The host ids of the target, none if no agent reported under its name.
 t AS (
   SELECT h.id FROM shawk.hosts h WHERE h.hostname = dependents.target_host
+),
+-- The time in which the agents of the target would not have seen a client
+-- of it: not observed, or observed in part.
+tb AS (
+  SELECT shawk.period(dependents.since, dependents.until) - o.observed + o.dropped + o.netns_limited AS blind, o.udp_untraced
+  FROM shawk.observation(dependents.since, dependents.until, ARRAY[dependents.target_host], interval '3 minutes') o
 ),
 d AS MATERIALIZED (
   SELECT row_number() OVER () AS id, x.*
@@ -391,10 +398,10 @@ cand AS (
 -- address the host of the client holds too is its own: the gateway of a
 -- container bridge, which every host has.
 srv AS (
-  SELECT DISTINCT ON (c.id, c.host) c.id, c.host, l.service
+  SELECT DISTINCT ON (c.id, c.host) c.id, c.host, l.service, l.unit
   FROM (SELECT cand.*, bool_or(cand.host = cand.client_host) OVER (PARTITION BY cand.id) AS own FROM cand) c
   LEFT JOIN LATERAL (
-    SELECT p.service_name AS service
+    SELECT p.service_name AS service, p.unit
     FROM shawk.hosts h
     JOIN shawk.listener_owners l ON l.host_id = h.id
     JOIN shawk.processes p ON p.id = l.process_id
@@ -402,71 +409,229 @@ srv AS (
       AND l.addr IN (c.server_addr, inet '0.0.0.0', inet '::')
       AND l.last_seen >= dependents.since - interval '15 minutes'
       AND l.first_seen <= c.last_seen + interval '15 minutes'
-    ORDER BY l.last_seen DESC, p.service_name LIMIT 1
+    ORDER BY l.last_seen DESC, p.service_name, p.unit LIMIT 1
   ) l ON true
   WHERE NOT c.own OR c.host = c.client_host
   ORDER BY c.id, c.host, l.service
 ),
--- The dependencies with the host and service of their server, also of
--- those that the client alone saw, and the host the inventory gives a
--- client without an agent. A dependency seen by its client alone may have
--- several rows, one per host that held the address of its server.
-r AS MATERIALIZED (
-  SELECT d.*,
-         CASE WHEN d.proto = 'unix' OR d.server_host IS NOT NULL THEN d.server_host ELSE s.host END AS srv_host,
-         CASE WHEN d.proto = 'unix' OR d.server_host IS NOT NULL THEN d.server_service ELSE s.service END AS srv_service,
-         coalesce(d.client_host, ci.host) AS cli_host
+-- The services that the client of a Unix socket without a server may have
+-- reached: the owners of the listeners of the name on its host in the
+-- period, in whatever namespace and at whatever time (a name served in
+-- several namespaces, a client that keeps trying after its server
+-- stopped); if no listener of the name is known, any service of the host
+-- (~unknown) when a connection of the client was established, or when the
+-- connector that wrote the edge did not tell. Failed attempts at a name
+-- that nothing is known to serve, as those of every process at the socket
+-- of nscd on a host without it, reach no service.
+ux AS (
+  SELECT d.id, o.service, o.unit
   FROM d
-  LEFT JOIN srv s ON s.id = d.id
-  LEFT JOIN shawk.inventory_addrs ci ON d.client_host IS NULL AND ci.addr = d.client_addr
+  CROSS JOIN LATERAL (
+    SELECT DISTINCT p.service_name AS service, p.unit
+    FROM shawk.hosts h
+    JOIN shawk.unix_listeners l ON l.host_id = h.id
+    JOIN shawk.processes p ON p.id = l.process_id
+    WHERE h.hostname = d.client_host AND l.path = d.path
+      AND l.last_seen >= dependents.since - interval '15 minutes'
+      AND l.first_seen <= dependents.until + interval '15 minutes'
+  ) o
+  WHERE d.proto = 'unix' AND d.server_host IS NULL
 ),
--- The dependencies on the target, without those of its own clients. A
--- connection that a socket without a known owner accepted (~unknown) may
--- be of any service of the host: it counts for the one asked for.
+uu AS (
+  SELECT d.id
+  FROM d
+  WHERE d.proto = 'unix' AND d.server_host IS NULL
+    AND d.id NOT IN (SELECT ux.id FROM ux)
+    AND EXISTS (
+      SELECT FROM shawk.hosts h
+      JOIN shawk.unix_edges e ON e.host_id = h.id
+      JOIN shawk.processes p ON p.id = e.process_id
+      WHERE h.hostname = d.client_host AND e.path = d.path
+        AND p.service_name = d.client_service AND p.unit = d.client_unit
+        AND e.last_seen >= dependents.since - interval '15 minutes'
+        AND e.first_seen <= dependents.until + interval '15 minutes'
+        AND e.established IS NOT FALSE)
+),
+-- The dependencies with the host, service and unit of their server: those
+-- that an agent saw the server of, those that the client alone saw, with
+-- a row per host that may have served them, and those over Unix sockets
+-- without a server. A dependency that reaches no known host is left out.
+-- cli_host names a client without an agent as the inventory does.
+r AS MATERIALIZED (
+  SELECT x.id, x.client_host, x.client_service, x.client_unit, x.client_addr,
+         x.server_host, x.server_service, x.server_unit, x.server_addr, x.port, x.proto,
+         x.first_seen, x.last_seen, x.observed_by, x.virtual_addr, x.virtual_port, x.path,
+         x.srv_host, x.srv_service, x.srv_unit, coalesce(x.client_host, ci.host) AS cli_host
+  FROM (
+    SELECT d.*, d.server_host AS srv_host, d.server_service AS srv_service, d.server_unit AS srv_unit
+    FROM d WHERE d.server_host IS NOT NULL
+    UNION ALL
+    SELECT d.*, s.host, s.service, s.unit
+    FROM d JOIN srv s ON s.id = d.id
+    UNION ALL
+    SELECT d.*, d.client_host, ux.service, ux.unit
+    FROM d JOIN ux ON ux.id = d.id
+    UNION ALL
+    SELECT d.*, d.client_host, '~unknown', NULL
+    FROM d JOIN uu ON uu.id = d.id
+  ) x
+  LEFT JOIN shawk.inventory_addrs ci ON x.client_host IS NULL AND ci.addr = x.client_addr
+),
+-- The connections that the target relayed in the kernel, as its agents
+-- learned them from conntrack (shawk.learned_translations): a load
+-- balancer, a NAT gateway, a node that forwards to the pods of others. No
+-- process of the target accepted them, and the dependency is that of the
+-- client on the backend, so the target shows nowhere else. Not those of
+-- its own clients (an address it holds, or the address of a client edge
+-- of its own), nor those to a backend that it serves itself, whose server
+-- edge has them.
+lt AS (
+  SELECT l.proto, l.client_addr, l.virtual_addr, l.virtual_port, min(l.first_seen) AS first_seen, max(l.last_seen) AS last_seen
+  FROM shawk.learned_translations l
+  WHERE l.host_id IN (SELECT t.id FROM t)
+    AND l.last_seen >= dependents.since AND l.first_seen <= dependents.until
+    AND NOT (l.client_addr << inet '127.0.0.0/8' OR l.client_addr = inet '::1')
+    AND NOT EXISTS (SELECT FROM ha
+                    WHERE ha.hostname = dependents.target_host AND ha.addr = l.client_addr
+                      AND ha.held_until >= l.first_seen AND ha.held_from <= l.last_seen)
+    AND NOT EXISTS (SELECT FROM shawk.edges e
+                    WHERE e.host_id = l.host_id AND e.role = 'client' AND e.proto = l.proto
+                      AND e.local_addr = l.client_addr AND e.remote_addr = l.virtual_addr AND e.port = l.virtual_port)
+    AND NOT EXISTS (SELECT FROM shawk.edges e
+                    WHERE e.host_id = l.host_id AND e.role = 'server' AND e.proto = l.proto
+                      AND e.local_addr = l.backend_addr AND e.port = l.backend_port
+                      AND e.last_seen >= dependents.since - interval '15 minutes'
+                      AND e.first_seen <= dependents.until + interval '15 minutes')
+  GROUP BY l.proto, l.client_addr, l.virtual_addr, l.virtual_port
+),
+-- The clients that the target relayed, each once per virtual address and
+-- port: those of the connections above, by the name that an agent on the
+-- client gives it, if any; those that reached a backend through a virtual
+-- address that the target held (a translation of the configuration, or
+-- one that another host learned); and those that the backends of a
+-- translation of the configuration saw alone, when the target held its
+-- virtual address, since they may have come through it. They are clients
+-- of the target on the virtual address and port, of no process of it:
+-- ~relay.
+relay AS (
+  SELECT -row_number() OVER () AS id, y.*
+  FROM (
+    SELECT DISTINCT ON (x.client_host, x.client_service, x.client_unit, x.client_addr, x.server_addr, x.port, x.proto)
+           x.client_host, x.client_service, x.client_unit, x.client_addr,
+           x.server_host, NULL::text AS server_service, NULL::text AS server_unit, x.server_addr, x.port, x.proto,
+           x.first_seen, x.last_seen, x.observed_by, NULL::inet AS virtual_addr, NULL::integer AS virtual_port, NULL::text AS path,
+           dependents.target_host AS srv_host, '~relay'::text AS srv_service, NULL::text AS srv_unit,
+           coalesce(x.client_host, ci.host) AS cli_host
+    FROM (
+      SELECT c.client_host, c.client_service, c.client_unit, lt.client_addr,
+             CASE WHEN c.client_host IS NULL THEN dependents.target_host END AS server_host,
+             lt.virtual_addr AS server_addr, lt.virtual_port AS port, lt.proto, lt.first_seen, lt.last_seen,
+             CASE WHEN c.client_host IS NULL THEN 'server' ELSE 'both' END AS observed_by
+      FROM lt
+      LEFT JOIN (
+        SELECT DISTINCT d.client_host, d.client_service, d.client_unit, d.client_addr, d.proto,
+               coalesce(d.virtual_addr, d.server_addr) AS addr, coalesce(d.virtual_port, d.port) AS port
+        FROM d WHERE d.client_host IS NOT NULL AND d.proto <> 'unix'
+      ) c ON c.client_addr = lt.client_addr AND c.addr = lt.virtual_addr AND c.port = lt.virtual_port AND c.proto = lt.proto
+      UNION ALL
+      SELECT d.client_host, d.client_service, d.client_unit, d.client_addr, NULL,
+             d.virtual_addr, d.virtual_port, d.proto, d.first_seen, d.last_seen, 'client'
+      FROM d
+      JOIN ha ON ha.addr = d.virtual_addr AND ha.hostname = dependents.target_host
+      WHERE d.virtual_addr IS NOT NULL
+        AND d.server_host IS DISTINCT FROM dependents.target_host
+        AND ha.held_until >= greatest(d.first_seen, dependents.since)
+        AND ha.held_from <= least(d.last_seen, dependents.until)
+      UNION ALL
+      SELECT NULL, NULL, NULL, d.client_addr, d.server_host,
+             v.addr::inet, CASE WHEN v.port = 0 THEN d.port ELSE v.port END, d.proto, d.first_seen, d.last_seen, 'server'
+      FROM shawk.translations v
+      JOIN ha ON ha.addr = v.addr::inet AND ha.hostname = dependents.target_host
+      JOIN shawk.translations b ON b.name = v.name AND b.proto = v.proto AND b.side = 'backend'
+      JOIN d ON d.proto = b.proto AND d.server_addr <<= b.addr AND b.port IN (0, d.port)
+      WHERE v.side = 'virtual'
+        AND (b.port <> 0 OR v.port IN (0, d.port))
+        AND d.client_host IS NULL AND d.server_host <> dependents.target_host
+        AND ha.held_until >= greatest(d.first_seen, dependents.since)
+        AND ha.held_from <= least(d.last_seen, dependents.until)
+        AND (NOT EXISTS (SELECT FROM shawk.translations x
+                         WHERE x.name = v.name AND x.proto = v.proto AND x.side = 'source')
+             OR EXISTS (SELECT FROM shawk.translations x
+                        WHERE x.name = v.name AND x.proto = v.proto AND x.side = 'source' AND d.client_addr <<= x.addr))
+    ) x
+    LEFT JOIN shawk.inventory_addrs ci ON x.client_host IS NULL AND ci.addr = x.client_addr
+    WHERE x.client_host IS DISTINCT FROM dependents.target_host
+    ORDER BY x.client_host, x.client_service, x.client_unit, x.client_addr, x.server_addr, x.port, x.proto,
+             x.observed_by, x.first_seen
+  ) y
+),
+-- The dependencies on the target. Those of a service are on the service,
+-- on a socket of its host without a known owner (~unknown) or on what its
+-- host relays (~relay), either of which may be the service's; and, when
+-- the target was not observed while the dependency was active, or never,
+-- on a port of the host whose owner is not known.
+--
+-- A client is no dependent if it is part of the target, which only what
+-- an agent saw on the target itself tells: a process on the host, or a
+-- peer on loopback, when the whole host is the target; a process of the
+-- service, when a service is; the process that serves the port, by its
+-- unit, when a port alone is. An address of the target tells nothing: a
+-- host that translates addresses is the source of the clients behind it.
 direct AS (
   SELECT r.*
   FROM r CROSS JOIN arg
   WHERE r.srv_host = dependents.target_host
-    AND (dependents.target_service IS NULL OR r.srv_service IN (dependents.target_service, '~unknown')
-         OR (r.srv_service IS NULL AND NOT EXISTS (SELECT FROM t)))
+    AND (dependents.target_service IS NULL
+         OR r.srv_service IN (dependents.target_service, '~unknown')
+         OR (r.srv_service IS NULL
+             AND (NOT EXISTS (SELECT FROM t)
+                  OR EXISTS (SELECT FROM tb
+                             WHERE tstzrange(greatest(r.first_seen, dependents.since),
+                                             greatest(least(r.last_seen, dependents.until), greatest(r.first_seen, dependents.since)), '[]')
+                                   && (tb.blind + CASE WHEN r.proto = 'udp' THEN tb.udp_untraced ELSE '{}' END)))))
     AND (dependents.target_port IS NULL OR r.port = dependents.target_port)
     AND (dependents.target_proto IS NULL OR r.proto = dependents.target_proto)
     AND NOT CASE
       WHEN arg.whole_host THEN
-        r.cli_host IS NOT DISTINCT FROM dependents.target_host
-        OR (r.cli_host IS NULL
-            AND (r.client_addr << inet '127.0.0.0/8' OR r.client_addr = inet '::1'
-                 -- An address the target held when the dependency was
-                 -- last seen: one that another host took since is that
-                 -- host's.
-                 OR EXISTS (SELECT FROM shawk.host_addrs a
-                            WHERE a.host_id IN (SELECT t.id FROM t) AND a.addr = r.client_addr
-                              AND a.first_seen <= r.last_seen + shawk.alive_window()
-                              AND a.last_seen >= least(r.last_seen, dependents.until) - shawk.alive_window())))
-      -- The service itself, as a client of its own port.
-      ELSE r.client_host IS NOT DISTINCT FROM dependents.target_host
-           AND r.client_service IS NOT DISTINCT FROM coalesce(dependents.target_service, r.srv_service)
-           AND r.client_service IS DISTINCT FROM '~unknown'
+        r.client_host IS NOT DISTINCT FROM dependents.target_host
+        OR (r.client_host IS NULL AND (r.client_addr << inet '127.0.0.0/8' OR r.client_addr = inet '::1'))
+      WHEN dependents.target_service IS NOT NULL THEN
+        r.client_host IS NOT DISTINCT FROM dependents.target_host
+        AND r.client_service IS NOT DISTINCT FROM dependents.target_service
+      ELSE
+        r.client_host IS NOT DISTINCT FROM dependents.target_host
+        AND r.client_service IS NOT DISTINCT FROM r.srv_service
+        AND r.client_unit IS NOT DISTINCT FROM r.srv_unit
+        AND r.client_service IS DISTINCT FROM '~unknown'
     END
+  UNION ALL
+  SELECT y.*
+  FROM relay y
+  WHERE (dependents.target_port IS NULL OR y.port = dependents.target_port)
+    AND (dependents.target_proto IS NULL OR y.proto = dependents.target_proto)
 ),
 -- The dependents with an agent, by the depths they are reached at. The
 -- sockets without a known owner of a host (~unknown) are no service: their
 -- clients are not those of the socket that used the target.
+g AS MATERIALIZED (
+  SELECT DISTINCT r.srv_host, r.srv_service, r.client_host, r.client_service
+  FROM r
+  WHERE r.client_host IS NOT NULL AND r.client_service <> '~unknown' AND r.srv_service IS NOT NULL
+    AND NOT (r.client_host = r.srv_host AND r.client_service = r.srv_service)
+),
 walk (depth, host, service) AS (
   SELECT 1, x.client_host, x.client_service FROM direct x
   WHERE x.client_host IS NOT NULL AND x.client_service <> '~unknown'
   UNION
-  SELECT w.depth + 1, r.client_host, r.client_service
+  SELECT w.depth + 1, g.client_host, g.client_service
   FROM walk w
-  JOIN r ON r.srv_host = w.host AND r.srv_service = w.service
+  JOIN g ON g.srv_host = w.host AND g.srv_service = w.service
   CROSS JOIN arg
   WHERE w.depth < arg.max_depth
-    AND r.client_host IS NOT NULL AND r.client_service <> '~unknown'
-    AND NOT (r.client_host = w.host AND r.client_service = w.service)
-    AND NOT (r.client_host = dependents.target_host
-             AND (arg.whole_host OR r.client_service IS NOT DISTINCT FROM dependents.target_service))
+    AND NOT (g.client_host = dependents.target_host
+             AND (arg.whole_host OR g.client_service IS NOT DISTINCT FROM dependents.target_service))
 ),
-node AS (
+node AS MATERIALIZED (
   SELECT w.host, w.service, min(w.depth) AS depth FROM walk w GROUP BY w.host, w.service
 ),
 -- The dependencies reported: those on the target, and those on a dependent
@@ -478,12 +643,12 @@ hit AS (
   FROM node n
   JOIN r ON r.srv_host = n.host AND r.srv_service = n.service
   CROSS JOIN arg
-  LEFT JOIN node nc ON nc.host = r.client_host AND nc.service = r.client_service
   WHERE n.depth < arg.max_depth
     AND NOT (r.client_host IS NOT DISTINCT FROM n.host AND r.client_service IS NOT DISTINCT FROM n.service)
     AND NOT (r.cli_host IS NOT DISTINCT FROM dependents.target_host
              AND (arg.whole_host OR r.client_service IS NOT DISTINCT FROM dependents.target_service))
-    AND (nc.depth IS NULL OR nc.depth = n.depth + 1)
+    AND NOT EXISTS (SELECT FROM node nc
+                    WHERE nc.host = r.client_host AND nc.service = r.client_service AND nc.depth <= n.depth)
     AND r.id NOT IN (SELECT x.id FROM direct x)
 )
 SELECT dense_rank() OVER (ORDER BY x.depth, x.cli_host, x.cli_service, x.cli_addr, x.srv_host, x.srv_service,
@@ -522,20 +687,42 @@ $$;
 -- port, NULL if none. A host whose agents did not report then held the
 -- address if it was among the last they reported before or the first they
 -- reported after, and no host of another name reported it in between: a
--- host that is used while its agent is stopped keeps its dependents. Such a dependency counts for a service of a host
--- only if that service owned the port, except on a target without an
--- agent, of which nothing else is known. A connection that a socket
--- without a known owner accepted (~unknown) counts for every service of
--- its host.
+-- host that is used while its agent is stopped keeps its dependents.
 --
--- A client is a dependent of the target unless it is part of it: a client
--- on the target itself when the whole host is the target, the service
--- itself otherwise. A dependent with an agent is followed: the clients of
--- its service on its host are dependents of the next depth, unless they
--- are part of the target or already dependents of a lesser depth, so that
--- a dependent with an agent is reported once, at the depth it is first
--- reached; one without an agent is reported with each server it uses. The
--- dependencies of the period are followed at most once per depth.
+-- The clients of a host are also those it relays in the kernel, with the
+-- server_service ~relay and the virtual address and port they connected
+-- to: a load balancer, a NAT gateway, a node that forwards to the pods of
+-- other nodes. They are the clients of the translations its agents
+-- learned, unless the client or the backend is on the host itself; those
+-- that reached a backend through a virtual address the host held; and
+-- those that the backends of a translation of the configuration saw
+-- alone, when the host held its virtual address.
+--
+-- The dependents of a service of a host are the clients of the service;
+-- those of a socket of the host without a known owner (~unknown) and
+-- those the host relays (~relay), either of which may be of any service;
+-- those of a port of the host whose owner is not known, seen by clients
+-- alone, while the host was not observed (or dropped flows, or traced one
+-- namespace), or when no agent ever reported under its name; and, over
+-- Unix sockets, the clients of a name without a server in their
+-- namespace, for the services that listened on the name in the period,
+-- or for every service (~unknown) when no listener of the name is known
+-- and a connection was established.
+--
+-- A client is a dependent of the target unless it is part of it, which
+-- only an agent on the target tells: a process on the target, or a peer
+-- on loopback, when the whole host is the target; a process of the
+-- service, when a service is; the process that serves the port, by its
+-- unit, when a port alone is. A connection from an address of the target
+-- that no process on it made is that of a dependent: the target may
+-- translate the addresses of the clients behind it.
+--
+-- A dependent with an agent is followed: the clients of its service on
+-- its host are dependents of the next depth, unless they are part of the
+-- target or already dependents of a lesser depth, so that a dependent
+-- with an agent is reported once, at the depth it is first reached; one
+-- without an agent is reported with each server it uses. The dependencies
+-- of the period are followed at most once per depth.
 --
 -- cadence, period, next_expected and runs are those of shawk.cadence() over
 -- the hours of activity of its edges (shawk.edge_activity), with the time
@@ -665,21 +852,25 @@ $$;
 --                 reasons tell what was missing;
 --   SAFE          no dependent was seen, and the target was watched.
 --
--- coverage is the part of the period, from 0 to 1, in which an agent of
--- the target observed all that the target covers: observed (not_observed
--- otherwise, or before_retention for the part of the period whose
--- dependencies are deleted), without dropped flows (dropped_flows), in every network
--- namespace (netns_limited), with UDP unless target_proto is another
--- transport (udp_not_traced), and with Unix sockets when the target is a
--- service without a port (unix_not_traced). A target that no agent reported
--- under has a coverage of 0: unknown_host, or no_agent for a host of the
+-- coverage is the part of the period, from 0 to 1, for which the history
+-- tells all that the target covers: an agent of the target observed
+-- (not_observed otherwise), within the retention (before_retention),
+-- without dropped flows (dropped_flows), in every network namespace
+-- (netns_limited), with UDP unless target_proto is another transport
+-- (udp_not_traced), and with Unix sockets when the target is a service
+-- without a port (unix_not_traced). A target that no agent reported under
+-- has a coverage of 0: unknown_host, or no_agent for a host of the
 -- inventory, whose clients without an agent nothing would tell.
 -- min_coverage is 1 by default: any gap makes the verdict INCONCLUSIVE.
+-- tolerance is the delay of writes, as in coverage(): 1 hour at most.
 --
 -- A service that no process of the host had in the period
--- (unknown_service), and a port that nothing listened on nor served there
--- (unknown_port), are INCONCLUSIVE too, whatever the coverage: nothing
--- used what shawk does not know of, a name or a port mistyped included.
+-- (unknown_service), and a port that no socket listened on nor served
+-- there, or none of the service when both are given (unknown_port), are
+-- INCONCLUSIVE too, whatever the coverage: nothing used what shawk does
+-- not know of, a name or a port mistyped included. target_proto unix is
+-- for a service without a port: the clients of a Unix socket are on its
+-- host.
 --
 -- direct and transitive count the dependents of depth 1 and of the depths
 -- after; caveats are the shortfalls of the coverage that did not decide
@@ -716,6 +907,12 @@ BEGIN
   END IF;
   IF target_port < 1 OR target_port > 65535 THEN
     RAISE EXCEPTION 'target_port is from 1 to 65535: %', target_port USING ERRCODE = 'invalid_parameter_value';
+  END IF;
+  -- The clients of a Unix socket are on its host, and a socket has no
+  -- port: only a service has dependents over Unix sockets.
+  IF target_proto = 'unix' AND (target_service IS NULL OR target_port IS NOT NULL) THEN
+    RAISE EXCEPTION 'target_proto unix is for a target_service, without a target_port'
+      USING ERRCODE = 'invalid_parameter_value';
   END IF;
   -- The tolerance is the delay of writes: one that hides gaps of hours is
   -- a mistake.
@@ -767,18 +964,31 @@ BEGIN
     unknown := true;
     shortfalls := shortfalls || 'unknown_service'::text;
   END IF;
+  -- A port counts if a socket listened on it or served on it in the
+  -- period: a socket of the service, or one without a known owner, when a
+  -- service is given too.
   IF o.agent AND target_port IS NOT NULL
      AND NOT EXISTS (
        SELECT FROM shawk.hosts h
-       JOIN shawk.listeners l ON l.host_id = h.id
+       JOIN shawk.listener_owners l ON l.host_id = h.id
+       JOIN shawk.processes p ON p.id = l.process_id
        WHERE h.hostname = target_host AND l.port = target_port
+         AND (target_proto IS NULL OR l.proto = target_proto)
+         AND (target_service IS NULL OR p.service_name IN (target_service, '~unknown'))
+         AND l.last_seen >= since - interval '15 minutes')
+     AND NOT EXISTS (
+       SELECT FROM shawk.hosts h
+       JOIN shawk.listeners l ON l.host_id = h.id
+       WHERE h.hostname = target_host AND l.port = target_port AND l.process_id IS NULL
          AND (target_proto IS NULL OR l.proto = target_proto)
          AND l.last_seen >= since - interval '15 minutes')
      AND NOT EXISTS (
        SELECT FROM shawk.hosts h
        JOIN shawk.edges e ON e.host_id = h.id AND e.role = 'server'
+       JOIN shawk.processes p ON p.id = e.process_id
        WHERE h.hostname = target_host AND e.port = target_port
          AND (target_proto IS NULL OR e.proto = target_proto)
+         AND (target_service IS NULL OR p.service_name IN (target_service, '~unknown'))
          AND e.last_seen >= since - interval '15 minutes') THEN
     unknown := true;
     shortfalls := shortfalls || 'unknown_port'::text;

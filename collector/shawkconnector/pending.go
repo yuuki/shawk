@@ -114,6 +114,13 @@ func (b *activityBits) String() string {
 	return string(out)
 }
 
+// established tells whether a connection of an edge was established since
+// the agent counts them: one it opened, or one that is open (an adopted
+// connection is counted open only).
+func established(e *edgeInput) bool {
+	return e.values[valueKey{metric: metricConnOpened}].value > 0 || e.values[valueKey{metric: metricConnCount}].value > 0
+}
+
 // sameHour tells whether two times are in the same hour, in UTC.
 func sameHour(a, b time.Time) bool {
 	return a.Truncate(time.Hour).Equal(b.Truncate(time.Hour))
@@ -166,12 +173,15 @@ type hostChanges struct {
 	kernel, version     string
 	span
 
-	sessions     map[time.Time]*sessionRow
-	addrs        map[netip.Addr]span
-	processes    map[procKey]*procRow
-	edges        map[edgeRowKey]span
-	wire         map[wireRowKey]span              // the wire protocols of edges, whose edges are in edges
-	activity     map[activityRowKey]*activityBits // the hours edges were active in, whose edges are in edges
+	sessions  map[time.Time]*sessionRow
+	addrs     map[netip.Addr]span
+	processes map[procKey]*procRow
+	edges     map[edgeRowKey]span
+	wire      map[wireRowKey]span              // the wire protocols of edges, whose edges are in edges
+	activity  map[activityRowKey]*activityBits // the hours edges were active in, whose edges are in edges
+	// established are the edges of Unix sockets, among edges, of which a
+	// connection was established: the others are failed attempts only.
+	established  map[edgeRowKey]struct{}
 	listeners    map[listenerRowKey]span
 	translations map[translationID]span
 }
@@ -185,6 +195,7 @@ func newHostChanges(key string) *hostChanges {
 		edges:        map[edgeRowKey]span{},
 		wire:         map[wireRowKey]span{},
 		activity:     map[activityRowKey]*activityBits{},
+		established:  map[edgeRowKey]struct{}{},
 		listeners:    map[listenerRowKey]span{},
 		translations: map[translationID]span{},
 	}
@@ -313,6 +324,9 @@ func (h *hostChanges) merge(o *hostChanges) {
 	}
 	for k, bits := range o.activity {
 		h.activityOf(k).merge(bits)
+	}
+	for k := range o.established {
+		h.established[k] = struct{}{}
 	}
 	for k, s := range o.listeners {
 		h.addListener(k, s)
@@ -522,6 +536,9 @@ func (c *changes) addEdges(b *hostBatch, h *hostChanges, latest, now time.Time) 
 		}
 		h.addProcess(pk, e.id.exe, s)
 		h.addEdge(k, s)
+		if k.proto == transportUnix && established(e) {
+			h.established[k] = struct{}{}
+		}
 		if !known || s.first.Before(prev.first) && !sameHour(s.first, prev.first) {
 			h.addActivity(k, s.first)
 		}

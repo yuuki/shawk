@@ -30,6 +30,12 @@ CREATE TABLE shawk.unix_edge_activity (
 );
 CREATE INDEX unix_edge_activity_month ON shawk.unix_edge_activity (month);
 
+-- Whether a connection of an edge of Unix sockets was ever established:
+-- false for an edge of failed attempts only, as those of the processes of
+-- a host without nscd at its socket, which reach no service; NULL for an
+-- edge written by a connector that did not tell.
+ALTER TABLE shawk.unix_edges ADD COLUMN established boolean;
+
 -- How far back the history is whole: the latest cutoff shawk.prune() was
 -- called with. An edge last seen before it is deleted, but the session of
 -- an agent that goes on is kept whole, so that the sessions alone would
