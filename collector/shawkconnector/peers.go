@@ -803,7 +803,7 @@ func (r *resolver) holderAgent(host, holder string, id *edgeID, now time.Time) (
 	case id.role == roleServer:
 		// Through a translation, the client connects to a virtual
 		// address, which its agent may fold.
-		v, through := r.foldedVirtual(a, holder, id, now)
+		v, through := r.foldedVirtual(host, a, holder, id, now)
 		if !through && !r.foldsPeer(a, holder, id.local, true, now) {
 			break
 		}
@@ -889,8 +889,12 @@ func (r *resolver) serverPeer(host string, id *edgeID, rules chooser, p peer, co
 	k := clientKey{id.peer, id.local, id.port, id.proto}
 	c := rules
 	c.add(r.localClients[k], r.dbClients[k], r.dbAge(now), 0)
-	if p.name = c.best.service; p.name != "" {
-		return p
+	direct := c.best.service
+	if direct != "" && !r.foldsServerAddr(p, id, now) {
+		// The client connected directly to this address, whatever it does
+		// with a virtual address that also reaches this host.
+		p.name = direct
+		return unfolded(p, covers)
 	}
 	if p.name = r.translatedClient(rules, id, now); p.name != "" {
 		// The client connected to the virtual address, which its agent
@@ -908,7 +912,25 @@ func (r *resolver) serverPeer(host string, id *edgeID, rules chooser, p peer, co
 		// SNAT keeps its name: the source forwards several clients.
 		return unfolded(p, covers)
 	}
+	if direct != "" {
+		// The live agent of the client folds this address itself, so its
+		// direct client edge is from before its configuration changed: the
+		// translations above come first, and otherwise it names the peer,
+		// which stays folded, without blaming a virtual address.
+		p.name, p.foldedVirtual = direct, netip.Addr{}
+	}
 	return p
+}
+
+// foldsServerAddr tells whether the live agent of the client of a server
+// edge, which folds the peer p of the edge, folds the address of the server
+// itself rather than only a virtual address that reaches it. r.mu is held.
+func (r *resolver) foldsServerAddr(p peer, id *edgeID, now time.Time) bool {
+	if p.foldedBy == "" {
+		return false
+	}
+	a, ok := r.agent(p.foldedBy, now)
+	return ok && r.foldsPeer(a, p.foldedBy, id.local, true, now)
 }
 
 // unfolded returns p with agent, as a peer whose agent folds nothing of
@@ -1375,10 +1397,10 @@ func (r *resolver) behindRelay(id *edgeID) bool {
 }
 
 // foldedVirtual returns a virtual address of a translation without sources,
-// static or learned (DNAT),
-// through which the client of a server edge reaches it, and that the agent a
-// of the client, on the host client, folds. r.mu is held.
-func (r *resolver) foldedVirtual(a agentHost, client string, id *edgeID, now time.Time) (netip.Addr, bool) {
+// static or learned (DNAT), through which the client of a server edge of
+// host reaches it, and that the agent a of the client, on the host client,
+// folds. r.mu is held.
+func (r *resolver) foldedVirtual(host string, a agentHost, client string, id *edgeID, now time.Time) (netip.Addr, bool) {
 	for i := range r.translations {
 		t := &r.translations[i]
 		if len(t.sources) > 0 || !t.has(id.proto) {
@@ -1391,15 +1413,14 @@ func (r *resolver) foldedVirtual(a agentHost, client string, id *edgeID, now tim
 		}
 	}
 	// Through a learned DNAT the client connects to its virtual address.
-	k := learnedServerKey{id.proto, id.local, id.port, id.peer}
-	for _, m := range []map[learnedClient]time.Time{r.localLearnedServers[k], r.dbLearnedServers[k]} {
-		for lc := range m {
-			if r.foldsPeer(a, client, lc.virtual, true, now) {
-				return lc.virtual, true
-			}
+	// Pick the smallest address so the choice does not depend on map order.
+	var best netip.Addr
+	for _, lc := range r.learnedClientsOf(host, id, now) {
+		if r.foldsPeer(a, client, lc.virtual, true, now) && (!best.IsValid() || lc.virtual.Less(best)) {
+			best = lc.virtual
 		}
 	}
-	return netip.Addr{}, false
+	return best, best.IsValid()
 }
 
 // translatedClient finds the client service of a server edge at a backend
