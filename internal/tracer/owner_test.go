@@ -2,8 +2,12 @@ package tracer
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"io"
+	"maps"
 	"net"
 	"net/netip"
 	"os"
@@ -17,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cilium/ebpf"
 	"golang.org/x/sys/unix"
 )
 
@@ -537,5 +542,647 @@ func TestCgroupBurst(t *testing.T) {
 				time.Sleep(50 * time.Millisecond)
 			}
 		})
+	}
+}
+
+type fakeListenMap struct {
+	entries  map[bpfShawkListenKey]struct{}
+	capacity int // 0 means unbounded
+	puts     int
+	keysErr  error
+	delErr   func(bpfShawkListenKey) error
+	putErr   func(bpfShawkListenKey) error
+}
+
+func newFakeListenMap(keys ...bpfShawkListenKey) *fakeListenMap {
+	m := &fakeListenMap{entries: make(map[bpfShawkListenKey]struct{}, len(keys))}
+	for _, k := range keys {
+		m.entries[k] = struct{}{}
+	}
+	return m
+}
+
+func (f *fakeListenMap) keys() ([]bpfShawkListenKey, error) {
+	if f.keysErr != nil {
+		return nil, f.keysErr
+	}
+	out := make([]bpfShawkListenKey, 0, len(f.entries))
+	for k := range f.entries {
+		out = append(out, k)
+	}
+	return out, nil
+}
+
+func (f *fakeListenMap) delete(key bpfShawkListenKey) error {
+	if f.delErr != nil {
+		if err := f.delErr(key); err != nil {
+			return err
+		}
+	}
+	if _, ok := f.entries[key]; !ok {
+		return ebpf.ErrKeyNotExist
+	}
+	delete(f.entries, key)
+	return nil
+}
+
+func (f *fakeListenMap) putNoExist(key bpfShawkListenKey) error {
+	f.puts++
+	if f.putErr != nil {
+		if err := f.putErr(key); err != nil {
+			return err
+		}
+	}
+	if _, ok := f.entries[key]; ok {
+		return ebpf.ErrKeyExist
+	}
+	if f.capacity > 0 && len(f.entries) >= f.capacity {
+		return fmt.Errorf("key too big for map: %w", unix.E2BIG)
+	}
+	f.entries[key] = struct{}{}
+	return nil
+}
+
+type callbackReadCloser struct {
+	r      io.Reader
+	onRead func()
+	once   bool
+	closed bool
+}
+
+func (c *callbackReadCloser) Read(p []byte) (int, error) {
+	if !c.once && c.onRead != nil {
+		c.once = true
+		c.onRead()
+	}
+	return c.r.Read(p)
+}
+
+func (c *callbackReadCloser) Close() error {
+	c.closed = true
+	return nil
+}
+
+type errReader struct{ err error }
+
+func (e errReader) Read([]byte) (int, error) { return 0, e.err }
+
+func encodeIterRecs(t *testing.T, recs ...bpfShawkIterRec) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := binary.Write(&buf, binary.NativeEndian, recs); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func listenerRec(proto Proto, netns uint32, addr string, port uint16, ino uint64) bpfShawkIterRec {
+	return bpfShawkIterRec{
+		Type:  recListener,
+		Proto: uint8(proto),
+		Netns: netns,
+		Addr:  netip.MustParseAddr(addr).As16(),
+		Port:  port,
+		Ino:   ino,
+	}
+}
+
+// TestScanSocketsPrunesListenPorts checks that scanSocketsWith clears TCP
+// listen_ports before walking namespaces while keeping pre-existing
+// udp_listen_ports entries intact throughout the walk, preserving ports
+// inserted concurrently by udp_direction(), pruning only stale UDP keys
+// afterwards, and issuing no backfill puts in steady state.
+func TestScanSocketsPrunesListenPorts(t *testing.T) {
+	key := func(netns uint32, port uint16) bpfShawkListenKey {
+		return bpfShawkListenKey{Netns: netns, Port: port}
+	}
+	initTCP := []bpfShawkListenKey{
+		key(100, 80),
+		key(100, 443),
+		key(200, 80),
+	}
+	initUDP := []bpfShawkListenKey{
+		key(100, 443),  // active UDP (TCP 443 closed)
+		key(100, 53),   // stale UDP (also appears in a non-listener record)
+		key(100, 5353), // IPv4 closed, IPv6 remains active
+		key(200, 443),  // stale in netns 200 (netns 100 port 443 stays active)
+		key(100, 9999), // removed before prune; ErrKeyNotExist must be ignored
+	}
+	tcpPorts := newFakeListenMap(initTCP...)
+	udpPorts := newFakeListenMap(initUDP...)
+
+	assertUDPPresent := func(phase string) {
+		t.Helper()
+		for _, k := range initUDP {
+			if _, ok := udpPorts.entries[k]; !ok {
+				t.Fatalf("%s: UDP key %+v was removed prematurely", phase, k)
+			}
+		}
+	}
+
+	concurrentUDP := key(100, 6000)
+	var opened, drained bool
+	open := func() ([]io.ReadCloser, error) {
+		opened = true
+		// TCP listen_ports must be cleared before iter/tcp opens so
+		// adopted_direction() never sees stale closed TCP listeners.
+		if len(tcpPorts.entries) != 0 {
+			t.Fatalf("during open: tcpPorts = %v, want empty", tcpPorts.entries)
+		}
+		assertUDPPresent("during open")
+		tcpRecs := encodeIterRecs(t,
+			listenerRec(ProtoTCP, 100, "127.0.0.1", 80, 1),
+			listenerRec(ProtoTCP, 100, "::1", 8080, 2),
+		)
+		udpRecs := encodeIterRecs(t,
+			listenerRec(ProtoUDP, 100, "127.0.0.1", 443, 3),
+			listenerRec(ProtoUDP, 100, "127.0.0.1", 443, 4), // SO_REUSEPORT peer
+			listenerRec(ProtoUDP, 100, "::1", 5353, 5),
+			listenerRec(ProtoUDP, 100, "127.0.0.1", 5000, 6),
+			bpfShawkIterRec{Type: recOwner, Proto: uint8(ProtoUDP), Netns: 100, Port: 53, Pid: 42},
+		)
+		tcpRd := &callbackReadCloser{
+			r: bytes.NewReader(tcpRecs),
+			onRead: func() {
+				if len(tcpPorts.entries) != 0 {
+					t.Fatalf("before TCP read: tcpPorts = %v, want empty", tcpPorts.entries)
+				}
+				assertUDPPresent("during TCP read")
+				// Simulate iter/tcp repopulating active TCP ports.
+				tcpPorts.entries[key(100, 80)] = struct{}{}
+				tcpPorts.entries[key(100, 8080)] = struct{}{}
+			},
+		}
+		udpRd := &callbackReadCloser{
+			r: bytes.NewReader(udpRecs),
+			onRead: func() {
+				drained = true
+				assertUDPPresent("during UDP read")
+				// Simulate iter/udp inserting the newly observed port,
+				// udp_direction() concurrently inserting a brand-new server
+				// port after the snapshot, and a stale entry disappearing.
+				udpPorts.entries[key(100, 5000)] = struct{}{}
+				udpPorts.entries[concurrentUDP] = struct{}{}
+				delete(udpPorts.entries, key(100, 9999))
+			},
+		}
+		return []io.ReadCloser{tcpRd, udpRd}, nil
+	}
+
+	listeners, inos, err := scanSocketsWith(tcpPorts, udpPorts, open)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !opened || !drained {
+		t.Fatalf("opened=%v drained=%v, want both true", opened, drained)
+	}
+	if len(listeners) != 5 || len(inos) != 6 {
+		t.Errorf("got %d listeners and %d inos, want 5 and 6", len(listeners), len(inos))
+	}
+
+	wantTCP := map[bpfShawkListenKey]struct{}{
+		key(100, 80):   {},
+		key(100, 8080): {},
+	}
+	if !maps.Equal(tcpPorts.entries, wantTCP) {
+		t.Errorf("tcpPorts after walk = %v, want %v", tcpPorts.entries, wantTCP)
+	}
+	wantUDP := map[bpfShawkListenKey]struct{}{
+		key(100, 443):  {},
+		key(100, 5353): {},
+		key(100, 5000): {},
+		concurrentUDP:  {},
+	}
+	if !maps.Equal(udpPorts.entries, wantUDP) {
+		t.Errorf("udpPorts after walk = %v, want %v", udpPorts.entries, wantUDP)
+	}
+
+	// Steady-state walk (activeUDP is a subset of prevUDP): no backfill puts,
+	// and a closed port previously added by udp_direction() is now pruned.
+	udpPorts.puts = 0
+	_, _, err = scanSocketsWith(tcpPorts, udpPorts, func() ([]io.ReadCloser, error) {
+		recs := encodeIterRecs(t,
+			listenerRec(ProtoTCP, 100, "127.0.0.1", 80, 1),
+			listenerRec(ProtoUDP, 100, "127.0.0.1", 443, 3),
+			listenerRec(ProtoUDP, 100, "::1", 5353, 5),
+			listenerRec(ProtoUDP, 100, "127.0.0.1", 5000, 6),
+		)
+		return []io.ReadCloser{io.NopCloser(bytes.NewReader(recs))}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if udpPorts.puts != 0 {
+		t.Errorf("steady-state walk performed %d backfill puts, want 0", udpPorts.puts)
+	}
+	if _, ok := udpPorts.entries[concurrentUDP]; ok {
+		t.Errorf("closed UDP port %+v was not pruned on the next walk", concurrentUDP)
+	}
+	if _, ok := udpPorts.entries[key(100, 443)]; !ok {
+		t.Errorf("active UDP port was pruned on the next walk")
+	}
+}
+
+// TestScanSocketsBackfillsFullUDPListenPorts checks that newly observed UDP
+// server ports dropped during the walk because stale entries filled
+// udp_listen_ports are backfilled once stale entries are pruned, and that
+// E2BIG is ignored when the map is genuinely full of active listeners.
+func TestScanSocketsBackfillsFullUDPListenPorts(t *testing.T) {
+	key := func(port uint16) bpfShawkListenKey {
+		return bpfShawkListenKey{Netns: 100, Port: port}
+	}
+
+	t.Run("recovers after pruning stale entries", func(t *testing.T) {
+		tcpPorts := newFakeListenMap()
+		udpPorts := newFakeListenMap(key(443), key(53))
+		udpPorts.capacity = 2
+
+		_, _, err := scanSocketsWith(tcpPorts, udpPorts, func() ([]io.ReadCloser, error) {
+			// Map is full (443 active + 53 stale), so iter/udp fails to insert
+			// newly opened port 5000 while still emitting its listener record.
+			recs := encodeIterRecs(t,
+				listenerRec(ProtoUDP, 100, "127.0.0.1", 443, 1),
+				listenerRec(ProtoUDP, 100, "127.0.0.1", 5000, 2),
+			)
+			return []io.ReadCloser{io.NopCloser(bytes.NewReader(recs))}, nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := map[bpfShawkListenKey]struct{}{
+			key(443):  {},
+			key(5000): {},
+		}
+		if !maps.Equal(udpPorts.entries, want) {
+			t.Errorf("udpPorts = %v, want %v", udpPorts.entries, want)
+		}
+	})
+
+	t.Run("ignores E2BIG when still full of active listeners", func(t *testing.T) {
+		tcpPorts := newFakeListenMap()
+		udpPorts := newFakeListenMap(key(443), key(5353))
+		udpPorts.capacity = 2
+
+		_, _, err := scanSocketsWith(tcpPorts, udpPorts, func() ([]io.ReadCloser, error) {
+			recs := encodeIterRecs(t,
+				listenerRec(ProtoUDP, 100, "127.0.0.1", 443, 1),
+				listenerRec(ProtoUDP, 100, "127.0.0.1", 5353, 2),
+				listenerRec(ProtoUDP, 100, "127.0.0.1", 5000, 3),
+			)
+			return []io.ReadCloser{io.NopCloser(bytes.NewReader(recs))}, nil
+		})
+		if err != nil {
+			t.Fatalf("unexpected error when map is genuinely full: %v", err)
+		}
+		want := map[bpfShawkListenKey]struct{}{
+			key(443):  {},
+			key(5353): {},
+		}
+		if !maps.Equal(udpPorts.entries, want) {
+			t.Errorf("udpPorts = %v, want %v", udpPorts.entries, want)
+		}
+	})
+}
+
+// TestScanSocketsErrorsPreserveListenPorts checks that errors during open or
+// read leave existing udp_listen_ports entries intact, and that map errors
+// propagate cleanly.
+func TestScanSocketsErrorsPreserveListenPorts(t *testing.T) {
+	k := bpfShawkListenKey{Netns: 100, Port: 443}
+	boom := errors.New("boom")
+
+	t.Run("open error", func(t *testing.T) {
+		tcpPorts := newFakeListenMap(k)
+		udpPorts := newFakeListenMap(k)
+		partial := &callbackReadCloser{r: bytes.NewReader(nil)}
+		_, _, err := scanSocketsWith(tcpPorts, udpPorts, func() ([]io.ReadCloser, error) {
+			return []io.ReadCloser{partial}, boom
+		})
+		if !errors.Is(err, boom) {
+			t.Fatalf("err = %v, want %v", err, boom)
+		}
+		if !partial.closed {
+			t.Error("partial reader was not closed")
+		}
+		if _, ok := udpPorts.entries[k]; !ok {
+			t.Error("udpPorts entry was removed on open error")
+		}
+	})
+
+	t.Run("read error", func(t *testing.T) {
+		tcpPorts := newFakeListenMap(k)
+		udpPorts := newFakeListenMap(k)
+		rd := &callbackReadCloser{r: errReader{err: boom}}
+		_, _, err := scanSocketsWith(tcpPorts, udpPorts, func() ([]io.ReadCloser, error) {
+			return []io.ReadCloser{rd}, nil
+		})
+		if !errors.Is(err, boom) {
+			t.Fatalf("err = %v, want %v", err, boom)
+		}
+		if !rd.closed {
+			t.Error("reader was not closed")
+		}
+		if _, ok := udpPorts.entries[k]; !ok {
+			t.Error("udpPorts entry was removed on read error")
+		}
+	})
+
+	t.Run("udp keys error", func(t *testing.T) {
+		tcpPorts := newFakeListenMap(k)
+		udpPorts := newFakeListenMap(k)
+		udpPorts.keysErr = boom
+		opened := false
+		_, _, err := scanSocketsWith(tcpPorts, udpPorts, func() ([]io.ReadCloser, error) {
+			opened = true
+			return nil, nil
+		})
+		if !errors.Is(err, boom) {
+			t.Fatalf("err = %v, want %v", err, boom)
+		}
+		if opened {
+			t.Error("open was called after udp keys failed")
+		}
+		if _, ok := tcpPorts.entries[k]; !ok {
+			t.Error("tcpPorts was cleared after udp keys failed")
+		}
+	})
+
+	t.Run("tcp clear error", func(t *testing.T) {
+		tcpPorts := newFakeListenMap(k)
+		tcpPorts.delErr = func(bpfShawkListenKey) error { return boom }
+		udpPorts := newFakeListenMap(k)
+		opened := false
+		_, _, err := scanSocketsWith(tcpPorts, udpPorts, func() ([]io.ReadCloser, error) {
+			opened = true
+			return nil, nil
+		})
+		if !errors.Is(err, boom) {
+			t.Fatalf("err = %v, want %v", err, boom)
+		}
+		if opened {
+			t.Error("open was called after tcp clear failed")
+		}
+		if _, ok := udpPorts.entries[k]; !ok {
+			t.Error("udpPorts was modified after tcp clear failed")
+		}
+	})
+
+	t.Run("udp delete error", func(t *testing.T) {
+		tcpPorts := newFakeListenMap()
+		udpPorts := newFakeListenMap(k)
+		udpPorts.delErr = func(bpfShawkListenKey) error { return boom }
+		_, _, err := scanSocketsWith(tcpPorts, udpPorts, func() ([]io.ReadCloser, error) {
+			return nil, nil
+		})
+		if !errors.Is(err, boom) {
+			t.Fatalf("err = %v, want %v", err, boom)
+		}
+	})
+
+	t.Run("udp backfill error", func(t *testing.T) {
+		tcpPorts := newFakeListenMap()
+		udpPorts := newFakeListenMap()
+		udpPorts.putErr = func(bpfShawkListenKey) error { return boom }
+		_, _, err := scanSocketsWith(tcpPorts, udpPorts, func() ([]io.ReadCloser, error) {
+			recs := encodeIterRecs(t, listenerRec(ProtoUDP, 100, "127.0.0.1", 443, 1))
+			return []io.ReadCloser{io.NopCloser(bytes.NewReader(recs))}, nil
+		})
+		if !errors.Is(err, boom) {
+			t.Fatalf("err = %v, want %v", err, boom)
+		}
+	})
+}
+
+// TestScanSocketsPrunesEBPFMaps exercises ebpfListenMap and scanSocketsWith
+// against real kernel BPF hash maps, including clearing TCP listen_ports
+// before the walk, keeping UDP entries during the walk, preserving ports
+// inserted concurrently, pruning stale entries, and backfilling new UDP
+// ports after stale slots are freed.
+func TestScanSocketsPrunesEBPFMaps(t *testing.T) {
+	requireRoot(t)
+	spec, err := loadBpf()
+	if err != nil {
+		t.Fatal(err)
+	}
+	newMap := func(name string, maxEntries uint32) *ebpf.Map {
+		t.Helper()
+		ms := spec.Maps[name].Copy()
+		ms.MaxEntries = maxEntries
+		m, err := ebpf.NewMap(ms)
+		if err != nil {
+			skipUnavailable(t, "creating %s: %v", name, err)
+		}
+		t.Cleanup(func() { m.Close() })
+		return m
+	}
+	tcpMap := newMap(bpfMapListenPorts, 16)
+	udpMap := newMap(bpfMapUdpListenPorts, 3)
+
+	staleTCP := bpfShawkListenKey{Netns: 100, Port: 81}
+	activeUDP := bpfShawkListenKey{Netns: 100, Port: 443}
+	staleUDP := bpfShawkListenKey{Netns: 100, Port: 444}
+	concurrentUDP := bpfShawkListenKey{Netns: 100, Port: 445}
+	backfillUDP := bpfShawkListenKey{Netns: 100, Port: 446}
+	overflowUDP := bpfShawkListenKey{Netns: 100, Port: 447}
+
+	if err := tcpMap.Put(&staleTCP, uint8(1)); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []bpfShawkListenKey{activeUDP, staleUDP} {
+		if err := udpMap.Put(&k, uint8(1)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	open := func() ([]io.ReadCloser, error) {
+		var v uint8
+		if err := tcpMap.Lookup(&staleTCP, &v); !errors.Is(err, ebpf.ErrKeyNotExist) {
+			t.Fatalf("stale TCP key still present during walk: %v", err)
+		}
+		if err := udpMap.Lookup(&activeUDP, &v); err != nil {
+			t.Fatalf("active UDP key missing during walk: %v", err)
+		}
+		// Fill the 3rd slot concurrently as udp_direction() would, leaving no
+		// room for backfillUDP until staleUDP is pruned after the walk.
+		if err := udpMap.Put(&concurrentUDP, uint8(1)); err != nil {
+			t.Fatal(err)
+		}
+		recs := encodeIterRecs(t,
+			listenerRec(ProtoUDP, activeUDP.Netns, "127.0.0.1", activeUDP.Port, 1),
+			listenerRec(ProtoUDP, backfillUDP.Netns, "127.0.0.1", backfillUDP.Port, 2),
+		)
+		return []io.ReadCloser{io.NopCloser(bytes.NewReader(recs))}, nil
+	}
+
+	if _, _, err := scanSocketsWith(ebpfListenMap{tcpMap}, ebpfListenMap{udpMap}, open); err != nil {
+		t.Fatal(err)
+	}
+
+	var v uint8
+	for _, tc := range []struct {
+		name string
+		key  bpfShawkListenKey
+		want bool
+	}{
+		{"active UDP kept", activeUDP, true},
+		{"concurrent UDP kept", concurrentUDP, true},
+		{"backfilled UDP inserted after prune", backfillUDP, true},
+		{"stale UDP pruned", staleUDP, false},
+	} {
+		err := udpMap.Lookup(&tc.key, &v)
+		if tc.want && err != nil {
+			t.Errorf("%s: Lookup = %v, want present", tc.name, err)
+		}
+		if !tc.want && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			t.Errorf("%s: Lookup = %v, want ErrKeyNotExist", tc.name, err)
+		}
+	}
+
+	// With all 3 slots occupied by active listeners, a 4th active UDP port
+	// hits E2BIG during backfill and must be ignored without error.
+	if _, _, err := scanSocketsWith(ebpfListenMap{tcpMap}, ebpfListenMap{udpMap}, func() ([]io.ReadCloser, error) {
+		recs := encodeIterRecs(t,
+			listenerRec(ProtoUDP, activeUDP.Netns, "127.0.0.1", activeUDP.Port, 1),
+			listenerRec(ProtoUDP, concurrentUDP.Netns, "127.0.0.1", concurrentUDP.Port, 2),
+			listenerRec(ProtoUDP, backfillUDP.Netns, "127.0.0.1", backfillUDP.Port, 3),
+			listenerRec(ProtoUDP, overflowUDP.Netns, "127.0.0.1", overflowUDP.Port, 4),
+		)
+		return []io.ReadCloser{io.NopCloser(bytes.NewReader(recs))}, nil
+	}); err != nil {
+		t.Fatalf("full-map backfill returned error: %v", err)
+	}
+}
+
+// TestUDPListenPortsKeptAcrossCollect checks end-to-end that during
+// Collect()'s socket walk, udp_listen_ports keeps active server ports while
+// listen_ports is cleared beforehand, so a new per-client connected UDP
+// server socket sending its first datagram mid-walk still caches DIR_IN,
+// and closed UDP server ports are pruned once the walk completes (#238).
+func TestUDPListenPortsKeptAcrossCollect(t *testing.T) {
+	skipIfNoNetwork(t, "udp4")
+	tr := newTestTracer(t)
+	requireUDP(t, tr)
+
+	tcpSrv, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tcpSrv.Close()
+
+	reuse := setsockoptControl(unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+	l := listenUDPFixedPort(t, "udp4", "127.0.0.1")
+	activeAddr := l.LocalAddr().String()
+	l.Close()
+	activeSrv, err := (&net.ListenConfig{Control: reuse}).ListenPacket(t.Context(), "udp4", activeAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer activeSrv.Close()
+	staleSrv := listenUDPFixedPort(t, "udp4", "127.0.0.1")
+	defer staleSrv.Close()
+
+	tcpKey := bpfShawkListenKey{Netns: tr.netns, Port: uint16(tcpSrv.Addr().(*net.TCPAddr).Port)}
+	activeKey := bpfShawkListenKey{Netns: tr.netns, Port: uint16(activeSrv.LocalAddr().(*net.UDPAddr).Port)}
+	staleKey := bpfShawkListenKey{Netns: tr.netns, Port: uint16(staleSrv.LocalAddr().(*net.UDPAddr).Port)}
+
+	if _, err := tr.Collect(); err != nil {
+		t.Fatal(err)
+	}
+	var v uint8
+	if err := tr.listenPorts.Lookup(&tcpKey, &v); err != nil {
+		t.Fatalf("TCP port missing after first Collect: %v", err)
+	}
+	if err := tr.udpListenPorts.Lookup(&activeKey, &v); err != nil {
+		t.Fatalf("active UDP port missing after first Collect: %v", err)
+	}
+	if err := tr.udpListenPorts.Lookup(&staleKey, &v); err != nil {
+		t.Fatalf("stale UDP port missing after first Collect: %v", err)
+	}
+
+	staleSrv.Close()
+	cli, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+	cliPort := uint16(cli.LocalAddr().(*net.UDPAddr).Port)
+
+	var (
+		conn    net.Conn
+		hookErr error
+	)
+	defer func(f func()) { beforeSocketWalk = f }(beforeSocketWalk)
+	beforeSocketWalk = func() {
+		var val uint8
+		if err := tr.listenPorts.Lookup(&tcpKey, &val); !errors.Is(err, ebpf.ErrKeyNotExist) {
+			hookErr = fmt.Errorf("TCP listen_ports not cleared before walk: %v", err)
+			return
+		}
+		if err := tr.udpListenPorts.Lookup(&activeKey, &val); err != nil {
+			hookErr = fmt.Errorf("active UDP port missing before walk: %w", err)
+			return
+		}
+		// Open a fresh per-client connected server socket and send its first
+		// datagram inside the walk window, before iter/udp runs.
+		c, err := (&net.Dialer{LocalAddr: activeSrv.LocalAddr(), Control: reuse}).DialContext(t.Context(), "udp4", cli.LocalAddr().String())
+		if err != nil {
+			hookErr = err
+			return
+		}
+		conn = c
+		buf := make([]byte, 32)
+		if _, err := c.Write(buf); err != nil {
+			hookErr = err
+			return
+		}
+		cli.SetReadDeadline(time.Now().Add(time.Second))
+		if _, _, err := cli.ReadFrom(buf); err != nil {
+			hookErr = err
+		}
+	}
+
+	snap, err := tr.Collect()
+	beforeSocketWalk = nil
+	if conn != nil {
+		defer conn.Close()
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hookErr != nil {
+		t.Fatal(hookErr)
+	}
+	if err := tr.listenPorts.Lookup(&tcpKey, &v); err != nil {
+		t.Errorf("TCP port missing after second Collect: %v", err)
+	}
+	if err := tr.udpListenPorts.Lookup(&activeKey, &v); err != nil {
+		t.Errorf("active UDP port missing after second Collect: %v", err)
+	}
+	if err := tr.udpListenPorts.Lookup(&staleKey, &v); !errors.Is(err, ebpf.ErrKeyNotExist) {
+		t.Errorf("closed UDP port Lookup = %v, want ErrKeyNotExist", err)
+	}
+	if f := findFlow(snap.Flows, DirIn, ProtoUDP, activeKey.Port, netip.MustParseAddr("127.0.0.1")); f == nil || f.MsgsSent != 1 {
+		t.Errorf("mid-walk connected server socket flow = %+v in %+v", f, snap.Flows)
+	}
+	for _, f := range snap.Flows {
+		if f.Proto == ProtoUDP && f.Port == cliPort {
+			t.Errorf("mid-walk connected server socket was misclassified onto client port: %+v", f)
+		}
+	}
+
+	// A subsequent datagram on the same socket must keep DIR_IN.
+	buf := make([]byte, 32)
+	if _, err := conn.Write(buf); err != nil {
+		t.Fatal(err)
+	}
+	cli.SetReadDeadline(time.Now().Add(time.Second))
+	if _, _, err := cli.ReadFrom(buf); err != nil {
+		t.Fatal(err)
+	}
+	if snap, err = tr.Collect(); err != nil {
+		t.Fatal(err)
+	}
+	if f := findFlow(snap.Flows, DirIn, ProtoUDP, activeKey.Port, netip.MustParseAddr("127.0.0.1")); f == nil || f.MsgsSent != 1 {
+		t.Errorf("subsequent datagram flow = %+v in %+v", f, snap.Flows)
 	}
 }

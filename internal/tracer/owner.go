@@ -3,12 +3,14 @@ package tracer
 import (
 	"cmp"
 	"errors"
+	"io"
 	"net/netip"
 	"slices"
 	"strings"
 	"time"
 
 	"github.com/cilium/ebpf"
+	"golang.org/x/sys/unix"
 )
 
 type sockAddrKey struct {
@@ -34,19 +36,80 @@ type unixListenerKey struct {
 	path  string
 }
 
+// listenPortMap is the subset of *ebpf.Map used to keep listen_ports and
+// udp_listen_ports in sync with the listeners observed by a socket walk.
+type listenPortMap interface {
+	keys() ([]bpfShawkListenKey, error)
+	delete(key bpfShawkListenKey) error
+	putNoExist(key bpfShawkListenKey) error
+}
+
+type ebpfListenMap struct{ m *ebpf.Map }
+
+func (e ebpfListenMap) keys() ([]bpfShawkListenKey, error) {
+	var (
+		key  bpfShawkListenKey
+		val  uint8
+		keys []bpfShawkListenKey
+	)
+	it := e.m.Iterate()
+	for it.Next(&key, &val) {
+		keys = append(keys, key)
+	}
+	if err := it.Err(); err != nil {
+		return nil, err
+	}
+	return keys, nil
+}
+
+func (e ebpfListenMap) delete(key bpfShawkListenKey) error {
+	return e.m.Delete(&key)
+}
+
+func (e ebpfListenMap) putNoExist(key bpfShawkListenKey) error {
+	return e.m.Update(&key, uint8(1), ebpf.UpdateNoExist)
+}
+
+// beforeSocketWalk, if set, runs after listen_ports is cleared and
+// udp_listen_ports is snapshotted, before opening the socket iterators;
+// set in tests.
+var beforeSocketWalk func()
+
 // scanSockets walks TCP and UDP sockets and returns the listeners and the
 // inodes of their sockets, where known. The Comm of a listener that the
 // kernel may hold is KernelComm, until its owner is resolved.
 //
 // The iterators are opened in every network namespace, since an iterator
-// only walks the namespace it was opened in.
+// only walks the namespace it was opened in. listen_ports is cleared before
+// the walk because it is read only synchronously during iter/tcp (where
+// TCP_LISTEN sockets precede established ones) and iter/task_file
+// afterwards. By contrast, udp_listen_ports is read asynchronously on every
+// UDP datagram by udp_direction(): its existing entries are kept during the
+// walk and only pre-existing keys absent from the newly observed UDP
+// listeners are pruned afterwards (preserving ports inserted concurrently
+// by udp_direction() during the walk), followed by backfilling newly
+// observed UDP ports that may not have fit while stale entries occupied the
+// map.
 func (t *Tracer) scanSockets() ([]Listener, []uint64, error) {
-	for _, m := range []*ebpf.Map{t.listenPorts, t.udpListenPorts} {
-		if err := clearMap(m); err != nil {
-			return nil, nil, err
-		}
+	return scanSocketsWith(
+		ebpfListenMap{t.listenPorts},
+		ebpfListenMap{t.udpListenPorts},
+		t.openAllNetNS,
+	)
+}
+
+func scanSocketsWith(tcpPorts, udpPorts listenPortMap, open func() ([]io.ReadCloser, error)) ([]Listener, []uint64, error) {
+	prevUDP, err := udpPorts.keys()
+	if err != nil {
+		return nil, nil, err
 	}
-	readers, err := t.openAllNetNS()
+	if err := clearListenPorts(tcpPorts); err != nil {
+		return nil, nil, err
+	}
+	if beforeSocketWalk != nil {
+		beforeSocketWalk()
+	}
+	readers, err := open()
 	defer closeAll(readers)
 	if err != nil {
 		return nil, nil, err
@@ -58,6 +121,7 @@ func (t *Tracer) scanSockets() ([]Listener, []uint64, error) {
 	)
 	// The sockets of a SO_REUSEPORT group share an address and a port.
 	seen := map[sockAddrKey]int{}
+	activeUDP := make(map[bpfShawkListenKey]struct{}, len(prevUDP))
 	for _, rd := range readers {
 		recs, err := readRecords(rd)
 		if err != nil {
@@ -71,8 +135,14 @@ func (t *Tracer) scanSockets() ([]Listener, []uint64, error) {
 			if r.Ino != 0 {
 				inos = append(inos, r.Ino)
 			}
+			if Proto(r.Proto) == ProtoUDP {
+				activeUDP[bpfShawkListenKey{Netns: r.Netns, Port: r.Port}] = struct{}{}
+			}
 			listeners = addListener(listeners, seen, listenerOf(r))
 		}
+	}
+	if err := syncUDPListenPorts(udpPorts, prevUDP, activeUDP); err != nil {
+		return nil, nil, err
 	}
 	return listeners, inos, nil
 }
@@ -111,21 +181,38 @@ func listenerOf(r *bpfShawkIterRec) Listener {
 	return l
 }
 
-func clearMap(m *ebpf.Map) error {
-	var (
-		key  bpfShawkListenKey
-		val  uint8
-		keys []bpfShawkListenKey
-	)
-	it := m.Iterate()
-	for it.Next(&key, &val) {
-		keys = append(keys, key)
-	}
-	if err := it.Err(); err != nil {
+func clearListenPorts(m listenPortMap) error {
+	keys, err := m.keys()
+	if err != nil {
 		return err
 	}
-	for i := range keys {
-		if err := m.Delete(&keys[i]); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+	for _, key := range keys {
+		if err := m.delete(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			return err
+		}
+	}
+	return nil
+}
+
+// syncUDPListenPorts deletes pre-existing keys absent from active and
+// backfills newly observed keys that may not have fit while stale entries
+// occupied the map during the walk.
+func syncUDPListenPorts(m listenPortMap, prev []bpfShawkListenKey, active map[bpfShawkListenKey]struct{}) error {
+	prevSet := make(map[bpfShawkListenKey]struct{}, len(prev))
+	for _, key := range prev {
+		prevSet[key] = struct{}{}
+		if _, ok := active[key]; ok {
+			continue
+		}
+		if err := m.delete(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			return err
+		}
+	}
+	for key := range active {
+		if _, ok := prevSet[key]; ok {
+			continue
+		}
+		if err := m.putNoExist(key); err != nil && !errors.Is(err, ebpf.ErrKeyExist) && !errors.Is(err, unix.E2BIG) {
 			return err
 		}
 	}
