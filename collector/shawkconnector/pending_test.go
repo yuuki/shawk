@@ -107,3 +107,34 @@ func TestAcceptedWhileReported(t *testing.T) {
 		}
 	}
 }
+
+// TestForgetKeepsLaterFloor: changes of a host dropped after its series
+// were (max_series_per_host) do not move its session floor back, so that
+// the next session does not cover the interval whose series were dropped.
+func TestForgetKeepsLaterFloor(t *testing.T) {
+	ch := newChanges(15*time.Minute, false)
+	b := testBatch(t, tAgent{host: "app-01", time: t0, segment: t0.Add(-time.Hour)})
+	ch.add(b, t0)
+	// Series were dropped in the interval the request at 10s closes: the
+	// next session starts no earlier than that request.
+	limited := t0.Add(10 * time.Second)
+	b.time, b.limited = limited, true
+	ch.add(b, limited)
+	if got := ch.floors[b.key].start; !got.Equal(limited) {
+		t.Fatalf("floor %v after the series were dropped, want %v", got.Sub(t0), limited.Sub(t0))
+	}
+	ch.take()
+	// Changes of the host are dropped 30 seconds later.
+	ch.forget(b.key, limited.Add(30*time.Second))
+	if got := ch.floors[b.key].start; !got.Equal(limited) {
+		t.Errorf("floor %v after changes were dropped, want it to stay at %v", got.Sub(t0), limited.Sub(t0))
+	}
+	next := t0.Add(time.Minute)
+	b.time, b.limited = next, false
+	ch.add(b, next)
+	for start := range ch.pending[b.key].sessions {
+		if start.Before(limited) {
+			t.Errorf("session starts at %v, before the series dropped at %v", start.Sub(t0), limited.Sub(t0))
+		}
+	}
+}

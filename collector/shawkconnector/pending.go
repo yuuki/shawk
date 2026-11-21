@@ -535,6 +535,8 @@ func (c *changes) restore(h *hostChanges) {
 // starts no earlier than the idle TTL of an agent before now. So do the
 // sessions already pending, of requests received while the dropped changes
 // were being written: those requests skipped the edges the changes held.
+// A floor already later, after series of the host were dropped
+// (advanceFloor), stays: it is never moved back.
 func (c *changes) forget(key string, now time.Time) {
 	delete(c.acceptedEdges, key)
 	delete(c.acceptedWire, key)
@@ -544,7 +546,9 @@ func (c *changes) forget(key string, now time.Time) {
 	if !ok {
 		return
 	}
-	f.start = now.Add(-f.skew).Add(-minAgentIdleTTL).Truncate(time.Second)
+	if t := now.Add(-f.skew).Add(-minAgentIdleTTL).Truncate(time.Second); t.After(f.start) {
+		f.start = t
+	}
 	c.floors[key] = f
 	if h := c.pending[key]; h != nil {
 		h.floorSessions(f.start)
