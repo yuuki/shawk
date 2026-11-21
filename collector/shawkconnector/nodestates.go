@@ -133,20 +133,11 @@ func parseNodeStates(b []byte, now time.Time) (*nodeStates, error) {
 	if err := decodeStrict(b, &doc); err != nil {
 		return nil, err
 	}
-	out := &nodeStates{}
-	if doc.GeneratedAt == "" {
-		return nil, errors.New("no generated_at, when the states were read from Slurm")
-	}
-	t, err := time.Parse(time.RFC3339, doc.GeneratedAt)
+	at, err := parseGeneratedAt(doc.GeneratedAt, now)
 	if err != nil {
-		return nil, fmt.Errorf("generated_at: %w", err)
+		return nil, err
 	}
-	if t.After(now.Add(maxGeneratedAhead)) {
-		// Its states would hold longer than they should, and hide those
-		// read after it until the clocks met.
-		return nil, fmt.Errorf("generated_at %s is in the future", doc.GeneratedAt)
-	}
-	out.at = t
+	out := &nodeStates{at: at}
 	seen := map[string]bool{}
 	for i, n := range doc.Nodes {
 		if (n.Host == "") == (n.Node == "") {
@@ -160,34 +151,71 @@ func parseNodeStates(b []byte, now time.Time) (*nodeStates, error) {
 			return nil, fmt.Errorf("nodes[%d]: %s is listed twice", i, key)
 		}
 		seen[key] = true
-		var state []string
-		add := func(f string) {
-			if !slices.Contains(state, f) {
-				state = append(state, f)
-			}
-		}
-		for _, e := range n.State {
-			for _, f := range strings.Split(e, "+") {
-				f = strings.ToUpper(strings.TrimSpace(f))
-				// scontrol show nodes marks a node that does not respond
-				// with *, as in DOWN*.
-				if g, ok := strings.CutSuffix(f, "*"); ok {
-					f = g
-					add("NOT_RESPONDING")
-				}
-				if f == "" || strings.IndexFunc(f, func(r rune) bool { return !(r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_') }) >= 0 {
-					return nil, fmt.Errorf("nodes[%d]: invalid flag %q in the state of %s", i, f, name)
-				}
-				add(f)
-			}
+		state, err := parseState(n.State)
+		if err != nil {
+			return nil, fmt.Errorf("nodes[%d]: %w in the state of %s", i, err, name)
 		}
 		if len(state) == 0 {
 			return nil, fmt.Errorf("nodes[%d]: no state for %s", i, name)
 		}
-		slices.Sort(state)
 		out.nodes = append(out.nodes, nodeState{host: n.Host, node: n.Node, state: state, reason: n.Reason})
 	}
 	return out, nil
+}
+
+// parseGeneratedAt parses the generated_at of a node_states_file read at
+// now: when its states were read from Slurm.
+func parseGeneratedAt(s string, now time.Time) (time.Time, error) {
+	if s == "" {
+		return time.Time{}, errors.New("no generated_at, when the states were read from Slurm")
+	}
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("generated_at: %w", err)
+	}
+	if t.After(now.Add(maxGeneratedAhead)) {
+		// Its states would hold longer than they should, and hide those
+		// read after it until the clocks met.
+		return time.Time{}, fmt.Errorf("generated_at %s is in the future", s)
+	}
+	return t, nil
+}
+
+// parseState returns the flags of a state, upper case, sorted and each
+// once. An entry of the state may join flags by '+'; a flag that is not a
+// name is an error.
+func parseState(entries stateFlags) ([]string, error) {
+	var state []string
+	add := func(f string) {
+		if !slices.Contains(state, f) {
+			state = append(state, f)
+		}
+	}
+	for _, e := range entries {
+		for _, f := range strings.Split(e, "+") {
+			f = strings.ToUpper(strings.TrimSpace(f))
+			// scontrol show nodes marks a node that does not respond
+			// with *, as in DOWN*.
+			if g, ok := strings.CutSuffix(f, "*"); ok {
+				f = g
+				add("NOT_RESPONDING")
+			}
+			if !flagName(f) {
+				return nil, fmt.Errorf("invalid flag %q", f)
+			}
+			add(f)
+		}
+	}
+	slices.Sort(state)
+	return state, nil
+}
+
+// flagName tells whether f is the name of a flag: upper case letters,
+// digits and underscores.
+func flagName(f string) bool {
+	return f != "" && strings.IndexFunc(f, func(r rune) bool {
+		return !(r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_')
+	}) < 0
 }
 
 // parseMaintenance parses a maintenance_file. The windows are sorted by
@@ -204,19 +232,9 @@ func parseMaintenance(b []byte) ([]maintenanceWindow, error) {
 	seen := map[windowKey]bool{}
 	var out []maintenanceWindow
 	for i, m := range doc.Maintenance {
-		start, err := time.Parse(time.RFC3339, m.Start)
+		start, end, err := parseWindowTimes(m.Start, m.End)
 		if err != nil {
-			return nil, fmt.Errorf("maintenance[%d]: start: %w", i, err)
-		}
-		end, err := time.Parse(time.RFC3339, m.End)
-		if err != nil {
-			return nil, fmt.Errorf("maintenance[%d]: end: %w", i, err)
-		}
-		if !end.After(start) {
-			return nil, fmt.Errorf("maintenance[%d]: the end is not after the start", i)
-		}
-		if end.Sub(start) > maxMaintenanceWindow {
-			return nil, fmt.Errorf("maintenance[%d]: longer than %s", i, maxMaintenanceWindow)
+			return nil, fmt.Errorf("maintenance[%d]: %w", i, err)
 		}
 		if len(m.Hosts) == 0 {
 			return nil, fmt.Errorf("maintenance[%d]: no hosts", i)
@@ -240,6 +258,24 @@ func parseMaintenance(b []byte) ([]maintenanceWindow, error) {
 		return a.start.Compare(b.start)
 	})
 	return out, nil
+}
+
+// parseWindowTimes parses the start and the end of a maintenance window,
+// which ends after it starts and lasts at most maxMaintenanceWindow.
+func parseWindowTimes(startAt, endAt string) (start, end time.Time, err error) {
+	if start, err = time.Parse(time.RFC3339, startAt); err != nil {
+		return start, end, fmt.Errorf("start: %w", err)
+	}
+	if end, err = time.Parse(time.RFC3339, endAt); err != nil {
+		return start, end, fmt.Errorf("end: %w", err)
+	}
+	if !end.After(start) {
+		return start, end, errors.New("the end is not after the start")
+	}
+	if end.Sub(start) > maxMaintenanceWindow {
+		return start, end, fmt.Errorf("longer than %s", maxMaintenanceWindow)
+	}
+	return start, end, nil
 }
 
 // hostsOfNodes gives the nodes named by their NodeName the hosts the

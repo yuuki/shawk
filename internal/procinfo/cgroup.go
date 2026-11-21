@@ -164,28 +164,38 @@ func Unit(cgroupPath string) string {
 		return (&Container{Runtime: runtimeOrAny(outer.runtime), ID: outer.id, Under: under}).Unit()
 	}
 	for i := len(parts) - 1; i >= 0; i-- {
-		p := parts[i]
-		if runScope.MatchString(p) {
-			return "run." + p[strings.LastIndexByte(p, '.')+1:]
-		}
-		if sessionScope.MatchString(p) {
-			if i > 0 {
-				return parts[i-1] + "/session.scope"
-			}
-			return "session.scope"
-		}
-		if strings.HasSuffix(p, ".service") {
-			if !userService.MatchString(p) {
-				for j := i - 1; j >= 0; j-- {
-					if userService.MatchString(parts[j]) {
-						return parts[j] + "/" + p
-					}
-				}
-			}
-			return p
+		if u, ok := systemdUnit(parts, i); ok {
+			return u
 		}
 	}
 	return parts[len(parts)-1]
+}
+
+// systemdUnit names the unit of systemd that parts[i] is, of the parts of a
+// cgroup path: a transient unit without its number, a login session after
+// the slice of its user, or a service, after the manager of its user if it
+// is in one (see Unit). ok is false if it is none of them.
+func systemdUnit(parts []string, i int) (unit string, ok bool) {
+	p := parts[i]
+	switch {
+	case runScope.MatchString(p):
+		return "run." + p[strings.LastIndexByte(p, '.')+1:], true
+	case sessionScope.MatchString(p):
+		if i > 0 {
+			return parts[i-1] + "/session.scope", true
+		}
+		return "session.scope", true
+	case strings.HasSuffix(p, ".service"):
+		if !userService.MatchString(p) {
+			for j := i - 1; j >= 0; j-- {
+				if userService.MatchString(parts[j]) {
+					return parts[j] + "/" + p, true
+				}
+			}
+		}
+		return p, true
+	}
+	return "", false
 }
 
 // containerRef identifies a container by the cgroup the runtime made for

@@ -2,7 +2,6 @@ package agent
 
 import (
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/yuuki/shawk/internal/otlp"
@@ -118,8 +117,33 @@ type procRequest struct {
 // export. Processes not read in time are marked incomplete. The
 // environment of a process is read if one of its requests uses it.
 func (r *identities) prefetch(reqs []procRequest) {
-	var todo []uint32
-	env := map[uint32]bool{}
+	todo, env := r.unread(reqs)
+	if len(todo) == 0 {
+		return
+	}
+	results, stop := r.startReaders(todo, env)
+	defer stop()
+	deadline := time.NewTimer(r.budget)
+	defer deadline.Stop()
+	for range todo {
+		select {
+		case res := <-results:
+			r.byPID[res.pid] = res.p
+		case <-deadline.C:
+			for _, pid := range todo {
+				if _, ok := r.byPID[pid]; !ok {
+					r.byPID[pid] = procRead{}
+				}
+			}
+			return
+		}
+	}
+}
+
+// unread returns the processes of the requests that the interval has not
+// read, each once, and whether a request of each uses its environment.
+func (r *identities) unread(reqs []procRequest) (todo []uint32, env map[uint32]bool) {
+	env = map[uint32]bool{}
 	for _, q := range reqs {
 		if _, ok := r.byPID[q.pid]; ok || q.pid == 0 {
 			continue
@@ -130,25 +154,30 @@ func (r *identities) prefetch(reqs []procRequest) {
 			todo = append(todo, q.pid)
 		}
 	}
-	if len(todo) == 0 {
-		return
-	}
-	type result struct {
-		pid uint32
-		p   procRead
-	}
+	return todo, env
+}
+
+// pidRead is what a reader read of a process.
+type pidRead struct {
+	pid uint32
+	p   procRead
+}
+
+// startReaders starts the readers of /proc, at most procReaders, which read
+// the processes of todo, with the environment of those env tells, and send
+// what they read. stop keeps them from starting to read the processes left;
+// a read that hangs goes on.
+func (r *identities) startReaders(todo []uint32, env map[uint32]bool) (results <-chan pidRead, stop func()) {
 	// Buffered, so that readers still running after the budget never block.
-	results := make(chan result, len(todo))
+	out := make(chan pidRead, len(todo))
 	jobs := make(chan uint32)
-	stop := make(chan struct{})
-	var once sync.Once
-	defer once.Do(func() { close(stop) })
+	stopped := make(chan struct{})
 	go func() {
 		defer close(jobs)
 		for _, pid := range todo {
 			select {
 			case jobs <- pid:
-			case <-stop:
+			case <-stopped:
 				return
 			}
 		}
@@ -156,26 +185,11 @@ func (r *identities) prefetch(reqs []procRequest) {
 	for range min(procReaders, len(todo)) {
 		go func() {
 			for pid := range jobs {
-				results <- result{pid, r.readNow(pid, env[pid])}
+				out <- pidRead{pid, r.readNow(pid, env[pid])}
 			}
 		}()
 	}
-	deadline := time.NewTimer(r.budget)
-	defer deadline.Stop()
-	for range todo {
-		select {
-		case res := <-results:
-			r.byPID[res.pid] = res.p
-		case <-deadline.C:
-			once.Do(func() { close(stop) })
-			for _, pid := range todo {
-				if _, ok := r.byPID[pid]; !ok {
-					r.byPID[pid] = procRead{}
-				}
-			}
-			return
-		}
-	}
+	return out, func() { close(stopped) }
 }
 
 // read returns the reads of a process, reading /proc if the interval has
