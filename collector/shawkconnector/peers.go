@@ -216,10 +216,14 @@ type resolver struct {
 	// when, with peer_hosts only, until they are written to PostgreSQL and
 	// read back into dbFormer (forgetHeld): while the database cannot be
 	// written or read, an address that moved to another host does not name
-	// its former holder again once the new one stops. localNames are the
-	// names of their hosts.
-	localHeld  map[netip.Addr]map[string]time.Time
-	localNames map[string]string
+	// its former holder again once the new one stops. Those whose changes
+	// are dropped are forgotten (droppedHeld), so that the holders not
+	// written are bounded with the pending changes. heldWritten are those
+	// written since the latest read, with when they held the addresses as
+	// written (wroteHeld). localNames are the names of their hosts.
+	localHeld   map[netip.Addr]map[string]time.Time
+	heldWritten map[netip.Addr]map[string]time.Time
+	localNames  map[string]string
 }
 
 // formerHolderWindow is how long after a host last held an address the
@@ -276,6 +280,7 @@ func newResolver(cidrs []namedPrefix, translations []translation) *resolver {
 		localServed:         map[clientKey]map[endpoint]time.Time{},
 		inferred:            map[string]int{},
 		localHeld:           map[netip.Addr]map[string]time.Time{},
+		heldWritten:         map[netip.Addr]map[string]time.Time{},
 		localNames:          map[string]string{},
 	}
 }
@@ -536,13 +541,66 @@ func (r *resolver) learnHost(b *hostBatch, now time.Time) {
 	}
 }
 
-// forgetHeld forgets the holders of addresses seen before t, once what was
-// seen then has been written to PostgreSQL and read back.
-func (r *resolver) forgetHeld(t time.Time) {
+// wroteHeld records that the changes of host written to PostgreSQL held
+// addrs, its addresses with when it held them: the holders seen no later
+// are forgotten once read back (forgetHeld). A holder seen since, by a
+// request whose changes were not yet pending, is kept for the next write.
+func (r *resolver) wroteHeld(host string, addrs map[netip.Addr]span) {
+	if !r.peerHosts || len(addrs) == 0 {
+		return
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	expireLearned(r.localHeld, t)
+	for a, s := range addrs {
+		if t, ok := r.localHeld[a][host]; ok && !t.After(s.last) {
+			learnTimed(r.heldWritten, a, host, s.last)
+		}
+	}
+}
+
+// droppedHeld forgets the holders of addresses seen no later than the
+// changes of host that were dropped, which held addrs: they will not be
+// written.
+func (r *resolver) droppedHeld(host string, addrs map[netip.Addr]span) {
+	if !r.peerHosts || len(addrs) == 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for a, s := range addrs {
+		forgetHolder(r.localHeld, a, host, s.last)
+	}
 	r.forgetNames()
+}
+
+// forgetHeld forgets the holders of addresses written to PostgreSQL, once
+// they have been read back.
+func (r *resolver) forgetHeld() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.heldWritten) == 0 {
+		return
+	}
+	for a, hs := range r.heldWritten {
+		for h, t := range hs {
+			forgetHolder(r.localHeld, a, h, t)
+		}
+	}
+	clear(r.heldWritten)
+	r.forgetNames()
+}
+
+// forgetHolder forgets that host held a, if it was last seen holding it no
+// later than t.
+func forgetHolder(held map[netip.Addr]map[string]time.Time, a netip.Addr, host string, t time.Time) {
+	hs := held[a]
+	if at, ok := hs[host]; !ok || at.After(t) {
+		return
+	}
+	delete(hs, host)
+	if len(hs) == 0 {
+		delete(held, a)
+	}
 }
 
 // forgetNames forgets the names of hosts that hold no address in
@@ -620,6 +678,7 @@ func (r *resolver) expire(t, now time.Time) {
 	expireLearned(r.localUnix, t)
 	expireLearned(r.localAddrs, now.Add(-aliveWindow))
 	expireLearned(r.localHeld, now.Add(-formerHolderWindow))
+	expireLearned(r.heldWritten, now.Add(-formerHolderWindow))
 	r.forgetNames()
 	for h, a := range r.localAgents {
 		if a.seen.Before(now.Add(-aliveWindow)) {

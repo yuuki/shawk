@@ -285,6 +285,28 @@ func TestMaxSessions(t *testing.T) {
 	}
 }
 
+// TestFoldWarningsExpire: the warning of a host whose agent folded hosts
+// since it was logged is forgotten once it has not folded any for
+// foldWarnInterval, as of a host decommissioned: it is not held for good.
+func TestFoldWarningsExpire(t *testing.T) {
+	c, _, _, _ := testConnector(t, nil)
+	b := &hostBatch{key: hostKey("", "app-01"), hostname: "app-01"}
+	id := &edgeID{role: roleClient, proto: "tcp", local: addrOf("10.0.0.11"), peer: addrOf("10.0.0.10"), port: 5432}
+	p := peer{foldedBy: hostKey("", "db-01"), foldedByName: "db-01"}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.foldedAgentPeer(b, id, p, t0)                     // logged
+	c.foldedAgentPeer(b, id, p, t0.Add(15*time.Second)) // counted for the next warning
+	c.expireWarnings(t0.Add(15*time.Second + foldWarnInterval - time.Nanosecond))
+	if len(c.foldWarned) != 1 {
+		t.Errorf("warnings held within foldWarnInterval of the last fold: %v, want one", c.foldWarned)
+	}
+	c.expireWarnings(t0.Add(100 * 24 * time.Hour))
+	if len(c.foldWarned) != 0 {
+		t.Errorf("warnings held 100 days later: %v", c.foldWarned)
+	}
+}
+
 // TestAgentInputBounds: the strings of agents are cut to maxStringBytes, at
 // the start of a character, and their internal ranges to maxInternalPeers,
 // so that what is held of a series or a host has a bounded size.

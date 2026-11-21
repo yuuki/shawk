@@ -1070,9 +1070,11 @@ last, unless another host held the address after that period began (beyond
 held it, not as of the load. Until what the connector saw is written and
 read back, the holders it saw itself count too, so that an address that
 moved while PostgreSQL could not be written does not name its former
-holder again once the new one stops. An address that left a host whose
-agent is still alive names no host. The names of `peer_cidrs` are ranges,
-not hosts. Through a translation, `pickBackend()` chooses a
+holder again once the new one stops; those of changes it drops (§5.1) no
+longer count, so that they are bounded with the pending rows (§5.5). An
+address that left a host whose agent is still alive names no host. The
+names of `peer_cidrs` are ranges, not hosts. Through a translation,
+`pickBackend()` chooses a
 representative to name the service, not the backend a connection reached,
 so a virtual address with several backends has host `~unknown`; the names
 of services do not change.

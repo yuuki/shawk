@@ -599,11 +599,11 @@ func (c *changes) forget(key string, now time.Time) {
 
 // bound drops the pending changes of whole hosts, those pending the longest
 // first, until at most max rows are pending, and forgets them as dropped at
-// now. It returns the hosts and rows dropped.
-func (c *changes) bound(max int, now time.Time) (hosts, rows int) {
+// now. It returns the changes dropped.
+func (c *changes) bound(max int, now time.Time) (dropped []*hostChanges) {
 	size := c.pendingSize()
 	if size <= max {
-		return 0, 0
+		return nil
 	}
 	pending := slices.SortedFunc(maps.Values(c.pending), func(a, b *hostChanges) int {
 		return cmp.Or(a.first.Compare(b.first), strings.Compare(a.key, b.key))
@@ -612,14 +612,12 @@ func (c *changes) bound(max int, now time.Time) (hosts, rows int) {
 		if size <= max {
 			break
 		}
-		n := h.size()
-		size -= n
-		hosts++
-		rows += n
+		size -= h.size()
+		dropped = append(dropped, h)
 		delete(c.pending, h.key)
 		c.forget(h.key, now)
 	}
-	return hosts, rows
+	return dropped
 }
 
 // expire forgets accepted spans not reported for the TTL.

@@ -1,6 +1,7 @@
 package shawkconnector
 
 import (
+	"context"
 	"fmt"
 	"maps"
 	"net/netip"
@@ -450,9 +451,10 @@ func TestPeerHostFormerHolderExpires(t *testing.T) {
 // PostgreSQL knows, once the new holder stops too; until it is written and
 // read back.
 func TestPeerHostLocalMove(t *testing.T) {
-	c, _, sink, now := testConnector(t, func(cfg *Config) { cfg.PeerHosts = true })
-	c.resolver.load(peerRows{former: []formerHolderRow{{addr: addrOf("10.0.2.3"),
-		formerHolder: formerHolder{host: hostKey("", "node-03"), name: "node-03", lastSeen: now.Add(-24 * time.Hour)}}}}, *now)
+	c, st, sink, now := testConnector(t, func(cfg *Config) { cfg.PeerHosts = true })
+	st.rows = peerRows{former: []formerHolderRow{{addr: addrOf("10.0.2.3"),
+		formerHolder: formerHolder{host: hostKey("", "node-03"), name: "node-03", lastSeen: now.Add(-24 * time.Hour)}}}}
+	c.resolver.load(st.rows, *now)
 	id := &edgeID{role: roleClient, proto: "tcp", local: addrOf("10.0.0.1"), peer: addrOf("10.0.2.3"), port: 6818}
 	host := func() string { return c.resolver.peer(hostKey("", "ctl-01"), id, *now).host }
 	if got := host(); got != "node-03" {
@@ -469,9 +471,84 @@ func TestPeerHostLocalMove(t *testing.T) {
 		t.Errorf("after the new holder stopped: %s", got)
 	}
 	// Written, and read back without it: PostgreSQL is the truth again.
-	c.resolver.forgetHeld(*now)
+	c.writePending(context.Background())
+	if got := host(); got != "node-13" {
+		t.Errorf("after the write, before it is read back: %s", got)
+	}
+	c.prepare(context.Background())
 	if got := host(); got != "node-03" {
 		t.Errorf("after the write: %s", got)
+	}
+}
+
+// TestPeerHostHeldBounded: the holders of addresses the connector saw are
+// forgotten once the changes that held them are written and read back,
+// whatever other hosts failed to be written; with changes of their hosts
+// that are dropped, so that they are bounded with the pending changes; and
+// not when a write took the changes of their host before the request that
+// saw them was added, although that request was received before the write
+// started.
+func TestPeerHostHeldBounded(t *testing.T) {
+	c, st, sink, now := testConnector(t, func(cfg *Config) { cfg.PeerHosts = true })
+	ctx := context.Background()
+	agent := func(host, addr string) tAgent { return tAgent{host: host, addrs: []string{addr}, time: *now} }
+	held := func() map[string]bool {
+		c.resolver.mu.RLock()
+		defer c.resolver.mu.RUnlock()
+		hosts := map[string]bool{}
+		for _, hs := range c.resolver.localHeld {
+			for h := range hs {
+				hosts[h] = true
+			}
+		}
+		return hosts
+	}
+	hold := func(f func(*hostChanges) error) {
+		st.mu.Lock()
+		st.hold = f
+		st.mu.Unlock()
+	}
+	node1, node2 := hostKey("", "node-01"), hostKey("", "node-02")
+
+	// node-01 fails to be written, node-02 is written.
+	consume(t, c, sink, agent("node-01", "10.0.2.1"))
+	consume(t, c, sink, agent("node-02", "10.0.2.2"))
+	hold(func(h *hostChanges) error {
+		if h.key == node1 {
+			return errFake
+		}
+		return nil
+	})
+	*now = now.Add(time.Second)
+	c.writePending(ctx)
+	c.prepare(ctx)
+	if got := held(); !got[node1] || got[node2] {
+		t.Errorf("after node-02 was written and read back: holders %v, want node-01 only", got)
+	}
+
+	// The changes of node-01 are dropped beyond max_pending_rows.
+	c.cfg.MaxPendingRows = 0
+	c.boundPending()
+	if got := held(); got[node1] {
+		t.Errorf("after the changes of node-01 were dropped: holders %v", got)
+	}
+	c.cfg.MaxPendingRows = createDefaultConfig().MaxPendingRows
+
+	// A request of node-02 received before a write starts is added after
+	// the write took the changes of node-02.
+	*now = now.Add(15 * time.Second)
+	consume(t, c, sink, agent("node-02", "10.0.2.2"))
+	received := now.Add(5 * time.Second)
+	late := testBatch(t, tAgent{host: "node-02", addrs: []string{"10.0.2.2"}, time: received})
+	hold(func(h *hostChanges) error {
+		c.resolver.learn(late, received)
+		return nil
+	})
+	*now = now.Add(10 * time.Second)
+	c.writePending(ctx)
+	c.prepare(ctx)
+	if got := held(); !got[node2] {
+		t.Errorf("node-02 seen by a request added after the write: holders %v, want node-02", got)
 	}
 }
 

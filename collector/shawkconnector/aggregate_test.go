@@ -230,6 +230,25 @@ func TestOutputsByConnectorClock(t *testing.T) {
 }
 
 // testBatch decodes the request of an agent.
+// TestIdleHostKept: a host that sends no edges, as an idle node, keeps the
+// latest interval it closed here until it stops sending for the TTL, so
+// that its inputs are not taken as new and a late request is not emitted.
+func TestIdleHostKept(t *testing.T) {
+	a := newAggregator(15*time.Minute, 50, 200, false, t0.Add(-time.Hour))
+	b := testBatch(t, tAgent{host: "app-01", time: t0})
+	a.add(b, func(*edgeID) peer { return peer{} }, t0, pmetric.NewMetrics())
+	for _, at := range []time.Duration{time.Minute, 15 * time.Minute} {
+		a.expire(t0.Add(at))
+		if h := a.hosts[b.key]; h == nil || !h.emitted.Equal(t0) {
+			t.Errorf("%v after its request: host %+v, want it with the interval it closed at t0", at, h)
+		}
+	}
+	a.expire(t0.Add(15*time.Minute + time.Nanosecond))
+	if h := a.hosts[b.key]; h != nil {
+		t.Errorf("after the TTL: host %+v, want it forgotten", h)
+	}
+}
+
 // TestGaugeInputsExpire: the open connections of an output forget the
 // inputs that expired, even while the output lives on and no request of its
 // host closes an interval, which would emit it and forget them all.

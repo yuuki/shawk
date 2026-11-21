@@ -62,9 +62,6 @@ type shawkConnector struct {
 	inventoryWarned map[string]time.Time
 
 	lastPrune, lastRefresh time.Time
-	// written is when the latest write that took every pending change
-	// started: what was seen before it is in PostgreSQL.
-	written time.Time
 	// portRulesWarned is when rules of ports in PostgreSQL other than
 	// those of this connector were last logged.
 	portRulesWarned time.Time
@@ -247,14 +244,9 @@ func (c *shawkConnector) prepare(ctx context.Context) bool {
 		return true
 	}
 	c.resolver.load(rows, at)
-	c.mu.Lock()
-	written := c.written
-	c.mu.Unlock()
-	if !written.IsZero() {
-		// The holders of addresses seen before the latest write are read
-		// back from PostgreSQL now.
-		c.resolver.forgetHeld(written)
-	}
+	// The holders of addresses written before, which the loop does in turn
+	// with this read, are read back from PostgreSQL now.
+	c.resolver.forgetHeld()
 	return true
 }
 
@@ -342,21 +334,15 @@ func (c *shawkConnector) tick(ctx context.Context) {
 	c.expire(c.now())
 }
 
-// writePending writes the pending changes within a write interval. Once
-// they are written, what was seen before the write started is in
-// PostgreSQL; otherwise they are bounded by max_pending_rows.
+// writePending writes the pending changes within a write interval. Those
+// that could not be written are bounded by max_pending_rows.
 func (c *shawkConnector) writePending(ctx context.Context) {
 	wctx, cancel := context.WithTimeout(ctx, c.cfg.WriteInterval)
-	started := c.now()
 	written := c.prepareSchemaOnly(wctx) && c.flush(wctx)
 	cancel()
 	if !written {
 		c.boundPending()
-		return
 	}
-	c.mu.Lock()
-	c.written = started
-	c.mu.Unlock()
 }
 
 // expire forgets the state of the connector that expired by now.
@@ -371,11 +357,13 @@ func (c *shawkConnector) expire(now time.Time) {
 }
 
 // expireWarnings forgets the warnings logged at least foldWarnInterval
-// before now. A host that folded hosts since it was logged is kept, so that
-// the next warning counts them. c.mu is held.
+// before now. A host whose agent folded hosts since it was logged is kept
+// while it goes on folding, so that the next warning counts them; once it
+// has not folded any for foldWarnInterval, which was logged at least as
+// long ago, it is forgotten with them. c.mu is held.
 func (c *shawkConnector) expireWarnings(now time.Time) {
 	for k, w := range c.foldWarned {
-		if len(w.hosts) == 0 && now.Sub(w.logged) >= foldWarnInterval {
+		if now.Sub(w.seen) >= foldWarnInterval {
 			delete(c.foldWarned, k)
 		}
 	}
@@ -478,7 +466,8 @@ func (c *shawkConnector) checkPortRules(ctx context.Context) {
 
 // flush writes the pending changes, one transaction per host. The changes
 // of a host that fail to be written are kept for the next flush. It reports
-// whether none failed.
+// whether none failed. The resolver learns, of every host, which of the
+// addresses it saw the host hold were written, or dropped.
 func (c *shawkConnector) flush(ctx context.Context) bool {
 	c.mu.Lock()
 	pending := c.changes.take()
@@ -486,17 +475,20 @@ func (c *shawkConnector) flush(ctx context.Context) bool {
 	var failed int
 	var lastErr error
 	for _, h := range pending {
-		if err := c.store.write(ctx, h); err != nil {
-			if isDataError(err) {
-				// Writing these changes again would fail again and block the
-				// host for good; drop them.
-				c.log.Error("dropping changes that PostgreSQL rejects", zap.String("host", h.hostname),
-					zap.Int("rows", h.size()), zap.Error(err))
-				c.mu.Lock()
-				c.changes.forget(h.key, c.now())
-				c.mu.Unlock()
-				continue
-			}
+		err := c.store.write(ctx, h)
+		switch {
+		case err == nil:
+			c.resolver.wroteHeld(h.key, h.addrs)
+		case isDataError(err):
+			// Writing these changes again would fail again and block the
+			// host for good; drop them.
+			c.log.Error("dropping changes that PostgreSQL rejects", zap.String("host", h.hostname),
+				zap.Int("rows", h.size()), zap.Error(err))
+			c.mu.Lock()
+			c.changes.forget(h.key, c.now())
+			c.mu.Unlock()
+			c.resolver.droppedHeld(h.key, h.addrs)
+		default:
 			failed++
 			lastErr = err
 			c.mu.Lock()
@@ -519,16 +511,23 @@ func (c *shawkConnector) flush(ctx context.Context) bool {
 // PostgreSQL rejects, the edges and listeners agents still send are written
 // again, and the next session of such a host starts no earlier than the
 // idle TTL of an agent before now: the time in between shows as not
-// observed.
+// observed. The holders of addresses the connector saw in them are
+// forgotten too, so that they are bounded with the pending changes.
 func (c *shawkConnector) boundPending() {
 	c.mu.Lock()
-	hosts, rows := c.changes.bound(c.cfg.MaxPendingRows, c.now())
+	dropped := c.changes.bound(c.cfg.MaxPendingRows, c.now())
 	c.mu.Unlock()
-	if hosts > 0 {
-		c.log.Error("dropping the changes of hosts that could not be written to PostgreSQL, beyond max_pending_rows; "+
-			"the hosts are not observed over them", zap.Int("hosts", hosts), zap.Int("rows", rows),
-			zap.Int("max_pending_rows", c.cfg.MaxPendingRows))
+	if len(dropped) == 0 {
+		return
 	}
+	rows := 0
+	for _, h := range dropped {
+		rows += h.size()
+		c.resolver.droppedHeld(h.key, h.addrs)
+	}
+	c.log.Error("dropping the changes of hosts that could not be written to PostgreSQL, beyond max_pending_rows; "+
+		"the hosts are not observed over them", zap.Int("hosts", len(dropped)), zap.Int("rows", rows),
+		zap.Int("max_pending_rows", c.cfg.MaxPendingRows))
 }
 
 func (c *shawkConnector) Shutdown(context.Context) error {
@@ -777,6 +776,7 @@ type foldWarnKey struct {
 // foldWarning is what foldedAgentPeer logged of a host whose agent folds.
 type foldWarning struct {
 	logged time.Time
+	seen   time.Time       // when the agent last folded a host
 	hosts  map[string]bool // folded since logged
 }
 
@@ -796,7 +796,7 @@ func (c *shawkConnector) foldedAgentPeer(b *hostBatch, id *edgeID, p peer, now t
 		w = &foldWarning{hosts: map[string]bool{}}
 		c.foldWarned[k] = w
 	}
-	w.hosts[b.key] = true
+	w.hosts[b.key], w.seen = true, now
 	if !w.logged.IsZero() && now.Sub(w.logged) < foldWarnInterval {
 		return
 	}
