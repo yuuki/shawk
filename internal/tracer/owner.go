@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/cilium/ebpf"
+	"golang.org/x/sys/unix"
 )
 
 type sockAddrKey struct {
@@ -34,19 +35,35 @@ type unixListenerKey struct {
 	path  string
 }
 
+// beforeSocketWalk, if set, runs before the iterators of a walk of the
+// sockets are opened, once listen_ports is cleared; set in tests.
+var beforeSocketWalk func()
+
 // scanSockets walks TCP and UDP sockets and returns the listeners and the
 // inodes of their sockets, where known. The Comm of a listener that the
 // kernel may hold is KernelComm, until its owner is resolved.
 //
 // The iterators are opened in every network namespace, since an iterator
-// only walks the namespace it was opened in.
+// only walks the namespace it was opened in. The walk rebuilds listen_ports
+// from empty: only the walks read it, and iter/tcp finds the listeners of a
+// namespace before its connections. The UDP programs read udp_listen_ports
+// at any time, so it keeps its ports during the walk: a socket that sends
+// first on the port of a server while the port is missing would be a client
+// for good (#238). Afterwards, the ports that the walk did not find are
+// deleted, except in the namespaces that it could not open, and those that
+// udp_direction() learned meanwhile are kept.
 func (t *Tracer) scanSockets() ([]Listener, []uint64, error) {
-	for _, m := range []*ebpf.Map{t.listenPorts, t.udpListenPorts} {
-		if err := clearMap(m); err != nil {
-			return nil, nil, err
-		}
+	before, err := listenKeys(t.udpListenPorts)
+	if err != nil {
+		return nil, nil, err
 	}
-	readers, err := t.openAllNetNS()
+	if err := clearMap(t.listenPorts); err != nil {
+		return nil, nil, err
+	}
+	if beforeSocketWalk != nil {
+		beforeSocketWalk()
+	}
+	readers, skipped, err := t.openAllNetNS()
 	defer closeAll(readers)
 	if err != nil {
 		return nil, nil, err
@@ -58,6 +75,7 @@ func (t *Tracer) scanSockets() ([]Listener, []uint64, error) {
 	)
 	// The sockets of a SO_REUSEPORT group share an address and a port.
 	seen := map[sockAddrKey]int{}
+	udpPorts := make(map[bpfShawkListenKey]bool, len(before))
 	for _, rd := range readers {
 		recs, err := readRecords(rd)
 		if err != nil {
@@ -71,8 +89,14 @@ func (t *Tracer) scanSockets() ([]Listener, []uint64, error) {
 			if r.Ino != 0 {
 				inos = append(inos, r.Ino)
 			}
+			if Proto(r.Proto) == ProtoUDP {
+				udpPorts[bpfShawkListenKey{Netns: r.Netns, Port: r.Port}] = true
+			}
 			listeners = addListener(listeners, seen, listenerOf(r))
 		}
+	}
+	if err := syncUDPListenPorts(t.udpListenPorts, before, udpPorts, skipped); err != nil {
+		return nil, nil, err
 	}
 	return listeners, inos, nil
 }
@@ -111,7 +135,8 @@ func listenerOf(r *bpfShawkIterRec) Listener {
 	return l
 }
 
-func clearMap(m *ebpf.Map) error {
+// listenKeys returns the ports that a map of listening ports holds.
+func listenKeys(m *ebpf.Map) ([]bpfShawkListenKey, error) {
 	var (
 		key  bpfShawkListenKey
 		val  uint8
@@ -121,11 +146,52 @@ func clearMap(m *ebpf.Map) error {
 	for it.Next(&key, &val) {
 		keys = append(keys, key)
 	}
-	if err := it.Err(); err != nil {
+	return keys, it.Err()
+}
+
+func clearMap(m *ebpf.Map) error {
+	keys, err := listenKeys(m)
+	if err != nil {
 		return err
 	}
 	for i := range keys {
 		if err := m.Delete(&keys[i]); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			return err
+		}
+	}
+	return nil
+}
+
+// syncUDPListenPorts updates udp_listen_ports after a walk of the sockets.
+// It deletes the ports that the map held before the walk and that the walk
+// did not find, unless the walk skipped their namespace, and adds those that
+// the walk found and that the map did not hold before: the walk may have
+// found no room for them while the deleted ones took it. A port that
+// udp_direction() learned during the walk is in neither, and stays. The
+// ports of a namespace that is gone are deleted by the next walk, which
+// does not list it.
+func syncUDPListenPorts(m *ebpf.Map, before []bpfShawkListenKey, found map[bpfShawkListenKey]bool, skipped map[uint32]bool) error {
+	held := make(map[bpfShawkListenKey]bool, len(before))
+	for i := range before {
+		k := &before[i]
+		held[*k] = true
+		if found[*k] || skipped[k.Netns] {
+			continue
+		}
+		if err := m.Delete(k); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			return err
+		}
+	}
+	for k := range found {
+		if held[k] {
+			continue
+		}
+		err := m.Update(&k, uint8(1), ebpf.UpdateNoExist)
+		if errors.Is(err, unix.E2BIG) {
+			// The map is full, and the walk counted the ports left out.
+			return nil
+		}
+		if err != nil && !errors.Is(err, ebpf.ErrKeyExist) {
 			return err
 		}
 	}
