@@ -171,76 +171,74 @@ func (t *Tracer) loadConntrack() error {
 	t.colls = append(t.colls, coll)
 	t.links = append(t.links, links...)
 	t.conntrackLinks = links
-	t.xlatConnsMap = coll.Maps[bpfMapXlatConns]
 	for name, p := range coll.Programs {
 		t.progs[name] = p
 	}
 	t.xlats = coll.Maps[bpfMapXlats]
+	t.xlatConns = coll.Maps[bpfMapXlatConns]
 	t.xlatDrops = drops
-	t.xlatLast = map[bpfShawkXlatKey]bpfShawkXlatStats{}
 	return nil
 }
 
-// collectTranslations returns the translations active since the last call:
-// those with a new conntrack entry, and those with a live one. A key idle
-// for a whole interval is deleted, so that the table holds the translations
-// in use. It is taken out with its values and put back if a confirmation
-// came in since the walk; one that lands between the two, and adds the key
-// again, keeps it with another generation, and the entries counted in the
-// former generation are lost from the live count.
+// collectTranslations returns the translations used in the interval that
+// flip() closed: those confirmed in it, which the programs recorded in xlats
+// with the index of the flow maps of the interval, and those with a
+// conntrack entry alive in xlat_conns. Then it deletes the keys of that
+// index, which no program writes once the flip has waited for them. User
+// space writes nothing else: deleting a key that a program may update, and
+// putting it back, lost confirms and destroys that ran in between (#237).
 func (t *Tracer) collectTranslations() ([]Translation, error) {
 	if t.xlats == nil {
 		return nil, nil
 	}
 	var (
 		key  bpfShawkXlatKey
-		val  bpfShawkXlatStats
+		one  uint8
+		done []bpfShawkXlatKey
 		out  []Translation
-		idle []bpfShawkXlatKey
 	)
-	seen := make(map[bpfShawkXlatKey]bpfShawkXlatStats, len(t.xlatLast))
-	it := t.xlats.Iterate()
-	for it.Next(&key, &val) {
-		prev, known := t.xlatLast[key]
-		seen[key] = val
-		if val.Live > 0 || !known || prev.Gen != val.Gen || prev.Conns != val.Conns {
-			out = append(out, convertTranslation(&key))
-			continue
+	seen := map[bpfShawkXlatKey]bool{}
+	add := func(k bpfShawkXlatKey) {
+		k.Idx = 0
+		if !seen[k] {
+			seen[k] = true
+			out = append(out, convertTranslation(&k))
 		}
-		idle = append(idle, key)
+	}
+	closed := uint8(t.idx ^ 1)
+	it := t.xlats.Iterate()
+	for it.Next(&key, &one) {
+		// The others are of the interval that goes on. Keys that an error
+		// left are read when their index is closed again.
+		if key.Idx == closed {
+			done = append(done, key)
+			add(key)
+		}
 	}
 	if err := it.Err(); err != nil {
 		return nil, fmt.Errorf("reading translations: %w", err)
 	}
+	var ct uint64
+	it = t.xlatConns.Iterate()
+	for it.Next(&ct, &key) {
+		add(key)
+	}
+	if err := it.Err(); err != nil {
+		return nil, fmt.Errorf("reading the live entries of translations: %w", err)
+	}
 	if afterTranslationWalk != nil {
 		afterTranslationWalk()
 	}
-	for i := range idle {
-		k := &idle[i]
-		prev := seen[*k]
-		delete(seen, *k)
-		if err := t.xlats.LookupAndDelete(k, &val); err != nil {
-			if errors.Is(err, ebpf.ErrKeyNotExist) {
-				continue
-			}
+	for i := range done {
+		if err := t.xlats.Delete(&done[i]); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 			return nil, fmt.Errorf("deleting a translation: %w", err)
 		}
-		if val.Gen == prev.Gen && val.Conns == prev.Conns && val.Live <= 0 {
-			continue
-		}
-		// A connection came in since the walk.
-		if err := t.xlats.Update(k, &val, ebpf.UpdateNoExist); err != nil && !errors.Is(err, ebpf.ErrKeyExist) {
-			return nil, fmt.Errorf("putting a translation back: %w", err)
-		}
-		seen[*k] = val
-		out = append(out, convertTranslation(k))
 	}
-	t.xlatLast = seen
 	return out, nil
 }
 
-// afterTranslationWalk, if set, runs between the walk of the translations
-// and the deletes of the idle ones; set in tests.
+// afterTranslationWalk, if set, runs between the walks of the translations
+// and the deletes of those confirmed in the interval; set in tests.
 var afterTranslationWalk func()
 
 func convertTranslation(k *bpfShawkXlatKey) Translation {

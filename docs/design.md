@@ -377,23 +377,28 @@ per packet.
   Ephemeral ports are dropped as in flows, so a change of the source port
   alone translates nothing.
 - `nf_ct_destroy` (`destroy_conntrack` before 5.19) runs when an entry
-  goes, so `xlats` counts live entries and a translation is in use in every
-  interval in which one of its connections is open, as edges are. An entry
-  outlives its connection by its conntrack timeout (up to 2 minutes), within
-  the margin of matching (§5.4); an established entry whose peer vanished
-  stays 5 days, but the rows it matches are still bounded by the edges. A
-  missed destroy (a kprobe is skipped while another BPF program runs on the
-  CPU) keeps a translation live until conntrack reuses the entry's memory.
+  goes, so `xlat_conns` holds the live entries and a translation is in use
+  in every interval in which one of its connections is open, as edges are.
+  An entry outlives its connection by its conntrack timeout (up to 2
+  minutes), within the margin of matching (§5.4); an established entry whose
+  peer vanished stays 5 days, but the rows it matches are still bounded by
+  the edges. A missed destroy (a kprobe is skipped while another BPF program
+  runs on the CPU) keeps a translation live until conntrack reuses the
+  entry's memory.
 - With folding (§3.6), a translation whose source, client or backend is
   outside the internal ranges is not learned, nor, with `all`, one whose
   virtual address is: no edge would match it, and the Internet clients of a
   published port stay out of the table. `-netns` restricts translations to
   one namespace.
-- Translations idle for an interval are deleted. `xlats` holds
-  `-max-flows` translations and `xlat_conns` four times as many live entries
-  (about 9 MiB at the default), allocated only once nf_conntrack is loaded
-  (most RHEL 9 hosts, whose firewalld loads it, and hosts with Docker or
-  kube-proxy). Overflow is counted in `shawk.agent.translations.dropped`; a
+- The translations confirmed in an interval are recorded in `xlats` with the
+  index of the flow maps, which user space reads and deletes after the flip
+  (§3.4); the programs alone add and delete the entries of `xlat_conns`.
+  User space thus writes nothing that a program may update at the same
+  time, and a confirm or a destroy during a read is not lost (#237).
+  `xlats` holds `-max-flows` translations confirmed in an interval and
+  `xlat_conns` four times as many live entries (about 9 MiB at the
+  default), allocated only once nf_conntrack is loaded (most RHEL 9 hosts,
+  whose firewalld loads it, and hosts with Docker or kube-proxy). Overflow is counted in `shawk.agent.translations.dropped`; a
   host with more live translated entries (`nf_conntrack_count`) needs a
   larger `-max-flows`, or a translation used only by long-lived connections
   that did not fit may end early.

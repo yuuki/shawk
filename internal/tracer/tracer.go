@@ -181,8 +181,9 @@ type Tracer struct {
 
 	// conntrackSpec is the specification the conntrack programs are loaded
 	// from once nf_conntrack is loaded, and conntrackTried the last
-	// attempt. xlats is nil until they are loaded; xlatLast holds the
-	// counts of each translation at the last read.
+	// attempt. xlats, the translations confirmed in each interval, and
+	// xlatConns, the translated conntrack entries alive, are nil until they
+	// are loaded.
 	conntrackSpec  *ebpf.CollectionSpec
 	conntrackTried time.Time
 	// conntrackMissingLogged and conntrackFailLogged tell that the absence
@@ -191,12 +192,11 @@ type Tracer struct {
 	// conntrackBackoff is the wait before the next load after one failed.
 	conntrackBackoff time.Duration
 	xlats            *ebpf.Map
+	xlatConns        *ebpf.Map
 	xlatDrops        *ebpf.Variable
-	xlatLast         map[bpfShawkXlatKey]bpfShawkXlatStats
-	// conntrackLinks are the links of conntrackPrograms, in their order, and
-	// xlatConnsMap the entries counted live; for tests.
+	// conntrackLinks are the links of conntrackPrograms, in their order; for
+	// tests.
 	conntrackLinks []link.Link
-	xlatConnsMap   *ebpf.Map
 
 	// connectErrHooks are the targets of connectErrorPrograms attached.
 	connectErrHooks []string
