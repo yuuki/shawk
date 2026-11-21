@@ -1,6 +1,7 @@
 package shawkconnector
 
 import (
+	"math"
 	"net/netip"
 	"time"
 
@@ -553,7 +554,29 @@ func (r *outResource) account(key outKey, m outMetric, ik inputKey, pt point, dv
 		return
 	}
 	s.value += dv
-	s.count += dc
+	s.count = addCount(s.count, dc)
+}
+
+// addCount adds the increase dc to the count c of a histogram. A count that
+// would wrap stays at its maximum: a smaller count would be taken for a
+// reset.
+func addCount(c, dc uint64) uint64 {
+	if sum := c + dc; sum >= c {
+		return sum
+	}
+	return math.MaxUint64
+}
+
+// intValue is the value v of an output sum as the integer it is emitted
+// as. The inputs of an output are each below maxValue but their increases
+// may add up beyond what an int64 holds: v then stays at its maximum
+// rather than wrapping to a negative value, which would be taken for a
+// reset.
+func intValue(v float64) int64 {
+	if v >= maxValue {
+		return math.MaxInt64
+	}
+	return int64(v)
 }
 
 // clampTime returns t within [lo, hi].
@@ -824,7 +847,7 @@ func (s *outSeries) appendPoint(m pmetric.Metric, desc outMetric, ts pcommon.Tim
 	dp := m.Sum().DataPoints().AppendEmpty()
 	dp.SetStartTimestamp(start)
 	dp.SetTimestamp(ts)
-	dp.SetIntValue(int64(s.value))
+	dp.SetIntValue(intValue(s.value))
 	return dp.Attributes()
 }
 

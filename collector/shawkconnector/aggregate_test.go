@@ -3,6 +3,7 @@ package shawkconnector
 import (
 	"fmt"
 	"maps"
+	"math"
 	"testing"
 	"time"
 
@@ -229,6 +230,36 @@ func TestOutputsByConnectorClock(t *testing.T) {
 }
 
 // testBatch decodes the request of an agent.
+// TestOutputsSaturate: an output whose inputs add up beyond what its type
+// holds stays at its maximum, rather than wrapping to a negative value or a
+// smaller count, which Prometheus would take for a reset.
+func TestOutputsSaturate(t *testing.T) {
+	r := &outResource{series: map[outKey]*outSeries{}}
+	sum, hist := outKey{metric: metricConnOpened}, outKey{metric: metricRTT}
+	for range 2 {
+		r.account(sum, outMetrics[metricConnOpened], inputKey{}, point{}, maxValue-1024, 0, t0, t0)
+		r.account(hist, outMetrics[metricRTT], inputKey{}, point{}, 1, math.MaxUint64-1, t0, t0)
+	}
+	out := pmetric.NewMetrics()
+	r.appendTo(svcKey{service: "app"}, &hostOutputs{hostname: "app-01"}, 0, t0, out)
+	ms := out.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics()
+	if ms.Len() != 2 {
+		t.Fatalf("%d metrics, want 2", ms.Len())
+	}
+	for i := range ms.Len() {
+		switch m := ms.At(i); m.Name() {
+		case metricConnOpened:
+			if v := m.Sum().DataPoints().At(0).IntValue(); v != math.MaxInt64 {
+				t.Errorf("sum = %d, want %d", v, int64(math.MaxInt64))
+			}
+		case metricRTT:
+			if c := m.Histogram().DataPoints().At(0).Count(); c != math.MaxUint64 {
+				t.Errorf("count = %d, want %d", c, uint64(math.MaxUint64))
+			}
+		}
+	}
+}
+
 func testBatch(t *testing.T, ta tAgent) *hostBatch {
 	t.Helper()
 	b, err := parseResource(ta.metrics().ResourceMetrics().At(0))

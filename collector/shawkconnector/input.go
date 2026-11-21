@@ -219,9 +219,11 @@ const maxStringBytes = 4096
 // the sum of the increases of its inputs.
 const maxValue = 1 << 63
 
-// validValue tells whether v, the value of a point of an edge, is within
-// maxValue; NaN is not.
-func validValue(v float64) bool { return math.Abs(v) < maxValue }
+// validValue tells whether v, the value of a point of an edge, is a count
+// below maxValue. No metric of an edge is negative: a negative value would
+// be taken for a reset of its input and decrease the outputs it is added
+// to. NaN is not valid.
+func validValue(v float64) bool { return v >= 0 && v < maxValue }
 
 // parseResource decodes the metrics of one agent.
 func parseResource(rm pmetric.ResourceMetrics) (*hostBatch, error) {
