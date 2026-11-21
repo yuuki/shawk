@@ -1,3 +1,248 @@
+## Unreleased
+
+### Changed
+
+* Host and node names in `node_states_file` and `maintenance_file` follow
+  the rules of the inventory (`docs/design.md` §5.6), and a bad one makes
+  the file invalid: what was written from it stays, and the states become
+  stale. The collector refuses to start with a name of `peer_cidrs`,
+  `translations`, `port_agnostic_services` or `dynamic_ports` that holds
+  NUL or bytes that are not UTF-8, rather than fail every write (#254).
+* The panels of the dependency details, peer hosts and application
+  dashboards keep `network_transport` beside `server_port`, as the
+  recording rules do, and show it in their legends and tables: `tcp/0` and
+  `unix/0`, and TCP and UDP on one port, showed as one dependency (#262,
+  `docs/design.md` §8).
+* The table "Dependencies in PostgreSQL" of the dependency details
+  dashboard names each side as Prometheus does (#243): `slurm-job` for the
+  processes of Slurm jobs (units `slurm/*`), which PostgreSQL keeps under
+  their own names (`a.out`, `mpirun`), and `peer_class()` for a side
+  without a service; `~other` matches any side. Selecting `slurm-job`
+  found none of their dependencies, and a name such as `python3` also
+  found the jobs of that name. A variable without values, as over a time
+  range that Prometheus no longer holds, now selects every side; it was a
+  syntax error. The table also shows `server_unit` (`docs/design.md` §8).
+
+### Fixed
+
+* On kernels whose TCP iterator skips sockets (before Linux 6.17 without
+  its backport: 5.15, RHEL 9 and 10), an incoming connection that predated
+  the agent, adopted while its listener was open, was named after the
+  first process the walk found holding it rather than after the owner of
+  its listener, as other incoming connections are (#267).
+* A UDP server whose per-client sockets send first, as those of a QUIC
+  server do, could have such a socket taken for a client for good when it
+  was made during the walk that marks the UDP servers: the walk emptied
+  their ports before it listed them again, namespace by namespace. The
+  ports now stay during the walk, and those of servers that are gone are
+  deleted after it; the ports of a namespace that the walk could not open
+  stay too (#270).
+* On hosts that translate addresses (Kubernetes services, Docker published
+  ports), a conntrack entry destroyed while the agent read the learned
+  translations kept its translation live until the agent restarted, one
+  confirmed meanwhile could lose its translation, and a failed update of
+  the programs (on Linux 5.14) miscounted the live entries. The programs
+  alone now add and delete the live entries, and user space writes nothing
+  they update, so no confirm or destroy is lost or undone (#237,
+  `docs/design.md` §3.7).
+* A UDP socket of the kernel (nfsd, lockd, SunRPC, VXLAN, WireGuard) at
+  the address of a former socket took its direction: with kprobes its
+  first datagram had that direction, and with fentry too, the walk of the
+  UDP sockets could list a socket that never received as a server and add
+  its port to the listening ports. Sockets are now told apart by the inode
+  of their `struct socket`, which the sockets of the kernel have too
+  (#256, `docs/design.md` §3.3).
+* The walk of the sockets skipped a network namespace for an interval,
+  with its open connections, byte deltas, RTT and listeners, when the
+  process through which the agent found it exited before the walk; a PID
+  reused in another namespace made the walk read that one twice. The agent
+  opened the iterators of every namespace before reading any, so a host
+  with hundreds of namespaces could run it out of file descriptors. A
+  namespace now keeps up to four paths, the bind mounts of `/run/netns`,
+  `/var/run/netns` and `/run/docker/netns` first; the agent checks that it
+  opened the namespace it listed, and walks one namespace at a time (#257,
+  `docs/design.md` §3.2).
+* The client of a Unix socket name did not request the owner scan that
+  finds a new listener when another network namespace had a listener of
+  that name: the new listener of an abstract name, or of a path that a
+  container binds in a file system of its own, was found only by the
+  periodic scan, up to a minute later, and its clients stayed unresolved
+  or were named after the other listener meanwhile. The request is now per
+  namespace and name (#258, `docs/design.md` §3.8).
+* A process that exited while the agent read its identity could name a
+  flow after the executable of another process that took its PID, and that
+  name stayed the latest identity of its unit and command name for the
+  idle TTL; a PID reused in the same cgroup could also give a flow the
+  `OTEL_` variables of another process. The executable, the command name
+  and the cgroup are now read through one open `/proc/PID`, and the
+  environment is used only if the process is still there with the same
+  executable and cgroup (#259).
+* On hosts of thousands of cgroups, the walk of `/sys/fs/cgroup` for an
+  unknown cgroup held the lock that the reader of the events of new
+  cgroups needs, so the kernel dropped these events meanwhile, and their
+  cgroups were unknown and walked again. The walk now runs without the
+  lock, one at a time (#260).
+* After the wall clock of a host stepped back, as when NTP corrects a
+  clock that was ahead, the agent could send edges, wire protocols,
+  listeners and translations first seen after they were last seen, and the
+  connector wrote such rows. The agent now moves the first time back, and
+  the connector takes a first time after the last as the last, as older
+  agents send it (#261).
+* A server that was not a backend of a translation, or a backend on
+  another port, was taken for one when its port was that of the virtual
+  address (any server on port 443 for `203.0.113.1:443`): the server side
+  of its connections could have `shawk.peer.agent` false, which counts it
+  too (`docs/design.md` §7), a client at a source of the translation was
+  named after its address alone, and the connector warned that a client
+  folds the virtual address. Only the backends of a translation, on their
+  ports, are now reached through it (#266).
+* A server edge whose client connected to the address of the server
+  directly had `shawk.peer.agent` false, with a warning of the connector,
+  when the agent of the client folds a virtual address of a translation
+  that also reaches the server: it now names the client and keeps
+  `shawk.peer.agent` true. A learned translation now marks a server edge
+  as folded only in its scope and while it is current, as when it names
+  the client (#269).
+* With `peer_hosts`, a client edge to a virtual address whose learned
+  translations came from several hosts, as from two directors in turn, had
+  `shawk.peer.host` `~unknown` even when all of them sent the client to
+  the same backend address: it is now the host that holds that address
+  (#252).
+* A `node_states_file` or `maintenance_file` of several YAML documents was
+  read up to its first one, and a file of `null`, `~` or `---` alone
+  removed every maintenance window. Both are now invalid, as an empty file
+  is, and what was written from the file stays; `{}` or `maintenance: []`
+  says that there is no window (#271, `docs/design.md` §5.7).
+* Text that PostgreSQL refuses, NUL or bytes that are not UTF-8, failed
+  whole writes when it did not come from agents: an escaped NUL in one
+  reason of `node_states_file` or `maintenance_file` failed the write of
+  the states, or of the windows, of every host, and an error of
+  `inventory_file` with such bytes was never recorded in
+  `inventory_status`. Reasons are now cut to 4096 bytes and cleaned as the
+  strings of agents, and so is the error of the inventory (#254,
+  `docs/design.md` §5.7).
+* A migration released its lock without a deadline: on a connection that
+  stopped answering, `shawk-migrate`, or a connector with
+  `postgres.migrate`, waited many minutes, until the kernel gave the
+  connection up. The release now gives up after 5 seconds and closes the
+  connection, which releases the lock. The writes of the configuration and
+  of the inventory, and the refresh of `known_dependencies`, could
+  deadlock with a migration; they now wait for it, as the other writes do
+  (#255).
+* After `max_series_per_host` dropped series of a host, a drop of its
+  changes (refused by PostgreSQL, or beyond `max_pending_rows`) moved the
+  start of its next session back before the dropped series, so that
+  `unobserved()` did not report the gap. The start no longer moves back
+  (#253).
+* A negative value of an edge, whose metrics are all counts or sums of
+  durations, was taken for a reset and added, so that counters and the
+  sums of histograms decreased and could turn negative: it is now an
+  invalid data point. An output whose inputs added up beyond what it holds
+  wrapped around; it now stays at its maximum, which Prometheus does not
+  take for a reset (#245).
+* The connector kept any start of an observation segment that an agent
+  sent: a start after the request that carried it made `unobserved()`
+  report the session as not observed, and one beyond what `timestamptz`
+  holds made PostgreSQL refuse the writes of the host, which dropped all
+  its pending changes. The start is now no later than the time of the
+  request by the clock of the agent. A gauge of Unix seconds is valid only
+  from 1970 to the end of 9999: one near 2^63 wrapped to a time before
+  1970, which PostgreSQL refused too (#246, `docs/design.md` §5.1, §10).
+* Three kinds of state per host outlived it in the connector. The fold
+  warning of a host that stopped folding, or was decommissioned, stayed
+  for good. A host that sent only the metrics of its agent, as an idle
+  node does, was forgotten at every write interval while it kept sending,
+  so that the first values of its next series could be taken for ones
+  already counted. With `peer_hosts`, the holders of addresses piled up
+  for up to 30 days while one host could not be written or PostgreSQL was
+  down. A warning is now forgotten an hour after its last fold, a host is
+  kept until `idle_ttl` after its latest request, and the holders of a
+  host are forgotten as its changes are written or dropped (#251,
+  `docs/design.md` §5.2).
+* `shawk_v1.dependencies` and `dependencies_between()` matched an edge in
+  the scope of its host and network namespace only when its remote address
+  was loopback: a client that binds an address of its host and connects to
+  `127.0.0.1` gave a client row and a server row instead of one row
+  observed by both sides. An edge with a loopback address on either side
+  is now matched in its host and namespace, and so are the learned
+  translations of a client edge with a loopback client or virtual address,
+  which those of any host matched before (#241, `docs/design.md` §6.2).
+* An edge matched through a translation and also by address lost part of
+  its period in `shawk_v1.dependencies` and `dependencies_between()`: a
+  client edge to a virtual address that a relay with an agent served for a
+  while had no row of its own for the time that no agent saw, and the row
+  of a server edge at a backend that a client also reached directly took
+  the whole period of the server edge. The row matched by address now has
+  the period of the other edge on both sides, and the edge keeps a row of
+  its own for what neither covers (#247, `docs/design.md` §5.4).
+* `shawk_v1.planned_stops` counted the 30 days of a `MAINT` reservation
+  from the start of an earlier one when the node was left out of
+  `node_states_file` between them: a reservation after one that ended 30.5
+  days before was left out at once, and the alert `shawk-agent-silent`
+  fired during the planned maintenance. A state read after the one before
+  became stale now starts a run (#248, `docs/design.md` §5.7).
+* `shawk_v1.service_endpoints` had no server edges of a host without
+  listeners, such as a UDP server or one whose listeners are too
+  short-lived to be listed, so the connector could not name the peers of
+  its clients after it. Its server edges now count too, and the view reads
+  only the hosts that reported in the last 30 days, in about half the time
+  (#249, `docs/design.md` §6.2).
+* Queries that run at every write of the connector or for every dashboard
+  read the whole retention of their tables: `shawk_v1.agents`,
+  `unobserved()`, `unobserved_reasons()`, the latest node states, read
+  under the lock of node states, and the sessions of an agent that dropped
+  flows. They now read the rows of the hosts and the period asked for
+  through indexes, two of them new, with the same results: on a test
+  database of 2000 host ids and 400 000 sessions, `agents` took 13 ms
+  instead of 405, and `unobserved_reasons()` over an hour 11 ms instead of
+  540 (#250).
+* The variables of the peer hosts dashboard listed only the services and
+  hosts with connections or failed connects, so services that use UDP
+  alone, and their peer hosts, could not be selected and were left out
+  even with `All`. They now list those with bytes too (#272).
+* The Grafana alert `shawk-agent-clock-skew` returned two rows with the
+  same labels, which collide in Grafana, when two live host ids share a
+  host name, as after a node boots with a new machine id: it now alerts
+  the largest skew of each host name. The panel "SYN retransmissions per
+  attempt" of the dependency details dashboard counted the failed connects
+  of Unix sockets, which have port 0, as attempts of the TCP dependencies
+  on port 0 of `port_agnostic_services` and `dynamic_ports`, which lowered
+  the ratio: it now counts the failures over TCP (#262).
+
+### Security
+
+* **A user can no longer name their processes after a container of the
+  host from a scope.** The walk of a cgroup stopped at a service, a
+  session scope or a `run-*` unit above the containers, but not at the
+  other scopes that systemd can delegate (`systemd-run --scope --unit=`,
+  `machine-*.scope`, `slurmstepd.scope`): a user could make a cgroup in
+  one named after a container of the host, and the agent named the user's
+  flows after that container. Any scope or service above the containers
+  now stops the walk, and the container is named by id after that unit,
+  without reading the state of the runtimes of the host; scopes below the
+  innermost container, such as `init.scope` of systemd in a container,
+  keep the name of the container. The cgroups under a Slurm task,
+  containers included, are now named after its step (`slurm/<kind>`), as
+  the task is (#268, `docs/design.md` §4.1).
+* **An agent can no longer make the connector hold a session per
+  request.** Nothing bounded the sessions pending for a host: an agent
+  that sent a new segment start with each request made the connector hold
+  a session per request, each with up to 4096 ranges of
+  `shawk.peer.internal`, and write as many rows. A session is now recorded
+  only from a request that closes an interval, where agents send the
+  segment start, and a host has at most 16 pending; a new one beyond is
+  not written, and logged at most once a minute. The gauge of open
+  connections also kept for good the expired inputs of a host whose
+  requests never close an interval; they are now forgotten (#240,
+  `docs/design.md` §5.5).
+
+**Upgrading.** Apply the migration `0003_view_fixes.sql` with
+`shawk-migrate`, or let the connector apply it with `postgres.migrate`: a
+connector of this version waits at start until the schema has it. It
+replaces views and functions of `shawk_v1` with the same columns, and adds
+two indexes; the database of v0.10.0 is kept. Upgrade the connectors with
+the agents.
+
 ## [v0.10.0](https://github.com/yuuki/shawk/compare/v0.9.0...v0.10.0) (2026-11-20)
 
 ### Added
