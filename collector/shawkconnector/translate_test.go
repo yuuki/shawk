@@ -3,6 +3,7 @@ package shawkconnector
 import (
 	"fmt"
 	"maps"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"slices"
@@ -565,4 +566,231 @@ func TestTranslationRelayEdgeCases(t *testing.T) {
 	if want := []string{"app-01 db-01 198.51.100.10 192.0.2.100"}; !slices.Equal(got, want) {
 		t.Errorf("warnings = %q, want %q", got, want)
 	}
+}
+
+// TestTranslationClientEnds checks clientEnds for fixed-port, same-port,
+// all-ports, and mixed backends, including non-backend addresses and backends
+// on a matching virtual port (#234).
+func TestTranslationClientEnds(t *testing.T) {
+	ts, err := parseTranslations(map[string]TranslationConfig{
+		"fixed": {
+			Virtual:  []string{"10.0.100.1:80", "10.0.100.1:8000"},
+			Backends: []string{"10.0.1.0/24:8080"},
+		},
+		"same-fixed-vport": {
+			Virtual:  []string{"10.0.100.2:443", "10.0.100.2:8443"},
+			Backends: []string{"10.0.2.10"},
+		},
+		"same-all-vport": {
+			Virtual:  []string{"10.0.100.3"},
+			Backends: []string{"10.0.3.10"},
+		},
+		"mixed": {
+			Virtual:  []string{"10.0.100.4:80", "10.0.100.4:8080"},
+			Backends: []string{"10.0.4.0/24", "10.0.4.10:8080"},
+		},
+		"v6": {
+			Virtual:  []string{"[2001:db8::1]:443"},
+			Backends: []string{"[2001:db8:1::10]:8443"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]*translation{}
+	for i := range ts {
+		byName[ts[i].name] = &ts[i]
+	}
+	aps := func(ss ...string) []netip.AddrPort {
+		out := make([]netip.AddrPort, len(ss))
+		for i, s := range ss {
+			out[i] = netip.MustParseAddrPort(s)
+		}
+		return out
+	}
+
+	for _, c := range []struct {
+		name  string
+		tr    string
+		local string
+		port  uint16
+		want  []netip.AddrPort
+	}{
+		// Fixed-port backend.
+		{"fixed backend matching fixed port", "fixed", "10.0.1.10", 8080, aps("10.0.100.1:80", "10.0.100.1:8000")},
+		{"fixed backend on virtual port 80", "fixed", "10.0.1.10", 80, nil},
+		{"fixed backend on virtual port 8000", "fixed", "10.0.1.10", 8000, nil},
+		{"fixed backend on unrelated port", "fixed", "10.0.1.10", 443, nil},
+		{"non-backend on fixed virtual port 80", "fixed", "10.0.99.99", 80, nil},
+		{"non-backend on fixed virtual port 8000", "fixed", "10.0.99.99", 8000, nil},
+		{"non-backend on fixed backend port", "fixed", "10.0.99.99", 8080, nil},
+
+		// Same-port backend with fixed virtual ports.
+		{"same-port backend on virtual port 443", "same-fixed-vport", "10.0.2.10", 443, aps("10.0.100.2:443")},
+		{"same-port backend on virtual port 8443", "same-fixed-vport", "10.0.2.10", 8443, aps("10.0.100.2:8443")},
+		{"same-port backend on other port", "same-fixed-vport", "10.0.2.10", 80, nil},
+		{"non-backend on same-port virtual port", "same-fixed-vport", "10.0.99.99", 443, nil},
+
+		// Same-port backend with all-ports virtual address.
+		{"all-ports backend on any port", "same-all-vport", "10.0.3.10", 5432, aps("10.0.100.3:5432")},
+		{"non-backend on all-ports virtual", "same-all-vport", "10.0.99.99", 5432, nil},
+
+		// Mixed overlapping fixed-port and same-port backends.
+		{"mixed overlapping backend on fixed port", "mixed", "10.0.4.10", 8080, aps("10.0.100.4:80", "10.0.100.4:8080")},
+		{"mixed overlapping backend on same port", "mixed", "10.0.4.10", 80, aps("10.0.100.4:80")},
+		{"mixed overlapping backend on unrelated port", "mixed", "10.0.4.10", 443, nil},
+		{"mixed range-only backend on 80", "mixed", "10.0.4.20", 80, aps("10.0.100.4:80")},
+		{"mixed range-only backend on 8080", "mixed", "10.0.4.20", 8080, aps("10.0.100.4:8080")},
+		{"mixed non-backend on virtual port 80", "mixed", "10.0.99.99", 80, nil},
+		{"mixed non-backend on virtual port 8080", "mixed", "10.0.99.99", 8080, nil},
+
+		// IPv6 fixed-port backend.
+		{"v6 backend on fixed port", "v6", "2001:db8:1::10", 8443, aps("[2001:db8::1]:443")},
+		{"v6 backend on virtual port", "v6", "2001:db8:1::10", 443, nil},
+		{"v6 non-backend on virtual port", "v6", "2001:db8:99::99", 443, nil},
+
+		// Zero port must not match fixed-port or fixed-virtual-port backends.
+		{"fixed backend on port 0", "fixed", "10.0.1.10", 0, nil},
+		{"same-port backend on port 0", "same-fixed-vport", "10.0.2.10", 0, nil},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			got := byName[c.tr].clientEnds(addrOf(c.local), c.port)
+			if !slices.Equal(got, c.want) {
+				t.Errorf("clientEnds(%s, %d) = %v, want %v", c.local, c.port, got, c.want)
+			}
+		})
+	}
+}
+
+// TestTranslationNonBackendIsolation verifies that a translation with a
+// virtual port does not affect non-backend servers (or backends on the wrong
+// port) via foldedVirtual, behindRelay, or translatedClient (#234).
+func TestTranslationNonBackendIsolation(t *testing.T) {
+	t.Run("foldedVirtual", func(t *testing.T) {
+		c, _, sink, _ := testConnector(t, func(cfg *Config) {
+			cfg.Translations = map[string]TranslationConfig{
+				"public-vip": {Virtual: []string{"203.0.113.1:443"}, Backends: []string{"10.0.1.10:8443"}},
+			}
+		})
+		logs := observe(c)
+		ts := t0.Add(15 * time.Second)
+		// Client folds external addresses (including 203.0.113.1) but keeps 10.0.0.0/8 exact.
+		consume(t, c, sink, tAgent{host: "app-01", addrs: []string{"10.0.0.11"}, time: ts,
+			fold: foldAll, internal: []string{"10.0.0.0/8"}})
+
+		// Unrelated internal server on port 443 must NOT trigger foldedVirtual.
+		out := consume(t, c, sink, tAgent{host: "other-01", addrs: []string{"10.0.99.99"}, time: ts,
+			edges: []tEdge{{role: "server", proto: "tcp", local: "10.0.99.99", peer: "10.0.0.11", port: 443,
+				svc: "other", comm: "other", opened: 3}}})
+		if s := find(out, metricConnOpened, "other", "*", roleServer, ""); len(s) != 1 || !s[0].agent {
+			t.Errorf("unrelated server series = %+v, want agent=true", s)
+		}
+		if got := logs.TakeAll(); len(got) != 0 {
+			t.Errorf("unexpected fold warnings for unrelated server = %v", got)
+		}
+
+		// Real backend serving directly on virtual port 443 (not its fixed backend port 8443)
+		// must NOT trigger foldedVirtual either.
+		out = consume(t, c, sink, tAgent{host: "be-01", addrs: []string{"10.0.1.10"}, time: ts,
+			edges: []tEdge{{role: "server", proto: "tcp", local: "10.0.1.10", peer: "10.0.0.11", port: 443,
+				svc: "be-direct", comm: "be-direct", opened: 2}}})
+		if s := find(out, metricConnOpened, "be-direct", "*", roleServer, ""); len(s) != 1 || !s[0].agent {
+			t.Errorf("backend on wrong port series = %+v, want agent=true", s)
+		}
+		if got := logs.TakeAll(); len(got) != 0 {
+			t.Errorf("unexpected fold warnings for backend on wrong port = %v", got)
+		}
+
+		// Real backend on its fixed backend port 8443 MUST still trigger foldedVirtual.
+		out = consume(t, c, sink, tAgent{host: "be-01", addrs: []string{"10.0.1.10"}, time: ts.Add(15 * time.Second),
+			edges: []tEdge{{role: "server", proto: "tcp", local: "10.0.1.10", peer: "10.0.0.11", port: 8443,
+				svc: "be-vip", comm: "be-vip", opened: 5}}})
+		if s := find(out, metricConnOpened, "be-vip", "*", roleServer, ""); len(s) != 1 || s[0].agent {
+			t.Errorf("real backend series = %+v, want agent=false", s)
+		}
+		if got := logs.TakeAll(); len(got) != 1 || got[0].ContextMap()["virtual_address"] != "203.0.113.1" {
+			t.Errorf("real backend fold warnings = %v, want virtual_address=203.0.113.1", got)
+		}
+	})
+
+	t.Run("behindRelay", func(t *testing.T) {
+		c, _, sink, _ := testConnector(t, func(cfg *Config) {
+			cfg.Translations = map[string]TranslationConfig{
+				"web-lb": {
+					Virtual:  []string{"10.0.100.2:80"},
+					Backends: []string{"10.0.1.10:8080"},
+					Sources:  []string{"10.0.100.250"},
+				},
+			}
+		})
+		ts := t0.Add(15 * time.Second)
+		// Host running an agent at the SNAT source address.
+		consume(t, c, sink, tAgent{host: "lb-01", addrs: []string{"10.0.100.250"}, time: ts})
+
+		// Unrelated server on port 80 receiving traffic from 10.0.100.250 is NOT behind web-lb.
+		out := consume(t, c, sink, tAgent{host: "other-01", addrs: []string{"10.0.99.99"}, time: ts,
+			edges: []tEdge{{role: "server", proto: "tcp", local: "10.0.99.99", peer: "10.0.100.250", port: 80,
+				svc: "other", comm: "other", opened: 4}}})
+		if s := find(out, metricConnOpened, "other", "*", roleServer, ""); len(s) != 1 || !s[0].agent {
+			t.Errorf("unrelated server series = %+v, want agent=true", s)
+		}
+
+		// Backend on virtual port 80 (not fixed backend port 8080) is NOT behind web-lb.
+		out = consume(t, c, sink, tAgent{host: "web-01", addrs: []string{"10.0.1.10"}, time: ts,
+			edges: []tEdge{{role: "server", proto: "tcp", local: "10.0.1.10", peer: "10.0.100.250", port: 80,
+				svc: "web-direct", comm: "web-direct", opened: 2}}})
+		if s := find(out, metricConnOpened, "web-direct", "*", roleServer, ""); len(s) != 1 || !s[0].agent {
+			t.Errorf("backend on wrong port series = %+v, want agent=true", s)
+		}
+
+		// Real backend on fixed backend port 8080 IS behind web-lb.
+		out = consume(t, c, sink, tAgent{host: "web-01", addrs: []string{"10.0.1.10"}, time: ts.Add(15 * time.Second),
+			edges: []tEdge{{role: "server", proto: "tcp", local: "10.0.1.10", peer: "10.0.100.250", port: 8080,
+				svc: "web", comm: "web", opened: 6}}})
+		if s := find(out, metricConnOpened, "web", "*", roleServer, ""); len(s) != 1 || s[0].agent {
+			t.Errorf("real backend series = %+v, want agent=false", s)
+		}
+	})
+
+	t.Run("translatedClient", func(t *testing.T) {
+		ts, err := parseTranslations(map[string]TranslationConfig{
+			"fixed": {Virtual: []string{"10.0.100.1:80", "10.0.100.1:8000"}, Backends: []string{"10.0.1.0/24:8080"}},
+			"same":  {Virtual: []string{"10.0.100.2:443"}, Backends: []string{"10.0.2.10"}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := newResolver(nil, ts)
+		now := t0
+		addClient := func(server string, port uint16, svc string) {
+			r.localClients[clientKey{addrOf("10.0.0.11"), addrOf(server), port, "tcp"}] = map[endpoint]time.Time{
+				{host: "app-01", service: svc, exact: true}: now,
+			}
+		}
+		addClient("10.0.100.1", 80, "app-80")
+		addClient("10.0.100.1", 8000, "app-8000")
+		addClient("10.0.100.2", 443, "app-443")
+
+		for _, c := range []struct {
+			local string
+			port  uint16
+			want  string
+		}{
+			// Non-backend servers on matching virtual ports must not inherit translated clients.
+			{"10.0.99.99", 80, peerUnresolved},
+			{"10.0.99.99", 8000, peerUnresolved},
+			{"10.0.99.99", 443, peerUnresolved},
+			// Fixed-port backend on matching virtual ports (wrong backend port) must not match.
+			{"10.0.1.10", 80, peerUnresolved},
+			{"10.0.1.10", 8000, peerUnresolved},
+			// Real backends on their expected ports still match.
+			{"10.0.1.10", 8080, "app-80"},
+			{"10.0.2.10", 443, "app-443"},
+		} {
+			id := &edgeID{role: roleServer, proto: "tcp", local: addrOf(c.local), peer: addrOf("10.0.0.11"), port: c.port}
+			if p := r.peer("srv", id, now); p.name != c.want {
+				t.Errorf("%s:%d: peer = %q, want %q", c.local, c.port, p.name, c.want)
+			}
+		}
+	})
 }

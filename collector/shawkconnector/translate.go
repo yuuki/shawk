@@ -59,10 +59,10 @@ func (t *translation) reaches(local netip.Addr, port uint16) (fixed, same bool) 
 			continue
 		}
 		switch b.port {
-		case port:
-			fixed = true
 		case 0:
 			same = true
+		case port:
+			fixed = true
 		}
 	}
 	return fixed, same
@@ -72,6 +72,9 @@ func (t *translation) reaches(local netip.Addr, port uint16) (fixed, same bool) 
 // to them on, through which a server at local on port is reached.
 func (t *translation) clientEnds(local netip.Addr, port uint16) []netip.AddrPort {
 	fixed, same := t.reaches(local, port)
+	if !fixed && !same {
+		return nil
+	}
 	var out []netip.AddrPort
 	for _, v := range t.virtual {
 		vp := v.Port()
@@ -82,7 +85,7 @@ func (t *translation) clientEnds(local netip.Addr, port uint16) []netip.AddrPort
 				continue
 			}
 			vp = port
-		case !fixed && vp != port:
+		case !fixed && (!same || vp != port):
 			continue
 		}
 		out = append(out, netip.AddrPortFrom(v.Addr(), vp))
