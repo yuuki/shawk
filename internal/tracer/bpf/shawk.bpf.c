@@ -2663,7 +2663,7 @@ int shawk_iter_task_file(struct bpf_iter__task_file *ctx)
 		ss = bpf_sk_storage_get(&sock_states, sk, NULL, 0);
 		if (!ss) {
 			ss = adopt_skipped(sk, netns, port, state);
-			if (!ss)
+			if (!ss || (ss->flags & SS_READY))
 				return 0;
 		} else if (ss->flags & SS_READY) {
 			account_skipped(ss, sk, state);
