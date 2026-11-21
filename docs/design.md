@@ -1493,11 +1493,13 @@ inventory, the file names hosts (`host`).
   after that. A file whose `generated_at` is older is not written, with a
   warning; one more than 10 seconds ahead is invalid (the file is
   generated on the host of the connector). When a file cannot be read, is
-  invalid (an empty file is) or is larger than 16 MiB, as the inventory,
-  what was written from it stays, and the states become stale. Flags are
-  names (`DOWN`, `POWERED_DOWN`), as `scontrol` gives them; the `*` of a
-  node that does not respond becomes `NOT_RESPONDING`, and the symbols of
-  `sinfo` (`idle~`) are invalid.
+  invalid (an empty file is, as is one of several YAML documents or one
+  that is only `null`; `{}` or `maintenance: []` says that there is no
+  window) or is larger than 16 MiB, as the inventory, what was written
+  from it stays, and the states become stale. Flags are names (`DOWN`,
+  `POWERED_DOWN`), as `scontrol` gives them; the `*` of a node that does
+  not respond becomes `NOT_RESPONDING`, and the symbols of `sinfo`
+  (`idle~`) are invalid.
 - **Maintenance windows** are written by the clock of the database
   (`maintenance_windows`) when the file changes, and count from when they
   were written, so a window registered afterwards does not make a past
