@@ -6,7 +6,11 @@
 --     with a loopback address on either side is matched within its host and
 --     network namespace, on both sides of a connection alike, so that a
 --     client that binds an address of its host and connects to 127.0.0.1
---     matches its server (docs/design.md §6.2).
+--     matches its server (docs/design.md §6.2). An edge matched through a
+--     translation and by address keeps a row of its own for the part of its
+--     period that neither covers, and its row matched by address has the
+--     period of the other edge on the server side as on the client side
+--     (§5.4).
 
 -- The dependencies active in [since, until]: the client and server edges
 -- of a connection matched into one row. Edges are taken with a margin of
@@ -47,11 +51,16 @@
 --     another period. The last columns tell the virtual address and port
 --     the client connected to and the name of the translation; they are
 --     NULL on rows matched by address;
---   - an edge keeps a row of its own if its matched rows leave a part of
---     its period (in the period asked for, a part in it): a client edge also
---     reached backends without an agent, or before their agents started,
---     and a server edge served the client directly. The row runs from the
---     start of the edge to the end of the last part left;
+--   - an edge keeps a row of its own if its matched rows, through
+--     translations and by address, leave a part of its period (in the
+--     period asked for, a part in it): a client edge also reached backends
+--     without an agent, or before their agents started, and a server edge
+--     served the client directly. The row runs from the start of the edge
+--     to the end of the last part left. The row of an edge matched through
+--     translations that is also matched by address has the period of the
+--     other edge (a relay that runs an agent served the client edge then;
+--     the client reached the server edge directly then), or the period
+--     both were active in if both are matched through translations;
 --   - on these rows, the observation of a side whose edge outlives the row
 --     is NULL: it tells nothing of the end of the row, which is for the
 --     other side to tell, so that a stopped agent does not make the
@@ -381,14 +390,30 @@ rest AS (
   WHERE NOT t.snat
   GROUP BY t.sid, t.s_first, t.s_last
 ),
+-- The periods in which the edges of rest were matched by address, within
+-- the margin, as in the rows below: a client edge by a relay that runs an
+-- agent, a server edge by a client that reached it directly.
+by_addr AS (
+  SELECT r.id,
+         range_agg(tstzrange(least(y.first_seen, y.last_seen) - interval '2 minutes',
+                             greatest(y.first_seen, y.last_seen) + interval '2 minutes', '[]')) AS matched
+  FROM rest r
+  JOIN e x ON x.id = r.id
+  JOIN e y
+    ON  y.role <> x.role AND y.proto = x.proto AND y.port = x.port
+    AND y.local_addr = x.remote_addr AND y.remote_addr = x.local_addr AND y.scope = x.scope
+  GROUP BY r.id
+),
 -- The row of its own of an edge matched through translations: from the
 -- start of the edge, so that a side that stops observing does not make its
--- other side look new, to the end of the last part left. It is shown if a
--- part is left, in [since, until].
+-- other side look new, to the end of the last part left that no row by
+-- address covers either. It is shown if such a part is left, in [since,
+-- until]. by_addr tells that the edge also has rows matched by address.
 own AS (
-  SELECT x.id, upper(x.rest) AS last_seen,
+  SELECT x.id, upper(x.rest) AS last_seen, x.by_addr,
          EXISTS (SELECT FROM unnest(x.rest) AS g WHERE g && tstzrange(since, until, '[]')) AS shown
-  FROM rest x
+  FROM (SELECT r.id, r.rest - coalesce(a.matched, '{}') AS rest, a.id IS NOT NULL AS by_addr
+        FROM rest r LEFT JOIN by_addr a ON a.id = r.id) x
 ),
 d AS (
 SELECT
@@ -402,19 +427,14 @@ SELECT
   coalesce(c.remote_addr, s.local_addr)         AS server_addr,
   coalesce(c.port, s.port)                      AS port,
   coalesce(c.proto, s.proto)                    AS proto,
-  CASE WHEN oc.id IS NOT NULL AND s.id IS NOT NULL THEN s.first_seen
-       ELSE least(c.first_seen, s.first_seen) END AS first_seen,
-  CASE WHEN oc.id IS NOT NULL AND s.id IS NULL THEN oc.last_seen
-       WHEN os.id IS NOT NULL THEN os.last_seen
-       WHEN oc.id IS NOT NULL THEN s.last_seen
-       ELSE greatest(c.last_seen, s.last_seen) END AS last_seen,
+  r.first_seen,
+  r.last_seen,
   CASE WHEN c.id IS NOT NULL AND s.id IS NOT NULL THEN 'both'
        WHEN c.id IS NOT NULL THEN 'client'
        ELSE 'server' END                        AS observed_by,
-  CASE WHEN oc.id IS NOT NULL
-        AND c.last_seen > coalesce(s.last_seen, oc.last_seen) + interval '2 minutes' THEN NULL
+  CASE WHEN oc.id IS NOT NULL AND c.last_seen > r.last_seen + interval '2 minutes' THEN NULL
        ELSE co.observed_until END               AS client_observed_until,
-  CASE WHEN os.id IS NOT NULL AND s.last_seen > os.last_seen + interval '2 minutes' THEN NULL
+  CASE WHEN os.id IS NOT NULL AND s.last_seen > r.last_seen + interval '2 minutes' THEN NULL
        ELSE so.observed_until END               AS server_observed_until,
   NULL::inet                                    AS virtual_addr,
   NULL::integer                                 AS virtual_port,
@@ -430,13 +450,30 @@ FULL JOIN (SELECT * FROM e WHERE role = 'server') s
 LEFT JOIN observed co ON co.host_id = c.host_id
 LEFT JOIN observed so ON so.host_id = s.host_id
 -- An edge matched through translations keeps a row of its own if its
--- matched rows below leave a part of it; a server edge that a client edge
--- also matched through a translation matches by address over its own
--- period, since the client edge also reached the backends. As on the rows
--- below, the observation of a side whose edge outlives the row tells
--- nothing of the end of the row.
+-- matched rows below leave a part of it. Matched by address as well, its
+-- row has the period of the other edge, which was matched by address only
+-- (a relay that runs an agent served the client edge then; the client
+-- reached the server edge directly then), or the period both were active
+-- in if both were matched through translations, and the part that neither
+-- covers is a row of its own below. As on the rows below, the observation
+-- of a side whose edge outlives the row tells nothing of the end of the
+-- row.
 LEFT JOIN own oc ON oc.id = c.id
-LEFT JOIN own os ON os.id = s.id AND c.id IS NULL
+LEFT JOIN own os ON os.id = s.id
+CROSS JOIN LATERAL (
+  SELECT CASE WHEN c.id IS NULL OR s.id IS NULL OR (oc.id IS NULL AND os.id IS NULL)
+                THEN least(c.first_seen, s.first_seen)
+              WHEN os.id IS NULL THEN s.first_seen
+              WHEN oc.id IS NULL THEN c.first_seen
+              ELSE least(greatest(c.first_seen, s.first_seen), least(c.last_seen, s.last_seen)) END AS first_seen,
+         CASE WHEN s.id IS NULL AND oc.id IS NOT NULL THEN oc.last_seen
+              WHEN c.id IS NULL AND os.id IS NOT NULL THEN os.last_seen
+              WHEN c.id IS NULL OR s.id IS NULL OR (oc.id IS NULL AND os.id IS NULL)
+                THEN greatest(c.last_seen, s.last_seen)
+              WHEN os.id IS NULL THEN s.last_seen
+              WHEN oc.id IS NULL THEN c.last_seen
+              ELSE greatest(greatest(c.first_seen, s.first_seen), least(c.last_seen, s.last_seen)) END AS last_seen
+) r
 WHERE NOT (s.id IS NULL AND oc.id IS NOT NULL AND NOT oc.shown)
   AND NOT (c.id IS NULL AND os.id IS NOT NULL AND NOT os.shown)
 UNION ALL
@@ -453,6 +490,29 @@ SELECT
 FROM translated t
 LEFT JOIN observed co ON co.host_id = t.c_host_id
 LEFT JOIN observed so ON so.host_id = t.s_host_id
+UNION ALL
+-- The row of its own of an edge matched through translations and by
+-- address, for the part of its period that neither covers: a client edge
+-- that a relay with an agent served for a while also reached backends
+-- without an agent, a server edge that served a client directly and
+-- through a translation also served it when its agent did not run.
+SELECT
+  CASE WHEN x.role = 'client' THEN x.hostname END,
+  CASE WHEN x.role = 'client' THEN x.service_name END,
+  CASE WHEN x.role = 'client' THEN x.unit END,
+  CASE WHEN x.role = 'client' THEN x.local_addr ELSE x.remote_addr END,
+  CASE WHEN x.role = 'server' THEN x.hostname END,
+  CASE WHEN x.role = 'server' THEN x.service_name END,
+  CASE WHEN x.role = 'server' THEN x.unit END,
+  CASE WHEN x.role = 'client' THEN x.remote_addr ELSE x.local_addr END,
+  x.port, x.proto, x.first_seen, o.last_seen, x.role,
+  CASE WHEN x.role = 'client' AND x.last_seen <= o.last_seen + interval '2 minutes' THEN ob.observed_until END,
+  CASE WHEN x.role = 'server' AND x.last_seen <= o.last_seen + interval '2 minutes' THEN ob.observed_until END,
+  NULL::inet, NULL::integer, NULL::text, NULL::text
+FROM own o
+JOIN e x ON x.id = o.id
+LEFT JOIN observed ob ON ob.host_id = x.host_id
+WHERE o.by_addr AND o.shown
 UNION ALL
 -- The dependencies over Unix sockets.
 SELECT
@@ -760,12 +820,29 @@ rest AS (
   WHERE NOT t.snat
   GROUP BY t.sid, t.s_first, t.s_last
 ),
+-- The periods in which the edges of rest were matched by address, within
+-- the margin, as in the rows below: a client edge by a relay that runs an
+-- agent, a server edge by a client that reached it directly.
+by_addr AS (
+  SELECT r.id,
+         range_agg(tstzrange(least(y.first_seen, y.last_seen) - interval '2 minutes',
+                             greatest(y.first_seen, y.last_seen) + interval '2 minutes', '[]')) AS matched
+  FROM rest r
+  JOIN e x ON x.id = r.id
+  JOIN e y
+    ON  y.role <> x.role AND y.proto = x.proto AND y.port = x.port
+    AND y.local_addr = x.remote_addr AND y.remote_addr = x.local_addr AND y.scope = x.scope
+  GROUP BY r.id
+),
 -- The row of its own of an edge matched through translations: from the
 -- start of the edge, so that a side that stops observing does not make its
--- other side look new, to the end of the last part left. It is shown if a
--- part is left.
+-- other side look new, to the end of the last part left that no row by
+-- address covers either. It is shown if such a part is left. by_addr tells
+-- that the edge also has rows matched by address.
 own AS (
-  SELECT x.id, upper(x.rest) AS last_seen, NOT isempty(x.rest) AS shown FROM rest x
+  SELECT x.id, upper(x.rest) AS last_seen, x.by_addr, NOT isempty(x.rest) AS shown
+  FROM (SELECT r.id, r.rest - coalesce(a.matched, '{}') AS rest, a.id IS NOT NULL AS by_addr
+        FROM rest r LEFT JOIN by_addr a ON a.id = r.id) x
 )
 SELECT
   c.hostname                                    AS client_host,
@@ -778,19 +855,14 @@ SELECT
   coalesce(c.remote_addr, s.local_addr)         AS server_addr,
   coalesce(c.port, s.port)                      AS port,
   coalesce(c.proto, s.proto)                    AS proto,
-  CASE WHEN oc.id IS NOT NULL AND s.id IS NOT NULL THEN s.first_seen
-       ELSE least(c.first_seen, s.first_seen) END AS first_seen,
-  CASE WHEN oc.id IS NOT NULL AND s.id IS NULL THEN oc.last_seen
-       WHEN os.id IS NOT NULL THEN os.last_seen
-       WHEN oc.id IS NOT NULL THEN s.last_seen
-       ELSE greatest(c.last_seen, s.last_seen) END AS last_seen,
+  r.first_seen,
+  r.last_seen,
   CASE WHEN c.id IS NOT NULL AND s.id IS NOT NULL THEN 'both'
        WHEN c.id IS NOT NULL THEN 'client'
        ELSE 'server' END                        AS observed_by,
-  CASE WHEN oc.id IS NOT NULL
-        AND c.last_seen > coalesce(s.last_seen, oc.last_seen) + interval '2 minutes' THEN NULL
+  CASE WHEN oc.id IS NOT NULL AND c.last_seen > r.last_seen + interval '2 minutes' THEN NULL
        ELSE co.observed_until END               AS client_observed_until,
-  CASE WHEN os.id IS NOT NULL AND s.last_seen > os.last_seen + interval '2 minutes' THEN NULL
+  CASE WHEN os.id IS NOT NULL AND s.last_seen > r.last_seen + interval '2 minutes' THEN NULL
        ELSE so.observed_until END               AS server_observed_until,
   NULL::inet                                    AS virtual_addr,
   NULL::integer                                 AS virtual_port,
@@ -806,13 +878,30 @@ FULL JOIN (SELECT * FROM e WHERE role = 'server') s
 LEFT JOIN observed co ON co.host_id = c.host_id
 LEFT JOIN observed so ON so.host_id = s.host_id
 -- An edge matched through translations keeps a row of its own if its
--- matched rows below leave a part of it; a server edge that a client edge
--- also matched through a translation matches by address over its own
--- period, since the client edge also reached the backends. As on the rows
--- below, the observation of a side whose edge outlives the row tells
--- nothing of the end of the row.
+-- matched rows below leave a part of it. Matched by address as well, its
+-- row has the period of the other edge, which was matched by address only
+-- (a relay that runs an agent served the client edge then; the client
+-- reached the server edge directly then), or the period both were active
+-- in if both were matched through translations, and the part that neither
+-- covers is a row of its own below. As on the rows below, the observation
+-- of a side whose edge outlives the row tells nothing of the end of the
+-- row.
 LEFT JOIN own oc ON oc.id = c.id
-LEFT JOIN own os ON os.id = s.id AND c.id IS NULL
+LEFT JOIN own os ON os.id = s.id
+CROSS JOIN LATERAL (
+  SELECT CASE WHEN c.id IS NULL OR s.id IS NULL OR (oc.id IS NULL AND os.id IS NULL)
+                THEN least(c.first_seen, s.first_seen)
+              WHEN os.id IS NULL THEN s.first_seen
+              WHEN oc.id IS NULL THEN c.first_seen
+              ELSE least(greatest(c.first_seen, s.first_seen), least(c.last_seen, s.last_seen)) END AS first_seen,
+         CASE WHEN s.id IS NULL AND oc.id IS NOT NULL THEN oc.last_seen
+              WHEN c.id IS NULL AND os.id IS NOT NULL THEN os.last_seen
+              WHEN c.id IS NULL OR s.id IS NULL OR (oc.id IS NULL AND os.id IS NULL)
+                THEN greatest(c.last_seen, s.last_seen)
+              WHEN os.id IS NULL THEN s.last_seen
+              WHEN oc.id IS NULL THEN c.last_seen
+              ELSE greatest(greatest(c.first_seen, s.first_seen), least(c.last_seen, s.last_seen)) END AS last_seen
+) r
 WHERE NOT (s.id IS NULL AND oc.id IS NOT NULL AND NOT oc.shown)
   AND NOT (c.id IS NULL AND os.id IS NOT NULL AND NOT os.shown)
 UNION ALL
@@ -829,6 +918,29 @@ SELECT
 FROM translated t
 LEFT JOIN observed co ON co.host_id = t.c_host_id
 LEFT JOIN observed so ON so.host_id = t.s_host_id
+UNION ALL
+-- The row of its own of an edge matched through translations and by
+-- address, for the part of its period that neither covers: a client edge
+-- that a relay with an agent served for a while also reached backends
+-- without an agent, a server edge that served a client directly and
+-- through a translation also served it when its agent did not run.
+SELECT
+  CASE WHEN x.role = 'client' THEN x.hostname END,
+  CASE WHEN x.role = 'client' THEN x.service_name END,
+  CASE WHEN x.role = 'client' THEN x.unit END,
+  CASE WHEN x.role = 'client' THEN x.local_addr ELSE x.remote_addr END,
+  CASE WHEN x.role = 'server' THEN x.hostname END,
+  CASE WHEN x.role = 'server' THEN x.service_name END,
+  CASE WHEN x.role = 'server' THEN x.unit END,
+  CASE WHEN x.role = 'client' THEN x.remote_addr ELSE x.local_addr END,
+  x.port, x.proto, x.first_seen, o.last_seen, x.role,
+  CASE WHEN x.role = 'client' AND x.last_seen <= o.last_seen + interval '2 minutes' THEN ob.observed_until END,
+  CASE WHEN x.role = 'server' AND x.last_seen <= o.last_seen + interval '2 minutes' THEN ob.observed_until END,
+  NULL::inet, NULL::integer, NULL::text, NULL::text
+FROM own o
+JOIN e x ON x.id = o.id
+LEFT JOIN observed ob ON ob.host_id = x.host_id
+WHERE o.by_addr AND o.shown
 UNION ALL
 -- The dependencies over Unix sockets.
 SELECT

@@ -1309,7 +1309,11 @@ should have the same.
   the dependency ended is for the other side to tell, so a stopped agent
   does not make it look removed (§8). Where a server edge at the virtual
   address matches by address (a relay that runs an agent), the translation
-  is not used.
+  is not used. A matched edge that also matches an edge by address over
+  another period (such a relay served the client before, or the client
+  also connects to the backend directly) has that row over the period of
+  the other edge, with the rules above for `*_observed_until`, and its row
+  of its own covers what neither leaves.
 - In the names of peers, a client edge to a virtual address is named after
   the service at a backend, with the backend's `server.port` and
   `shawk.peer.agent`, unless a service was observed on a socket at the
