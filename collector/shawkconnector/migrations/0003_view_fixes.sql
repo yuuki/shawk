@@ -17,6 +17,11 @@
 --   - shawk_v1.service_endpoints: the server edges of a host without
 --     listeners are endpoints too, and only the hosts that reported in the
 --     last 30 days are read (§6.2).
+--   - shawk_v1.agents, shawk_v1.unobserved() and
+--     shawk_v1.unobserved_reasons(), and two indexes for the writes of
+--     agents that dropped flows: the same results from the rows of the
+--     hosts and of the period asked for, read through indexes, rather than
+--     from the history of the retention.
 
 -- The dependencies active in [since, until]: the client and server edges
 -- of a connection matched into one row. Edges are taken with a margin of
@@ -1116,3 +1121,129 @@ JOIN recent r ON r.host_id = s.host_id
 LEFT JOIN moved ON moved.host_id = s.host_id AND moved.addr = s.addr
 WHERE moved.host_id IS NULL
 GROUP BY s.addr, s.port, s.proto, r.hostname, s.host_id, s.service;
+
+-- The latest session of every host, and whether its agent is alive, as
+-- shawk_v1.agents of 0002_edge_protocols.sql: the latest session of each
+-- host is read through the index of its heartbeats, rather than every
+-- session of the retention sorted.
+CREATE OR REPLACE VIEW shawk_v1.agents AS
+SELECT
+  h.hostname        AS host,
+  h.id              AS host_id,
+  h.machine_id,
+  h.kernel,
+  h.agent_version,
+  s.started_at,
+  s.last_heartbeat,
+  s.udp_traced,
+  s.unix_traced,    -- whether the agent traces Unix sockets; NULL if it does not tell
+  s.netns_scope,
+  s.dropped_flows,
+  s.last_heartbeat > now() - shawk.alive_window() AS alive,
+  s.clock_skew,     -- how far the clock of the host is behind the connector
+  s.peer_fold,      -- the peers the agent folds: none, in or all
+  s.peer_internal,  -- the ranges of peers the agent keeps exact
+  s.protocols_classified  -- whether the agent classifies wire protocols; NULL if it does not tell
+FROM shawk.hosts h
+CROSS JOIN LATERAL (
+  SELECT * FROM shawk.agent_sessions s
+  WHERE s.host_id = h.id
+  ORDER BY s.last_heartbeat DESC LIMIT 1
+) s
+ORDER BY h.id;
+
+-- The periods in [since, until] in which a host was not observed, as
+-- shawk_v1.unobserved() of 0001_schema.sql: only the sessions that meet
+-- [since, until] are aggregated, as in unobserved_by_name(), so that a
+-- short period does not aggregate the sessions of the whole retention of
+-- every host.
+CREATE OR REPLACE FUNCTION shawk_v1.unobserved(since timestamptz, until timestamptz,
+                                               tolerance interval DEFAULT '3 minutes')
+RETURNS TABLE (host text, gap_start timestamptz, gap_end timestamptz)
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+  SELECT h.hostname, lower(g), upper(g)
+  FROM shawk.hosts h
+  CROSS JOIN LATERAL unnest(
+    tstzmultirange(tstzrange(since, until))
+    - coalesce((SELECT range_agg(tstzrange(least(s.started_at + s.clock_skew, s.last_heartbeat),
+                                           s.last_heartbeat + tolerance))
+                FROM shawk.agent_sessions s
+                WHERE s.host_id = h.id
+                  AND s.last_heartbeat > since - tolerance
+                  AND least(s.started_at + s.clock_skew, s.last_heartbeat) < until),
+               '{}'::tstzmultirange)
+  ) AS g
+  WHERE h.last_seen >= since;
+$$;
+
+-- The periods of unobserved_by_name(since, until, tolerance) cut by what
+-- Slurm and the maintenance windows tell about them, as
+-- shawk_v1.unobserved_reasons() of 0001_schema.sql: cause is maintenance or
+-- power_saving for a planned stop and NULL otherwise; node_state is the
+-- state of Slurm then ('+' between flags, NULL if none was read or it was
+-- stale) and reason the reason of Slurm or of the maintenance window. A
+-- maintenance window takes precedence over the state. The gaps are those of
+-- host names, as the states and windows are. The periods of the states are
+-- those of shawk.node_state_periods that may meet the gaps, which are in
+-- [since, until]: the states first read before until and read again
+-- after since, less the time they stay fresh, each ended by the next state
+-- of its host, which is read through the index, so that a short period does
+-- not read the states of the whole retention.
+CREATE OR REPLACE FUNCTION shawk_v1.unobserved_reasons(since timestamptz, until timestamptz,
+                                                       tolerance interval DEFAULT '3 minutes')
+RETURNS TABLE (host text, gap_start timestamptz, gap_end timestamptz,
+               cause text, node_state text, reason text)
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+  WITH gaps AS (
+    SELECT u.host, tstzmultirange(tstzrange(u.gap_start, u.gap_end)) AS gap,
+           coalesce((SELECT range_agg(w.period) FROM shawk.maintenance_periods w
+                     WHERE w.hostname = u.host AND w.period && tstzrange(u.gap_start, u.gap_end)),
+                    '{}'::tstzmultirange) AS maint
+    FROM shawk_v1.unobserved_by_name(unobserved_reasons.since, unobserved_reasons.until,
+                                     unobserved_reasons.tolerance) u
+  ),
+  periods AS (
+    SELECT s.hostname,
+           tstzrange(s.first_seen,
+                     least(s.last_seen + shawk.node_state_max_age(),
+                           (SELECT min(n.first_seen) FROM shawk.node_states n
+                            WHERE n.hostname = s.hostname AND n.first_seen > s.first_seen)),
+                     '[)') AS period,
+           s.state, s.reason
+    FROM shawk.node_states s
+    WHERE s.first_seen < unobserved_reasons.until
+      AND s.last_seen > unobserved_reasons.since - shawk.node_state_max_age()
+  ),
+  states AS (
+    SELECT g.host, g.gap - g.maint AS rest, p.period, p.state, p.reason
+    FROM gaps g
+    JOIN periods p ON p.hostname = g.host AND (g.gap - g.maint) && p.period
+  )
+  SELECT g.host, lower(m), upper(m), 'maintenance',
+         NULL::text,
+         (SELECT string_agg(DISTINCT w.reason, '; ') FROM shawk.maintenance_periods w
+          WHERE w.hostname = g.host AND w.period && m AND w.reason <> '')
+  FROM gaps g CROSS JOIN LATERAL unnest(g.gap * g.maint) AS m
+  UNION ALL
+  SELECT s.host, lower(r), upper(r), shawk.planned_state(s.state),
+         array_to_string(s.state, '+'), nullif(s.reason, '')
+  FROM states s CROSS JOIN LATERAL unnest(s.rest * tstzmultirange(s.period)) AS r
+  UNION ALL
+  -- The periods are joined rather than looked up per gap, which would scan
+  -- them all for each.
+  SELECT g.host, lower(r), upper(r), NULL, NULL, NULL
+  FROM (
+    SELECT g.host, g.gap, g.maint, range_agg(p.period) AS periods
+    FROM gaps g
+    LEFT JOIN periods p ON p.hostname = g.host AND p.period && g.gap
+    GROUP BY g.host, g.gap, g.maint
+  ) g
+  CROSS JOIN LATERAL unnest(g.gap - g.maint - coalesce(g.periods, '{}'::tstzmultirange)) AS r
+$$;
+
+-- The sessions of a run of an agent, with whose drops the connector
+-- compares those it writes, and the latest period of partial observation of
+-- a host, which it extends: both are read per host on every write of an
+-- agent that dropped flows (queueSessions).
+CREATE INDEX agent_sessions_run ON shawk.agent_sessions (host_id, counters_started);
+CREATE INDEX partial_observations_host ON shawk.partial_observations (host_id, period_end);
