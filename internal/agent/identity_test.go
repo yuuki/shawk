@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"log/slog"
 	"maps"
+	"path"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -13,14 +15,55 @@ import (
 	"github.com/yuuki/shawk/internal/procinfo"
 )
 
+// fakeProcs is the /proc of the tests: the executable, the command name and
+// the cgroup of each PID, from functions that return "" for none. A nil comm
+// reads the base name of the executable, and a nil cgroup reads none.
+type fakeProcs struct {
+	exe, comm, cgroup func(pid uint32) string
+	// opened counts the processes opened.
+	opened atomic.Int32
+}
+
+// fakeProcsOf makes r read its processes from the fakeProcs it returns.
+func fakeProcsOf(r *identities) *fakeProcs {
+	f := &fakeProcs{}
+	r.open = func(pid uint32) (procDir, bool) {
+		f.opened.Add(1)
+		return fakeProc{f, pid}, true
+	}
+	return f
+}
+
+type fakeProc struct {
+	f   *fakeProcs
+	pid uint32
+}
+
+func (p fakeProc) Exe() string { return p.f.exe(p.pid) }
+
+func (p fakeProc) Comm() (string, bool) {
+	if p.f.comm == nil {
+		return path.Base(p.Exe()), true
+	}
+	return p.f.comm(p.pid), true
+}
+
+func (p fakeProc) Cgroup() (string, bool) {
+	if p.f.cgroup == nil {
+		return "", true
+	}
+	return p.f.cgroup(p.pid), true
+}
+
+func (fakeProc) Close() error { return nil }
+
 func TestIdentities(t *testing.T) {
 	now := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
 	exes := map[uint32]string{100: "/usr/bin/ruby", 200: "/usr/sbin/nginx"}
 	envs := map[uint32]map[string]string{100: {"OTEL_SERVICE_NAME": "billing"}}
-	reads := 0
 	r := newIdentities(procinfo.FallbackExe, 15*time.Minute, nil)
-	r.exe = func(pid uint32) string { reads++; return exes[pid] }
-	r.comm = func(uint32) string { return "" }
+	procs := fakeProcsOf(r)
+	procs.exe = func(pid uint32) string { return exes[pid] }
 	stuck := map[uint32]bool{}
 	r.env = func(pid uint32) (map[string]string, bool) { return envs[pid], !stuck[pid] }
 
@@ -31,8 +74,8 @@ func TestIdentities(t *testing.T) {
 		t.Errorf("resolve = %+v, want %+v", got, want)
 	}
 	r.resolve(100, "ruby", flowCgroup{}, "billing.service", nil, now)
-	if reads != 1 {
-		t.Errorf("/proc read %d times in an interval", reads)
+	if n := procs.opened.Load(); n != 1 {
+		t.Errorf("/proc read %d times in an interval", n)
 	}
 	if got := r.resolve(200, "nginx", flowCgroup{}, "nginx.service", nil, now); got.Service != "nginx" || got.Exe != "/usr/sbin/nginx" {
 		t.Errorf("resolve nginx = %+v", got)
@@ -83,8 +126,7 @@ func TestPrefetchBudget(t *testing.T) {
 	r.budget = 300 * time.Millisecond
 	block := make(chan struct{})
 	t.Cleanup(func() { close(block) })
-	r.exe = func(pid uint32) string { return "/usr/bin/app" }
-	r.comm = func(uint32) string { return "" }
+	fakeProcsOf(r).exe = func(pid uint32) string { return "/usr/bin/app" }
 	r.env = func(pid uint32) (map[string]string, bool) {
 		if pid >= 1000 {
 			<-block // a process stuck for longer than the budget
@@ -93,7 +135,7 @@ func TestPrefetchBudget(t *testing.T) {
 	}
 	// An earlier interval left an identity for one of the stuck ones.
 	r.beginInterval()
-	r.byPID[1000] = procRead{exe: "/usr/bin/app", env: map[string]string{"OTEL_SERVICE_NAME": "known"}, complete: true}
+	r.byPID[1000] = procRead{exe: "/usr/bin/app", comm: "app", env: map[string]string{"OTEL_SERVICE_NAME": "known"}, complete: true}
 	r.resolve(1000, "app", flowCgroup{}, "known.service", nil, now)
 
 	r.beginInterval()
@@ -124,8 +166,9 @@ func TestPrefetchBudget(t *testing.T) {
 func TestReusedPID(t *testing.T) {
 	now := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
 	r := newIdentities(procinfo.FallbackExe, 15*time.Minute, nil)
-	r.exe = func(uint32) string { return "/usr/bin/python3" }
-	r.comm = func(uint32) string { return "python3" }
+	procs := fakeProcsOf(r)
+	procs.exe = func(uint32) string { return "/usr/bin/python3" }
+	procs.comm = func(uint32) string { return "python3" }
 	r.env = func(uint32) (map[string]string, bool) { return map[string]string{"OTEL_SERVICE_NAME": "billing"}, true }
 	r.beginInterval()
 	if got := r.resolve(100, "python3", flowCgroup{}, "billing.service", nil, now); got.Service != "billing" {
@@ -143,8 +186,9 @@ func TestReusedPID(t *testing.T) {
 func TestSystemdChild(t *testing.T) {
 	now := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
 	r := newIdentities(procinfo.FallbackExe, 15*time.Minute, nil)
-	r.exe = func(uint32) string { return "/usr/sbin/cron" }
-	r.comm = func(uint32) string { return "cron" }
+	procs := fakeProcsOf(r)
+	procs.exe = func(uint32) string { return "/usr/sbin/cron" }
+	procs.comm = func(uint32) string { return "cron" }
 	r.env = func(uint32) (map[string]string, bool) { return nil, true }
 	r.beginInterval()
 	want := otlp.Process{Unit: "cron.service", Comm: "cron", Exe: "/usr/sbin/cron", Service: "cron"}
@@ -152,8 +196,8 @@ func TestSystemdChild(t *testing.T) {
 		t.Errorf("resolve = %+v, want %+v", got, want)
 	}
 	// A name cut at 15 bytes loses its closing parenthesis.
-	r.comm = func(uint32) string { return "systemd-network" }
-	r.exe = func(uint32) string { return "/usr/lib/systemd/systemd-networkd" }
+	procs.comm = func(uint32) string { return "systemd-network" }
+	procs.exe = func(uint32) string { return "/usr/lib/systemd/systemd-networkd" }
 	r.beginInterval()
 	if got := r.resolve(101, "(systemd-netwo", flowCgroup{}, "systemd-networkd.service", nil, now); got.Comm != "systemd-network" ||
 		got.Service != "systemd-networkd" {
@@ -173,8 +217,7 @@ func TestLatestIdentityOfContainers(t *testing.T) {
 	now := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
 	r := newIdentities(procinfo.FallbackExe, 15*time.Minute, nil)
 	exes := map[uint32]string{100: "/usr/bin/node"}
-	r.exe = func(pid uint32) string { return exes[pid] }
-	r.comm = func(uint32) string { return "" }
+	fakeProcsOf(r).exe = func(pid uint32) string { return exes[pid] }
 	r.env = func(uint32) (map[string]string, bool) { return nil, true }
 	a := &procinfo.Container{Runtime: procinfo.RuntimeDocker, ID: "aaaa", Name: "web"}
 	b := &procinfo.Container{Runtime: procinfo.RuntimeDocker, ID: "bbbb", Name: "web"}
@@ -241,9 +284,9 @@ func TestIdentitiesOfSlurmJobs(t *testing.T) {
 	r := newIdentities(procinfo.FallbackExe, 15*time.Minute, nil)
 	exes := map[uint32]string{100: "/home/alice/bin/a.out", 200: "/home/bob/bin/a.out", 300: "/usr/sbin/slurmstepd"}
 	cgroups := map[uint32]string{100: step1.path, 200: step2.path, 300: stepd.path}
-	r.exe = func(pid uint32) string { return exes[pid] }
-	r.comm = func(uint32) string { return "" }
-	r.cgroup = func(pid uint32) string { return cgroups[pid] }
+	procs := fakeProcsOf(r)
+	procs.exe = func(pid uint32) string { return exes[pid] }
+	procs.cgroup = func(pid uint32) string { return cgroups[pid] }
 	envReads := map[uint32]int{}
 	r.env = func(pid uint32) (map[string]string, bool) {
 		envReads[pid]++
@@ -317,9 +360,9 @@ func TestIdentitiesOfProcessesInJobs(t *testing.T) {
 	now := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
 	const extern = "/system.slice/slurmstepd.scope/job_1/step_extern/user/task_special"
 	r := newIdentities(procinfo.FallbackExe, 15*time.Minute, nil)
-	r.exe = func(uint32) string { return "/usr/bin/python3" }
-	r.comm = func(uint32) string { return "" }
-	r.cgroup = func(uint32) string { return extern }
+	procs := fakeProcsOf(r)
+	procs.exe = func(uint32) string { return "/usr/bin/python3" }
+	procs.cgroup = func(uint32) string { return extern }
 	envReads := 0
 	r.env = func(uint32) (map[string]string, bool) {
 		envReads++
@@ -337,11 +380,11 @@ func TestIdentitiesOfProcessesInJobs(t *testing.T) {
 	if envReads != 0 || len(r.latest) != 0 {
 		t.Errorf("%d environments read, identities kept: %v", envReads, r.latest)
 	}
-	// A process whose cgroup cannot be read is taken as it is.
-	r.cgroup = func(uint32) string { return "" }
+	// A process whose cgroup is not in the hierarchy is taken as it is.
+	procs.cgroup = func(uint32) string { return "" }
 	r.beginInterval()
 	if got := r.resolve(300, "python3", sshd, "sshd.service", nil, now); got.Service != "slurmctld" {
-		t.Errorf("resolve of a process whose cgroup is not read = %+v", got)
+		t.Errorf("resolve of a process outside the hierarchy = %+v", got)
 	}
 }
 
@@ -352,14 +395,14 @@ func TestCgroupChangedWhileReading(t *testing.T) {
 	now := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
 	nginx := flowCgroup{11, "/system.slice/nginx.service"}
 	r := newIdentities(procinfo.FallbackExe, 15*time.Minute, nil)
-	r.exe = func(uint32) string { return "/usr/sbin/nginx" }
-	r.comm = func(uint32) string { return "" }
-	r.cgroup = func(uint32) string { return nginx.path }
+	procs := fakeProcsOf(r)
+	procs.exe = func(uint32) string { return "/usr/sbin/nginx" }
+	procs.cgroup = func(uint32) string { return nginx.path }
 	r.env = func(uint32) (map[string]string, bool) { return nil, true }
 	r.beginInterval()
 	want := r.resolve(100, "nginx", nginx, "nginx.service", nil, now)
 	reads := 0
-	r.cgroup = func(uint32) string {
+	procs.cgroup = func(uint32) string {
 		reads++
 		if reads == 1 {
 			return nginx.path
@@ -373,13 +416,89 @@ func TestCgroupChangedWhileReading(t *testing.T) {
 	}
 }
 
+// exitingProc is a process that exits after reads reads of its files: the
+// reads after fail, as through an open /proc/PID, except those of the
+// command name and the cgroup of a zombie, which the kernel keeps until the
+// process is reaped.
+type exitingProc struct {
+	exe, comm, cgroup string
+	reads             int
+	zombie            bool
+}
+
+func (p *exitingProc) read(s string, zombie bool) (string, bool) {
+	if p.reads == 0 && !zombie {
+		return "", false
+	}
+	p.reads = max(p.reads-1, 0)
+	return s, true
+}
+
+func (p *exitingProc) Exe() string            { s, _ := p.read(p.exe, false); return s }
+func (p *exitingProc) Comm() (string, bool)   { return p.read(p.comm, p.zombie) }
+func (p *exitingProc) Cgroup() (string, bool) { return p.read(p.cgroup, p.zombie) }
+func (*exitingProc) Close() error             { return nil }
+
+// What is read of a process that exits while it is read, whose PID another
+// process may take, does not name the flow, nor replace its latest identity
+// (#259): the executable is used only with the command name read with it,
+// and the environment only if the process was still there after it was
+// read.
+func TestProcessExitedWhileRead(t *testing.T) {
+	now := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
+	billing := flowCgroup{11, "/system.slice/billing.service"}
+	k := newIdentityKey("billing.service", "ruby", billing.id)
+	want := otlp.Process{Unit: "billing.service", Comm: "ruby", Exe: "/usr/bin/ruby", Service: "billing"}
+	for _, tc := range []struct {
+		name string
+		proc exitingProc
+		env  map[string]string
+	}{
+		// The PID was taken by another process, which exited after its
+		// executable was read.
+		{"after the executable", exitingProc{exe: "/usr/bin/other", comm: "ruby", cgroup: billing.path, reads: 1}, nil},
+		// The process exited while its environment was read, and another
+		// process of the unit took the PID.
+		{"while the environment is read", exitingProc{exe: "/usr/bin/ruby", comm: "ruby", cgroup: billing.path, reads: 3},
+			map[string]string{"OTEL_SERVICE_NAME": "other"}},
+		// The process exited while its environment was read, which a
+		// zombie does not have.
+		{"as a zombie", exitingProc{exe: "/usr/bin/ruby", comm: "ruby", cgroup: billing.path, reads: 3, zombie: true}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newIdentities(procinfo.FallbackExe, 15*time.Minute, nil)
+			r.latest[k] = latestIdentity{proc: want, at: now}
+			r.open = func(uint32) (procDir, bool) { p := tc.proc; return &p, true }
+			r.env = func(uint32) (map[string]string, bool) { return tc.env, true }
+			r.beginInterval()
+			if got := r.resolve(100, "ruby", billing, "billing.service", nil, now); got != want {
+				t.Errorf("resolve = %+v, want %+v", got, want)
+			}
+			if got := r.latest[k].proc; got != want {
+				t.Errorf("latest identity = %+v, want %+v", got, want)
+			}
+		})
+	}
+
+	// A process that took the PID and has no command name is not that of
+	// the flow either.
+	r := newIdentities(procinfo.FallbackExe, 15*time.Minute, nil)
+	procs := fakeProcsOf(r)
+	procs.exe = func(uint32) string { return "/usr/bin/other" }
+	procs.comm = func(uint32) string { return "" }
+	r.env = func(uint32) (map[string]string, bool) { return nil, true }
+	r.beginInterval()
+	if got := r.resolve(100, "ruby", billing, "billing.service", nil, now); got.Exe != "" || got.Service != "ruby" || len(r.latest) != 0 {
+		t.Errorf("resolve of a process without a command name = %+v, latest identities %v", got, r.latest)
+	}
+}
+
 // A PID asked for with and without its environment, e.g. a process that
 // pam_slurm_adopt moved into a job with sockets opened before, is read
 // with it.
 func TestPrefetchEnvironment(t *testing.T) {
 	r := newIdentities(procinfo.FallbackExe, 15*time.Minute, nil)
-	r.exe = func(uint32) string { return "/usr/sbin/sshd" }
-	r.comm = func(uint32) string { return "sshd" }
+	fakeProcsOf(r).exe = func(uint32) string { return "/usr/sbin/sshd" }
 	reads := 0
 	r.env = func(uint32) (map[string]string, bool) {
 		reads++
@@ -425,13 +544,14 @@ func TestIdentitiesUsers(t *testing.T) {
 	}
 	newResolver := func(users func(uint32) (uint32, uint64, bool)) *identities {
 		r := newIdentities(procinfo.FallbackExe, 15*time.Minute, users)
-		r.exe = func(pid uint32) string { return exes[pid] }
-		r.comm = func(pid uint32) string { return comms[pid] }
+		procs := fakeProcsOf(r)
+		procs.exe = func(pid uint32) string { return exes[pid] }
+		procs.comm = func(pid uint32) string { return comms[pid] }
 		r.env = func(uint32) (map[string]string, bool) { return nil, true }
 		// The path of the cgroup is not read, so that the user id is
 		// checked alone: a process may take the PID after the path was
 		// read and before the user id.
-		r.cgroup = func(uint32) string { return "" }
+		procs.cgroup = func(uint32) string { return "" }
 		return r
 	}
 

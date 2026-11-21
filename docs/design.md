@@ -747,14 +747,18 @@ have them, so they add no series.
   its flow takes the identity and the comm of the service. A process that exits before it is read
   takes the latest identity seen for the same unit and comm, and for the
   processes of Slurm jobs, whose units every job of every user shares, the
-  same cgroup (step) too. The agent reads `/proc/PID/cgroup` with the
-  executable. What `/proc` tells of a PID now in another cgroup than the
-  flow, one of them a job's, is not used: the PID was reused by another
-  job, or `pam_slurm_adopt` moved the process; nor is a read during which
-  the cgroup changed. A flow whose cgroup path is not known (its event was
-  dropped) learns it from its process if the process is still in that
-  cgroup (same inode); otherwise a process now in a job is not taken for
-  it.
+  same cgroup (step) too. The agent reads the executable, the comm and
+  `/proc/PID/cgroup` through one open `/proc/PID`, which fails once that
+  process exits, so that they are of one process: the executable is used
+  only with the comm read with it, and a process that exits while it is
+  read is taken as one that exited before. What `/proc` tells of a PID now
+  in another cgroup than the flow, one of them a job's, is not used: the
+  PID was reused by another job, or `pam_slurm_adopt` moved the process;
+  nor is an environment during whose read the process exited, executed
+  another executable or changed cgroup. A flow whose cgroup path is not
+  known (its event was dropped) learns it from its process if the process
+  is still in that cgroup (same inode); otherwise a process now in a job is
+  not taken for it.
 - Users, opt-in. With `-job-users`, a process of a Slurm job (a unit
   `slurm/...`) carries its user as `process.user.id`: the effective uid of
   `/proc/PID/status`, read with the executable in the interval. It is read
