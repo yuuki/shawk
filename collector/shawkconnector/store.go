@@ -687,7 +687,8 @@ const configLock = 0x73686179 // "shay"
 // and the rules of ports in one transaction, keeping the rows that stay, so
 // that the views see either the old rows or the new ones. It runs in READ
 // COMMITTED, whatever the default of the database, so that the statements
-// after the lock see what a connector that held it before wrote.
+// after the locks see what a connector that held them before wrote. As the
+// other writes, it takes the lock of migrations shared first.
 func (s *pgStore) syncConfig(ctx context.Context, cidrs []namedPrefix, ts []translation, ports *portRules) error {
 	prefixes := make([]string, 0, len(cidrs))
 	cidrNames := make([]string, 0, len(cidrs))
@@ -719,6 +720,9 @@ func (s *pgStore) syncConfig(ctx context.Context, cidrs []namedPrefix, ts []tran
 		dto = append(dto, int32(r.to))
 	}
 	return pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.ReadCommitted}, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared($1)`, int64(migrationLock)); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, int64(configLock)); err != nil {
 			return err
 		}
@@ -808,6 +812,9 @@ const inventoryLock = 0x73686169 // "shai"
 
 func (s *pgStore) syncInventory(ctx context.Context, inv *inventory, readAt time.Time) error {
 	return pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.ReadCommitted}, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared($1)`, int64(migrationLock)); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, int64(inventoryLock)); err != nil {
 			return err
 		}
@@ -1020,9 +1027,18 @@ ON CONFLICT DO NOTHING`,
 	})
 }
 
+// refreshDependencies refreshes known_dependencies under the lock of
+// migrations, shared, as the writes: shawk.refresh_known_dependencies()
+// does not take it itself. It runs in READ COMMITTED, so that the refresh
+// reads the tables as a migration it waited for left them.
 func (s *pgStore) refreshDependencies(ctx context.Context) (int64, error) {
 	var n int64
-	err := s.pool.QueryRow(ctx, `SELECT shawk.refresh_known_dependencies()`).Scan(&n)
+	err := pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.ReadCommitted}, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared($1)`, int64(migrationLock)); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT shawk.refresh_known_dependencies()`).Scan(&n)
+	})
 	return n, err
 }
 

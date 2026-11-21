@@ -965,8 +965,12 @@ each compares with the one before.
 A connector that does not migrate waits at start until the schema is at
 least its version (`shawk.schema_version()`), warns if it is newer, checks
 the migration history as `shawk-migrate` does, and refuses a schema from
-before the migrations were consolidated (§6). Writes and `shawk.prune()`
-take a shared advisory lock that migrations take exclusively.
+before the migrations were consolidated (§6). Writes, those of the
+configuration and of the inventory included, the refresh of
+`known_dependencies` and `shawk.prune()` take a shared advisory lock that
+migrations take exclusively, before any other lock, so that they wait for
+a migration rather than deadlock with it. A migration that cannot release
+its lock within 5 seconds closes its connection, which releases it.
 
 Rows last seen longer ago than `retention` (3 years) are deleted hourly by
 `shawk.prune()` in short batches, with sessions and partly observed
