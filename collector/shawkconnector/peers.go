@@ -889,18 +889,11 @@ func (r *resolver) serverPeer(host string, id *edgeID, rules chooser, p peer, co
 	k := clientKey{id.peer, id.local, id.port, id.proto}
 	c := rules
 	c.add(r.localClients[k], r.dbClients[k], r.dbAge(now), 0)
-	if p.name = c.best.service; p.name != "" {
+	direct := c.best.service
+	if direct != "" && !r.foldsServerAddr(p, id, now) {
 		// The client connected directly to this address, whatever it does
-		// with a virtual address that also reaches this host. If its live
-		// agent now folds this address itself, the direct edge is stale
-		// from before the configuration changed: keep it folded without
-		// blaming a virtual address.
-		if p.foldedBy != "" {
-			if a, ok := r.agent(p.foldedBy, now); ok && r.foldsPeer(a, p.foldedBy, id.local, true, now) {
-				p.foldedVirtual = netip.Addr{}
-				return p
-			}
-		}
+		// with a virtual address that also reaches this host.
+		p.name = direct
 		return unfolded(p, covers)
 	}
 	if p.name = r.translatedClient(rules, id, now); p.name != "" {
@@ -919,7 +912,25 @@ func (r *resolver) serverPeer(host string, id *edgeID, rules chooser, p peer, co
 		// SNAT keeps its name: the source forwards several clients.
 		return unfolded(p, covers)
 	}
+	if direct != "" {
+		// The live agent of the client folds this address itself, so its
+		// direct client edge is from before its configuration changed: the
+		// translations above come first, and otherwise it names the peer,
+		// which stays folded, without blaming a virtual address.
+		p.name, p.foldedVirtual = direct, netip.Addr{}
+	}
 	return p
+}
+
+// foldsServerAddr tells whether the live agent of the client of a server
+// edge, which folds the peer p of the edge, folds the address of the server
+// itself rather than only a virtual address that reaches it. r.mu is held.
+func (r *resolver) foldsServerAddr(p peer, id *edgeID, now time.Time) bool {
+	if p.foldedBy == "" {
+		return false
+	}
+	a, ok := r.agent(p.foldedBy, now)
+	return ok && r.foldsPeer(a, p.foldedBy, id.local, true, now)
 }
 
 // unfolded returns p with agent, as a peer whose agent folds nothing of

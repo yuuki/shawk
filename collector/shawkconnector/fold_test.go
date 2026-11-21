@@ -443,6 +443,64 @@ func TestFoldAllSwitchedAfterDirectClient(t *testing.T) {
 	}
 }
 
+// TestFoldAllSwitchedThroughVirtual: a client whose agent began to fold the
+// address of a server while its former direct client edge is still known,
+// and that now reaches the server through a static or learned virtual
+// address it keeps exact, is counted by its agent, as without the former
+// edge: the server edge keeps shawk.peer.agent true and logs no warning.
+func TestFoldAllSwitchedThroughVirtual(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		translations map[string]TranslationConfig
+		learned      []tTranslation
+		virtual      string
+	}{
+		{"static", map[string]TranslationConfig{
+			"vip": {Virtual: []string{"10.0.100.1:8080"}, Backends: []string{"198.51.100.10"}},
+		}, nil, "10.0.100.1"},
+		{"learned", nil, []tTranslation{{client: "10.0.2.5", virtual: "10.96.0.10", vport: 8080,
+			backend: "198.51.100.10", bport: 8080}}, "10.96.0.10"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _, sink, now := testConnector(t, func(cfg *Config) {
+				cfg.Translations = tc.translations
+			})
+			logs := observe(c)
+			ts := t0.Add(15 * time.Second)
+			*now = ts
+			if tc.learned != nil {
+				consume(t, c, sink, tAgent{host: "lb-01", addrs: []string{"10.0.2.1"}, time: ts, translations: tc.learned})
+			}
+
+			// The client connected directly while it kept the address of
+			// the server exact.
+			consume(t, c, sink, tAgent{host: "app-01", addrs: []string{"10.0.2.5"}, time: ts, fold: foldNone,
+				edges: []tEdge{{role: "client", proto: "tcp", local: "10.0.2.5", peer: "198.51.100.10",
+					port: 8080, svc: "app", comm: "app", opened: 1}}})
+
+			// It then folds that address, and connects to the virtual
+			// address, which it keeps exact.
+			later := ts.Add(15 * time.Second)
+			*now = later
+			consume(t, c, sink, tAgent{host: "app-01", addrs: []string{"10.0.2.5"}, time: later,
+				fold: foldAll, internal: []string{"10.0.0.0/8"},
+				edges: []tEdge{{role: "client", proto: "tcp", local: "10.0.2.5", peer: tc.virtual,
+					port: 8080, svc: "app", comm: "app", opened: 1}}})
+
+			out := consume(t, c, sink, tAgent{host: "web-01", addrs: []string{"198.51.100.10"}, time: later,
+				edges: []tEdge{{role: "server", proto: "tcp", local: "198.51.100.10", peer: "10.0.2.5",
+					port: 8080, svc: "web", comm: "web", opened: 2}}})
+			if s := find(out, metricConnOpened, "web", "app", roleServer, ""); len(s) != 1 || !s[0].agent {
+				t.Errorf("server series = %+v, want peer app with agent=true",
+					find(out, metricConnOpened, "web", "*", roleServer, ""))
+			}
+			if got := foldWarnings(logs); len(got) != 0 {
+				t.Errorf("unexpected fold warnings = %q", got)
+			}
+		})
+	}
+}
+
 // TestFoldedCIDRsWarning: an agent that folds the peers in a range of
 // peer_cidrs makes them ~external; the connector warns once an hour per
 // configuration of the agents, and not about a range of a whole network,
