@@ -1709,6 +1709,15 @@ shows a failure ratio of 100%. With `networks`, a table gives the
 connections and bytes of the selected services by the networks of the
 client and the server.
 
+The dependency details dashboard selects services from Prometheus, and its
+table of `dependencies_between()` names each side as Prometheus does
+(§5.3): `slurm-job` for a process of a Slurm job (unit `slurm/*`), which
+the table shows under its own name and unit, and `peer_class()` for a side
+without a service. `~other` can fold any service, with an agent or not, and
+matches every side. A selection without values, as over a time range that
+Prometheus no longer holds while PostgreSQL does (`retention`), matches
+every side too.
+
 PostgreSQL alerts use the time series format, with every row at `now()` so
 each series has a value at the last time; a query that finds nothing
 returns No Data, which the rules treat as Normal. New and disappeared
