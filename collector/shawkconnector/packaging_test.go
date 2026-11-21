@@ -243,7 +243,7 @@ var dashboardVars = map[string][]string{
 	"depth":     {"2"},
 	// The impact dashboard.
 	"host":         {"db-01"},
-	"min_coverage": {"100"},
+	"min_coverage": {"1"},
 }
 
 var sqlstringVar = regexp.MustCompile(`\$\{(\w+):sqlstring\}`)
@@ -780,7 +780,7 @@ func TestPGImpactDashboard(t *testing.T) {
 	// run runs a query with the values of vars, or else those of db-01,
 	// and returns its first column.
 	run := func(name string, vars map[string][]string) ([]string, error) {
-		sql := expandVars(expandVars(all[name], vars), map[string][]string{"host": {"db-01"}, "depth": {"3"}, "min_coverage": {"100"}})
+		sql := expandVars(expandVars(all[name], vars), map[string][]string{"host": {"db-01"}, "depth": {"3"}, "min_coverage": {"1"}})
 		rows, err := conn.Query(context.Background(), expandMacros(sql, now.Add(-6*time.Hour), now))
 		if err != nil {
 			return nil, err
@@ -806,18 +806,19 @@ func TestPGImpactDashboard(t *testing.T) {
 	if got, err := run(verdict, map[string][]string{"host": {"app-01' OR 'x' = 'x"}}); err != nil || !slices.Equal(got, []string{"INCONCLUSIVE"}) {
 		t.Errorf("crafted host: verdict = %v, %v; want INCONCLUSIVE", got, err)
 	}
-	for name, vars := range map[string]map[string][]string{
-		"depth":        {"depth": {"3) UNION SELECT 'SAFE' --"}},
-		"min_coverage": {"min_coverage": {"0 + 100"}},
-		"no coverage":  {"min_coverage": {"0"}},
+	// A value that is no number is an error, as is a coverage of a
+	// percentage: the unit is that of the function, from 0 to 1.
+	for name, c := range map[string]struct {
+		query string
+		vars  map[string][]string
+	}{
+		"depth":        {"shawk-impact.json/shawk / Impact/Dependents/A#0", map[string][]string{"depth": {"3) UNION SELECT 'SAFE' --"}}},
+		"min_coverage": {verdict, map[string][]string{"min_coverage": {"0 + 1"}}},
+		"no coverage":  {verdict, map[string][]string{"min_coverage": {"0"}}},
+		"a percentage": {verdict, map[string][]string{"min_coverage": {"99.9"}}},
 	} {
-		for _, q := range []string{verdict, "shawk-impact.json/shawk / Impact/Dependents/A#0"} {
-			if name != "depth" && q != verdict {
-				continue
-			}
-			if got, err := run(q, vars); err == nil {
-				t.Errorf("crafted %s: %s returned %v, want an error", name, q, got)
-			}
+		if got, err := run(c.query, c.vars); err == nil {
+			t.Errorf("crafted %s: %s returned %v, want an error", name, c.query, got)
 		}
 	}
 	// The dependents and the observation of the host.

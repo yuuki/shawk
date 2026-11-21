@@ -2,6 +2,7 @@ package shawkconnector
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"slices"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // The period of the tests of the impact: 90 days, at fixed times, so that
@@ -114,9 +116,26 @@ func TestPGCadence(t *testing.T) {
 		{"since 5 hours", []timeSpan{{until.Add(-5 * time.Hour), until}}, nil, "unknown <nil> <nil> 1"},
 		{"at odd times", at(2, day(3, 0), day(5, 7), day(40, 1), day(41, 13), day(70, 4), day(85, 0)), nil,
 			"irregular <nil> <nil> 6"},
-		// Runs of a month with an hour between them are no monthly job.
+		// Runs of a month with an hour between them are no monthly job, and
+		// 12 hours of idle time do not end what was used for 90 days.
 		{"long runs", []timeSpan{{day(0, 0), day(30, 0)}, {day(30, 1), day(60, 0)}, {day(60, 1), day(89, 12)}}, nil,
+			"continuous <nil> <nil> 3"},
+		// Long runs with pauses of weeks: neither continuous nor a job.
+		{"long runs, weeks apart", []timeSpan{{day(0, 0), day(10, 0)}, {day(30, 0), day(45, 0)}, {day(70, 0), day(89, 12)}}, nil,
 			"irregular <nil> <nil> 3"},
+		// Used all along and idle for the last 2 hours: not gone, as far as
+		// 2 hours tell. A day later it is.
+		{"all along until 2 hours ago", []timeSpan{{impactSince, until.Add(-2 * time.Hour)}}, nil, "continuous <nil> <nil> 1"},
+		{"all along until 23 hours ago", []timeSpan{{impactSince, until.Add(-23 * time.Hour)}}, nil, "continuous <nil> <nil> 1"},
+		{"all along until 25 hours ago", []timeSpan{{impactSince, until.Add(-25 * time.Hour)}}, nil, "dormant <nil> <nil> 1"},
+		{"all along but for two deploys, until 2 hours ago", []timeSpan{{impactSince, day(50, 0)}, {day(50, 2), day(80, 0)},
+			{day(80, 2), until.Add(-2 * time.Hour)}}, nil, "continuous <nil> <nil> 3"},
+		// The first 20 hours of something new, idle for 2 hours: too recent
+		// to tell. Idle for more than a day, it was a one-off.
+		{"for 20 hours until 2 hours ago", []timeSpan{{until.Add(-22 * time.Hour), until.Add(-2 * time.Hour)}}, nil,
+			"unknown <nil> <nil> 1"},
+		{"for 20 hours until 25 hours ago", []timeSpan{{until.Add(-45 * time.Hour), until.Add(-25 * time.Hour)}}, nil,
+			"one-off <nil> <nil> 1"},
 		// The host was not observed for two days: the dependency may have
 		// been active, so the run goes on.
 		{"all along, not observed for two days", []timeSpan{{impactSince, day(40, 0)}, {day(42, 0), until}},
@@ -417,7 +436,7 @@ func (f impactFixture) impact(target string) []string {
 	f.t.Helper()
 	rows, err := f.conn.Query(context.Background(), fmt.Sprintf(`
 SELECT depth || ' ' || coalesce(client_host, '-') || ' ' || client_service || ' ' || coalesce(host(client_addr), '-')
-       || ' -> ' || server_host || ' ' || coalesce(server_service, '-') || ' ' || port || ' ' || observed_by || ' ' || cadence
+       || ' -> ' || server_host || ' ' || coalesce(server_service, '-') || ' ' || port || ' ' || observed_by || ' ' || coalesce(cadence, '-')
 FROM shawk_v1.impact(%s) ORDER BY 1`, fmt.Sprintf(target, ts(impactSince), ts(impactUntil))))
 	if err != nil {
 		f.t.Fatal(err)
@@ -430,12 +449,12 @@ FROM shawk_v1.impact(%s) ORDER BY 1`, fmt.Sprintf(target, ts(impactSince), ts(im
 }
 
 // verdict returns the verdict on a target over the period of the tests:
-// "verdict reasons caveats direct transitive coverage".
+// "verdict reasons caveats direct coverage".
 func (f impactFixture) verdict(target string) string {
 	f.t.Helper()
 	var out string
 	err := f.conn.QueryRow(context.Background(), fmt.Sprintf(`
-SELECT verdict || ' ' || reasons::text || ' ' || caveats::text || ' ' || direct || ' ' || transitive || ' ' || coverage
+SELECT verdict || ' ' || reasons::text || ' ' || caveats::text || ' ' || direct || ' ' || coverage
 FROM shawk_v1.impact_verdict(%s)`, fmt.Sprintf(target, ts(impactSince), ts(impactUntil)))).Scan(&out)
 	if err != nil {
 		f.t.Fatal(err)
@@ -499,7 +518,7 @@ func impactFleet(t *testing.T) impactFixture {
 // the host include its other services.
 func TestPGImpact(t *testing.T) {
 	f := impactFleet(t)
-	checkRows(t, "dependents of db-01", f.impact(`'db-01', %s, %s`), []string{
+	checkRows(t, "dependents of db-01", f.impact(`'db-01', %s, %s, cadence_depth => 3`), []string{
 		"1 app-01 app - -> db-01 postgres 5432 both continuous",
 		"1 app-01 app - -> db-01 redis 6379 both continuous",
 		"1 batch-01 billing - -> db-01 postgres 5432 both monthly",
@@ -508,6 +527,21 @@ func TestPGImpact(t *testing.T) {
 		"3 - ~external 0.0.0.0 -> web-01 web 443 server continuous",
 		"3 report-01 report - -> web-01 web 443 both daily",
 	})
+	// The cadence is that of the dependents of depth 1 unless asked for:
+	// it reads the hours of every dependent.
+	checkRows(t, "dependents of db-01, with the cadence of the first depth", f.impact(`'db-01', %s, %s`), []string{
+		"1 app-01 app - -> db-01 postgres 5432 both continuous",
+		"1 app-01 app - -> db-01 redis 6379 both continuous",
+		"1 batch-01 billing - -> db-01 postgres 5432 both monthly",
+		"1 nas-01 ~unresolved 10.0.9.9 -> db-01 postgres 5432 server one-off",
+		"2 web-01 web - -> app-01 app 8080 both -",
+		"3 - ~external 0.0.0.0 -> web-01 web 443 server -",
+		"3 report-01 report - -> web-01 web 443 both -",
+	})
+	if got := queryStrings(t, f.conn, fmt.Sprintf(`SELECT count(*), count(cadence), count(runs) FROM shawk_v1.impact('db-01', %s, %s, cadence_depth => 0)`,
+		ts(impactSince), ts(impactUntil))); !slices.Equal(got, []string{"7 0 0"}) {
+		t.Errorf("dependents of db-01 without cadences: %v, want 7 0 0", got)
+	}
 	checkRows(t, "dependents of db-01 at depth 1", f.impact(`'db-01', %s, %s, max_depth => 1`), []string{
 		"1 app-01 app - -> db-01 postgres 5432 both continuous",
 		"1 app-01 app - -> db-01 redis 6379 both continuous",
@@ -515,7 +549,7 @@ func TestPGImpact(t *testing.T) {
 		"1 nas-01 ~unresolved 10.0.9.9 -> db-01 postgres 5432 server one-off",
 	})
 	// redis alone: app, and what depends on app.
-	checkRows(t, "dependents of redis on db-01", f.impact(`'db-01', %s, %s, 'redis', max_depth => 2`), []string{
+	checkRows(t, "dependents of redis on db-01", f.impact(`'db-01', %s, %s, 'redis', max_depth => 2, cadence_depth => 2`), []string{
 		"1 app-01 app - -> db-01 redis 6379 both continuous",
 		"2 web-01 web - -> app-01 app 8080 both continuous",
 	})
@@ -548,32 +582,124 @@ func TestPGImpact(t *testing.T) {
 	}
 }
 
+// TestPGImpactDepth: the dependents are followed to max_depth, which is 10
+// at most and 1 at least.
+func TestPGImpactDepth(t *testing.T) {
+	_, conn := migratedDB(t)
+	f := newImpactFixture(t, conn)
+	// c-00 is used by c-01, which is used by c-02, and so on to c-13.
+	for i := range 14 {
+		f.watched(fmt.Sprintf("c-%02d", i), fmt.Sprintf("10.0.3.%d", i))
+	}
+	for i := range 13 {
+		f.both(fmt.Sprintf("c-%02d", i+1), "svc", fmt.Sprintf("10.0.3.%d", i+1), fmt.Sprintf("c-%02d", i), "svc", fmt.Sprintf("10.0.3.%d", i),
+			8080, impactSince, impactUntil)
+	}
+	for depth, want := range map[string]string{"NULL": "3 3", "0": "1 1", "-5": "1 1", "1": "1 1", "7": "7 7", "10": "10 10", "11": "10 10", "100000": "10 10"} {
+		got := queryStrings(t, conn, fmt.Sprintf(`SELECT count(*), max(depth) FROM shawk_v1.impact('c-00', %s, %s, max_depth => %s)`,
+			ts(impactSince), ts(impactUntil), depth))
+		if !slices.Equal(got, []string{want}) {
+			t.Errorf("max_depth %s: rows and depth = %v, want %s", depth, got, want)
+		}
+	}
+}
+
+// TestPGImpactPlans: the dependents are computed without nested loops that
+// compare every dependency with every other one, which took minutes on a
+// fleet of 2000 hosts. The plans of the statements of the functions are
+// read with auto_explain, where the role of the tests may load it.
+func TestPGImpactPlans(t *testing.T) {
+	f := impactFleet(t)
+	ctx := context.Background()
+	if got := queryStrings(t, f.conn, `SELECT array_to_string(proconfig, ' ') FROM pg_proc WHERE oid = 'shawk.dependents'::regproc`); len(got) != 1 ||
+		!strings.Contains(got[0], "enable_nestloop=off") || !strings.Contains(got[0], "jit=off") {
+		t.Errorf("settings of shawk.dependents = %v, want nested loops and the JIT compiler off", got)
+	}
+	if got := queryStrings(t, f.conn, `SELECT array_to_string(proconfig, ' ') FROM pg_proc WHERE oid = 'shawk.dependencies_in'::regproc`); len(got) != 1 ||
+		!strings.Contains(got[0], "enable_nestloop=on") {
+		t.Errorf("settings of shawk.dependencies_in = %v, want nested loops on", got)
+	}
+	cfg := f.conn.Config().Copy()
+	var plans []string
+	cfg.OnNotice = func(_ *pgconn.PgConn, n *pgconn.Notice) {
+		if i := strings.Index(n.Message, "{"); i >= 0 && strings.Contains(n.Message, "plan:") {
+			plans = append(plans, n.Message[i:])
+		}
+	}
+	conn, err := pgx.ConnectConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+	if _, err := conn.Exec(ctx, `LOAD 'auto_explain'`); err != nil {
+		t.Skipf("auto_explain cannot be loaded: %v", err)
+	}
+	execAll(t, conn, `SET auto_explain.log_min_duration = 0`, `SET auto_explain.log_nested_statements = on`,
+		`SET auto_explain.log_format = json`, `SET client_min_messages = log`)
+	period := ts(impactSince) + ", " + ts(impactUntil)
+	execAll(t, conn, `SELECT * FROM shawk_v1.impact('db-01', `+period+`, max_depth => 5)`,
+		`SELECT * FROM shawk_v1.impact_verdict('db-01', `+period+`, 'postgres')`)
+	// The nested loops left are those that have no other plan: the
+	// lookups of one row at a time, which have no condition of their own.
+	var loops func(node map[string]any, text string)
+	walked := 0
+	loops = func(node map[string]any, text string) {
+		walked++
+		if node["Node Type"] == "Nested Loop" && node["Join Filter"] != nil {
+			t.Errorf("a nested loop with the condition %v in the plan of:\n%.300s", node["Join Filter"], text)
+		}
+		children, _ := node["Plans"].([]any)
+		for _, c := range children {
+			if m, ok := c.(map[string]any); ok {
+				loops(m, text)
+			}
+		}
+	}
+	dependents := 0
+	for _, raw := range plans {
+		var p struct {
+			Text string         `json:"Query Text"`
+			Plan map[string]any `json:"Plan"`
+		}
+		if err := json.Unmarshal([]byte(raw), &p); err != nil {
+			t.Fatalf("plan: %v\n%.300s", err, raw)
+		}
+		if strings.Contains(p.Text, "WITH RECURSIVE") && strings.Contains(p.Text, "walk") {
+			dependents++
+			loops(p.Plan, p.Text)
+		}
+	}
+	if dependents != 2 || walked < 100 {
+		t.Errorf("%d plans of shawk.dependents with %d nodes among %d plans, want 2 of them", dependents, walked, len(plans))
+	}
+}
+
 // TestPGImpactVerdict: a target with dependents is UNSAFE; without any, it
 // is SAFE only if an agent observed it over the whole period, everything
 // the target covers, and INCONCLUSIVE otherwise.
 func TestPGImpactVerdict(t *testing.T) {
 	f := impactFleet(t)
 	// Dependents: unsafe, whatever the coverage.
-	if got, want := f.verdict(`'db-01', %s, %s`), "UNSAFE {active_dependents} {} 3 3 1.000000"; got != want {
+	if got, want := f.verdict(`'db-01', %s, %s`), "UNSAFE {active_dependents} {} 3 1.000000"; got != want {
 		t.Errorf("db-01: %s, want %s", got, want)
 	}
-	if got, want := f.verdict(`'db-01', %s, %s, 'redis'`), "UNSAFE {active_dependents} {} 1 3 1.000000"; got != want {
+	if got, want := f.verdict(`'db-01', %s, %s, 'redis'`), "UNSAFE {active_dependents} {} 1 1.000000"; got != want {
 		t.Errorf("redis of db-01: %s, want %s", got, want)
 	}
 	// Observed all along and used by none but itself.
 	f.watched("idle-01", "10.0.1.1")
 	f.edge("idle-01", "cron", "client", "127.0.0.1", "127.0.0.1", 22, impactSince, impactUntil)
 	f.edge("idle-01", "sshd", "server", "127.0.0.1", "127.0.0.1", 22, impactSince, impactUntil)
-	if got, want := f.verdict(`'idle-01', %s, %s`), "SAFE {} {} 0 0 1.000000"; got != want {
+	if got, want := f.verdict(`'idle-01', %s, %s`), "SAFE {} {} 0 1.000000"; got != want {
 		t.Errorf("idle-01: %s, want %s", got, want)
 	}
 	// Its sshd is used by its cron: unsafe to remove alone.
-	if got, want := f.verdict(`'idle-01', %s, %s, 'sshd'`), "UNSAFE {active_dependents} {} 1 0 1.000000"; got != want {
+	if got, want := f.verdict(`'idle-01', %s, %s, 'sshd'`), "UNSAFE {active_dependents} {} 1 1.000000"; got != want {
 		t.Errorf("sshd of idle-01: %s, want %s", got, want)
 	}
 	// A service that connects to itself is no dependent of its own.
 	f.exec(`UPDATE shawk.processes SET service_name = 'sshd' WHERE host_id = 'idle-01' AND service_name = 'cron'`)
-	if got, want := f.verdict(`'idle-01', %s, %s, 'sshd'`), "SAFE {} {} 0 0 1.000000"; got != want {
+	if got, want := f.verdict(`'idle-01', %s, %s, 'sshd'`), "SAFE {} {} 0 1.000000"; got != want {
 		t.Errorf("sshd of idle-01, used by itself: %s, want %s", got, want)
 	}
 
@@ -587,161 +713,161 @@ func TestPGImpactVerdict(t *testing.T) {
 			f.host(h, "10.0.2.1")
 			f.observed(h, impactSince.Add(-time.Hour), day(30, 0))
 			f.observed(h, day(30, 2), impactUntil)
-		}, "", "INCONCLUSIVE {not_observed} {} 0 0 0.999097"},
+		}, "", "INCONCLUSIVE {not_observed} {} 0 0.999097"},
 		// Three minutes after a heartbeat are the delay of writes.
 		{"a gap within the tolerance", func(h string) {
 			f.host(h, "10.0.2.2")
 			f.observed(h, impactSince.Add(-time.Hour), day(30, 0))
 			f.observed(h, day(30, 0).Add(3*time.Minute), impactUntil)
-		}, "", "SAFE {} {} 0 0 1.000000"},
+		}, "", "SAFE {} {} 0 1.000000"},
 		// Ten seconds beyond the tolerance are a gap, however small it is
 		// in 90 days.
 		{"a gap of ten seconds", func(h string) {
 			f.host(h, "10.0.2.20")
 			f.observed(h, impactSince.Add(-time.Hour), day(30, 0))
 			f.observed(h, day(30, 0).Add(3*time.Minute+10*time.Second), impactUntil)
-		}, "", "INCONCLUSIVE {not_observed} {} 0 0 0.999998"},
+		}, "", "INCONCLUSIVE {not_observed} {} 0 0.999998"},
 		// The coverage is compared as it is, not as it is reported.
 		{"a gap of ten seconds, of a caller that accepts a little more", func(h string) {
 			f.host(h, "10.0.2.25")
 			f.observed(h, impactSince.Add(-time.Hour), day(30, 0))
 			f.observed(h, day(30, 0).Add(3*time.Minute+10*time.Second), impactUntil)
-		}, ", min_coverage => 0.999999", "INCONCLUSIVE {not_observed} {} 0 0 0.999998"},
+		}, ", min_coverage => 0.999999", "INCONCLUSIVE {not_observed} {} 0 0.999998"},
 		{"a gap that a longer tolerance covers", func(h string) {
 			f.host(h, "10.0.2.26")
 			f.observed(h, impactSince.Add(-time.Hour), day(30, 0))
 			f.observed(h, day(30, 0).Add(10*time.Minute), impactUntil)
-		}, ", tolerance => '15 minutes'", "SAFE {} {} 0 0 1.000000"},
+		}, ", tolerance => '15 minutes'", "SAFE {} {} 0 1.000000"},
 		// A clock an hour behind: the session started half an hour into the
 		// period, and what it saw in its last hour is dated before.
 		{"a clock behind", func(h string) {
 			f.host(h, "10.0.2.27")
 			f.observed(h, impactSince.Add(-30*time.Minute), impactUntil)
 			f.exec(`UPDATE shawk.agent_sessions SET clock_skew = '1 hour' WHERE host_id = $1`, h)
-		}, "", "INCONCLUSIVE {not_observed} {} 0 0 0.999328"},
+		}, "", "INCONCLUSIVE {not_observed} {} 0 0.999328"},
 		// A clock an hour ahead: the session started half an hour before
 		// the period, and the connector does not write times after its own.
 		{"a clock ahead", func(h string) {
 			f.host(h, "10.0.2.28")
 			f.observed(h, impactSince.Add(30*time.Minute), impactUntil)
 			f.exec(`UPDATE shawk.agent_sessions SET clock_skew = '-1 hour' WHERE host_id = $1`, h)
-		}, "", "SAFE {} {} 0 0 1.000000"},
+		}, "", "SAFE {} {} 0 1.000000"},
 		{"a gap that the caller accepts", func(h string) {
 			f.host(h, "10.0.2.3")
 			f.observed(h, impactSince.Add(-time.Hour), day(30, 0))
 			f.observed(h, day(30, 2), impactUntil)
-		}, ", min_coverage => 0.999", "SAFE {} {not_observed} 0 0 0.999097"},
+		}, ", min_coverage => 0.999", "SAFE {} {not_observed} 0 0.999097"},
 		{"a period longer than the history", func(h string) {
 			f.host(h, "10.0.2.4")
 			f.observed(h, day(45, 0), impactUntil)
-		}, "", "INCONCLUSIVE {not_observed} {} 0 0 0.500000"},
+		}, "", "INCONCLUSIVE {not_observed} {} 0 0.500000"},
 		{"an agent that stopped before the period", func(h string) {
 			f.host(h, "10.0.2.5")
 			f.observed(h, impactSince.Add(-48*time.Hour), impactSince.Add(-24*time.Hour))
-		}, "", "INCONCLUSIVE {not_observed} {} 0 0 0.000000"},
+		}, "", "INCONCLUSIVE {not_observed} {} 0 0.000000"},
 		{"an agent that stopped before the period, and a caller that accepts gaps", func(h string) {
 			f.host(h, "10.0.2.6")
-		}, ", min_coverage => 0.000001", "INCONCLUSIVE {not_observed} {} 0 0 0.000000"},
+		}, ", min_coverage => 0.000001", "INCONCLUSIVE {not_observed} {} 0 0.000000"},
 		{"dropped flows", func(h string) {
 			f.watched(h, "10.0.2.7")
 			f.exec(`INSERT INTO shawk.partial_observations VALUES ($1, $2, $3, $4, 7)`, h, impactSince.Add(-time.Hour), day(5, 0), day(5, 9))
-		}, "", "INCONCLUSIVE {dropped_flows} {} 0 0 0.995833"},
+		}, "", "INCONCLUSIVE {dropped_flows} {} 0 0.995833"},
 		{"UDP not traced for a day", func(h string) {
 			f.host(h, "10.0.2.8")
 			f.observed(h, impactSince.Add(-time.Hour), day(89, 0))
 			f.session(h, day(89, 0), impactUntil, "false", "true", "'all'")
-		}, "", "INCONCLUSIVE {udp_not_traced} {} 0 0 0.988888"},
+		}, "", "INCONCLUSIVE {udp_not_traced} {} 0 0.988888"},
 		// Dropped from an hour before the period to two hours into it.
 		{"dropped flows over the start of the period", func(h string) {
 			f.watched(h, "10.0.2.29")
 			f.exec(`INSERT INTO shawk.partial_observations VALUES ($1, $2, $3, $4, 7)`, h, impactSince.Add(-time.Hour),
 				impactSince.Add(-time.Hour), impactSince.Add(2*time.Hour))
-		}, "", "INCONCLUSIVE {dropped_flows} {} 0 0 0.999074"},
+		}, "", "INCONCLUSIVE {dropped_flows} {} 0 0.999074"},
 		{"UDP not traced, of a target of UDP", func(h string) {
 			f.host(h, "10.0.2.30")
 			f.session(h, impactSince, impactUntil, "false", "true", "'all'")
-		}, ", target_proto => 'udp'", "INCONCLUSIVE {udp_not_traced} {} 0 0 0.000000"},
+		}, ", target_proto => 'udp'", "INCONCLUSIVE {udp_not_traced} {} 0 0.000000"},
 		{"UDP not traced, of a target of TCP", func(h string) {
 			f.host(h, "10.0.2.9")
 			f.session(h, impactSince, impactUntil, "false", "true", "'all'")
-		}, ", target_proto => 'tcp'", "SAFE {} {} 0 0 1.000000"},
+		}, ", target_proto => 'tcp'", "SAFE {} {} 0 1.000000"},
 		{"one network namespace", func(h string) {
 			f.host(h, "10.0.2.10")
 			f.session(h, impactSince, impactUntil, "true", "true", "'4026531840'")
-		}, "", "INCONCLUSIVE {netns_limited} {} 0 0 0.000000"},
+		}, "", "INCONCLUSIVE {netns_limited} {} 0 0.000000"},
 		// The clients of a service over Unix sockets are on its host: they
 		// matter to a service, not to the host.
 		{"Unix sockets not traced, of a host", func(h string) {
 			f.host(h, "10.0.2.11")
 			f.session(h, impactSince, impactUntil, "true", "NULL", "'all'")
-		}, "", "SAFE {} {} 0 0 1.000000"},
+		}, "", "SAFE {} {} 0 1.000000"},
 		{"Unix sockets not traced, of a service", func(h string) {
 			f.host(h, "10.0.2.12")
 			f.listens(h, "postgres", 5432)
 			f.session(h, impactSince, impactUntil, "true", "NULL", "'all'")
-		}, ", 'postgres'", "INCONCLUSIVE {unix_not_traced} {} 0 0 0.000000"},
+		}, ", 'postgres'", "INCONCLUSIVE {unix_not_traced} {} 0 0.000000"},
 		{"Unix sockets not traced, of a port", func(h string) {
 			f.host(h, "10.0.2.13")
 			f.listens(h, "postgres", 5432)
 			f.session(h, impactSince, impactUntil, "true", "false", "'all'")
-		}, ", target_port => 5432", "SAFE {} {} 0 0 1.000000"},
+		}, ", target_port => 5432", "SAFE {} {} 0 1.000000"},
 		// A service that the host does not run, or a name mistyped: nothing
 		// used it, which tells nothing.
 		{"a service the host does not have", func(h string) {
 			f.watched(h, "10.0.2.17")
 			f.listens(h, "postgres", 5432)
-		}, ", 'postgress'", "INCONCLUSIVE {unknown_service} {} 0 0 1.000000"},
+		}, ", 'postgress'", "INCONCLUSIVE {unknown_service} {} 0 1.000000"},
 		{"a service the host had before the period", func(h string) {
 			f.watched(h, "10.0.2.18")
 			f.listener(h, "postgres", 5432, impactSince.Add(-20*24*time.Hour), impactSince.Add(-time.Hour))
-		}, ", 'postgres'", "INCONCLUSIVE {unknown_service} {} 0 0 1.000000"},
+		}, ", 'postgres'", "INCONCLUSIVE {unknown_service} {} 0 1.000000"},
 		{"a service that listens and has no client", func(h string) {
 			f.watched(h, "10.0.2.19")
 			f.listens(h, "postgres", 5432)
-		}, ", 'postgres', 5432, 'tcp'", "SAFE {} {} 0 0 1.000000"},
+		}, ", 'postgres', 5432, 'tcp'", "SAFE {} {} 0 1.000000"},
 		{"a port nothing listens on", func(h string) {
 			f.watched(h, "10.0.2.21")
 			f.listens(h, "postgres", 5432)
-		}, ", target_port => 5433", "INCONCLUSIVE {unknown_port} {} 0 0 1.000000"},
+		}, ", target_port => 5433", "INCONCLUSIVE {unknown_port} {} 0 1.000000"},
 		{"a port of another transport", func(h string) {
 			f.watched(h, "10.0.2.22")
 			f.listens(h, "postgres", 5432)
-		}, ", target_port => 5432, target_proto => 'udp'", "INCONCLUSIVE {unknown_port} {} 0 0 1.000000"},
+		}, ", target_port => 5432, target_proto => 'udp'", "INCONCLUSIVE {unknown_port} {} 0 1.000000"},
 		// A port known from the connections it served, those of the
 		// service to itself, of a listener that was not seen.
 		{"a port that served without a listener seen", func(h string) {
 			f.watched(h, "10.0.2.23")
 			f.both(h, "postgres", "127.0.0.1", h, "postgres", "127.0.0.1", 5432, day(1, 0), day(2, 0))
-		}, ", target_port => 5432", "SAFE {} {} 0 0 1.000000"},
+		}, ", target_port => 5432", "SAFE {} {} 0 1.000000"},
 		// A port of another service of the host: no port of the service.
 		{"a service and a port of another service", func(h string) {
 			f.watched(h, "10.0.2.31")
 			f.listens(h, "postgres", 5432)
 			f.listens(h, "app", 8080)
-		}, ", 'app', 5432", "INCONCLUSIVE {unknown_port} {} 0 0 1.000000"},
+		}, ", 'app', 5432", "INCONCLUSIVE {unknown_port} {} 0 1.000000"},
 		// A port whose listener has no known owner may be of the service.
 		{"a service and a port without a known owner", func(h string) {
 			f.watched(h, "10.0.2.32")
 			f.listens(h, "app", 8080)
 			f.exec(`INSERT INTO shawk.listeners (host_id, process_id, proto, addr, port, netns, first_seen, last_seen)
 				VALUES ($1, NULL, 'tcp', '0.0.0.0', 9000, 1, $2, $3)`, h, impactSince, impactUntil)
-		}, ", 'app', 9000", "SAFE {} {} 0 0 1.000000"},
+		}, ", 'app', 9000", "SAFE {} {} 0 1.000000"},
 		{"a service and a port that the host does not have, not observed all along", func(h string) {
 			f.host(h, "10.0.2.24")
 			f.observed(h, day(45, 0), impactUntil)
-		}, ", 'postgres', 5432", "INCONCLUSIVE {not_observed,unknown_service,unknown_port} {} 0 0 0.500000"},
-		{"a name no agent reported under", func(string) {}, "", "INCONCLUSIVE {unknown_host} {} 0 0 0.000000"},
+		}, ", 'postgres', 5432", "INCONCLUSIVE {not_observed,unknown_service,unknown_port} {} 0 0.500000"},
+		{"a name no agent reported under", func(string) {}, "", "INCONCLUSIVE {unknown_host} {} 0 0.000000"},
 		{"a host of the inventory without an agent", func(h string) {
 			f.exec(`INSERT INTO shawk.inventory_hosts (host, agent) VALUES ($1, false)`, h)
 			f.exec(`INSERT INTO shawk.inventory_addrs VALUES ('10.0.2.15', $1)`, h)
-		}, "", "INCONCLUSIVE {no_agent} {} 0 0 0.000000"},
+		}, "", "INCONCLUSIVE {no_agent} {} 0 0.000000"},
 		// A node whose machine id changed at a boot: two hosts of one name.
 		{"two host ids of one name", func(h string) {
 			f.host(h, "10.0.2.16")
 			f.observed(h, impactSince.Add(-time.Hour), day(30, 0))
 			f.exec(`INSERT INTO shawk.hosts VALUES ($1, 'm2', $2, 'k', 'v', $3, $4)`, h+"-b", h, day(30, 0), impactUntil)
 			f.observed(h+"-b", day(30, 0).Add(time.Minute), impactUntil)
-		}, "", "SAFE {} {} 0 0 1.000000"},
+		}, "", "SAFE {} {} 0 1.000000"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			host := "h-" + strings.NewReplacer(" ", "-", ",", "").Replace(c.name)
@@ -755,7 +881,7 @@ func TestPGImpactVerdict(t *testing.T) {
 	// Dependents and a gap: unsafe, and the dependents may not be all.
 	f.exec(`DELETE FROM shawk.agent_sessions WHERE host_id = 'db-01'`)
 	f.observed("db-01", day(1, 0), impactUntil)
-	if got, want := f.verdict(`'db-01', %s, %s`), "UNSAFE {active_dependents} {not_observed} 3 3 0.988888"; got != want {
+	if got, want := f.verdict(`'db-01', %s, %s`), "UNSAFE {active_dependents} {not_observed} 3 0.988888"; got != want {
 		t.Errorf("db-01 with a gap: %s, want %s", got, want)
 	}
 
@@ -813,7 +939,7 @@ func TestPGImpactSeenByClients(t *testing.T) {
 		"1 app-01 app - -> db-01 postgres 5432 client one-off",
 		"1 app-01 probe - -> db-01 - 9999 client one-off",
 	})
-	if got, want := f.verdict(`'db-01', %s, %s`), "UNSAFE {active_dependents} {not_observed} 2 0 0.988912"; got != want {
+	if got, want := f.verdict(`'db-01', %s, %s`), "UNSAFE {active_dependents} {not_observed} 2 0.988912"; got != want {
 		t.Errorf("db-01: %s, want %s", got, want)
 	}
 	checkRows(t, "dependents of postgres on db-01", f.impact(`'db-01', %s, %s, 'postgres'`), []string{
@@ -822,7 +948,7 @@ func TestPGImpactSeenByClients(t *testing.T) {
 	// redis: neither the client of postgres nor the probe of a port
 	// without a listener, but the gap leaves it open.
 	checkRows(t, "dependents of redis on db-01", f.impact(`'db-01', %s, %s, 'redis'`), nil)
-	if got, want := f.verdict(`'db-01', %s, %s, 'redis'`), "INCONCLUSIVE {not_observed} {} 0 0 0.988912"; got != want {
+	if got, want := f.verdict(`'db-01', %s, %s, 'redis'`), "INCONCLUSIVE {not_observed} {} 0 0.988912"; got != want {
 		t.Errorf("redis of db-01: %s, want %s", got, want)
 	}
 	checkRows(t, "dependents of port 9999 of db-01", f.impact(`'db-01', %s, %s, target_port => 9999`), []string{
@@ -836,7 +962,7 @@ func TestPGImpactSeenByClients(t *testing.T) {
 			t.Errorf("dependents of %s on db-01: %v, want the client of port 7777", svc, got)
 		}
 	}
-	if got, want := f.verdict(`'db-01', %s, %s, 'redis', min_coverage => 0.9`), "UNSAFE {active_dependents} {not_observed} 1 0 0.988912"; got != want {
+	if got, want := f.verdict(`'db-01', %s, %s, 'redis', min_coverage => 0.9`), "UNSAFE {active_dependents} {not_observed} 1 0.988912"; got != want {
 		t.Errorf("redis of db-01, with the client of a port without an owner: %s, want %s", got, want)
 	}
 	f.exec(`DELETE FROM shawk.edges WHERE port = 7777`)
@@ -865,7 +991,7 @@ func TestPGImpactSeenByClients(t *testing.T) {
 	// are its dependents, whatever its service, of which nothing is known.
 	f.exec(`INSERT INTO shawk.inventory_hosts (host, agent) VALUES ('sfa-01', false)`)
 	f.exec(`INSERT INTO shawk.inventory_addrs VALUES ('10.0.9.5', 'sfa-01')`)
-	if got, want := f.verdict(`'sfa-01', %s, %s`), "INCONCLUSIVE {no_agent} {} 0 0 0.000000"; got != want {
+	if got, want := f.verdict(`'sfa-01', %s, %s`), "INCONCLUSIVE {no_agent} {} 0 0.000000"; got != want {
 		t.Errorf("sfa-01 without clients: %s, want %s", got, want)
 	}
 	f.edge("app-01", "app", "client", "10.0.0.11", "10.0.9.5", 2049, impactSince, impactUntil)
@@ -874,7 +1000,7 @@ func TestPGImpactSeenByClients(t *testing.T) {
 		checkRows(t, "dependents of "+target, f.impact(target), []string{
 			"1 app-01 app - -> sfa-01 - 2049 client continuous",
 		})
-		if got, want := f.verdict(target), "UNSAFE {active_dependents} {no_agent} 1 0 0.000000"; got != want {
+		if got, want := f.verdict(target), "UNSAFE {active_dependents} {no_agent} 1 0.000000"; got != want {
 			t.Errorf("%s: %s, want %s", target, got, want)
 		}
 	}
@@ -981,7 +1107,7 @@ func TestPGImpactOfAService(t *testing.T) {
 		"1 - ~unresolved 10.0.5.5 -> db-01 postgres 5432 server continuous",
 	})
 	checkRows(t, "dependents of redis on db-01", f.impact(`'db-01', %s, %s, 'redis'`), nil)
-	if got, want := f.verdict(`'db-01', %s, %s, 'redis'`), "SAFE {} {} 0 0 1.000000"; got != want {
+	if got, want := f.verdict(`'db-01', %s, %s, 'redis'`), "SAFE {} {} 0 1.000000"; got != want {
 		t.Errorf("redis of db-01: %s, want %s", got, want)
 	}
 	checkRows(t, "dependents of db-01 over Unix sockets", f.impact(`'db-01', %s, %s, 'postgres', target_proto => 'unix'`), []string{
@@ -1007,7 +1133,7 @@ func TestPGImpactOfAService(t *testing.T) {
 		"1 db-01 worker - -> db-01 ~unknown 0 client continuous",
 	}
 	checkRows(t, "dependents of redis on db-01, with sockets without a listener", f.impact(`'db-01', %s, %s, 'redis'`), unowned)
-	if got, want := f.verdict(`'db-01', %s, %s, 'redis'`), "UNSAFE {active_dependents} {} 2 0 1.000000"; got != want {
+	if got, want := f.verdict(`'db-01', %s, %s, 'redis'`), "UNSAFE {active_dependents} {} 2 1.000000"; got != want {
 		t.Errorf("redis of db-01, with sockets without a listener: %s, want %s", got, want)
 	}
 	// Not for the service of the client itself, nor for the host.
@@ -1097,15 +1223,15 @@ func TestPGImpactOfAPort(t *testing.T) {
 	// The old cluster also connects to itself.
 	f.edge("db-01", "postgresql@14-main/postgres", "client", "10.0.0.10", "10.0.0.10", 5432, impactSince, impactUntil)
 	f.edge("db-01", "postgresql@14-main/postgres", "server", "10.0.0.10", "10.0.0.10", 5432, impactSince, impactUntil)
-	if got, want := f.verdict(`'db-01', %s, %s, target_port => 5432`), "UNSAFE {active_dependents} {} 1 0 1.000000"; got != want {
+	if got, want := f.verdict(`'db-01', %s, %s, target_port => 5432`), "UNSAFE {active_dependents} {} 1 1.000000"; got != want {
 		t.Errorf("port 5432 of db-01: %s, want %s", got, want)
 	}
-	if got, want := f.verdict(`'db-01', %s, %s, target_port => 5433`), "SAFE {} {} 0 0 1.000000"; got != want {
+	if got, want := f.verdict(`'db-01', %s, %s, target_port => 5433`), "SAFE {} {} 0 1.000000"; got != want {
 		t.Errorf("port 5433 of db-01: %s, want %s", got, want)
 	}
 	// The service is both clusters, and the host all of it.
 	for _, target := range []string{`'db-01', %s, %s, 'postgres'`, `'db-01', %s, %s, 'postgres', 5432`, `'db-01', %s, %s`} {
-		if got, want := f.verdict(target), "SAFE {} {} 0 0 1.000000"; got != want {
+		if got, want := f.verdict(target), "SAFE {} {} 0 1.000000"; got != want {
 			t.Errorf("%s: %s, want %s", target, got, want)
 		}
 	}
@@ -1129,7 +1255,7 @@ func TestPGImpactOwnAddress(t *testing.T) {
 	f.both("node-a", "kubelet", "10.244.1.1", "node-a", "web", "10.244.1.7", 8081, impactSince, impactUntil)
 	masqueraded := []string{"1 - ~unresolved 10.244.1.1 -> node-a web 8080 server continuous"}
 	checkRows(t, "dependents of node-a", f.impact(`'node-a', %s, %s`), masqueraded)
-	if got, want := f.verdict(`'node-a', %s, %s`), "UNSAFE {active_dependents} {} 1 0 1.000000"; got != want {
+	if got, want := f.verdict(`'node-a', %s, %s`), "UNSAFE {active_dependents} {} 1 1.000000"; got != want {
 		t.Errorf("node-a: %s, want %s", got, want)
 	}
 	// The same with the translation that its agent learned, whose backend
@@ -1141,13 +1267,13 @@ func TestPGImpactOwnAddress(t *testing.T) {
 	checkRows(t, "dependents of node-a, in the inventory", f.impact(`'node-a', %s, %s`), []string{
 		"1 node-a ~unresolved 10.244.1.1 -> node-a web 8080 server continuous",
 	})
-	if got, want := f.verdict(`'node-a', %s, %s`), "UNSAFE {active_dependents} {} 1 0 1.000000"; got != want {
+	if got, want := f.verdict(`'node-a', %s, %s`), "UNSAFE {active_dependents} {} 1 1.000000"; got != want {
 		t.Errorf("node-a, in the inventory: %s, want %s", got, want)
 	}
 	// Without it, only kubelet and the pod itself are left.
 	f.exec(`DELETE FROM shawk.edges WHERE port = 8080`)
 	f.exec(`DELETE FROM shawk.learned_translations`)
-	if got, want := f.verdict(`'node-a', %s, %s`), "SAFE {} {} 0 0 1.000000"; got != want {
+	if got, want := f.verdict(`'node-a', %s, %s`), "SAFE {} {} 0 1.000000"; got != want {
 		t.Errorf("node-a without the masqueraded connections: %s, want %s", got, want)
 	}
 }
@@ -1183,14 +1309,14 @@ func TestPGImpactOfARelay(t *testing.T) {
 		"1 app-01 app - -> lvs-01 ~relay 5432 both continuous",
 	}
 	checkRows(t, "dependents of lvs-01", f.impact(`'lvs-01', %s, %s`), relayed)
-	if got, want := f.verdict(`'lvs-01', %s, %s`), "UNSAFE {active_dependents} {} 2 0 1.000000"; got != want {
+	if got, want := f.verdict(`'lvs-01', %s, %s`), "UNSAFE {active_dependents} {} 2 1.000000"; got != want {
 		t.Errorf("lvs-01: %s, want %s", got, want)
 	}
 	// Which of its services keeps the translations is not known: they
 	// count for each, and for the port, not for another port.
 	checkRows(t, "dependents of keepalived on lvs-01", f.impact(`'lvs-01', %s, %s, 'keepalived'`), relayed)
 	checkRows(t, "dependents of port 5432 of lvs-01", f.impact(`'lvs-01', %s, %s, target_port => 5432`), relayed)
-	if got, want := f.verdict(`'lvs-01', %s, %s, target_port => 22`), "SAFE {} {} 0 0 1.000000"; got != want {
+	if got, want := f.verdict(`'lvs-01', %s, %s, target_port => 22`), "SAFE {} {} 0 1.000000"; got != want {
 		t.Errorf("port 22 of lvs-01: %s, want %s", got, want)
 	}
 	// The backend keeps its dependents, lvs-01 among them.
@@ -1255,7 +1381,7 @@ func TestPGImpactThroughATranslation(t *testing.T) {
 		"1 - ~unresolved 10.0.7.7 -> lb-01 ~relay 5432 server unknown",
 		"1 app-01 app - -> lb-01 ~relay 5432 client continuous",
 	})
-	if got, want := f.verdict(`'lb-01', %s, %s`), "UNSAFE {active_dependents} {no_agent} 2 0 0.000000"; got != want {
+	if got, want := f.verdict(`'lb-01', %s, %s`), "UNSAFE {active_dependents} {no_agent} 2 0.000000"; got != want {
 		t.Errorf("lb-01: %s, want %s", got, want)
 	}
 	// Two months after db-01 served its last client, nothing depends on it.
@@ -1402,7 +1528,7 @@ func TestPGImpactBeforeTheRetention(t *testing.T) {
 	f.listener("db-01", "postgres", 5432, impactSince.Add(-100*24*time.Hour), impactUntil)
 	// billing used postgres for 2 hours on day 20.
 	f.both("batch-01", "billing", "10.0.0.13", "db-01", "postgres", "10.0.0.10", 5432, day(20, 0), day(20, 2))
-	if got, want := f.verdict(`'db-01', %s, %s`), "UNSAFE {active_dependents} {} 1 0 1.000000"; got != want {
+	if got, want := f.verdict(`'db-01', %s, %s`), "UNSAFE {active_dependents} {} 1 1.000000"; got != want {
 		t.Errorf("db-01 before the prune: %s, want %s", got, want)
 	}
 	// A connector that keeps 30 days prunes.
@@ -1410,10 +1536,10 @@ func TestPGImpactBeforeTheRetention(t *testing.T) {
 	if got := queryStrings(t, conn, `SELECT (SELECT count(*) FROM shawk.edges), (SELECT count(*) FROM shawk.agent_sessions)`); !slices.Equal(got, []string{"0 2"}) {
 		t.Fatalf("edges and sessions left after the prune: %v, want 0 2", got)
 	}
-	if got, want := f.verdict(`'db-01', %s, %s`), "INCONCLUSIVE {before_retention} {} 0 0 0.333333"; got != want {
+	if got, want := f.verdict(`'db-01', %s, %s`), "INCONCLUSIVE {before_retention} {} 0 0.333333"; got != want {
 		t.Errorf("db-01 after the prune: %s, want %s", got, want)
 	}
-	if got, want := f.verdict(`'db-01', %s, %s, 'postgres', 5432`), "INCONCLUSIVE {before_retention} {} 0 0 0.333333"; got != want {
+	if got, want := f.verdict(`'db-01', %s, %s, 'postgres', 5432`), "INCONCLUSIVE {before_retention} {} 0 0.333333"; got != want {
 		t.Errorf("postgres of db-01 after the prune: %s, want %s", got, want)
 	}
 	checkRows(t, "what the verdict on db-01 tells of the period",
@@ -1474,7 +1600,7 @@ func TestPGImpactUnknownOwner(t *testing.T) {
 	// Its port leaves the other sockets out.
 	checkRows(t, "dependents of redis on port 6379 of db-01", f.impact(`'db-01', %s, %s, 'redis', 6379`), []string{accepted})
 	checkRows(t, "dependents of port 6379 of db-01", f.impact(`'db-01', %s, %s, target_port => 6379`), []string{accepted})
-	if got, want := f.verdict(`'db-01', %s, %s, 'redis'`), "UNSAFE {active_dependents} {} 2 0 1.000000"; got != want {
+	if got, want := f.verdict(`'db-01', %s, %s, 'redis'`), "UNSAFE {active_dependents} {} 2 1.000000"; got != want {
 		t.Errorf("redis of db-01: %s, want %s", got, want)
 	}
 	// The host as a whole: its own sockets go with it.

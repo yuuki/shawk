@@ -72,32 +72,32 @@
       },
       {
         "name": "min_coverage",
-        "label": "Coverage for SAFE (%)",
+        "label": "Coverage for SAFE (0 to 1)",
         "type": "custom",
-        "query": "100,99.99,99.9,99",
+        "query": "1,0.9999,0.999,0.99",
         "current": {
-          "text": "100",
-          "value": "100"
+          "text": "1",
+          "value": "1"
         },
         "options": [
           {
-            "text": "100",
-            "value": "100",
+            "text": "1",
+            "value": "1",
             "selected": true
           },
           {
-            "text": "99.99",
-            "value": "99.99",
+            "text": "0.9999",
+            "value": "0.9999",
             "selected": false
           },
           {
-            "text": "99.9",
-            "value": "99.9",
+            "text": "0.999",
+            "value": "0.999",
             "selected": false
           },
           {
-            "text": "99",
-            "value": "99",
+            "text": "0.99",
+            "value": "0.99",
             "selected": false
           }
         ]
@@ -157,7 +157,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT verdict, array_to_string(reasons, ', ') AS reasons, array_to_string(caveats, ', ') AS caveats,\n       direct AS dependents, transitive AS dependents_of_dependents, coverage * 100 AS coverage_percent,\n       unobserved AS not_observed, gaps, partly_observed AS dropped_flows_for\nFROM shawk_v1.impact_verdict(${host:sqlstring}, $__timeFrom(), $__timeTo(),\n       min_coverage => ${min_coverage:sqlstring}::numeric / 100, max_depth => ${depth:sqlstring}::integer)"
+          "rawSql": "SELECT verdict, array_to_string(reasons, ', ') AS reasons, array_to_string(caveats, ', ') AS caveats,\n       direct AS dependents, coverage, unobserved AS not_observed, gaps, partly_observed AS dropped_flows_for\nFROM shawk_v1.impact_verdict(${host:sqlstring}, $__timeFrom(), $__timeTo(),\n       min_coverage => ${min_coverage:sqlstring}::numeric)"
         }
       ],
       "options": {
@@ -168,7 +168,7 @@
         "defaults": {},
         "overrides": []
       },
-      "description": "UNSAFE: the host has dependents in the time range. SAFE: it has none, and its agent observed it for the coverage asked of the time range. INCONCLUSIVE: none was seen, but the host was not watched enough to tell; reasons say what was missing (not_observed, dropped_flows, udp_not_traced, netns_limited; unknown_host or no_agent for a name no agent reported under). caveats are the same shortfalls where they did not decide the verdict. coverage_percent is cut, not rounded: 100 is all of the time range. Only TCP, UDP and Unix stream sockets are observed: a host used over RDMA is not seen to be used. For a service or a port of the host alone, use shawk-impact or shawk_v1.impact_verdict()."
+      "description": "UNSAFE: the host has dependents in the time range, those of depth 1 below. SAFE: it has none, and the history tells so for the coverage asked of the time range. INCONCLUSIVE: none was seen, but the host was not watched enough to tell; reasons say what was missing (not_observed, before_retention for a time range that starts before the retention of the connector, dropped_flows, udp_not_traced, netns_limited; unknown_host or no_agent for a name no agent reported under). caveats are the same shortfalls where they did not decide the verdict. coverage is from 0 to 1, cut, not rounded: 1 is all of the time range. Only TCP, UDP and Unix stream sockets are observed: a host used over RDMA, or that only forwards packets, is not seen to be used. For a service or a port of the host alone, use shawk-impact or shawk_v1.impact_verdict()."
     },
     {
       "id": 2,
@@ -205,7 +205,7 @@
         "defaults": {},
         "overrides": []
       },
-      "description": "The clients of the host (depth 1), and the clients of its dependents after, each at the depth it is first reached. A client without an agent has client_addr, and the host the inventory gives the address. port 0 stands for the ports of a service under the rules of ports. cadence is read from the hours in which the dependency was active: continuous breaks at once; daily, weekly, monthly and periodic at their next run, which next_expected estimates; one-off and dormant stopped in the time range; unknown has too little history, or hours that were not recorded. At most 1000 rows."
+      "description": "The clients of the host (depth 1), and the clients of its dependents after, each at the depth it is first reached. A client without an agent has client_addr, and the host the inventory gives the address. server_service ~relay is a client whose connections the host relays in the kernel, on the virtual port; ~unknown a socket without a known owner. port 0 stands for the ports of a service under the rules of ports. cadence, of the dependents of depth 1, is read from the hours in which the dependency was active: continuous is in use; daily, weekly, monthly and periodic break at their next run, which next_expected estimates; one-off and dormant stopped in the time range; unknown has too little history, or hours that were not recorded. At most 1000 rows."
     },
     {
       "id": 3,
@@ -231,7 +231,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT host, agent, observed * 100 AS observed_percent, unobserved AS not_observed, gaps,\n       partly_observed AS dropped_flows_for, dropped_flows, udp_untraced AS without_udp,\n       unix_untraced AS without_unix_sockets, netns_limited AS one_netns_only\nFROM shawk_v1.coverage($__timeFrom(), $__timeTo(), ARRAY[${host:sqlstring}])"
+          "rawSql": "SELECT host, agent, observed, unobserved AS not_observed, gaps, before_retention,\n       partly_observed AS dropped_flows_for, dropped_flows, udp_untraced AS without_udp,\n       unix_untraced AS without_unix_sockets, netns_limited AS one_netns_only\nFROM shawk_v1.coverage($__timeFrom(), $__timeTo(), ARRAY[${host:sqlstring}])"
         }
       ],
       "options": {
@@ -242,7 +242,7 @@
         "defaults": {},
         "overrides": []
       },
-      "description": "How much of the time range the agent of the host observed, and what it did not trace. agent is false for a name no agent ever reported under: such a host is never SAFE."
+      "description": "How much of the time range the history tells what the host was used for, from 0 to 1, and what its agent did not trace. before_retention is the part of the time range before the retention of the connector, whose dependencies are deleted. agent is false for a name no agent ever reported under: such a host is never SAFE."
     },
     {
       "id": 4,
@@ -268,7 +268,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT gap_start, gap_end, gap_end - gap_start AS duration, cause, node_state, reason\nFROM shawk_v1.unobserved_reasons($__timeFrom(), $__timeTo())\nWHERE host = ${host:sqlstring}\nORDER BY gap_start DESC\nLIMIT 100"
+          "rawSql": "SELECT gap_start, gap_end, gap_end - gap_start AS duration, cause\nFROM shawk_v1.coverage_gaps($__timeFrom(), $__timeTo(), ARRAY[${host:sqlstring}])\nORDER BY gap_start DESC\nLIMIT 100"
         }
       ],
       "options": {
@@ -279,7 +279,7 @@
         "defaults": {},
         "overrides": []
       },
-      "description": "The periods in which the host was not observed, with what explains them: cause is maintenance or power_saving for a planned stop. A planned stop is a gap all the same: nothing watched the host then."
+      "description": "The gaps that the verdict counts: the time before the retention of the connector (cause retention), and the periods in which no agent observed the host (cause agent), with 3 minutes of tolerance for the delay of writes; a restart of the agent within them is no gap. shawk / Fleet tells which gaps were planned stops: a planned stop is a gap all the same."
     }
   ]
 }

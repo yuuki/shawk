@@ -3,10 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
-	"math/big"
 	"slices"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -69,13 +67,18 @@ type report struct {
 	// Observers are the target, first, and the hosts whose agents saw its
 	// dependents.
 	Observers []observer `json:"observers"`
-	// Gaps are the periods in which the target was not observed, the
-	// first maxGaps of them.
+	// Gaps are the periods for which the history does not tell what the
+	// target was used for, the first maxGaps of them.
 	Gaps []gap `json:"target_gaps"`
+	// CadenceDepth is the depth up to which the dependents have a cadence.
+	CadenceDepth int `json:"cadence_depth"`
+	// Incomplete tells what failed after the verdict was read: the lists
+	// after it are missing, or cut short.
+	Incomplete string `json:"incomplete,omitempty"`
 
-	// coverage is Coverage in percent as PostgreSQL writes it, which is
-	// cut rather than rounded: 100 is a target watched all along.
-	// minCoverage is MinCoverage in percent.
+	// coverage is Coverage as PostgreSQL writes it, which is cut rather
+	// than rounded: 1 is a target watched all along. minCoverage is
+	// MinCoverage as it was asked for.
 	coverage, minCoverage string
 }
 
@@ -92,10 +95,10 @@ type dependent struct {
 	FirstSeen     time.Time  `json:"first_seen"`
 	LastSeen      time.Time  `json:"last_seen"`
 	ObservedBy    string     `json:"observed_by"`
-	Cadence       string     `json:"cadence"`
+	Cadence       *string    `json:"cadence"`
 	PeriodSeconds *float64   `json:"period_seconds"`
 	NextExpected  *time.Time `json:"next_expected"`
-	Runs          int        `json:"runs"`
+	Runs          *int       `json:"runs"`
 }
 
 // observer is a row of shawk_v1.coverage.
@@ -111,8 +114,11 @@ type observer struct {
 	UDPUntracedSeconds    float64 `json:"udp_untraced_seconds"`
 	UnixUntracedSeconds   float64 `json:"unix_untraced_seconds"`
 	NetnsLimitedSeconds   float64 `json:"netns_limited_seconds"`
+	// BeforeRetentionSeconds is the part of UnobservedSeconds before the
+	// retention of the connector.
+	BeforeRetentionSeconds float64 `json:"before_retention_seconds"`
 
-	observed string // Observed in percent, cut
+	observed string // Observed as PostgreSQL writes it, cut
 }
 
 // complete tells whether the agent of the host observed over the whole
@@ -122,10 +128,13 @@ func (o *observer) complete() bool {
 		o.UnixUntracedSeconds == 0 && o.NetnsLimitedSeconds == 0
 }
 
-// gap is a period in which the target was not observed.
+// gap is a period for which the history does not tell what the target was
+// used for: before the retention of the connector (cause retention), or
+// while no agent observed it (cause agent).
 type gap struct {
 	Start time.Time `json:"start"`
 	End   time.Time `json:"end"`
+	Cause string    `json:"cause"`
 }
 
 // maxGaps is how many gaps of the target a report lists.
@@ -133,15 +142,37 @@ const maxGaps = 10
 
 // options are what a report is made with.
 type options struct {
-	target      target
-	lookback    time.Duration
-	until       time.Time // the clock of the database if zero
-	depth       int
-	minCoverage string // from 0 to 1, as a decimal
+	target   target
+	lookback time.Duration
+	until    time.Time // the clock of the database if zero
+	depth    int
+	// cadenceDepth is the depth up to which the cadences are read.
+	cadenceDepth int
+	minCoverage  string // from 0 to 1, as a decimal
+	// timeout is how long a statement may take.
+	timeout time.Duration
+}
+
+// coverageColumns are the columns of shawk_v1.coverage that scanObserver
+// reads.
+const coverageColumns = `host, agent, observed::float8, observed::text, extract(epoch FROM unobserved)::float8, gaps,
+       extract(epoch FROM partly_observed)::float8, dropped_flows, extract(epoch FROM udp_untraced)::float8,
+       extract(epoch FROM unix_untraced)::float8, extract(epoch FROM netns_limited)::float8,
+       extract(epoch FROM before_retention)::float8`
+
+func scanObserver(row pgx.CollectableRow) (observer, error) {
+	ob := observer{Role: "client"}
+	err := row.Scan(&ob.Host, &ob.Agent, &ob.Observed, &ob.observed, &ob.UnobservedSeconds, &ob.Gaps,
+		&ob.PartlyObservedSeconds, &ob.DroppedFlows, &ob.UDPUntracedSeconds, &ob.UnixUntracedSeconds, &ob.NetnsLimitedSeconds,
+		&ob.BeforeRetentionSeconds)
+	return ob, err
 }
 
 // build reads the report of a target in one read-only transaction, so that
-// the verdict, the dependents and the coverage are of the same data.
+// the verdict, the dependents and the coverage are of the same data. The
+// verdict and what explains it are read first: when what follows fails,
+// as the dependents of a hub may after the time limit, build returns the
+// report so far with the error.
 func build(ctx context.Context, conn *pgx.Conn, o options) (*report, error) {
 	tx, err := conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
@@ -149,7 +180,18 @@ func build(ctx context.Context, conn *pgx.Conn, o options) (*report, error) {
 	}
 	// Nothing was written: the end of the transaction changes nothing.
 	defer tx.Rollback(context.WithoutCancel(ctx)) //nolint:errcheck // see above
-	r := &report{Target: o.target, Until: o.until, Depth: o.depth}
+	// The time limit of the role (30 seconds for shawk_grafana) is a
+	// default for dashboards: a period of months over a large fleet takes
+	// longer, and -timeout bounds it instead. It is set in the transaction
+	// rather than at the connection, which a pooler may refuse.
+	if o.timeout > 0 {
+		if _, err := tx.Exec(ctx, `SELECT set_config('statement_timeout', $1, true)`,
+			strconv.FormatInt(o.timeout.Milliseconds(), 10)); err != nil {
+			return nil, err
+		}
+	}
+	r := &report{Target: o.target, Until: o.until, Depth: o.depth, CadenceDepth: o.cadenceDepth, minCoverage: o.minCoverage,
+		Reasons: []string{}, Caveats: []string{}, Dependents: []dependent{}, Observers: []observer{}, Gaps: []gap{}}
 	if r.Until.IsZero() {
 		// The period ends at the clock of the database, which the
 		// heartbeats of the agents are compared with: a clock ahead of it
@@ -163,26 +205,54 @@ func build(ctx context.Context, conn *pgx.Conn, o options) (*report, error) {
 	if r.MinCoverage, err = strconv.ParseFloat(o.minCoverage, 64); err != nil {
 		return nil, err
 	}
-	if p, ok := new(big.Rat).SetString(o.minCoverage); ok {
-		r.minCoverage = p.Mul(p, big.NewRat(100, 1)).FloatString(10)
-	}
 	period := []any{r.Since, r.Until}
 	t := o.target.args()
+	var reasons, caveats []string
 	if err := tx.QueryRow(ctx, `
-SELECT verdict, reasons, caveats, direct, transitive, coverage::float8, (coverage * 100)::text
-FROM shawk_v1.impact_verdict($1, $2, $3, $4, $5, $6, $7::numeric, $8)`,
-		t[0], period[0], period[1], t[1], t[2], t[3], o.minCoverage, o.depth).
-		Scan(&r.Verdict, &r.Reasons, &r.Caveats, &r.Direct, &r.Transitive, &r.Coverage, &r.coverage); err != nil {
+SELECT verdict, reasons, caveats, direct, coverage::float8, coverage::text
+FROM shawk_v1.impact_verdict($1, $2, $3, $4, $5, $6, $7::numeric)`,
+		t[0], period[0], period[1], t[1], t[2], t[3], o.minCoverage).
+		Scan(&r.Verdict, &reasons, &caveats, &r.Direct, &r.Coverage, &r.coverage); err != nil {
 		return nil, fmt.Errorf("the verdict: %w", err)
 	}
-	rows, err := tx.Query(ctx, `
+	r.Reasons, r.Caveats = append(r.Reasons, reasons...), append(r.Caveats, caveats...)
+
+	// How the target was observed, which is quick to read.
+	rows, err := tx.Query(ctx, `SELECT `+coverageColumns+` FROM shawk_v1.coverage($1, $2, $3)`, period[0], period[1], []string{o.target.Host})
+	if err != nil {
+		return r, fmt.Errorf("the coverage of the target: %w", err)
+	}
+	if r.Observers, err = pgx.CollectRows(rows, scanObserver); err != nil {
+		return r, fmt.Errorf("the coverage of the target: %w", err)
+	}
+	for i := range r.Observers {
+		r.Observers[i].Role = "target"
+	}
+	rows, err = tx.Query(ctx, `
+SELECT gap_start, gap_end, cause FROM shawk_v1.coverage_gaps($1, $2, $3) ORDER BY gap_start LIMIT $4`,
+		period[0], period[1], []string{o.target.Host}, maxGaps)
+	if err != nil {
+		return r, fmt.Errorf("the gaps: %w", err)
+	}
+	gaps, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (gap, error) {
+		var g gap
+		err := row.Scan(&g.Start, &g.End, &g.Cause)
+		g.Start, g.End = g.Start.UTC(), g.End.UTC()
+		return g, err
+	})
+	if err != nil {
+		return r, fmt.Errorf("the gaps: %w", err)
+	}
+	r.Gaps = append(r.Gaps, gaps...)
+
+	rows, err = tx.Query(ctx, `
 SELECT depth, client_host, client_service, host(client_addr), server_host, server_service, port, proto,
        first_seen, last_seen, observed_by, cadence, extract(epoch FROM period)::float8, next_expected, runs
-FROM shawk_v1.impact($1, $2, $3, $4, $5, $6, $7)`, t[0], period[0], period[1], t[1], t[2], t[3], o.depth)
+FROM shawk_v1.impact($1, $2, $3, $4, $5, $6, $7, $8)`, t[0], period[0], period[1], t[1], t[2], t[3], o.depth, o.cadenceDepth)
 	if err != nil {
-		return nil, fmt.Errorf("the dependents: %w", err)
+		return r, fmt.Errorf("the dependents: %w", err)
 	}
-	r.Dependents, err = pgx.CollectRows(rows, func(row pgx.CollectableRow) (dependent, error) {
+	dependents, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (dependent, error) {
 		var d dependent
 		err := row.Scan(&d.Depth, &d.ClientHost, &d.ClientService, &d.ClientAddr, &d.ServerHost, &d.ServerService, &d.Port,
 			&d.Proto, &d.FirstSeen, &d.LastSeen, &d.ObservedBy, &d.Cadence, &d.PeriodSeconds, &d.NextExpected, &d.Runs)
@@ -194,75 +264,46 @@ FROM shawk_v1.impact($1, $2, $3, $4, $5, $6, $7)`, t[0], period[0], period[1], t
 		return d, err
 	})
 	if err != nil {
-		return nil, fmt.Errorf("the dependents: %w", err)
+		return r, fmt.Errorf("the dependents: %w", err)
 	}
-
-	// The hosts whose agents tell: the target, and the clients with an
-	// agent among its dependents.
-	hosts := []string{o.target.Host}
+	r.Dependents = append(r.Dependents, dependents...)
+	// The dependents of the depths after the first: each client once.
+	type client struct{ host, service, addr string }
+	deeper := map[client]struct{}{}
 	for _, d := range r.Dependents {
-		if d.ClientHost != nil && d.ObservedBy != "server" && !slices.Contains(hosts, *d.ClientHost) {
+		if d.Depth > 1 {
+			c := client{service: d.ClientService}
+			if d.ClientHost != nil {
+				c.host = *d.ClientHost
+			}
+			if d.ClientAddr != nil {
+				c.addr = *d.ClientAddr
+			}
+			deeper[c] = struct{}{}
+		}
+	}
+	r.Transitive = int64(len(deeper))
+
+	// The other hosts whose agents tell: the clients with an agent among
+	// the dependents, by name.
+	var hosts []string
+	for _, d := range r.Dependents {
+		if d.ClientHost != nil && d.ObservedBy != "server" && *d.ClientHost != o.target.Host && !slices.Contains(hosts, *d.ClientHost) {
 			hosts = append(hosts, *d.ClientHost)
 		}
 	}
-	rows, err = tx.Query(ctx, `
-SELECT host, agent, observed::float8, (observed * 100)::text, extract(epoch FROM unobserved)::float8, gaps,
-       extract(epoch FROM partly_observed)::float8, dropped_flows, extract(epoch FROM udp_untraced)::float8,
-       extract(epoch FROM unix_untraced)::float8, extract(epoch FROM netns_limited)::float8
-FROM shawk_v1.coverage($1, $2, $3)`, period[0], period[1], hosts)
+	if len(hosts) == 0 {
+		return r, nil
+	}
+	rows, err = tx.Query(ctx, `SELECT `+coverageColumns+` FROM shawk_v1.coverage($1, $2, $3) ORDER BY host`, period[0], period[1], hosts)
 	if err != nil {
-		return nil, fmt.Errorf("the coverage: %w", err)
+		return r, fmt.Errorf("the coverage of the clients: %w", err)
 	}
-	r.Observers, err = pgx.CollectRows(rows, func(row pgx.CollectableRow) (observer, error) {
-		ob := observer{Role: "client"}
-		err := row.Scan(&ob.Host, &ob.Agent, &ob.Observed, &ob.observed, &ob.UnobservedSeconds, &ob.Gaps,
-			&ob.PartlyObservedSeconds, &ob.DroppedFlows, &ob.UDPUntracedSeconds, &ob.UnixUntracedSeconds, &ob.NetnsLimitedSeconds)
-		if ob.Host == o.target.Host {
-			ob.Role = "target"
-		}
-		return ob, err
-	})
+	clients, err := pgx.CollectRows(rows, scanObserver)
 	if err != nil {
-		return nil, fmt.Errorf("the coverage: %w", err)
+		return r, fmt.Errorf("the coverage of the clients: %w", err)
 	}
-	// The target first, then the hosts by name.
-	slices.SortFunc(r.Observers, func(a, b observer) int {
-		if (a.Role == "target") != (b.Role == "target") {
-			if a.Role == "target" {
-				return -1
-			}
-			return 1
-		}
-		return strings.Compare(a.Host, b.Host)
-	})
-
-	rows, err = tx.Query(ctx, `
-SELECT gap_start, gap_end FROM shawk_v1.unobserved_by_name($1, $2) WHERE host = $3 ORDER BY gap_start LIMIT $4`,
-		period[0], period[1], o.target.Host, maxGaps)
-	if err != nil {
-		return nil, fmt.Errorf("the gaps: %w", err)
-	}
-	r.Gaps, err = pgx.CollectRows(rows, func(row pgx.CollectableRow) (gap, error) {
-		var g gap
-		err := row.Scan(&g.Start, &g.End)
-		g.Start, g.End = g.Start.UTC(), g.End.UTC()
-		return g, err
-	})
-	if err != nil {
-		return nil, fmt.Errorf("the gaps: %w", err)
-	}
-	if r.Reasons == nil {
-		r.Reasons = []string{}
-	}
-	if r.Caveats == nil {
-		r.Caveats = []string{}
-	}
-	if r.Dependents == nil {
-		r.Dependents = []dependent{}
-	}
-	if r.Gaps == nil {
-		r.Gaps = []gap{}
-	}
+	r.Observers = append(r.Observers, clients...)
 	return r, nil
 }
 

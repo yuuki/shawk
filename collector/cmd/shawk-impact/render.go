@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"slices"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -46,7 +47,7 @@ func writeText(w io.Writer, r *report, limit int) error {
 		}
 		b.WriteString("\n")
 	case r.Verdict == verdictSafe:
-		fmt.Fprintf(&b, "         nothing used it in the period, and it was watched for %s%% of it\n", percent(r.coverage))
+		fmt.Fprintf(&b, "         nothing used it in the period, of which the history covers %s (1 is all of it)\n", fraction(r.coverage))
 	default:
 		b.WriteString("         nothing was seen to use it in the period, but it was not watched enough to tell\n")
 	}
@@ -59,7 +60,7 @@ func writeText(w io.Writer, r *report, limit int) error {
 		if r.Verdict == verdictUnsafe {
 			b.WriteString("         The dependents below may not be all:\n")
 		} else {
-			fmt.Fprintf(&b, "         Accepted with a coverage of %s%% at least:\n", percent(r.minCoverage))
+			fmt.Fprintf(&b, "         Accepted with -min-coverage %s:\n", fraction(r.minCoverage))
 		}
 		for _, caveat := range r.Caveats {
 			if s := describeShortfall(r, caveat); s != "" {
@@ -70,11 +71,18 @@ func writeText(w io.Writer, r *report, limit int) error {
 	if len(r.Gaps) > 0 {
 		b.WriteString("\nNot observed\n")
 		for _, g := range r.Gaps {
-			fmt.Fprintf(&b, "  %s to %s (%s)\n", formatTime(g.Start), formatTime(g.End), formatDuration(g.End.Sub(g.Start)))
+			fmt.Fprintf(&b, "  %s to %s (%s)", formatTime(g.Start), formatTime(g.End), formatDuration(g.End.Sub(g.Start)))
+			if g.Cause == "retention" {
+				b.WriteString(", before the retention of the connector")
+			}
+			b.WriteString("\n")
 		}
 		if t := r.targetObserver(); t != nil && t.Gaps > len(r.Gaps) {
 			fmt.Fprintf(&b, "  and %s\n", plural(int64(t.Gaps-len(r.Gaps)), "more gap"))
 		}
+	}
+	if r.Incomplete != "" {
+		fmt.Fprintf(&b, "\nThe rest of the report is missing: %s\n", printable(r.Incomplete))
 	}
 	if _, err := io.WriteString(w, b.String()); err != nil {
 		return err
@@ -98,6 +106,9 @@ func writeText(w io.Writer, r *report, limit int) error {
 		if n := len(r.Dependents) - len(shown); n > 0 {
 			fmt.Fprintf(w, "and %s (-limit 0 shows all)\n", plural(int64(n), "more row"))
 		}
+		if slices.ContainsFunc(shown, func(d dependent) bool { return d.Cadence == nil }) {
+			fmt.Fprintf(w, "The cadence is read to depth %d (-cadence-depth).\n", r.CadenceDepth)
+		}
 	}
 
 	// The target, and the clients whose agents did not observe all along,
@@ -117,13 +128,13 @@ func writeText(w io.Writer, r *report, limit int) error {
 	if len(shown) > 0 {
 		fmt.Fprintf(w, "\nObservation of the hosts that tell\n")
 		tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(tw, "HOST\tROLE\tOBSERVED\tNOT OBSERVED\tGAPS\tPARTLY OBSERVED\tNO UDP\tNO UNIX\tONE NETNS")
+		fmt.Fprintln(tw, "HOST\tROLE\tCOVERAGE\tNOT OBSERVED\tGAPS\tPARTLY OBSERVED\tNO UDP\tNO UNIX\tONE NETNS")
 		for _, ob := range shown {
 			if !ob.Agent {
 				fmt.Fprintf(tw, "%s\t%s\tno agent\t-\t-\t-\t-\t-\t-\n", printable(ob.Host), ob.Role)
 				continue
 			}
-			fmt.Fprintf(tw, "%s\t%s\t%s%%\t%s\t%d\t%s\t%s\t%s\t%s\n", printable(ob.Host), ob.Role, percent(ob.observed),
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\n", printable(ob.Host), ob.Role, fraction(ob.observed),
 				seconds(ob.UnobservedSeconds), ob.Gaps, seconds(ob.PartlyObservedSeconds),
 				seconds(ob.UDPUntracedSeconds), seconds(ob.UnixUntracedSeconds), seconds(ob.NetnsLimitedSeconds))
 		}
@@ -136,9 +147,12 @@ func writeText(w io.Writer, r *report, limit int) error {
 		if complete > 0 {
 			fmt.Fprintf(w, "and %s observed all along\n", plural(int64(complete), "client"))
 		}
+		fmt.Fprint(w, "The coverage is from 0 to 1. A gap of 3m or less is not counted: an agent that\n"+
+			"restarts within it is not seen to.\n")
 	}
-	_, err := fmt.Fprint(w, "\nOnly TCP, UDP and Unix stream sockets are observed: a host used over RDMA, or less\n"+
-		"often than the period, looks unused (docs/design.md, sections 6.3 and 10).\n")
+	_, err := fmt.Fprint(w, "\nOnly TCP, UDP and Unix stream sockets are observed: a host used over RDMA, one that\n"+
+		"only forwards packets, or one used less often than the period, looks unused\n"+
+		"(docs/design.md, sections 6.3 and 10).\n")
 	return err
 }
 
@@ -198,9 +212,16 @@ func describeShortfall(r *report, code string) string {
 		return fmt.Sprintf("no process of %s had the service %s in the period: check the name", printable(r.Target.Host),
 			printable(r.Target.Service))
 	case "unknown_port":
+		if r.Target.Service != "" {
+			return fmt.Sprintf("no socket of %s listened on port %d of %s in the period: check the port", printable(r.Target.Service),
+				r.Target.Port, printable(r.Target.Host))
+		}
 		return fmt.Sprintf("nothing listened on port %d of %s in the period: check the port", r.Target.Port, printable(r.Target.Host))
 	case "not_observed":
-		return fmt.Sprintf("not observed for %s of the period, in %s", seconds(t.UnobservedSeconds), plural(int64(t.Gaps), "gap"))
+		return fmt.Sprintf("not observed by an agent for %s of the period", seconds(t.UnobservedSeconds-t.BeforeRetentionSeconds))
+	case "before_retention":
+		return fmt.Sprintf("the first %s of the period are before the retention of the connector: the dependencies last seen then are deleted",
+			seconds(t.BeforeRetentionSeconds))
 	case "dropped_flows":
 		return fmt.Sprintf("its agent dropped flows for %s (%s): dependencies active then may be missing",
 			seconds(t.PartlyObservedSeconds), plural(t.DroppedFlows, "update"))
@@ -252,16 +273,22 @@ func describePort(d dependent) string {
 // describeCadence is the cadence, with the period of one that has no name
 // of its own.
 func describeCadence(d dependent) string {
-	if d.Cadence == "periodic" && d.PeriodSeconds != nil {
+	switch {
+	case d.Cadence == nil:
+		return "-"
+	case *d.Cadence == "periodic" && d.PeriodSeconds != nil:
 		return "every " + seconds(*d.PeriodSeconds)
 	}
-	return printable(d.Cadence)
+	return printable(*d.Cadence)
 }
 
 // nextActivity tells when a dependent would next use its server, as far as
 // its cadence tells: the time at which removing the server would break it.
 func nextActivity(d dependent, until time.Time) string {
-	switch d.Cadence {
+	if d.Cadence == nil {
+		return "-"
+	}
+	switch *d.Cadence {
 	case "continuous":
 		return "now"
 	case "one-off", "dormant":
@@ -315,9 +342,9 @@ func formatDuration(d time.Duration) string {
 	return strings.Join(parts, "")
 }
 
-// percent trims a percentage as PostgreSQL writes a numeric: 99.980000 is
-// 99.98, and 100.000000 is 100.
-func percent(s string) string {
+// fraction trims a part of the period as PostgreSQL writes a numeric:
+// 0.999800 is 0.9998, and 1.000000 is 1.
+func fraction(s string) string {
 	if strings.Contains(s, ".") {
 		s = strings.TrimRight(strings.TrimRight(s, "0"), ".")
 	}

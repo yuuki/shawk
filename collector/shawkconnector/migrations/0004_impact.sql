@@ -55,17 +55,18 @@ $$;
 -- of one and the start of the next, their interval the time between their
 -- starts. idle is the time observed since the end of the last run, and
 -- duty the part of the time observed since the start of the first run in
--- which the dependency was active. The first rule that holds gives the
+-- which the dependency was active. The dependency has ended when it is
+-- idle for longer than a day and than twice its longest gap: before that,
+-- its next run may still come. The first rule that holds gives the
 -- cadence:
 --
 --   unknown     no run: no hour was recorded;
---   continuous  idle for an hour at most, observed for a day at least
---               since the first run, and a duty of 0.9 at least;
---   unknown     one run, idle for an hour at most: too recent to tell;
---   one-off     one run, shorter than a day, that ended;
---   dormant     one run of a day at least that ended, or several runs and
---               idle for longer than a day and than twice the longest gap;
---   unknown     two runs: one interval tells no period;
+--   continuous  not ended, observed for a day at least since the first
+--               run, and a duty of 0.9 at least;
+--   one-off     ended, after one run shorter than a day;
+--   dormant     ended, after a longer run or several;
+--   unknown     one run or two: too recent to tell, or one interval,
+--               which tells no period;
 --   daily, weekly, monthly, periodic
 --               two thirds of the intervals at least are within 25% of
 --               their median, and the median run lasts half of it at
@@ -76,7 +77,13 @@ $$;
 -- A dependency of the last four cadences has a period, the median
 -- interval, and next_expected, the start of its last run plus the period:
 -- an estimate, not a schedule. runs is the number of runs, and last_active
--- the end of the last one.
+-- the end of the last one. A job whose cycle is longer than the period
+-- asked for has one run in it: one-off, or dormant.
+--
+-- The runs are read in one pass over the stretches in the order they
+-- start, so that the cost grows with the hours of activity, not with
+-- their square: an active stretch belongs to the run of the last stretch
+-- of active or blind time that starts no later than it.
 CREATE FUNCTION shawk.cadence(active tstzmultirange, blind tstzmultirange, until timestamptz)
 RETURNS TABLE (cadence text, period interval, next_expected timestamptz, runs integer, last_active timestamptz)
 LANGUAGE sql STABLE AS $$
@@ -89,11 +96,18 @@ WITH b AS (
   FROM unnest(cadence.blind) AS x
 ),
 run AS (
-  SELECT lower(a.hours) AS s, upper(a.hours) AS e
-  FROM b
-  CROSS JOIN LATERAL unnest(active + b.blind) AS g
-  CROSS JOIN LATERAL (SELECT tstzmultirange(g) * active AS hours) a
-  WHERE NOT isempty(a.hours)
+  SELECT min(q.s) AS s, max(q.e) AS e
+  FROM (
+    SELECT u.s, u.e, u.hours, count(*) FILTER (WHERE NOT u.hours) OVER (ORDER BY u.s, u.hours) AS stretch
+    FROM (
+      SELECT lower(g) AS s, NULL::timestamptz AS e, false AS hours
+      FROM b CROSS JOIN LATERAL unnest(cadence.active + b.blind) AS g
+      UNION ALL
+      SELECT lower(x), upper(x), true FROM unnest(cadence.active) AS x
+    ) u
+  ) q
+  WHERE q.hours
+  GROUP BY q.stretch
 ),
 r AS (
   SELECT run.s, run.e,
@@ -115,29 +129,27 @@ m AS (
          -- start of the first; the time active since then.
          extract(epoch FROM shawk.duration(tstzmultirange(tstzrange(least(stat.last_end, until), until)) - b.blind)) AS idle,
          extract(epoch FROM shawk.duration(tstzmultirange(tstzrange(least(stat.first_start, until), until)) - b.blind)) AS observed,
-         extract(epoch FROM shawk.duration(active * tstzmultirange(tstzrange(least(stat.first_start, until), until)))) AS on_time,
+         extract(epoch FROM shawk.duration(cadence.active * tstzmultirange(tstzrange(least(stat.first_start, until), until)))) AS on_time,
          (SELECT 3 * count(*) FILTER (WHERE r.step BETWEEN 0.75 * stat.step AND 1.25 * stat.step) >= 2 * count(*)
           FROM r WHERE r.step IS NOT NULL) AS regular
   FROM stat CROSS JOIN b
 ),
 c AS (
-  SELECT m.*,
+  SELECT e.*,
          CASE
-           WHEN m.n = 0 THEN 'unknown'
-           WHEN m.idle <= 3600 AND m.observed >= 86400 AND m.on_time >= 0.9 * m.observed THEN 'continuous'
-           WHEN m.n = 1 AND m.idle <= 3600 THEN 'unknown'
-           WHEN m.n = 1 AND m.len < 86400 THEN 'one-off'
-           WHEN m.n = 1 THEN 'dormant'
-           WHEN m.idle > greatest(86400, 2 * m.max_gap) THEN 'dormant'
-           WHEN m.n = 2 THEN 'unknown'
-           WHEN m.regular AND 2 * m.median_len <= m.step THEN
-             CASE WHEN m.step BETWEEN 20 * 3600 AND 28 * 3600 THEN 'daily'
-                  WHEN m.step BETWEEN 6 * 86400 AND 8 * 86400 THEN 'weekly'
-                  WHEN m.step BETWEEN 27 * 86400 AND 32 * 86400 THEN 'monthly'
+           WHEN e.n = 0 THEN 'unknown'
+           WHEN NOT e.ended AND e.observed >= 86400 AND e.on_time >= 0.9 * e.observed THEN 'continuous'
+           WHEN e.ended AND e.n = 1 AND e.len < 86400 THEN 'one-off'
+           WHEN e.ended THEN 'dormant'
+           WHEN e.n <= 2 THEN 'unknown'
+           WHEN e.regular AND 2 * e.median_len <= e.step THEN
+             CASE WHEN e.step BETWEEN 20 * 3600 AND 28 * 3600 THEN 'daily'
+                  WHEN e.step BETWEEN 6 * 86400 AND 8 * 86400 THEN 'weekly'
+                  WHEN e.step BETWEEN 27 * 86400 AND 32 * 86400 THEN 'monthly'
                   ELSE 'periodic' END
            ELSE 'irregular'
          END AS cadence
-  FROM m
+  FROM (SELECT m.*, m.idle > greatest(86400, 2 * m.max_gap) AS ended FROM m) e
 )
 SELECT c.cadence,
        CASE WHEN c.cadence IN ('daily', 'weekly', 'monthly', 'periodic')
@@ -280,6 +292,19 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
   ORDER BY o.host, lower(g.gap)
 $$;
 
+-- shawk_v1.dependencies_between() for shawk.dependents(), with the plans it
+-- has on its own: nested loops are on within it, whatever its caller sets.
+CREATE FUNCTION shawk.dependencies_in(since timestamptz, until timestamptz)
+RETURNS TABLE (
+  client_host text, client_service text, client_unit text, client_addr inet,
+  server_host text, server_service text, server_unit text, server_addr inet,
+  port integer, proto text, first_seen timestamptz, last_seen timestamptz,
+  observed_by text, client_observed_until timestamptz, server_observed_until timestamptz,
+  virtual_addr inet, virtual_port integer, translation text, path text)
+LANGUAGE sql STABLE ROWS 100000 SET search_path = pg_catalog, pg_temp SET enable_nestloop = on AS $$
+  SELECT * FROM shawk_v1.dependencies_between(dependencies_in.since, dependencies_in.until)
+$$;
+
 -- The dependencies that make the dependents of a target (shawk_v1.impact),
 -- one row per dependency of the period (shawk_v1.dependencies_between)
 -- that makes its client a dependent, with the depth, and the dependent,
@@ -288,6 +313,14 @@ $$;
 -- impact(). The other columns are those of the dependency, which find its
 -- edges; a client that the target relays (srv_service ~relay) has the
 -- virtual address and port as those of its server.
+--
+-- The function joins the dependencies of the period with each other, and
+-- they are the rows of a function, of which the planner knows nothing: it
+-- would join a few rows it expects in nested loops, which take minutes
+-- over the hundreds of thousands there are. Nested loops are off, so that
+-- the joins hash: the time grows with the dependencies, not their square.
+-- The costs of a plan without nested loops are beyond every threshold of
+-- the JIT compiler, which then takes seconds for nothing: it is off too.
 CREATE FUNCTION shawk.dependents(target_host text, since timestamptz, until timestamptz,
                                  target_service text, target_port integer, target_proto text, max_depth integer)
 RETURNS TABLE (
@@ -297,8 +330,11 @@ RETURNS TABLE (
   client_host text, client_service text, client_unit text, client_addr inet,
   server_host text, server_service text, server_unit text, server_addr inet,
   port integer, virtual_addr inet, virtual_port integer, path text)
-LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $$
+LANGUAGE sql STABLE ROWS 10000 SET search_path = pg_catalog, pg_temp SET enable_nestloop = off SET jit = off AS $$
 WITH RECURSIVE
+-- The depth asked for, from 1 to 10, and whether the whole host is the
+-- target: values, not rows to join, so that the joins below are those of
+-- the dependencies alone.
 arg AS (
   SELECT least(greatest(coalesce(dependents.max_depth, 3), 1), 10) AS max_depth,
          dependents.target_service IS NULL AND dependents.target_port IS NULL AS whole_host
@@ -315,7 +351,7 @@ tb AS (
 ),
 d AS MATERIALIZED (
   SELECT row_number() OVER () AS id, x.*
-  FROM shawk_v1.dependencies_between(dependents.since, dependents.until) x
+  FROM shawk.dependencies_in(dependents.since, dependents.until) x
   WHERE dependents.since < dependents.until
 ),
 -- The periods in which the agents of a name reported addresses, and the
@@ -579,7 +615,7 @@ relay AS (
 -- host that translates addresses is the source of the clients behind it.
 direct AS (
   SELECT r.*
-  FROM r CROSS JOIN arg
+  FROM r
   WHERE r.srv_host = dependents.target_host
     AND (dependents.target_service IS NULL
          OR r.srv_service IN (dependents.target_service, '~unknown')
@@ -592,7 +628,7 @@ direct AS (
     AND (dependents.target_port IS NULL OR r.port = dependents.target_port)
     AND (dependents.target_proto IS NULL OR r.proto = dependents.target_proto)
     AND NOT CASE
-      WHEN arg.whole_host THEN
+      WHEN (SELECT arg.whole_host FROM arg) THEN
         r.client_host IS NOT DISTINCT FROM dependents.target_host
         OR (r.client_host IS NULL AND (r.client_addr << inet '127.0.0.0/8' OR r.client_addr = inet '::1'))
       WHEN dependents.target_service IS NOT NULL THEN
@@ -626,10 +662,9 @@ walk (depth, host, service) AS (
   SELECT w.depth + 1, g.client_host, g.client_service
   FROM walk w
   JOIN g ON g.srv_host = w.host AND g.srv_service = w.service
-  CROSS JOIN arg
-  WHERE w.depth < arg.max_depth
+  WHERE w.depth < (SELECT arg.max_depth FROM arg)
     AND NOT (g.client_host = dependents.target_host
-             AND (arg.whole_host OR g.client_service IS NOT DISTINCT FROM dependents.target_service))
+             AND ((SELECT arg.whole_host FROM arg) OR g.client_service IS NOT DISTINCT FROM dependents.target_service))
 ),
 node AS MATERIALIZED (
   SELECT w.host, w.service, min(w.depth) AS depth FROM walk w GROUP BY w.host, w.service
@@ -642,11 +677,10 @@ hit AS (
   SELECT n.depth + 1, r.*
   FROM node n
   JOIN r ON r.srv_host = n.host AND r.srv_service = n.service
-  CROSS JOIN arg
-  WHERE n.depth < arg.max_depth
+  WHERE n.depth < (SELECT arg.max_depth FROM arg)
     AND NOT (r.client_host IS NOT DISTINCT FROM n.host AND r.client_service IS NOT DISTINCT FROM n.service)
     AND NOT (r.cli_host IS NOT DISTINCT FROM dependents.target_host
-             AND (arg.whole_host OR r.client_service IS NOT DISTINCT FROM dependents.target_service))
+             AND ((SELECT arg.whole_host FROM arg) OR r.client_service IS NOT DISTINCT FROM dependents.target_service))
     AND NOT EXISTS (SELECT FROM node nc
                     WHERE nc.host = r.client_host AND nc.service = r.client_service AND nc.depth <= n.depth)
     AND r.id NOT IN (SELECT x.id FROM direct x)
@@ -728,10 +762,16 @@ $$;
 -- the hours of activity of its edges (shawk.edge_activity), with the time
 -- in which none of the hosts that saw it was observed as blind. The
 -- cadence is unknown when the hours end before the dependency was last
--- seen: activity that a connector did not record.
+-- seen: activity that a connector did not record. They are NULL for the
+-- dependents deeper than cadence_depth, 1 by default: the cadence reads
+-- the hours of every edge of a dependent, which is a fraction of a
+-- millisecond each and minutes for the tens of thousands of dependents
+-- that a hub has at depth 3, where the dependents of depth 1 are those
+-- that decide.
 CREATE FUNCTION shawk_v1.impact(target_host text, since timestamptz, until timestamptz,
                                 target_service text DEFAULT NULL, target_port integer DEFAULT NULL,
-                                target_proto text DEFAULT NULL, max_depth integer DEFAULT 3)
+                                target_proto text DEFAULT NULL, max_depth integer DEFAULT 3,
+                                cadence_depth integer DEFAULT 1)
 RETURNS TABLE (
   depth integer, client_host text, client_service text, client_addr inet,
   server_host text, server_service text, port integer, proto text,
@@ -761,6 +801,7 @@ keys AS (
   SELECT DISTINCT s.gid, s.proto, s.client_host, s.client_service, s.client_unit, s.client_addr,
          s.server_host, s.server_service, s.server_unit, s.server_addr, s.port, s.virtual_addr, s.virtual_port, s.path
   FROM sel s
+  WHERE s.depth <= coalesce(impact.cadence_depth, 1)
 ),
 months AS (
   SELECT k.gid, a.month, a.hours
@@ -820,24 +861,34 @@ active AS (
 obs AS (
   SELECT o.host, o.observed
   FROM shawk.observation(impact.since, impact.until,
-         ARRAY(SELECT g.client_agent FROM grp g UNION SELECT g.server_agent FROM grp g), interval '3 minutes') o
+         ARRAY(SELECT g.client_agent FROM grp g WHERE g.depth <= coalesce(impact.cadence_depth, 1)
+               UNION
+               SELECT g.server_agent FROM grp g WHERE g.depth <= coalesce(impact.cadence_depth, 1)), interval '3 minutes') o
+),
+-- The cadences, of the dependents up to cadence_depth.
+cad AS (
+  SELECT g.gid,
+         CASE WHEN c.last_active < least(g.last_seen, impact.until) - interval '2 minutes' THEN 'unknown' ELSE c.cadence END AS cadence,
+         CASE WHEN c.last_active >= least(g.last_seen, impact.until) - interval '2 minutes' THEN c.period END AS period,
+         CASE WHEN c.last_active >= least(g.last_seen, impact.until) - interval '2 minutes' THEN c.next_expected END AS next_expected,
+         c.runs
+  FROM grp g
+  CROSS JOIN (SELECT shawk.period(impact.since, impact.until) AS period) w
+  LEFT JOIN active a ON a.gid = g.gid
+  LEFT JOIN obs oc ON g.by_client AND oc.host = g.client_agent
+  LEFT JOIN obs os ON g.by_server AND os.host = g.server_agent
+  CROSS JOIN LATERAL shawk.cadence(
+    coalesce(a.hours, '{}') * w.period,
+    w.period - (coalesce(oc.observed, '{}') + coalesce(os.observed, '{}')),
+    impact.until) c
+  WHERE g.depth <= coalesce(impact.cadence_depth, 1)
 )
 SELECT g.depth, g.cli_host, g.cli_service, g.cli_addr, g.srv_host, g.srv_service, g.dep_port, g.proto,
        g.first_seen, g.last_seen,
        CASE WHEN g.by_client AND g.by_server THEN 'both' WHEN g.by_client THEN 'client' ELSE 'server' END,
-       CASE WHEN c.last_active < least(g.last_seen, impact.until) - interval '2 minutes' THEN 'unknown' ELSE c.cadence END,
-       CASE WHEN c.last_active >= least(g.last_seen, impact.until) - interval '2 minutes' THEN c.period END,
-       CASE WHEN c.last_active >= least(g.last_seen, impact.until) - interval '2 minutes' THEN c.next_expected END,
-       c.runs
+       c.cadence, c.period, c.next_expected, c.runs
 FROM grp g
-CROSS JOIN (SELECT shawk.period(impact.since, impact.until) AS period) w
-LEFT JOIN active a ON a.gid = g.gid
-LEFT JOIN obs oc ON g.by_client AND oc.host = g.client_agent
-LEFT JOIN obs os ON g.by_server AND os.host = g.server_agent
-CROSS JOIN LATERAL shawk.cadence(
-  coalesce(a.hours, '{}') * w.period,
-  w.period - (coalesce(oc.observed, '{}') + coalesce(os.observed, '{}')),
-  impact.until) c
+LEFT JOIN cad c ON c.gid = g.gid
 ORDER BY g.depth, g.cli_host, g.cli_service, g.cli_addr, g.srv_host, g.srv_service, g.dep_port, g.proto
 $$;
 
@@ -872,15 +923,16 @@ $$;
 -- for a service without a port: the clients of a Unix socket are on its
 -- host.
 --
--- direct and transitive count the dependents of depth 1 and of the depths
--- after; caveats are the shortfalls of the coverage that did not decide
--- the verdict, with which the dependents listed may not be all. unobserved,
--- gaps and partly_observed are those of coverage() for the target.
+-- direct counts the dependents, those of depth 1 of impact(): the verdict
+-- does not follow them, which impact() does. caveats are the shortfalls of
+-- the coverage that did not decide the verdict, with which the dependents
+-- listed may not be all. unobserved, gaps and partly_observed are those of
+-- coverage() for the target.
 CREATE FUNCTION shawk_v1.impact_verdict(target_host text, since timestamptz, until timestamptz,
                                         target_service text DEFAULT NULL, target_port integer DEFAULT NULL,
                                         target_proto text DEFAULT NULL, min_coverage numeric DEFAULT 1,
-                                        max_depth integer DEFAULT 3, tolerance interval DEFAULT '3 minutes')
-RETURNS TABLE (verdict text, reasons text[], caveats text[], direct bigint, transitive bigint,
+                                        tolerance interval DEFAULT '3 minutes')
+RETURNS TABLE (verdict text, reasons text[], caveats text[], direct bigint,
                coverage numeric, unobserved interval, gaps integer, partly_observed interval)
 LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
 DECLARE
@@ -921,10 +973,8 @@ BEGIN
   END IF;
   period := shawk.period(since, until);
 
-  SELECT count(DISTINCT (i.cli_host, i.cli_service, i.cli_addr)) FILTER (WHERE i.depth = 1),
-         count(DISTINCT (i.cli_host, i.cli_service, i.cli_addr)) FILTER (WHERE i.depth > 1)
-  INTO direct, transitive
-  FROM shawk.dependents(target_host, since, until, target_service, target_port, target_proto, max_depth) i;
+  SELECT count(DISTINCT (i.cli_host, i.cli_service, i.cli_addr)) INTO direct
+  FROM shawk.dependents(target_host, since, until, target_service, target_port, target_proto, 1) i;
 
   SELECT * INTO o FROM shawk.observation(since, until, ARRAY[target_host], tolerance);
   inventoried := EXISTS (SELECT FROM shawk.inventory_hosts h WHERE h.host = target_host);

@@ -28,13 +28,14 @@ the dependencies and the observation periods that shawk keeps in PostgreSQL.
 Usage:
   shawk-impact -host NAME [-service NAME] [-port PORT] [-proto tcp|udp|unix] [flags]
 
-The verdict is SAFE when nothing used the target in the period and an agent
-watched it over the whole period, UNSAFE when it has dependents, and
-INCONCLUSIVE when nothing was seen but the target was not watched enough, or
-is not known: a host, a service or a port that no agent reported.
+The verdict is SAFE when nothing used the target in the period and the history
+tells so for the whole period, UNSAFE when it has dependents, and INCONCLUSIVE
+when nothing was seen but the target was not watched enough, or is not known:
+a host, a service or a port that no agent reported.
 
-Exit status: 0 SAFE, 3 UNSAFE, 4 INCONCLUSIVE; 1 when the command fails and 2
-when the command line is invalid.
+Exit status: 0 SAFE, and nothing else; 3 UNSAFE; 4 INCONCLUSIVE; 1 when the
+command fails, also after it printed a verdict; 2 when the command line is
+invalid, or asks for this help.
 
 Flags:
 `
@@ -62,7 +63,6 @@ type config struct {
 	dsn, dsnFile string
 	asJSON       bool
 	limit        int
-	timeout      time.Duration
 }
 
 var (
@@ -84,22 +84,23 @@ func parse(args []string, stderr io.Writer) (*config, error) {
 	}
 	var (
 		c        config
-		lookback = fs.String("lookback", "90d", "how far back the period goes from its end: a duration in d, w, h, m or s, e.g. 90d or 12w")
+		lookback = fs.String("lookback", "90d", "how far back the period goes from its end, an hour at least: a number of days (90d) or weeks (12w), or hours and minutes (36h, 1h30m; m is minutes)")
 		until    = fs.String("until", "", "end of the period, as 2006-01-02T15:04:05Z (default: now, by the clock of the database)")
-		coverage = fs.String("min-coverage", "100", "part of the period, in percent, that the target must have been watched for a verdict of SAFE")
+		coverage = fs.String("min-coverage", "1", "part of the period, from 0 to 1 as in PostgreSQL, that the history must cover for a verdict of SAFE: 1 is all of it, 0.999 all but 0.1%")
 	)
 	fs.StringVar(&c.target.Host, "host", "", "host to remove, by the host.name of its agent or its name in the inventory")
-	fs.StringVar(&c.target.Service, "service", "", "service of the host to remove alone, as in PostgreSQL ([namespace/]name); the whole host if empty")
-	fs.IntVar(&c.target.Port, "port", 0, "port of the host to remove alone")
-	fs.StringVar(&c.target.Proto, "proto", "", "transport to look at alone: tcp, udp or unix")
+	fs.StringVar(&c.target.Service, "service", "", "service of the host to remove alone, as in PostgreSQL ([namespace/]name); without it, the whole host")
+	fs.IntVar(&c.target.Port, "port", 0, "port of the host to remove alone, from 1 to 65535")
+	fs.StringVar(&c.target.Proto, "proto", "", "transport to look at alone: tcp, udp, or unix with -service")
 	fs.IntVar(&c.depth, "depth", 3, "how far the dependents of dependents are followed, from 1 (the clients of the target only) to 10")
+	fs.IntVar(&c.cadenceDepth, "cadence-depth", 1, "depth up to which the cadence of the dependents is read, from 0 to 10: it takes a fraction of a millisecond per dependent")
 	// The default is not that of the flag, which the usage would print
 	// with its password.
 	fs.StringVar(&c.dsn, "dsn", "", "PostgreSQL connection string of a role that reads shawk_v1 (default $SHAWK_POSTGRES_DSN)")
 	fs.StringVar(&c.dsnFile, "dsn-file", "", "file that holds the connection string")
 	fs.BoolVar(&c.asJSON, "json", false, "write the report as JSON")
 	fs.IntVar(&c.limit, "limit", 50, "dependents to list in the text report; 0 for all")
-	fs.DurationVar(&c.timeout, "timeout", 2*time.Minute, "how long the queries may take; also the statement_timeout of the session")
+	fs.DurationVar(&c.timeout, "timeout", 2*time.Minute, "how long the queries may take; also the statement_timeout of their transaction")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil, err
@@ -109,18 +110,28 @@ func parse(args []string, stderr io.Writer) (*config, error) {
 	if fs.NArg() > 0 {
 		return nil, fmt.Errorf("%w: unexpected argument %q", errUsage, fs.Arg(0))
 	}
+	// A flag given with no value, as by a script whose variable is empty,
+	// would widen the target to the whole host without a word.
+	given := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { given[f.Name] = true })
 	var err error
 	switch {
 	case c.target.Host == "":
 		err = errors.New("-host is required")
-	case c.target.Port < 0 || c.target.Port > 65535:
-		err = errors.New("-port must be from 1 to 65535")
-	case c.target.Proto != "" && c.target.Proto != "tcp" && c.target.Proto != "udp" && c.target.Proto != "unix":
+	case given["service"] && c.target.Service == "":
+		err = errors.New("-service must not be empty: leave it out for the whole host")
+	case given["port"] && (c.target.Port < 1 || c.target.Port > 65535):
+		err = errors.New("-port must be from 1 to 65535: leave it out for every port")
+	case given["proto"] && c.target.Proto != "tcp" && c.target.Proto != "udp" && c.target.Proto != "unix":
 		err = errors.New("-proto must be tcp, udp or unix")
 	case c.target.Proto == "unix" && c.target.Port != 0:
 		err = errors.New("a Unix socket has no port: -proto unix cannot be used with -port")
+	case c.target.Proto == "unix" && c.target.Service == "":
+		err = errors.New("the clients of a Unix socket are on its host: -proto unix needs -service")
 	case c.depth < 1 || c.depth > 10:
 		err = errors.New("-depth must be from 1 to 10")
+	case c.cadenceDepth < 0 || c.cadenceDepth > 10:
+		err = errors.New("-cadence-depth must be from 0 to 10")
 	case c.limit < 0:
 		err = errors.New("-limit must not be negative")
 	case c.timeout <= 0:
@@ -145,8 +156,13 @@ func parse(args []string, stderr io.Writer) (*config, error) {
 
 // maxLookback bounds the period: the retention of the connector is 3 years
 // by default, and a period far longer than what is kept only reads as not
-// observed.
-const maxLookback = 100 * 365 * 24 * time.Hour
+// observed. minLookback is the least that tells anything, an hour of
+// activity being what is recorded: a shorter period is a mistake, as 3m
+// meant as 3 months, and would be SAFE for a host used the hour before.
+const (
+	maxLookback = 100 * 365 * 24 * time.Hour
+	minLookback = time.Hour
+)
 
 // parseLookback parses the length of a period: a duration of Go, or a
 // number of days (d) or weeks (w).
@@ -171,52 +187,74 @@ func parseLookback(s string) (time.Duration, error) {
 			return 0, fmt.Errorf("-lookback: invalid duration %q", s)
 		}
 	}
-	if d < time.Second || d > maxLookback {
-		return 0, fmt.Errorf("-lookback must be from a second to 100 years: %q", s)
+	if d < minLookback || d > maxLookback {
+		return 0, fmt.Errorf("-lookback must be from an hour to 100 years (m is minutes, not months): %q", s)
 	}
 	return d.Truncate(time.Second), nil
 }
 
-// parseCoverage parses a part of the period in percent, above 0 and up to
-// 100, and returns it from 0 to 1 as a decimal: what impact_verdict takes
-// as min_coverage, without the rounding of a float.
+// parseCoverage parses a part of the period, above 0 and up to 1, and
+// returns it as a decimal: what impact_verdict takes as min_coverage,
+// without the rounding of a float. The unit is that of PostgreSQL and of
+// the report, so that no value means two things: a percentage, 99.9, is
+// refused rather than taken for more than the whole period.
 func parseCoverage(s string) (string, error) {
 	p, ok := new(big.Rat).SetString(s)
-	// A ten billionth of a percent is the least that 12 decimals tell from 0.
-	if !ok || strings.ContainsAny(s, "/eE") || p.Cmp(big.NewRat(1, 1e10)) < 0 || p.Cmp(big.NewRat(100, 1)) > 0 {
-		return "", fmt.Errorf("-min-coverage must be a number above 0, up to 100: %q", s)
+	// A trillionth is the least that 12 decimals tell from 0.
+	if !ok || strings.ContainsAny(s, "/eE") || p.Cmp(big.NewRat(1, 1e12)) < 0 || p.Cmp(big.NewRat(1, 1)) > 0 {
+		return "", fmt.Errorf("-min-coverage must be a part of the period above 0, up to 1 (0.999 for 99.9%%): %q", s)
 	}
-	return p.Quo(p, big.NewRat(100, 1)).FloatString(12), nil
+	return p.FloatString(12), nil
 }
 
 // run runs the command and returns its exit status.
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	c, err := parse(args, stderr)
 	switch {
-	case errors.Is(err, flag.ErrHelp):
-		return exitSafe
-	case errors.Is(err, errFlags):
-		// The flag package has already reported the error with the usage.
+	case errors.Is(err, flag.ErrHelp), errors.Is(err, errFlags):
+		// The flag package has already printed the usage, with the error
+		// if any. The help is no verdict: its status is not that of SAFE,
+		// which a script may test for.
 		return exitUsage
 	case err != nil:
 		fmt.Fprintln(stderr, "shawk-impact:", err)
 		return exitUsage
 	}
 	r, err := query(ctx, c)
-	if err != nil {
+	return finish(r, err, c, stdout, stderr)
+}
+
+// finish writes the report that query returned and returns the exit
+// status. A report that an error cut short is written with its verdict,
+// which was read first, and the command fails all the same.
+func finish(r *report, err error, c *config, stdout, stderr io.Writer) int {
+	if r == nil {
 		fmt.Fprintln(stderr, "shawk-impact:", err)
 		return exitError
 	}
+	if err != nil {
+		r.Incomplete = err.Error()
+	}
+	var werr error
 	if c.asJSON {
-		err = writeJSON(stdout, r)
+		werr = writeJSON(stdout, r)
 	} else {
-		err = writeText(stdout, r, c.limit)
+		werr = writeText(stdout, r, c.limit)
+	}
+	if werr != nil {
+		fmt.Fprintln(stderr, "shawk-impact:", werr)
+		return exitError
 	}
 	if err != nil {
 		fmt.Fprintln(stderr, "shawk-impact:", err)
 		return exitError
 	}
-	switch r.Verdict {
+	return exitStatus(r.Verdict, stderr)
+}
+
+// exitStatus is the exit status of a verdict.
+func exitStatus(verdict string, stderr io.Writer) int {
+	switch verdict {
 	case verdictSafe:
 		return exitSafe
 	case verdictUnsafe:
@@ -225,11 +263,12 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return exitInconclusive
 	}
 	// A verdict of a schema newer than this command: not SAFE.
-	fmt.Fprintf(stderr, "shawk-impact: unknown verdict %q\n", r.Verdict)
+	fmt.Fprintf(stderr, "shawk-impact: unknown verdict %q\n", verdict)
 	return exitError
 }
 
-// query connects to PostgreSQL and reads the report.
+// query connects to PostgreSQL and reads the report. It returns the report
+// with an error when the verdict was read and what follows it failed.
 func query(ctx context.Context, c *config) (*report, error) {
 	dsn := c.dsn
 	if dsn == "" {
@@ -254,10 +293,6 @@ func query(ctx context.Context, c *config) (*report, error) {
 		cfg.RuntimeParams = map[string]string{}
 	}
 	cfg.RuntimeParams["application_name"] = "shawk-impact"
-	// The time limit of the role (30 seconds for shawk_grafana) is a
-	// default for dashboards: a period of months over a large fleet takes
-	// longer, and -timeout bounds it instead.
-	cfg.RuntimeParams["statement_timeout"] = strconv.FormatInt(c.timeout.Milliseconds(), 10)
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
 	conn, err := pgx.ConnectConfig(ctx, cfg)
