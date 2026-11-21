@@ -644,24 +644,26 @@ have them, so they add no series.
 - The processes of Slurm jobs (cgroup v2) are named by the structure of
   `system.slice/slurmstepd.scope/<job>/<step>/...`, whatever names the job
   directory (`job_<id>` before Slurm 26.05 or with `CgroupJobIdPaths=yes`,
-  the SLUID otherwise): `user/task_*` (`task_special` too, where
-  `pam_slurm_adopt` puts the processes it adopts) is named after the kind
-  of its step, `slurm/batch`, `slurm/step` (`step_<n>`,
-  `step_<n>+<component>`), `slurm/extern` or `slurm/interactive`, and the
-  directory of slurmstepd in a step (`slurm`; `slurm_processes` in the
-  documentation) and `<scope>/system` are `slurmstepd`, as Slurm's
-  `cgroup/v2` plugin makes them. The scope is `slurmstepd.scope`, or
-  `<node>_slurmstepd.scope` with `--enable-multiple-slurmd`, recognized
-  only under slices from the root (`system.slice`, or the slice of
-  `CgroupSlice`), where users cannot make cgroups; other hierarchies, and
-  cgroup v1, keep the rules above (`internal/procinfo/cgroup.go`).
+  the SLUID otherwise): `user/task_*` and the cgroups under it, containers
+  included (`task_special` too, where `pam_slurm_adopt` puts the processes
+  it adopts), are named after the kind of their step, `slurm/batch`,
+  `slurm/step` (`step_<n>`, `step_<n>+<component>`), `slurm/extern` or
+  `slurm/interactive`, and the directory of slurmstepd in a step (`slurm`;
+  `slurm_processes` in the documentation) and `<scope>/system` are
+  `slurmstepd`, as Slurm's `cgroup/v2` plugin makes them. The scope is
+  `slurmstepd.scope`, or `<node>_slurmstepd.scope` with
+  `--enable-multiple-slurmd`, recognized only under slices from the root
+  (`system.slice`, or the slice of `CgroupSlice`), where users cannot make
+  cgroups; other hierarchies, and cgroup v1, keep the rules above
+  (`internal/procinfo/cgroup.go`).
 - Container names are not trusted blindly. Docker merges image labels into
   container labels, so pod labels are believed only with the container name
   cri-dockerd gives, and Compose labels only with the name Compose gives.
   Only the outermost container of a cgroup, made by a runtime of the host,
   is named from its state: a user with delegated cgroups could otherwise
   create a cgroup named after any container. Host runtimes never create
-  cgroups inside a unit, so a container in a unit is named by id after the
+  cgroups inside a unit, so a container in a unit (a service or a scope,
+  which systemd delegates with `Delegate=yes`) is named by id after the
   unit (`user@1000.service/podman-0123456789ab`). Name parts are limited to
   `[A-Za-z0-9_.-]` and 253 characters, so they cannot add a level to the
   unit or the `job`.
