@@ -112,18 +112,28 @@ func (f *stateFlags) UnmarshalYAML(n *yaml.Node) error {
 	return nil
 }
 
-// decodeStrict decodes a document in YAML or JSON, refusing unknown fields
-// and an empty file: one being written, rather than one without contents,
-// which says so ({} or maintenance: []).
-func decodeStrict(b []byte, doc any) error {
+// decodeStrict decodes one document in YAML or JSON, refusing unknown
+// fields, trailing documents and an empty or null file: one being written,
+// rather than one without contents, which says so ({} or maintenance: []).
+func decodeStrict[T any](b []byte, doc *T) error {
 	dec := yaml.NewDecoder(bytes.NewReader(b))
 	dec.KnownFields(true)
-	if err := dec.Decode(doc); err != nil {
+	var got *T
+	if err := dec.Decode(&got); err != nil {
 		if errors.Is(err, io.EOF) {
 			return errors.New("the file is empty")
 		}
 		return err
 	}
+	// Files concatenated by mistake would leave everything after the first
+	// document unchecked and dropped.
+	if err := dec.Decode(new(any)); !errors.Is(err, io.EOF) {
+		return errors.New("more than one YAML document")
+	}
+	if got == nil {
+		return errors.New("the file is empty")
+	}
+	*doc = *got
 	return nil
 }
 
