@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"net/netip"
 	"os"
@@ -544,9 +545,9 @@ func TestCgroupBurst(t *testing.T) {
 
 // TestSyncUDPListenPorts checks the update of udp_listen_ports after a walk
 // of the sockets (#238): the ports that the walk did not find are deleted,
-// those that udp_direction() learned during the walk stay, and those that
-// found no room during the walk are added once the others are deleted. A
-// full map is no error.
+// except in the namespaces it could not open; those that udp_direction()
+// learned during the walk stay; and those that found no room during the
+// walk are added once the others are deleted. A full map is no error.
 func TestSyncUDPListenPorts(t *testing.T) {
 	requireRoot(t)
 	spec, err := loadBpf()
@@ -554,13 +555,19 @@ func TestSyncUDPListenPorts(t *testing.T) {
 		t.Fatal(err)
 	}
 	ms := spec.Maps[bpfMapUdpListenPorts].Copy()
-	ms.MaxEntries = 3
+	ms.MaxEntries = 4
 	m, err := ebpf.NewMap(ms)
 	if err != nil {
 		skipUnavailable(t, "creating %s: %v", bpfMapUdpListenPorts, err)
 	}
 	defer m.Close()
-	key := func(port uint16) bpfShawkListenKey { return bpfShawkListenKey{Netns: 100, Port: port} }
+	// Ports of namespace 1, and of namespace 2 with an offset of 10000.
+	key := func(p uint16) bpfShawkListenKey {
+		if p >= 10000 {
+			return bpfShawkListenKey{Netns: 2, Port: p - 10000}
+		}
+		return bpfShawkListenKey{Netns: 1, Port: p}
+	}
 	put := func(ports ...uint16) {
 		t.Helper()
 		for _, p := range ports {
@@ -570,57 +577,55 @@ func TestSyncUDPListenPorts(t *testing.T) {
 			}
 		}
 	}
-	found := func(ports ...uint16) map[bpfShawkListenKey]bool {
+	keys := func(ports ...uint16) map[bpfShawkListenKey]bool {
 		out := map[bpfShawkListenKey]bool{}
 		for _, p := range ports {
 			out[key(p)] = true
 		}
 		return out
 	}
-	check := func(want ...uint16) {
+	held := func() []bpfShawkListenKey {
 		t.Helper()
-		keys, err := listenKeys(m)
+		ks, err := listenKeys(m)
 		if err != nil {
 			t.Fatal(err)
 		}
-		got := map[uint16]bool{}
-		for _, k := range keys {
-			got[k.Port] = true
+		return ks
+	}
+	check := func(want ...uint16) {
+		t.Helper()
+		got := map[bpfShawkListenKey]bool{}
+		for _, k := range held() {
+			got[k] = true
 		}
-		if len(got) != len(want) {
-			t.Errorf("ports = %v, want %v", got, want)
-		}
-		for _, p := range want {
-			if !got[p] {
-				t.Errorf("port %d is missing from %v", p, got)
-			}
+		if !maps.Equal(got, keys(want...)) {
+			t.Errorf("ports = %v, want those of %v", got, want)
 		}
 	}
 
-	// The server of 53 closed before the walk; 9999 went away during it.
-	put(443, 53)
-	before, err := listenKeys(m)
-	if err != nil {
-		t.Fatal(err)
-	}
-	before = append(before, key(9999))
-	// During the walk, udp_direction() learns 6000, which fills the map,
-	// and the walk finds 443 and the new server 5000, which does not fit.
+	// The server of 53 closed before the walk, and 9999 during it. The walk
+	// cannot open namespace 2, whose server 10053 stays. During the walk,
+	// udp_direction() learns 6000, which fills the map, and the walk finds
+	// 443 and the new server 5000, which does not fit.
+	put(443, 53, 10053)
+	before := append(held(), key(9999))
 	put(6000)
-	if err := syncUDPListenPorts(m, before, found(443, 5000)); err != nil {
+	if err := syncUDPListenPorts(m, before, keys(443, 5000), map[uint32]bool{2: true}); err != nil {
 		t.Fatal(err)
 	}
-	check(443, 6000, 5000)
+	check(443, 6000, 5000, 10053)
 
 	// More servers than the map holds.
-	before, err = listenKeys(m)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := syncUDPListenPorts(m, before, found(443, 6000, 5000, 7000)); err != nil {
+	if err := syncUDPListenPorts(m, held(), keys(443, 6000, 5000, 7000), map[uint32]bool{2: true}); err != nil {
 		t.Fatalf("with a full map: %v", err)
 	}
-	check(443, 6000, 5000)
+	check(443, 6000, 5000, 10053)
+
+	// Namespace 2 is gone, and no longer listed.
+	if err := syncUDPListenPorts(m, held(), keys(443, 6000, 5000, 7000), nil); err != nil {
+		t.Fatal(err)
+	}
+	check(443, 6000, 5000, 7000)
 }
 
 // TestUDPListenPortsKeptAcrossCollect checks that a walk of the sockets keeps

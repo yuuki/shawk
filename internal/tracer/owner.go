@@ -50,7 +50,8 @@ var beforeSocketWalk func()
 // at any time, so it keeps its ports during the walk: a socket that sends
 // first on the port of a server while the port is missing would be a client
 // for good (#238). Afterwards, the ports that the walk did not find are
-// deleted, and those that udp_direction() learned meanwhile are kept.
+// deleted, except in the namespaces that it could not open, and those that
+// udp_direction() learned meanwhile are kept.
 func (t *Tracer) scanSockets() ([]Listener, []uint64, error) {
 	before, err := listenKeys(t.udpListenPorts)
 	if err != nil {
@@ -62,7 +63,7 @@ func (t *Tracer) scanSockets() ([]Listener, []uint64, error) {
 	if beforeSocketWalk != nil {
 		beforeSocketWalk()
 	}
-	readers, err := t.openAllNetNS()
+	readers, skipped, err := t.openAllNetNS()
 	defer closeAll(readers)
 	if err != nil {
 		return nil, nil, err
@@ -94,7 +95,7 @@ func (t *Tracer) scanSockets() ([]Listener, []uint64, error) {
 			listeners = addListener(listeners, seen, listenerOf(r))
 		}
 	}
-	if err := syncUDPListenPorts(t.udpListenPorts, before, udpPorts); err != nil {
+	if err := syncUDPListenPorts(t.udpListenPorts, before, udpPorts, skipped); err != nil {
 		return nil, nil, err
 	}
 	return listeners, inos, nil
@@ -163,16 +164,18 @@ func clearMap(m *ebpf.Map) error {
 
 // syncUDPListenPorts updates udp_listen_ports after a walk of the sockets.
 // It deletes the ports that the map held before the walk and that the walk
-// did not find, and adds those that the walk found and that the map did not
-// hold before: the walk may have found no room for them while the deleted
-// ones took it. A port that udp_direction() learned during the walk is in
-// neither, and stays.
-func syncUDPListenPorts(m *ebpf.Map, before []bpfShawkListenKey, found map[bpfShawkListenKey]bool) error {
+// did not find, unless the walk skipped their namespace, and adds those that
+// the walk found and that the map did not hold before: the walk may have
+// found no room for them while the deleted ones took it. A port that
+// udp_direction() learned during the walk is in neither, and stays. The
+// ports of a namespace that is gone are deleted by the next walk, which
+// does not list it.
+func syncUDPListenPorts(m *ebpf.Map, before []bpfShawkListenKey, found map[bpfShawkListenKey]bool, skipped map[uint32]bool) error {
 	held := make(map[bpfShawkListenKey]bool, len(before))
 	for i := range before {
 		k := &before[i]
 		held[*k] = true
-		if found[*k] {
+		if found[*k] || skipped[k.Netns] {
 			continue
 		}
 		if err := m.Delete(k); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
@@ -183,7 +186,12 @@ func syncUDPListenPorts(m *ebpf.Map, before []bpfShawkListenKey, found map[bpfSh
 		if held[k] {
 			continue
 		}
-		if err := m.Update(&k, uint8(1), ebpf.UpdateNoExist); err != nil && !errors.Is(err, ebpf.ErrKeyExist) && !errors.Is(err, unix.E2BIG) {
+		err := m.Update(&k, uint8(1), ebpf.UpdateNoExist)
+		if errors.Is(err, unix.E2BIG) {
+			// The map is full, and the walk counted the ports left out.
+			return nil
+		}
+		if err != nil && !errors.Is(err, ebpf.ErrKeyExist) {
 			return err
 		}
 	}

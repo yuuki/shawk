@@ -59,41 +59,47 @@ func listNetNS(only uint32) []netnsRef {
 	return refs
 }
 
-// openAllNetNS opens the socket iterators in every network namespace.
+// openAllNetNS opens the socket iterators in every network namespace, and
+// returns the namespaces it could not open, which may have gone away since
+// they were listed.
 //
 // The iterators walk the namespace of the thread that opens them, which is
 // not always that of the process: a thread may have entered another
 // namespace and stayed there, e.g. the main thread of the process, which Go
 // never terminates. The namespace of the thread is therefore compared, on a
 // thread locked for the walk.
-func (t *Tracer) openAllNetNS() ([]io.ReadCloser, error) {
+func (t *Tracer) openAllNetNS() ([]io.ReadCloser, map[uint32]bool, error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	var (
 		readers []io.ReadCloser
+		skipped map[uint32]bool
 		st      unix.Stat_t
 	)
 	if err := unix.Stat("/proc/thread-self/ns/net", &st); err != nil {
-		return nil, fmt.Errorf("finding the network namespace: %w", err)
+		return nil, nil, fmt.Errorf("finding the network namespace: %w", err)
 	}
 	for _, ns := range listNetNS(t.opts.NetNS) {
 		if ns.inode == uint32(st.Ino) {
 			rcs, err := openIters(t.iterTCP, t.iterUDP)
 			if err != nil {
-				return readers, err
+				return readers, nil, err
 			}
 			readers = append(readers, rcs...)
 			continue
 		}
 		rcs, err := openInNetNS(ns.path, t.iterTCP, t.iterUDP)
 		if err != nil {
-			// The namespace may have gone away since it was listed.
 			t.log.Debug("skipping network namespace", "netns", ns.inode, "error", err)
+			if skipped == nil {
+				skipped = map[uint32]bool{}
+			}
+			skipped[ns.inode] = true
 			continue
 		}
 		readers = append(readers, rcs...)
 	}
-	return readers, nil
+	return readers, skipped, nil
 }
 
 // openIters opens the iterators in the current network namespace.
