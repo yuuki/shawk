@@ -3,8 +3,11 @@ package procinfo
 import (
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 )
 
 func TestUnit(t *testing.T) {
@@ -207,6 +210,68 @@ func TestLearn(t *testing.T) {
 	}
 	if got := r.CgroupPath(43); got != "" {
 		t.Errorf("CgroupPath(43) = %q", got)
+	}
+}
+
+// The hierarchy is walked without the lock that Learn takes, on the
+// goroutine that drains the events of the kernel, so that a long walk does
+// not hold up the events (#260). One walk runs at a time, the lookups of
+// other unknown cgroups wait for it, and the paths learned meanwhile are
+// kept.
+func TestCgroupPathWalk(t *testing.T) {
+	root := t.TempDir()
+	ids := map[string]uint64{}
+	for _, p := range []string{"/system.slice/nginx.service", "/system.slice/sshd.service"} {
+		if err := os.MkdirAll(filepath.Join(root, p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		st, err := os.Stat(filepath.Join(root, p))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids[p] = statIno(t, st)
+	}
+	var walks atomic.Int32
+	walking, release := make(chan struct{}), make(chan struct{})
+	walkCgroups = func(root string) map[uint64]string {
+		if walks.Add(1) == 1 {
+			close(walking)
+		}
+		<-release
+		return walkHierarchy(root)
+	}
+	t.Cleanup(func() { walkCgroups = walkHierarchy })
+	r := &Resolver{root: root, paths: map[uint64]string{}, learned: map[uint64]learnedPath{}}
+
+	var lookups sync.WaitGroup
+	got := make([]string, 2)
+	for i, p := range []string{"/system.slice/nginx.service", "/system.slice/sshd.service"} {
+		lookups.Go(func() { got[i] = r.CgroupPath(ids[p]) })
+		if i == 0 {
+			<-walking
+		}
+	}
+	learned := make(chan struct{})
+	go func() {
+		r.Learn(42, "/system.slice/new.service")
+		close(learned)
+	}()
+	select {
+	case <-learned:
+	case <-time.After(10 * time.Second):
+		t.Error("Learn waits for the walk of the hierarchy")
+	}
+	close(release)
+	lookups.Wait()
+	<-learned
+	if got[0] != "/system.slice/nginx.service" || got[1] != "/system.slice/sshd.service" {
+		t.Errorf("CgroupPath during a walk = %q", got)
+	}
+	if n := walks.Load(); n != 1 {
+		t.Errorf("%d walks of the hierarchy, want 1", n)
+	}
+	if got := r.CgroupPath(42); got != "/system.slice/new.service" {
+		t.Errorf("CgroupPath of a cgroup learned during the walk = %q", got)
 	}
 }
 
