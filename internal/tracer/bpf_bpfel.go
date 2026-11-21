@@ -173,12 +173,6 @@ const (
 	bpfShawkWireProtoWIRE_PROTOS       bpfShawkWireProto = 15
 )
 
-type bpfShawkXlatConn struct {
-	_   structs.HostLayout
-	Key bpfShawkXlatKey
-	Gen uint64
-}
-
 type bpfShawkXlatKey struct {
 	_       structs.HostLayout
 	Client  [16]uint8
@@ -189,14 +183,8 @@ type bpfShawkXlatKey struct {
 	Vport   uint16
 	Bport   uint16
 	Proto   uint8
-	Pad     [7]uint8
-}
-
-type bpfShawkXlatStats struct {
-	_     structs.HostLayout
-	Conns uint64
-	Live  int64
-	Gen   uint64
+	Idx     uint8
+	Pad     [6]uint8
 }
 
 // Names of all BPF objects in the ELF.
@@ -261,9 +249,7 @@ const (
 	bpfVarUnusedCgroupEvent       = "unused_cgroup_event"
 	bpfVarUnusedIterRec           = "unused_iter_rec"
 	bpfVarUnusedWireProto         = "unused_wire_proto"
-	bpfVarUnusedXlatConn          = "unused_xlat_conn"
 	bpfVarUnusedXlatKey           = "unused_xlat_key"
-	bpfVarUnusedXlatStats         = "unused_xlat_stats"
 	bpfVarWalkGen                 = "walk_gen"
 	bpfVarWireTraced              = "wire_traced"
 	bpfVarXlatDrops               = "xlat_drops"
@@ -381,9 +367,7 @@ type bpfVariableSpecs struct {
 	UnusedCgroupEvent *ebpf.VariableSpec `ebpf:"unused_cgroup_event"`
 	UnusedIterRec     *ebpf.VariableSpec `ebpf:"unused_iter_rec"`
 	UnusedWireProto   *ebpf.VariableSpec `ebpf:"unused_wire_proto"`
-	UnusedXlatConn    *ebpf.VariableSpec `ebpf:"unused_xlat_conn"`
 	UnusedXlatKey     *ebpf.VariableSpec `ebpf:"unused_xlat_key"`
-	UnusedXlatStats   *ebpf.VariableSpec `ebpf:"unused_xlat_stats"`
 	WalkGen           *ebpf.VariableSpec `ebpf:"walk_gen"`
 	WireTraced        *ebpf.VariableSpec `ebpf:"wire_traced"`
 	XlatDrops         *ebpf.VariableSpec `ebpf:"xlat_drops"`
@@ -478,9 +462,7 @@ type bpfVariables struct {
 	UnusedCgroupEvent *ebpf.Variable `ebpf:"unused_cgroup_event"`
 	UnusedIterRec     *ebpf.Variable `ebpf:"unused_iter_rec"`
 	UnusedWireProto   *ebpf.Variable `ebpf:"unused_wire_proto"`
-	UnusedXlatConn    *ebpf.Variable `ebpf:"unused_xlat_conn"`
 	UnusedXlatKey     *ebpf.Variable `ebpf:"unused_xlat_key"`
-	UnusedXlatStats   *ebpf.Variable `ebpf:"unused_xlat_stats"`
 	WalkGen           *ebpf.Variable `ebpf:"walk_gen"`
 	WireTraced        *ebpf.Variable `ebpf:"wire_traced"`
 	XlatDrops         *ebpf.Variable `ebpf:"xlat_drops"`

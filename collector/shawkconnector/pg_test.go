@@ -1,13 +1,17 @@
 package shawkconnector
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/url"
 	"os"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -89,6 +93,141 @@ INSERT INTO shawk.schema_migrations (version, name) VALUES (1, '0001_init.sql'),
 	applied, err := Migrate(ctx, conn)
 	if err == nil || !strings.Contains(err.Error(), "drop the schemas shawk and shawk_v1") {
 		t.Errorf("Migrate = %v, %v; want an error that tells to recreate the schema", applied, err)
+	}
+}
+
+// stallingProxy forwards the TCP connections it accepts to addr until a
+// client sends stall, then forwards nothing more that clients send, as a
+// network that drops packets, without closing anything until the test
+// ends. It returns its address.
+func stallingProxy(t *testing.T, addr string, stall []byte) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var conns []net.Conn
+	t.Cleanup(func() {
+		l.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range conns {
+			c.Close()
+		}
+	})
+	forward := func(c, s net.Conn) {
+		var tail []byte
+		buf := make([]byte, 64<<10)
+		for {
+			n, err := c.Read(buf)
+			tail = append(tail[max(0, len(tail)-len(stall)):], buf[:n]...)
+			if bytes.Contains(tail, stall) {
+				// The rest is dropped until the test closes the connection.
+				io.Copy(io.Discard, c)
+				return
+			}
+			if _, werr := s.Write(buf[:n]); werr != nil || err != nil {
+				return
+			}
+		}
+	}
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			s, err := net.Dial("tcp", addr)
+			if err != nil {
+				c.Close()
+				return
+			}
+			mu.Lock()
+			conns = append(conns, c, s)
+			mu.Unlock()
+			go io.Copy(c, s)
+			go forward(c, s)
+		}
+	}()
+	return l.Addr().String()
+}
+
+// TestPGMigrateUnlockTimeout: Migrate gives up releasing its lock on a
+// connection that stopped answering after unlockTimeout, rather than wait
+// for the kernel to give the connection up, and the connection is closed,
+// which releases the lock (#255).
+func TestPGMigrateUnlockTimeout(t *testing.T) {
+	dsn, _ := testDB(t)
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// In plain text, so that the proxy sees the unlock.
+	u.Host = stallingProxy(t, u.Host, []byte("pg_advisory_unlock"))
+	u.RawQuery = "sslmode=disable"
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, u.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func(d time.Duration) { unlockTimeout = d }(unlockTimeout)
+	unlockTimeout = 200 * time.Millisecond
+	type result struct {
+		applied []string
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		applied, err := Migrate(ctx, conn)
+		done <- result{applied, err}
+	}()
+	select {
+	case r := <-done:
+		if r.err != nil || len(r.applied) != len(must(Migrations())) {
+			t.Errorf("Migrate = %v, %v", r.applied, r.err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Migrate waits for a connection that stopped answering")
+	}
+	if !conn.IsClosed() {
+		t.Error("the connection that may hold the lock of migrations is not closed")
+	}
+}
+
+// TestPGConfigWaitsForMigration: the writes of the configuration and of the
+// inventory, and the refresh of known dependencies, wait for a migration in
+// progress, as the writes of hosts do, rather than take the locks of tables
+// in another order and deadlock with it (#255).
+func TestPGConfigWaitsForMigration(t *testing.T) {
+	dsn, _ := migratedDB(t)
+	ctx := context.Background()
+	other, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close(ctx)
+	if _, err := other.Exec(ctx, `SELECT pg_advisory_lock($1)`, int64(migrationLock)); err != nil {
+		t.Fatal(err)
+	}
+	st, err := newPGStore(ctx, dsn+"?lock_timeout=300ms")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+	inv := must(parseInventory([]byte(testInventory)))
+	for _, w := range []struct {
+		name  string
+		write func() error
+	}{
+		{"syncConfig", func() error { return st.syncConfig(ctx, nil, nil, nil) }},
+		{"syncInventory", func() error { return st.syncInventory(ctx, inv, time.Now()) }},
+		{"refreshDependencies", func() error { _, err := st.refreshDependencies(ctx); return err }},
+	} {
+		var pgErr *pgconn.PgError
+		if err := w.write(); !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
+			t.Errorf("%s during a migration: %v", w.name, err)
+		}
 	}
 }
 

@@ -151,12 +151,13 @@ type Tracer struct {
 	idx    uint32
 	owners map[sockAddrKey][]owner
 	// unixOwners are the holders of the listening Unix sockets at the last
-	// owner scan, by namespace and name. unixMissing are the names that
-	// Unix flows connected to and that the last periodic scan, or one they
-	// requested since, found no listener of: they request no other scan
-	// until the next periodic one.
+	// owner scan, by namespace and name. unixMissing are the names, by the
+	// namespace of their clients, that Unix flows connected to and that the
+	// last periodic scan, or one they requested since, found no listener of
+	// in that namespace: they request no other scan until the next periodic
+	// one, which clears them.
 	unixOwners  map[unixListenerKey][]owner
-	unixMissing map[string]bool
+	unixMissing map[unixListenerKey]bool
 	// held are the inodes of the sockets held by the processes at the last
 	// owner scan.
 	held map[uint64]bool
@@ -181,8 +182,9 @@ type Tracer struct {
 
 	// conntrackSpec is the specification the conntrack programs are loaded
 	// from once nf_conntrack is loaded, and conntrackTried the last
-	// attempt. xlats is nil until they are loaded; xlatLast holds the
-	// counts of each translation at the last read.
+	// attempt. xlats, the translations confirmed in each interval, and
+	// xlatConns, the translated conntrack entries alive, are nil until they
+	// are loaded.
 	conntrackSpec  *ebpf.CollectionSpec
 	conntrackTried time.Time
 	// conntrackMissingLogged and conntrackFailLogged tell that the absence
@@ -191,12 +193,11 @@ type Tracer struct {
 	// conntrackBackoff is the wait before the next load after one failed.
 	conntrackBackoff time.Duration
 	xlats            *ebpf.Map
+	xlatConns        *ebpf.Map
 	xlatDrops        *ebpf.Variable
-	xlatLast         map[bpfShawkXlatKey]bpfShawkXlatStats
-	// conntrackLinks are the links of conntrackPrograms, in their order, and
-	// xlatConnsMap the entries counted live; for tests.
+	// conntrackLinks are the links of conntrackPrograms, in their order; for
+	// tests.
 	conntrackLinks []link.Link
-	xlatConnsMap   *ebpf.Map
 
 	// connectErrHooks are the targets of connectErrorPrograms attached.
 	connectErrHooks []string
@@ -278,7 +279,7 @@ func New(opts Options) (*Tracer, error) {
 		log:         opts.Logger,
 		owners:      map[sockAddrKey][]owner{},
 		unixOwners:  map[unixListenerKey][]owner{},
-		unixMissing: map[string]bool{},
+		unixMissing: map[unixListenerKey]bool{},
 	}
 	var st unix.Stat_t
 	if err := unix.Stat("/proc/self/ns/net", &st); err != nil {

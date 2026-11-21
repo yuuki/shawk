@@ -153,10 +153,16 @@ func parseNodeStates(b []byte, now time.Time) (*nodeStates, error) {
 		if (n.Host == "") == (n.Node == "") {
 			return nil, fmt.Errorf("nodes[%d]: give either host or node", i)
 		}
-		name, key := n.Host, "host "+n.Host
+		field, name := "host", n.Host
 		if n.Node != "" {
-			name, key = n.Node, "node "+n.Node
+			field, name = "node", n.Node
 		}
+		// Host and node names follow the rules of the inventory, which
+		// also keep out what PostgreSQL refuses (NUL).
+		if err := checkInventoryName(name); err != nil {
+			return nil, fmt.Errorf("nodes[%d]: %s %q: %w", i, field, name, err)
+		}
+		key := field + " " + name
 		if seen[key] {
 			return nil, fmt.Errorf("nodes[%d]: %s is listed twice", i, key)
 		}
@@ -168,7 +174,7 @@ func parseNodeStates(b []byte, now time.Time) (*nodeStates, error) {
 		if len(state) == 0 {
 			return nil, fmt.Errorf("nodes[%d]: no state for %s", i, name)
 		}
-		out.nodes = append(out.nodes, nodeState{host: n.Host, node: n.Node, state: state, reason: n.Reason})
+		out.nodes = append(out.nodes, nodeState{host: n.Host, node: n.Node, state: state, reason: cleanReason(n.Reason)})
 	}
 	return out, nil
 }
@@ -249,16 +255,17 @@ func parseMaintenance(b []byte) ([]maintenanceWindow, error) {
 		if len(m.Hosts) == 0 {
 			return nil, fmt.Errorf("maintenance[%d]: no hosts", i)
 		}
+		reason := cleanReason(m.Reason)
 		for _, h := range m.Hosts {
-			if h == "" {
-				return nil, fmt.Errorf("maintenance[%d]: an empty host", i)
+			if err := checkInventoryName(h); err != nil {
+				return nil, fmt.Errorf("maintenance[%d]: host %q: %w", i, h, err)
 			}
 			k := windowKey{h, start.UTC()}
 			if seen[k] {
 				return nil, fmt.Errorf("maintenance[%d]: %s has two windows that start at %s", i, h, m.Start)
 			}
 			seen[k] = true
-			out = append(out, maintenanceWindow{host: h, start: start, end: end, reason: m.Reason})
+			out = append(out, maintenanceWindow{host: h, start: start, end: end, reason: reason})
 		}
 	}
 	slices.SortFunc(out, func(a, b maintenanceWindow) int {
@@ -268,6 +275,14 @@ func parseMaintenance(b []byte) ([]maintenanceWindow, error) {
 		return a.start.Compare(b.start)
 	})
 	return out, nil
+}
+
+// cleanReason makes a reason of Slurm or of a maintenance window, free text,
+// acceptable to PostgreSQL (see cleanString), cut to maxStringBytes as the
+// strings of agents: a reason PostgreSQL refuses would fail the states or
+// windows of every host.
+func cleanReason(s string) string {
+	return cleanString(cutLabel(s, maxStringBytes))
 }
 
 // parseWindowTimes parses the start and the end of a maintenance window,

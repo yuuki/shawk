@@ -77,10 +77,11 @@ func TestInvalidMetricTypes(t *testing.T) {
 	}
 }
 
-// TestValuesNotNumbers: a value of an edge that is not a number, or beyond
-// the int64 counts of agents, is an invalid point. It would otherwise stay
-// in the outputs it is added to, e.g. a NaN sum of RTTs in every later
-// point of the series of its dependency.
+// TestValuesNotNumbers: a value of an edge that is not a number, negative or
+// beyond the int64 counts of agents, is an invalid point. It would otherwise
+// stay in the outputs it is added to, e.g. a NaN sum of RTTs in every later
+// point of the series of its dependency, or a negative count taken for a
+// reset that decreases them.
 func TestValuesNotNumbers(t *testing.T) {
 	c, _, sink, now := testConnector(t, nil)
 	request := func(opened float64, rttSum float64) pmetric.Metrics {
@@ -104,7 +105,7 @@ func TestValuesNotNumbers(t *testing.T) {
 	}
 	*now = now.Add(15 * time.Second)
 	consumeRequest(t, c, sink, request(1, 0.1))
-	for _, v := range []float64{math.NaN(), math.Inf(-1), 1 << 63, -1 << 63} {
+	for _, v := range []float64{math.NaN(), math.Inf(-1), 1 << 63, -1 << 63, -1} {
 		*now = now.Add(15 * time.Second)
 		consumeRequest(t, c, sink, request(v, v))
 	}

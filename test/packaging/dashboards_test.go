@@ -131,9 +131,23 @@ func TestDashboards(t *testing.T) {
 				return
 			}
 			e := expandVars(expr)
-			if _, err := parser.NewParser(parser.Options{}).ParseExpr(e); err != nil {
+			node, err := parser.NewParser(parser.Options{}).ParseExpr(e)
+			if err != nil {
 				t.Errorf("%s: %v\n%s", f, err, e)
+				return
 			}
+			// Port 0 is that of the dependencies over Unix sockets and of
+			// those over TCP or UDP to the servers without a port of
+			// port_agnostic_services and dynamic_ports; and TCP and UDP
+			// share the numbers of ports. A dependency is thus a port and
+			// a transport, as in the recording rules.
+			parser.Inspect(node, func(n parser.Node, _ []parser.Node) error {
+				if a, ok := n.(*parser.AggregateExpr); ok && !a.Without &&
+					slices.Contains(a.Grouping, "server_port") && !slices.Contains(a.Grouping, "network_transport") {
+					t.Errorf("%s: %s keeps server_port without network_transport:\n%s", f, a.Op, expr)
+				}
+				return nil
+			})
 			for _, m := range regexp.MustCompile(`shawk:[a-z_:0-9]+`).FindAllString(expr, -1) {
 				if _, ok := records[m]; !ok {
 					t.Errorf("%s: unknown recording rule %s", f, m)
@@ -251,12 +265,28 @@ var grafanaInterpolation = regexp.MustCompile(`\$(\w+)|\[\[(\w+?)(?::(\w+))?\]\]
 // singlequote format escapes a quote with a backslash, which PostgreSQL
 // reads as a backslash (standard_conforming_strings), so that the quote
 // ends the string. Macros ($__timeFrom() etc.) are not variables.
+//
+// A variable of several values (multi or includeAll) has none when its
+// query finds none, e.g. options from Prometheus over a time range it no
+// longer holds, and the sqlstring format then gives nothing: such a
+// variable is interpolated as an array, ARRAY[${name:sqlstring}]::text[],
+// which is empty then, rather than in IN (...), which fails.
 func TestDashboardSQLVariables(t *testing.T) {
 	sqlstring := regexp.MustCompile(`^\$\{\w+:sqlstring\}$`)
 	files, _ := filepath.Glob(filepath.Join(grafana, "dashboards/*.json"))
 	n := 0
 	for _, f := range files {
-		walk(loadJSON(t, f), func(o map[string]any) {
+		d := loadJSON(t, f)
+		multi := map[string]bool{}
+		templating, _ := d["templating"].(map[string]any)
+		vars, _ := templating["list"].([]any)
+		for _, v := range vars {
+			v, _ := v.(map[string]any)
+			if name, _ := v["name"].(string); v["multi"] == true || v["includeAll"] == true {
+				multi[name] = true
+			}
+		}
+		walk(d, func(o map[string]any) {
 			var queries []string
 			if s, ok := o["rawSql"].(string); ok {
 				queries = append(queries, s)
@@ -271,9 +301,18 @@ func TestDashboardSQLVariables(t *testing.T) {
 			}
 			for _, sql := range queries {
 				n++
-				for _, m := range grafanaInterpolation.FindAllString(sql, -1) {
-					if !strings.HasPrefix(m, "$__") && !sqlstring.MatchString(m) {
-						t.Errorf("%s: %s is interpolated without the sqlstring format:\n%s", f, m, sql)
+				for _, m := range grafanaInterpolation.FindAllStringSubmatchIndex(sql, -1) {
+					s := sql[m[0]:m[1]]
+					if strings.HasPrefix(s, "$__") {
+						continue
+					}
+					if !sqlstring.MatchString(s) {
+						t.Errorf("%s: %s is interpolated without the sqlstring format:\n%s", f, s, sql)
+						continue
+					}
+					if multi[sql[m[8]:m[9]]] &&
+						(!strings.HasSuffix(sql[:m[0]], "ARRAY[") || !strings.HasPrefix(sql[m[1]:], "]::text[]")) {
+						t.Errorf("%s: %s has several values, which are not interpolated as ARRAY[%[2]s]::text[]:\n%s", f, s, sql)
 					}
 				}
 			}

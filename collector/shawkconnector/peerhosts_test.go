@@ -1,6 +1,7 @@
 package shawkconnector
 
 import (
+	"context"
 	"fmt"
 	"maps"
 	"net/netip"
@@ -357,6 +358,41 @@ func TestPeerHostLearned(t *testing.T) {
 	}
 }
 
+// TestPeerHostLearnedDirectors: two directors in turn that send a client to
+// the same backend address name the host that holds it (#252); a backend at
+// an address that several hosts hold is on the host that translated the
+// connections, so two such hosts name none.
+func TestPeerHostLearnedDirectors(t *testing.T) {
+	c, _, sink, _ := testConnector(t, func(cfg *Config) { cfg.PeerHosts = true })
+	ts := t0.Add(15 * time.Second)
+	consume(t, c, sink, tAgent{host: "db-01", addrs: []string{"10.0.1.10"}, time: ts,
+		edges: []tEdge{{role: "server", proto: "tcp", local: "10.0.1.10", peer: "10.0.0.11", port: 5432,
+			svc: "postgres", comm: "postgres", opened: 3}}})
+	for _, d := range []struct{ host, addr string }{{"lvs-1", "10.0.2.1"}, {"lvs-2", "10.0.2.2"}} {
+		consume(t, c, sink, tAgent{host: d.host, addrs: []string{d.addr}, time: ts,
+			translations: []tTranslation{{client: "10.0.0.11", virtual: "10.0.100.1", vport: 5432,
+				backend: "10.0.1.10", bport: 5432}}})
+	}
+	// h2 and h4 both hold the bridge address 172.17.0.5, and both send the
+	// virtual address 10.0.100.2 to their own container there.
+	for _, h := range []struct{ host, addr string }{{"h2", "10.0.0.2"}, {"h4", "10.0.0.4"}} {
+		consume(t, c, sink, tAgent{host: h.host, addrs: []string{h.addr, "172.17.0.1", "172.17.0.5"}, time: ts,
+			edges: []tEdge{{role: "server", proto: "tcp", local: "172.17.0.5", peer: "10.0.0.11", port: 80,
+				svc: "web", comm: "web", opened: 1}},
+			translations: []tTranslation{{client: "10.0.0.11", virtual: "10.0.100.2", vport: 80,
+				backend: "172.17.0.5", bport: 80}}})
+	}
+	out := consume(t, c, sink, tAgent{host: "app-01", addrs: []string{"10.0.0.11"}, time: ts,
+		edges: []tEdge{
+			{role: "client", proto: "tcp", local: "10.0.0.11", peer: "10.0.100.1", port: 5432, svc: "app", comm: "app", opened: 3},
+			{role: "client", proto: "tcp", local: "10.0.0.11", peer: "10.0.100.2", port: 80, svc: "app", comm: "app", opened: 2},
+		}})
+	if got, want := hostsOf(out, metricHostConnOpened, "app", roleClient, ""),
+		map[string]float64{"db-01 postgres": 3, "~unknown web": 2}; !maps.Equal(got, want) {
+		t.Errorf("hosts through learned translations of several hosts = %v, want %v", got, want)
+	}
+}
+
 // TestPeerHostBounds: max_peer_hosts folds further hosts into ~other, and
 // peer_host_services restricts the family to the dependencies with one of
 // its services at either end, so that both sides of each have it: the
@@ -415,9 +451,10 @@ func TestPeerHostFormerHolderExpires(t *testing.T) {
 // PostgreSQL knows, once the new holder stops too; until it is written and
 // read back.
 func TestPeerHostLocalMove(t *testing.T) {
-	c, _, sink, now := testConnector(t, func(cfg *Config) { cfg.PeerHosts = true })
-	c.resolver.load(peerRows{former: []formerHolderRow{{addr: addrOf("10.0.2.3"),
-		formerHolder: formerHolder{host: hostKey("", "node-03"), name: "node-03", lastSeen: now.Add(-24 * time.Hour)}}}}, *now)
+	c, st, sink, now := testConnector(t, func(cfg *Config) { cfg.PeerHosts = true })
+	st.rows = peerRows{former: []formerHolderRow{{addr: addrOf("10.0.2.3"),
+		formerHolder: formerHolder{host: hostKey("", "node-03"), name: "node-03", lastSeen: now.Add(-24 * time.Hour)}}}}
+	c.resolver.load(st.rows, *now)
 	id := &edgeID{role: roleClient, proto: "tcp", local: addrOf("10.0.0.1"), peer: addrOf("10.0.2.3"), port: 6818}
 	host := func() string { return c.resolver.peer(hostKey("", "ctl-01"), id, *now).host }
 	if got := host(); got != "node-03" {
@@ -434,9 +471,84 @@ func TestPeerHostLocalMove(t *testing.T) {
 		t.Errorf("after the new holder stopped: %s", got)
 	}
 	// Written, and read back without it: PostgreSQL is the truth again.
-	c.resolver.forgetHeld(*now)
+	c.writePending(context.Background())
+	if got := host(); got != "node-13" {
+		t.Errorf("after the write, before it is read back: %s", got)
+	}
+	c.prepare(context.Background())
 	if got := host(); got != "node-03" {
 		t.Errorf("after the write: %s", got)
+	}
+}
+
+// TestPeerHostHeldBounded: the holders of addresses the connector saw are
+// forgotten once the changes that held them are written and read back,
+// whatever other hosts failed to be written; with changes of their hosts
+// that are dropped, so that they are bounded with the pending changes; and
+// not when a write took the changes of their host before the request that
+// saw them was added, although that request was received before the write
+// started.
+func TestPeerHostHeldBounded(t *testing.T) {
+	c, st, sink, now := testConnector(t, func(cfg *Config) { cfg.PeerHosts = true })
+	ctx := context.Background()
+	agent := func(host, addr string) tAgent { return tAgent{host: host, addrs: []string{addr}, time: *now} }
+	held := func() map[string]bool {
+		c.resolver.mu.RLock()
+		defer c.resolver.mu.RUnlock()
+		hosts := map[string]bool{}
+		for _, hs := range c.resolver.localHeld {
+			for h := range hs {
+				hosts[h] = true
+			}
+		}
+		return hosts
+	}
+	hold := func(f func(*hostChanges) error) {
+		st.mu.Lock()
+		st.hold = f
+		st.mu.Unlock()
+	}
+	node1, node2 := hostKey("", "node-01"), hostKey("", "node-02")
+
+	// node-01 fails to be written, node-02 is written.
+	consume(t, c, sink, agent("node-01", "10.0.2.1"))
+	consume(t, c, sink, agent("node-02", "10.0.2.2"))
+	hold(func(h *hostChanges) error {
+		if h.key == node1 {
+			return errFake
+		}
+		return nil
+	})
+	*now = now.Add(time.Second)
+	c.writePending(ctx)
+	c.prepare(ctx)
+	if got := held(); !got[node1] || got[node2] {
+		t.Errorf("after node-02 was written and read back: holders %v, want node-01 only", got)
+	}
+
+	// The changes of node-01 are dropped beyond max_pending_rows.
+	c.cfg.MaxPendingRows = 0
+	c.boundPending()
+	if got := held(); got[node1] {
+		t.Errorf("after the changes of node-01 were dropped: holders %v", got)
+	}
+	c.cfg.MaxPendingRows = createDefaultConfig().MaxPendingRows
+
+	// A request of node-02 received before a write starts is added after
+	// the write took the changes of node-02.
+	*now = now.Add(15 * time.Second)
+	consume(t, c, sink, agent("node-02", "10.0.2.2"))
+	received := now.Add(5 * time.Second)
+	late := testBatch(t, tAgent{host: "node-02", addrs: []string{"10.0.2.2"}, time: received})
+	hold(func(h *hostChanges) error {
+		c.resolver.learn(late, received)
+		return nil
+	})
+	*now = now.Add(10 * time.Second)
+	c.writePending(ctx)
+	c.prepare(ctx)
+	if got := held(); !got[node2] {
+		t.Errorf("node-02 seen by a request added after the write: holders %v, want node-02", got)
 	}
 }
 

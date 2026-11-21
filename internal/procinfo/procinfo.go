@@ -36,6 +36,9 @@ type Resolver struct {
 	paths    map[uint64]string
 	learned  map[uint64]learnedPath
 	lastScan time.Time
+	// scanned is closed when the walk of the hierarchy in progress ends;
+	// nil while none runs.
+	scanned chan struct{}
 
 	// The paths of new cgroups of containers whose state a worker reads.
 	readerOnce sync.Once
@@ -180,31 +183,73 @@ func (r *Resolver) expire(now time.Time) {
 
 // CgroupPath returns the path of a cgroup relative to the hierarchy root,
 // such as "/system.slice/nginx.service", or "" if it is unknown.
+//
+// An unknown id walks the hierarchy, at most every rescanInterval. The walk
+// runs without the lock, which Learn takes on the goroutine that drains the
+// events of the kernel: a host of thousands of cgroups takes long to walk,
+// and the events that come meanwhile would be dropped. One walk runs at a
+// time; the lookups that come meanwhile wait for it.
 func (r *Resolver) CgroupPath(id uint64) string {
 	if id == 0 {
 		return ""
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	if p, ok := r.paths[id]; ok {
+	if p, ok := r.lookup(id); ok || r.root == "" {
+		r.mu.Unlock()
 		return p
 	}
-	if l, ok := r.learned[id]; ok {
-		return l.path
+	if done := r.scanned; done != nil {
+		r.mu.Unlock()
+		<-done
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		p, _ := r.lookup(id)
+		return p
 	}
-	if r.root == "" || time.Since(r.lastScan) < rescanInterval {
+	if time.Since(r.lastScan) < rescanInterval {
+		r.mu.Unlock()
 		return ""
 	}
-	r.scan()
-	return r.paths[id]
+	done := make(chan struct{})
+	r.scanned = done
+	r.mu.Unlock()
+
+	paths := walkCgroups(r.root)
+	now := time.Now()
+	r.mu.Lock()
+	// The paths learned meanwhile are kept apart, in learned.
+	r.paths, r.lastScan, r.scanned = paths, now, nil
+	close(done)
+	r.expire(now)
+	p, _ := r.lookup(id)
+	r.mu.Unlock()
+	if r.containers != nil {
+		r.containers.expire(now)
+	}
+	return p
 }
 
-// scan walks the cgroup hierarchy. On cgroup v2 the id of a cgroup is the
-// inode number of its directory.
-func (r *Resolver) scan() {
-	paths := make(map[uint64]string, len(r.paths))
+// lookup returns the path of a cgroup found by the last walk or learned.
+func (r *Resolver) lookup(id uint64) (string, bool) {
+	if p, ok := r.paths[id]; ok {
+		return p, true
+	}
+	if l, ok := r.learned[id]; ok {
+		return l.path, true
+	}
+	return "", false
+}
+
+// walkCgroups walks the cgroup hierarchy mounted at root for the paths of
+// its cgroups by id; replaced in tests.
+var walkCgroups = walkHierarchy
+
+// walkHierarchy walks the cgroup hierarchy mounted at root. On cgroup v2 the
+// id of a cgroup is the inode number of its directory.
+func walkHierarchy(root string) map[uint64]string {
+	paths := map[uint64]string{}
 	//nolint:errcheck // the function skips what cannot be read and returns no error, so neither does WalkDir
-	filepath.WalkDir(r.root, func(path string, d fs.DirEntry, err error) error {
+	filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil || !d.IsDir() {
 			return nil
 		}
@@ -216,19 +261,14 @@ func (r *Resolver) scan() {
 		if !ok {
 			return nil
 		}
-		rel := strings.TrimPrefix(path, r.root)
+		rel := strings.TrimPrefix(path, root)
 		if rel == "" {
 			rel = "/"
 		}
 		paths[st.Ino] = rel
 		return nil
 	})
-	r.paths = paths
-	r.lastScan = time.Now()
-	r.expire(r.lastScan)
-	if r.containers != nil {
-		r.containers.expire(r.lastScan)
-	}
+	return paths
 }
 
 // Comm returns the command name of a process (of its main thread), or "" if

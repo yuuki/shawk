@@ -240,12 +240,26 @@ func (s *State) AddEdge(k EdgeKey, st EdgeStats, start, end time.Time) {
 		if p.First.IsZero() {
 			p.First = end
 		}
-		if end.After(p.Last) {
-			p.Last = end
-		}
+		see(&p.First, &p.Last, end)
 	}
-	if st.active() && end.After(e.LastSeen) {
-		e.LastSeen = end
+	if st.active() {
+		see(&e.FirstSeen, &e.LastSeen, end)
+	}
+}
+
+// see records that what was first and last seen at *first and *last was
+// seen at t, which is its last time if it is after *last: by the monotonic
+// clock, which the agent's times read and Expire compares. The times are
+// sent by the wall clock, and a step back of the wall clock makes t after
+// *last but before *first by it: *first then moves back to t, so that what
+// was first seen is never sent after what was last seen.
+func see(first, last *time.Time, t time.Time) {
+	if elapsed(t, *last) <= 0 {
+		return
+	}
+	*last = t
+	if t.Round(0).Before(first.Round(0)) {
+		*first = t
 	}
 }
 
@@ -256,9 +270,7 @@ func (s *State) AddListener(k ListenerKey, t time.Time) {
 		l = &Listener{FirstSeen: t}
 		s.listeners[k] = l
 	}
-	if t.After(l.LastSeen) {
-		l.LastSeen = t
-	}
+	see(&l.FirstSeen, &l.LastSeen, t)
 }
 
 // AddTranslation records that a translation was in use at t: a new
@@ -269,9 +281,7 @@ func (s *State) AddTranslation(k TranslationKey, t time.Time) {
 		x = &Translation{FirstSeen: t}
 		s.translations[k] = x
 	}
-	if t.After(x.LastSeen) {
-		x.LastSeen = t
-	}
+	see(&x.FirstSeen, &x.LastSeen, t)
 }
 
 // BeginInterval prepares the series for the statistics of a new interval:

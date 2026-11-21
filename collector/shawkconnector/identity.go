@@ -78,8 +78,16 @@ func certificateID(cert *x509.Certificate) string {
 // refuses text with NUL or that is not valid UTF-8: such bytes become
 // U+FFFD, as the agent replaces them.
 func cleanString(s string) string {
-	if utf8.ValidString(s) && !strings.ContainsRune(s, 0) {
+	if pgText(s) {
 		return s
 	}
 	return strings.ReplaceAll(strings.ToValidUTF8(s, "�"), "\x00", "�")
+}
+
+// pgText tells whether PostgreSQL accepts a string as text: valid UTF-8
+// without NUL. The names of the configuration are checked with it rather
+// than cleaned: the collector then refuses to start and tells what to fix,
+// where a cleaned name would differ from the one configured.
+func pgText(s string) bool {
+	return utf8.ValidString(s) && !strings.ContainsRune(s, 0)
 }

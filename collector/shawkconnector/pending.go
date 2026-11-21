@@ -150,11 +150,27 @@ func (h *hostChanges) setHost(machineID, hostname, kernel, version string, t tim
 	h.span.merge(span{t, t})
 }
 
-func (h *hostChanges) addSession(start time.Time, s sessionRow) {
+// maxSessions bounds the sessions pending of a host. An agent starts a new
+// segment only when it starts, or after it could not send for its idle TTL,
+// so a host has several sessions pending only when that happened while
+// writes failed. Each holds the ranges its agent keeps exact (up to
+// maxInternalPeers), which an agent sending a new segment start with every
+// request would otherwise make the connector hold without bound. A new
+// session beyond is not written: the host may show as not observed over
+// it, if it ends before the sessions pending are written.
+const maxSessions = 16
+
+// addSession records a session that starts at start, and tells whether it
+// is held: whether it was, or the host has fewer than maxSessions.
+func (h *hostChanges) addSession(start time.Time, s sessionRow) bool {
 	cur := h.sessions[start]
+	if cur == nil && len(h.sessions) >= maxSessions {
+		return false
+	}
 	if cur == nil || !s.lastHeartbeat.Before(cur.lastHeartbeat) {
 		h.sessions[start] = &s
 	}
+	return true
 }
 
 // floorSessions makes the sessions start no earlier than floor, by the
@@ -216,8 +232,9 @@ func (h *hostChanges) addTranslation(k translationID, s span) {
 }
 
 // merge adds the changes of o, which are older, back into h after o failed
-// to be written.
-func (h *hostChanges) merge(o *hostChanges) {
+// to be written, and returns how many sessions of o it left out beyond
+// maxSessions.
+func (h *hostChanges) merge(o *hostChanges) (dropped int) {
 	if o.hostname != "" {
 		if h.hostname == "" {
 			h.machineID, h.hostname, h.kernel, h.version = o.machineID, o.hostname, o.kernel, o.version
@@ -225,7 +242,9 @@ func (h *hostChanges) merge(o *hostChanges) {
 		h.span.merge(o.span)
 	}
 	for t, s := range o.sessions {
-		h.addSession(t, *s)
+		if !h.addSession(t, *s) {
+			dropped++
+		}
 	}
 	for a, s := range o.addrs {
 		h.addAddr(a, s)
@@ -245,6 +264,7 @@ func (h *hostChanges) merge(o *hostChanges) {
 	for k, s := range o.translations {
 		h.addTranslation(k, s)
 	}
+	return dropped
 }
 
 // changes accumulates the changes of every host until they are written. To
@@ -265,6 +285,9 @@ type changes struct {
 	acceptedTranslations map[string]map[translationID]acceptedSpan
 	// floors bound the start of the sessions of hosts.
 	floors map[string]sessionFloor
+	// droppedSessions counts the sessions left out beyond maxSessions, until
+	// they are taken.
+	droppedSessions int
 }
 
 // minAgentIdleTTL is the shortest idle TTL of an agent: an edge active that
@@ -348,20 +371,14 @@ func (c *changes) add(b *hostBatch, now time.Time) {
 	h := c.host(b.key)
 	h.setHost(b.machineID, b.hostname, b.kernel, b.agentVersion, now)
 	f := c.advanceFloor(b, skew, now)
-	if !b.segmentStart.IsZero() && !b.limited {
-		start := b.segmentStart
-		if start.Before(f.start) {
-			start = f.start
-		}
-		s := sessionRow{lastHeartbeat: now, clockSkew: skew, udpTraced: b.udpTraced, unixTraced: b.unixTraced,
-			protocolsClassified: b.protocolsClassified,
-			netnsScope:          b.netnsScope, dropped: b.dropped, peerFold: b.peerFold, peerInternal: b.peerInternal}
-		s.countersStarted = b.droppedSince
-		h.addSession(start, s)
-	}
-	// The host holds its addresses as of the requests that close intervals,
-	// like its heartbeat.
+	// The host holds its addresses, and its session goes on, as of the
+	// requests that close intervals, like its heartbeat: those of the agent
+	// carry its segment start. Series dropped in the interval end the
+	// session.
 	if b.final {
+		if !b.segmentStart.IsZero() && !b.limited {
+			c.addSegment(b, h, f, skew, now)
+		}
 		for _, a := range b.addrs {
 			h.addAddr(a, span{now, now})
 		}
@@ -369,6 +386,31 @@ func (c *changes) add(b *hostBatch, now time.Time) {
 	c.addEdges(b, h, latest, now)
 	c.addListeners(b, h, latest, now)
 	c.addTranslations(b, h, latest, now)
+}
+
+// addSegment records the session of a request received at now that closes
+// an interval, f being the session floor of its host and skew how far the
+// clock of the connector is ahead of the clock of the agent.
+func (c *changes) addSegment(b *hostBatch, h *hostChanges, f sessionFloor, skew time.Duration, now time.Time) {
+	// A segment starts no later than the request that carries it, by the
+	// clock of the agent, so that converted with the clock skew the session
+	// never starts after its heartbeat, and a time the agent makes up is
+	// written within what PostgreSQL holds. Nor does it start before the
+	// floor.
+	start := b.segmentStart
+	if t := now.Add(-skew).Truncate(time.Second); start.After(t) {
+		start = t
+	}
+	if start.Before(f.start) {
+		start = f.start
+	}
+	s := sessionRow{lastHeartbeat: now, clockSkew: skew, udpTraced: b.udpTraced, unixTraced: b.unixTraced,
+		protocolsClassified: b.protocolsClassified,
+		netnsScope:          b.netnsScope, dropped: b.dropped, peerFold: b.peerFold, peerInternal: b.peerInternal}
+	s.countersStarted = b.droppedSince
+	if !h.addSession(start, s) {
+		c.droppedSessions++
+	}
 }
 
 // advanceFloor updates the session floor of the host of a request received
@@ -495,10 +537,12 @@ func acceptedOf[K comparable](m map[string]map[K]acceptedSpan, host string) map[
 }
 
 // observedSpan is the span of an observation first and last seen at those
-// times, first being zero if not known, and no later than latest.
+// times, first being zero if not known, and no later than latest. A first
+// time after the last, which older agents sent after their clock stepped
+// back, is the last.
 func observedSpan(first, last, latest time.Time) span {
 	s := span{first, last}
-	if s.first.IsZero() {
+	if s.first.IsZero() || s.first.After(s.last) {
 		s.first = s.last
 	}
 	return s.notAfter(latest)
@@ -524,7 +568,7 @@ func (c *changes) take() map[string]*hostChanges {
 
 // restore puts back changes that failed to be written.
 func (c *changes) restore(h *hostChanges) {
-	c.host(h.key).merge(h)
+	c.droppedSessions += c.host(h.key).merge(h)
 }
 
 // forget is called when changes of a host were dropped at now. The spans
@@ -533,6 +577,8 @@ func (c *changes) restore(h *hostChanges) {
 // starts no earlier than the idle TTL of an agent before now. So do the
 // sessions already pending, of requests received while the dropped changes
 // were being written: those requests skipped the edges the changes held.
+// A floor already later, after series of the host were dropped
+// (advanceFloor), stays: it is never moved back.
 func (c *changes) forget(key string, now time.Time) {
 	delete(c.acceptedEdges, key)
 	delete(c.acceptedWire, key)
@@ -542,7 +588,9 @@ func (c *changes) forget(key string, now time.Time) {
 	if !ok {
 		return
 	}
-	f.start = now.Add(-f.skew).Add(-minAgentIdleTTL).Truncate(time.Second)
+	if t := now.Add(-f.skew).Add(-minAgentIdleTTL).Truncate(time.Second); t.After(f.start) {
+		f.start = t
+	}
 	c.floors[key] = f
 	if h := c.pending[key]; h != nil {
 		h.floorSessions(f.start)
@@ -551,11 +599,11 @@ func (c *changes) forget(key string, now time.Time) {
 
 // bound drops the pending changes of whole hosts, those pending the longest
 // first, until at most max rows are pending, and forgets them as dropped at
-// now. It returns the hosts and rows dropped.
-func (c *changes) bound(max int, now time.Time) (hosts, rows int) {
+// now. It returns the changes dropped.
+func (c *changes) bound(max int, now time.Time) (dropped []*hostChanges) {
 	size := c.pendingSize()
 	if size <= max {
-		return 0, 0
+		return nil
 	}
 	pending := slices.SortedFunc(maps.Values(c.pending), func(a, b *hostChanges) int {
 		return cmp.Or(a.first.Compare(b.first), strings.Compare(a.key, b.key))
@@ -564,14 +612,12 @@ func (c *changes) bound(max int, now time.Time) (hosts, rows int) {
 		if size <= max {
 			break
 		}
-		n := h.size()
-		size -= n
-		hosts++
-		rows += n
+		size -= h.size()
+		dropped = append(dropped, h)
 		delete(c.pending, h.key)
 		c.forget(h.key, now)
 	}
-	return hosts, rows
+	return dropped
 }
 
 // expire forgets accepted spans not reported for the TTL.

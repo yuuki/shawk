@@ -304,6 +304,64 @@ ON CONFLICT (edge_id, protocol) DO UPDATE SET
 		h.key, units, comms, services, users, roles, locals, peers, ports, netns, protocols, firsts, lasts)
 }
 
+// sessionDropsSQL records the periods in which the agent of a host dropped
+// flows, as queueSessions tells: its arguments are the host and the
+// starts, heartbeats, dropped flows, clock skews (in seconds) and starts
+// of the counters of its sessions.
+const sessionDropsSQL = `
+WITH u AS (
+  -- One row per run: the sessions of a run in one batch count the same drops.
+  SELECT DISTINCT ON (coalesce(u.run, u.started), u.run IS NULL) u.*
+  FROM unnest($2::timestamptz[], $3::timestamptz[], $4::bigint[], $5::float8[], $6::timestamptz[])
+    AS u(started, beat, dropped, skew, run)
+  WHERE u.dropped > 0
+  ORDER BY coalesce(u.run, u.started), u.run IS NULL, u.dropped DESC, u.beat DESC
+),
+d AS (
+  SELECT u.started, u.beat, u.dropped,
+         least(u.started + make_interval(secs => u.skew), u.beat) AS start,
+         base.dropped AS base_dropped, base.beat AS base_beat
+  FROM u
+  CROSS JOIN LATERAL (
+    -- The session itself without the start of the counters, else the
+    -- sessions of the run, each read through an index.
+    SELECT max(s.dropped_flows) AS dropped, max(s.last_heartbeat) AS beat
+    FROM shawk.agent_sessions s
+    WHERE s.host_id = $1
+      AND (u.run IS NULL AND s.started_at = u.started OR s.counters_started = u.run)
+  ) base
+),
+e AS (
+  SELECT started, beat, dropped - coalesce(base_dropped, 0) AS n,
+         CASE WHEN base_beat IS NULL THEN start ELSE greatest(base_beat, start) END AS since
+  FROM d
+  WHERE dropped > coalesce(base_dropped, 0)
+),
+p AS (SELECT started, least(since, beat) AS since, greatest(since, beat) AS until, n FROM e),
+latest AS (
+  SELECT o.started_at, o.period_start, o.period_end
+  FROM shawk.partial_observations o WHERE o.host_id = $1
+  ORDER BY o.period_end DESC LIMIT 1
+),
+m AS (
+  SELECT max(p.until) AS until, sum(p.n) AS n
+  FROM p, latest WHERE p.since <= latest.period_end AND p.until >= latest.period_start
+),
+extended AS (
+  UPDATE shawk.partial_observations o
+  SET period_end = greatest(o.period_end, m.until), dropped_flows = o.dropped_flows + m.n
+  FROM m, latest
+  WHERE m.n IS NOT NULL AND o.host_id = $1
+    AND o.started_at = latest.started_at AND o.period_start = latest.period_start
+  RETURNING o.host_id
+)
+INSERT INTO shawk.partial_observations AS o (host_id, started_at, period_start, period_end, dropped_flows)
+SELECT $1, p.started, p.since, p.until, p.n FROM p
+WHERE NOT EXISTS (SELECT FROM latest WHERE p.since <= latest.period_end AND p.until >= latest.period_start)
+ON CONFLICT (host_id, started_at, period_start) DO UPDATE SET
+  period_end    = greatest(o.period_end, excluded.period_end),
+  dropped_flows = o.dropped_flows + excluded.dropped_flows`
+
 // queueSessions writes the sessions of a host, and the periods in which its
 // agent dropped flows.
 //
@@ -363,58 +421,7 @@ func queueSessions(b *pgx.Batch, h *hostChanges) {
 		anyDropped = anyDropped || s.dropped > 0
 	}
 	if anyDropped {
-		b.Queue(`
-WITH u AS (
-  -- One row per run: the sessions of a run in one batch count the same drops.
-  SELECT DISTINCT ON (coalesce(u.run, u.started), u.run IS NULL) u.*
-  FROM unnest($2::timestamptz[], $3::timestamptz[], $4::bigint[], $5::float8[], $6::timestamptz[])
-    AS u(started, beat, dropped, skew, run)
-  WHERE u.dropped > 0
-  ORDER BY coalesce(u.run, u.started), u.run IS NULL, u.dropped DESC, u.beat DESC
-),
-d AS (
-  SELECT u.started, u.beat, u.dropped,
-         least(u.started + make_interval(secs => u.skew), u.beat) AS start,
-         base.dropped AS base_dropped, base.beat AS base_beat
-  FROM u
-  CROSS JOIN LATERAL (
-    SELECT max(s.dropped_flows) AS dropped, max(s.last_heartbeat) AS beat
-    FROM shawk.agent_sessions s
-    WHERE s.host_id = $1
-      AND CASE WHEN u.run IS NULL THEN s.started_at = u.started ELSE s.counters_started = u.run END
-  ) base
-),
-e AS (
-  SELECT started, beat, dropped - coalesce(base_dropped, 0) AS n,
-         CASE WHEN base_beat IS NULL THEN start ELSE greatest(base_beat, start) END AS since
-  FROM d
-  WHERE dropped > coalesce(base_dropped, 0)
-),
-p AS (SELECT started, least(since, beat) AS since, greatest(since, beat) AS until, n FROM e),
-latest AS (
-  SELECT o.started_at, o.period_start, o.period_end
-  FROM shawk.partial_observations o WHERE o.host_id = $1
-  ORDER BY o.period_end DESC LIMIT 1
-),
-m AS (
-  SELECT max(p.until) AS until, sum(p.n) AS n
-  FROM p, latest WHERE p.since <= latest.period_end AND p.until >= latest.period_start
-),
-extended AS (
-  UPDATE shawk.partial_observations o
-  SET period_end = greatest(o.period_end, m.until), dropped_flows = o.dropped_flows + m.n
-  FROM m, latest
-  WHERE m.n IS NOT NULL AND o.host_id = $1
-    AND o.started_at = latest.started_at AND o.period_start = latest.period_start
-  RETURNING o.host_id
-)
-INSERT INTO shawk.partial_observations AS o (host_id, started_at, period_start, period_end, dropped_flows)
-SELECT $1, p.started, p.since, p.until, p.n FROM p
-WHERE NOT EXISTS (SELECT FROM latest WHERE p.since <= latest.period_end AND p.until >= latest.period_start)
-ON CONFLICT (host_id, started_at, period_start) DO UPDATE SET
-  period_end    = greatest(o.period_end, excluded.period_end),
-  dropped_flows = o.dropped_flows + excluded.dropped_flows`,
-			h.key, starts, beats, dropped, skews, runs)
+		b.Queue(sessionDropsSQL, h.key, starts, beats, dropped, skews, runs)
 	}
 	// What the agent traces and folds is kept as of the latest heartbeat.
 	b.Queue(`
@@ -687,7 +694,8 @@ const configLock = 0x73686179 // "shay"
 // and the rules of ports in one transaction, keeping the rows that stay, so
 // that the views see either the old rows or the new ones. It runs in READ
 // COMMITTED, whatever the default of the database, so that the statements
-// after the lock see what a connector that held it before wrote.
+// after the locks see what a connector that held them before wrote. As the
+// other writes, it takes the lock of migrations shared first.
 func (s *pgStore) syncConfig(ctx context.Context, cidrs []namedPrefix, ts []translation, ports *portRules) error {
 	prefixes := make([]string, 0, len(cidrs))
 	cidrNames := make([]string, 0, len(cidrs))
@@ -719,6 +727,9 @@ func (s *pgStore) syncConfig(ctx context.Context, cidrs []namedPrefix, ts []tran
 		dto = append(dto, int32(r.to))
 	}
 	return pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.ReadCommitted}, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared($1)`, int64(migrationLock)); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, int64(configLock)); err != nil {
 			return err
 		}
@@ -808,6 +819,9 @@ const inventoryLock = 0x73686169 // "shai"
 
 func (s *pgStore) syncInventory(ctx context.Context, inv *inventory, readAt time.Time) error {
 	return pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.ReadCommitted}, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared($1)`, int64(migrationLock)); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, int64(inventoryLock)); err != nil {
 			return err
 		}
@@ -916,6 +930,29 @@ ORDER BY h.host`, func(rows pgx.Rows) error {
 // of node states and maintenance windows by several connectors.
 const nodeStatesLock = 0x7368617a // "shaz"
 
+// continueNodeStatesSQL continues the latest states of hosts read again
+// with the same flags and reason within node_state_max_age(), as
+// writeNodeStates tells: its arguments are the hosts, their states (flags
+// joined by +) and reasons, and the time they were read.
+const continueNodeStatesSQL = `
+WITH u AS (
+  SELECT * FROM unnest($1::text[], $2::text[], $3::text[]) AS u(hostname, state, reason)
+), latest AS (
+  -- The latest state of each host, read through the index rather than
+  -- every state of the host sorted.
+  SELECT l.* FROM u CROSS JOIN LATERAL (
+    SELECT s.hostname, s.first_seen, s.last_seen, s.state, s.reason
+    FROM shawk.node_states s
+    WHERE s.hostname = u.hostname
+    ORDER BY s.first_seen DESC LIMIT 1
+  ) l
+)
+UPDATE shawk.node_states s SET last_seen = $4::timestamptz
+FROM u JOIN latest l ON l.hostname = u.hostname
+WHERE s.hostname = l.hostname AND s.first_seen = l.first_seen
+  AND l.state = string_to_array(u.state, '+') AND l.reason = u.reason
+  AND l.last_seen < $4::timestamptz AND l.last_seen >= $4::timestamptz - shawk.node_state_max_age()`
+
 // writeNodeStates records the states of nodes read from Slurm at a time. A
 // host whose latest state has the same flags and reason, read again within
 // node_state_max_age(), continues it; otherwise a new period starts at the
@@ -938,21 +975,7 @@ func (s *pgStore) writeNodeStates(ctx context.Context, at time.Time, nodes []nod
 			return err
 		}
 		b := &pgx.Batch{}
-		b.Queue(`
-WITH u AS (
-  SELECT * FROM unnest($1::text[], $2::text[], $3::text[]) AS u(hostname, state, reason)
-), latest AS (
-  SELECT DISTINCT ON (s.hostname) s.hostname, s.first_seen, s.last_seen, s.state, s.reason
-  FROM shawk.node_states s
-  WHERE s.hostname = ANY ($1::text[])
-  ORDER BY s.hostname, s.first_seen DESC
-)
-UPDATE shawk.node_states s SET last_seen = $4::timestamptz
-FROM u JOIN latest l ON l.hostname = u.hostname
-WHERE s.hostname = l.hostname AND s.first_seen = l.first_seen
-  AND l.state = string_to_array(u.state, '+') AND l.reason = u.reason
-  AND l.last_seen < $4::timestamptz AND l.last_seen >= $4::timestamptz - shawk.node_state_max_age()`,
-			hosts, states, reasons, at)
+		b.Queue(continueNodeStatesSQL, hosts, states, reasons, at)
 		b.Queue(`
 INSERT INTO shawk.node_states (hostname, first_seen, last_seen, state, reason)
 SELECT u.hostname, $4::timestamptz, $4::timestamptz, string_to_array(u.state, '+'), u.reason
@@ -1020,9 +1043,18 @@ ON CONFLICT DO NOTHING`,
 	})
 }
 
+// refreshDependencies refreshes known_dependencies under the lock of
+// migrations, shared, as the writes: shawk.refresh_known_dependencies()
+// does not take it itself. It runs in READ COMMITTED, so that the refresh
+// reads the tables as a migration it waited for left them.
 func (s *pgStore) refreshDependencies(ctx context.Context) (int64, error) {
 	var n int64
-	err := s.pool.QueryRow(ctx, `SELECT shawk.refresh_known_dependencies()`).Scan(&n)
+	err := pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.ReadCommitted}, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared($1)`, int64(migrationLock)); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT shawk.refresh_known_dependencies()`).Scan(&n)
+	})
 	return n, err
 }
 

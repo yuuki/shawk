@@ -266,19 +266,12 @@ struct shawk_xlat_key {
 	__u16 vport;      /* original destination port */
 	__u16 bport;      /* reply source port */
 	__u8 proto;       /* IPPROTO_TCP or IPPROTO_UDP */
-	__u8 _pad[7];
-};
-
-struct shawk_xlat_stats {
-	__u64 conns; /* entries confirmed since the key was added */
-	__s64 live;  /* entries alive now that were seen confirmed */
-	__u64 gen;   /* when the key was added, which tells it from a former one */
-};
-
-/* A conntrack entry counted in the live count of its translation. */
-struct shawk_xlat_conn {
-	struct shawk_xlat_key key;
-	__u64 gen; /* shawk_xlat_stats.gen of the key it was counted in */
+	/*
+	 * In xlats, the index of the flow maps (active_idx) when the
+	 * translation was confirmed; 0 in xlat_conns.
+	 */
+	__u8 idx;
+	__u8 _pad[6];
 };
 
 #endif /* __SHAWK_H */
