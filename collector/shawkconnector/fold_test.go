@@ -322,6 +322,127 @@ func TestFoldAllAgentServer(t *testing.T) {
 	}
 }
 
+// TestFoldAllDirectClientWithVirtual: a client with -fold-external=all that
+// connects directly to an internal server keeps its peer exact, even when
+// that server is also a backend of a static or learned DNAT with a public
+// virtual address that the client would fold. The server edge must keep
+// shawk.peer.agent true and log no fold warning.
+func TestFoldAllDirectClientWithVirtual(t *testing.T) {
+	c, _, sink, now := testConnector(t, func(cfg *Config) {
+		cfg.Translations = map[string]TranslationConfig{
+			"public-vip": {Virtual: []string{"203.0.113.1:80"}, Backends: []string{"10.0.1.10:8080"}},
+		}
+	})
+	logs := observe(c)
+	ts := t0.Add(15 * time.Second)
+	*now = ts
+
+	// A learned DNAT with a public virtual address to another internal server.
+	consume(t, c, sink, tAgent{host: "lb-01", addrs: []string{"10.0.2.1"}, time: ts,
+		translations: []tTranslation{{client: "10.0.2.5", virtual: "203.0.113.2", vport: 80,
+			backend: "10.0.1.11", bport: 8080}}})
+
+	// Client folds external servers, but connects directly to both internal
+	// servers (within 10.0.0.0/8).
+	consume(t, c, sink, tAgent{host: "app-01", addrs: []string{"10.0.2.5"}, time: ts,
+		fold: foldAll, internal: []string{"10.0.0.0/8"},
+		edges: []tEdge{
+			{role: "client", proto: "tcp", local: "10.0.2.5", peer: "10.0.1.10", port: 8080, svc: "app", comm: "app", opened: 1},
+			{role: "client", proto: "tcp", local: "10.0.2.5", peer: "10.0.1.11", port: 8080, svc: "app", comm: "app", opened: 1},
+		}})
+
+	for _, tc := range []struct {
+		name, host, addr, svc string
+	}{
+		{"static DNAT", "web-01", "10.0.1.10", "web1"},
+		{"learned DNAT", "web-02", "10.0.1.11", "web2"},
+	} {
+		out := consume(t, c, sink, tAgent{host: tc.host, addrs: []string{tc.addr}, time: ts,
+			edges: []tEdge{{role: "server", proto: "tcp", local: tc.addr, peer: "10.0.2.5", port: 8080,
+				svc: tc.svc, comm: tc.svc, opened: 2}}})
+		s := find(out, metricConnOpened, tc.svc, "app", roleServer, "")
+		if len(s) != 1 || !s[0].agent {
+			t.Errorf("%s: server series = %+v, want peer app with agent=true", tc.name,
+				find(out, metricConnOpened, tc.svc, "*", roleServer, ""))
+		}
+		p := c.resolver.peer(hostKey("", tc.host), &edgeID{role: roleServer, proto: "tcp",
+			local: addrOf(tc.addr), peer: addrOf("10.0.2.5"), port: 8080}, ts)
+		if p.name != "app" || !p.agent || p.foldedBy != "" || p.foldsServer || p.foldedVirtual.IsValid() {
+			t.Errorf("%s: peer = %+v, want unfolded peer app with agent=true", tc.name, p)
+		}
+	}
+	if got := foldWarnings(logs); len(got) != 0 {
+		t.Errorf("unexpected fold warnings = %q", got)
+	}
+}
+
+// TestFoldAllSwitchedAfterDirectClient: a client that previously connected
+// directly while keeping the server address exact, and then switched to
+// -fold-external=all folding that server address, leaves a stale direct
+// client edge in the resolver until it expires. The server edge must still
+// report shawk.peer.agent=false and log a direct fold warning (not blaming
+// a virtual address even if one also targets the server).
+func TestFoldAllSwitchedAfterDirectClient(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		translations map[string]TranslationConfig
+	}{
+		{"plain direct", nil},
+		{"with folded virtual", map[string]TranslationConfig{
+			"public-vip": {Virtual: []string{"203.0.113.1:80"}, Backends: []string{"198.51.100.10:8080"}},
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _, sink, now := testConnector(t, func(cfg *Config) {
+				cfg.Translations = tc.translations
+			})
+			logs := observe(c)
+			ts := t0.Add(15 * time.Second)
+			*now = ts
+
+			// Initially the client keeps 198.51.100.10 exact and connects directly.
+			consume(t, c, sink, tAgent{host: "app-01", addrs: []string{"10.0.2.5"}, time: ts,
+				fold: foldNone,
+				edges: []tEdge{{role: "client", proto: "tcp", local: "10.0.2.5", peer: "198.51.100.10",
+					port: 8080, svc: "app", comm: "app", opened: 1}}})
+
+			// Later the client switches to -fold-external=all, folding 198.51.100.10.
+			later := ts.Add(15 * time.Second)
+			*now = later
+			consume(t, c, sink, tAgent{host: "app-01", addrs: []string{"10.0.2.5"}, time: later,
+				fold: foldAll, internal: []string{"10.0.0.0/8"},
+				edges: []tEdge{{role: "client", proto: "tcp", local: "10.0.2.5", peer: "0.0.0.0",
+					folded: true, port: 8080, svc: "app", comm: "app", opened: 1}}})
+
+			out := consume(t, c, sink, tAgent{host: "web-01", addrs: []string{"198.51.100.10"}, time: later,
+				edges: []tEdge{{role: "server", proto: "tcp", local: "198.51.100.10", peer: "10.0.2.5",
+					port: 8080, svc: "web", comm: "web", opened: 2}}})
+
+			s := find(out, metricConnOpened, "web", "app", roleServer, "")
+			if len(s) != 1 || s[0].agent {
+				t.Errorf("server series = %+v, want peer app with agent=false",
+					find(out, metricConnOpened, "web", "*", roleServer, ""))
+			}
+			p := c.resolver.peer(hostKey("", "web-01"), &edgeID{role: roleServer, proto: "tcp",
+				local: addrOf("198.51.100.10"), peer: addrOf("10.0.2.5"), port: 8080}, later)
+			if p.name != "app" || p.agent || p.foldedBy == "" || !p.foldsServer || p.foldedVirtual.IsValid() {
+				t.Errorf("peer = %+v, want direct-folded peer app without foldedVirtual", p)
+			}
+			entries := logs.TakeAll()
+			if len(entries) != 1 {
+				t.Fatalf("warnings = %v, want 1", entries)
+			}
+			m := entries[0].ContextMap()
+			if m["client_host"] != "app-01" || m["server_host"] != "web-01" || m["server_address"] != "198.51.100.10" {
+				t.Errorf("warning fields = %v", m)
+			}
+			if _, hasVirtual := m["virtual_address"]; hasVirtual {
+				t.Errorf("warning unexpectedly blamed virtual_address: %v", m)
+			}
+		})
+	}
+}
+
 // TestFoldedCIDRsWarning: an agent that folds the peers in a range of
 // peer_cidrs makes them ~external; the connector warns once an hour per
 // configuration of the agents, and not about a range of a whole network,

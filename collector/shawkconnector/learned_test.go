@@ -196,6 +196,137 @@ func TestLearnedFoldedVirtual(t *testing.T) {
 	}
 }
 
+// TestLearnedFoldedVirtualScope: a learned DNAT with a folded virtual
+// address applies to a server edge at a shared or loopback backend only on
+// the host (and, for loopback, in the network namespace) of the translation.
+func TestLearnedFoldedVirtualScope(t *testing.T) {
+	c, _, sink, now := testConnector(t, nil)
+	logs := observe(c)
+	ts := t0.Add(15 * time.Second)
+	*now = ts
+
+	consume(t, c, sink, tAgent{host: "app", addrs: []string{"10.0.0.11"}, time: ts,
+		fold: foldAll, internal: []string{"10.0.0.0/8"}})
+	bridge := func(host, addr string, xs ...tTranslation) tAgent {
+		return tAgent{host: host, addrs: []string{"127.0.0.1", addr, "172.17.0.1", "172.17.0.5"}, time: ts, translations: xs}
+	}
+	consume(t, c, sink, bridge("h2", "10.0.0.2",
+		tTranslation{client: "10.0.0.11", virtual: "192.0.2.10", vport: 80, backend: "172.17.0.5", bport: 80},
+		tTranslation{client: "10.0.0.11", virtual: "192.0.2.10", vport: 80, backend: "127.0.0.1", bport: 15001, netns: "100"}))
+	consume(t, c, sink, bridge("h4", "10.0.0.4"))
+
+	for _, tc := range []struct {
+		name, host, local string
+		port              uint16
+		netns             uint64
+		wantFolded        bool
+	}{
+		{"shared same host", "h2", "172.17.0.5", 80, 0, true},
+		{"shared other host", "h4", "172.17.0.5", 80, 0, false},
+		{"loopback same host and netns", "h2", "127.0.0.1", 15001, 100, true},
+		{"loopback same host other netns", "h2", "127.0.0.1", 15001, 200, false},
+		{"loopback other host same netns", "h4", "127.0.0.1", 15001, 100, false},
+	} {
+		p := c.resolver.peer(hostKey("", tc.host), &edgeID{role: roleServer, proto: "tcp",
+			local: addrOf(tc.local), peer: addrOf("10.0.0.11"), port: tc.port, netns: tc.netns}, ts)
+		if tc.wantFolded {
+			if p.agent || p.foldedVirtual != addrOf("192.0.2.10") {
+				t.Errorf("%s: peer = %+v, want folded virtual 192.0.2.10 with agent=false", tc.name, p)
+			}
+		} else if !p.agent || p.foldedBy != "" || p.foldedVirtual.IsValid() {
+			t.Errorf("%s: peer = %+v, want unfolded peer with agent=true", tc.name, p)
+		}
+	}
+
+	// End-to-end check on h4: no false fold warning and shawk.peer.agent stays true.
+	h4 := bridge("h4", "10.0.0.4")
+	h4.time = ts.Add(15 * time.Second)
+	h4.edges = []tEdge{{role: "server", proto: "tcp", local: "172.17.0.5", peer: "10.0.0.11", port: 80,
+		svc: "billing", comm: "billing", opened: 2}}
+	out := consume(t, c, sink, h4)
+	if s := find(out, metricConnOpened, "billing", "*", roleServer, ""); len(s) != 1 || !s[0].agent {
+		t.Errorf("h4 server series = %+v, want agent=true", s)
+	}
+	if got := foldWarnings(logs); len(got) != 0 {
+		t.Errorf("h4 fold warnings = %q, want none", got)
+	}
+}
+
+// TestLearnedFoldedVirtualRecency: a stale learned DNAT with a folded
+// virtual address, older than backendWindow before a newer translation for
+// the same backend and client, does not mark the server edge as folded
+// (whether the stale translation is local or loaded from PostgreSQL).
+func TestLearnedFoldedVirtualRecency(t *testing.T) {
+	c, st, sink, now := testConnector(t, nil)
+	logs := observe(c)
+	ts := t0.Add(15 * time.Second)
+	*now = ts
+
+	// At ts, lb learns a DNAT from a public (folded) virtual IP.
+	old := tTranslation{client: "10.0.0.11", virtual: "192.0.2.10", vport: 80,
+		backend: "10.0.1.20", bport: 80, first: ts, last: ts}
+	consume(t, c, sink, tAgent{host: "lb", addrs: []string{"10.0.2.1"}, time: ts,
+		translations: []tTranslation{old}})
+
+	// 10 minutes later (> backendWindow, within idle_ttl), lb resends the
+	// old translation and reports a newer DNAT from an internal virtual IP.
+	later := ts.Add(10 * time.Minute)
+	*now = later
+	consume(t, c, sink, tAgent{host: "lb", addrs: []string{"10.0.2.1"}, time: later,
+		translations: []tTranslation{old,
+			{client: "10.0.0.11", virtual: "10.96.0.10", vport: 80, backend: "10.0.1.20", bport: 80}}})
+	consume(t, c, sink, tAgent{host: "app", addrs: []string{"10.0.0.11"}, time: later,
+		fold: foldAll, internal: []string{"10.0.0.0/8"}})
+	out := consume(t, c, sink, tAgent{host: "web-01", addrs: []string{"10.0.1.20"}, time: later,
+		edges: []tEdge{{role: "server", proto: "tcp", local: "10.0.1.20", peer: "10.0.0.11", port: 80,
+			svc: "web", comm: "web", opened: 3}}})
+	if s := find(out, metricConnOpened, "web", "*", roleServer, ""); len(s) != 1 || !s[0].agent {
+		t.Errorf("local stale DNAT: server series = %+v, want agent=true", s)
+	}
+	if got := foldWarnings(logs); len(got) != 0 {
+		t.Errorf("local stale DNAT: fold warnings = %q, want none", got)
+	}
+
+	// Same when the stale folded translation comes from PostgreSQL alone
+	// (isolated on another backend so localLearnedServers holds only the
+	// newer internal translation).
+	consume(t, c, sink, tAgent{host: "lb", addrs: []string{"10.0.2.1"}, time: later,
+		translations: []tTranslation{{client: "10.0.0.11", virtual: "10.96.0.11", vport: 80,
+			backend: "10.0.1.21", bport: 80}}})
+	st.mu.Lock()
+	st.rows.learned = []learnedRow{{
+		host:     hostKey("", "lb-db"),
+		lastSeen: ts,
+		id: translationID{proto: "tcp", client: addrOf("10.0.0.11"), virtual: addrOf("192.0.2.11"),
+			vport: 80, source: addrOf("10.0.0.11"), backend: addrOf("10.0.1.21"), bport: 80},
+	}}
+	st.mu.Unlock()
+	c.prepare(t.Context())
+	p := c.resolver.peer(hostKey("", "web-02"), &edgeID{role: roleServer, proto: "tcp",
+		local: addrOf("10.0.1.21"), peer: addrOf("10.0.0.11"), port: 80}, later)
+	if !p.agent || p.foldedBy != "" || p.foldedVirtual.IsValid() {
+		t.Errorf("db stale DNAT: peer = %+v, want unfolded peer with agent=true", p)
+	}
+
+	// Multiple current learned DNATs with folded virtual addresses: the
+	// smallest virtual address is chosen deterministically regardless of
+	// map iteration order.
+	consume(t, c, sink, tAgent{host: "lb", addrs: []string{"10.0.2.1"}, time: later,
+		translations: []tTranslation{
+			{client: "10.0.0.11", virtual: "192.0.2.30", vport: 80, backend: "10.0.1.22", bport: 80},
+			{client: "10.0.0.11", virtual: "192.0.2.12", vport: 80, backend: "10.0.1.22", bport: 80},
+			{client: "10.0.0.11", virtual: "192.0.2.20", vport: 80, backend: "10.0.1.22", bport: 80},
+		}})
+	multiID := &edgeID{role: roleServer, proto: "tcp",
+		local: addrOf("10.0.1.22"), peer: addrOf("10.0.0.11"), port: 80}
+	for i := range 50 {
+		p := c.resolver.peer(hostKey("", "web-03"), multiID, later)
+		if p.agent || p.foldedVirtual != addrOf("192.0.2.12") {
+			t.Fatalf("iteration %d: peer = %+v, want deterministic foldedVirtual 192.0.2.12", i, p)
+		}
+	}
+}
+
 // TestLearnedStaleBackendResent: the agent goes on sending the former
 // translation, with its last seen time, for its idle TTL; it is as old as
 // that.
