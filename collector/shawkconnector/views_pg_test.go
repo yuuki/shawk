@@ -66,6 +66,26 @@ func TestPGEndpointsCurrentAddresses(t *testing.T) {
 	}
 }
 
+// TestPGEndpointsWithoutListeners: a host without listeners, such as a UDP
+// server, has the endpoints of its server edges of the 7 days before its
+// latest one (#249).
+func TestPGEndpointsWithoutListeners(t *testing.T) {
+	_, conn := migratedDB(t)
+	f := fixture{t, conn}
+	f.host("dns-01", "unbound")
+	server := func(addr string, port int, first, last string) string {
+		return fmt.Sprintf(`INSERT INTO shawk.edges (host_id, process_id, role, proto, local_addr, remote_addr, port, netns, first_seen, last_seen)
+		  VALUES ('dns-01', (SELECT id FROM shawk.processes), 'server', 'udp', '%s', '10.0.0.11', %d, 1, %s, %s)`, addr, port, first, last)
+	}
+	execAll(t, conn,
+		server("10.0.0.53", 53, "now() - interval '1 day'", "now() - interval '1 hour'"),
+		server("10.0.0.53", 5353, "now() - interval '20 days'", "now() - interval '9 days'"))
+	got := queryStrings(t, conn, `SELECT host(addr), port, proto, host, service, exact FROM shawk_v1.service_endpoints`)
+	if want := []string{"10.0.0.53 53 udp dns-01 unbound true"}; !slices.Equal(got, want) {
+		t.Errorf("service_endpoints = %v, want %v", got, want)
+	}
+}
+
 // TestPGAgentAddrsCoverage: agent_addrs tells what the agent traces.
 func TestPGAgentAddrsCoverage(t *testing.T) {
 	_, conn := migratedDB(t)

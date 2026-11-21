@@ -14,6 +14,9 @@
 --   - shawk_v1.planned_stops: the states with MAINT that follow each other
 --     are those read while the one before was fresh, so that a reservation
 --     after a stale gap counts its 30 days from its own start (§5.7).
+--   - shawk_v1.service_endpoints: the server edges of a host without
+--     listeners are endpoints too, and only the hosts that reported in the
+--     last 30 days are read (§6.2).
 
 -- The dependencies active in [since, until]: the client and server edges
 -- of a connection matched into one row. Edges are taken with a margin of
@@ -1007,3 +1010,109 @@ FROM (
 WHERE s.last_seen + shawk.node_state_max_age() > now()
   AND s.cause IS NOT NULL
   AND (s.cause <> 'maintenance' OR s.since > now() - interval '30 days');
+
+-- Addresses and ports services accept connections on, as
+-- shawk_v1.service_endpoints of 0001_schema.sql, used by the shawk
+-- connector to name the peers of client edges. They are the last known
+-- endpoints of each host, so that a host whose agent stopped keeps its
+-- names:
+--
+--   - listeners open at the latest listener report of the host, within an
+--     hour (times of the agent are compared with times of the same agent);
+--     a listener on an unspecified address is expanded to the current
+--     addresses of its host (those of its latest report);
+--   - server edges of the 7 days before that report, or before the latest
+--     server edge of the host if it is later, read per host through an
+--     index: a host may have server edges and no listener, such as a UDP
+--     server, or a listener too short-lived for the agent to list it;
+--   - of hosts that reported in the last 30 days, which are found first, so
+--     that the listeners, addresses and edges of the others are not read;
+--   - not an address another host started a period of after the latest
+--     period of this host ended (beyond the alive window, and not
+--     loopback), so that a reused address takes the name of its new holder.
+--
+-- exact tells whether the address was observed on a socket rather than
+-- inferred from a listener on an unspecified address; the connector prefers
+-- exact endpoints. slurm_job tells that a process of a Slurm job (unit
+-- slurm/*) serves it, which the connector names slurm-job as a peer.
+CREATE OR REPLACE VIEW shawk_v1.service_endpoints AS
+WITH recent AS (
+  SELECT h.id AS host_id, h.hostname FROM shawk.hosts h WHERE h.last_seen > now() - interval '30 days'
+),
+-- The latest listener report of each host, and the latest report of a
+-- listener or a server edge.
+latest AS (
+  SELECT r.host_id, l.last_seen AS listened, greatest(l.last_seen, e.last_seen) AS reported
+  FROM recent r
+  CROSS JOIN LATERAL (SELECT max(l.last_seen) AS last_seen FROM shawk.listeners l WHERE l.host_id = r.host_id) l
+  LEFT JOIN LATERAL (
+    SELECT e.last_seen FROM shawk.edges e
+    WHERE e.role = 'server' AND e.host_id = r.host_id
+    ORDER BY e.last_seen DESC LIMIT 1
+  ) e ON true
+),
+current_addrs AS (
+  SELECT a.host_id, a.addr, a.last_seen
+  FROM shawk.host_addrs a
+  JOIN (SELECT m.host_id, max(m.last_seen) AS last_seen FROM shawk.host_addrs m
+        WHERE m.host_id IN (SELECT host_id FROM recent) GROUP BY m.host_id) m
+    ON m.host_id = a.host_id
+  WHERE a.last_seen >= m.last_seen - shawk.alive_window()
+),
+s AS (
+  SELECT l.addr, l.port, l.proto, l.host_id, p.service_name AS service, l.last_seen, true AS exact,
+         p.unit LIKE 'slurm/%' AS slurm_job
+  FROM shawk.listeners l
+  JOIN shawk.processes p ON p.id = l.process_id
+  JOIN latest ON latest.host_id = l.host_id
+  WHERE l.addr NOT IN (inet '0.0.0.0', inet '::')
+    AND l.last_seen >= latest.listened - interval '1 hour'
+  UNION ALL
+  SELECT a.addr, l.port, l.proto, l.host_id, p.service_name, l.last_seen, false, p.unit LIKE 'slurm/%'
+  FROM shawk.listeners l
+  JOIN shawk.processes p ON p.id = l.process_id
+  JOIN latest ON latest.host_id = l.host_id
+  JOIN current_addrs a ON a.host_id = l.host_id
+   AND (l.addr = inet '::' OR family(a.addr) = 4)
+  WHERE l.addr IN (inet '0.0.0.0', inet '::')
+    AND l.last_seen >= latest.listened - interval '1 hour'
+  UNION ALL
+  SELECT e.local_addr, e.port, e.proto, e.host_id, p.service_name, e.last_seen, true, p.unit LIKE 'slurm/%'
+  FROM latest
+  CROSS JOIN LATERAL (
+    SELECT DISTINCT ON (e.local_addr, e.port, e.proto, e.process_id) e.*
+    FROM shawk.edges e
+    WHERE e.role = 'server' AND e.host_id = latest.host_id
+      AND e.last_seen >= latest.reported - interval '7 days'
+    ORDER BY e.local_addr, e.port, e.proto, e.process_id, e.last_seen DESC
+  ) e
+  JOIN shawk.processes p ON p.id = e.process_id
+),
+-- The latest period of each address of the hosts, and the start of the
+-- latest period of the address on any host.
+mine AS (
+  SELECT a.host_id, a.addr, max(a.last_seen) AS last_seen
+  FROM shawk.host_addrs a
+  WHERE a.host_id IN (SELECT host_id FROM recent)
+  GROUP BY a.host_id, a.addr
+),
+newest AS (
+  SELECT a.addr, max(a.first_seen) AS first_seen
+  FROM shawk.host_addrs a
+  WHERE a.addr IN (SELECT addr FROM mine)
+  GROUP BY a.addr
+),
+moved AS (
+  SELECT mine.host_id, mine.addr
+  FROM mine
+  JOIN newest ON newest.addr = mine.addr
+  WHERE newest.first_seen > mine.last_seen + shawk.alive_window()
+    AND NOT (mine.addr << inet '127.0.0.0/8' OR mine.addr = inet '::1')
+)
+SELECT s.addr, s.port, s.proto, r.hostname AS host, s.host_id, s.service, max(s.last_seen) AS last_seen,
+       bool_or(s.exact) AS exact, bool_or(s.slurm_job) AS slurm_job
+FROM s
+JOIN recent r ON r.host_id = s.host_id
+LEFT JOIN moved ON moved.host_id = s.host_id AND moved.addr = s.addr
+WHERE moved.host_id IS NULL
+GROUP BY s.addr, s.port, s.proto, r.hostname, s.host_id, s.service;
