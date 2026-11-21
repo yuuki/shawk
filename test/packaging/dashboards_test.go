@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 
@@ -139,6 +140,99 @@ func TestDashboards(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// The peer hosts dashboard populates its variables from recording rules.
+// UDP edges emit byte metrics rather than connections or failures, so each
+// variable must match both byte recording rules (for asymmetric or
+// response-only flows as well) alongside connections and failures, keep
+// query and definition in sync, and only query rules that keep its label.
+func TestHostsDashboardVariables(t *testing.T) {
+	records, _ := loadRules(t)
+	d := loadJSON(t, filepath.Join(grafana, "dashboards/shawk-hosts.json"))
+	templating, _ := d["templating"].(map[string]any)
+	list, _ := templating["list"].([]any)
+	wantVars := map[string]bool{"dst": false, "src": false, "dst_host": false}
+	wantRules := []string{
+		"shawk:host_dependency_connections:rate5m",
+		"shawk:host_dependency_connection_failures_by_reason:rate5m",
+		"shawk:host_dependency_request_bytes:rate5m",
+		"shawk:host_dependency_response_bytes:rate5m",
+	}
+	labelValuesRe := regexp.MustCompile(`^label_values\((.*), (\w+)\)$`)
+	p := parser.NewParser(parser.Options{})
+	for _, item := range list {
+		v, _ := item.(map[string]any)
+		name, _ := v["name"].(string)
+		if _, ok := wantVars[name]; !ok {
+			continue
+		}
+		wantVars[name] = true
+		q, _ := v["query"].(map[string]any)
+		query, _ := q["query"].(string)
+		def, _ := v["definition"].(string)
+		if query == "" || query != def {
+			t.Errorf("variable %s: query %q != definition %q", name, query, def)
+		}
+		m := labelValuesRe.FindStringSubmatch(query)
+		if m == nil || m[2] != name {
+			t.Errorf("variable %s: unexpected label_values query %q", name, query)
+			continue
+		}
+		parsed, err := p.ParseExpr(expandVars(m[1]))
+		if err != nil {
+			t.Errorf("variable %s: %v\n%s", name, err, m[1])
+			continue
+		}
+		vs, ok := parsed.(*parser.VectorSelector)
+		if !ok {
+			t.Errorf("variable %s: selector %q parsed as %T, want *parser.VectorSelector", name, m[1], parsed)
+			continue
+		}
+		var nameMatcher interface{ Matches(string) bool }
+		for _, lm := range vs.LabelMatchers {
+			if lm.Name == "__name__" {
+				nameMatcher = lm
+				break
+			}
+		}
+		if nameMatcher == nil {
+			t.Errorf("variable %s: no __name__ matcher in %q", name, m[1])
+			continue
+		}
+		for _, rule := range wantRules {
+			if !nameMatcher.Matches(rule) {
+				t.Errorf("variable %s: __name__ matcher in %q does not match %s", name, m[1], rule)
+			}
+		}
+	}
+	for name, seen := range wantVars {
+		if !seen {
+			t.Errorf("shawk-hosts.json: missing variable %s", name)
+		}
+	}
+	for _, rule := range wantRules {
+		expr, ok := records[rule]
+		if !ok {
+			t.Errorf("recording rule %s not found in shawk-rules.yml", rule)
+			continue
+		}
+		parsed, err := p.ParseExpr(expr)
+		if err != nil {
+			t.Errorf("recording rule %s: %v", rule, err)
+			continue
+		}
+		agg, ok := parsed.(*parser.AggregateExpr)
+		if !ok || agg.Without {
+			t.Errorf("recording rule %s: expected sum by (...) expression, got %T", rule, parsed)
+			continue
+		}
+		for name := range wantVars {
+			if !slices.Contains(agg.Grouping, name) {
+				t.Errorf("recording rule %s does not preserve label %s (grouping: %v)", rule, name, agg.Grouping)
+			}
+		}
 	}
 }
 
