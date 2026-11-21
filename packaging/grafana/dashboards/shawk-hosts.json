@@ -26,10 +26,10 @@
           "uid": "shawk-prometheus"
         },
         "query": {
-          "query": "label_values({__name__=~\"shawk:host_dependency_connections:rate5m|shawk:host_dependency_connection_failures_by_reason:rate5m\"}, dst)",
+          "query": "label_values({__name__=~\"shawk:host_dependency_connections:rate5m|shawk:host_dependency_connection_failures_by_reason:rate5m|shawk:host_dependency_request_bytes:rate5m|shawk:host_dependency_response_bytes:rate5m\"}, dst)",
           "refId": "dst"
         },
-        "definition": "label_values({__name__=~\"shawk:host_dependency_connections:rate5m|shawk:host_dependency_connection_failures_by_reason:rate5m\"}, dst)",
+        "definition": "label_values({__name__=~\"shawk:host_dependency_connections:rate5m|shawk:host_dependency_connection_failures_by_reason:rate5m|shawk:host_dependency_request_bytes:rate5m|shawk:host_dependency_response_bytes:rate5m\"}, dst)",
         "refresh": 2,
         "multi": true,
         "includeAll": true,
@@ -45,10 +45,10 @@
           "uid": "shawk-prometheus"
         },
         "query": {
-          "query": "label_values({__name__=~\"shawk:host_dependency_connections:rate5m|shawk:host_dependency_connection_failures_by_reason:rate5m\", dst=~\"$dst\"}, src)",
+          "query": "label_values({__name__=~\"shawk:host_dependency_connections:rate5m|shawk:host_dependency_connection_failures_by_reason:rate5m|shawk:host_dependency_request_bytes:rate5m|shawk:host_dependency_response_bytes:rate5m\", dst=~\"$dst\"}, src)",
           "refId": "src"
         },
-        "definition": "label_values({__name__=~\"shawk:host_dependency_connections:rate5m|shawk:host_dependency_connection_failures_by_reason:rate5m\", dst=~\"$dst\"}, src)",
+        "definition": "label_values({__name__=~\"shawk:host_dependency_connections:rate5m|shawk:host_dependency_connection_failures_by_reason:rate5m|shawk:host_dependency_request_bytes:rate5m|shawk:host_dependency_response_bytes:rate5m\", dst=~\"$dst\"}, src)",
         "refresh": 2,
         "multi": true,
         "includeAll": true,
@@ -64,10 +64,10 @@
           "uid": "shawk-prometheus"
         },
         "query": {
-          "query": "label_values({__name__=~\"shawk:host_dependency_connections:rate5m|shawk:host_dependency_connection_failures_by_reason:rate5m\", dst=~\"$dst\", src=~\"$src\"}, dst_host)",
+          "query": "label_values({__name__=~\"shawk:host_dependency_connections:rate5m|shawk:host_dependency_connection_failures_by_reason:rate5m|shawk:host_dependency_request_bytes:rate5m|shawk:host_dependency_response_bytes:rate5m\", dst=~\"$dst\", src=~\"$src\"}, dst_host)",
           "refId": "dst_host"
         },
-        "definition": "label_values({__name__=~\"shawk:host_dependency_connections:rate5m|shawk:host_dependency_connection_failures_by_reason:rate5m\", dst=~\"$dst\", src=~\"$src\"}, dst_host)",
+        "definition": "label_values({__name__=~\"shawk:host_dependency_connections:rate5m|shawk:host_dependency_connection_failures_by_reason:rate5m|shawk:host_dependency_request_bytes:rate5m|shawk:host_dependency_response_bytes:rate5m\", dst=~\"$dst\", src=~\"$src\"}, dst_host)",
         "refresh": 2,
         "multi": true,
         "includeAll": true,
