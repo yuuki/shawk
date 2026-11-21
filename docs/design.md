@@ -274,9 +274,12 @@ not attach, kprobes on the same functions stand in for them (#118), with
 the same work: the direction of a socket is then kept in an LRU hash keyed
 by the socket, with its inode, which tells it from a former socket at the
 same address (`udp_kstates`, sized as the listening ports); a socket whose
-entry the LRU evicted is decided again by its next datagram. The agent
-logs that UDP is traced with kprobes. Without either it traces TCP and
-reports that UDP is not traced. Misattributions are listed in §10.
+entry the LRU evicted is decided again by its next datagram. The inode is
+that of its `struct socket`, not of its file, which the sockets of the
+kernel (nfsd, lockd, VXLAN) lack: with the inode 0 of their missing file,
+one would take the direction of a former one at its address (#256). The
+agent logs that UDP is traced with kprobes. Without either it traces TCP
+and reports that UDP is not traced. Misattributions are listed in §10.
 
 ### 3.4 Reading flows without losing updates
 

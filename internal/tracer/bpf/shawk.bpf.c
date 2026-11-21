@@ -279,7 +279,12 @@ struct {
 	__type(value, __u8);
 } listen_ports SEC(".maps");
 
-/* UDP server ports, rebuilt by iter/udp at every scan. */
+/*
+ * UDP server ports, added by iter/udp and by udp_direction(). User space
+ * prunes them after each walk: it deletes the ports that the walk did not
+ * find, except those of the namespaces it could not open and those learned
+ * at a receive meanwhile (see scanSockets()).
+ */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 8192);
@@ -303,9 +308,10 @@ struct {
  * The direction of UDP sockets for the kprobes that stand in for the fentry
  * programs where BPF trampolines are missing (arm64 before Linux 6.0,
  * Rocky Linux 9.6 on arm64; #118): kprobes have no socket local storage.
- * Keyed by the socket, with the inode of the socket, which tells it from a
- * former socket at the same address; sized by user space. An entry the LRU
- * evicts is decided again by the next datagram, as for a new socket.
+ * Keyed by the socket, with the inode of the socket (sock_ino()), which
+ * tells it from a former socket at the same address; sized by user space.
+ * An entry the LRU evicts is decided again by the next datagram, as for a
+ * new socket.
  */
 struct shawk_udp_kstate {
 	__u64 ino;
@@ -1774,11 +1780,35 @@ static __always_inline __u64 kprobe_arg3(struct pt_regs *ctx)
 
 /*
  * The inode of a socket, which the kprobes of UDP keep with its direction
- * (udp_kstates); 0 for a socket without a file, as those of the kernel.
+ * (udp_kstates) to tell it from a former socket at the same address: the
+ * inode that sock_alloc() gives every struct socket. The sockets of the
+ * kernel (nfsd, lockd, VXLAN) have one too, but no file, whose inode would
+ * be 0 for all of them and let one take the direction of a former one
+ * (#256). 0 for a socket without a struct socket, which is not kept.
  */
 static __always_inline __u64 sock_ino(struct sock *sk)
 {
-	return BPF_CORE_READ(sk, sk_socket, file, f_inode, i_ino);
+	/* The struct socket is the first member of its struct socket_alloc. */
+	struct socket_alloc *sa = (void *)BPF_CORE_READ(sk, sk_socket);
+
+	if (!sa)
+		return 0;
+	return BPF_CORE_READ(sa, vfs_inode.i_ino);
+}
+
+/* The direction udp_kstates keeps for a socket with inode ino, or NULL. */
+static __always_inline struct shawk_udp_kstate *udp_kstate(struct sock *sk,
+							   __u64 ino)
+{
+	struct shawk_udp_kstate *ks;
+	__u64 skp = (__u64)sk;
+
+	if (!ino)
+		return NULL;
+	ks = bpf_map_lookup_elem(&udp_kstates, &skp);
+	if (ks && ks->ino == ino)
+		return ks;
+	return NULL;
 }
 
 /*
@@ -1814,8 +1844,8 @@ static __always_inline __u32 udp_direction(struct sock *sk, __u32 netns,
 
 	if (kprobe) {
 		kst.ino = sock_ino(sk);
-		ks = bpf_map_lookup_elem(&udp_kstates, &skp);
-		if (ks && ks->ino == kst.ino)
+		ks = udp_kstate(sk, kst.ino);
+		if (ks)
 			return ks->dir;
 	} else {
 		us = bpf_sk_storage_get(&udp_states, sk, NULL, 0);
@@ -1835,8 +1865,10 @@ static __always_inline __u32 udp_direction(struct sock *sk, __u32 netns,
 			__sync_fetch_and_add(&listen_port_drops, 1);
 	}
 	if (kprobe) {
+		/* Without an inode, each datagram decides again. */
 		kst.dir = dir;
-		bpf_map_update_elem(&udp_kstates, &skp, &kst, BPF_ANY);
+		if (kst.ino)
+			bpf_map_update_elem(&udp_kstates, &skp, &kst, BPF_ANY);
 		return dir;
 	}
 	us = bpf_sk_storage_get(&udp_states, sk, NULL,
@@ -1851,15 +1883,14 @@ static __always_inline bool udp_listener(struct sock *sk, __u16 port)
 {
 	struct shawk_udp_kstate *ks;
 	struct shawk_udp_state *us;
-	__u64 skp = (__u64)sk;
 
 	if (!port || BPF_CORE_READ(sk, __sk_common.skc_dport))
 		return false;
 	us = bpf_sk_storage_get(&udp_states, sk, NULL, 0);
 	if (us)
 		return us->dir == DIR_IN;
-	ks = bpf_map_lookup_elem(&udp_kstates, &skp);
-	if (ks && ks->ino == sock_ino(sk))
+	ks = udp_kstate(sk, sock_ino(sk));
+	if (ks)
 		return ks->dir == DIR_IN;
 	/* Idle since the tracer started: trust an explicitly bound port. */
 	return port_bound(sk) && !ephemeral(port);
@@ -2146,7 +2177,8 @@ int shawk_iter_udp(struct bpf_iter__udp *ctx)
 		ks.ino = sock_ino(sk);
 		ks.dir = DIR_IN;
 		skp = (__u64)sk;
-		bpf_map_update_elem(&udp_kstates, &skp, &ks, BPF_NOEXIST);
+		if (ks.ino)
+			bpf_map_update_elem(&udp_kstates, &skp, &ks, BPF_NOEXIST);
 	}
 	if (!udp_listener(sk, port))
 		return 0;
