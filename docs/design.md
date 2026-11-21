@@ -153,7 +153,15 @@ Bytes are read from the cumulative counters of `struct tcp_sock`
 walk, and the difference to the last accounted value is added to the flow
 (SYN and FIN are subtracted; see shawk.bpf.c). A socket iterator walks only
 the network namespace of the thread that opens it, so the agent opens the
-iterators in every namespace of the host (`/proc/*/ns/net`, `/run/netns`).
+iterators in every namespace of the host, and reads them, one namespace at a
+time: the files it holds do not grow with the number of namespaces. The
+namespaces are found through the bind mounts of `ip netns`, CNI and Docker
+(`/run/netns`, `/var/run/netns`, `/run/docker/netns`), which keep their
+namespace, and through `/proc/*/ns/net`, whose process may exit, and its PID
+be reused in another namespace, before the walk. Each namespace keeps up to
+four paths, bind mounts first, then the lowest PIDs; the agent checks that
+the file it opened is the namespace it listed (device and inode), else it
+tries the next path, and skips the namespace for the walk when none is left.
 Where the TCP iterator does not lock each socket (before 5.19; RHEL 9 has
 the backport), a connection closing during a walk may rarely be counted
 twice.

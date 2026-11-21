@@ -3,6 +3,7 @@ package tracer
 import (
 	"cmp"
 	"errors"
+	"io"
 	"net/netip"
 	"slices"
 	"strings"
@@ -63,11 +64,6 @@ func (t *Tracer) scanSockets() ([]Listener, []uint64, error) {
 	if beforeSocketWalk != nil {
 		beforeSocketWalk()
 	}
-	readers, skipped, err := t.openAllNetNS()
-	defer closeAll(readers)
-	if err != nil {
-		return nil, nil, err
-	}
 
 	var (
 		listeners []Listener
@@ -76,10 +72,10 @@ func (t *Tracer) scanSockets() ([]Listener, []uint64, error) {
 	// The sockets of a SO_REUSEPORT group share an address and a port.
 	seen := map[sockAddrKey]int{}
 	udpPorts := make(map[bpfShawkListenKey]bool, len(before))
-	for _, rd := range readers {
+	skipped, err := t.walkAllNetNS(func(rd io.Reader) error {
 		recs, err := readRecords(rd)
 		if err != nil {
-			return nil, nil, err
+			return err
 		}
 		for i := range recs {
 			r := &recs[i]
@@ -94,6 +90,10 @@ func (t *Tracer) scanSockets() ([]Listener, []uint64, error) {
 			}
 			listeners = addListener(listeners, seen, listenerOf(r))
 		}
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
 	}
 	if err := syncUDPListenPorts(t.udpListenPorts, before, udpPorts, skipped); err != nil {
 		return nil, nil, err
