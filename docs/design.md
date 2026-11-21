@@ -1731,7 +1731,10 @@ than a row missing from the result, so a stopped agent does not look like
 a removed dependency. Stopped agents are alerted by Prometheus
 (`ShawkAgentDown`) for 24 hours, then from `shawk_v1.agents` for 30 days,
 labelled with the host id; a host reinstalled under the same name and
-alive is not alerted. Neither alerts hosts in a planned stop (§5.7): the
+alive is not alerted. A clock off by more than a minute is alerted per host
+name, with the largest skew of its live host ids, so that a node that
+booted with a new machine id within the alive window is one series.
+Neither alerts hosts in a planned stop (§5.7): the
 Grafana alert excludes `shawk_v1.planned_stops`, and `ShawkAgentDown` the
 nodes a Slurm exporter reports in power saving (powered down, powering down
 or up, with no flag but `IDLE`, `ALLOCATED`, `MIXED`, `CLOUD` and
@@ -1750,10 +1753,14 @@ the periods from `unobserved()` and `partly_observed()` as annotations, so
 the absence of a dependency is not read as disuse over them. The table of
 gaps of the fleet dashboard gives their reasons (`unobserved_reasons()`),
 per host name as `unobserved_by_name()`: the old ids of a node whose
-machine id changed have gaps in the annotations, not in the table. SYN
-retransmissions per connection attempt (handshakes plus failures) exceed 1
-when connects time out, and `TCP_FASTOPEN_CONNECT` connects, which have no
-handshake, raise them. OBI panels use a minimum interval of a minute, since
+machine id changed have gaps in the annotations, not in the table. The
+panels keep `network_transport` beside `server_port`, as the recording
+rules do: port 0 is that of Unix sockets and of the servers of
+`port_agnostic_services` and `dynamic_ports` (§5.3), and TCP and UDP share
+the numbers of ports. SYN retransmissions per connection attempt
+(handshakes plus failures over TCP) exceed 1 when connects time out, and
+`TCP_FASTOPEN_CONNECT` connects, which have no handshake, raise them. OBI
+panels use a minimum interval of a minute, since
 OBI exports every 60 seconds by default.
 
 Where the absence of a dependency is read (the changes dashboard, and the

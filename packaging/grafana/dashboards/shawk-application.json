@@ -248,9 +248,9 @@
             "uid": "shawk-prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (dst, server_port) (shawk:dependency_connections:rate5m{src=\"$service\"})",
+          "expr": "sum by (dst, server_port, network_transport) (shawk:dependency_connections:rate5m{src=\"$service\"})",
           "range": true,
-          "legendFormat": "→ {{dst}}:{{server_port}}"
+          "legendFormat": "→ {{dst}}:{{server_port}}/{{network_transport}}"
         },
         {
           "refId": "B",
@@ -259,9 +259,9 @@
             "uid": "shawk-prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (src, server_port) (shawk:dependency_connections:rate5m{dst=\"$service\"})",
+          "expr": "sum by (src, server_port, network_transport) (shawk:dependency_connections:rate5m{dst=\"$service\"})",
           "range": true,
-          "legendFormat": "← {{src}}:{{server_port}}"
+          "legendFormat": "← {{src}}:{{server_port}}/{{network_transport}}"
         }
       ],
       "fieldConfig": {

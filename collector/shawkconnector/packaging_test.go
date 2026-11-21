@@ -681,6 +681,42 @@ func TestPGSilentAlertReinstall(t *testing.T) {
 	}
 }
 
+// TestPGClockSkewAlertSharedName: the clock skew alert has one series per
+// host name, labelled with the name only, also when two live host ids have
+// it, as a node that booted with a new machine id within the alive window;
+// its value is the largest skew.
+func TestPGClockSkewAlertSharedName(t *testing.T) {
+	_, conn := migratedDB(t)
+	execAll(t, conn,
+		`INSERT INTO shawk.hosts VALUES
+		   ('old','m1','node-1','k','v',now()-interval '30 days',now()-interval '3 minutes'),
+		   ('new','m2','node-1','k','v',now()-interval '2 minutes',now()),
+		   ('synced','m3','node-2','k','v',now()-interval '30 days',now()),
+		   ('silent','m4','node-3','k','v',now()-interval '30 days',now()-interval '1 hour')`,
+		`INSERT INTO shawk.agent_sessions (host_id, started_at, last_heartbeat, udp_traced, netns_scope, clock_skew) VALUES
+		   ('old', now()-interval '30 days', now()-interval '3 minutes', true, 'all', interval '120 seconds'),
+		   ('new', now()-interval '2 minutes', now(), true, 'all', interval '-90 seconds'),
+		   ('synced', now()-interval '30 days', now(), true, 'all', interval '1 second'),
+		   ('silent', now()-interval '30 days', now()-interval '1 hour', true, 'all', interval '300 seconds')`)
+	q := packagedSQL(t)["shawk-rules.yaml/shawk-agents/shawk agent clock skew/A/A#0"]
+	if q == "" {
+		t.Fatal("no query")
+	}
+	rows, err := conn.Query(context.Background(), q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for rows.Next() {
+		vals, _ := rows.Values()
+		got = append(got, fmt.Sprint(vals[1:]))
+	}
+	rows.Close()
+	if !slices.Equal(got, []string{"[node-1 120]"}) {
+		t.Errorf("skewed clocks = %v", got)
+	}
+}
+
 // TestPGMapWalkHubs: the map walks every service once rather than every
 // path, which would explode around shared services at a depth of 5.
 func TestPGMapWalkHubs(t *testing.T) {

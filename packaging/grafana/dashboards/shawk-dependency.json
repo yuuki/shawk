@@ -148,9 +148,9 @@
             "uid": "shawk-prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (src, dst, server_port) (shawk:dependency_connections:rate5m{src=~\"$src\", dst=~\"$dst\"})",
+          "expr": "sum by (src, dst, server_port, network_transport) (shawk:dependency_connections:rate5m{src=~\"$src\", dst=~\"$dst\"})",
           "range": true,
-          "legendFormat": "{{src}} → {{dst}}:{{server_port}}"
+          "legendFormat": "{{src}} → {{dst}}:{{server_port}}/{{network_transport}}"
         }
       ],
       "fieldConfig": {
@@ -200,9 +200,9 @@
             "uid": "shawk-prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (src, dst, server_port) (shawk:dependency_connection_failures:rate5m{src=~\"$src\", dst=~\"$dst\"})\n  / (sum by (src, dst, server_port) (shawk:dependency_connections:rate5m{src=~\"$src\", dst=~\"$dst\"})\n     + sum by (src, dst, server_port) (shawk:dependency_connection_failures:rate5m{src=~\"$src\", dst=~\"$dst\"}))",
+          "expr": "sum by (src, dst, server_port, network_transport) (shawk:dependency_connection_failures:rate5m{src=~\"$src\", dst=~\"$dst\"})\n  / (sum by (src, dst, server_port, network_transport) (shawk:dependency_connections:rate5m{src=~\"$src\", dst=~\"$dst\"})\n     + sum by (src, dst, server_port, network_transport) (shawk:dependency_connection_failures:rate5m{src=~\"$src\", dst=~\"$dst\"}))",
           "range": true,
-          "legendFormat": "{{src}} → {{dst}}:{{server_port}}"
+          "legendFormat": "{{src}} → {{dst}}:{{server_port}}/{{network_transport}}"
         }
       ],
       "fieldConfig": {
@@ -253,9 +253,9 @@
             "uid": "shawk-prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (src, dst, server_port) (shawk:dependency_request_bytes:rate5m{src=~\"$src\", dst=~\"$dst\"})",
+          "expr": "sum by (src, dst, server_port, network_transport) (shawk:dependency_request_bytes:rate5m{src=~\"$src\", dst=~\"$dst\"})",
           "range": true,
-          "legendFormat": "request {{src}} → {{dst}}:{{server_port}}"
+          "legendFormat": "request {{src}} → {{dst}}:{{server_port}}/{{network_transport}}"
         },
         {
           "refId": "B",
@@ -264,9 +264,9 @@
             "uid": "shawk-prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (src, dst, server_port) (shawk:dependency_response_bytes:rate5m{src=~\"$src\", dst=~\"$dst\"})",
+          "expr": "sum by (src, dst, server_port, network_transport) (shawk:dependency_response_bytes:rate5m{src=~\"$src\", dst=~\"$dst\"})",
           "range": true,
-          "legendFormat": "response {{src}} → {{dst}}:{{server_port}}"
+          "legendFormat": "response {{src}} → {{dst}}:{{server_port}}/{{network_transport}}"
         }
       ],
       "fieldConfig": {
@@ -316,9 +316,9 @@
             "uid": "shawk-prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (src, dst, server_port) (shawk:dependency_rtt_seconds_sum:rate5m{src=~\"$src\", dst=~\"$dst\"})\n  / sum by (src, dst, server_port) (shawk:dependency_rtt_seconds_count:rate5m{src=~\"$src\", dst=~\"$dst\"})",
+          "expr": "sum by (src, dst, server_port, network_transport) (shawk:dependency_rtt_seconds_sum:rate5m{src=~\"$src\", dst=~\"$dst\"})\n  / sum by (src, dst, server_port, network_transport) (shawk:dependency_rtt_seconds_count:rate5m{src=~\"$src\", dst=~\"$dst\"})",
           "range": true,
-          "legendFormat": "{{src}} → {{dst}}:{{server_port}}"
+          "legendFormat": "{{src}} → {{dst}}:{{server_port}}/{{network_transport}}"
         }
       ],
       "fieldConfig": {
@@ -369,9 +369,9 @@
             "uid": "shawk-prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (src, dst, server_port, shawk_role) (shawk:dependency_retransmits:rate5m{src=~\"$src\", dst=~\"$dst\"})",
+          "expr": "sum by (src, dst, server_port, network_transport, shawk_role) (shawk:dependency_retransmits:rate5m{src=~\"$src\", dst=~\"$dst\"})",
           "range": true,
-          "legendFormat": "{{shawk_role}} sends: {{src}} → {{dst}}:{{server_port}}"
+          "legendFormat": "{{shawk_role}} sends: {{src}} → {{dst}}:{{server_port}}/{{network_transport}}"
         }
       ],
       "fieldConfig": {
@@ -421,9 +421,9 @@
             "uid": "shawk-prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (src, dst, server_port) (shawk:dependency_open_connections{src=~\"$src\", dst=~\"$dst\"})",
+          "expr": "sum by (src, dst, server_port, network_transport) (shawk:dependency_open_connections{src=~\"$src\", dst=~\"$dst\"})",
           "range": true,
-          "legendFormat": "{{src}} → {{dst}}:{{server_port}}"
+          "legendFormat": "{{src}} → {{dst}}:{{server_port}}/{{network_transport}}"
         }
       ],
       "fieldConfig": {
@@ -472,9 +472,9 @@
             "uid": "shawk-prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (src, dst, server_port) (shawk:dependency_handshake_seconds_sum:rate5m{src=~\"$src\", dst=~\"$dst\"})\n  / sum by (src, dst, server_port) (shawk:dependency_handshake_seconds_count:rate5m{src=~\"$src\", dst=~\"$dst\"})",
+          "expr": "sum by (src, dst, server_port, network_transport) (shawk:dependency_handshake_seconds_sum:rate5m{src=~\"$src\", dst=~\"$dst\"})\n  / sum by (src, dst, server_port, network_transport) (shawk:dependency_handshake_seconds_count:rate5m{src=~\"$src\", dst=~\"$dst\"})",
           "range": true,
-          "legendFormat": "{{src}} → {{dst}}:{{server_port}}"
+          "legendFormat": "{{src}} → {{dst}}:{{server_port}}/{{network_transport}}"
         }
       ],
       "fieldConfig": {
@@ -525,9 +525,9 @@
             "uid": "shawk-prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (src, dst, server_port) (shawk:dependency_syn_retransmits:rate5m{src=~\"$src\", dst=~\"$dst\"})\n  / sum by (src, dst, server_port) (\n      shawk:dependency_handshake_seconds_count:rate5m{src=~\"$src\", dst=~\"$dst\"}\n      or shawk:dependency_connection_failures_by_reason:rate5m{src=~\"$src\", dst=~\"$dst\"})",
+          "expr": "sum by (src, dst, server_port, network_transport) (shawk:dependency_syn_retransmits:rate5m{src=~\"$src\", dst=~\"$dst\"})\n  / sum by (src, dst, server_port, network_transport) (\n      shawk:dependency_handshake_seconds_count:rate5m{src=~\"$src\", dst=~\"$dst\"}\n      or shawk:dependency_connection_failures_by_reason:rate5m{src=~\"$src\", dst=~\"$dst\", network_transport=\"tcp\"})",
           "range": true,
-          "legendFormat": "{{src}} → {{dst}}:{{server_port}}"
+          "legendFormat": "{{src}} → {{dst}}:{{server_port}}/{{network_transport}}"
         }
       ],
       "fieldConfig": {
@@ -555,7 +555,7 @@
           "sort": "desc"
         }
       },
-      "description": "SYNs that the client side retransmitted per connection attempt (a connect that times out retransmits several), established or failed: a SYN or its SYN-ACK was lost, or dropped by a firewall, a network policy or a server whose accept queue is full. The attempts are the handshakes and the failures by reason, which agents send with the retransmissions; connects with TCP_FASTOPEN_CONNECT have no handshake and raise the ratio."
+      "description": "SYNs that the client side retransmitted per connection attempt (a connect that times out retransmits several), established or failed: a SYN or its SYN-ACK was lost, or dropped by a firewall, a network policy or a server whose accept queue is full. The attempts are the handshakes and the failures by reason over TCP, which agents send with the retransmissions; connects with TCP_FASTOPEN_CONNECT have no handshake and raise the ratio."
     },
     {
       "id": 12,
@@ -579,9 +579,9 @@
             "uid": "shawk-prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (src, dst, server_port, error_type) (shawk:dependency_connection_failures_by_reason:rate5m{src=~\"$src\", dst=~\"$dst\"})",
+          "expr": "sum by (src, dst, server_port, network_transport, error_type) (shawk:dependency_connection_failures_by_reason:rate5m{src=~\"$src\", dst=~\"$dst\"})",
           "range": true,
-          "legendFormat": "{{src}} → {{dst}}:{{server_port}} {{error_type}}"
+          "legendFormat": "{{src}} → {{dst}}:{{server_port}}/{{network_transport}} {{error_type}}"
         }
       ],
       "fieldConfig": {
@@ -636,9 +636,9 @@
             "uid": "shawk-prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (src, dst, server_port) (shawk:dependency_request_datagrams:rate5m{src=~\"$src\", dst=~\"$dst\"})",
+          "expr": "sum by (src, dst, server_port, network_transport) (shawk:dependency_request_datagrams:rate5m{src=~\"$src\", dst=~\"$dst\"})",
           "range": true,
-          "legendFormat": "request {{src}} → {{dst}}:{{server_port}}"
+          "legendFormat": "request {{src}} → {{dst}}:{{server_port}}/{{network_transport}}"
         },
         {
           "refId": "B",
@@ -647,9 +647,9 @@
             "uid": "shawk-prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (src, dst, server_port) (shawk:dependency_response_datagrams:rate5m{src=~\"$src\", dst=~\"$dst\"})",
+          "expr": "sum by (src, dst, server_port, network_transport) (shawk:dependency_response_datagrams:rate5m{src=~\"$src\", dst=~\"$dst\"})",
           "range": true,
-          "legendFormat": "response {{src}} → {{dst}}:{{server_port}}"
+          "legendFormat": "response {{src}} → {{dst}}:{{server_port}}/{{network_transport}}"
         }
       ],
       "fieldConfig": {

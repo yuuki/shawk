@@ -131,9 +131,23 @@ func TestDashboards(t *testing.T) {
 				return
 			}
 			e := expandVars(expr)
-			if _, err := parser.NewParser(parser.Options{}).ParseExpr(e); err != nil {
+			node, err := parser.NewParser(parser.Options{}).ParseExpr(e)
+			if err != nil {
 				t.Errorf("%s: %v\n%s", f, err, e)
+				return
 			}
+			// Port 0 is that of the dependencies over Unix sockets and of
+			// those over TCP or UDP to the servers without a port of
+			// port_agnostic_services and dynamic_ports; and TCP and UDP
+			// share the numbers of ports. A dependency is thus a port and
+			// a transport, as in the recording rules.
+			parser.Inspect(node, func(n parser.Node, _ []parser.Node) error {
+				if a, ok := n.(*parser.AggregateExpr); ok && !a.Without &&
+					slices.Contains(a.Grouping, "server_port") && !slices.Contains(a.Grouping, "network_transport") {
+					t.Errorf("%s: %s keeps server_port without network_transport:\n%s", f, a.Op, expr)
+				}
+				return nil
+			})
 			for _, m := range regexp.MustCompile(`shawk:[a-z_:0-9]+`).FindAllString(expr, -1) {
 				if _, ok := records[m]; !ok {
 					t.Errorf("%s: unknown recording rule %s", f, m)
