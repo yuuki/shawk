@@ -108,10 +108,12 @@ func stallingProxy(t *testing.T, addr string, stall []byte) string {
 	}
 	var mu sync.Mutex
 	var conns []net.Conn
+	var closed bool
 	t.Cleanup(func() {
 		l.Close()
 		mu.Lock()
 		defer mu.Unlock()
+		closed = true
 		for _, c := range conns {
 			c.Close()
 		}
@@ -144,6 +146,14 @@ func stallingProxy(t *testing.T, addr string, stall []byte) string {
 				return
 			}
 			mu.Lock()
+			if closed {
+				// The test ended while this connection was accepted, so
+				// its cleanup did not see it: close it here.
+				mu.Unlock()
+				c.Close()
+				s.Close()
+				return
+			}
 			conns = append(conns, c, s)
 			mu.Unlock()
 			go io.Copy(c, s)
