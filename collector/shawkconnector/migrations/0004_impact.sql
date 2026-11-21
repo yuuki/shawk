@@ -149,32 +149,44 @@ FROM c
 $$;
 
 -- How each host of hosts was observed in [since, until], by name as
--- unobserved_by_name(): the time in which an agent of the name observed
--- (with the tolerance of the delay of writes), in which it dropped flows,
--- and in which it did not trace UDP or Unix sockets, or traced one network
--- namespace only. agent tells whether an agent of the name ever reported.
+-- unobserved_by_name(): the time in which an agent of the name observed,
+-- in which it dropped flows, and in which it did not trace UDP or Unix
+-- sockets, or traced one network namespace only. agent tells whether an
+-- agent of the name ever reported, and pruned is the part of the period
+-- before the retention (shawk.retention), which is not observed whatever
+-- the sessions say: its dependencies are deleted.
+--
+-- observed is the time for which the history tells what the host was used
+-- for. A session counts from its start, by the clock of the connector
+-- (started_at is by the clock of the agent, clock_skew behind), to its
+-- last heartbeat, with the tolerance for the delay of the writes of an
+-- agent that goes on. The edges keep the times of the agent: with a clock
+-- behind, what the agent saw up to the heartbeat is dated up to clock_skew
+-- before it, so the session ends that much earlier. A clock ahead does not
+-- shorten it: the connector does not write times after its own.
 CREATE FUNCTION shawk.observation(since timestamptz, until timestamptz, hosts text[], tolerance interval)
-RETURNS TABLE (host text, agent boolean, observed tstzmultirange, dropped tstzmultirange, dropped_flows bigint,
+RETURNS TABLE (host text, agent boolean, observed tstzmultirange, pruned tstzmultirange,
+               dropped tstzmultirange, dropped_flows bigint,
                udp_untraced tstzmultirange, unix_untraced tstzmultirange, netns_limited tstzmultirange)
 LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $$
 WITH ids AS (
   SELECT h.id, h.hostname FROM shawk.hosts h WHERE h.hostname = ANY (observation.hosts)
 ),
 -- Only the sessions that meet the period, as in unobserved_by_name().
--- The tolerance covers the delay of the writes of an agent that goes on:
--- it is no time traced, so that the session that follows one is not taken
--- for it.
 s AS (
-  SELECT i.hostname, a.udp_traced, a.unix_traced, a.netns_scope,
-         least(a.started_at + a.clock_skew, a.last_heartbeat) AS started, a.last_heartbeat
+  SELECT i.hostname, a.udp_traced, a.unix_traced, a.netns_scope, a.last_heartbeat,
+         least(a.started_at + a.clock_skew, a.last_heartbeat - greatest(a.clock_skew, interval '0')) AS started,
+         a.last_heartbeat - greatest(a.clock_skew, interval '0') AS ended
   FROM ids i
   JOIN shawk.agent_sessions a ON a.host_id = i.id
   WHERE a.last_heartbeat > observation.since - observation.tolerance
     AND least(a.started_at + a.clock_skew, a.last_heartbeat) < observation.until
 ),
+-- The tolerance is no time traced, so that the session that follows one
+-- is not taken for it.
 ses AS (
   SELECT s.hostname,
-         range_agg(tstzrange(s.started, s.last_heartbeat + observation.tolerance)) AS observed,
+         range_agg(tstzrange(s.started, s.ended + observation.tolerance)) AS observed,
          range_agg(tstzrange(s.started, s.last_heartbeat)) FILTER (WHERE NOT s.udp_traced) AS udp_untraced,
          range_agg(tstzrange(s.started, s.last_heartbeat)) FILTER (WHERE s.unix_traced IS NOT TRUE) AS unix_untraced,
          range_agg(tstzrange(s.started, s.last_heartbeat)) FILTER (WHERE s.netns_scope <> 'all') AS netns_limited
@@ -186,17 +198,22 @@ par AS (
   JOIN shawk.partial_observations p ON p.host_id = i.id
   WHERE p.period_end > observation.since AND p.period_start < observation.until
   GROUP BY i.hostname
+),
+w AS (
+  SELECT shawk.period(observation.since, observation.until) AS period,
+         coalesce((SELECT tstzmultirange(tstzrange(NULL, r.pruned_before)) FROM shawk.retention r), '{}') AS pruned
 )
 SELECT n.host,
        EXISTS (SELECT FROM ids i WHERE i.hostname = n.host),
-       coalesce(ses.observed, '{}') * w.period,
+       coalesce(ses.observed, '{}') * w.period - w.pruned,
+       w.period * w.pruned,
        coalesce(par.dropped, '{}') * w.period,
        coalesce(par.dropped_flows, 0),
        coalesce(ses.udp_untraced, '{}') * w.period,
        coalesce(ses.unix_untraced, '{}') * w.period,
        coalesce(ses.netns_limited, '{}') * w.period
 FROM (SELECT DISTINCT u.host FROM unnest(observation.hosts) AS u(host) WHERE u.host IS NOT NULL) n
-CROSS JOIN (SELECT shawk.period(observation.since, observation.until) AS period) w
+CROSS JOIN w
 LEFT JOIN ses ON ses.hostname = n.host
 LEFT JOIN par ON par.hostname = n.host
 $$;
@@ -205,26 +222,33 @@ $$;
 
 -- How much of [since, until] each host of hosts was observed, by name:
 -- every host that reported since `since` when hosts is NULL. observed is
--- the part of the period, from 0 to 1, in which an agent of the name
--- observed; unobserved the time in which none did, in `gaps` gaps (those
--- of unobserved_by_name()); partly_observed the time in which it dropped
--- flows (partly_observed()), and dropped_flows how many. udp_untraced,
+-- the part of the period, from 0 to 1, for which the history tells what
+-- the host was used for: an agent of the name observed, and the time is
+-- within the retention. unobserved is the rest, in `gaps` gaps (those of
+-- coverage_gaps()), of which before_retention precedes the retention;
+-- partly_observed the time in which the agent dropped flows
+-- (partly_observed()), and dropped_flows how many. udp_untraced,
 -- unix_untraced and netns_limited are the time observed without UDP,
 -- without Unix sockets (or by an agent that does not tell), or in one
 -- network namespace only. agent is false for a name no agent ever
 -- reported under, within the retention.
+--
+-- The time observed is not that of unobserved_by_name(): a session ends
+-- earlier by the time the clock of its host is behind, and nothing is
+-- observed before the retention (shawk.observation).
 CREATE FUNCTION shawk_v1.coverage(since timestamptz, until timestamptz, hosts text[] DEFAULT NULL,
                                   tolerance interval DEFAULT '3 minutes')
 RETURNS TABLE (host text, agent boolean, observed numeric, unobserved interval, gaps integer,
                partly_observed interval, dropped_flows bigint,
-               udp_untraced interval, unix_untraced interval, netns_limited interval)
+               udp_untraced interval, unix_untraced interval, netns_limited interval, before_retention interval)
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
   SELECT o.host, o.agent,
          -- Cut, not rounded: 1 is a host observed all along.
          trunc(extract(epoch FROM shawk.duration(o.observed)) / extract(epoch FROM coverage.until - coverage.since), 6),
          shawk.duration(g.gaps), (SELECT count(*)::integer FROM unnest(g.gaps)),
          shawk.duration(o.dropped), o.dropped_flows,
-         shawk.duration(o.udp_untraced), shawk.duration(o.unix_untraced), shawk.duration(o.netns_limited)
+         shawk.duration(o.udp_untraced), shawk.duration(o.unix_untraced), shawk.duration(o.netns_limited),
+         shawk.duration(o.pruned)
   FROM shawk.observation(coverage.since, coverage.until,
          coalesce(coverage.hosts,
                   ARRAY(SELECT h.hostname FROM shawk.hosts h GROUP BY h.hostname HAVING max(h.last_seen) >= coverage.since)),
@@ -233,6 +257,27 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
     SELECT shawk.period(coverage.since, coverage.until) - o.observed AS gaps
   ) g
   WHERE coverage.since < coverage.until
+$$;
+
+-- The gaps of coverage(): the stretches of [since, until] for which the
+-- history does not tell what a host of hosts was used for, by name, each
+-- with its cause: retention for the time before the retention, agent for
+-- the time in which no agent of the name observed. Unlike
+-- unobserved_by_name(), a name that no agent reported under has a gap, the
+-- whole period.
+CREATE FUNCTION shawk_v1.coverage_gaps(since timestamptz, until timestamptz, hosts text[],
+                                       tolerance interval DEFAULT '3 minutes')
+RETURNS TABLE (host text, gap_start timestamptz, gap_end timestamptz, cause text)
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+  SELECT o.host, lower(g.gap), upper(g.gap), g.cause
+  FROM shawk.observation(coverage_gaps.since, coverage_gaps.until, coverage_gaps.hosts, coverage_gaps.tolerance) o
+  CROSS JOIN LATERAL (
+    SELECT x AS gap, 'retention' AS cause FROM unnest(o.pruned) AS x
+    UNION ALL
+    SELECT x, 'agent' FROM unnest(shawk.period(coverage_gaps.since, coverage_gaps.until) - o.observed - o.pruned) AS x
+  ) g
+  WHERE coverage_gaps.since < coverage_gaps.until
+  ORDER BY o.host, lower(g.gap)
 $$;
 
 -- The dependencies that make the dependents of a target (shawk_v1.impact),
@@ -622,7 +667,8 @@ $$;
 --
 -- coverage is the part of the period, from 0 to 1, in which an agent of
 -- the target observed all that the target covers: observed (not_observed
--- otherwise), without dropped flows (dropped_flows), in every network
+-- otherwise, or before_retention for the part of the period whose
+-- dependencies are deleted), without dropped flows (dropped_flows), in every network
 -- namespace (netns_limited), with UDP unless target_proto is another
 -- transport (udp_not_traced), and with Unix sockets when the target is a
 -- service without a port (unix_not_traced). A target that no agent reported
@@ -671,6 +717,11 @@ BEGIN
   IF target_port < 1 OR target_port > 65535 THEN
     RAISE EXCEPTION 'target_port is from 1 to 65535: %', target_port USING ERRCODE = 'invalid_parameter_value';
   END IF;
+  -- The tolerance is the delay of writes: one that hides gaps of hours is
+  -- a mistake.
+  IF tolerance IS NULL OR tolerance < interval '0' OR tolerance > interval '1 hour' THEN
+    RAISE EXCEPTION 'tolerance is from 0 to 1 hour: %', tolerance USING ERRCODE = 'invalid_parameter_value';
+  END IF;
   period := shawk.period(since, until);
 
   SELECT count(DISTINCT (i.cli_host, i.cli_service, i.cli_addr)) FILTER (WHERE i.depth = 1),
@@ -684,8 +735,11 @@ BEGIN
   blind := missing + o.dropped + o.netns_limited;
   shortfalls := CASE WHEN NOT o.agent AND inventoried THEN ARRAY['no_agent']
                      WHEN NOT o.agent THEN ARRAY['unknown_host']
-                     WHEN NOT isempty(missing) THEN ARRAY['not_observed']
+                     WHEN NOT isempty(missing - o.pruned) THEN ARRAY['not_observed']
                      ELSE '{}'::text[] END;
+  IF o.agent AND NOT isempty(o.pruned) THEN
+    shortfalls := shortfalls || 'before_retention'::text;
+  END IF;
   IF NOT isempty(o.dropped) THEN
     shortfalls := shortfalls || 'dropped_flows'::text;
   END IF;

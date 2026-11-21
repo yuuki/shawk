@@ -30,12 +30,25 @@ CREATE TABLE shawk.unix_edge_activity (
 );
 CREATE INDEX unix_edge_activity_month ON shawk.unix_edge_activity (month);
 
--- shawk.prune() of 0002_edge_protocols.sql, which also deletes the months
--- of activity that ended before the cutoff, of edges seen since: a month
--- has at most 31 days. They are deleted after their edges, in the order
--- the connector writes them, like the wire protocols; the months of the
--- edges deleted go with them (ON DELETE CASCADE), which ROW_COUNT does not
--- count.
+-- How far back the history is whole: the latest cutoff shawk.prune() was
+-- called with. An edge last seen before it is deleted, but the session of
+-- an agent that goes on is kept whole, so that the sessions alone would
+-- tell that a host was observed, and unused, in a time whose dependencies
+-- are gone. What reads the history as evidence that something was not used
+-- (0004_impact.sql) takes the time before the cutoff as not observed. No
+-- row until the first prune.
+CREATE TABLE shawk.retention (
+  singleton     boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+  pruned_before timestamptz NOT NULL
+);
+
+-- shawk.prune() of 0002_edge_protocols.sql, which also records its cutoff
+-- (shawk.retention), first, so that no reader takes the history for whole
+-- while it is deleted, and deletes the months of activity that ended
+-- before the cutoff, of edges seen since: a month has at most 31 days. They
+-- are deleted after their edges, in the order the connector writes them,
+-- like the wire protocols; the months of the edges deleted go with them
+-- (ON DELETE CASCADE), which ROW_COUNT does not count.
 CREATE OR REPLACE FUNCTION shawk.prune(cutoff timestamptz, max_rows integer DEFAULT 10000) RETURNS bigint
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -43,6 +56,10 @@ DECLARE
   total bigint := 0;
 BEGIN
   PERFORM pg_advisory_xact_lock_shared(1936220535);  -- 0x73686177, see Migrate
+
+  INSERT INTO shawk.retention AS r (pruned_before) VALUES (cutoff)
+  ON CONFLICT (singleton) DO UPDATE SET pruned_before = excluded.pruned_before
+  WHERE r.pruned_before < excluded.pruned_before;
 
   DELETE FROM shawk.edges WHERE last_seen < cutoff AND id IN (
     SELECT id FROM shawk.edges WHERE last_seen < cutoff LIMIT max_rows);

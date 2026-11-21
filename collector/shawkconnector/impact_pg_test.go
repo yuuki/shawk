@@ -566,6 +566,31 @@ func TestPGImpactVerdict(t *testing.T) {
 			f.observed(h, impactSince.Add(-time.Hour), day(30, 0))
 			f.observed(h, day(30, 0).Add(3*time.Minute+10*time.Second), impactUntil)
 		}, "", "INCONCLUSIVE {not_observed} {} 0 0 0.999998"},
+		// The coverage is compared as it is, not as it is reported.
+		{"a gap of ten seconds, of a caller that accepts a little more", func(h string) {
+			f.host(h, "10.0.2.25")
+			f.observed(h, impactSince.Add(-time.Hour), day(30, 0))
+			f.observed(h, day(30, 0).Add(3*time.Minute+10*time.Second), impactUntil)
+		}, ", min_coverage => 0.999999", "INCONCLUSIVE {not_observed} {} 0 0 0.999998"},
+		{"a gap that a longer tolerance covers", func(h string) {
+			f.host(h, "10.0.2.26")
+			f.observed(h, impactSince.Add(-time.Hour), day(30, 0))
+			f.observed(h, day(30, 0).Add(10*time.Minute), impactUntil)
+		}, ", tolerance => '15 minutes'", "SAFE {} {} 0 0 1.000000"},
+		// A clock an hour behind: the session started half an hour into the
+		// period, and what it saw in its last hour is dated before.
+		{"a clock behind", func(h string) {
+			f.host(h, "10.0.2.27")
+			f.observed(h, impactSince.Add(-30*time.Minute), impactUntil)
+			f.exec(`UPDATE shawk.agent_sessions SET clock_skew = '1 hour' WHERE host_id = $1`, h)
+		}, "", "INCONCLUSIVE {not_observed} {} 0 0 0.999328"},
+		// A clock an hour ahead: the session started half an hour before
+		// the period, and the connector does not write times after its own.
+		{"a clock ahead", func(h string) {
+			f.host(h, "10.0.2.28")
+			f.observed(h, impactSince.Add(30*time.Minute), impactUntil)
+			f.exec(`UPDATE shawk.agent_sessions SET clock_skew = '-1 hour' WHERE host_id = $1`, h)
+		}, "", "SAFE {} {} 0 0 1.000000"},
 		{"a gap that the caller accepts", func(h string) {
 			f.host(h, "10.0.2.3")
 			f.observed(h, impactSince.Add(-time.Hour), day(30, 0))
@@ -591,6 +616,16 @@ func TestPGImpactVerdict(t *testing.T) {
 			f.observed(h, impactSince.Add(-time.Hour), day(89, 0))
 			f.session(h, day(89, 0), impactUntil, "false", "true", "'all'")
 		}, "", "INCONCLUSIVE {udp_not_traced} {} 0 0 0.988888"},
+		// Dropped from an hour before the period to two hours into it.
+		{"dropped flows over the start of the period", func(h string) {
+			f.watched(h, "10.0.2.29")
+			f.exec(`INSERT INTO shawk.partial_observations VALUES ($1, $2, $3, $4, 7)`, h, impactSince.Add(-time.Hour),
+				impactSince.Add(-time.Hour), impactSince.Add(2*time.Hour))
+		}, "", "INCONCLUSIVE {dropped_flows} {} 0 0 0.999074"},
+		{"UDP not traced, of a target of UDP", func(h string) {
+			f.host(h, "10.0.2.30")
+			f.session(h, impactSince, impactUntil, "false", "true", "'all'")
+		}, ", target_proto => 'udp'", "INCONCLUSIVE {udp_not_traced} {} 0 0 0.000000"},
 		{"UDP not traced, of a target of TCP", func(h string) {
 			f.host(h, "10.0.2.9")
 			f.session(h, impactSince, impactUntil, "false", "true", "'all'")
@@ -686,6 +721,9 @@ func TestPGImpactVerdict(t *testing.T) {
 		`SELECT * FROM shawk_v1.impact_verdict('db-01', now() - interval '1 day', now(), target_proto => 'TCP')`,
 		`SELECT * FROM shawk_v1.impact_verdict('db-01', now() - interval '1 day', now(), target_port => 0)`,
 		`SELECT * FROM shawk_v1.impact_verdict('db-01', now() - interval '1 day', now(), target_port => 65536)`,
+		`SELECT * FROM shawk_v1.impact_verdict('db-01', now() - interval '1 day', now(), tolerance => '2 hours')`,
+		`SELECT * FROM shawk_v1.impact_verdict('db-01', now() - interval '1 day', now(), tolerance => '-1 second')`,
+		`SELECT * FROM shawk_v1.impact_verdict('db-01', now() - interval '1 day', now(), tolerance => NULL)`,
 	} {
 		if _, err := f.conn.Exec(context.Background(), q); err == nil {
 			t.Errorf("%s: no error", q)
@@ -1009,22 +1047,108 @@ func TestPGCoverage(t *testing.T) {
 	f.exec(`INSERT INTO shawk.hosts VALUES ('old-01', 'm', 'old-01', 'k', 'v', $1, $1)`, impactSince.Add(-48*time.Hour))
 	const cols = `host, agent, observed::text, extract(epoch FROM unobserved)::int, gaps, extract(epoch FROM partly_observed)::int,
 		dropped_flows, extract(epoch FROM udp_untraced)::int, extract(epoch FROM unix_untraced)::int,
-		extract(epoch FROM netns_limited)::int`
+		extract(epoch FROM netns_limited)::int, extract(epoch FROM before_retention)::int`
+	const gapCols = `host, to_char(gap_start AT TIME ZONE 'UTC', 'MM-DD"T"HH24:MI'), to_char(gap_end AT TIME ZONE 'UTC', 'MM-DD"T"HH24:MI'), cause`
 	args := ts(impactSince) + ", " + ts(impactUntil)
 	checkRows(t, "coverage of every host", queryStrings(t, conn, `SELECT `+cols+` FROM shawk_v1.coverage(`+args+`)`), []string{
-		"full-01 true 1.000000 0 0 0 0 0 0 0",
+		"full-01 true 1.000000 0 0 0 0 0 0 0 0",
 		// 45 days, and a day less 3 minutes: the tolerance.
-		"part-01 true 0.488912 3974220 2 32400 7 86400 86400 86400",
+		"part-01 true 0.488912 3974220 2 32400 7 86400 86400 86400 0",
 	})
 	checkRows(t, "coverage of hosts by name",
 		queryStrings(t, conn, `SELECT `+cols+` FROM shawk_v1.coverage(`+args+`, ARRAY['old-01', 'none-01', 'full-01', 'full-01'])`), []string{
-			"full-01 true 1.000000 0 0 0 0 0 0 0",
-			"none-01 false 0.000000 7776000 1 0 0 0 0 0",
-			"old-01 true 0.000000 7776000 1 0 0 0 0 0",
+			"full-01 true 1.000000 0 0 0 0 0 0 0 0",
+			"none-01 false 0.000000 7776000 1 0 0 0 0 0 0",
+			"old-01 true 0.000000 7776000 1 0 0 0 0 0 0",
+		})
+	// The gaps, also of the names that were not seen in the period.
+	checkRows(t, "gaps",
+		queryStrings(t, conn, `SELECT `+gapCols+` FROM shawk_v1.coverage_gaps(`+args+`, ARRAY['old-01', 'none-01', 'full-01', 'part-01'])`), []string{
+			"none-01 08-01T00:00 10-30T00:00 agent",
+			"old-01 08-01T00:00 10-30T00:00 agent",
+			"part-01 08-01T00:00 09-15T00:00 agent",
+			"part-01 09-30T00:03 10-01T00:00 agent",
+		})
+	// A connector that keeps 30 days pruned: the 60 days before tell
+	// nothing, of the hosts observed then either.
+	execAll(t, conn, `SELECT shawk.prune(`+ts(day(60, 0))+`)`, `SELECT shawk.prune(`+ts(day(50, 0))+`)`)
+	checkRows(t, "coverage of every host after a prune", queryStrings(t, conn, `SELECT `+cols+` FROM shawk_v1.coverage(`+args+`)`), []string{
+		"full-01 true 0.333333 5184000 1 0 0 0 0 0 5184000",
+		"part-01 true 0.322245 5270220 2 0 0 86400 86400 86400 5184000",
+	})
+	checkRows(t, "gaps after a prune",
+		queryStrings(t, conn, `SELECT `+gapCols+` FROM shawk_v1.coverage_gaps(`+args+`, ARRAY['full-01', 'part-01'])`), []string{
+			"full-01 08-01T00:00 09-30T00:00 retention",
+			"part-01 08-01T00:00 09-30T00:00 retention",
+			"part-01 09-30T00:03 10-01T00:00 agent",
 		})
 	if got := queryStrings(t, conn, `SELECT count(*) FROM shawk_v1.coverage('2026-09-02T00:00:00Z', '2026-09-01T00:00:00Z')`); !slices.Equal(got, []string{"0"}) {
 		t.Errorf("%v rows of an empty period", got)
 	}
+}
+
+// TestPGImpactBeforeTheRetention: a period that starts before the retention
+// of the connector is not observed before it, although the session of an
+// agent that never stopped spans it: the dependencies last seen then are
+// deleted.
+func TestPGImpactBeforeTheRetention(t *testing.T) {
+	_, conn := migratedDB(t)
+	f := newImpactFixture(t, conn)
+	for host, addr := range map[string]string{"db-01": "10.0.0.10", "batch-01": "10.0.0.13"} {
+		f.host(host, addr)
+		f.observed(host, impactSince.Add(-100*24*time.Hour), impactUntil)
+	}
+	f.listener("db-01", "postgres", 5432, impactSince.Add(-100*24*time.Hour), impactUntil)
+	// billing used postgres for 2 hours on day 20.
+	f.both("batch-01", "billing", "10.0.0.13", "db-01", "postgres", "10.0.0.10", 5432, day(20, 0), day(20, 2))
+	if got, want := f.verdict(`'db-01', %s, %s`), "UNSAFE {active_dependents} {} 1 0 1.000000"; got != want {
+		t.Errorf("db-01 before the prune: %s, want %s", got, want)
+	}
+	// A connector that keeps 30 days prunes.
+	execAll(t, conn, `SELECT shawk.prune(`+ts(day(60, 0))+`)`)
+	if got := queryStrings(t, conn, `SELECT (SELECT count(*) FROM shawk.edges), (SELECT count(*) FROM shawk.agent_sessions)`); !slices.Equal(got, []string{"0 2"}) {
+		t.Fatalf("edges and sessions left after the prune: %v, want 0 2", got)
+	}
+	if got, want := f.verdict(`'db-01', %s, %s`), "INCONCLUSIVE {before_retention} {} 0 0 0.333333"; got != want {
+		t.Errorf("db-01 after the prune: %s, want %s", got, want)
+	}
+	if got, want := f.verdict(`'db-01', %s, %s, 'postgres', 5432`), "INCONCLUSIVE {before_retention} {} 0 0 0.333333"; got != want {
+		t.Errorf("postgres of db-01 after the prune: %s, want %s", got, want)
+	}
+	checkRows(t, "what the verdict on db-01 tells of the period",
+		queryStrings(t, conn, fmt.Sprintf(`SELECT unobserved::text, gaps FROM shawk_v1.impact_verdict('db-01', %s, %s)`, ts(impactSince), ts(impactUntil))),
+		[]string{"60 days 1"})
+	// The period within the retention is observed.
+	if got := queryStrings(t, conn, fmt.Sprintf(`SELECT verdict, reasons::text, coverage::text FROM shawk_v1.impact_verdict('db-01', %s, %s)`,
+		ts(day(60, 0)), ts(impactUntil))); !slices.Equal(got, []string{"SAFE {} 1.000000"}) {
+		t.Errorf("db-01 within the retention: %v, want SAFE", got)
+	}
+	// A prune of rows left with an earlier cutoff does not move it back.
+	execAll(t, conn, `SELECT shawk.prune(`+ts(day(10, 0))+`)`)
+	if got := queryStrings(t, conn, `SELECT to_char(pruned_before AT TIME ZONE 'UTC', 'MM-DD') FROM shawk.retention`); !slices.Equal(got, []string{"09-30"}) {
+		t.Errorf("pruned before %v, want 09-30", got)
+	}
+}
+
+// TestPGImpactClockBehind: the edges keep the times of the agent: with a
+// clock 2 hours behind, the last 2 hours of the history of a host are not
+// written yet, whatever the heartbeat of its session.
+func TestPGImpactClockBehind(t *testing.T) {
+	_, conn := migratedDB(t)
+	f := newImpactFixture(t, conn)
+	f.host("db-01", "10.0.0.10")
+	f.observed("db-01", impactUntil.Add(-30*24*time.Hour-2*time.Hour), impactUntil)
+	f.exec(`UPDATE shawk.agent_sessions SET clock_skew = '2 hours'`)
+	// A client without an agent uses postgres all along, up to now: by the
+	// clock of the agent, up to 2 hours ago.
+	f.edge("db-01", "postgres", "server", "10.0.0.10", "10.0.5.5", 5432, impactUntil.Add(-30*24*time.Hour-2*time.Hour), impactUntil.Add(-2*time.Hour))
+	verdict := func(lookback string) []string {
+		return queryStrings(t, conn, fmt.Sprintf(`SELECT verdict, reasons::text, caveats::text, direct, coverage::text
+			FROM shawk_v1.impact_verdict('db-01', %s - interval '%s', %s)`, ts(impactUntil), lookback, ts(impactUntil)))
+	}
+	checkRows(t, "the last hour", verdict("1 hour"), []string{"INCONCLUSIVE {not_observed} {} 0 0.000000"})
+	checkRows(t, "the last 3 hours", verdict("3 hours"), []string{"UNSAFE {active_dependents} {not_observed} 1 0.350000"})
+	checkRows(t, "the last 7 days", verdict("7 days"), []string{"UNSAFE {active_dependents} {not_observed} 1 0.988392"})
 }
 
 // TestPGImpactAddressTakenOver: an address of the target that a host
