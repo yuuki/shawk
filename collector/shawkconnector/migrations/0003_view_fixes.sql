@@ -11,6 +11,9 @@
 --     period that neither covers, and its row matched by address has the
 --     period of the other edge on the server side as on the client side
 --     (§5.4).
+--   - shawk_v1.planned_stops: the states with MAINT that follow each other
+--     are those read while the one before was fresh, so that a reservation
+--     after a stale gap counts its 30 days from its own start (§5.7).
 
 -- The dependencies active in [since, until]: the client and server edges
 -- of a connection matched into one row. Edges are taken with a margin of
@@ -959,3 +962,48 @@ FROM ue u
 LEFT JOIN uo o ON o.edge_id = u.id
 LEFT JOIN shawk.processes ps ON ps.id = o.process_id
 LEFT JOIN observed ob ON ob.host_id = u.host_id;
+
+-- Hosts in a planned stop now, until when at the latest, as
+-- shawk_v1.planned_stops of 0001_schema.sql: in a maintenance window until
+-- its end, or in a planned state of their latest read from Slurm until it
+-- becomes stale. A stale state, DOWN or DRAIN stop nothing: alerts on
+-- stopped agents exclude these hosts only. A MAINT reservation (which may
+-- be unlimited) stops them for 30 days at most, as the longest window of
+-- the maintenance_file, counted from the first of the states with MAINT
+-- that follow each other, whatever their other flags and reasons. A state
+-- follows the one before if it was read while that one was fresh: a
+-- reservation read after a gap in which the states became stale, such as
+-- one of a node left out of the file for a while, counts from its own
+-- start. The states read in the last 31 days suffice to find it: the first
+-- of them follows one read before.
+CREATE OR REPLACE VIEW shawk_v1.planned_stops AS
+SELECT w.hostname AS host, 'maintenance'::text AS cause, lower(w.period) AS since, upper(w.period) AS until, w.reason
+FROM shawk.maintenance_periods w
+WHERE w.period @> now()
+UNION ALL
+SELECT s.hostname, s.cause, s.since, s.last_seen + shawk.node_state_max_age(), s.reason
+FROM (
+  SELECT DISTINCT ON (r.hostname) r.hostname, r.first_seen, r.cause, r.last_seen, r.reason,
+         CASE WHEN r.cause = 'maintenance'
+              THEN min(r.first_seen) FILTER (WHERE r.cause = 'maintenance') OVER (PARTITION BY r.hostname, r.run)
+              ELSE r.first_seen END AS since
+  FROM (
+    SELECT n.*,
+           -- states with MAINT that follow each other share a run (with
+           -- the state before them, which the minimum leaves out); one read
+           -- after the state before became stale starts a run
+           count(*) FILTER (WHERE n.cause IS DISTINCT FROM 'maintenance' OR n.after_stale)
+             OVER (PARTITION BY n.hostname ORDER BY n.first_seen) AS run
+    FROM (
+      SELECT n.hostname, n.first_seen, n.last_seen, n.reason, shawk.planned_state(n.state) AS cause,
+             lag(n.last_seen) OVER (PARTITION BY n.hostname ORDER BY n.first_seen)
+               + shawk.node_state_max_age() < n.first_seen AS after_stale
+      FROM shawk.node_states n
+      WHERE n.last_seen > now() - interval '31 days'
+    ) n
+  ) r
+  ORDER BY r.hostname, r.first_seen DESC
+) s
+WHERE s.last_seen + shawk.node_state_max_age() > now()
+  AND s.cause IS NOT NULL
+  AND (s.cause <> 'maintenance' OR s.since > now() - interval '30 days');

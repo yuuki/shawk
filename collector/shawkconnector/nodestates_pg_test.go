@@ -180,10 +180,13 @@ FROM shawk_v1.unobserved_reasons(now() - interval '12 hours', now() - interval '
 // TestPGPlannedStops: hosts in a planned stop now, by the latest state if it
 // is fresh and planned (powering up too, but not once up), or a window in
 // progress; MAINT for 30 days since it started, whatever the other flags
-// (longmaint); and the silent agent alert does not name them.
+// (longmaint), counted again after a state that is not MAINT (remaint) or
+// that became stale (gapmaint, #248); and the silent agent alert does not
+// name them.
 func TestPGPlannedStops(t *testing.T) {
 	_, conn := migratedDB(t)
-	hosts := []string{"off", "stale", "down", "resuming", "booted", "maint", "maintflag", "longmaint", "remaint", "nothing"}
+	hosts := []string{"off", "stale", "down", "resuming", "booted", "maint", "maintflag", "longmaint", "remaint", "gapmaint",
+		"nothing"}
 	for _, h := range hosts {
 		execAll(t, conn,
 			fmt.Sprintf(`INSERT INTO shawk.hosts VALUES ('%[1]s','m','%[1]s','k','v',now()-interval '30 days',now()-interval '2 days')`, h),
@@ -203,13 +206,15 @@ func TestPGPlannedStops(t *testing.T) {
 		   ('longmaint', now()-interval '40 days', now()-interval '20 days', '{IDLE,MAINT}'),
 		   ('longmaint', now()-interval '20 days', now()-interval '1 minute', '{DOWN,MAINT}'),
 		   ('remaint', now()-interval '40 days', now()-interval '10 days', '{IDLE}'),
-		   ('remaint', now()-interval '10 days', now()-interval '1 minute', '{IDLE,MAINT}')`,
+		   ('remaint', now()-interval '10 days', now()-interval '1 minute', '{IDLE,MAINT}'),
+		   ('gapmaint', now()-interval '35 days', now()-interval '30 days 12 hours', '{IDLE,MAINT}'),
+		   ('gapmaint', now()-interval '1 minute', now(), '{IDLE,MAINT}')`,
 		`INSERT INTO shawk.maintenance_windows VALUES
 		   ('maint', now()-interval '1 hour', now()+interval '1 hour', 'firmware', now()-interval '2 hours'),
 		   ('nothing', now()-interval '3 hours', now()-interval '1 hour', '', now()-interval '4 hours')`)
-	got := queryStrings(t, conn, `SELECT host, cause FROM shawk_v1.planned_stops`)
-	if !slices.Equal(got, []string{"maint maintenance", "maintflag maintenance", "off power_saving", "remaint maintenance",
-		"resuming power_saving"}) {
+	got := queryStrings(t, conn, `SELECT host, cause, since > now() - interval '1 day' FROM shawk_v1.planned_stops`)
+	if !slices.Equal(got, []string{"gapmaint maintenance true", "maint maintenance true", "maintflag maintenance true",
+		"off power_saving false", "remaint maintenance false", "resuming power_saving true"}) {
 		t.Errorf("planned_stops = %v", got)
 	}
 	q := packagedSQL(t)["shawk-rules.yaml/shawk-agents/shawk agent silent/A/A#0"]

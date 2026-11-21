@@ -1550,7 +1550,10 @@ fail the write of every host.
   while it boots. Maintenance: a window of the file, or the flag `MAINT` of
   a reservation of Slurm, which is registered with an end; alerts are
   stopped for 30 days at most from the first of the states with `MAINT`
-  that follow each other, whatever their other flags and reasons.
+  that follow each other, whatever their other flags and reasons. A state
+  follows the one before if it was read while that one was fresh, so a
+  reservation read after the states became stale (a node left out of the
+  file for a while) counts from its own start.
   `unobserved_reasons()` reports the state as Slurm had it, `MAINT`
   included, without this bound.
 
