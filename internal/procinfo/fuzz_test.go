@@ -27,6 +27,8 @@ func FuzzUnit(f *testing.F) {
 		"/system.slice/slurmstepd.scope/job_42/step_0/user/task_0",
 		"/system.slice/slurmstepd.scope/job_42/step_0/user/task_0/docker-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.scope",
 		"/system.slice/alice-work.scope/docker-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.scope",
+		"/system.slice/alice-work.scope/docker-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.scope/init.scope",
+		"/system.slice/docker-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.scope/init.scope",
 		"/hpc.slice/hpc-slurm.slice/node1_slurmstepd.scope/s5K1KKYAYG5D00/step_1+2/user/task_3",
 		"/system.slice/slurmstepd.scope/job_42/step_extern/slurm",
 		"/user.slice/user-1000.slice/user@1000.service/system.slice/slurmstepd.scope/job_42/step_0/user/task_0",
@@ -48,13 +50,27 @@ func FuzzUnit(f *testing.F) {
 		if utf8.ValidString(p) && !utf8.ValidString(u) {
 			t.Fatalf("Unit(%q) = %q, not valid UTF-8", p, u)
 		}
+		parts := strings.FieldsFunc(p, func(r rune) bool { return r == '/' })
 		// A user cannot make the cgroup of a process look like that of a
 		// task of a Slurm job: only slurmstepd makes the structure under a
 		// scope in slices, where users make no cgroups.
 		if slurmUnits[u] {
-			parts := strings.FieldsFunc(p, func(r rune) bool { return r == '/' })
 			if s, ok := slurmUnit(parts); !ok || s != u {
 				t.Fatalf("Unit(%q) = %q, but the path is not one of slurmstepd", p, u)
+			}
+		}
+		// The state of the host is read only for a container that a
+		// runtime of the host made: no scope or service is above it,
+		// since its user may name the cgroups of the unit (see
+		// cgroupContainers).
+		if refs, under := cgroupContainers(p); len(refs) > 0 && under == "" {
+			for i, q := range parts {
+				if _, _, ok := containerOf(parts, i); ok {
+					break
+				}
+				if strings.HasSuffix(q, ".scope") || strings.HasSuffix(q, ".service") {
+					t.Fatalf("cgroupContainers(%q) = %+v in the unit %q, not under it", p, refs, q)
+				}
 			}
 		}
 		// The path read from /proc/PID/cgroup is the line of cgroup v2.

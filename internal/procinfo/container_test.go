@@ -137,7 +137,13 @@ func TestCgroupContainer(t *testing.T) {
 		{"/system.slice/nerdctl-" + id1 + ".scope", containerRef{RuntimeContainerd, id1}, true},
 		// systemd in a container: the unit inside names the process.
 		{"/system.slice/docker-" + id1 + ".scope/system.slice/nginx.service", containerRef{}, false},
-		{"/system.slice/docker-" + id1 + ".scope/init.scope", containerRef{}, false},
+		// Other scopes in a container, such as that of systemd in it, keep
+		// the name of the container.
+		{"/system.slice/docker-" + id1 + ".scope/init.scope", containerRef{RuntimeDocker, id1}, true},
+		{"/machine.slice/libpod-" + id1 + ".scope/container/init.scope", containerRef{RuntimePodman, id1}, true},
+		{"/system.slice/docker-" + id1 + ".scope/system.slice/foo.scope/sub", containerRef{RuntimeDocker, id1}, true},
+		{"/system.slice/docker-" + id1 + ".scope/user.slice/user-0.slice/session-1.scope", containerRef{}, false},
+		{"/system.slice/docker-" + id1 + ".scope/system.slice/run-u12.scope", containerRef{}, false},
 		{"/system.slice/crio-conmon-" + id1 + ".scope", containerRef{}, false},
 		{"/" + id1, containerRef{}, false},
 		{"/system.slice/" + id1, containerRef{}, false},
@@ -190,6 +196,8 @@ func TestCgroupContainerUnder(t *testing.T) {
 			"user@1000.service", "user@1000.service/docker-0123456789ab"},
 		{"/system.slice/slurmstepd.scope/job_42/step_0/docker-" + id1 + ".scope",
 			"slurmstepd.scope", "slurmstepd.scope/docker-0123456789ab"},
+		{"/system.slice/alice-work.scope/docker-" + id1 + ".scope/init.scope",
+			"alice-work.scope", "alice-work.scope/docker-0123456789ab"},
 	} {
 		refs, under := cgroupContainers(tc.path)
 		if len(refs) != 1 || refs[0].id != id1 || under != tc.under {
@@ -549,10 +557,12 @@ func TestResolverUnitForged(t *testing.T) {
 			"user@1000.service/docker-0123456789ab", id1, false},
 		{"/system.slice/runner.service/docker-" + id1 + ".scope", "runner.service/docker-0123456789ab", id1, false},
 		{"/system.slice/alice-work.scope/docker-" + id1 + ".scope", "alice-work.scope/docker-0123456789ab", id1, false},
+		{"/system.slice/alice-work.scope/docker-" + id1 + ".scope/init.scope", "alice-work.scope/docker-0123456789ab", id1, false},
 		{"/machine.slice/machine-vm1.scope/docker-" + id1 + ".scope", "machine-vm1.scope/docker-0123456789ab", id1, false},
 		{"/system.slice/alice-work.scope/cri-containerd-" + id3 + ".scope", "alice-work.scope/containerd-abababababab", id3, false},
 		{"/system.slice/alice-work.scope/kubepods/burstable/pod1/" + id3, "alice-work.scope/container-abababababab", id3, false},
-		// Inside a Slurm job: stays a Slurm job unit and never reads host container state.
+		// A container in a Slurm job is named after the kind of its step,
+		// without reading the state of the host.
 		{"/system.slice/slurmstepd.scope/job_42/step_0/user/task_0/docker-" + id1 + ".scope", "slurm/step", "", true},
 		{"/system.slice/slurmstepd.scope/job_42/step_batch/user/task_0/cri-containerd-" + id3 + ".scope", "slurm/batch", "", true},
 		{"/system.slice/slurmstepd.scope/job_42/step_0/user/task_0/sub/docker/" + id1, "slurm/step", "", true},
@@ -573,7 +583,7 @@ func TestResolverUnitForged(t *testing.T) {
 			t.Errorf("Unit(%q) = %q, %+v, want %q (untrusted)", tc.path, unit, ctr, tc.unit)
 		}
 	}
-	// None of the forged cgroups above should have read host runtime state.
+	// None of the forged cgroups above read the state of the host.
 	r.containers.mu.Lock()
 	cached := len(r.containers.cache)
 	r.containers.mu.Unlock()
@@ -585,6 +595,7 @@ func TestResolverUnitForged(t *testing.T) {
 		{"/system.slice/docker-" + id2 + ".scope/docker-" + id1 + ".scope", "docker-fedcba987654", id2},
 		// The containers of the host themselves.
 		{"/system.slice/docker-" + id1 + ".scope", "docker/db", id1},
+		{"/system.slice/docker-" + id1 + ".scope/init.scope", "docker/db", id1},
 		{"/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod1.slice/cri-containerd-" + id3 + ".scope",
 			"k8s/shop/cart/app", id3},
 	} {

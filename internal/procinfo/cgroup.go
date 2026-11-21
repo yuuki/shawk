@@ -212,17 +212,20 @@ func systemdUnit(parts []string, i int) (unit string, ok bool) {
 type containerRef struct{ runtime, id string }
 
 // cgroupContainers finds the containers of a cgroup path, innermost first:
-// several when containers run in a container. It finds none when a unit of
-// systemd is deeper than the innermost container, e.g. a service of
-// systemd in a container, which then names the process, as in Unit; it
-// stops at a unit above the containers, such as user@1000.service above
-// the containers of a rootless runtime, and returns that unit as under.
+// several when containers run in a container. It finds none when a unit
+// that Unit names is deeper than the innermost container, e.g. a service of
+// systemd in a container, which then names the process, as in Unit; other
+// scopes deeper than the containers, such as init.scope of systemd in a
+// container, keep the name of the container. It stops at any scope or
+// service above the containers, such as user@1000.service above the
+// containers of a rootless runtime, and returns that unit as under.
 //
 // The runtimes of the host make the cgroups of their containers in slices
 // or at the root of the hierarchy, never in a unit: a unit above the
 // containers delegates its cgroups to a user (user@1000.service, or a
-// service or scope with Delegate=yes and User=), who may name them after
-// any container of the host. Their state is not read (see Resolver.unit).
+// service or scope with Delegate=yes and User=, such as one systemd-run
+// --scope makes), who may name them after any container of the host.
+// Their state is not read (see Resolver.unit).
 func cgroupContainers(cgroupPath string) (refs []containerRef, under string) {
 	return cgroupContainersParts(cgroupParts(cgroupPath))
 }
@@ -234,7 +237,8 @@ func cgroupContainersParts(parts []string) (refs []containerRef, under string) {
 			continue
 		}
 		p := parts[i]
-		if strings.HasSuffix(p, ".scope") || strings.HasSuffix(p, ".service") {
+		named := runScope.MatchString(p) || sessionScope.MatchString(p) || strings.HasSuffix(p, ".service")
+		if named || len(refs) > 0 && strings.HasSuffix(p, ".scope") {
 			if len(refs) > 0 {
 				under = unitParts(parts[:i+1])
 			}
