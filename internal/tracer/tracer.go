@@ -151,12 +151,13 @@ type Tracer struct {
 	idx    uint32
 	owners map[sockAddrKey][]owner
 	// unixOwners are the holders of the listening Unix sockets at the last
-	// owner scan, by namespace and name. unixMissing are the names that
-	// Unix flows connected to and that the last periodic scan, or one they
-	// requested since, found no listener of: they request no other scan
-	// until the next periodic one.
+	// owner scan, by namespace and name. unixMissing are the names, by the
+	// namespace of their clients, that Unix flows connected to and that the
+	// last periodic scan, or one they requested since, found no listener of
+	// in that namespace: they request no other scan until the next periodic
+	// one, which clears them.
 	unixOwners  map[unixListenerKey][]owner
-	unixMissing map[string]bool
+	unixMissing map[unixListenerKey]bool
 	// held are the inodes of the sockets held by the processes at the last
 	// owner scan.
 	held map[uint64]bool
@@ -278,7 +279,7 @@ func New(opts Options) (*Tracer, error) {
 		log:         opts.Logger,
 		owners:      map[sockAddrKey][]owner{},
 		unixOwners:  map[unixListenerKey][]owner{},
-		unixMissing: map[string]bool{},
+		unixMissing: map[unixListenerKey]bool{},
 	}
 	var st unix.Stat_t
 	if err := unix.Stat("/proc/self/ns/net", &st); err != nil {

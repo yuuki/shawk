@@ -455,8 +455,11 @@ functions that the socket operations point to, and so are never inlined:
   other namespaces through mounts; an abstract name is reached in the
   namespace of its client only. Listeners are found by the owner scans of §3.2 (every
   minute), since `iter/unix` exists only since Linux 5.17; a client of a
-  name that no scan found requests one at the next interval, so a new
-  server is named an interval later. The owner is chosen as for TCP: the
+  name that no scan found in its namespace requests one at the next
+  interval, so a new server is named an interval later, also when another
+  namespace listens on the name. A client that reaches the listener of a
+  path in another namespace through a mount requests such a scan again
+  after each periodic one. The owner is chosen as for TCP: the
   service rather than systemd for socket activation, the parent among its
   workers.
 - **Open connections** are entries of a table that is not flipped, one per

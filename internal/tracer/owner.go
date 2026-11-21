@@ -333,15 +333,13 @@ func (t *Tracer) unixListeners() []Listener {
 }
 
 // hasUnixListener reports whether the last owner scan found a listener of
-// the name path in any network namespace: a client may reach a path
-// through a mount from another namespace than that of its server.
-func (t *Tracer) hasUnixListener(path string) bool {
-	for k := range t.unixOwners {
-		if k.path == path {
-			return true
-		}
-	}
-	return false
+// the name of k in the network namespace of k. A listener of the name in
+// another namespace does not count: an abstract name is reached in the
+// namespace of its client only, and while a client may reach a path through
+// a mount from another namespace, the connector names the listener of the
+// namespace of the client first, which may have started since the scan.
+func (t *Tracer) hasUnixListener(k unixListenerKey) bool {
+	return len(t.unixOwners[k]) > 0
 }
 
 func (t *Tracer) hasOwner(k sockAddrKey) bool {

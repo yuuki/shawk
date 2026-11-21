@@ -86,12 +86,14 @@ func (t *Tracer) setListenerOwners(listeners []Listener) {
 }
 
 // noteMissingUnixListeners requests an owner scan when a client connected
-// to a name that no scan found a listener of: a server that started since
-// the last scan.
+// to a name that no scan found a listener of in the network namespace of
+// the client: a server that started since the last scan.
 func (t *Tracer) noteMissingUnixListeners(unixFlows []Flow) {
 	for i := range unixFlows {
-		if f := &unixFlows[i]; f.Conns > 0 && !t.hasUnixListener(f.Path) && !t.unixMissing[f.Path] {
-			t.unixMissing[f.Path] = true
+		f := &unixFlows[i]
+		k := unixListenerKey{netns: f.NetNS, path: f.Path}
+		if f.Conns > 0 && !t.hasUnixListener(k) && !t.unixMissing[k] {
+			t.unixMissing[k] = true
 			t.ownerMissing = true
 		}
 	}
