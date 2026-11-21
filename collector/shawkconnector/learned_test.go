@@ -325,6 +325,19 @@ func TestLearnedFoldedVirtualRecency(t *testing.T) {
 			t.Fatalf("iteration %d: peer = %+v, want deterministic foldedVirtual 192.0.2.12", i, p)
 		}
 	}
+
+	// The window is relative to the newest translation of the backend and
+	// client, not to now: the only one, last seen longer than
+	// backendWindow ago and resent by its agent, still folds.
+	only := tTranslation{client: "10.0.0.11", virtual: "192.0.2.14", vport: 80,
+		backend: "10.0.1.24", bport: 80, first: ts, last: ts}
+	consume(t, c, sink, tAgent{host: "lb", addrs: []string{"10.0.2.1"}, time: later,
+		translations: []tTranslation{only}})
+	p = c.resolver.peer(hostKey("", "web-04"), &edgeID{role: roleServer, proto: "tcp",
+		local: addrOf("10.0.1.24"), peer: addrOf("10.0.0.11"), port: 80}, later)
+	if p.agent || p.foldedVirtual != addrOf("192.0.2.14") {
+		t.Errorf("only DNAT, last seen long ago: peer = %+v, want folded virtual 192.0.2.14 with agent=false", p)
+	}
 }
 
 // TestLearnedStaleBackendResent: the agent goes on sending the former
