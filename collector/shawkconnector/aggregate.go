@@ -1,6 +1,7 @@
 package shawkconnector
 
 import (
+	"maps"
 	"math"
 	"net/netip"
 	"time"
@@ -723,6 +724,14 @@ func (a *aggregator) expire(now time.Time) {
 			a.expireSeries(r, now)
 			if len(r.series) == 0 {
 				delete(h.resources, sk)
+				continue
+			}
+			// A gauge forgets its inputs when it is emitted, which it never is
+			// if the requests of its host do not close intervals; it also
+			// forgets those that expired, so that it holds no more inputs
+			// than the host.
+			for _, s := range r.series {
+				maps.DeleteFunc(s.gauge, func(k inputKey, _ gaugePoint) bool { return h.inputs[k] == nil })
 			}
 		}
 		for sk, t := range h.services {

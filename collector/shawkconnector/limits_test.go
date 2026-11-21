@@ -268,6 +268,23 @@ func TestMaxPendingRows(t *testing.T) {
 	}
 }
 
+// TestMaxSessions: a host whose agent starts segments faster than they are
+// written has at most maxSessions pending; those beyond are logged.
+func TestMaxSessions(t *testing.T) {
+	c, _, sink, now := testConnector(t, nil)
+	logs := observe(c)
+	for range maxSessions + 1 {
+		*now = now.Add(time.Second)
+		consume(t, c, sink, tAgent{host: "app-01", time: *now, segment: *now})
+	}
+	if n := len(c.changes.pending[hostKey("", "app-01")].sessions); n != maxSessions {
+		t.Errorf("%d sessions pending, want %d", n, maxSessions)
+	}
+	if got := logs.FilterMessageSnippet("sessions").All(); len(got) != 1 || got[0].ContextMap()["sessions"] != int64(1) {
+		t.Errorf("warnings = %v, want one about a session", got)
+	}
+}
+
 // TestAgentInputBounds: the strings of agents are cut to maxStringBytes, at
 // the start of a character, and their internal ranges to maxInternalPeers,
 // so that what is held of a series or a host has a bounded size.

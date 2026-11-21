@@ -109,6 +109,48 @@ func TestAcceptedWhileReported(t *testing.T) {
 	}
 }
 
+// TestSessionsBounded: only a request that closes an interval records the
+// session of its host, as the agent sends its segment start in it, and a
+// host has at most maxSessions pending, also once changes that failed to be
+// written are put back: an agent that sends a new segment start with every
+// request does not make the connector hold a session, with the ranges it
+// keeps exact, for each.
+func TestSessionsBounded(t *testing.T) {
+	ch := newChanges(15*time.Minute, false)
+	b := testBatch(t, tAgent{host: "app-01", time: t0, partial: true})
+	b.segmentStart = t0.Add(-time.Minute)
+	ch.add(b, t0)
+	if n := len(ch.pending[b.key].sessions); n != 0 {
+		t.Errorf("%d sessions of a request that does not close an interval, want none", n)
+	}
+	b.final = true
+	add := func(from, n int) {
+		for i := from; i < from+n; i++ {
+			at := t0.Add(time.Duration(i) * time.Second)
+			b.time, b.segmentStart = at, at
+			ch.add(b, at)
+		}
+	}
+	add(0, 10000)
+	if n := len(ch.pending[b.key].sessions); n != maxSessions {
+		t.Errorf("%d sessions pending, want %d", n, maxSessions)
+	}
+	if ch.droppedSessions != 10000-maxSessions {
+		t.Errorf("%d sessions dropped, want %d", ch.droppedSessions, 10000-maxSessions)
+	}
+	ch.droppedSessions = 0
+	// A write fails while the agent starts as many segments again.
+	failed := ch.take()[b.key]
+	add(10000, maxSessions)
+	ch.restore(failed)
+	if n := len(ch.pending[b.key].sessions); n != maxSessions {
+		t.Errorf("%d sessions pending after a failed write, want %d", n, maxSessions)
+	}
+	if ch.droppedSessions != maxSessions {
+		t.Errorf("%d sessions dropped after a failed write, want %d", ch.droppedSessions, maxSessions)
+	}
+}
+
 // TestSessionStartsNoLaterThanRequest: a segment start after the request
 // that carries it, by the clock of the agent, is taken as the time of the
 // request, whatever the clock skew: the session does not start after its

@@ -98,6 +98,10 @@ type shawkConnector struct {
 	lastHostsLog                 time.Time
 	seriesDropped, inputsDropped int
 	lastSeriesLog                time.Time
+	// Sessions of hosts left out beyond maxSessions pending, logged at most
+	// once a minute.
+	sessionsDropped int
+	lastSessionsLog time.Time
 	// Requests of hosts refused by maxHostsPerCertificate, logged at most
 	// once a minute.
 	certificateRefused int
@@ -615,9 +619,14 @@ func (c *shawkConnector) consumeHost(b *hostBatch, dropped int, now time.Time, o
 	}, now, out)
 	inputs := c.agg.dropped
 	c.agg.dropped = 0
+	sessions := c.changes.droppedSessions
+	c.changes.droppedSessions = 0
 	c.mu.Unlock()
 	if dropped > 0 || inputs > 0 {
 		c.dropSeries(b, dropped, inputs, now)
+	}
+	if sessions > 0 {
+		c.dropSessions(b, sessions, now)
 	}
 }
 
@@ -683,6 +692,23 @@ func (c *shawkConnector) dropSeries(b *hostBatch, series, inputs int, now time.T
 		"a host is not observed in the intervals in which its dependencies, listeners, translations or addresses are dropped",
 		zap.String("host", b.hostname), zap.Int("series", s), zap.Int("metric_series", in),
 		zap.Int("max_series_per_host", c.cfg.MaxSeriesPerHost))
+}
+
+// dropSessions logs the sessions of hosts left out beyond maxSessions
+// pending, at most once a minute.
+func (c *shawkConnector) dropSessions(b *hostBatch, n int, now time.Time) {
+	c.mu.Lock()
+	c.sessionsDropped += n
+	n = c.sessionsDropped
+	if !c.lastSessionsLog.IsZero() && now.Sub(c.lastSessionsLog) < time.Minute {
+		c.mu.Unlock()
+		return
+	}
+	c.lastSessionsLog, c.sessionsDropped = now, 0
+	c.mu.Unlock()
+	c.log.Error("dropping new sessions of hosts beyond those pending, as of agents that start segments faster than "+
+		"they are written; a host is not observed over a session dropped that ended before it was written",
+		zap.String("host", b.hostname), zap.Int("sessions", n), zap.Int("max_sessions_per_host", maxSessions))
 }
 
 // checkIdentity checks, with host_identity: certificate, that the client

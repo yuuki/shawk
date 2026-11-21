@@ -1387,7 +1387,13 @@ connector holds, so the connector bounds it:
   of an edge that is not of TCP is invalid.
 - Pending rows (`max_pending_rows`, 10 million), kept while writes fail or
   the schema is not ready. Beyond the bound, the changes of the hosts
-  pending longest are dropped whole, as with rejected rows (§5.1).
+  pending longest are dropped whole, as with rejected rows (§5.1). Of
+  these, at most 16 sessions per host, each with the ranges its agent keeps
+  exact: an agent starts a segment when it starts or after it could not
+  send for its idle TTL, so more are pending only when it restarts faster
+  than they are written. A new one beyond is not written, and logged at
+  most once a minute; the host is not observed over it if it ends before
+  the pending sessions are written.
 
 Agent strings are cut to 4096 bytes and `shawk.peer.internal` to 4096
 ranges. The defaults are far above what one connector serves and what a

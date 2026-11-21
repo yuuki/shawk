@@ -230,6 +230,48 @@ func TestOutputsByConnectorClock(t *testing.T) {
 }
 
 // testBatch decodes the request of an agent.
+// TestGaugeInputsExpire: the open connections of an output forget the
+// inputs that expired, even while the output lives on and no request of its
+// host closes an interval, which would emit it and forget them all.
+func TestGaugeInputsExpire(t *testing.T) {
+	a := newAggregator(15*time.Minute, 50, 200, false, t0.Add(-time.Hour))
+	edge := func(peer string) tEdge {
+		return tEdge{role: roleClient, proto: "tcp", local: "10.0.0.11", peer: peer, port: 5432, svc: "app", comm: "app",
+			opened: 1, count: 1}
+	}
+	db := func(*edgeID) peer { return peer{name: "db"} }
+	// Two edges to replicas of db, of one output, in requests that do not
+	// close intervals.
+	a.add(testBatch(t, tAgent{host: "app-01", time: t0, partial: true, edges: []tEdge{edge("10.0.0.10"), edge("10.0.0.20")}}),
+		db, t0, pmetric.NewMetrics())
+	// The first goes on, the second stops.
+	later := t0.Add(10 * time.Minute)
+	a.add(testBatch(t, tAgent{host: "app-01", time: later, partial: true, edges: []tEdge{edge("10.0.0.10")}}),
+		db, later, pmetric.NewMetrics())
+	a.expire(t0.Add(16 * time.Minute))
+	h := a.hosts[hostKey("", "app-01")]
+	var gauges int
+	for _, r := range h.resources {
+		for k, s := range r.series {
+			if k.metric != metricConnCount {
+				continue
+			}
+			gauges++
+			for ik := range s.gauge {
+				if h.inputs[ik] == nil {
+					t.Errorf("the gauge holds an input that expired, to %v", ik.edge.peer)
+				}
+			}
+			if len(s.gauge) != 1 {
+				t.Errorf("the gauge holds %d inputs, want 1", len(s.gauge))
+			}
+		}
+	}
+	if gauges != 1 {
+		t.Errorf("%d outputs of open connections, want 1", gauges)
+	}
+}
+
 // TestOutputsSaturate: an output whose inputs add up beyond what its type
 // holds stays at its maximum, rather than wrapping to a negative value or a
 // smaller count, which Prometheus would take for a reset.
