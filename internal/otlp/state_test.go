@@ -196,3 +196,57 @@ func TestSegmentClockStep(t *testing.T) {
 		t.Errorf("start after the step = %v, want %v", got, t0.Add(step))
 	}
 }
+
+// After the wall clock stepped back, a series seen again is last seen
+// later by the monotonic clock but earlier by the wall clock, which the
+// times are sent by: its first time moves back with it, so that it is never
+// sent after the last (#261).
+func TestStateClockStepBack(t *testing.T) {
+	step := -5 * time.Minute
+	t1 := t0.Add(15 * time.Second).Add(step)
+	// The monotonic clock ignores the step; Sub of times without a
+	// monotonic reading does not, so the test adds it back between t0 and
+	// t1.
+	elapsed = func(now, t time.Time) time.Duration {
+		if now.Equal(t1) && t.Equal(t0) {
+			return now.Sub(t) - step
+		}
+		return now.Sub(t)
+	}
+	t.Cleanup(func() { elapsed = func(now, t time.Time) time.Duration { return now.Sub(t) } })
+
+	s := NewState(15 * time.Minute)
+	k := clientEdge()
+	l := ListenerKey{Proto: "tcp", Addr: netip.MustParseAddr("10.0.0.11"), Port: 80}
+	x := TranslationKey{Proto: "tcp", Client: netip.MustParseAddr("10.0.0.11"), Virtual: netip.MustParseAddr("10.96.0.1"),
+		VirtualPort: 443, Source: netip.MustParseAddr("10.0.0.11"), Backend: netip.MustParseAddr("10.0.1.5"), BackendPort: 8443}
+	for _, at := range []struct{ start, end time.Time }{{t0.Add(-15 * time.Second), t0}, {t0, t1}} {
+		s.BeginInterval()
+		s.AddEdge(k, EdgeStats{Conns: 1, Protocols: 1}, at.start, at.end)
+		s.AddListener(l, at.end)
+		s.AddTranslation(x, at.end)
+	}
+	e := s.Edges()[k]
+	for name, seen := range map[string]Seen{
+		"edge":          {e.FirstSeen, e.LastSeen},
+		"wire protocol": e.Protocols[0],
+		"listener":      {s.Listeners()[l].FirstSeen, s.Listeners()[l].LastSeen},
+		"translation":   {s.Translations()[x].FirstSeen, s.Translations()[x].LastSeen},
+	} {
+		if !seen.Last.Equal(t1) || seen.First.After(seen.Last) {
+			t.Errorf("%s first seen %v, last seen %v; want both %v", name, seen.First, seen.Last, t1)
+		}
+	}
+	m := metricsOf(t, s, t1)
+	for _, names := range [][2]string{
+		{MetricEdgeFirst, MetricEdgeLast}, {MetricEdgeWireFirst, MetricEdgeWireLast},
+		{MetricListenerFirst, MetricListenerLast}, {MetricTranslationFirst, MetricTranslationLast},
+	} {
+		first, last := m[names[0]].GetGauge().GetDataPoints(), m[names[1]].GetGauge().GetDataPoints()
+		if len(first) != 1 || len(last) != 1 {
+			t.Errorf("%d %s and %d %s", len(first), names[0], len(last), names[1])
+		} else if f, l := first[0].GetAsInt(), last[0].GetAsInt(); f > l {
+			t.Errorf("%s %d after %s %d", names[0], f, names[1], l)
+		}
+	}
+}

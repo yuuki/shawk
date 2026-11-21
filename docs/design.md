@@ -940,7 +940,7 @@ beyond a minute. Edges, listeners, translations and processes keep the
 agent's times, capped at 2 minutes ahead of the connector, so a clock far
 ahead or an agent making times up cannot pin `last_seen` (`greatest()`),
 win the choice of most recently seen endpoint (§5.2) or escape the
-retention.
+retention; a first time after the last is taken as the last.
 
 While the database is down, changes accumulate in proportion to the number
 of edges, not to time, up to `max_pending_rows` (§5.5). Rows PostgreSQL
@@ -1990,7 +1990,10 @@ only the protocols it parses. shawk runs beside it:
 - **Clocks**: first and last seen times come from each host's clock, capped
   at 2 minutes ahead of the connector (§5.1), as does the segment start;
   heartbeats come from the connector's clock, compared with PostgreSQL's.
-  Keep clocks synchronized (chrony); `clock_skew` shows hosts that are not.
+  A series seen again after its host's clock stepped back to before its
+  first time takes the new time as its first time too, so that it is never
+  first seen after it was last seen. Keep clocks synchronized (chrony);
+  `clock_skew` shows hosts that are not.
 - **Agents report the addresses of their hosts**, unverified:
   `host_identity: certificate` ties requests to a host, not to addresses.
   What a host reports at an address another live host holds alone does not

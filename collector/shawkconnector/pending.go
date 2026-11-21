@@ -495,10 +495,12 @@ func acceptedOf[K comparable](m map[string]map[K]acceptedSpan, host string) map[
 }
 
 // observedSpan is the span of an observation first and last seen at those
-// times, first being zero if not known, and no later than latest.
+// times, first being zero if not known, and no later than latest. A first
+// time after the last, which older agents sent after their clock stepped
+// back, is the last.
 func observedSpan(first, last, latest time.Time) span {
 	s := span{first, last}
-	if s.first.IsZero() {
+	if s.first.IsZero() || s.first.After(s.last) {
 		s.first = s.last
 	}
 	return s.notAfter(latest)

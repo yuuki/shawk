@@ -181,3 +181,43 @@ func TestFutureTimesNotWritten(t *testing.T) {
 		t.Errorf("changes = %+v", h)
 	}
 }
+
+// TestInvertedTimesWritten: a first time after the last, as an agent sent
+// after its clock stepped back (#261), is written as the last, so that no
+// row is first seen after it was last seen.
+func TestInvertedTimesWritten(t *testing.T) {
+	c, st, sink, now := testConnector(t, nil)
+	first, last := now.Add(-time.Minute), now.Add(-6*time.Minute)
+	consume(t, c, sink, tAgent{host: "app-01", addrs: []string{"10.0.0.11"}, time: *now,
+		listeners: []tListener{{proto: "tcp", addr: "10.0.0.11", port: 8080, svc: "app", comm: "app", first: first, last: last}},
+		edges: []tEdge{{role: "client", proto: "tcp", local: "10.0.0.11", peer: "10.0.0.10", port: 5432, svc: "app", comm: "app",
+			opened: 1, first: first, last: last, wire: map[string]span{"unknown": {first, last}}}},
+		translations: []tTranslation{{client: "172.17.0.2", virtual: "10.0.0.11", vport: 8080, backend: "172.17.0.2",
+			bport: 80, first: first, last: last}}})
+	c.flush(context.Background())
+	if len(st.writes) != 1 {
+		t.Fatalf("%d writes", len(st.writes))
+	}
+	h := st.writes[0]
+	spans := map[string]span{}
+	for _, s := range h.listeners {
+		spans["listener"] = s
+	}
+	for _, s := range h.edges {
+		spans["edge"] = s
+	}
+	for _, s := range h.wire {
+		spans["wire protocol"] = s
+	}
+	for _, s := range h.translations {
+		spans["translation"] = s
+	}
+	for _, p := range h.processes {
+		spans["process"] = p.span
+	}
+	for _, what := range []string{"listener", "edge", "wire protocol", "translation", "process"} {
+		if s, ok := spans[what]; !ok || !s.first.Equal(last) || !s.last.Equal(last) {
+			t.Errorf("%s: %v - %v, want %v - %v", what, s.first, s.last, last, last)
+		}
+	}
+}
