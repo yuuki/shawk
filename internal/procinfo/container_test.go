@@ -125,6 +125,7 @@ func TestCgroupContainer(t *testing.T) {
 		{"/system.slice/docker-" + id1 + ".scope", containerRef{RuntimeDocker, id1}, true},
 		{"/docker/" + id1, containerRef{RuntimeDocker, id1}, true},
 		{"/machine.slice/libpod-" + id1 + ".scope/container", containerRef{RuntimePodman, id1}, true},
+		{"/machine.slice/machine-libpod_pod_1234.slice/libpod-" + id1 + ".scope/container", containerRef{RuntimePodman, id1}, true},
 		{"/libpod_parent/libpod-" + id1, containerRef{RuntimePodman, id1}, true},
 		{"/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod1234.slice/cri-containerd-" + id1 + ".scope",
 			containerRef{RuntimeContainerd, id1}, true},
@@ -136,6 +137,7 @@ func TestCgroupContainer(t *testing.T) {
 		{"/system.slice/nerdctl-" + id1 + ".scope", containerRef{RuntimeContainerd, id1}, true},
 		// systemd in a container: the unit inside names the process.
 		{"/system.slice/docker-" + id1 + ".scope/system.slice/nginx.service", containerRef{}, false},
+		{"/system.slice/docker-" + id1 + ".scope/init.scope", containerRef{}, false},
 		{"/system.slice/crio-conmon-" + id1 + ".scope", containerRef{}, false},
 		{"/" + id1, containerRef{}, false},
 		{"/system.slice/" + id1, containerRef{}, false},
@@ -178,6 +180,16 @@ func TestCgroupContainerUnder(t *testing.T) {
 		{"/system.slice/runner.service/docker/" + id1, "runner.service", "runner.service/docker-0123456789ab"},
 		{"/user.slice/user-1000.slice/session-3.scope/docker-" + id1 + ".scope",
 			"user-1000.slice/session.scope", "user-1000.slice/session.scope/docker-0123456789ab"},
+		{"/system.slice/alice-work.scope/docker-" + id1 + ".scope",
+			"alice-work.scope", "alice-work.scope/docker-0123456789ab"},
+		{"/machine.slice/machine-vm1.scope/cri-containerd-" + id1 + ".scope",
+			"machine-vm1.scope", "machine-vm1.scope/containerd-0123456789ab"},
+		{"/system.slice/alice-work.scope/kubepods/burstable/pod1/" + id1,
+			"alice-work.scope", "alice-work.scope/container-0123456789ab"},
+		{"/user.slice/user-1000.slice/user@1000.service/app.slice/alice-work.scope/docker-" + id1 + ".scope",
+			"user@1000.service", "user@1000.service/docker-0123456789ab"},
+		{"/system.slice/slurmstepd.scope/job_42/step_0/docker-" + id1 + ".scope",
+			"slurmstepd.scope", "slurmstepd.scope/docker-0123456789ab"},
 	} {
 		refs, under := cgroupContainers(tc.path)
 		if len(refs) != 1 || refs[0].id != id1 || under != tc.under {
@@ -521,18 +533,62 @@ func TestResolverUnit(t *testing.T) {
 // after that container.
 func TestResolverUnitForged(t *testing.T) {
 	root := t.TempDir()
+	id3 := strings.Repeat("ab", 32)
 	writeFile(t, root, "/var/lib/docker/containers/"+id1+"/config.v2.json", `{"Name": "/db", "Config": {}}`)
+	writeFile(t, root, containerdTasks[0]+"/k8s.io/"+id3+"/config.json", `{
+		"annotations": {"io.kubernetes.cri.container-type": "container",
+			"io.kubernetes.cri.sandbox-name": "cart-5d8f7c9b6-x7z2k",
+			"io.kubernetes.cri.sandbox-namespace": "shop",
+			"io.kubernetes.cri.container-name": "app"}}`)
 	r := &Resolver{containers: newContainers(root), paths: map[uint64]string{}, learned: map[uint64]learnedPath{}}
-	for i, tc := range []struct{ path, unit, id string }{
+	for i, tc := range []struct {
+		path, unit, id string
+		noCtr          bool
+	}{
 		{"/user.slice/user-1000.slice/user@1000.service/app.slice/docker-" + id1 + ".scope",
-			"user@1000.service/docker-0123456789ab", id1},
-		{"/system.slice/runner.service/docker-" + id1 + ".scope", "runner.service/docker-0123456789ab", id1},
-		// Inside the container id2, which has no state: named after it.
-		{"/system.slice/docker-" + id2 + ".scope/docker-" + id1 + ".scope", "docker-fedcba987654", id2},
-		// The container of the host itself.
-		{"/system.slice/docker-" + id1 + ".scope", "docker/db", id1},
+			"user@1000.service/docker-0123456789ab", id1, false},
+		{"/system.slice/runner.service/docker-" + id1 + ".scope", "runner.service/docker-0123456789ab", id1, false},
+		{"/system.slice/alice-work.scope/docker-" + id1 + ".scope", "alice-work.scope/docker-0123456789ab", id1, false},
+		{"/machine.slice/machine-vm1.scope/docker-" + id1 + ".scope", "machine-vm1.scope/docker-0123456789ab", id1, false},
+		{"/system.slice/alice-work.scope/cri-containerd-" + id3 + ".scope", "alice-work.scope/containerd-abababababab", id3, false},
+		{"/system.slice/alice-work.scope/kubepods/burstable/pod1/" + id3, "alice-work.scope/container-abababababab", id3, false},
+		// Inside a Slurm job: stays a Slurm job unit and never reads host container state.
+		{"/system.slice/slurmstepd.scope/job_42/step_0/user/task_0/docker-" + id1 + ".scope", "slurm/step", "", true},
+		{"/system.slice/slurmstepd.scope/job_42/step_batch/user/task_0/cri-containerd-" + id3 + ".scope", "slurm/batch", "", true},
+		{"/system.slice/slurmstepd.scope/job_42/step_0/user/task_0/sub/docker/" + id1, "slurm/step", "", true},
+		{"/hpc.slice/hpc-slurm.slice/node1_slurmstepd.scope/s5K1KKYAYG5D00/step_extern/user/task_special/libpod-" + id1 + ".scope/container",
+			"slurm/extern", "", true},
 	} {
 		id := uint64(20 + i)
+		r.Learn(id, tc.path)
+		r.reads.Wait()
+		unit, ctr := r.Unit(id)
+		if tc.noCtr {
+			if unit != tc.unit || ctr != nil {
+				t.Errorf("Unit(%q) = %q, %+v, want %q, nil", tc.path, unit, ctr, tc.unit)
+			}
+			continue
+		}
+		if unit != tc.unit || ctr == nil || ctr.ID != tc.id || ctr.Name != "" || ctr.PodName != "" || ctr.Workload() != (Service{}) {
+			t.Errorf("Unit(%q) = %q, %+v, want %q (untrusted)", tc.path, unit, ctr, tc.unit)
+		}
+	}
+	// None of the forged cgroups above should have read host runtime state.
+	r.containers.mu.Lock()
+	cached := len(r.containers.cache)
+	r.containers.mu.Unlock()
+	if cached != 0 {
+		t.Errorf("forged cgroups populated host container cache: %d entries", cached)
+	}
+	for i, tc := range []struct{ path, unit, id string }{
+		// Inside the container id2, which has no state: named after it.
+		{"/system.slice/docker-" + id2 + ".scope/docker-" + id1 + ".scope", "docker-fedcba987654", id2},
+		// The containers of the host themselves.
+		{"/system.slice/docker-" + id1 + ".scope", "docker/db", id1},
+		{"/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod1.slice/cri-containerd-" + id3 + ".scope",
+			"k8s/shop/cart/app", id3},
+	} {
+		id := uint64(40 + i)
 		r.Learn(id, tc.path)
 		r.reads.Wait()
 		unit, ctr := r.Unit(id)

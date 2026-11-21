@@ -86,15 +86,17 @@ func SlurmJob(unit string) bool { return strings.HasPrefix(unit, SlurmJobPrefix)
 // CgroupJobIdPaths=yes, and otherwise its SLUID; it is recognized by the
 // structure under it, whatever its name:
 //
-//	<scope>/<job>/<step>/user/task_<n>   the tasks of a step  -> slurm/<kind>
-//	<scope>/<job>/<step>/slurm           slurmstepd of a step -> slurmstepd
-//	<scope>/system                       slurmstepd waiting   -> slurmstepd
+//	<scope>/<job>/<step>/user/task_<n>[/...]  the tasks of a step  -> slurm/<kind>
+//	<scope>/<job>/<step>/slurm                slurmstepd of a step -> slurmstepd
+//	<scope>/system                            slurmstepd waiting   -> slurmstepd
 //
 // as src/plugins/cgroup/v2/cgroup_v2.c of Slurm makes them. task_special
 // holds the processes that are not tasks, such as those pam_slurm_adopt
-// moves into the extern step. The documentation names the directory of
-// slurmstepd slurm_processes, which is recognized too. The kind of a step
-// is batch, extern, interactive, or step for those srun starts.
+// moves into the extern step; sub-cgroups beneath task_<n> (e.g. a
+// container runtime or user sub-cgroup) keep the step's unit. The
+// documentation names the directory of slurmstepd slurm_processes, which is
+// recognized too. The kind of a step is batch, extern, interactive, or step
+// for those srun starts.
 //
 // The scope is in system.slice, or the slice of CgroupSlice, which systemd
 // nests from the root (a.slice/a-b.slice): only slices are above it, where
@@ -117,7 +119,7 @@ func slurmUnit(parts []string) (unit string, ok bool) {
 		return "", false
 	case len(rest) == 3 && (rest[2] == "slurm" || rest[2] == "slurm_processes"):
 		return SlurmStepd, true
-	case len(rest) == 4 && rest[2] == "user" && strings.HasPrefix(rest[3], "task_"):
+	case len(rest) >= 4 && rest[2] == "user" && strings.HasPrefix(rest[3], "task_"):
 		kind := strings.TrimPrefix(rest[1], "step_")
 		if kind[0] >= '0' && kind[0] <= '9' {
 			kind = "step"
@@ -125,6 +127,10 @@ func slurmUnit(parts []string) (unit string, ok bool) {
 		return SlurmJobPrefix + kind, true
 	}
 	return "", false
+}
+
+func cgroupParts(cgroupPath string) []string {
+	return strings.FieldsFunc(cgroupPath, func(r rune) bool { return r == '/' })
 }
 
 // Unit derives a stable name of the service a process belongs to from its
@@ -152,14 +158,17 @@ func slurmUnit(parts []string) (unit string, ok bool) {
 // The processes of Slurm jobs are named after the kind of their step (see
 // slurmUnit): slurm/batch, slurm/step, slurm/extern or slurm/interactive.
 func Unit(cgroupPath string) string {
-	parts := strings.FieldsFunc(cgroupPath, func(r rune) bool { return r == '/' })
+	return unitParts(cgroupParts(cgroupPath))
+}
+
+func unitParts(parts []string) string {
 	if len(parts) == 0 {
 		return ""
 	}
 	if u, ok := slurmUnit(parts); ok {
 		return u
 	}
-	if refs, under := cgroupContainers(cgroupPath); len(refs) > 0 {
+	if refs, under := cgroupContainersParts(parts); len(refs) > 0 {
 		outer := refs[len(refs)-1]
 		return (&Container{Runtime: runtimeOrAny(outer.runtime), ID: outer.id, Under: under}).Unit()
 	}
@@ -212,19 +221,22 @@ type containerRef struct{ runtime, id string }
 // The runtimes of the host make the cgroups of their containers in slices
 // or at the root of the hierarchy, never in a unit: a unit above the
 // containers delegates its cgroups to a user (user@1000.service, or a
-// service with Delegate=yes and User=), who may name them after any
-// container of the host. Their state is not read (see Resolver.unit).
+// service or scope with Delegate=yes and User=), who may name them after
+// any container of the host. Their state is not read (see Resolver.unit).
 func cgroupContainers(cgroupPath string) (refs []containerRef, under string) {
-	parts := strings.FieldsFunc(cgroupPath, func(r rune) bool { return r == '/' })
+	return cgroupContainersParts(cgroupParts(cgroupPath))
+}
+
+func cgroupContainersParts(parts []string) (refs []containerRef, under string) {
 	for i := len(parts) - 1; i >= 0; i-- {
 		if runtime, id, ok := containerOf(parts, i); ok {
 			refs = append(refs, containerRef{runtime, id})
 			continue
 		}
 		p := parts[i]
-		if runScope.MatchString(p) || sessionScope.MatchString(p) || strings.HasSuffix(p, ".service") {
+		if strings.HasSuffix(p, ".scope") || strings.HasSuffix(p, ".service") {
 			if len(refs) > 0 {
-				under = Unit("/" + strings.Join(parts[:i+1], "/"))
+				under = unitParts(parts[:i+1])
 			}
 			break
 		}

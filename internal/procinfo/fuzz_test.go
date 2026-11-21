@@ -25,6 +25,8 @@ func FuzzUnit(f *testing.F) {
 		"/user.slice/user-1000.slice/user@1000.service/app.slice/foo.service",
 		"/system.slice/run-p4242-i4243.service",
 		"/system.slice/slurmstepd.scope/job_42/step_0/user/task_0",
+		"/system.slice/slurmstepd.scope/job_42/step_0/user/task_0/docker-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.scope",
+		"/system.slice/alice-work.scope/docker-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.scope",
 		"/hpc.slice/hpc-slurm.slice/node1_slurmstepd.scope/s5K1KKYAYG5D00/step_1+2/user/task_3",
 		"/system.slice/slurmstepd.scope/job_42/step_extern/slurm",
 		"/user.slice/user-1000.slice/user@1000.service/system.slice/slurmstepd.scope/job_42/step_0/user/task_0",

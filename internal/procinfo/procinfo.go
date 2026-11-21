@@ -81,8 +81,13 @@ func (r *Resolver) Learn(id uint64, path string) {
 	}
 	r.learned[id] = learnedPath{path: path, at: time.Now()}
 	r.mu.Unlock()
-	if refs, under := cgroupContainers(path); r.containers != nil && len(refs) > 0 && under == "" {
-		r.queueRead(path)
+	if r.containers != nil {
+		parts := cgroupParts(path)
+		if _, ok := slurmUnit(parts); !ok {
+			if refs, under := cgroupContainersParts(parts); len(refs) > 0 && under == "" {
+				r.queueRead(path)
+			}
+		}
 	}
 }
 
@@ -138,17 +143,23 @@ func (r *Resolver) Unit(id uint64) (string, *Container) {
 }
 
 // unit names the outermost container of a cgroup path after the state its
-// runtime keeps. A container in a container, e.g. with Docker in Docker or
-// kind, keeps its state in the outer one, out of reach, and is named after
-// the outer container; so is a cgroup that a container allowed to write its
-// cgroups made in its own with the name of another container of the host.
-// A container in the cgroup of a unit (see cgroupContainers) is named by
-// id, after the unit. Without any state, the outermost container names it
-// by id, as Unit does.
+// runtime keeps. Slurm cgroups are recognized first (as in Unit), so
+// sub-cgroups or containers inside a Slurm job stay in slurm/<kind>. A
+// container in a container, e.g. with Docker in Docker or kind, keeps its
+// state in the outer one, out of reach, and is named after the outer
+// container; so is a cgroup that a container allowed to write its cgroups
+// made in its own with the name of another container of the host. A
+// container in the cgroup of a unit (see cgroupContainers) is named by id,
+// after the unit. Without any state, the outermost container names it by
+// id, as Unit does.
 func (r *Resolver) unit(path string) (string, *Container) {
-	refs, under := cgroupContainers(path)
+	parts := cgroupParts(path)
+	if u, ok := slurmUnit(parts); ok {
+		return u, nil
+	}
+	refs, under := cgroupContainersParts(parts)
 	if len(refs) == 0 || r.containers == nil {
-		return Unit(path), nil
+		return unitParts(parts), nil
 	}
 	outer := refs[len(refs)-1]
 	if under != "" {
