@@ -357,6 +357,41 @@ func TestPeerHostLearned(t *testing.T) {
 	}
 }
 
+// TestPeerHostLearnedDirectors: two directors in turn that send a client to
+// the same backend address name the host that holds it (#252); a backend at
+// an address that several hosts hold is on the host that translated the
+// connections, so two such hosts name none.
+func TestPeerHostLearnedDirectors(t *testing.T) {
+	c, _, sink, _ := testConnector(t, func(cfg *Config) { cfg.PeerHosts = true })
+	ts := t0.Add(15 * time.Second)
+	consume(t, c, sink, tAgent{host: "db-01", addrs: []string{"10.0.1.10"}, time: ts,
+		edges: []tEdge{{role: "server", proto: "tcp", local: "10.0.1.10", peer: "10.0.0.11", port: 5432,
+			svc: "postgres", comm: "postgres", opened: 3}}})
+	for _, d := range []struct{ host, addr string }{{"lvs-1", "10.0.2.1"}, {"lvs-2", "10.0.2.2"}} {
+		consume(t, c, sink, tAgent{host: d.host, addrs: []string{d.addr}, time: ts,
+			translations: []tTranslation{{client: "10.0.0.11", virtual: "10.0.100.1", vport: 5432,
+				backend: "10.0.1.10", bport: 5432}}})
+	}
+	// h2 and h4 both hold the bridge address 172.17.0.5, and both send the
+	// virtual address 10.0.100.2 to their own container there.
+	for _, h := range []struct{ host, addr string }{{"h2", "10.0.0.2"}, {"h4", "10.0.0.4"}} {
+		consume(t, c, sink, tAgent{host: h.host, addrs: []string{h.addr, "172.17.0.1", "172.17.0.5"}, time: ts,
+			edges: []tEdge{{role: "server", proto: "tcp", local: "172.17.0.5", peer: "10.0.0.11", port: 80,
+				svc: "web", comm: "web", opened: 1}},
+			translations: []tTranslation{{client: "10.0.0.11", virtual: "10.0.100.2", vport: 80,
+				backend: "172.17.0.5", bport: 80}}})
+	}
+	out := consume(t, c, sink, tAgent{host: "app-01", addrs: []string{"10.0.0.11"}, time: ts,
+		edges: []tEdge{
+			{role: "client", proto: "tcp", local: "10.0.0.11", peer: "10.0.100.1", port: 5432, svc: "app", comm: "app", opened: 3},
+			{role: "client", proto: "tcp", local: "10.0.0.11", peer: "10.0.100.2", port: 80, svc: "app", comm: "app", opened: 2},
+		}})
+	if got, want := hostsOf(out, metricHostConnOpened, "app", roleClient, ""),
+		map[string]float64{"db-01 postgres": 3, "~unknown web": 2}; !maps.Equal(got, want) {
+		t.Errorf("hosts through learned translations of several hosts = %v, want %v", got, want)
+	}
+}
+
 // TestPeerHostBounds: max_peer_hosts folds further hosts into ~other, and
 // peer_host_services restricts the family to the dependencies with one of
 // its services at either end, so that both sides of each have it: the

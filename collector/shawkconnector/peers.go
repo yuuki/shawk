@@ -1030,7 +1030,9 @@ func (r *resolver) formerHolder(a netip.Addr, now time.Time) (string, bool) {
 // representative to name the service. So the backend is the host of the
 // peer only when it is the only one: the only backend of a static
 // translation, a single address, or the only address learned translations
-// sent the client to. r.mu is held.
+// sent the client to. Several hosts may have translated to that address,
+// as two directors in turn: they matter only for a loopback or shared
+// address, which is on the host that translated. r.mu is held.
 func (r *resolver) translatedHost(host string, id *edgeID, now time.Time) (string, bool) {
 	if t := r.virtualOf(id); t != nil {
 		if len(t.backends) == 1 && t.backends[0].prefix.IsSingleIP() {
@@ -1043,12 +1045,13 @@ func (r *resolver) translatedHost(host string, id *edgeID, now time.Time) (strin
 		return hostUnknown, false
 	}
 	b := bs[0]
+	onHost := r.sameHostAddr(b.backend, now)
 	for _, o := range bs[1:] {
-		if o.backend != b.backend || o.host != b.host {
+		if o.backend != b.backend || onHost && o.host != b.host {
 			return hostUnknown, false
 		}
 	}
-	if r.sameHostAddr(b.backend, now) {
+	if onHost {
 		// A backend at a loopback or shared address is on the host that
 		// translated the connections.
 		if b.host == host {
