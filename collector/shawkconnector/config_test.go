@@ -36,6 +36,15 @@ func TestConfigValidate(t *testing.T) {
 		"bad network":           func(c *Config) { c.Networks = map[string]string{"ib": "10.10.0.0/40"} },
 		"reserved network name": func(c *Config) { c.Networks = map[string]string{"~unknown": "10.10.0.0/16"} },
 		"network named twice":   func(c *Config) { c.Networks = map[string]string{"ib": "10.10.0.0/16", "ipoib": "10.10.0.0/16"} },
+		// Names written to PostgreSQL, whose text takes neither NUL nor
+		// bytes that are not UTF-8 (#254).
+		"NUL in a name":         func(c *Config) { c.PeerCIDRs = map[string]string{"lan\x00": "10.0.0.0/8"} },
+		"name not UTF-8":        func(c *Config) { c.PeerCIDRs = map[string]string{"lan\xff": "10.0.0.0/8"} },
+		"NUL in a service":      func(c *Config) { c.PortAgnosticServices = []string{"srun\x00"} },
+		"NUL in a dynamic name": func(c *Config) { c.DynamicPorts = map[string]DynamicPortsConfig{"mpi\x00": {Ports: "60001-63000"}} },
+		"NUL in a translation": func(c *Config) {
+			c.Translations = map[string]TranslationConfig{"vip\x00": {Virtual: []string{"10.0.100.1:80"}, Backends: []string{"10.0.1.10"}}}
+		},
 	} {
 		c := *ok
 		mod(&c)

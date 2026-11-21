@@ -24,7 +24,7 @@ func parseRanges(option string, m map[string]string) ([]namedPrefix, error) {
 	var out []namedPrefix
 	seen := map[netip.Prefix]string{}
 	for name, v := range m {
-		if name == "" || strings.HasPrefix(name, "~") {
+		if name == "" || strings.HasPrefix(name, "~") || !pgText(name) {
 			return nil, fmt.Errorf("%s: invalid name %q", option, name)
 		}
 		for _, s := range strings.Split(v, ",") {

@@ -231,10 +231,11 @@ func parseInventoryAddr(host, s string) (netip.Addr, error) {
 	a = a.Unmap()
 	switch {
 	case a.Zone() != "":
-		return netip.Addr{}, fmt.Errorf("host %s: address %s has a zone", host, s)
+		// A zone is any text, NUL included.
+		return netip.Addr{}, fmt.Errorf("host %s: address %q has a zone", host, s)
 	case a.IsUnspecified(), a.IsLoopback(), a.IsMulticast():
 		// Every host has these, or none.
-		return netip.Addr{}, fmt.Errorf("host %s: address %s names no host", host, s)
+		return netip.Addr{}, fmt.Errorf("host %s: address %q names no host", host, s)
 	}
 	return a, nil
 }
@@ -327,9 +328,10 @@ func (c *shawkConnector) writeInventory(ctx context.Context, inv *inventory, rea
 // the connector has read none since it started, writes it if it could not
 // be written when it was read, and records the failure.
 // A failure is logged when it changes, and at most once an hour while it
-// lasts.
+// lasts. The error may quote the file, so what is recorded is made
+// acceptable to PostgreSQL (see cleanString) and cut to maxStringBytes.
 func (c *shawkConnector) inventoryUnreadable(ctx context.Context, err error, at time.Time) {
-	msg := err.Error()
+	msg := cleanString(cutLabel(err.Error(), maxStringBytes))
 	if msg != c.inventoryErr || at.Sub(c.lastInventoryLog) >= foldWarnInterval {
 		c.log.Error("reading inventory_file; the inventory read before stays", zap.String("file", c.cfg.InventoryFile),
 			zap.Error(err))

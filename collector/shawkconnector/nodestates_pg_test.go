@@ -3,7 +3,10 @@ package shawkconnector
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -243,5 +246,50 @@ func TestPGPruneNodeStates(t *testing.T) {
 	}
 	if got := query(`SELECT array_to_string(state, '+') FROM shawk.node_states`); !slices.Equal(got, []string{"IDLE+POWERED_DOWN"}) {
 		t.Errorf("after prune = %v", got)
+	}
+}
+
+// TestPGFileStrings: a NUL or a byte that is not UTF-8 in the reasons of
+// node_states_file and maintenance_file, or in the error of an invalid
+// inventory_file, is written cleaned rather than making PostgreSQL refuse
+// the states, the windows or the record of the failure (#254).
+func TestPGFileStrings(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC().Truncate(time.Second)
+	files := map[string]string{
+		"states.json": fmt.Sprintf(`{"generated_at": %q, "nodes": [{"host": "cn001", "state": "DRAIN", "reason": "disk\u0000full"}]}`,
+			now.Format(time.RFC3339)),
+		"maintenance.json": fmt.Sprintf(`{"maintenance": [{"hosts": ["nfs01"], "start": %q, "end": %q, "reason": "fw\u0000"}]}`,
+			now.Add(-time.Hour).Format(time.RFC3339), now.Add(time.Hour).Format(time.RFC3339)),
+		// A zone may hold any text, NUL included.
+		"inventory.json": `{"hosts": [{"name": "cn001", "addrs": ["fe80::1%eth0\u0000"]}]}`,
+		// yaml quotes the start of a value it cannot decode, cut within a
+		// character.
+		"inventory2.yaml": "hosts:\n  - name: cn001\n    agent: éééééé\n",
+	}
+	for name, doc := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(doc), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c, _, conn := pgConnectorWith(t, func(cfg *Config) {
+		cfg.NodeStatesFile = filepath.Join(dir, "states.json")
+		cfg.MaintenanceFile = filepath.Join(dir, "maintenance.json")
+		cfg.InventoryFile = filepath.Join(dir, "inventory.json")
+	})
+	if got := queryStrings(t, conn, `SELECT hostname, array_to_string(state, '+'), reason FROM shawk.node_states`); !slices.Equal(got, []string{"cn001 DRAIN disk�full"}) {
+		t.Errorf("node_states = %q", got)
+	}
+	if got := queryStrings(t, conn, `SELECT hostname, reason FROM shawk.maintenance_windows`); !slices.Equal(got, []string{"nfs01 fw�"}) {
+		t.Errorf("maintenance_windows = %q", got)
+	}
+	const status = `SELECT error FROM shawk_v1.inventory_status WHERE failed_at IS NOT NULL`
+	if got := queryStrings(t, conn, status); len(got) != 1 || !strings.Contains(got[0], "has a zone") || !strings.Contains(got[0], `\x00`) {
+		t.Errorf("inventory_status error = %q", got)
+	}
+	c.cfg.InventoryFile = filepath.Join(dir, "inventory2.yaml")
+	c.syncInventory(context.Background())
+	if got := queryStrings(t, conn, status); len(got) != 1 || !strings.Contains(got[0], "cannot unmarshal") {
+		t.Errorf("inventory_status error = %q", got)
 	}
 }

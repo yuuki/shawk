@@ -151,6 +151,9 @@ func parseTranslation(name string, c TranslationConfig) (translation, error) {
 	if strings.TrimSpace(name) == "" {
 		return translation{}, errors.New("translations: a translation has no name")
 	}
+	if !pgText(name) {
+		return translation{}, fmt.Errorf("translations: %q: a name must be UTF-8 without NUL", name)
+	}
 	t := translation{name: name}
 	if err := t.parse(c); err != nil {
 		return translation{}, fmt.Errorf("translations: %s: %w", name, err)

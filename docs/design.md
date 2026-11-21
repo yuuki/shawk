@@ -1479,7 +1479,11 @@ by `slurm_node` of the inventory (§5.6), when it reads the file, and writes
 the host: the state of a past gap stays with the host it had then. Nodes
 the inventory does not map are left out, with a warning when they change,
 and the reading is written again until they are mapped; without an
-inventory, the file names hosts (`host`).
+inventory, the file names hosts (`host`). Host and node names, in both
+files, follow the rules of the inventory (§5.6). Reasons are free text,
+cut to 4096 bytes, with NUL and bytes that are not UTF-8 replaced as in
+the strings of agents: PostgreSQL refuses them, and one of them would
+fail the write of every host.
 
 - **Gaps.** `unobserved_reasons()` cuts the gaps of host names
   (`unobserved_by_name()`), whose states and windows these are: a node

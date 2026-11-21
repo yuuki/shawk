@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func TestParseNodeStates(t *testing.T) {
@@ -38,6 +39,23 @@ nodes:
 	ns, err = parseNodeStates([]byte(`{"generated_at":"2026-10-31T12:00:00Z","nodes":[{"host":"cn001","state":["IDLE","POWERING_DOWN"],"reason":""}]}`), t0)
 	if err != nil || len(ns.nodes) != 1 || !slices.Equal(ns.nodes[0].state, []string{"IDLE", "POWERING_DOWN"}) {
 		t.Errorf("JSON = %+v, %v", ns, err)
+	}
+
+	// A reason is free text, cleaned for PostgreSQL and cut (#254).
+	reason := func(r string) string {
+		t.Helper()
+		ns, err := parseNodeStates([]byte(`{"generated_at": "2026-10-31T12:00:00Z", "nodes": [{"host": "cn001", "state": "DRAIN", "reason": "`+
+			r+`"}]}`), t0)
+		if err != nil || len(ns.nodes) != 1 {
+			t.Fatalf("reason %.20q: %+v, %v", r, ns, err)
+		}
+		return ns.nodes[0].reason
+	}
+	if got := reason(`a\u0000\tb\n`); got != "a\uFFFD\tb\n" {
+		t.Errorf("reason with NUL = %q", got)
+	}
+	if got := reason(strings.Repeat("é", maxStringBytes)); len(got) != maxStringBytes || !utf8.ValidString(got) {
+		t.Errorf("long reason has %d bytes, valid UTF-8 %t", len(got), utf8.ValidString(got))
 	}
 
 	// Flags joined in a list element are split, and * of a node that does
@@ -74,6 +92,9 @@ nodes:
 		{"no state", "generated_at: 2026-10-31T12:00:00Z\nnodes: [{host: cn001}]\n"},
 		{"empty flag", "generated_at: 2026-10-31T12:00:00Z\nnodes: [{host: cn001, state: IDLE+}]\n"},
 		{"twice", "generated_at: 2026-10-31T12:00:00Z\nnodes: [{host: cn001, state: IDLE}, {host: cn001, state: DOWN}]\n"},
+		// PostgreSQL refuses text with NUL (#254).
+		{"NUL in a host", `{"generated_at": "2026-10-31T12:00:00Z", "nodes": [{"host": "cn\u0000", "state": "IDLE"}]}`},
+		{"control character in a node", `{"generated_at": "2026-10-31T12:00:00Z", "nodes": [{"node": "cn\u0001", "state": "IDLE"}]}`},
 	} {
 		if ns, err := parseNodeStates([]byte(bad.doc), t0); err == nil {
 			t.Errorf("%s: parsed %+v", bad.name, ns)
@@ -129,6 +150,11 @@ maintenance:
 		!ws[0].start.Equal(time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)) || ws[1].reason != "firmware" {
 		t.Errorf("windows = %+v", ws)
 	}
+	ws, err = parseMaintenance([]byte(`{"maintenance": [{"hosts": ["nfs01"], "start": "2026-11-01T00:00:00Z",
+	  "end": "2026-11-02T00:00:00Z", "reason": "fw\u0000"}]}`))
+	if err != nil || len(ws) != 1 || ws[0].reason != "fw\uFFFD" {
+		t.Errorf("reason = %+v, %v", ws, err)
+	}
 	for _, empty := range []struct{ name, doc string }{
 		{"empty list", "maintenance: []\n"},
 		{"empty mapping", "{}\n"},
@@ -180,6 +206,8 @@ maintenance:
 		{"no hosts", "maintenance: [{hosts: [], start: 2026-11-01T00:00:00Z, end: 2026-11-02T00:00:00Z}]\n", ""},
 		{"same start", "maintenance: [{hosts: [cn001], start: 2026-11-01T00:00:00Z, end: 2026-11-02T00:00:00Z}," +
 			" {hosts: [cn001], start: 2026-11-01T09:00:00+09:00, end: 2026-11-03T00:00:00Z}]\n", ""},
+		{"empty host", "maintenance: [{hosts: [''], start: 2026-11-01T00:00:00Z, end: 2026-11-02T00:00:00Z}]\n", ""},
+		{"NUL in a host", `{"maintenance": [{"hosts": ["nfs\u0000"], "start": "2026-11-01T00:00:00Z", "end": "2026-11-02T00:00:00Z"}]}`, ""},
 	} {
 		ws, err := parseMaintenance([]byte(bad.doc))
 		if err == nil {

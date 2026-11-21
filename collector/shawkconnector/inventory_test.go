@@ -100,6 +100,7 @@ func TestParseInventoryInvalid(t *testing.T) {
 		{"loopback", "hosts:\n  - name: a\n    addrs: [127.0.0.1]", "names no host"},
 		{"unspecified", "hosts:\n  - name: a\n    addrs: ['::']", "names no host"},
 		{"zone", "hosts:\n  - name: a\n    addrs: ['fe80::1%eth0']", "zone"},
+		{"NUL in a zone", "hosts:\n  - name: a\n    addrs: [\"fe80::1%eth0\\0\"]", `address "fe80::1%eth0\x00" has a zone`},
 		{"empty role", "hosts:\n  - name: a\n    roles: ['']", "empty"},
 		{"not YAML", "hosts: [", "yaml"},
 		{"two documents", "hosts:\n  - name: a\n---\nhosts:\n  - name: b", "more than one YAML document"},
