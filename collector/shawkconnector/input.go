@@ -587,6 +587,13 @@ func (b *hostBatch) dropAgent(name string) {
 	}
 }
 
+// maxUnixTime is the latest time of a gauge of Unix seconds the connector
+// takes, the end of the year 9999. A later time is no time an agent sends,
+// and one near 2^63 seconds wraps around in time.Unix to a time far before
+// 1970, which no cap on times ahead of the connector catches and which
+// would make PostgreSQL refuse the changes of the host.
+const maxUnixTime = 253402300799
+
 // forGauge calls f with the data points of a gauge of Unix seconds.
 func forGauge(b *hostBatch, m pmetric.Metric, f func(pmetric.NumberDataPoint, time.Time)) {
 	if m.Type() != pmetric.MetricTypeGauge {
@@ -597,10 +604,11 @@ func forGauge(b *hostBatch, m pmetric.Metric, f func(pmetric.NumberDataPoint, ti
 	for i := range dps.Len() {
 		dp := dps.At(i)
 		b.observe(dp.Timestamp())
-		// A time before 1970 is no time an agent sends, and one far before
-		// would make PostgreSQL refuse the changes of the host.
+		// A time before 1970 is no time an agent sends either, and one far
+		// before would make PostgreSQL refuse the changes of the host. NaN is
+		// not a time.
 		v := numberValue(dp)
-		if !(v >= 0) || !validValue(v) {
+		if !(v >= 0 && v <= maxUnixTime) {
 			b.invalid++
 			continue
 		}

@@ -936,7 +936,9 @@ The request that closes an interval upserts the segment into
 and the host's addresses, one row per period held (a period ends after 5
 minutes unseen). Liveness is thus judged by the connector's clock; the
 difference to the agent's is kept as `clock_skew`, shown and alerted on
-beyond a minute. Edges, listeners, translations and processes keep the
+beyond a minute. The segment starts no later than the request by the
+agent's clock, so that, converted with `clock_skew`, it never starts after
+its heartbeat. Edges, listeners, translations and processes keep the
 agent's times, capped at 2 minutes ahead of the connector, so a clock far
 ahead or an agent making times up cannot pin `last_seen` (`greatest()`),
 win the choice of most recently seen endpoint (§5.2) or escape the
@@ -1988,7 +1990,8 @@ only the protocols it parses. shawk runs beside it:
   classifies. The signatures are matched on the first bytes, so a protocol
   that starts like another one is taken for it, and others are `unknown`.
 - **Clocks**: first and last seen times come from each host's clock, capped
-  at 2 minutes ahead of the connector (§5.1), as does the segment start;
+  at 2 minutes ahead of the connector (§5.1); so does the segment start,
+  capped at the request that carries it, which `clock_skew` converts;
   heartbeats come from the connector's clock, compared with PostgreSQL's.
   A series seen again after its host's clock stepped back to before its
   first time takes the new time as its first time too, so that it is never

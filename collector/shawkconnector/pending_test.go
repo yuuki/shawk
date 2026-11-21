@@ -1,6 +1,7 @@
 package shawkconnector
 
 import (
+	"math"
 	"testing"
 	"time"
 )
@@ -104,6 +105,67 @@ func TestAcceptedWhileReported(t *testing.T) {
 		h := ch.take()[b.key]
 		if len(h.edges) != 0 || len(h.listeners) != 0 || len(h.translations) != 0 || len(h.processes) != 0 {
 			t.Errorf("after %v: written again: %v, %v, %v, %v", at, h.edges, h.listeners, h.translations, h.processes)
+		}
+	}
+}
+
+// TestSessionStartsNoLaterThanRequest: a segment start after the request
+// that carries it, by the clock of the agent, is taken as the time of the
+// request, whatever the clock skew: the session does not start after its
+// heartbeat, and a time the agent makes up is not written.
+func TestSessionStartsNoLaterThanRequest(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		ahead time.Duration // how far the clock of the agent is ahead
+	}{
+		{"synchronized", 0},
+		{"agent ahead", time.Hour},
+		{"agent behind", -time.Hour},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ch := newChanges(15*time.Minute, false)
+			at := t0.Add(tc.ahead)
+			b := testBatch(t, tAgent{host: "app-01", time: at, segment: at.Add(24 * time.Hour)})
+			ch.add(b, t0)
+			sessions := ch.pending[b.key].sessions
+			if len(sessions) != 1 {
+				t.Fatalf("sessions = %v, want one", sessions)
+			}
+			for start, s := range sessions {
+				if !start.Equal(at) || start.Add(s.clockSkew).After(s.lastHeartbeat) {
+					t.Errorf("session starts at %v by the clock of the agent, %v by the connector's, heartbeat %v; "+
+						"want the time of the request", start.Sub(t0), start.Add(s.clockSkew).Sub(t0), s.lastHeartbeat.Sub(t0))
+				}
+			}
+		})
+	}
+}
+
+// TestGaugeTimesOutOfRange: a time of a gauge of Unix seconds that is not a
+// time an agent sends, before 1970 or after the year 9999, is invalid. One
+// near 2^63 seconds would otherwise wrap around to a time far before 1970,
+// which no cap catches and which PostgreSQL refuses.
+func TestGaugeTimesOutOfRange(t *testing.T) {
+	for _, v := range []float64{-1, math.NaN(), math.Inf(1), maxUnixTime + 1, maxValue - 1024} {
+		md := tAgent{host: "app-01", time: t0, listeners: []tListener{{proto: "tcp", addr: "10.0.0.11", port: 80,
+			svc: "web", comm: "web"}}}.metrics()
+		ms := md.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics()
+		for i := range ms.Len() {
+			if m := ms.At(i); m.Name() == metricListenerLast {
+				m.Gauge().DataPoints().At(0).SetDoubleValue(v)
+			}
+		}
+		b, err := parseResource(md.ResourceMetrics().At(0))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if b.invalid != 1 {
+			t.Errorf("last seen %v: %d invalid points, want 1", v, b.invalid)
+		}
+		ch := newChanges(15*time.Minute, false)
+		ch.add(b, t0)
+		if ls := ch.pending[b.key].listeners; len(ls) != 0 {
+			t.Errorf("last seen %v: listeners written %v", v, ls)
 		}
 	}
 }

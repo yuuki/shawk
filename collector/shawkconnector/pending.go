@@ -349,7 +349,15 @@ func (c *changes) add(b *hostBatch, now time.Time) {
 	h.setHost(b.machineID, b.hostname, b.kernel, b.agentVersion, now)
 	f := c.advanceFloor(b, skew, now)
 	if !b.segmentStart.IsZero() && !b.limited {
+		// A segment starts no later than the request that carries it, by the
+		// clock of the agent, so that converted with the clock skew the
+		// session never starts after its heartbeat, and a time the agent
+		// makes up is written within what PostgreSQL holds. Nor does it start
+		// before the floor.
 		start := b.segmentStart
+		if t := now.Add(-skew).Truncate(time.Second); start.After(t) {
+			start = t
+		}
 		if start.Before(f.start) {
 			start = f.start
 		}
