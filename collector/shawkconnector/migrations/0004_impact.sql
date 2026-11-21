@@ -266,33 +266,81 @@ d AS MATERIALIZED (
   FROM shawk_v1.dependencies_between(dependents.since, dependents.until) x
   WHERE dependents.since < dependents.until
 ),
--- The hosts that held addresses in the period, and those the inventory
--- gives addresses (without a host id).
-ha AS MATERIALIZED (
-  SELECT a.addr, a.host_id, h.hostname, a.first_seen, a.last_seen
+-- The periods in which the agents of a name reported addresses, and the
+-- stretches in which they reported any: when the name was seen. A period
+-- starts anew after the alive window (shawk.host_addrs), so that an agent
+-- that stops ends the periods of all the addresses of its host.
+hp AS (
+  SELECT h.hostname, a.addr, a.first_seen, a.last_seen
   FROM shawk.host_addrs a
   JOIN shawk.hosts h ON h.id = a.host_id
-  WHERE a.last_seen >= dependents.since - shawk.alive_window() AND a.first_seen <= dependents.until + shawk.alive_window()
+),
+hs AS (
+  SELECT s.hostname, s.seen, lag(upper(s.seen)) OVER w AS before, lead(lower(s.seen)) OVER w AS after
+  FROM (
+    SELECT hp.hostname,
+           unnest(range_agg(tstzrange(hp.first_seen, hp.last_seen + shawk.alive_window(), '[]'))) AS seen
+    FROM hp GROUP BY hp.hostname
+  ) s
+  WINDOW w AS (PARTITION BY s.hostname ORDER BY s.seen)
+),
+-- The periods of an address in the order they started, numbered by the
+-- runs of periods of one name, and when a run of another name started
+-- after each run (taken) and ended before it (released).
+ho AS (
+  SELECT y.hostname, y.addr, y.first_seen, y.last_seen,
+         sum(y.other) OVER (PARTITION BY y.addr ORDER BY y.first_seen, y.hostname) AS run
+  FROM (
+    SELECT hp.*,
+           (hp.hostname IS DISTINCT FROM lag(hp.hostname) OVER (PARTITION BY hp.addr ORDER BY hp.first_seen, hp.hostname))::integer AS other
+    FROM hp
+  ) y
+),
+hr AS (
+  SELECT x.addr, x.run, lead(x.starts) OVER w AS taken, lag(x.ends) OVER w AS released
+  FROM (SELECT ho.addr, ho.run, min(ho.first_seen) AS starts, max(ho.last_seen) AS ends FROM ho GROUP BY ho.addr, ho.run) x
+  WINDOW w AS (PARTITION BY x.addr ORDER BY x.run)
+),
+-- When each name held each address, as far as the data tells. While its
+-- agents report, a host holds the addresses they report. While none
+-- reports, it may still hold those of the last report before, and already
+-- hold those of the first report after: a period that ends with a stretch
+-- goes on to the next stretch of the name, and one that starts with a
+-- stretch goes back to the stretch before, but not beyond the time a host
+-- of another name reported the address. The inventory gives its addresses
+-- to its hosts at all times.
+ha AS MATERIALIZED (
+  SELECT ho.addr, ho.hostname,
+         CASE WHEN ho.first_seen <= lower(hs.seen) + shawk.alive_window()
+              THEN least(ho.first_seen - shawk.alive_window(),
+                         greatest(coalesce(hs.before, '-infinity'), coalesce(hr.released, '-infinity')))
+              ELSE ho.first_seen - shawk.alive_window() END AS held_from,
+         CASE WHEN ho.last_seen >= upper(hs.seen) - 2 * shawk.alive_window()
+              THEN greatest(ho.last_seen + shawk.alive_window(),
+                            least(coalesce(hs.after, 'infinity'), coalesce(hr.taken, 'infinity')))
+              ELSE ho.last_seen + shawk.alive_window() END AS held_until
+  FROM ho
+  JOIN hs ON hs.hostname = ho.hostname AND hs.seen @> ho.first_seen
+  JOIN hr ON hr.addr = ho.addr AND hr.run = ho.run
   UNION ALL
-  SELECT i.addr, NULL, i.host, '-infinity', 'infinity' FROM shawk.inventory_addrs i
+  SELECT i.addr, i.host, '-infinity', 'infinity' FROM shawk.inventory_addrs i
 ),
 -- The hosts that may have served a dependency that its client alone saw:
 -- the host of the client for loopback, else those that held the address
 -- of the server while the dependency was active in the period.
 cand AS (
-  SELECT d.id, d.client_host, d.server_addr, d.port, d.proto, d.last_seen, d.client_host AS host, hc.id AS host_id
+  SELECT d.id, d.client_host, d.server_addr, d.port, d.proto, d.last_seen, d.client_host AS host
   FROM d
-  JOIN shawk.hosts hc ON hc.hostname = d.client_host
   WHERE d.server_host IS NULL AND d.proto <> 'unix'
     AND (d.server_addr << inet '127.0.0.0/8' OR d.server_addr = inet '::1')
   UNION ALL
-  SELECT d.id, d.client_host, d.server_addr, d.port, d.proto, d.last_seen, ha.hostname, ha.host_id
+  SELECT d.id, d.client_host, d.server_addr, d.port, d.proto, d.last_seen, ha.hostname
   FROM d
   JOIN ha ON ha.addr = d.server_addr
   WHERE d.server_host IS NULL AND d.proto <> 'unix'
     AND NOT (d.server_addr << inet '127.0.0.0/8' OR d.server_addr = inet '::1')
-    AND ha.last_seen >= greatest(d.first_seen, dependents.since) - shawk.alive_window()
-    AND ha.first_seen <= least(d.last_seen, dependents.until) + shawk.alive_window()
+    AND ha.held_until >= greatest(d.first_seen, dependents.since)
+    AND ha.held_from <= least(d.last_seen, dependents.until)
 ),
 -- Their service: the latest known owner of a listener on the port. An
 -- address the host of the client holds too is its own: the gateway of a
@@ -302,9 +350,10 @@ srv AS (
   FROM (SELECT cand.*, bool_or(cand.host = cand.client_host) OVER (PARTITION BY cand.id) AS own FROM cand) c
   LEFT JOIN LATERAL (
     SELECT p.service_name AS service
-    FROM shawk.listener_owners l
+    FROM shawk.hosts h
+    JOIN shawk.listener_owners l ON l.host_id = h.id
     JOIN shawk.processes p ON p.id = l.process_id
-    WHERE l.host_id = c.host_id AND l.proto = c.proto AND l.port = c.port
+    WHERE h.hostname = c.host AND l.proto = c.proto AND l.port = c.port
       AND l.addr IN (c.server_addr, inet '0.0.0.0', inet '::')
       AND l.last_seen >= dependents.since - interval '15 minutes'
       AND l.first_seen <= c.last_seen + interval '15 minutes'
@@ -425,7 +474,10 @@ $$;
 -- held the address then, the host of the client for loopback and for an
 -- address the client holds too, or the host the inventory gives the
 -- address; its service is the latest known owner of a listener on the
--- port, NULL if none. Such a dependency counts for a service of a host
+-- port, NULL if none. A host whose agents did not report then held the
+-- address if it was among the last they reported before or the first they
+-- reported after, and no host of another name reported it in between: a
+-- host that is used while its agent is stopped keeps its dependents. Such a dependency counts for a service of a host
 -- only if that service owned the port, except on a target without an
 -- agent, of which nothing else is known. A connection that a socket
 -- without a known owner accepted (~unknown) counts for every service of
