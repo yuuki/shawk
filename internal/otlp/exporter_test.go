@@ -8,6 +8,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -154,6 +156,14 @@ func TestGRPCExporter(t *testing.T) {
 }
 
 func TestNewExporterErrors(t *testing.T) {
+	dir := t.TempDir()
+	tokenFile, emptyFile := filepath.Join(dir, "token"), filepath.Join(dir, "empty")
+	if err := os.WriteFile(tokenFile, []byte("token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(emptyFile, []byte("\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	for _, cfg := range []ExporterConfig{
 		{Endpoint: "localhost:4317"},
 		{Endpoint: "ftp://localhost:4317"},
@@ -162,12 +172,54 @@ func TestNewExporterErrors(t *testing.T) {
 		// TLS settings with a plaintext endpoint would be silently ignored.
 		{Endpoint: "http://localhost:4317", CAFile: "/etc/ssl/ca.pem"},
 		{Endpoint: "http://localhost:4317", CertFile: "/c.pem", KeyFile: "/k.pem"},
+		{Endpoint: "http://localhost:4317", ServerName: "collector.example"},
 		{Endpoint: "https://localhost:4317", CertFile: "/c.pem"},
 		{Endpoint: "https://localhost:4317", CertFile: "/nonexistent", KeyFile: "/nonexistent"},
+		// A token is never sent in the clear, not even to loopback.
+		{Endpoint: "http://localhost:4317", BearerTokenFile: tokenFile},
+		{Endpoint: "http://10.0.0.1:4318", Protocol: ProtocolHTTP, BearerTokenFile: tokenFile},
+		{Endpoint: "https://localhost:4317", BearerTokenFile: "/nonexistent"},
+		{Endpoint: "https://localhost:4317", BearerTokenFile: emptyFile},
 	} {
 		if _, err := NewExporter(cfg); err == nil {
 			t.Errorf("NewExporter(%+v) succeeded", cfg)
 		}
+	}
+}
+
+// TestBearerTokenFile checks how a token is read: one word of visible
+// ASCII without the white space around it, in errors that never hold it.
+func TestBearerTokenFile(t *testing.T) {
+	dir := t.TempDir()
+	long := strings.Repeat("s3cr3t", maxBearerTokenFile/6)
+	for _, tc := range []struct {
+		content, want string // want "" for an error
+	}{
+		{"s3cr3t\n", "Bearer s3cr3t"},
+		{" \t s3cr3t \r\n\n", "Bearer s3cr3t"},
+		{long, "Bearer " + long},
+		{"", ""},
+		{" \n\t\n", ""},
+		{"s3cr3t # comment\n", ""},
+		{"s3cr3t\nanother\n", ""},
+		{"s3cr3t\x00", ""},
+		{"s3cr3té", ""},
+		{long + strings.Repeat(" ", maxBearerTokenFile+1-len(long)), ""},
+	} {
+		f := filepath.Join(dir, "token")
+		if err := os.WriteFile(f, []byte(tc.content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		got, err := ExporterConfig{BearerTokenFile: f}.authorization()
+		if got != tc.want || (err == nil) != (tc.want != "") {
+			t.Errorf("%.40q: %.40q, %v; want %.40q", tc.content, got, err, tc.want)
+		}
+		if err != nil && strings.Contains(err.Error(), "s3cr3t") {
+			t.Errorf("%.40q: the error holds the token: %v", tc.content, err)
+		}
+	}
+	if _, err := (ExporterConfig{BearerTokenFile: dir}).authorization(); err == nil {
+		t.Error("a directory was read as a token")
 	}
 }
 

@@ -3,6 +3,8 @@ package cli
 import (
 	"bytes"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -49,6 +51,9 @@ func TestAgentFlags(t *testing.T) {
 		{"agent", "-otlp-endpoint", "localhost:4327"},
 		{"agent", "-otlp-protocol", "carrier-pigeon"},
 		{"agent", "-otlp-cert-file", "client.crt", "-otlp-key-file", "client.key"}, // without https://
+		{"agent", "-otlp-endpoint", "http://localhost:4327", "-otlp-server-name", "collector.example"},
+		// A token is never sent in the clear, not even to loopback.
+		{"agent", "-otlp-endpoint", "http://localhost:4327", "-otlp-bearer-token-file", "token"},
 		{"flows", "extra"},
 		{"flows", "-interval", "0"},
 		{"flows", "-count", "-1"},
@@ -62,6 +67,17 @@ func TestAgentFlags(t *testing.T) {
 	if code := Main([]string{"agent", "-otlp-endpoint", "https://localhost:4327", "-otlp-ca-file", "/nonexistent/ca.pem"},
 		&out, &errOut); code != 1 {
 		t.Errorf("exit code of an agent whose CA file is missing = %d", code)
+	}
+	// So is the token, which the agent refuses empty.
+	empty := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(empty, []byte("\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range []string{"/nonexistent/token", empty} {
+		if code := Main([]string{"agent", "-otlp-endpoint", "https://localhost:4327", "-otlp-bearer-token-file", file},
+			&out, &errOut); code != 1 {
+			t.Errorf("exit code of an agent with the token file %s = %d", file, code)
+		}
 	}
 }
 

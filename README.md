@@ -103,9 +103,12 @@ connections should be traced after it, e.g. slurmd
 
 `shawk agent -h` lists the flags. Most deployments set only
 `-otlp-endpoint` and the TLS files (`-otlp-ca-file`, `-otlp-cert-file`,
-`-otlp-key-file`). Services that share an executable on a host (`ruby`,
-`python`, `java`) should set `OTEL_SERVICE_NAME`, e.g. with `Environment=`
-in a systemd drop-in, as for OBI.
+`-otlp-key-file`); behind a front collector that checks tokens rather
+than client certificates, `-otlp-bearer-token-file` replaces the
+certificate ([packaging/](packaging/README.md#agent)). Services that
+share an executable on a host (`ruby`, `python`, `java`) should set
+`OTEL_SERVICE_NAME`, e.g. with `Environment=` in a systemd drop-in, as
+for OBI.
 
 ### Collector
 

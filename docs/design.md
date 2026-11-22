@@ -913,10 +913,28 @@ which include containers.
   converted with the agent's current clock skew, so it stays right after the
   clock steps.
 - TLS. An `https://` endpoint verifies the collector and may present a
-  client certificate. Over `http://` the host's dependencies, executables,
-  name and machine id travel in the clear, and the agent warns unless the
-  endpoint is loopback. The agent does not follow HTTP redirects, so nothing
-  in the path can divert the export elsewhere or to `http://`.
+  client certificate. `-otlp-server-name` verifies the certificate by
+  another name than the host of the endpoint, and asks for it in SNI, for
+  an endpoint given by its address, such as a virtual address of a network
+  without DNS; over gRPC it is also the authority of the requests. Over
+  `http://` the host's dependencies, executables, name and machine id
+  travel in the clear, and the agent warns unless the endpoint is
+  loopback. The agent does not follow HTTP redirects, so nothing in the
+  path can divert the export elsewhere or to `http://`.
+- Bearer token. Instead of a client certificate, the agent can send a token
+  to a front collector that authenticates agents by tokens (the
+  bearertokenauth extension of otelcol-contrib) and forwards to the
+  connectors (§5.3): `Authorization: Bearer` with every request, in the
+  metadata of gRPC and the headers of HTTP. The token is read at start from
+  `-otlp-bearer-token-file` (e.g. a credential of systemd), without the
+  white space around it, so a new token takes a restart. The agent refuses
+  to start with an empty file, a token that is not one word of visible
+  ASCII, or an endpoint other than `https://`, loopback included: in the
+  clear the token could be read on the way and replayed, and while the
+  collector is down any user of the host could listen on its port and take
+  it, whereas TLS verifies the collector. The token is never logged, nor
+  held in errors. A token names no host, so any holder can write as any
+  host, as behind a front with certificates (`host_identity: none`, §5.5).
 - Host identity. With `host_identity: certificate` the connector accepts a
   host's metrics only from an agent whose verified certificate names its
   `host.name` (a DNS name, else the common name; no wildcards), so one

@@ -44,6 +44,36 @@ node whose agent fails stays out of service. An agent older than the unit
 does not report ready, so systemd stops it at the timeout: upgrade the
 binary and the unit together, as the packages do.
 
+Behind a front collector that authenticates agents by tokens rather than
+client certificates (`collector/front.yaml`), give each agent its token
+with `-otlp-bearer-token-file`, e.g. as an encrypted credential of
+systemd, which only the unit reads:
+
+```sh
+systemd-creds encrypt --name=otlp-token token.txt /etc/shawk/otlp-token.cred
+```
+
+```ini
+# /etc/systemd/system/shawk-agent.service.d/otlp-token.conf
+[Service]
+LoadCredentialEncrypted=otlp-token:/etc/shawk/otlp-token.cred
+ExecStart=
+ExecStart=/usr/bin/shawk agent $SHAWK_AGENT_OPTS -otlp-bearer-token-file ${CREDENTIALS_DIRECTORY}/otlp-token
+```
+
+The name embedded by `--name` must be the one of
+`LoadCredentialEncrypted=`; without `--name` it is the name of the output
+file, and the unit fails with `243/CREDENTIALS`. systemd expands
+`${CREDENTIALS_DIRECTORY}` in `ExecStart=` but not in the value of
+`SHAWK_AGENT_OPTS`, so the flag goes in the drop-in rather than in
+`/etc/shawk/agent.env`. The drop-in replaces the command of the unit, so
+keep it in step with the unit. The agent reads the token when it starts:
+restart it after a new token. It refuses to send a token to an endpoint
+other than `https://`. Nodes that reach the collector by an address, e.g. a
+virtual address of a network without DNS, verify its certificate by the
+name it holds: `-otlp-endpoint https://10.0.0.10:4327 -otlp-server-name
+collector.example`.
+
 ## PostgreSQL
 
 ```sh

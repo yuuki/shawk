@@ -25,7 +25,14 @@
 #   forwarded one at a time in their order, and a failure reaches the
 #   agent, which makes up for it at the next interval.
 receivers:
-  # The receiver of agents, as otlp/shawk in config.yaml.
+  # The receiver of agents, as otlp/shawk in config.yaml. Agents can send a
+  # token instead of a client certificate (-otlp-bearer-token-file), which
+  # the bearertokenauth extension of otelcol-contrib checks: remove
+  # client_ca_file, set `auth: {authenticator: bearertokenauth}` beside
+  # tls, and add the extension, e.g. with `filename:
+  # /etc/shawk/agent-tokens` (a token per line), to extensions and
+  # service.extensions. A token names no host: any agent with one can write
+  # as any host, as with a certificate here.
   otlp/shawk:
     protocols:
       grpc:
