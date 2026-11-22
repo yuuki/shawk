@@ -164,14 +164,16 @@ func TestPackagedCollectorConfig(t *testing.T) {
 	}
 	sends, shared := map[string]bool{}, map[string]string{}
 	for name, p := range doc.Service.Pipelines {
+		// An exporter has one instance, and one queue, per signal.
+		signal, _, _ := strings.Cut(name, "/")
 		for _, e := range p.Exporters {
 			if doc.Exporters[e] == nil {
 				continue // the connector, or undefined (below)
 			}
-			if other, ok := shared[e]; ok {
+			if other, ok := shared[signal+" "+e]; ok {
 				t.Errorf("%s: in %s and %s, whose requests share its queue", e, other, name)
 			}
-			shared[e] = name
+			shared[signal+" "+e] = name
 			want, ok := queues[name]
 			if !ok {
 				t.Errorf("%s: exports through %s, whose queue is not checked", name, e)
@@ -213,6 +215,11 @@ func TestPackagedCollectorConfig(t *testing.T) {
 	for name := range queues {
 		if !sends[name] {
 			t.Errorf("%s exports through no exporter", name)
+		}
+	}
+	for _, name := range []string{"metrics/shawk-out", "metrics/obi"} {
+		if len(toPrometheus(doc.Service.Pipelines[name].Exporters)) == 0 {
+			t.Errorf("%s sends nothing to Prometheus", name)
 		}
 	}
 }

@@ -224,20 +224,20 @@ exporters:
       cert_file: /etc/shawk/tls/collector-client.crt
       key_file: /etc/shawk/tls/collector-client.key
     # The queue counts the encoded bytes of the batches of OBI's spans
-    # (docs/design.md, section 9): 64 MiB, up to about 3.5 times as much in
-    # memory, hold about 260 000 spans of 250 bytes, as those of HTTP and
-    # SQL requests, which last 2.5 minutes for a fleet whose OBI sends
-    # 100 000 spans a minute; size it to the fleet and the memory of the
-    # collector. Not spans: their attributes (paths, URLs, SQL queries) come
-    # from the applications, so that a span takes from 250 bytes to several
-    # KB of memory. Not batches: a batch holds what arrives in 200 ms, up to
-    # 8192 spans, and the default of 1000 batches bounds no number of spans
-    # (full, they take about 5.5 GiB). While the store is down the queue
-    # fills, and a full memory would make memory_limiter refuse the requests
-    # of agents, for PostgreSQL too. Keep the queue enabled, and not
-    # blocking: the retries of a batch would otherwise block the batch
-    # processor, and with it the requests of OBI. Spans beyond the queue are
-    # dropped.
+    # (docs/design.md, section 9): 64 MiB, about 200 MiB in memory (up to
+    # 3.5 times as much), hold about 270 000 spans of 250 encoded bytes, as
+    # those of HTTP and SQL requests, which last 2.7 minutes for a fleet
+    # whose OBI sends 100 000 spans a minute; size it to the fleet and the
+    # memory of the collector. Not spans: their attributes (paths, URLs, SQL
+    # queries) come from the applications, so that a span takes from 235
+    # bytes to several KB of memory. Not batches: a batch holds what arrives
+    # in 200 ms, up to 8192 spans, so that the default of 1000 batches holds
+    # 200 seconds of spans whatever their rate, about 5.7 GiB once batches
+    # are full. While the store is down the queue fills, and a full memory
+    # would make memory_limiter refuse the requests of agents, for
+    # PostgreSQL too. Keep the queue enabled, and not blocking: the retries
+    # of a batch would otherwise block the batch processor, and with it the
+    # requests of OBI. Spans beyond the queue are dropped.
     sending_queue:
       sizer: bytes
       queue_size: 67108864

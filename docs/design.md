@@ -1929,16 +1929,26 @@ URLs, SQL queries). Measured as pdata, as the receiver makes them, a mix
 of the spans of HTTP, gRPC, SQL and Redis requests takes about 750 bytes of
 memory a span (250 encoded), an internal span without attributes 235 bytes
 and one with a query of 2 KiB 3 KB, while memory stays within 1.3 to 3.5
-times the encoded bytes. The default counts 1000 batches, which bounds no
-number of spans: while the store is down, 1000 batches of 8192 such spans
-take about 5.5 GiB, until `memory_limiter`, which measures the whole
-collector, refuses the requests of agents, so that PostgreSQL gets nothing
-either until the store is back. The example holds 64 MiB, about 200 MiB in
-memory, or 260 000 spans of 250 bytes, which last 2.5 minutes for a fleet
-whose OBI sends 100 000 spans a minute: size it to the fleet (the rate of
-`otelcol_exporter_sent_spans` times the encoded size of a span) and to the
-memory of the collector. Spans beyond are dropped
-(`otelcol_exporter_enqueue_failed_spans`), and their traces miss them.
+times the encoded bytes. The default counts 1000 batches, which hold 200
+seconds of spans whatever their rate, since the batch processor sends what
+arrived within 200 ms: about 250 MB at 100 000 spans a minute, but about
+5.7 GiB once batches are full (41 000 spans a second). While the store is
+down that memory grows with the rate of spans, until `memory_limiter`,
+which measures the whole collector, refuses the requests of agents, so that
+PostgreSQL gets nothing either until the store is back. The example holds
+64 MiB, about 200 MiB in memory whatever the rate, or 270 000 spans of 250
+encoded bytes, which last 2.7 minutes at 100 000 spans a minute: size it
+to the fleet and to the memory of the collector. With this sizer,
+`otelcol_exporter_queue_size` and `otelcol_exporter_queue_capacity` are in
+bytes, and the queue fills while the store is down at the rate of
+`otelcol_exporter_enqueue_size_bytes_sum`, which the collector reports at
+the `detailed` level of its telemetry. Spans beyond are dropped
+(`otelcol_exporter_enqueue_failed_spans`), as are those still not sent when
+their retries end (`otelcol_exporter_send_failed_spans`), and their traces
+miss them. With the queues to Prometheus, those of the example hold up to
+about 700 MiB, which must fit, beside what the connector holds (§5.5),
+under the soft limit of `memory_limiter`: 60% of the memory of the
+collector in the example.
 
 ## 10. Limitations
 

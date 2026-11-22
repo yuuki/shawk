@@ -36,8 +36,9 @@
 * `packaging/collector/config.yaml` bounds the queue of the exporter of
   OBI's traces (`otlp_grpc/traces`) to 64 MiB of encoded spans
   (`sizer: bytes`, about 200 MiB in memory). The default queue counted
-  1000 batches of up to 8192 spans, about 5.5 GiB once full, so that a
-  trace store that was down could fill the memory of the collector until
+  1000 batches of up to 8192 spans, 200 seconds of spans whatever their
+  rate and about 5.7 GiB once batches are full, so that a trace store that
+  was down could fill the memory of the collector until
   `memory_limiter` refused the requests of agents, and PostgreSQL got
   nothing either (`docs/design.md` §9). Bring an edited
   `/etc/shawk/collector.yaml` in line with the example.
