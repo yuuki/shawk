@@ -47,10 +47,12 @@ binary and the unit together, as the packages do.
 Behind a front collector that authenticates agents by tokens rather than
 client certificates (`collector/front.yaml`), give each agent its token
 with `-otlp-bearer-token-file`, e.g. as an encrypted credential of
-systemd, which only the unit reads:
+systemd (250 or later), which only the unit reads. Encrypt it on each
+node, since the file is bound to the key of its host (and its TPM2, if
+any), from the standard input rather than a file left on the disk:
 
 ```sh
-systemd-creds encrypt --name=otlp-token token.txt /etc/shawk/otlp-token.cred
+systemd-creds encrypt --name=otlp-token - /etc/shawk/otlp-token.cred   # the token on the standard input
 ```
 
 ```ini
@@ -68,8 +70,10 @@ file, and the unit fails with `243/CREDENTIALS`. systemd expands
 `SHAWK_AGENT_OPTS`, so the flag goes in the drop-in rather than in
 `/etc/shawk/agent.env`. The drop-in replaces the command of the unit, so
 keep it in step with the unit. The agent reads the token when it starts:
-restart it after a new token. It refuses to send a token to an endpoint
-other than `https://`. Nodes that reach the collector by an address, e.g. a
+to change it, add the new token beside the old one in the file of the
+front (bearertokenauth takes a token per line), restart the agents with
+the new one, then remove the old one. The agent refuses to send a token
+to an endpoint other than `https://`. Nodes that reach the collector by an address, e.g. a
 virtual address of a network without DNS, verify its certificate by the
 name it holds: `-otlp-endpoint https://10.0.0.10:4327 -otlp-server-name
 collector.example`.

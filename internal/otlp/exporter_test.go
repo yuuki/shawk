@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -220,6 +221,24 @@ func TestBearerTokenFile(t *testing.T) {
 	}
 	if _, err := (ExporterConfig{BearerTokenFile: dir}).authorization(); err == nil {
 		t.Error("a directory was read as a token")
+	}
+	// A FIFO that nothing writes is empty, rather than blocking the start.
+	fifo := filepath.Join(dir, "fifo")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := ExporterConfig{BearerTokenFile: fifo}.authorization()
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Error("a FIFO without a writer was read as a token")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("reading a FIFO without a writer blocks")
 	}
 }
 

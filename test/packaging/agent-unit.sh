@@ -51,10 +51,10 @@ journal() { journalctl -u "$UNIT" -o cat --no-pager; }
 
 fail() {
 	echo "FAIL: $*" >&2
-	echo "--- journal of $UNIT" >&2
-	journal | tail -30 >&2
-	echo "--- collector" >&2
-	tail -20 "$WORK/collector.log" >&2
+	echo "--- journal of $UNIT and $TOKEN" >&2
+	journalctl -u "$UNIT" -u "$TOKEN" -o cat --no-pager | tail -30 >&2
+	echo "--- collectors" >&2
+	tail -n 20 "$WORK/collector.log" "$WORK/token-collector.log" >&2 2>/dev/null || true
 	exit 1
 }
 
@@ -171,7 +171,8 @@ journalctl -u "$FAILING" -o cat --no-pager | grep -q 'starting tracer' ||
 mkdir -p "$TLS_DIR"
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 1 \
 	-subj /CN=collector.example -addext subjectAltName=DNS:collector.example \
-	-keyout "$TLS_DIR/collector.key" -out "$TLS_DIR/collector.crt" 2>/dev/null
+	-keyout "$TLS_DIR/collector.key" -out "$TLS_DIR/collector.crt" 2>"$WORK/openssl.log" ||
+	fail "openssl did not make the certificate of the collector: $(cat "$WORK/openssl.log")"
 head -c 32 /dev/urandom | base64 | tr -d '=+/' >"$WORK/token"
 python3 - "$TLS_PORT" "$TLS_DIR" "$WORK/token" >"$WORK/token-collector.log" 2>&1 <<'PY' &
 import http.server, ssl, sys
@@ -210,16 +211,16 @@ mkdir -p "/run/systemd/system/$TOKEN.d"
 } >"/run/systemd/system/$TOKEN.d/token.conf"
 systemctl stop "$UNIT"
 systemctl daemon-reload
-systemctl start "$TOKEN" || {
-	journalctl -u "$TOKEN" -o cat --no-pager | tail -20 >&2
-	fail "the agent with a token did not start"
-}
+systemctl start "$TOKEN" || fail "the agent with a token did not start"
 wait_for "no request with the token reached the collector" grep -q '^authorized' "$WORK/token-collector.log"
 grep -q '^sni collector.example$' "$WORK/token-collector.log" || fail "the agent did not ask for collector.example"
 if grep -q '^unauthorized' "$WORK/token-collector.log"; then
 	fail "the agent sent a request without its token"
 fi
-if journalctl -u "$TOKEN" -o cat --no-pager | grep -qF "$(cat "$WORK/token")"; then
+# Through a file: grep -q would stop journalctl early, and pipefail would
+# then hide a match.
+journalctl -u "$TOKEN" -o cat --no-pager >"$WORK/token-journal"
+if grep -qF -- "$(cat "$WORK/token")" "$WORK/token-journal"; then
 	fail "the agent logged its token"
 fi
 echo "PASS"

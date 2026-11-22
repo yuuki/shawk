@@ -932,9 +932,10 @@ which include containers.
   ASCII, or an endpoint other than `https://`, loopback included: in the
   clear the token could be read on the way and replayed, and while the
   collector is down any user of the host could listen on its port and take
-  it, whereas TLS verifies the collector. The token is never logged, nor
-  held in errors. A token names no host, so any holder can write as any
-  host, as behind a front with certificates (`host_identity: none`, §5.5).
+  it, whereas TLS verifies the collector. The token is never logged; errors
+  hold the path of its file, not its content. A token names no host, so
+  any holder can write as any host, as behind a front with certificates
+  (`host_identity: none`, §5.5).
 - Host identity. With `host_identity: certificate` the connector accepts a
   host's metrics only from an agent whose verified certificate names its
   `host.name` (a DNS name, else the common name; no wildcards), so one

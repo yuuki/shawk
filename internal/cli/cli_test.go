@@ -63,20 +63,24 @@ func TestAgentFlags(t *testing.T) {
 		}
 	}
 	// A valid command line whose command fails is not a usage error: the CA
-	// file is read when the agent starts.
-	if code := Main([]string{"agent", "-otlp-endpoint", "https://localhost:4327", "-otlp-ca-file", "/nonexistent/ca.pem"},
-		&out, &errOut); code != 1 {
-		t.Errorf("exit code of an agent whose CA file is missing = %d", code)
-	}
-	// So is the token, which the agent refuses empty.
+	// file and the token are read when the agent starts, which the agent
+	// refuses empty. Its error tells them apart from a later failure, such
+	// as that of the tracer without root.
 	empty := filepath.Join(t.TempDir(), "token")
 	if err := os.WriteFile(empty, []byte("\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	for _, file := range []string{"/nonexistent/token", empty} {
-		if code := Main([]string{"agent", "-otlp-endpoint", "https://localhost:4327", "-otlp-bearer-token-file", file},
-			&out, &errOut); code != 1 {
-			t.Errorf("exit code of an agent with the token file %s = %d", file, code)
+	for _, tc := range []struct {
+		flag, file, want string
+	}{
+		{"-otlp-ca-file", "/nonexistent/ca.pem", "/nonexistent/ca.pem"},
+		{"-otlp-bearer-token-file", "/nonexistent/token", "reading the bearer token"},
+		{"-otlp-bearer-token-file", empty, "is empty"},
+	} {
+		errOut.Reset()
+		if code := Main([]string{"agent", "-otlp-endpoint", "https://localhost:4327", tc.flag, tc.file},
+			&out, &errOut); code != 1 || !strings.Contains(errOut.String(), tc.want) {
+			t.Errorf("%s %s: exit code %d, %q; want 1 and %q", tc.flag, tc.file, code, errOut.String(), tc.want)
 		}
 	}
 }

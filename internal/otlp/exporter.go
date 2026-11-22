@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"syscall"
 
 	colmetricspb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
 	"google.golang.org/grpc"
@@ -55,9 +56,8 @@ type ExporterConfig struct {
 	BearerTokenFile string
 }
 
-// maxBearerTokenFile bounds the file of a bearer token: far above the
-// tokens of collectors, and below the 16 KiB of headers that a gRPC server
-// takes by default.
+// maxBearerTokenFile bounds the file of a bearer token, far above the
+// tokens of collectors: a larger file is another file given by mistake.
 const maxBearerTokenFile = 4096
 
 // DefaultEndpoint returns the endpoint of a collector on the local host for
@@ -153,12 +153,15 @@ func (cfg ExporterConfig) tlsConfig() (*tls.Config, error) {
 
 // authorization returns the value of the Authorization header of the
 // requests, read from BearerTokenFile: "Bearer " and the token, or ""
-// without a file. Its errors never hold the token.
+// without a file. Its errors hold the path of the file, never its content.
 func (cfg ExporterConfig) authorization() (string, error) {
 	if cfg.BearerTokenFile == "" {
 		return "", nil
 	}
-	f, err := os.Open(cfg.BearerTokenFile)
+	// Without O_NONBLOCK, opening a FIFO that nothing writes would block the
+	// start until systemd gives up waiting for READY=1; with it, the FIFO
+	// reads as empty. It changes nothing for a regular file.
+	f, err := os.OpenFile(cfg.BearerTokenFile, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return "", fmt.Errorf("reading the bearer token: %w", err)
 	}
