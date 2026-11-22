@@ -1,9 +1,9 @@
 {
   "repository": "yuuki/shawk/complexity",
   "ref": "refs/heads/main",
-  "commit": "171a248f8799b9af3dbc19a9f287101f37eb1e17",
+  "commit": "91b693a9b76fe53f1edb39f1fd08bd320002d7e3",
   "base_ref": "refs/heads/main",
-  "timestamp": "2026-11-22T02:10:52.789573071Z",
+  "timestamp": "2026-11-22T05:16:18.280896068Z",
   "custom_metrics": [
     {
       "key": "code_complexity",
