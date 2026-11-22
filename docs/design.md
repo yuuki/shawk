@@ -1296,6 +1296,22 @@ Prometheus needs `--web.enable-otlp-receiver`,
 `otlp.promote_resource_attributes: [host.id, host.name]` and a 30-minute
 out-of-order window.
 
+A store that takes Prometheus remote write, such as VictoriaMetrics, whose
+OTLP receiver does not translate names as Prometheus's does, gets the same
+series from the `prometheus_remote_write` exporter of the collector
+(`packaging/collector/config.yaml`). Its translation
+`UnderscoreEscapingWithSuffixes`, the default of the exporter and of
+Prometheus, gives the names above and the same `job` and `instance`, and
+`resource_constant_labels` with `included: [host.id, host.name]` the
+labels of `promote_resource_attributes`. Its queue (`remote_write_queue`)
+holds batches of the batch processor, a few MiB each for 8192 points:
+while the store is down, the default of 10000 would fill the memory of the
+collector until `memory_limiter` refuses the requests of agents, so that
+PostgreSQL gets nothing either until the store is back. The example holds
+50; batches beyond are dropped, which leaves gaps but no wrong totals,
+since counters are cumulative. The store must take points as late as
+Prometheus does with its window.
+
 The OTLP receiver of Prometheus writes whatever it is sent, so anyone who
 could push could write `shawk_agent_up` and silence `ShawkAgentDown`. The
 example pushes over TLS with a password (`packaging/collector/config.yaml`,

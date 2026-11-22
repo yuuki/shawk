@@ -118,9 +118,11 @@ PostgreSQL scripts) and the image `ghcr.io/yuuki/shawk-collector`. To build
 it yourself, run `make collector shawk-migrate`.
 
 [packaging/](packaging/README.md) has the configuration of the collector,
-PostgreSQL, Prometheus and Grafana, and the steps to set them up. A
-database created by v0.8.0 must be created again; see the
-[CHANGELOG](CHANGELOG.md).
+PostgreSQL, Prometheus and Grafana, and the steps to set them up. The
+collector also has the Prometheus remote write exporter, for
+VictoriaMetrics or another store that takes remote write rather than
+OTLP ([packaging/](packaging/README.md#prometheus)). A database created
+by v0.8.0 must be created again; see the [CHANGELOG](CHANGELOG.md).
 
 Connections through a load balancer, a virtual address or a proxy without
 an agent end at its address unless the translation is known: agents learn

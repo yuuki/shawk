@@ -14,6 +14,11 @@
   collector by another name than the host of `-otlp-endpoint`, and asks
   for it in SNI, for nodes that reach the collector by an address
   (`docs/design.md` §4.3).
+* The collector includes the `prometheus_remote_write` exporter of
+  opentelemetry-collector-contrib, to send to VictoriaMetrics or another
+  store that takes Prometheus remote write; `packaging/collector/config.yaml`
+  has its settings, which give the names and labels of the OTLP receiver
+  of Prometheus, with a small queue (`docs/design.md` §5.3).
 
 ## [v0.10.1](https://github.com/yuuki/shawk/compare/v0.10.0...v0.10.1) (2026-11-21)
 

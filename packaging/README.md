@@ -7,7 +7,7 @@ order of the steps and what the files leave out.
 | path | what |
 |---|---|
 | `systemd/` | units of the agent and the collector, and their environment files |
-| `collector/config.yaml` | the collector: `otlp/shawk` for agents, `otlp` for OBI, the shawk connector, exporters to Prometheus and a trace store |
+| `collector/config.yaml` | the collector: `otlp/shawk` for agents, `otlp` for OBI, the shawk connector, exporters to Prometheus (OTLP, or remote write) and a trace store |
 | `collector/front.yaml` | a front collector that spreads agents over several connectors by `host.id` and `host.name`; read its caveats first |
 | `postgres/` | roles (`shawk_owner`, `shawk_connector`, `shawk_grafana`), database and privileges |
 | `prometheus/` | settings for the OTLP push, TLS and users (`web.yml`), recording rules and alerts (`shawk-rules.yml`) |
@@ -127,6 +127,16 @@ Run Prometheus with `--web.enable-otlp-receiver` and
 Prometheus can push series, including `shawk_agent_up`, and silence the
 agent alerts. Replace the placeholders in `web.yml` with bcrypt hashes and
 give each client its own user.
+
+To send to VictoriaMetrics or another store that takes Prometheus remote
+write, use the exporter `prometheus_remote_write/victoriametrics` of
+`collector/config.yaml` (commented out) in place of
+`otlp_http/prometheus`. Its names and its labels `host_id` and
+`host_name` are those of the OTLP receiver of Prometheus with
+`prometheus.yml`, which the rules and dashboards expect; the rules of
+`shawk-rules.yml` then run in the ruler of the store (vmalert for
+VictoriaMetrics). Keep its queue small: while the store is down, the
+queue holds batches in the memory of the collector.
 
 ## Collector
 
