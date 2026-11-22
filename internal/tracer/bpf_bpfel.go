@@ -187,6 +187,13 @@ type bpfShawkXlatKey struct {
 	Pad     [6]uint8
 }
 
+type bpfUnixConnectArgs struct {
+	_    structs.HostLayout
+	Sock uint64
+	Addr uint64
+	Len  uint64
+}
+
 // Names of all BPF objects in the ELF.
 //
 // Used for safe lookups in a Collection or CollectionSpec.
@@ -208,6 +215,7 @@ const (
 	bpfMapUnixFlows               = "unix_flows"
 	bpfMapUnixFlows0              = "unix_flows_0"
 	bpfMapUnixFlows1              = "unix_flows_1"
+	bpfMapUnixPending             = "unix_pending"
 	bpfMapXlatConns               = "xlat_conns"
 	bpfMapXlats                   = "xlats"
 	bpfProgShawkCgroupMkdir       = "shawk_cgroup_mkdir"
@@ -227,7 +235,10 @@ const (
 	bpfProgShawkSkbConsumeUdpK    = "shawk_skb_consume_udp_k"
 	bpfProgShawkTcpReceiveReset   = "shawk_tcp_receive_reset"
 	bpfProgShawkTcpSendmsg        = "shawk_tcp_sendmsg"
+	bpfProgShawkUnixConnectK      = "shawk_unix_connect_k"
+	bpfProgShawkUnixConnectRet    = "shawk_unix_connect_ret"
 	bpfProgShawkUnixRelease       = "shawk_unix_release"
+	bpfProgShawkUnixReleaseK      = "shawk_unix_release_k"
 	bpfProgShawkUnixStreamConnect = "shawk_unix_stream_connect"
 	bpfVarActiveIdx               = "active_idx"
 	bpfVarAdoptedUnowned          = "adopted_unowned"
@@ -314,7 +325,10 @@ type bpfProgramSpecs struct {
 	ShawkSkbConsumeUdpK    *ebpf.ProgramSpec `ebpf:"shawk_skb_consume_udp_k"`
 	ShawkTcpReceiveReset   *ebpf.ProgramSpec `ebpf:"shawk_tcp_receive_reset"`
 	ShawkTcpSendmsg        *ebpf.ProgramSpec `ebpf:"shawk_tcp_sendmsg"`
+	ShawkUnixConnectK      *ebpf.ProgramSpec `ebpf:"shawk_unix_connect_k"`
+	ShawkUnixConnectRet    *ebpf.ProgramSpec `ebpf:"shawk_unix_connect_ret"`
 	ShawkUnixRelease       *ebpf.ProgramSpec `ebpf:"shawk_unix_release"`
+	ShawkUnixReleaseK      *ebpf.ProgramSpec `ebpf:"shawk_unix_release_k"`
 	ShawkUnixStreamConnect *ebpf.ProgramSpec `ebpf:"shawk_unix_stream_connect"`
 }
 
@@ -339,6 +353,7 @@ type bpfMapSpecs struct {
 	UnixFlows      *ebpf.MapSpec `ebpf:"unix_flows"`
 	UnixFlows0     *ebpf.MapSpec `ebpf:"unix_flows_0"`
 	UnixFlows1     *ebpf.MapSpec `ebpf:"unix_flows_1"`
+	UnixPending    *ebpf.MapSpec `ebpf:"unix_pending"`
 	XlatConns      *ebpf.MapSpec `ebpf:"xlat_conns"`
 	Xlats          *ebpf.MapSpec `ebpf:"xlats"`
 }
@@ -410,6 +425,7 @@ type bpfMaps struct {
 	UnixFlows      *ebpf.Map `ebpf:"unix_flows"`
 	UnixFlows0     *ebpf.Map `ebpf:"unix_flows_0"`
 	UnixFlows1     *ebpf.Map `ebpf:"unix_flows_1"`
+	UnixPending    *ebpf.Map `ebpf:"unix_pending"`
 	XlatConns      *ebpf.Map `ebpf:"xlat_conns"`
 	Xlats          *ebpf.Map `ebpf:"xlats"`
 }
@@ -433,6 +449,7 @@ func (m *bpfMaps) Close() error {
 		m.UnixFlows,
 		m.UnixFlows0,
 		m.UnixFlows1,
+		m.UnixPending,
 		m.XlatConns,
 		m.Xlats,
 	)
@@ -489,7 +506,10 @@ type bpfPrograms struct {
 	ShawkSkbConsumeUdpK    *ebpf.Program `ebpf:"shawk_skb_consume_udp_k"`
 	ShawkTcpReceiveReset   *ebpf.Program `ebpf:"shawk_tcp_receive_reset"`
 	ShawkTcpSendmsg        *ebpf.Program `ebpf:"shawk_tcp_sendmsg"`
+	ShawkUnixConnectK      *ebpf.Program `ebpf:"shawk_unix_connect_k"`
+	ShawkUnixConnectRet    *ebpf.Program `ebpf:"shawk_unix_connect_ret"`
 	ShawkUnixRelease       *ebpf.Program `ebpf:"shawk_unix_release"`
+	ShawkUnixReleaseK      *ebpf.Program `ebpf:"shawk_unix_release_k"`
 	ShawkUnixStreamConnect *ebpf.Program `ebpf:"shawk_unix_stream_connect"`
 }
 
@@ -512,7 +532,10 @@ func (p *bpfPrograms) Close() error {
 		p.ShawkSkbConsumeUdpK,
 		p.ShawkTcpReceiveReset,
 		p.ShawkTcpSendmsg,
+		p.ShawkUnixConnectK,
+		p.ShawkUnixConnectRet,
 		p.ShawkUnixRelease,
+		p.ShawkUnixReleaseK,
 		p.ShawkUnixStreamConnect,
 	)
 }

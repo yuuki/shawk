@@ -383,6 +383,22 @@ struct {
 	.values = {&unix_flows_0, &unix_flows_1},
 };
 
+/* The arguments a kretprobe cannot read on return. A task has at most
+ * one unix_stream_connect in flight. The LRU reclaims missed returns.
+ */
+struct unix_connect_args {
+	__u64 sock;
+	__u64 addr;
+	__u64 len;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 1024);
+	__type(key, __u64);
+	__type(value, struct unix_connect_args);
+} unix_pending SEC(".maps");
+
 /*
  * The open connections of Unix flows, by the address of their client
  * socket: added when a client connects, or when a walk of the processes
@@ -1733,6 +1749,7 @@ struct pt_regs___x86 {
 	unsigned long di;
 	unsigned long si;
 	unsigned long dx;
+	unsigned long ax;
 } __attribute__((preserve_access_index));
 
 struct pt_regs___arm64 {
@@ -1774,6 +1791,16 @@ static __always_inline __u64 kprobe_arg3(struct pt_regs *ctx)
 	if (bpf_core_field_exists(x86->dx))
 		return BPF_CORE_READ(x86, dx);
 	return BPF_CORE_READ(arm64, regs[2]);
+}
+
+static __always_inline int kprobe_ret(struct pt_regs *ctx)
+{
+	struct pt_regs___x86 *x86 = (void *)ctx;
+	struct pt_regs___arm64 *arm64 = (void *)ctx;
+
+	if (bpf_core_field_exists(x86->ax))
+		return (int)BPF_CORE_READ(x86, ax);
+	return (int)BPF_CORE_READ(arm64, regs[0]);
 }
 
 /* ---------------------------------------------------------------- UDP --- */
@@ -2375,9 +2402,9 @@ static __always_inline int unix_fail_reason(int err)
  * The connection is open in unix_conns until the client closes it
  * (shawk_unix_release); what the server does with its end is not seen.
  */
-SEC("fexit/unix_stream_connect")
-int BPF_PROG(shawk_unix_stream_connect, struct socket *sock,
-	     struct sockaddr *uaddr, int addr_len, int flags, int ret)
+static __always_inline int handle_unix_connect(struct socket *sock,
+					       struct sockaddr *uaddr,
+					       int addr_len, int ret)
 {
 	__u32 tgid = bpf_get_current_pid_tgid() >> 32;
 	struct shawk_unix_conn c = {};
@@ -2430,19 +2457,70 @@ int BPF_PROG(shawk_unix_stream_connect, struct socket *sock,
 	return 0;
 }
 
+SEC("fexit/unix_stream_connect")
+int BPF_PROG(shawk_unix_stream_connect, struct socket *sock,
+	     struct sockaddr *uaddr, int addr_len, int flags, int ret)
+{
+	return handle_unix_connect(sock, uaddr, addr_len, ret);
+}
+
+/* KPROBE(shawk_unix_connect_k, struct socket *sock, struct sockaddr *addr, int len, int flags) */
+SEC("kprobe/unix_stream_connect")
+int shawk_unix_connect_k(struct pt_regs *ctx)
+{
+	__u64 task = bpf_get_current_pid_tgid();
+	struct unix_connect_args args = {
+		.sock = kprobe_arg1(ctx),
+		.addr = kprobe_arg2(ctx),
+		.len = kprobe_arg3(ctx),
+	};
+
+	bpf_map_update_elem(&unix_pending, &task, &args, BPF_ANY);
+	return 0;
+}
+
+/* KPROBE(shawk_unix_connect_ret, struct socket *sock, struct sockaddr *addr, int len, int flags) */
+SEC("kretprobe/unix_stream_connect")
+int shawk_unix_connect_ret(struct pt_regs *ctx)
+{
+	__u64 task = bpf_get_current_pid_tgid();
+	struct unix_connect_args *pending, args;
+
+	pending = bpf_map_lookup_elem(&unix_pending, &task);
+	if (!pending) {
+		__sync_fetch_and_add(&flow_drops, 1);
+		return 0;
+	}
+	args = *pending;
+	bpf_map_delete_elem(&unix_pending, &task);
+	return handle_unix_connect((void *)args.sock, (void *)args.addr, (int)args.len, kprobe_ret(ctx));
+}
+
 /*
  * A socket is closed: its last file is released. The connection of a
  * client is no longer open. The lookup spares the lock of a deletion to
  * the other sockets.
  */
-SEC("fentry/unix_release")
-int BPF_PROG(shawk_unix_release, struct socket *sock)
+static __always_inline int handle_unix_release(struct socket *sock)
 {
 	__u64 k = (__u64)BPF_CORE_READ(sock, sk);
 
 	if (k && bpf_map_lookup_elem(&unix_conns, &k))
 		bpf_map_delete_elem(&unix_conns, &k);
 	return 0;
+}
+
+SEC("fentry/unix_release")
+int BPF_PROG(shawk_unix_release, struct socket *sock)
+{
+	return handle_unix_release(sock);
+}
+
+/* KPROBE(shawk_unix_release_k, struct socket *sock) */
+SEC("kprobe/unix_release")
+int shawk_unix_release_k(struct pt_regs *ctx)
+{
+	return handle_unix_release((struct socket *)kprobe_arg1(ctx));
 }
 
 /*

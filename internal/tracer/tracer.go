@@ -100,8 +100,8 @@ type Tracer struct {
 	unix  bool
 	// wire tells that wire protocols are classified (protocolPrograms).
 	wire bool
-	// udpKprobes tells that UDP is traced with udpKprobePrograms.
-	udpKprobes bool
+	// Whether the fallback programs attached for each transport.
+	udpKprobes, unixKprobes bool
 
 	flowMaps       [2]*ebpf.Map
 	unixFlowMaps   [2]*ebpf.Map
@@ -203,44 +203,18 @@ type Tracer struct {
 	connectErrHooks []string
 }
 
-// tracingProgram is a program that hooks a kernel function with a BPF
-// trampoline (fentry, fexit), or with a kprobe.
-type tracingProgram struct {
-	prog, target string
-	kprobe       bool
-}
-
-// udpPrograms and unixPrograms hook kernel functions with BPF trampolines.
-// Each set is loaded separately so that TCP tracing, and the other set,
-// keep working on kernels that do not support trampolines (e.g. arm64
-// before Linux 6.0) or lack a target. udpKprobePrograms stand in for
-// udpPrograms where these do not attach (#118): a kprobe costs twice as
-// much per datagram on arm64, so they are not the first choice.
+// UDP and Unix sockets each prefer trampolines and fall back independently.
 var (
-	udpPrograms = []tracingProgram{
-		{prog: bpfProgShawkIpSendSkb, target: "ip_send_skb"},
-		{prog: bpfProgShawkIp6SendSkb, target: "ip6_send_skb"},
-		{prog: bpfProgShawkSkbConsumeUdp, target: "skb_consume_udp"},
-	}
-	udpKprobePrograms = []tracingProgram{
-		{prog: bpfProgShawkIpSendSkbK, target: "ip_send_skb", kprobe: true},
-		{prog: bpfProgShawkIp6SendSkbK, target: "ip6_send_skb", kprobe: true},
-		{prog: bpfProgShawkSkbConsumeUdpK, target: "skb_consume_udp", kprobe: true},
-	}
-	unixPrograms = []tracingProgram{
-		{prog: bpfProgShawkUnixStreamConnect, target: "unix_stream_connect"},
-		{prog: bpfProgShawkUnixRelease, target: "unix_release"},
-	}
-	// protocolPrograms classify the first payloads of TCP connections
-	// (Options.ClassifyProtocols). Without trampolines they are not traced:
-	// a kprobe has no socket storage and costs more on every send.
-	protocolPrograms = []tracingProgram{
-		{prog: bpfProgShawkTcpSendmsg, target: "tcp_sendmsg"},
-	}
+	udpPrograms       = []string{bpfProgShawkIpSendSkb, bpfProgShawkIp6SendSkb, bpfProgShawkSkbConsumeUdp}
+	udpKprobePrograms = []string{bpfProgShawkIpSendSkbK, bpfProgShawkIp6SendSkbK, bpfProgShawkSkbConsumeUdpK}
+	// Attach release first so that a new connection can always be removed.
+	unixPrograms       = []string{bpfProgShawkUnixRelease, bpfProgShawkUnixStreamConnect}
+	unixKprobePrograms = []string{bpfProgShawkUnixReleaseK, bpfProgShawkUnixConnectK, bpfProgShawkUnixConnectRet}
+	// Wire classification requires socket storage and a trampoline.
+	protocolPrograms = []string{bpfProgShawkTcpSendmsg}
+	// Tests can exercise either fallback on kernels with trampolines.
+	forceUDPKprobes, forceUnixKprobes bool
 )
-
-// forceUDPKprobes makes New trace UDP with udpKprobePrograms; for tests.
-var forceUDPKprobes = false
 
 // withDefaults returns the options with the defaults of those left unset.
 func (opts Options) withDefaults() Options {
@@ -311,8 +285,13 @@ func (t *Tracer) start(spec *ebpf.CollectionSpec) error {
 	}
 	// The first walk of the processes adopts the connections of Unix
 	// sockets once their close is traced.
-	if t.unix, err = t.loadOptional(spec, unixPrograms, t.unixTraced, "Unix socket tracing is disabled"); err != nil {
+	t.unixKprobes, err = t.loadWithFallback(spec, unixPrograms, unixKprobePrograms, forceUnixKprobes, "Unix sockets")
+	if err != nil {
+		t.log.Warn("Unix socket tracing is disabled", "error", err)
+	} else if err := t.unixTraced.Set(uint32(1)); err != nil {
 		return err
+	} else {
+		t.unix = true
 	}
 
 	// Adopt connections and listeners that existed before the tracer
@@ -323,7 +302,9 @@ func (t *Tracer) start(spec *ebpf.CollectionSpec) error {
 	if err != nil {
 		return err
 	}
-	if err := t.loadUDP(spec); err != nil {
+	t.udpKprobes, err = t.loadWithFallback(spec, udpPrograms, udpKprobePrograms, forceUDPKprobes, "UDP")
+	t.udp = err == nil
+	if err != nil {
 		t.log.Warn("UDP tracing is disabled", "error", err)
 	}
 	if t.opts.ClassifyProtocols {
@@ -343,7 +324,7 @@ func (t *Tracer) start(spec *ebpf.CollectionSpec) error {
 // without, and then tells the programs loaded before, through traced, that
 // they are attached. It reports whether they are, and logs with msg why
 // they are not.
-func (t *Tracer) loadOptional(spec *ebpf.CollectionSpec, progs []tracingProgram, traced *ebpf.Variable, msg string) (bool, error) {
+func (t *Tracer) loadOptional(spec *ebpf.CollectionSpec, progs []string, traced *ebpf.Variable, msg string) (bool, error) {
 	if err := t.loadTracing(spec, progs); err != nil {
 		t.log.Warn(msg, "error", err)
 		return false, nil
@@ -430,8 +411,8 @@ func ephemeralPortRange() (uint16, uint16) {
 // loadCore loads the maps, the TCP programs and the iterators.
 func (t *Tracer) loadCore(spec *ebpf.CollectionSpec) error {
 	core := spec.Copy()
-	for _, p := range slices.Concat(udpPrograms, udpKprobePrograms, unixPrograms, protocolPrograms) {
-		delete(core.Programs, p.prog)
+	for _, p := range slices.Concat(udpPrograms, udpKprobePrograms, unixPrograms, unixKprobePrograms, protocolPrograms) {
+		delete(core.Programs, p)
 	}
 	withoutConntrack(core)
 	withoutConnectErrors(core)
@@ -537,34 +518,30 @@ func (t *Tracer) watchCgroups(coll *ebpf.Collection) error {
 	return nil
 }
 
-// loadUDP attaches the programs of UDP: those with BPF trampolines, or else
-// the kprobes.
-func (t *Tracer) loadUDP(spec *ebpf.CollectionSpec) error {
+// loadWithFallback returns whether it attached the kprobes.
+func (t *Tracer) loadWithFallback(spec *ebpf.CollectionSpec, tracing, kprobes []string, force bool, protocol string) (bool, error) {
 	err := errors.New("forced to use kprobes")
-	if !forceUDPKprobes {
-		err = t.loadTracing(spec, udpPrograms)
+	if !force {
+		err = t.loadTracing(spec, tracing)
+		if err == nil {
+			return false, nil
+		}
 	}
-	if err == nil {
-		t.udp = true
-		return nil
+	if kerr := t.loadTracing(spec, kprobes); kerr != nil {
+		return false, fmt.Errorf("with BPF trampolines: %w; with kprobes: %w", err, kerr)
 	}
-	if kerr := t.loadTracing(spec, udpKprobePrograms); kerr != nil {
-		return fmt.Errorf("with BPF trampolines: %w; with kprobes: %w", err, kerr)
-	}
-	t.udp, t.udpKprobes = true, true
-	t.log.Info("UDP is traced with kprobes, which cost more per datagram than BPF trampolines, which do not attach",
-		"error", err)
-	return nil
+	t.log.Info("tracing with kprobes", "protocol", protocol, "trampoline_error", err)
+	return true, nil
 }
 
 // loadTracing loads and attaches a set of programs with BPF trampolines or
 // kprobes, sharing the maps of the core collection: all of them, or none.
-func (t *Tracer) loadTracing(spec *ebpf.CollectionSpec, progs []tracingProgram) error {
+func (t *Tracer) loadTracing(spec *ebpf.CollectionSpec, progs []string) error {
 	sub := spec.Copy()
 	withoutConntrack(sub)
 	want := map[string]bool{}
 	for _, p := range progs {
-		want[p.prog] = true
+		want[p] = true
 	}
 	for name := range sub.Programs {
 		if !want[name] {
@@ -581,17 +558,21 @@ func (t *Tracer) loadTracing(spec *ebpf.CollectionSpec, progs []tracingProgram) 
 			l   link.Link
 			err error
 		)
-		if p.kprobe {
-			l, err = link.Kprobe(p.target, coll.Programs[p.prog], nil)
-		} else {
-			l, err = link.AttachTracing(link.TracingOptions{Program: coll.Programs[p.prog]})
+		prog := sub.Programs[p]
+		switch {
+		case strings.HasPrefix(prog.SectionName, "kretprobe/"):
+			l, err = link.Kretprobe(prog.AttachTo, coll.Programs[p], nil)
+		case prog.Type == ebpf.Kprobe:
+			l, err = link.Kprobe(prog.AttachTo, coll.Programs[p], nil)
+		default:
+			l, err = link.AttachTracing(link.TracingOptions{Program: coll.Programs[p]})
 		}
 		if err != nil {
 			for _, l := range links {
 				l.Close()
 			}
 			coll.Close()
-			return fmt.Errorf("attaching %s: %w", p.target, err)
+			return fmt.Errorf("attaching %s: %w", prog.SectionName, err)
 		}
 		links = append(links, l)
 	}

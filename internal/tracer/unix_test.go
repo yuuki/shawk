@@ -78,23 +78,34 @@ func TestNoteMissingUnixListeners(t *testing.T) {
 	}
 }
 
-// requireUnix skips a test of the tracing of Unix sockets when the kernel
-// cannot trace them: their programs need BPF trampolines, which
-// SHAWK_TEST_NO_TRAMPOLINES=1 declares the kernel has not, as
-// SHAWK_TEST_NO_UDP=1 does.
+// On the older arm64 VM kernels the ordinary Unix tests exercise the
+// fallback. Check which programs attached before testing their results.
 func requireUnix(t *testing.T, tr *Tracer) {
 	t.Helper()
 	noTrampolines, _ := strconv.ParseBool(os.Getenv("SHAWK_TEST_NO_TRAMPOLINES"))
-	noUDP, _ := strconv.ParseBool(os.Getenv("SHAWK_TEST_NO_UDP"))
-	noTrampolines = noTrampolines || noUDP
+	noProbes, _ := strconv.ParseBool(os.Getenv("SHAWK_TEST_NO_UDP"))
 	switch {
-	case noTrampolines && tr.UnixEnabled():
-		t.Fatal("Unix sockets are traced, but the kernel is declared without BPF trampolines")
-	case noTrampolines:
-		t.Skip("Unix sockets are not traced on this kernel, which is declared without BPF trampolines")
+	case noProbes && tr.UnixEnabled():
+		t.Fatal("Unix sockets are traced on a kernel declared without trampolines or kprobes")
+	case noProbes:
+		t.Skip("kernel declared without trampolines or kprobes")
 	case !tr.UnixEnabled():
 		skipUnavailable(t, "Unix sockets are not traced on this kernel")
+	case (noTrampolines || forceUnixKprobes) && !tr.unixKprobes:
+		t.Fatal("expected Unix sockets to be traced with kprobes")
 	}
+}
+
+func TestUnixKprobes(t *testing.T) {
+	if noTrampolines, _ := strconv.ParseBool(os.Getenv("SHAWK_TEST_NO_TRAMPOLINES")); noTrampolines {
+		t.Skip("the Unix tests already exercise the kprobes on this kernel")
+	}
+	forceUnixKprobes = true
+	t.Cleanup(func() { forceUnixKprobes = false })
+	t.Run("Connections", TestUnixConnections)
+	t.Run("Failures", TestUnixFailures)
+	t.Run("Adopted", TestUnixAdopted)
+	t.Run("OpenUnderChurn", TestUnixOpenUnderChurn)
 }
 
 // findUnixFlow returns the statistics of the flows of Unix sockets to the

@@ -240,7 +240,7 @@ func warnUntraced(cfg Config, tr *tracer.Tracer) {
 		cfg.Logger.Warn("UDP is not traced; see the error above (UDP tracing needs BPF trampolines, fentry, or else kprobes)")
 	}
 	if !tr.UnixEnabled() {
-		cfg.Logger.Warn("Unix sockets are not traced; see the error above (their tracing needs BPF trampolines, fexit)")
+		cfg.Logger.Warn("Unix sockets are not traced; see the error above (trampolines and fallback kprobes could not be attached)")
 	}
 	if cfg.ClassifyProtocols && !tr.ProtocolsEnabled() {
 		cfg.Logger.Warn("wire protocols are not classified; see the error above (their classification needs BPF trampolines, fentry)")

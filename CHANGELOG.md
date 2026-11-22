@@ -1,3 +1,10 @@
+## Unreleased
+
+### Added
+
+* Unix stream and seqpacket socket tracing falls back to kprobes when BPF
+  trampolines do not attach, including on Rocky Linux 9.6 arm64 (#220).
+
 ## [v0.10.1](https://github.com/yuuki/shawk/compare/v0.10.0...v0.10.1) (2026-11-21)
 
 ### Changed
