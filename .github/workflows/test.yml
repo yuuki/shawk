@@ -1,183 +1,19 @@
-name: Test
+name: Kernel performance probe
 on:
   push:
-  pull_request:
-  workflow_call:
-  workflow_dispatch:
-  # Weekly, with longer fuzzing, and the kernels and tools of the week.
-  schedule:
-    - cron: "37 14 * * 6"
-
-# The tests only read the repository, also when release.yml calls them, which
-# grants no more. Actions are pinned by commit (.github/workflows/actions.lock).
+    branches: [ci/profile-kernel-tests]
 permissions:
   contents: read
-
-# A newer push to a pull request cancels the runs of the older one; runs of
-# branches and tags finish.
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
 jobs:
-  # golangci-lint (.golangci.yml) in every module, and go.mod and go.sum
-  # tidy: make lint with the golangci-lint of the action.
-  lint:
-    runs-on: ubuntu-24.04
+  probe:
+    name: ${{ matrix.runner }} RCU=${{ matrix.rcu }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-go@v7.0.0
-        with:
-          go-version-file: go.mod
-      - uses: golangci/golangci-lint-action@v9.3.0
-        with:
-          version: v2.15.0
-          install-only: true
-      - name: Lint
-        run: make lint GOLANGCI_LINT=golangci-lint
-
-  # The fuzz targets, briefly on every change and longer every week. A
-  # failing input is kept in testdata/fuzz of its package: download it from
-  # the artifact and commit it with the fix.
-  fuzz:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-go@v7.0.0
-        with:
-          go-version-file: go.mod
-      - name: Fuzz
-        env:
-          FUZZTIME: ${{ github.event_name == 'schedule' && '3m' || '15s' }}
-        run: make test-fuzz FUZZTIME="$FUZZTIME"
-      - name: Keep the failing inputs
-        if: failure()
-        uses: actions/upload-artifact@v7.0.2
-        with:
-          name: fuzz-failures
-          path: "**/testdata/fuzz/**"
-          if-no-files-found: ignore
-
-  # actionlint and zizmor, whose online audits use the token.
-  workflows:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-go@v7.0.0
-        with:
-          go-version-file: go.mod
-      - name: Lint and audit the workflows
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: make lint-actions
-
-  test:
-    # Hosted runners allow loading BPF programs with sudo, including fentry,
-    # which the UDP tracing needs.
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_PASSWORD: postgres
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
-    env:
-      SHAWK_TEST_POSTGRES_DSN: postgres://postgres:postgres@localhost:5432/postgres
-      SHAWK_E2E_POSTGRES_DSN: postgres://postgres:postgres@localhost:5432/shawke2e
-    steps:
-      - uses: actions/checkout@v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-go@v7.0.0
-        with:
-          go-version-file: go.mod
-      - name: Install tools
-        run: sudo apt-get update && sudo apt-get install -y clang llvm rpm2cpio cpio
-      - name: Vet
-        run: make vet
-      - name: Unit tests with the race detector (agent, connector with PostgreSQL, packaging examples)
-        run: make test-race
-      # The tests below use the committed BPF object, which the binary embeds
-      # and releases ship.
-      # The runners support everything the tests need, e.g. IPv6 and BPF
-      # trampolines for UDP: fail rather than skip if that ever changes.
-      - name: Tests loading BPF programs
-        env:
-          SHAWK_TEST_STRICT: "1"
-        run: make test-root
-      - name: End-to-end test
-        env:
-          SHAWK_TEST_STRICT: "1"
-        run: |
-          psql "$SHAWK_TEST_POSTGRES_DSN" -c 'CREATE DATABASE shawke2e'
-          make e2e
-      # The collector built by make e2e checks the packaged configuration,
-      # including the names of the settings of its components.
-      - name: Validate the packaged collector configuration
-        run: collector/_build/shawk-collector validate --config packaging/collector/config.yaml
-      # The runners have systemd as PID 1: the agent runs under the packaged
-      # unit and its sandbox, with the binaries built by make e2e.
-      - name: Agent under the packaged systemd unit
-        run: sudo test/packaging/agent-unit.sh ./shawk collector/_build/shawk-collector
-      # The kernel RPMs of make compat, whose SHA-256 the scripts pin.
-      - name: Cache the Rocky Linux 9 kernel
-        uses: actions/cache@v6.1.0
-        with:
-          path: build/kernel
-          key: kernel-rpm-${{ hashFiles('scripts/fetch-kernel-btf.sh', 'scripts/fetch-module-btf.sh') }}
-          restore-keys: kernel-rpm-
-      - name: Compatibility with the Rocky Linux 9 kernel
-        run: make compat
-      - name: Check that the committed BPF object matches the source
-        run: make check-object
-
-  # The tests that load the BPF programs, on kernels booted in QEMU: Rocky
-  # Linux 9 and upstream releases older than the runner's, on x86_64 (with
-  # KVM) and on aarch64 (emulated).
-  kernels:
-    name: kernel ${{ matrix.kernel }} ${{ matrix.arch }}${{ matrix.shard && format(' ({0})', matrix.shard) || '' }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { kernel: rocky9, arch: x86_64, qemu: qemu-system-x86 }
-          - { kernel: rocky9, arch: aarch64, qemu: qemu-system-arm }
-          - { kernel: "5.14", arch: x86_64, qemu: qemu-system-x86 }
-          - { kernel: "5.15", arch: x86_64, qemu: qemu-system-x86 }
-          # This emulated guest takes about 20 minutes. Split its tests by
-          # name across separate VMs, without running BPF tests concurrently
-          # in one kernel. The three patterns cover every Test, Example and
-          # Fuzz name, including new tests; the other guests still run all.
-          - kernel: "5.15"
-            arch: aarch64
-            qemu: qemu-system-arm
-            shard: A-S
-            test-args: '-test.run=^Test[A-S]'
-          - kernel: "5.15"
-            arch: aarch64
-            qemu: qemu-system-arm
-            shard: T
-            test-args: '-test.run=^TestT'
-          - kernel: "5.15"
-            arch: aarch64
-            qemu: qemu-system-arm
-            shard: remaining
-            test-args: '-test.run=^(Test([^A-T]|$)|Example|Fuzz)'
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+        rcu: ["0", "1"]
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -186,40 +22,26 @@ jobs:
         with:
           go-version-file: go.mod
       - name: Install QEMU
-        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.qemu }} rpm2cpio cpio
-      # The runners have KVM, which only its group may open.
-      - name: Enable KVM
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-arm cpio
+      - name: Inspect virtualization
         run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
-      # The kernel packages, whose SHA-256 the script pins.
-      - name: Cache the kernel
-        uses: actions/cache@v6.1.0
+          uname -a
+          lscpu
+          if [ -e /dev/kvm ]; then
+            ls -l /dev/kvm
+            sudo chmod a+rw /dev/kvm
+          else
+            echo '/dev/kvm is absent'
+          fi
+      - uses: actions/cache@v6.1.0
         with:
           path: build/kernel
-          key: kernel-${{ matrix.kernel }}-${{ matrix.arch }}-${{ hashFiles('test/vm/run.sh') }}
-          # The script checks the SHA-256 of what an older cache holds.
-          restore-keys: kernel-${{ matrix.kernel }}-${{ matrix.arch }}-
-      - name: Tests in the virtual machine
+          key: kernel-probe-5.15-aarch64
+          restore-keys: kernel-5.15-aarch64-
+      - name: Measure
         env:
-          VM_TEST_ARGS: ${{ matrix.test-args }}
-        run: test/vm/run.sh ${{ matrix.kernel }} ${{ matrix.arch }}
-
-  # The same tests on an arm64 host, with its own kernel and JIT.
-  arm64:
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-go@v7.0.0
-        with:
-          go-version-file: go.mod
-      - name: Unit tests
-        run: go test ./...
-      - name: Tests loading BPF programs
-        env:
-          SHAWK_TEST_STRICT: "1"
-        run: make test-root
+          RCU: ${{ matrix.rcu }}
+          VM_TEST_ARGS: '-test.run=^(TestCIProfile|TestTCPIteratorSkips|TestTCPManyShortConnections|TestUDPDirection)$'
+        run: |
+          sed -i "s/panic=-1 quiet/panic=-1 quiet rcupdate.rcu_expedited=$RCU/" test/vm/run.sh
+          time test/vm/run.sh 5.15 aarch64
