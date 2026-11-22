@@ -913,10 +913,29 @@ which include containers.
   converted with the agent's current clock skew, so it stays right after the
   clock steps.
 - TLS. An `https://` endpoint verifies the collector and may present a
-  client certificate. Over `http://` the host's dependencies, executables,
-  name and machine id travel in the clear, and the agent warns unless the
-  endpoint is loopback. The agent does not follow HTTP redirects, so nothing
-  in the path can divert the export elsewhere or to `http://`.
+  client certificate. `-otlp-server-name` verifies the certificate by
+  another name than the host of the endpoint, and asks for it in SNI, for
+  an endpoint given by its address, such as a virtual address of a network
+  without DNS; over gRPC it is also the authority of the requests. Over
+  `http://` the host's dependencies, executables, name and machine id
+  travel in the clear, and the agent warns unless the endpoint is
+  loopback. The agent does not follow HTTP redirects, so nothing in the
+  path can divert the export elsewhere or to `http://`.
+- Bearer token. Instead of a client certificate, the agent can send a token
+  to a front collector that authenticates agents by tokens (the
+  bearertokenauth extension of otelcol-contrib) and forwards to the
+  connectors (§5.3): `Authorization: Bearer` with every request, in the
+  metadata of gRPC and the headers of HTTP. The token is read at start from
+  `-otlp-bearer-token-file` (e.g. a credential of systemd), without the
+  white space around it, so a new token takes a restart. The agent refuses
+  to start with an empty file, a token that is not one word of visible
+  ASCII, or an endpoint other than `https://`, loopback included: in the
+  clear the token could be read on the way and replayed, and while the
+  collector is down any user of the host could listen on its port and take
+  it, whereas TLS verifies the collector. The token is never logged; errors
+  hold the path of its file, not its content. A token names no host, so
+  any holder can write as any host, as behind a front with certificates
+  (`host_identity: none`, §5.5).
 - Host identity. With `host_identity: certificate` the connector accepts a
   host's metrics only from an agent whose verified certificate names its
   `host.name` (a DNS name, else the common name; no wildcards), so one
@@ -1308,6 +1327,26 @@ of the connector; its queue counts the encoded bytes of their requests
 (`sizer: bytes`, 64 MiB, up to about 3.5 times as much in memory), since a
 request is as large as an export of OBI and their points range from
 counters to histograms with buckets.
+
+A store that takes Prometheus remote write, such as VictoriaMetrics, whose
+OTLP receiver does not translate names as Prometheus's does by default,
+gets the same series from the `prometheus_remote_write` exporter of the
+collector (`packaging/collector/config.yaml`). Its translation
+`UnderscoreEscapingWithSuffixes`, the default of the exporter and of
+Prometheus, gives the names above and the same `job` and `instance`;
+`resource_constant_labels` with `included: [host.id, host.name]` gives the
+labels of `promote_resource_attributes`; and `disable_scope_info: true`
+leaves out `otel_scope_name`, which the exporter would put on every series
+and Prometheus does not. Its queue (`remote_write_queue`) counts batches,
+whatever their size, since the exporter counts nothing else: the example
+holds 50, at most about 225 MiB of batches of 8192 points but 10 seconds
+for the fleet above, so size it to the outage to cover and to the memory
+of the collector; the default of 10000 would fill that memory as above. It
+must stay enabled for the same reason, and batches beyond it are dropped
+and leave gaps. OBI's metrics take an instance of their own, as they take
+`otlp_http/obi`; its queue counts their requests, each as large as an
+export of OBI. The store must take points as late as Prometheus does with
+its window.
 
 The OTLP receiver of Prometheus writes whatever it is sent, so anyone who
 could push could write `shawk_agent_up` and silence `ShawkAgentDown`. The

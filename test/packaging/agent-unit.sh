@@ -3,10 +3,12 @@
 # checks that it reports ready once its programs are attached, starts with
 # UDP tracing, traces the TCP and UDP traffic of another process, learns a
 # translation of addresses from conntrack and sends them to a collector,
-# and that a failure to attach the programs fails the start.
+# that a failure to attach the programs fails the start, and that it reads
+# a bearer token from a credential of systemd and sends it over TLS to a
+# collector verified by another name than the address of the endpoint.
 #
-# Requires root, systemd as PID 1 (e.g. a GitHub runner), python3, ss and
-# iptables with NAT.
+# Requires root, systemd as PID 1 (e.g. a GitHub runner), python3, openssl,
+# ss and iptables with NAT.
 # Usage: test/packaging/agent-unit.sh path/to/shawk path/to/shawk-collector
 set -euo pipefail
 
@@ -17,9 +19,14 @@ WORK="$(mktemp -d)"
 UNIT=shawk-agent-unittest.service
 # The same unit, with bpf(2) denied.
 FAILING=shawk-agent-unittest-failing.service
+# The same unit, with a token from a credential, over TLS.
+TOKEN=shawk-agent-unittest-token.service
 BIN=/usr/local/bin/shawk-unittest
+# The certificate of the collector, where PrivateTmp does not hide it.
+TLS_DIR=/run/shawk-unittest-tls
 TCP_PORT=21438
 UDP_PORT=21437
+TLS_PORT=21439
 # A REDIRECT in OUTPUT sends VIRTUAL:9 to the TCP listener.
 VIRTUAL=198.51.100.7
 REDIRECT=(OUTPUT -d "$VIRTUAL/32" -p tcp --dport 9 -j REDIRECT --to-ports "$TCP_PORT")
@@ -27,10 +34,12 @@ PIDS=()
 
 cleanup() {
 	set +e
-	systemctl stop "$UNIT" "$FAILING" 2>/dev/null
+	systemctl stop "$UNIT" "$FAILING" "$TOKEN" 2>/dev/null
 	iptables -t nat -D "${REDIRECT[@]}" 2>/dev/null
-	rm -f "/run/systemd/system/$UNIT" "/run/systemd/system/$FAILING" "/run/systemd/system/$FAILING.d/nobpf.conf" "$BIN"
-	rmdir "/run/systemd/system/$FAILING.d" 2>/dev/null
+	rm -f "/run/systemd/system/$UNIT" "/run/systemd/system/$FAILING" "/run/systemd/system/$FAILING.d/nobpf.conf" \
+		"/run/systemd/system/$TOKEN" "/run/systemd/system/$TOKEN.d/token.conf" "$BIN"
+	rmdir "/run/systemd/system/$FAILING.d" "/run/systemd/system/$TOKEN.d" 2>/dev/null
+	rm -rf "$TLS_DIR"
 	systemctl daemon-reload
 	for pid in "${PIDS[@]}"; do kill "$pid" 2>/dev/null; done
 	wait 2>/dev/null
@@ -42,10 +51,10 @@ journal() { journalctl -u "$UNIT" -o cat --no-pager; }
 
 fail() {
 	echo "FAIL: $*" >&2
-	echo "--- journal of $UNIT" >&2
-	journal | tail -30 >&2
-	echo "--- collector" >&2
-	tail -20 "$WORK/collector.log" >&2
+	echo "--- journal of $UNIT and $TOKEN" >&2
+	journalctl -u "$UNIT" -u "$TOKEN" -o cat --no-pager | tail -30 >&2
+	echo "--- collectors" >&2
+	tail -n 20 "$WORK/collector.log" "$WORK/token-collector.log" >&2 2>/dev/null || true
 	exit 1
 }
 
@@ -154,4 +163,64 @@ systemctl is-failed --quiet "$FAILING" || fail "the unit without bpf(2) did not 
 	fail "the unit without bpf(2) failed with $(systemctl show -p Result --value "$FAILING"), not exit-code"
 journalctl -u "$FAILING" -o cat --no-pager | grep -q 'starting tracer' ||
 	fail "the agent without bpf(2) did not fail to start its tracer"
+
+# A token from a credential (LoadCredential=, as LoadCredentialEncrypted=
+# would decrypt it into the same directory), read by the agent at
+# ${CREDENTIALS_DIRECTORY} in its sandbox, and sent over TLS to a collector
+# at 127.0.0.1 whose certificate names collector.example only.
+mkdir -p "$TLS_DIR"
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 1 \
+	-subj /CN=collector.example -addext subjectAltName=DNS:collector.example \
+	-keyout "$TLS_DIR/collector.key" -out "$TLS_DIR/collector.crt" 2>"$WORK/openssl.log" ||
+	fail "openssl did not make the certificate of the collector: $(cat "$WORK/openssl.log")"
+head -c 32 /dev/urandom | base64 | tr -d '=+/' >"$WORK/token"
+python3 - "$TLS_PORT" "$TLS_DIR" "$WORK/token" >"$WORK/token-collector.log" 2>&1 <<'PY' &
+import http.server, ssl, sys
+
+port, tls, token = int(sys.argv[1]), sys.argv[2], open(sys.argv[3]).read().strip()
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        ok = self.headers.get("Authorization") == "Bearer " + token
+        print("authorized" if ok else "unauthorized", flush=True)
+        self.send_response(200 if ok else 401)
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain(tls + "/collector.crt", tls + "/collector.key")
+ctx.sni_callback = lambda sock, name, c: print("sni", name, flush=True)
+srv = http.server.HTTPServer(("127.0.0.1", port), Handler)
+srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+srv.serve_forever()
+PY
+PIDS+=($!)
+wait_for "the collector of tokens does not listen" sh -c "ss -Hltn 'src 127.0.0.1:$TLS_PORT' | grep -q ."
+cp "/run/systemd/system/$UNIT" "/run/systemd/system/$TOKEN"
+mkdir -p "/run/systemd/system/$TOKEN.d"
+{
+	echo '[Service]'
+	echo "LoadCredential=otlp-token:$WORK/token"
+	echo "Environment=\"SHAWK_AGENT_OPTS=-otlp-endpoint https://127.0.0.1:$TLS_PORT -otlp-protocol http/protobuf -otlp-ca-file $TLS_DIR/collector.crt -otlp-server-name collector.example -interval 1s\""
+	echo 'ExecStart='
+	# shellcheck disable=SC2016 # systemd expands the variables
+	echo "ExecStart=$BIN agent"' $SHAWK_AGENT_OPTS -otlp-bearer-token-file ${CREDENTIALS_DIRECTORY}/otlp-token'
+} >"/run/systemd/system/$TOKEN.d/token.conf"
+systemctl stop "$UNIT"
+systemctl daemon-reload
+systemctl start "$TOKEN" || fail "the agent with a token did not start"
+wait_for "no request with the token reached the collector" grep -q '^authorized' "$WORK/token-collector.log"
+grep -q '^sni collector.example$' "$WORK/token-collector.log" || fail "the agent did not ask for collector.example"
+if grep -q '^unauthorized' "$WORK/token-collector.log"; then
+	fail "the agent sent a request without its token"
+fi
+# Through a file: grep -q would stop journalctl early, and pipefail would
+# then hide a match.
+journalctl -u "$TOKEN" -o cat --no-pager >"$WORK/token-journal"
+if grep -qF -- "$(cat "$WORK/token")" "$WORK/token-journal"; then
+	fail "the agent logged its token"
+fi
 echo "PASS"

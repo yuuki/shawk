@@ -4,7 +4,9 @@
 #   go run go.opentelemetry.io/collector/cmd/builder@v0.165.0 --config builder-config.yaml
 #
 # or `make collector` at the top of the repository. The versions of the
-# components must match the collector libraries in go.mod.
+# components must match the collector libraries in go.mod; those of
+# opentelemetry-collector-contrib are released with the v0 version of the
+# collector.
 dist:
   name: shawk-collector
   description: OpenTelemetry Collector with the shawk connector
@@ -23,6 +25,9 @@ exporters:
   - gomod: go.opentelemetry.io/collector/exporter/otlpexporter v0.165.0
   - gomod: go.opentelemetry.io/collector/exporter/otlphttpexporter v0.165.0
   - gomod: go.opentelemetry.io/collector/exporter/debugexporter v0.165.0
+  # Prometheus remote write, for VictoriaMetrics and other stores that take
+  # it rather than OTLP (packaging/collector/config.yaml).
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/exporter/prometheusremotewriteexporter v0.165.0
 
 connectors:
   - gomod: github.com/yuuki/shawk/collector v0.0.0

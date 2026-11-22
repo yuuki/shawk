@@ -7,7 +7,7 @@ order of the steps and what the files leave out.
 | path | what |
 |---|---|
 | `systemd/` | units of the agent and the collector, and their environment files |
-| `collector/config.yaml` | the collector: `otlp/shawk` for agents, `otlp` for OBI, the shawk connector, exporters to Prometheus and a trace store |
+| `collector/config.yaml` | the collector: `otlp/shawk` for agents, `otlp` for OBI, the shawk connector, exporters to Prometheus (OTLP, or remote write) and a trace store |
 | `collector/front.yaml` | a front collector that spreads agents over several connectors by `host.id` and `host.name`; read its caveats first |
 | `postgres/` | roles (`shawk_owner`, `shawk_connector`, `shawk_grafana`), database and privileges |
 | `prometheus/` | settings for the OTLP push, TLS and users (`web.yml`), recording rules and alerts (`shawk-rules.yml`) |
@@ -43,6 +43,40 @@ fails, since `Wants=` does not require it; with `Requires=` instead, a
 node whose agent fails stays out of service. An agent older than the unit
 does not report ready, so systemd stops it at the timeout: upgrade the
 binary and the unit together, as the packages do.
+
+Behind a front collector that authenticates agents by tokens rather than
+client certificates (`collector/front.yaml`), give each agent its token
+with `-otlp-bearer-token-file`, e.g. as an encrypted credential of
+systemd (250 or later), which only the unit reads. Encrypt it on each
+node, since the file is bound to the key of its host (and its TPM2, if
+any), from the standard input rather than a file left on the disk:
+
+```sh
+systemd-creds encrypt --name=otlp-token - /etc/shawk/otlp-token.cred   # the token on the standard input
+```
+
+```ini
+# /etc/systemd/system/shawk-agent.service.d/otlp-token.conf
+[Service]
+LoadCredentialEncrypted=otlp-token:/etc/shawk/otlp-token.cred
+ExecStart=
+ExecStart=/usr/bin/shawk agent $SHAWK_AGENT_OPTS -otlp-bearer-token-file ${CREDENTIALS_DIRECTORY}/otlp-token
+```
+
+The name embedded by `--name` must be the one of
+`LoadCredentialEncrypted=`; without `--name` it is the name of the output
+file, and the unit fails with `243/CREDENTIALS`. systemd expands
+`${CREDENTIALS_DIRECTORY}` in `ExecStart=` but not in the value of
+`SHAWK_AGENT_OPTS`, so the flag goes in the drop-in rather than in
+`/etc/shawk/agent.env`. The drop-in replaces the command of the unit, so
+keep it in step with the unit. The agent reads the token when it starts:
+to change it, add the new token beside the old one in the file of the
+front (bearertokenauth takes a token per line), restart the agents with
+the new one, then remove the old one. The agent refuses to send a token
+to an endpoint other than `https://`. Nodes that reach the collector by an address, e.g. a
+virtual address of a network without DNS, verify its certificate by the
+name it holds: `-otlp-endpoint https://10.0.0.10:4327 -otlp-server-name
+collector.example`.
 
 ## PostgreSQL
 
@@ -97,6 +131,21 @@ Run Prometheus with `--web.enable-otlp-receiver` and
 Prometheus can push series, including `shawk_agent_up`, and silence the
 agent alerts. Replace the placeholders in `web.yml` with bcrypt hashes and
 give each client its own user.
+
+To send to VictoriaMetrics or another store that takes Prometheus remote
+write, use the exporter `prometheus_remote_write/victoriametrics` of
+`collector/config.yaml` (commented out) in place of
+`otlp_http/prometheus`, and another instance of it in place of
+`otlp_http/obi`. Its names and
+labels, `host_id` and `host_name` among them, are those of the OTLP
+receiver of Prometheus with `prometheus.yml`, which the rules and
+dashboards expect. The rules of `shawk-rules.yml` then need the ruler of
+the store, such as vmalert for VictoriaMetrics; MetricsQL differs from
+PromQL in details such as `rate()` and the lookback, so check when the
+alerts fire there. Its queue counts batches, not points: while the store
+is down it holds them in the memory of the collector, and 50 last seconds
+for a large fleet, so size it to the outage to cover and to that memory
+(`docs/design.md` §5.3).
 
 ## Collector
 

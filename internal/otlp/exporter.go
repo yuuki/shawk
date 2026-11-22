@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"syscall"
 
 	colmetricspb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
 	"google.golang.org/grpc"
@@ -43,7 +44,21 @@ type ExporterConfig struct {
 	// to a collector that requires them (mutual TLS).
 	CertFile string
 	KeyFile  string
+	// ServerName is the name that the certificate of the collector must
+	// hold, sent in SNI, instead of the host of the endpoint: e.g. for an
+	// endpoint given by its IP address. Over gRPC it is also the authority
+	// of the requests.
+	ServerName string
+	// BearerTokenFile is a file of a token sent with every request as
+	// "Authorization: Bearer TOKEN", for a collector that authenticates
+	// agents by tokens rather than client certificates. NewExporter reads
+	// it once; the white space around the token is left out.
+	BearerTokenFile string
 }
+
+// maxBearerTokenFile bounds the file of a bearer token, far above the
+// tokens of collectors: a larger file is another file given by mistake.
+const maxBearerTokenFile = 4096
 
 // DefaultEndpoint returns the endpoint of a collector on the local host for
 // a protocol: the ports of the otlp/shawk receiver in the examples.
@@ -73,8 +88,14 @@ func (cfg ExporterConfig) endpoint() (*url.URL, error) {
 	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
 		return nil, fmt.Errorf("invalid OTLP endpoint %q: want http://HOST:PORT or https://HOST:PORT", cfg.Endpoint)
 	}
-	if u.Scheme == "http" && (cfg.CAFile != "" || cfg.CertFile != "") {
-		return nil, fmt.Errorf("a CA or client certificate is set but the OTLP endpoint %s does not use TLS; use https://", cfg.Endpoint)
+	// A token is refused over http:// also to a loopback address: while the
+	// collector is down, any user of the host can listen on its port and
+	// take the token, whereas TLS verifies the collector.
+	if u.Scheme == "http" && cfg.BearerTokenFile != "" {
+		return nil, fmt.Errorf("a bearer token is set but the OTLP endpoint %s does not use TLS, which would send it in the clear; use https://", cfg.Endpoint)
+	}
+	if u.Scheme == "http" && (cfg.CAFile != "" || cfg.CertFile != "" || cfg.ServerName != "") {
+		return nil, fmt.Errorf("a CA, client certificate or server name is set but the OTLP endpoint %s does not use TLS; use https://", cfg.Endpoint)
 	}
 	if (cfg.CertFile == "") != (cfg.KeyFile == "") {
 		return nil, errors.New("set both or neither of the client certificate and its key")
@@ -107,7 +128,8 @@ func (cfg ExporterConfig) CleartextRemote() bool {
 // the client certificate and the CA of the configuration, if any, read
 // from their files.
 func (cfg ExporterConfig) tlsConfig() (*tls.Config, error) {
-	tlsConf := &tls.Config{MinVersion: tls.VersionTLS12}
+	// An empty ServerName is the host of the endpoint, for gRPC as for HTTP.
+	tlsConf := &tls.Config{MinVersion: tls.VersionTLS12, ServerName: cfg.ServerName}
 	if cfg.CertFile != "" {
 		cert, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
 		if err != nil {
@@ -129,6 +151,42 @@ func (cfg ExporterConfig) tlsConfig() (*tls.Config, error) {
 	return tlsConf, nil
 }
 
+// authorization returns the value of the Authorization header of the
+// requests, read from BearerTokenFile: "Bearer " and the token, or ""
+// without a file. Its errors hold the path of the file, never its content.
+func (cfg ExporterConfig) authorization() (string, error) {
+	if cfg.BearerTokenFile == "" {
+		return "", nil
+	}
+	// Without O_NONBLOCK, opening a FIFO that nothing writes would block the
+	// start until systemd gives up waiting for READY=1; with it, the FIFO
+	// reads as empty. It changes nothing for a regular file.
+	f, err := os.OpenFile(cfg.BearerTokenFile, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return "", fmt.Errorf("reading the bearer token: %w", err)
+	}
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, maxBearerTokenFile+1))
+	if err != nil {
+		return "", fmt.Errorf("reading the bearer token: %w", err)
+	}
+	if len(b) > maxBearerTokenFile {
+		return "", fmt.Errorf("the bearer token file %s is larger than %d bytes", cfg.BearerTokenFile, maxBearerTokenFile)
+	}
+	token := strings.TrimSpace(string(b))
+	if token == "" {
+		return "", fmt.Errorf("the bearer token file %s is empty", cfg.BearerTokenFile)
+	}
+	// A token is one word of visible ASCII, as gRPC metadata and the
+	// tokens of bearertokenauth are.
+	for i := range len(token) {
+		if c := token[i]; c <= ' ' || c > '~' {
+			return "", fmt.Errorf("the bearer token in %s holds white space, a control character or a byte that is not ASCII", cfg.BearerTokenFile)
+		}
+	}
+	return "Bearer " + token, nil
+}
+
 // NewExporter returns an exporter. It does not connect yet.
 func NewExporter(cfg ExporterConfig) (Exporter, error) {
 	u, err := cfg.endpoint()
@@ -141,14 +199,22 @@ func NewExporter(cfg ExporterConfig) (Exporter, error) {
 			return nil, err
 		}
 	}
+	auth, err := cfg.authorization()
+	if err != nil {
+		return nil, err
+	}
 	switch cfg.Protocol {
 	case "", ProtocolGRPC:
 		creds := insecure.NewCredentials()
 		if tlsConf != nil {
 			creds = credentials.NewTLS(tlsConf)
 		}
-		conn, err := grpc.NewClient(u.Host, grpc.WithTransportCredentials(creds),
-			grpc.WithDefaultCallOptions(grpc.UseCompressor(grpcgzip.Name)))
+		opts := []grpc.DialOption{grpc.WithTransportCredentials(creds),
+			grpc.WithDefaultCallOptions(grpc.UseCompressor(grpcgzip.Name))}
+		if auth != "" {
+			opts = append(opts, grpc.WithPerRPCCredentials(bearerToken(auth)))
+		}
+		conn, err := grpc.NewClient(u.Host, opts...)
 		if err != nil {
 			return nil, err
 		}
@@ -164,10 +230,21 @@ func NewExporter(cfg ExporterConfig) (Exporter, error) {
 		client := &http.Client{Transport: tr, CheckRedirect: func(*http.Request, []*http.Request) error {
 			return http.ErrUseLastResponse
 		}}
-		return &httpExporter{url: u.String(), client: client}, nil
+		return &httpExporter{url: u.String(), client: client, authorization: auth}, nil
 	}
 	panic("unreachable: the protocol was validated")
 }
+
+// bearerToken is the credentials of gRPC that send the Authorization of a
+// bearer token ("Bearer " and the token) in the metadata of every request.
+type bearerToken string
+
+func (t bearerToken) GetRequestMetadata(context.Context, ...string) (map[string]string, error) {
+	return map[string]string{"authorization": string(t)}, nil
+}
+
+// RequireTransportSecurity makes gRPC refuse to send the token without TLS.
+func (bearerToken) RequireTransportSecurity() bool { return true }
 
 type grpcExporter struct {
 	conn   *grpc.ClientConn
@@ -187,6 +264,8 @@ func (e *grpcExporter) Close() error { return e.conn.Close() }
 type httpExporter struct {
 	url    string
 	client *http.Client
+	// authorization is the value of the Authorization header, if any.
+	authorization string
 }
 
 func (e *httpExporter) Export(ctx context.Context, req *colmetricspb.ExportMetricsServiceRequest) error {
@@ -206,6 +285,9 @@ func (e *httpExporter) Export(ctx context.Context, req *colmetricspb.ExportMetri
 	}
 	hreq.Header.Set("Content-Type", "application/x-protobuf")
 	hreq.Header.Set("Content-Encoding", "gzip")
+	if e.authorization != "" {
+		hreq.Header.Set("Authorization", e.authorization)
+	}
 	resp, err := e.client.Do(hreq)
 	if err != nil {
 		return err

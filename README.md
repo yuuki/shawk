@@ -103,9 +103,12 @@ connections should be traced after it, e.g. slurmd
 
 `shawk agent -h` lists the flags. Most deployments set only
 `-otlp-endpoint` and the TLS files (`-otlp-ca-file`, `-otlp-cert-file`,
-`-otlp-key-file`). Services that share an executable on a host (`ruby`,
-`python`, `java`) should set `OTEL_SERVICE_NAME`, e.g. with `Environment=`
-in a systemd drop-in, as for OBI.
+`-otlp-key-file`); behind a front collector that checks tokens rather
+than client certificates, `-otlp-bearer-token-file` replaces the
+certificate ([packaging/](packaging/README.md#agent)). Services that
+share an executable on a host (`ruby`, `python`, `java`) should set
+`OTEL_SERVICE_NAME`, e.g. with `Environment=` in a systemd drop-in, as
+for OBI.
 
 ### Collector
 
@@ -115,9 +118,11 @@ PostgreSQL scripts) and the image `ghcr.io/yuuki/shawk-collector`. To build
 it yourself, run `make collector shawk-migrate`.
 
 [packaging/](packaging/README.md) has the configuration of the collector,
-PostgreSQL, Prometheus and Grafana, and the steps to set them up. A
-database created by v0.8.0 must be created again; see the
-[CHANGELOG](CHANGELOG.md).
+PostgreSQL, Prometheus and Grafana, and the steps to set them up. The
+collector also has the Prometheus remote write exporter, for
+VictoriaMetrics or another store that takes Prometheus remote write
+([packaging/](packaging/README.md#prometheus)). A database created
+by v0.8.0 must be created again; see the [CHANGELOG](CHANGELOG.md).
 
 Connections through a load balancer, a virtual address or a proxy without
 an agent end at its address unless the translation is known: agents learn
