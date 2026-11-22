@@ -134,7 +134,11 @@ processors:
     check_interval: 1s
     limit_percentage: 80
     spike_limit_percentage: 20
-  batch: {}
+  # At most 8192 points (or spans) a batch: the outputs of a host arrive
+  # whole, so a batch would otherwise be as large as the largest host makes
+  # it, and the queue of otlp_http/prometheus counts batches.
+  batch:
+    send_batch_max_size: 8192
 
 exporters:
   # Prometheus started with --web.enable-otlp-receiver and the web
@@ -146,11 +150,32 @@ exporters:
   # requires client certificates instead takes tls.cert_file and
   # tls.key_file here.
   otlp_http/prometheus:
-    endpoint: https://prometheus.example:9090/api/v1/otlp
-    tls:
+    endpoint: &prometheus https://prometheus.example:9090/api/v1/otlp
+    tls: &prometheus_tls
       ca_file: /etc/shawk/tls/prometheus-ca.crt
-    headers:
+    headers: &prometheus_headers
       Authorization: ${env:SHAWK_PROMETHEUS_AUTHORIZATION}
+    # Batches of the batch processor, at most 8192 points and about 4.5 MiB
+    # of memory each (docs/design.md, section 5.3); size the queue to the
+    # fleet and the memory of the collector. While Prometheus is down the
+    # queue fills: the default of 1000 would take gigabytes, and
+    # memory_limiter would then refuse the requests of agents, for
+    # PostgreSQL too. Keep the queue enabled: without it, the retries of a
+    # batch would block the connector, and with it the requests of agents.
+    # Batches beyond the queue are dropped, which leaves gaps in the series.
+    sending_queue:
+      queue_size: 50
+  # The metrics of OBI, to the same Prometheus. They are not batched, so a
+  # request is as large as an export of OBI: the queue counts their encoded
+  # bytes (64 MiB, two to three times as much in memory), apart from the
+  # queue of the connector, which they would otherwise fill.
+  otlp_http/obi:
+    endpoint: *prometheus
+    tls: *prometheus_tls
+    headers: *prometheus_headers
+    sending_queue:
+      sizer: bytes
+      queue_size: 67108864
   # Tempo or another trace store, over TLS with the client certificate of
   # the collector, which the store should require: in Tempo,
   # tls.client_ca_file of the otlp receiver of the distributor.
@@ -181,7 +206,7 @@ service:
     metrics/obi:
       receivers: [otlp]
       processors: [memory_limiter]
-      exporters: [otlp_http/prometheus]
+      exporters: [otlp_http/obi]
     traces/obi:
       receivers: [otlp]
       processors: [memory_limiter, batch]

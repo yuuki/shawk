@@ -5,6 +5,17 @@
 * Unix stream and seqpacket socket tracing falls back to kprobes when BPF
   trampolines do not attach, including on Rocky Linux 9.6 arm64 (#220).
 
+### Fixed
+
+* `packaging/collector/config.yaml` bounds the queues of the exporters to
+  Prometheus: 50 batches of at most 8192 points (`send_batch_max_size` of
+  the batch processor) for the outputs of the connector, and 64 MiB for
+  the metrics of OBI, which take an exporter of their own
+  (`otlp_http/obi`). With the default queue of 1000 requests, a Prometheus
+  that was down filled the memory of the collector until `memory_limiter`
+  refused the requests of agents, so that PostgreSQL got nothing either
+  (`docs/design.md` §5.3).
+
 ## [v0.10.1](https://github.com/yuuki/shawk/compare/v0.10.0...v0.10.1) (2026-11-21)
 
 ### Changed

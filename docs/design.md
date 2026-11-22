@@ -1278,6 +1278,31 @@ Prometheus needs `--web.enable-otlp-receiver`,
 `otlp.promote_resource_attributes: [host.id, host.name]` and a 30-minute
 out-of-order window.
 
+The exporter to Prometheus queues what it sends (`sending_queue`), so that
+the connector, which hands its outputs to the batch processor within the
+request of an agent, does not wait for Prometheus: without the queue, the
+retries of a batch (up to 5 minutes by default) would block the batch
+processor, then the connector, and with it the requests of agents. The
+queue holds batches of the batch processor, which `send_batch_max_size`
+bounds to 8192 points, about 4.5 MiB of memory each (measured on outputs of
+the connector; encoded, a third of it): the outputs of a host arrive whole,
+so a batch is otherwise as large as the largest host makes it. While
+Prometheus is down the queue fills, the batches being retried included; the
+default of 1000 would fill the memory of the collector (gigabytes) until
+`memory_limiter` refuses the requests of agents, so that PostgreSQL gets
+nothing either until Prometheus is back. The example holds 50 batches,
+under 250 MiB, which last 4 minutes for a fleet whose outputs are 100 000
+points a minute: size it to the fleet (the rate of
+`otelcol_exporter_sent_metric_points`) and to the memory of the collector.
+Batches beyond are dropped (`otelcol_exporter_enqueue_failed_metric_points`)
+and leave gaps; the next points of a series carry its totals, but a new
+series whose first points are dropped counts from its next ones. OBI's
+metrics, which are not batched, take an exporter of their own
+(`otlp_http/obi`), so that they do not fill the queue of the connector; its
+queue counts the encoded bytes of their requests (`sizer: bytes`, 64 MiB,
+two to three times as much in memory), since a request is as large as an
+export of OBI.
+
 The OTLP receiver of Prometheus writes whatever it is sent, so anyone who
 could push could write `shawk_agent_up` and silence `ShawkAgentDown`. The
 example pushes over TLS with a password (`packaging/collector/config.yaml`,
