@@ -133,6 +133,10 @@ func runAgent(ctx context.Context, args []string, _, stderr io.Writer) error {
 		caFile   = fs.String("otlp-ca-file", "", "PEM file of the CAs that verify the collector (default: system roots)")
 		certFile = fs.String("otlp-cert-file", "", "PEM client certificate for a collector that requires one (mutual TLS)")
 		keyFile  = fs.String("otlp-key-file", "", "PEM key of -otlp-cert-file")
+		srvName  = fs.String("otlp-server-name", "",
+			"name that the certificate of the collector must hold, sent in SNI, if not the host of -otlp-endpoint (e.g. an IP address); https:// only")
+		tokenFile = fs.String("otlp-bearer-token-file", "",
+			"file of a token sent with every request (Authorization: Bearer), for a collector that authenticates agents by tokens; read at start; https:// only")
 		perReq   = fs.Int("max-series-per-request", 1000, "dependencies, listeners and translations per OTLP request, which also stays below 3 MiB; more are sent in several requests")
 		interval = fs.Duration("interval", 15*time.Second, "collection and export interval, at most 1m")
 		idleTTL  = fs.Duration("idle-ttl", 15*time.Minute, "how long a dependency is sent after its last activity")
@@ -185,7 +189,7 @@ func runAgent(ctx context.Context, args []string, _, stderr io.Writer) error {
 	}
 	cfg := agent.Config{
 		Exporter: otlp.ExporterConfig{Endpoint: *endpoint, Protocol: *protocol, CAFile: *caFile,
-			CertFile: *certFile, KeyFile: *keyFile},
+			CertFile: *certFile, KeyFile: *keyFile, ServerName: *srvName, BearerTokenFile: *tokenFile},
 		MaxSeriesPerRequest: *perReq,
 		Interval:            *interval,
 		IdleTTL:             *idleTTL,

@@ -913,10 +913,29 @@ which include containers.
   converted with the agent's current clock skew, so it stays right after the
   clock steps.
 - TLS. An `https://` endpoint verifies the collector and may present a
-  client certificate. Over `http://` the host's dependencies, executables,
-  name and machine id travel in the clear, and the agent warns unless the
-  endpoint is loopback. The agent does not follow HTTP redirects, so nothing
-  in the path can divert the export elsewhere or to `http://`.
+  client certificate. `-otlp-server-name` verifies the certificate by
+  another name than the host of the endpoint, and asks for it in SNI, for
+  an endpoint given by its address, such as a virtual address of a network
+  without DNS; over gRPC it is also the authority of the requests. Over
+  `http://` the host's dependencies, executables, name and machine id
+  travel in the clear, and the agent warns unless the endpoint is
+  loopback. The agent does not follow HTTP redirects, so nothing in the
+  path can divert the export elsewhere or to `http://`.
+- Bearer token. Instead of a client certificate, the agent can send a token
+  to a front collector that authenticates agents by tokens (the
+  bearertokenauth extension of otelcol-contrib) and forwards to the
+  connectors (§5.3): `Authorization: Bearer` with every request, in the
+  metadata of gRPC and the headers of HTTP. The token is read at start from
+  `-otlp-bearer-token-file` (e.g. a credential of systemd), without the
+  white space around it, so a new token takes a restart. The agent refuses
+  to start with an empty file, a token that is not one word of visible
+  ASCII, or an endpoint other than `https://`, loopback included: in the
+  clear the token could be read on the way and replayed, and while the
+  collector is down any user of the host could listen on its port and take
+  it, whereas TLS verifies the collector. The token is never logged; errors
+  hold the path of its file, not its content. A token names no host, so
+  any holder can write as any host, as behind a front with certificates
+  (`host_identity: none`, §5.5).
 - Host identity. With `host_identity: certificate` the connector accepts a
   host's metrics only from an agent whose verified certificate names its
   `host.name` (a DNS name, else the common name; no wildcards), so one
@@ -1277,6 +1296,30 @@ change.
 Prometheus needs `--web.enable-otlp-receiver`,
 `otlp.promote_resource_attributes: [host.id, host.name]` and a 30-minute
 out-of-order window.
+
+A store that takes Prometheus remote write, such as VictoriaMetrics, whose
+OTLP receiver does not translate names as Prometheus's does by default,
+gets the same series from the `prometheus_remote_write` exporter of the
+collector (`packaging/collector/config.yaml`). Its translation
+`UnderscoreEscapingWithSuffixes`, the default of the exporter and of
+Prometheus, gives the names above and the same `job` and `instance`;
+`resource_constant_labels` with `included: [host.id, host.name]` gives the
+labels of `promote_resource_attributes`; and `disable_scope_info: true`
+leaves out `otel_scope_name`, which the exporter would put on every series
+and Prometheus does not. Its queue (`remote_write_queue`) holds batches of
+the batch processor, a few MiB each once `send_batch_max_size` bounds them
+to 8192 points: the outputs of a host arrive whole, so a batch is
+otherwise as large as the largest host makes it. While the store is down,
+the default of 10000 would fill the memory of the collector until
+`memory_limiter` refuses the requests of agents, so that PostgreSQL gets
+nothing either until the store is back. The example holds 50, to size to
+the fleet; batches beyond are dropped and leave gaps, and a new series
+whose first points are dropped counts from its next ones. The queue must
+stay enabled: without it, the retries of a batch (up to 5 minutes by
+default) would block the connector, and with it the requests of agents.
+OBI's metrics, which are not batched, take an instance of their own, so
+that they do not fill the queue of the connector. The store must take
+points as late as Prometheus does with its window.
 
 The OTLP receiver of Prometheus writes whatever it is sent, so anyone who
 could push could write `shawk_agent_up` and silence `ShawkAgentDown`. The
