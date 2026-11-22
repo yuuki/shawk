@@ -136,7 +136,7 @@ processors:
     spike_limit_percentage: 20
   # At most 8192 points (or spans) a batch: the outputs of a host arrive
   # whole, so a batch would otherwise be as large as the largest host makes
-  # it, and the queue of otlp_http/prometheus counts batches.
+  # it, and one larger than the queue of otlp_http/prometheus is refused.
   batch:
     send_batch_max_size: 8192
 
@@ -155,19 +155,23 @@ exporters:
       ca_file: /etc/shawk/tls/prometheus-ca.crt
     headers: &prometheus_headers
       Authorization: ${env:SHAWK_PROMETHEUS_AUTHORIZATION}
-    # Batches of the batch processor, at most 8192 points and about 4.5 MiB
-    # of memory each (docs/design.md, section 5.3); size the queue to the
-    # fleet and the memory of the collector. While Prometheus is down the
-    # queue fills: the default of 1000 would take gigabytes, and
-    # memory_limiter would then refuse the requests of agents, for
-    # PostgreSQL too. Keep the queue enabled: without it, the retries of a
-    # batch would block the connector, and with it the requests of agents.
-    # Batches beyond the queue are dropped, which leaves gaps in the series.
+    # The queue counts points, about 600 bytes of memory each
+    # (docs/design.md, section 5.3): 409600 take under 250 MiB and last 4
+    # minutes for a fleet whose outputs are 100 000 points a minute; size it
+    # to the fleet and the memory of the collector. Not batches: a batch
+    # holds what arrives in 200 ms, often a few hundred points, and the
+    # default of 1000 batches bounds no number of points. While Prometheus
+    # is down the queue fills, and a full memory would make memory_limiter
+    # refuse the requests of agents, for PostgreSQL too. Keep the queue
+    # enabled, and not blocking: the retries of a batch would otherwise
+    # block the connector, and with it the requests of agents. Points
+    # beyond the queue are dropped, which leaves gaps in the series.
     sending_queue:
-      queue_size: 50
+      sizer: items
+      queue_size: 409600
   # The metrics of OBI, to the same Prometheus. They are not batched, so a
   # request is as large as an export of OBI: the queue counts their encoded
-  # bytes (64 MiB, two to three times as much in memory), apart from the
+  # bytes (64 MiB, up to about 3.5 times as much in memory), apart from the
   # queue of the connector, which they would otherwise fill.
   otlp_http/obi:
     endpoint: *prometheus

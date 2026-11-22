@@ -145,35 +145,38 @@ func TestPackagedCollectorConfig(t *testing.T) {
 		}
 		return out
 	}
-	// The queues of the exporters to Prometheus stay enabled, so that the
-	// retries of a batch do not block the connector, and are bounded, so
-	// that they do not fill the memory of the collector while Prometheus is
-	// down: in batches bounded by send_batch_max_size, else in bytes. OBI's
-	// requests, which are not batched, have a queue of their own
-	// (docs/design.md, section 5.3).
+	// The queues of the exporters to Prometheus stay enabled and do not
+	// block, so that the retries of a batch do not block the connector, and
+	// are bounded, so that they do not fill the memory of the collector
+	// while Prometheus is down: in points, since a batch holds what arrived
+	// within its timeout, and in bytes for OBI's requests, which are not
+	// batched and have a queue of their own (docs/design.md, section 5.3).
 	batch, _ := doc.Processors["batch"].(map[string]any)
 	if batch["send_batch_max_size"] != 8192 {
 		t.Errorf("batch: send_batch_max_size = %v", batch["send_batch_max_size"])
 	}
-	shawkOut, obi := doc.Service.Pipelines["metrics/shawk-out"], doc.Service.Pipelines["metrics/obi"]
-	if len(toPrometheus(shawkOut.Exporters)) == 0 || len(toPrometheus(obi.Exporters)) == 0 {
-		t.Errorf("metrics/shawk-out %v or metrics/obi %v sends nothing to Prometheus", shawkOut.Exporters, obi.Exporters)
+	queues := map[string]map[string]any{
+		"metrics/shawk-out": {"sizer": "items", "queue_size": 409600},
+		"metrics/obi":       {"sizer": "bytes", "queue_size": 67108864},
 	}
-	for _, e := range shawkOut.Exporters {
-		if slicesContains(obi.Exporters, e) {
-			t.Errorf("%s: in metrics/shawk-out and metrics/obi, whose requests would fill the queue of the connector", e)
-		}
-	}
+	sends, shared := map[string]bool{}, map[string]string{}
 	for name, p := range doc.Service.Pipelines {
 		for _, e := range toPrometheus(p.Exporters) {
+			if other, ok := shared[e]; ok {
+				t.Errorf("%s: in %s and %s, whose requests share its queue", e, other, name)
+			}
+			shared[e] = name
+			want, ok := queues[name]
+			if !ok {
+				t.Errorf("%s: sends to Prometheus through %s, whose queue is not checked", name, e)
+				continue
+			}
+			sends[name] = true
 			ex, _ := doc.Exporters[e].(map[string]any)
 			q, _ := ex["sending_queue"].(map[string]any)
-			size, _ := q["queue_size"].(int)
-			if q["enabled"] == false || size <= 0 {
-				t.Errorf("%s: sending_queue = %v, not enabled with a queue_size of its own", e, q)
-			}
-			if !slicesContains(p.Processors, "batch") && q["sizer"] != "bytes" {
-				t.Errorf("%s: the queue of %s counts requests that are not batched: %v", name, e, q)
+			if q["enabled"] == false || q["block_on_overflow"] == true || q["wait_for_result"] == true ||
+				q["sizer"] != want["sizer"] || q["queue_size"] != want["queue_size"] {
+				t.Errorf("%s: sending_queue of %s = %v, want %v, enabled and not blocking", name, e, q, want)
 			}
 		}
 		// Points of other sources carry the clocks of their hosts; batched,
@@ -199,6 +202,11 @@ func TestPackagedCollectorConfig(t *testing.T) {
 			if doc.Exporters[e] == nil && doc.Connectors[e] == nil {
 				t.Errorf("%s: undefined exporter %s", name, e)
 			}
+		}
+	}
+	for name := range queues {
+		if !sends[name] {
+			t.Errorf("%s sends nothing to Prometheus", name)
 		}
 	}
 }

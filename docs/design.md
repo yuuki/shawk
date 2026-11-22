@@ -1280,28 +1280,34 @@ out-of-order window.
 
 The exporter to Prometheus queues what it sends (`sending_queue`), so that
 the connector, which hands its outputs to the batch processor within the
-request of an agent, does not wait for Prometheus: without the queue, the
-retries of a batch (up to 5 minutes by default) would block the batch
-processor, then the connector, and with it the requests of agents. The
-queue holds batches of the batch processor, which `send_batch_max_size`
-bounds to 8192 points, about 4.5 MiB of memory each (measured on outputs of
-the connector; encoded, a third of it): the outputs of a host arrive whole,
-so a batch is otherwise as large as the largest host makes it. While
-Prometheus is down the queue fills, the batches being retried included; the
-default of 1000 would fill the memory of the collector (gigabytes) until
-`memory_limiter` refuses the requests of agents, so that PostgreSQL gets
-nothing either until Prometheus is back. The example holds 50 batches,
-under 250 MiB, which last 4 minutes for a fleet whose outputs are 100 000
-points a minute: size it to the fleet (the rate of
+request of an agent, does not wait for Prometheus: without the queue, or
+with one that blocks when full, the retries of a batch (for 5 minutes by
+default) would block the batch processor, then the connector, and with it
+the requests of agents. The queue counts points (`sizer: items`), the
+batches being retried included, about 600 bytes of memory each (measured
+on outputs of the connector; encoded, a third of it). Its default counts
+1000 batches, which bounds no number of points: the batch processor sends
+what arrived within 200 ms, a few hundred points for a fleet whose agents
+send at different times, up to `send_batch_max_size`. While Prometheus is
+down the queue fills; by default, a large fleet or large hosts make batches
+that would fill the memory of the collector (1000 batches of 8192 points
+take about 4.5 GiB) until `memory_limiter` refuses the requests of agents,
+so that PostgreSQL gets nothing either until Prometheus is back. The
+example holds 409 600 points, under 250 MiB, which last 4 minutes for a
+fleet whose outputs are 100 000 points a minute, where 50 batches would
+last 10 seconds: size it to the fleet (the rate of
 `otelcol_exporter_sent_metric_points`) and to the memory of the collector.
-Batches beyond are dropped (`otelcol_exporter_enqueue_failed_metric_points`)
-and leave gaps; the next points of a series carry its totals, but a new
-series whose first points are dropped counts from its next ones. OBI's
-metrics, which are not batched, take an exporter of their own
-(`otlp_http/obi`), so that they do not fill the queue of the connector; its
-queue counts the encoded bytes of their requests (`sizer: bytes`, 64 MiB,
-two to three times as much in memory), since a request is as large as an
-export of OBI.
+`send_batch_max_size` bounds batches to 8192 points: the outputs of a host
+arrive whole, and a batch larger than the queue would be refused. Points
+beyond are dropped (`otelcol_exporter_enqueue_failed_metric_points`) and
+leave gaps, possibly in part of the outputs of a host; the next points of a
+series carry its totals, but a new series whose first points are dropped
+counts from its next ones. OBI's metrics, which are not batched, take an
+exporter of their own (`otlp_http/obi`), so that they do not fill the queue
+of the connector; its queue counts the encoded bytes of their requests
+(`sizer: bytes`, 64 MiB, up to about 3.5 times as much in memory), since a
+request is as large as an export of OBI and their points range from
+counters to histograms with buckets.
 
 The OTLP receiver of Prometheus writes whatever it is sent, so anyone who
 could push could write `shawk_agent_up` and silence `ShawkAgentDown`. The
