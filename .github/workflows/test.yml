@@ -204,6 +204,7 @@ jobs:
       - name: Tests in the virtual machine
         env:
           VM_TEST_ARGS: ${{ matrix.test-args }}
+          VM_RCU_EXPEDITED: "1"
         run: test/vm/run.sh ${{ matrix.kernel }} ${{ matrix.arch }}
 
   # The same tests on an arm64 host, with its own kernel and JIT.

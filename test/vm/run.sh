@@ -33,6 +33,9 @@
 # the modules package of the mainline build, for the tests of translations;
 # a kernel given by its path runs with SHAWK_TEST_NO_CONNTRACK=1. Further arguments of the test binaries can be given in
 # VM_TEST_ARGS, e.g. VM_TEST_ARGS='-test.run=TestUDP'.
+# VM_RCU_EXPEDITED=1 asks the test kernel to expedite RCU grace periods:
+# the map flips and probe teardown still wait for readers, with less delay
+# at the cost of extra CPU work. The default (0) uses the kernel's policy.
 #
 # Requires go, qemu-system-x86_64 or qemu-system-aarch64, cpio, gzip, curl,
 # sha256sum, timeout, rpm2cpio and xz (rocky9), and dpkg-deb (5.14, 5.15).
@@ -47,6 +50,11 @@ ARCH="${2:-$(uname -m)}"
 ARCH="${ARCH/arm64/aarch64}"
 ARCH="${ARCH/amd64/x86_64}"
 TIMEOUT="${VM_TIMEOUT:-1800}"
+rcu_expedited="${VM_RCU_EXPEDITED:-0}"
+case "$rcu_expedited" in
+0|1) ;;
+*) echo "VM_RCU_EXPEDITED must be 0 or 1" >&2; exit 2 ;;
+esac
 
 case "$ARCH" in
 x86_64) goarch=amd64 qemu=qemu-system-x86_64 console=ttyS0 ;;
@@ -216,20 +224,24 @@ EOF
 # Unknown parameters of the kernel command line are passed to init as
 # environment variables.
 cmdline="console=$console panic=-1 quiet SHAWK_TEST_STRICT=${SHAWK_TEST_STRICT:-1} SHAWK_TEST_NO_UDP=${no_udp:-0} SHAWK_TEST_NO_TRAMPOLINES=${no_trampolines:-0} SHAWK_TEST_NO_NFS=${SHAWK_TEST_NO_NFS:-$no_nfs} SHAWK_TEST_NO_CONNTRACK=${SHAWK_TEST_NO_CONNTRACK:-$no_conntrack}"
+if [[ "$rcu_expedited" == 1 ]]; then
+	cmdline+=" rcupdate.rcu_expedited=1"
+fi
 opts=(-m 2G -smp 2 -nographic -no-reboot -kernel "$image" -initrd "$WORK/initramfs.gz" -append "$cmdline")
 host="$(uname -m)"
 host="${host/arm64/aarch64}"
+accel=tcg
+cpu=max
 if [[ "$host" == "$ARCH" && -r /dev/kvm && -w /dev/kvm ]]; then
-	opts+=(-accel kvm -cpu host)
+	accel=kvm cpu=host
 elif [[ "$host" == "$ARCH" && "$(uname -s)" == Darwin ]]; then
-	opts+=(-accel hvf -cpu host)
-else
-	opts+=(-accel tcg -cpu max)
+	accel=hvf cpu=host
 fi
+opts+=(-accel "$accel" -cpu "$cpu")
 [[ "$ARCH" == aarch64 ]] && opts+=(-machine virt)
 [[ "$ARCH" == x86_64 ]] && opts+=(-machine q35)
 
-echo "booting $(basename "$image") ($ARCH) with ${opts[*]: -4}" >&2
+echo "booting $(basename "$image") ($ARCH) with $accel, CPU $cpu, expedited RCU $rcu_expedited" >&2
 log="$WORK/console.log"
 status=0
 timeout "$TIMEOUT" "$qemu" "${opts[@]}" </dev/null 2>&1 | tee "$log" || status=$?
