@@ -51,12 +51,17 @@ func TestTCPIteratorSkips(t *testing.T) {
 		// The connections stay, without their listener.
 		ln.Close()
 	})
-	tr := startTracer(t, Options{NetNS: ns})
+	// These connections share one flow per direction. A small table
+	// avoids scanning thousands of empty hash buckets at every port.
+	tr := startTracer(t, Options{NetNS: ns, MaxFlows: 256})
 	check := func(what string) {
 		t.Helper()
 		snap, err := tr.Collect()
 		if err != nil {
 			t.Fatal(err)
+		}
+		if snap.Drops != 0 {
+			t.Fatalf("%s: %d flow updates dropped", what, snap.Drops)
 		}
 		var out, in uint64
 		for _, f := range snap.Flows {

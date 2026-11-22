@@ -57,6 +57,12 @@ the architecture of the host, and emulates it otherwise (slow). Without
 `rpm2cpio` or `dpkg-deb`, as on macOS, `bsdtar` extracts the kernel packages.
 On macOS, Homebrew has `qemu`, `xz` and `coreutils` (`timeout`).
 
+CI sets `VM_RCU_EXPEDITED=1` to shorten the RCU grace periods that map
+flips and probe teardown wait for. This keeps the wait for readers and
+spends more CPU to reduce latency, especially under emulation; it does
+not reduce the test cases or the 1024-port iterator regression test.
+Local runs default to the kernel's normal policy (`VM_RCU_EXPEDITED=0`).
+
 ## Slurm cluster
 
 ```bash
@@ -129,6 +135,7 @@ the pinned release of Lima if `limactl` is missing, and needs QEMU and
 | `SHAWK_TEST_NO_TRAMPOLINES`, `SHAWK_TEST_NO_UDP`, `SHAWK_TEST_NO_NFS`, `SHAWK_TEST_NO_CONNTRACK`, `SHAWK_TEST_NO_VXLAN` | the BPF tests: what the kernel lacks | `test/vm/run.sh` from the kernel |
 | `SHAWK_TARGET_BTF`, `SHAWK_TARGET_MODULE_BTF`, `SHAWK_FRESH_OBJECT` | `TestKernelCompatibility` and the check of the committed object | `make compat`, `make check-object` |
 | `VM_TEST_ARGS`, `VM_TIMEOUT` | `test/vm/run.sh`: arguments of the test binaries, a deadline | the user |
+| `VM_RCU_EXPEDITED` | `test/vm/run.sh`: expedite RCU grace periods (0 or 1) | 0 locally, 1 in CI |
 | `SLURM_*`, `SHAWK_VM_*` | `slurm.sh up` (above) | the user |
 | `SHAWK_CACHE_DIR`, `SHAWK_HARNESS_ID` | all of `test/harness`: the cache, the name of the workspace (8 hex digits of its path) | the user |
 
