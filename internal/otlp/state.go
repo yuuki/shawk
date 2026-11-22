@@ -66,6 +66,11 @@ type EdgeStats struct {
 	HandshakeSumUs uint64
 	SynRetrans     uint64
 	Fails          [len(FailReasons)]uint64
+	// Protocols are the wire protocols of the connections of a TCP edge
+	// whose first payload was sent in the interval: bit i for
+	// WireProtocols[i]. Input only: a series keeps when each was seen
+	// (Edge.Protocols), not their bits in Total.
+	Protocols uint32
 }
 
 // fails returns the failures for reason i of FailReasons, or for ErrorOther
@@ -92,7 +97,8 @@ func (s *EdgeStats) handshakes() uint64 {
 
 // active tells whether the statistics of an interval show activity.
 func (s *EdgeStats) active() bool {
-	return s.Conns|s.ConnFails|s.OpenConns|s.BytesSent|s.BytesRecv|s.MsgsSent|s.MsgsRecv|s.Retrans|s.RTTSamples != 0
+	return s.Conns|s.ConnFails|s.OpenConns|s.BytesSent|s.BytesRecv|s.MsgsSent|s.MsgsRecv|s.Retrans|s.RTTSamples != 0 ||
+		s.Protocols != 0
 }
 
 func (s *EdgeStats) add(o *EdgeStats) {
@@ -166,6 +172,16 @@ type Edge struct {
 	// a data point for every reason, and the connector takes its first
 	// value as new rather than as a baseline.
 	FailStart [len(FailReasons) + 1]time.Time
+	// Protocols are when a connection of each of WireProtocols was first
+	// and last seen, at the end of the intervals that saw them; zero for
+	// those not seen. Nil until the edge sees one, so that the edges of an
+	// agent that does not classify hold a pointer only.
+	Protocols *[len(WireProtocols)]Seen
+}
+
+// Seen is when something was first and last seen.
+type Seen struct {
+	First, Last time.Time
 }
 
 // Listener is the state of a listener series.
@@ -213,8 +229,37 @@ func (s *State) AddEdge(k EdgeKey, st EdgeStats, start, end time.Time) {
 			e.FailStart[i] = start
 		}
 	}
-	if st.active() && end.After(e.LastSeen) {
-		e.LastSeen = end
+	if st.Protocols != 0 && e.Protocols == nil {
+		e.Protocols = new([len(WireProtocols)]Seen)
+	}
+	for i := range len(WireProtocols) {
+		if st.Protocols&(1<<i) == 0 {
+			continue
+		}
+		p := &e.Protocols[i]
+		if p.First.IsZero() {
+			p.First = end
+		}
+		see(&p.First, &p.Last, end)
+	}
+	if st.active() {
+		see(&e.FirstSeen, &e.LastSeen, end)
+	}
+}
+
+// see records that what was first and last seen at *first and *last was
+// seen at t, which is its last time if it is after *last: by the monotonic
+// clock, which the agent's times read and Expire compares. The times are
+// sent by the wall clock, and a step back of the wall clock makes t after
+// *last but before *first by it: *first then moves back to t, so that what
+// was first seen is never sent after what was last seen.
+func see(first, last *time.Time, t time.Time) {
+	if elapsed(t, *last) <= 0 {
+		return
+	}
+	*last = t
+	if t.Round(0).Before(first.Round(0)) {
+		*first = t
 	}
 }
 
@@ -225,9 +270,7 @@ func (s *State) AddListener(k ListenerKey, t time.Time) {
 		l = &Listener{FirstSeen: t}
 		s.listeners[k] = l
 	}
-	if t.After(l.LastSeen) {
-		l.LastSeen = t
-	}
+	see(&l.FirstSeen, &l.LastSeen, t)
 }
 
 // AddTranslation records that a translation was in use at t: a new
@@ -238,9 +281,7 @@ func (s *State) AddTranslation(k TranslationKey, t time.Time) {
 		x = &Translation{FirstSeen: t}
 		s.translations[k] = x
 	}
-	if t.After(x.LastSeen) {
-		x.LastSeen = t
-	}
+	see(&x.FirstSeen, &x.LastSeen, t)
 }
 
 // BeginInterval prepares the series for the statistics of a new interval:

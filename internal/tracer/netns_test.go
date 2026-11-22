@@ -8,6 +8,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -298,4 +300,225 @@ func TestCollectFromOtherNetNS(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestFindNetNS checks the paths kept for each network namespace (#257):
+// those of bind mounts first, through one name of their directory, then
+// those of the processes with the lowest PIDs, at most maxNetNSPaths of
+// them; and that only keeps one namespace.
+func TestFindNetNS(t *testing.T) {
+	dir := t.TempDir()
+	// Files stand in for the namespaces, and links to them for the paths
+	// that open them.
+	link := func(ns, path string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join(dir, "ns", ns), path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ids := map[string]fileID{}
+	if err := os.Mkdir(filepath.Join(dir, "ns"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, ns := range []string{"a", "b", "c"} {
+		path := filepath.Join(dir, "ns", ns)
+		if err := os.WriteFile(path, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var st unix.Stat_t
+		if err := unix.Stat(path, &st); err != nil {
+			t.Fatal(err)
+		}
+		ids[ns] = fileIDOf(&st)
+	}
+	proc := filepath.Join(dir, "proc")
+	pidPath := func(pid string) string { return filepath.Join(proc, pid, "ns", "net") }
+	link("a", pidPath("1"))
+	for _, pid := range []string{"10000", "2000", "300", "400", "500"} {
+		link("b", pidPath(pid))
+	}
+	// A process whose namespace cannot be read.
+	if err := os.MkdirAll(filepath.Join(proc, "600"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("1", filepath.Join(proc, "self")); err != nil {
+		t.Fatal(err)
+	}
+	run := filepath.Join(dir, "run")
+	link("b", filepath.Join(run, "netns", "b"))
+	link("c", filepath.Join(run, "docker", "netns", "c"))
+	if err := os.MkdirAll(filepath.Join(dir, "var"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(run, filepath.Join(dir, "var", "run")); err != nil {
+		t.Fatal(err)
+	}
+	dirs := []string{
+		filepath.Join(run, "netns"), filepath.Join(dir, "var", "run", "netns"),
+		filepath.Join(run, "docker", "netns"), filepath.Join(dir, "missing"),
+	}
+
+	equal := func(a, b netnsRef) bool { return a.id == b.id && slices.Equal(a.paths, b.paths) }
+	want := []netnsRef{
+		{id: ids["b"], paths: []string{filepath.Join(run, "netns", "b"), pidPath("300"), pidPath("400"), pidPath("500")}},
+		{id: ids["c"], paths: []string{filepath.Join(run, "docker", "netns", "c")}},
+		{id: ids["a"], paths: []string{pidPath("self"), pidPath("1")}},
+	}
+	if got := findNetNS(proc, dirs, 0); !slices.EqualFunc(got, want, equal) {
+		t.Errorf("findNetNS = %+v, want %+v", got, want)
+	}
+	if got := findNetNS(proc, dirs, uint32(ids["b"].ino)); !slices.EqualFunc(got, want[:1], equal) {
+		t.Errorf("findNetNS of %d alone = %+v, want %+v", ids["b"].ino, got, want[:1])
+	}
+}
+
+// TestOpenNetNS checks that a network namespace is opened by the first of
+// its paths that still opens it (#257): a path that no longer exists, like
+// that of a process that exited, or that opens another file, like that of a
+// process whose PID was reused in another namespace, is passed over.
+func TestOpenNetNS(t *testing.T) {
+	dir := t.TempDir()
+	other, target := filepath.Join(dir, "other"), filepath.Join(dir, "target")
+	for _, path := range []string{other, target} {
+		if err := os.WriteFile(path, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var st unix.Stat_t
+	if err := unix.Stat(target, &st); err != nil {
+		t.Fatal(err)
+	}
+	ns := netnsRef{id: fileIDOf(&st), paths: []string{filepath.Join(dir, "exited"), other, target}}
+	f, err := openNetNS(&ns)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	if f.Name() != target {
+		t.Errorf("opened %s, want %s", f.Name(), target)
+	}
+	ns.paths = ns.paths[:2]
+	if f, err := openNetNS(&ns); err == nil {
+		f.Close()
+		t.Errorf("opened %s, which is another file", f.Name())
+	}
+}
+
+// TestOpenInNetNSChecksPath checks that the iterators are opened in the
+// network namespace that was listed when its first path opens another one
+// (#257), like that of a process whose PID was reused in the namespace of
+// the agent.
+func TestOpenInNetNSChecksPath(t *testing.T) {
+	skipIfNoNetwork(t, "tcp4")
+	tr := newTestTracer(t)
+	path := createNetNS(t)
+	leave := enterNetNS(t, path)
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	leave()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	var st unix.Stat_t
+	if err := unix.Stat(path, &st); err != nil {
+		t.Fatal(err)
+	}
+	ns := netnsRef{id: fileIDOf(&st), paths: []string{"/proc/self/ns/net", path}}
+	rcs, err := openInNetNS(&ns, tr.iterTCP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeAll(rcs)
+	recs, err := readRecords(rcs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := uint16(ln.Addr().(*net.TCPAddr).Port)
+	found := false
+	for i := range recs {
+		if r := &recs[i]; r.Type == recListener {
+			if r.Netns != ns.inode() {
+				t.Fatalf("walked network namespace %d, not %d", r.Netns, ns.inode())
+			}
+			found = found || r.Port == port
+		}
+	}
+	if !found {
+		t.Errorf("the listener on port %d in network namespace %d was not walked", port, ns.inode())
+	}
+}
+
+// TestWalkNetNSWithFewFiles checks that a walk of the sockets holds the
+// files of one network namespace at a time (#257): with room for the files
+// of a few namespaces only, it still walks the listeners of every one.
+func TestWalkNetNSWithFewFiles(t *testing.T) {
+	skipIfNoNetwork(t, "tcp4")
+	tr := newTestTracer(t)
+	ports := map[uint32]uint16{}
+	for range 8 {
+		run, inode := newNetNS(t)
+		run(func() {
+			ln, err := net.Listen("tcp4", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { ln.Close() })
+			ports[inode] = uint16(ln.Addr().(*net.TCPAddr).Port)
+		})
+	}
+	var (
+		listeners []Listener
+		err       error
+	)
+	withFreeFiles(t, 6, func() { listeners, _, err = tr.scanSockets() })
+	if err != nil {
+		t.Fatal(err)
+	}
+	for inode, port := range ports {
+		if !slices.ContainsFunc(listeners, func(l Listener) bool {
+			return l.Proto == ProtoTCP && l.NetNS == inode && l.Port == port
+		}) {
+			t.Errorf("the listener on port %d in network namespace %d was not walked", port, inode)
+		}
+	}
+}
+
+// withFreeFiles runs f with a limit of open files that leaves n of them to
+// open.
+func withFreeFiles(t *testing.T, n int, f func()) {
+	t.Helper()
+	var orig unix.Rlimit
+	if err := unix.Getrlimit(unix.RLIMIT_NOFILE, &orig); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	open := map[int]bool{}
+	for _, e := range entries {
+		if fd, err := strconv.Atoi(e.Name()); err == nil {
+			open[fd] = true
+		}
+	}
+	// A file takes the lowest free descriptor, and fails above the limit.
+	limit := 0
+	for free := 0; free < n; limit++ {
+		if !open[limit] {
+			free++
+		}
+	}
+	lim := unix.Rlimit{Cur: uint64(limit), Max: orig.Max}
+	if err := unix.Setrlimit(unix.RLIMIT_NOFILE, &lim); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := unix.Setrlimit(unix.RLIMIT_NOFILE, &orig); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	f()
 }

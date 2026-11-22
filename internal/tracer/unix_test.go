@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"sync"
 	"testing"
@@ -39,23 +40,72 @@ func TestUnixName(t *testing.T) {
 	}
 }
 
-// requireUnix skips a test of the tracing of Unix sockets when the kernel
-// cannot trace them: their programs need BPF trampolines, which
-// SHAWK_TEST_NO_TRAMPOLINES=1 declares the kernel has not, as
-// SHAWK_TEST_NO_UDP=1 does.
+// TestNoteMissingUnixListeners checks that a client of a Unix socket
+// requests an owner scan when no scan found a listener of its name in its
+// own network namespace, even if one did in another namespace (#258): an
+// abstract name is reached in the namespace of its client only, and a
+// container may bind the same path as another one. A name in a namespace
+// requests one scan until the next periodic one.
+func TestNoteMissingUnixListeners(t *testing.T) {
+	const path, abstract = "/run/php-fpm.sock", "@app"
+	php := owner{pid: 100, comm: "php-fpm", cgroupID: 10}
+	tr := &Tracer{
+		unixOwners: map[unixListenerKey][]owner{
+			{netns: 1, path: path}:     {php},
+			{netns: 1, path: abstract}: {php},
+		},
+		unixMissing: map[unixListenerKey]bool{},
+	}
+	flow := func(netns uint32, name string) Flow {
+		return Flow{FlowKey: FlowKey{Direction: DirOut, Proto: ProtoUnix, Path: name, NetNS: netns}, FlowStats: FlowStats{Conns: 1}}
+	}
+	for _, tc := range []struct {
+		name  string
+		flows []Flow
+		want  bool
+	}{
+		{"listeners of the namespace", []Flow{flow(1, path), flow(1, abstract)}, false},
+		{"a path served in another namespace", []Flow{flow(2, path)}, true},
+		{"an abstract name served in another namespace", []Flow{flow(2, abstract)}, true},
+		{"names that requested a scan", []Flow{flow(2, path), flow(2, abstract)}, false},
+		{"a path of a third namespace", []Flow{flow(3, path)}, true},
+	} {
+		tr.ownerMissing = false
+		tr.noteMissingUnixListeners(tc.flows)
+		if tr.ownerMissing != tc.want {
+			t.Errorf("%s: owner scan requested = %v, want %v", tc.name, tr.ownerMissing, tc.want)
+		}
+	}
+}
+
+// On the older arm64 VM kernels the ordinary Unix tests exercise the
+// fallback. Check which programs attached before testing their results.
 func requireUnix(t *testing.T, tr *Tracer) {
 	t.Helper()
 	noTrampolines, _ := strconv.ParseBool(os.Getenv("SHAWK_TEST_NO_TRAMPOLINES"))
-	noUDP, _ := strconv.ParseBool(os.Getenv("SHAWK_TEST_NO_UDP"))
-	noTrampolines = noTrampolines || noUDP
+	noProbes, _ := strconv.ParseBool(os.Getenv("SHAWK_TEST_NO_UDP"))
 	switch {
-	case noTrampolines && tr.UnixEnabled():
-		t.Fatal("Unix sockets are traced, but the kernel is declared without BPF trampolines")
-	case noTrampolines:
-		t.Skip("Unix sockets are not traced on this kernel, which is declared without BPF trampolines")
+	case noProbes && tr.UnixEnabled():
+		t.Fatal("Unix sockets are traced on a kernel declared without trampolines or kprobes")
+	case noProbes:
+		t.Skip("kernel declared without trampolines or kprobes")
 	case !tr.UnixEnabled():
 		skipUnavailable(t, "Unix sockets are not traced on this kernel")
+	case (noTrampolines || forceUnixKprobes) && !tr.unixKprobes:
+		t.Fatal("expected Unix sockets to be traced with kprobes")
 	}
+}
+
+func TestUnixKprobes(t *testing.T) {
+	if noTrampolines, _ := strconv.ParseBool(os.Getenv("SHAWK_TEST_NO_TRAMPOLINES")); noTrampolines {
+		t.Skip("the Unix tests already exercise the kprobes on this kernel")
+	}
+	forceUnixKprobes = true
+	t.Cleanup(func() { forceUnixKprobes = false })
+	t.Run("Connections", TestUnixConnections)
+	t.Run("Failures", TestUnixFailures)
+	t.Run("Adopted", TestUnixAdopted)
+	t.Run("OpenUnderChurn", TestUnixOpenUnderChurn)
 }
 
 // findUnixFlow returns the statistics of the flows of Unix sockets to the
@@ -179,6 +229,52 @@ func TestUnixConnections(t *testing.T) {
 				t.Errorf("third interval: flow = %+v after the connection closed", f)
 			}
 		})
+	}
+}
+
+// TestUnixListenerInOtherNetNS checks that the clients of an abstract name
+// in a network namespace request the owner scan that finds its listener
+// there, although the scan before found a listener of the same name in
+// another namespace (#258).
+func TestUnixListenerInOtherNetNS(t *testing.T) {
+	ln := echoServer(t, "unix", fmt.Sprintf("@shawk-test-netns-%d", os.Getpid()))
+	name := ln.Addr().String()
+	tr := newTestTracer(t)
+	requireUnix(t, tr)
+	// Any owner scan that the start requested runs before the listener of
+	// the other namespace opens.
+	if _, err := tr.Collect(); err != nil {
+		t.Fatal(err)
+	}
+	run, inode := newNetNS(t)
+	run(func() {
+		echoServer(t, "unix", name)
+		c, err := net.Dial("unix", name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		roundTrip(t, c, 100)
+	})
+	time.Sleep(100 * time.Millisecond)
+
+	snap, err := tr.Collect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f := findUnixFlow(snap.Flows, name); f == nil || f.NetNS != inode || f.Conns != 1 {
+		t.Fatalf("flow to %s = %+v, want one connection in network namespace %d", name, f, inode)
+	}
+	snap, err = tr.Collect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, netns := range []uint32{tr.netns, inode} {
+		if !slices.ContainsFunc(snap.Listeners, func(l Listener) bool {
+			return l.Proto == ProtoUnix && l.Path == name && l.NetNS == netns && l.PID == uint32(os.Getpid())
+		}) {
+			t.Errorf("no listener of %s in network namespace %d in %+v", name, netns, snap.Listeners)
+		}
 	}
 }
 

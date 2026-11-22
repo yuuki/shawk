@@ -2,6 +2,7 @@
 package cli
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -148,6 +149,8 @@ func runAgent(ctx context.Context, args []string, _, stderr io.Writer) error {
 			"learn the translations of addresses the host makes (DNAT, SNAT, IPVS) from conntrack, so that dependencies through them are matched")
 		jobUsers = fs.Bool("job-users", false,
 			"send the user ids of the processes of Slurm jobs (process.user.id), which PostgreSQL keeps with job_users of the connector; for administrators only")
+		classify = fs.Bool("classify-protocols", false,
+			"classify the wire protocol of new TCP connections (TLS version, HTTP, SSH, PostgreSQL, ...) from the first payload each side sends, kept in PostgreSQL; needs BPF trampolines, and adds a hook to every TCP send (design §3.9)")
 		logLevel = fs.String("log-level", "info", "log level: debug, info, warn or error")
 	)
 	if err := parseFlags(fs, args, stderr); err != nil {
@@ -194,6 +197,7 @@ func runAgent(ctx context.Context, args []string, _, stderr io.Writer) error {
 		BPFStats:            *bpfStats,
 		LearnTranslations:   *learn,
 		JobUsers:            *jobUsers,
+		ClassifyProtocols:   *classify,
 		Logger:              logger,
 	}
 	if err := cfg.Validate(); err != nil {
@@ -216,6 +220,8 @@ func runFlows(ctx context.Context, args []string, w, stderr io.Writer) error {
 		count    = fs.Int("count", 0, "number of intervals to show; 0 means forever")
 		netns    = fs.String("netns", "all", `network namespaces to trace: "all", "self" or an inode number`)
 		asJSON   = fs.Bool("json", false, "output JSON lines")
+		classify = fs.Bool("classify-protocols", false,
+			"classify the wire protocol of new TCP connections from the first payload each side sends (column WIRE)")
 	)
 	if err := parseFlags(fs, args, stderr); err != nil {
 		return err
@@ -230,16 +236,19 @@ func runFlows(ctx context.Context, args []string, w, stderr io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("%w: %w", errUsage, err)
 	}
-	tr, err := tracer.New(tracer.Options{NetNS: ns, OwnerScanInterval: *interval})
+	tr, err := tracer.New(tracer.Options{NetNS: ns, OwnerScanInterval: *interval, ClassifyProtocols: *classify})
 	if err != nil {
 		return err
 	}
 	defer tr.Close()
+	if *classify && !tr.ProtocolsEnabled() {
+		fmt.Fprintln(stderr, "warning: wire protocols are not classified: their program could not be loaded (it needs BPF trampolines, fentry)")
+	}
 	if !tr.UDPEnabled() {
 		fmt.Fprintln(stderr, "warning: UDP is not traced: its programs could not be loaded (they need BPF trampolines, fentry)")
 	}
 	if !tr.UnixEnabled() {
-		fmt.Fprintln(stderr, "warning: Unix sockets are not traced: their programs could not be loaded (they need BPF trampolines, fexit)")
+		fmt.Fprintln(stderr, "warning: Unix sockets are not traced: trampolines and fallback kprobes could not be attached")
 	}
 	ticker := time.NewTicker(*interval)
 	defer ticker.Stop()
@@ -259,60 +268,76 @@ func runFlows(ctx context.Context, args []string, w, stderr io.Writer) error {
 			}
 			continue
 		}
-		printFlows(w, snap.Flows)
+		printFlows(w, snap.Flows, *classify)
 	}
 	return nil
 }
 
-func printFlows(w io.Writer, flows []tracer.Flow) {
-	sort.Slice(flows, func(i, j int) bool {
-		a, b := flows[i], flows[j]
-		if a.Direction != b.Direction {
-			return a.Direction > b.Direction
-		}
-		if a.Proto != b.Proto {
-			return a.Proto < b.Proto
-		}
-		if a.Port != b.Port {
-			return a.Port < b.Port
-		}
-		if a.Path != b.Path {
-			return a.Path < b.Path
-		}
-		return a.RemoteAddr.Less(b.RemoteAddr)
-	})
+func printFlows(w io.Writer, flows []tracer.Flow, wire bool) {
+	sort.Slice(flows, func(i, j int) bool { return flowLess(&flows[i], &flows[j]) })
 	fmt.Fprintf(w, "--- %s\n", time.Now().Format(time.TimeOnly))
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "DIR\tPROTO\tLOCAL\tREMOTE\tPORT\tPROCESS\tPID\tCONNS\tFAILED\tHANDSHAKE\tSYN-RETRANS\tOPEN\tSENT\tRECV")
-	for _, f := range flows {
-		local, remote := f.LocalAddr.String(), f.RemoteAddr.String()
-		port := strconv.FormatUint(uint64(f.Port), 10)
-		if f.Proto == tracer.ProtoUnix {
-			// The name of the socket of the server, which has no address.
-			local, remote, port = "-", f.Path, "-"
-		}
-		arrow := "-->"
-		if f.Direction == tracer.DirIn {
-			arrow = "<--"
-		}
-		conns := strconv.FormatUint(f.Conns, 10)
-		if f.Proto == tracer.ProtoUDP {
-			conns = fmt.Sprintf("%dmsg", f.MsgsSent+f.MsgsRecv)
-		}
-		// Only active opens of TCP have handshakes, and they and the
-		// connects of Unix sockets failures; Unix sockets count no bytes.
-		failed, handshake, synRetrans := "-", "-", "-"
-		sent, recv := humanBytes(f.BytesSent), humanBytes(f.BytesRecv)
-		switch {
-		case f.Proto == tracer.ProtoTCP && f.Direction == tracer.DirOut:
-			failed, handshake, synRetrans = failures(&f.FlowStats), meanHandshake(&f.FlowStats), strconv.FormatUint(f.SynRetrans, 10)
-		case f.Proto == tracer.ProtoUnix:
-			failed, sent, recv = failures(&f.FlowStats), "-", "-"
-		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\t%d\t%s\t%s\n", arrow, f.Proto, local, remote, port, f.Comm,
-			f.PID, conns, failed, handshake, synRetrans, f.OpenConns, sent, recv)
+	header := "DIR\tPROTO\tLOCAL\tREMOTE\tPORT\tPROCESS\tPID\tCONNS\tFAILED\tHANDSHAKE\tSYN-RETRANS\tOPEN\tSENT\tRECV"
+	if wire {
+		header += "\tWIRE"
+	}
+	fmt.Fprintln(tw, header)
+	for i := range flows {
+		printFlow(tw, &flows[i], wire)
 	}
 	tw.Flush()
+}
+
+// flowLess orders the flows of the table: the incoming ones first, then by
+// transport, port, name of the Unix socket and remote address.
+func flowLess(a, b *tracer.Flow) bool {
+	return cmp.Or(
+		cmp.Compare(b.Direction, a.Direction),
+		cmp.Compare(a.Proto, b.Proto),
+		cmp.Compare(a.Port, b.Port),
+		strings.Compare(a.Path, b.Path),
+		a.RemoteAddr.Compare(b.RemoteAddr),
+	) < 0
+}
+
+// printFlow writes the row of a flow, with its wire protocols if wire.
+func printFlow(w io.Writer, f *tracer.Flow, wire bool) {
+	local, remote := f.LocalAddr.String(), f.RemoteAddr.String()
+	port := strconv.FormatUint(uint64(f.Port), 10)
+	if f.Proto == tracer.ProtoUnix {
+		// The name of the socket of the server, which has no address.
+		local, remote, port = "-", f.Path, "-"
+	}
+	arrow := "-->"
+	if f.Direction == tracer.DirIn {
+		arrow = "<--"
+	}
+	conns := strconv.FormatUint(f.Conns, 10)
+	if f.Proto == tracer.ProtoUDP {
+		conns = fmt.Sprintf("%dmsg", f.MsgsSent+f.MsgsRecv)
+	}
+	// Only active opens of TCP have handshakes, and they and the
+	// connects of Unix sockets failures; Unix sockets count no bytes.
+	failed, handshake, synRetrans := "-", "-", "-"
+	sent, recv := humanBytes(f.BytesSent), humanBytes(f.BytesRecv)
+	switch {
+	case f.Proto == tracer.ProtoTCP && f.Direction == tracer.DirOut:
+		failed, handshake, synRetrans = failures(&f.FlowStats), meanHandshake(&f.FlowStats), strconv.FormatUint(f.SynRetrans, 10)
+	case f.Proto == tracer.ProtoUnix:
+		failed, sent, recv = failures(&f.FlowStats), "-", "-"
+	}
+	fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\t%d\t%s\t%s", arrow, f.Proto, local, remote, port, f.Comm,
+		f.PID, conns, failed, handshake, synRetrans, f.OpenConns, sent, recv)
+	if wire {
+		// The protocols of the connections whose first payload was
+		// sent in the interval.
+		protocols := f.Protocols.String()
+		if protocols == "" {
+			protocols = "-"
+		}
+		fmt.Fprintf(w, "\t%s", protocols)
+	}
+	fmt.Fprintln(w)
 }
 
 // failures formats the failed active opens of a flow with their reasons,

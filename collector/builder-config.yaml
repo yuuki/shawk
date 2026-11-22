@@ -1,7 +1,7 @@
 # Manifest of the OpenTelemetry Collector Builder (ocb) for a collector with
 # the shawk connector. Build it with
 #
-#   go run go.opentelemetry.io/collector/cmd/builder@v0.164.0 --config builder-config.yaml
+#   go run go.opentelemetry.io/collector/cmd/builder@v0.165.0 --config builder-config.yaml
 #
 # or `make collector` at the top of the repository. The versions of the
 # components must match the collector libraries in go.mod.
@@ -13,16 +13,16 @@ dist:
   version: dev
 
 receivers:
-  - gomod: go.opentelemetry.io/collector/receiver/otlpreceiver v0.164.0
+  - gomod: go.opentelemetry.io/collector/receiver/otlpreceiver v0.165.0
 
 processors:
-  - gomod: go.opentelemetry.io/collector/processor/batchprocessor v0.164.0
-  - gomod: go.opentelemetry.io/collector/processor/memorylimiterprocessor v0.164.0
+  - gomod: go.opentelemetry.io/collector/processor/batchprocessor v0.165.0
+  - gomod: go.opentelemetry.io/collector/processor/memorylimiterprocessor v0.165.0
 
 exporters:
-  - gomod: go.opentelemetry.io/collector/exporter/otlpexporter v0.164.0
-  - gomod: go.opentelemetry.io/collector/exporter/otlphttpexporter v0.164.0
-  - gomod: go.opentelemetry.io/collector/exporter/debugexporter v0.164.0
+  - gomod: go.opentelemetry.io/collector/exporter/otlpexporter v0.165.0
+  - gomod: go.opentelemetry.io/collector/exporter/otlphttpexporter v0.165.0
+  - gomod: go.opentelemetry.io/collector/exporter/debugexporter v0.165.0
 
 connectors:
   - gomod: github.com/yuuki/shawk/collector v0.0.0
@@ -30,5 +30,5 @@ connectors:
     path: ./
 
 providers:
-  - gomod: go.opentelemetry.io/collector/confmap/provider/envprovider v1.70.0
-  - gomod: go.opentelemetry.io/collector/confmap/provider/fileprovider v1.70.0
+  - gomod: go.opentelemetry.io/collector/confmap/provider/envprovider v1.71.0
+  - gomod: go.opentelemetry.io/collector/confmap/provider/fileprovider v1.71.0

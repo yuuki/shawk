@@ -268,6 +268,45 @@ func TestMaxPendingRows(t *testing.T) {
 	}
 }
 
+// TestMaxSessions: a host whose agent starts segments faster than they are
+// written has at most maxSessions pending; those beyond are logged.
+func TestMaxSessions(t *testing.T) {
+	c, _, sink, now := testConnector(t, nil)
+	logs := observe(c)
+	for range maxSessions + 1 {
+		*now = now.Add(time.Second)
+		consume(t, c, sink, tAgent{host: "app-01", time: *now, segment: *now})
+	}
+	if n := len(c.changes.pending[hostKey("", "app-01")].sessions); n != maxSessions {
+		t.Errorf("%d sessions pending, want %d", n, maxSessions)
+	}
+	if got := logs.FilterMessageSnippet("sessions").All(); len(got) != 1 || got[0].ContextMap()["sessions"] != int64(1) {
+		t.Errorf("warnings = %v, want one about a session", got)
+	}
+}
+
+// TestFoldWarningsExpire: the warning of a host whose agent folded hosts
+// since it was logged is forgotten once it has not folded any for
+// foldWarnInterval, as of a host decommissioned: it is not held for good.
+func TestFoldWarningsExpire(t *testing.T) {
+	c, _, _, _ := testConnector(t, nil)
+	b := &hostBatch{key: hostKey("", "app-01"), hostname: "app-01"}
+	id := &edgeID{role: roleClient, proto: "tcp", local: addrOf("10.0.0.11"), peer: addrOf("10.0.0.10"), port: 5432}
+	p := peer{foldedBy: hostKey("", "db-01"), foldedByName: "db-01"}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.foldedAgentPeer(b, id, p, t0)                     // logged
+	c.foldedAgentPeer(b, id, p, t0.Add(15*time.Second)) // counted for the next warning
+	c.expireWarnings(t0.Add(15*time.Second + foldWarnInterval - time.Nanosecond))
+	if len(c.foldWarned) != 1 {
+		t.Errorf("warnings held within foldWarnInterval of the last fold: %v, want one", c.foldWarned)
+	}
+	c.expireWarnings(t0.Add(100 * 24 * time.Hour))
+	if len(c.foldWarned) != 0 {
+		t.Errorf("warnings held 100 days later: %v", c.foldWarned)
+	}
+}
+
 // TestAgentInputBounds: the strings of agents are cut to maxStringBytes, at
 // the start of a character, and their internal ranges to maxInternalPeers,
 // so that what is held of a series or a host has a bounded size.

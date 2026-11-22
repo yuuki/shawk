@@ -1,9 +1,11 @@
 package tracer
 
 import (
+	"encoding/binary"
 	"net"
 	"net/netip"
 	"os"
+	"slices"
 	"strconv"
 	"syscall"
 	"testing"
@@ -245,5 +247,119 @@ func TestUDPKprobes(t *testing.T) {
 		"ListenerKernelChosen":    TestListenerKernelChosen,
 	} {
 		t.Run(name, test)
+	}
+}
+
+// addVXLAN creates a VXLAN device on port in the network namespace of the
+// thread and brings it up: it opens a UDP socket of the kernel bound to the
+// port, which has no file. SHAWK_TEST_NO_VXLAN=1 declares a kernel without
+// VXLAN, as those of the virtual machines of test/vm, whose initramfs has
+// no module of it: the test is then skipped even in strict mode.
+func addVXLAN(t *testing.T, name string, port uint16) {
+	t.Helper()
+	ifinfo := make([]byte, unix.SizeofIfInfomsg) // AF_UNSPEC, no flags
+	data := slices.Concat(rtAttr(unix.IFLA_VXLAN_ID, binary.NativeEndian.AppendUint32(nil, 42)),
+		rtAttr(unix.IFLA_VXLAN_PORT, binary.BigEndian.AppendUint16(nil, port)))
+	linkInfo := slices.Concat(rtAttr(unix.IFLA_INFO_KIND, []byte("vxlan")),
+		rtAttr(unix.IFLA_INFO_DATA|unix.NLA_F_NESTED, data))
+	body := slices.Concat(ifinfo, rtAttr(unix.IFLA_IFNAME, cstr(name)), rtAttr(unix.IFLA_LINKINFO|unix.NLA_F_NESTED, linkInfo))
+	if err := rtnetlink(unix.RTM_NEWLINK, unix.NLM_F_CREATE|unix.NLM_F_EXCL, body); err != nil {
+		if no, _ := strconv.ParseBool(os.Getenv("SHAWK_TEST_NO_VXLAN")); no {
+			t.Skip("the kernel has no VXLAN, as SHAWK_TEST_NO_VXLAN declares")
+		}
+		skipUnavailable(t, "creating a VXLAN device: %v", err)
+	}
+	if err := linkUp(name); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// delLink deletes an interface of the network namespace of the thread.
+func delLink(t *testing.T, name string) {
+	t.Helper()
+	body := slices.Concat(make([]byte, unix.SizeofIfInfomsg), rtAttr(unix.IFLA_IFNAME, cstr(name)))
+	if err := rtnetlink(unix.RTM_DELLINK, 0, body); err != nil {
+		t.Fatalf("deleting %s: %v", name, err)
+	}
+}
+
+// udpKstates returns the entries of udp_kstates of a tracer: the struct
+// shawk_udp_kstate kept for each socket address.
+func udpKstates(t *testing.T, tr *Tracer) map[uint64][16]byte {
+	t.Helper()
+	var (
+		sk  uint64
+		val [16]byte
+	)
+	out := map[uint64][16]byte{}
+	it := tr.colls[0].Maps[bpfMapUdpKstates].Iterate()
+	for it.Next(&sk, &val) {
+		out[sk] = val
+	}
+	if err := it.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// TestUDPKernelSocketReuse checks that a UDP socket of the kernel does not
+// take the direction that udp_kstates keeps for a former socket at its
+// address (#256). Sockets of the kernel have no file, and the inode of the
+// file, 0 for both, matched: a socket that never received was listed as a
+// server, and its first datagram with kprobes took the former direction.
+// Rather than waiting for the allocator to reuse the memory of the former
+// socket, the test moves its entry to the address of the new one. VXLAN
+// devices hold such sockets.
+func TestUDPKernelSocketReuse(t *testing.T) {
+	requireRoot(t)
+	run, ns := newNetNS(t)
+	// A server that the tracer marks at its start, and a socket on a port of
+	// the ephemeral range, which is not listed until it receives first.
+	const serverPort = 4789
+	low, high := ephemeralPortRange()
+	clientPort := low + (high-low)/2
+	run(func() { addVXLAN(t, "vxs", serverPort) })
+	tr := startTracer(t, Options{NetNS: ns})
+	former := udpKstates(t, tr)
+	if len(former) != 1 {
+		t.Fatalf("udp_kstates holds %d sockets of the namespace, want the VXLAN socket: %v", len(former), former)
+	}
+	run(func() {
+		delLink(t, "vxs")
+		addVXLAN(t, "vxc", clientPort)
+	})
+	// Another tracer marks the new socket at its start, which tells its
+	// address, and checks that the walk sees it.
+	other := startTracer(t, Options{NetNS: ns})
+	listed := func(snap *Snapshot) bool {
+		for _, l := range snap.Listeners {
+			if l.Proto == ProtoUDP && l.NetNS == ns && l.Port == clientPort {
+				return true
+			}
+		}
+		return false
+	}
+	if !listed(collect(t, other)) {
+		t.Fatal("the VXLAN socket that existed at the start is not listed")
+	}
+	current := udpKstates(t, other)
+	if len(current) != 1 {
+		t.Fatalf("udp_kstates holds %d sockets of the namespace, want the VXLAN socket: %v", len(current), current)
+	}
+	kstates := tr.colls[0].Maps[bpfMapUdpKstates]
+	for sk := range former {
+		if err := kstates.Delete(sk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for sk := range current {
+		for _, val := range former {
+			if err := kstates.Put(sk, val); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if listed(collect(t, tr)) {
+		t.Error("the new socket of the kernel took the direction of the former one at its address: it is listed as a server")
 	}
 }

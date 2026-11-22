@@ -41,8 +41,14 @@ type AgentStatus struct {
 	UDPTraced    bool
 	// UnixTraced tells whether the connections of Unix stream sockets are
 	// traced.
-	UnixTraced   bool
-	FlowsDropped uint64 // cumulative
+	UnixTraced bool
+	// ProtocolsRequested tells that the classification of wire protocols
+	// was asked for (-classify-protocols), and ProtocolsClassified whether
+	// they are classified: shawk.agent.protocols.classified is sent only
+	// when asked for, so that 0 means that the program did not attach.
+	ProtocolsRequested  bool
+	ProtocolsClassified bool
+	FlowsDropped        uint64 // cumulative
 	// CgroupEventsDropped counts the cgroups created whose event the
 	// kernel dropped (cumulative).
 	CgroupEventsDropped uint64
@@ -199,11 +205,26 @@ var errorTypeSize = func() int {
 	return n
 }()
 
+// wireProtocolSize bounds the size of the attribute shawk.wire_protocol.
+var wireProtocolSize = func() int {
+	n := 0
+	for _, p := range WireProtocols {
+		n = max(n, attrsSize([]*commonpb.KeyValue{str(AttrWireProtocol, p)}))
+	}
+	return n
+}()
+
 // edgeSize bounds the encoded size of the data points of an edge.
 func edgeSize(k *EdgeKey, e *Edge, attrs []*commonpb.KeyValue) int {
 	a := attrsSize(attrs)
 	// Two gauges, first and last seen.
 	n := 2 * (a + pointOverhead)
+	// Two gauges per wire protocol seen.
+	for _, p := range protocolsOf(e) {
+		if !p.First.IsZero() {
+			n += 2 * (a + wireProtocolSize + pointOverhead)
+		}
+	}
 	// The reasons of failure that occurred.
 	reasons := 0
 	for _, t := range e.FailStart {
@@ -281,6 +302,29 @@ func (s *State) addEdge(b *builder, k *EdgeKey, attrs []*commonpb.KeyValue) {
 	}
 	b.gauge(MetricEdgeFirst, "s", e.FirstSeen.Unix(), attrs)
 	b.gauge(MetricEdgeLast, "s", e.LastSeen.Unix(), attrs)
+	addWireProtocols(b, e, attrs)
+}
+
+// protocolsOf returns when an edge saw each wire protocol, nil if it saw
+// none.
+func protocolsOf(e *Edge) []Seen {
+	if e.Protocols == nil {
+		return nil
+	}
+	return e.Protocols[:]
+}
+
+// addWireProtocols adds when the wire protocols seen on an edge were first
+// and last seen, for those seen.
+func addWireProtocols(b *builder, e *Edge, attrs []*commonpb.KeyValue) {
+	for i, p := range protocolsOf(e) {
+		if p.First.IsZero() {
+			continue
+		}
+		a := with(attrs, AttrWireProtocol, WireProtocols[i])
+		b.gauge(MetricEdgeWireFirst, "s", p.First.Unix(), a)
+		b.gauge(MetricEdgeWireLast, "s", p.Last.Unix(), a)
+	}
 }
 
 // addFailReasons adds the failures of a client edge by error.type, for the
@@ -324,6 +368,13 @@ func addAgent(b *builder, st *AgentStatus) {
 		unixTraced = 1
 	}
 	b.gauge(MetricAgentUnixTraced, "", unixTraced, nil)
+	if st.ProtocolsRequested {
+		classified := int64(0)
+		if st.ProtocolsClassified {
+			classified = 1
+		}
+		b.gauge(MetricAgentProtocolsClassified, "", classified, nil)
+	}
 	b.sum(MetricAgentFlowsDropped, "{update}", true, st.Started, st.FlowsDropped, nil)
 	b.sum(MetricAgentCgroupsDropped, "{event}", true, st.Started, st.CgroupEventsDropped, nil)
 	b.sum(MetricAgentReadsDropped, "{read}", true, st.Started, st.ContainerReadsDrops, nil)

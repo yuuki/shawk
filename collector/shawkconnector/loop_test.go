@@ -259,7 +259,7 @@ const loopInterval = 20 * time.Millisecond
 // changes, then reads the names of peers, then prunes and refreshes the
 // history of dependencies when they are due. The write and the read have
 // deadlines of their own, of a write interval each. What was seen before
-// the write started is written, however long it takes.
+// the write is written, however long it takes.
 func TestLoopInterval(t *testing.T) {
 	st := newLoopStore()
 	c, sink, clock := loopConnector(t, st, loopInterval, func(cfg *Config) { cfg.Retention = 24 * time.Hour })
@@ -289,14 +289,11 @@ func TestLoopInterval(t *testing.T) {
 		peers.left > loopInterval {
 		t.Errorf("deadlines: write %+v, peers %+v; want their own, within %v", write, peers, loopInterval)
 	}
-	c.mu.Lock()
-	written := c.written
-	c.mu.Unlock()
 	st.mu.Lock()
-	writes := len(st.writes)
+	writes := st.writes
 	st.mu.Unlock()
-	if writes != 1 || !written.Equal(at) {
-		t.Errorf("%d writes, written as of %v; want 1, as of %v", writes, written, at)
+	if len(writes) != 1 || writes[0].key != hostKey("", "app-01") || len(writes[0].edges) != 1 {
+		t.Errorf("writes %v; want one, of the edge of app-01", writes)
 	}
 
 	// The names of peers are read again every interval.
@@ -314,28 +311,23 @@ func TestLoopInterval(t *testing.T) {
 }
 
 // TestLoopWriteFailure: after a write that fails, the pending changes are
-// bounded by max_pending_rows, and what was seen is not taken for written.
-// After one that succeeds, what was seen before it started is, before the
-// names of peers are read: with peer_hosts, the holders of addresses seen
-// before are forgotten once read back.
+// kept, and with peer_hosts the holders of addresses seen in them; beyond
+// max_pending_rows, both are dropped. After a write that succeeds, the
+// holders written are forgotten once read back with the names of peers.
 func TestLoopWriteFailure(t *testing.T) {
 	st := newLoopStore()
-	c, sink, clock := loopConnector(t, st, loopInterval, func(cfg *Config) {
-		cfg.PeerHosts = true
-		cfg.MaxPendingRows = 1
-	})
-	st.wait(t) // written as of t0, with nothing pending
-	check := func(step string, written time.Time, held int) {
+	c, sink, clock := loopConnector(t, st, loopInterval, func(cfg *Config) { cfg.PeerHosts = true })
+	st.wait(t)
+	check := func(step string, pending bool, held int) {
 		t.Helper()
 		c.mu.Lock()
-		gotPending, gotWritten := c.changes.pendingSize(), c.written
+		gotPending := c.changes.pendingSize() > 0
 		c.mu.Unlock()
 		c.resolver.mu.RLock()
 		gotHeld := len(c.resolver.localHeld)
 		c.resolver.mu.RUnlock()
-		if gotPending != 0 || !gotWritten.Equal(written) || gotHeld != held {
-			t.Errorf("%s: %d rows pending, written as of %v, %d addresses held; want 0, %v, %d",
-				step, gotPending, gotWritten, gotHeld, written, held)
+		if gotPending != pending || gotHeld != held {
+			t.Errorf("%s: rows pending %v, %d addresses held; want %v, %d", step, gotPending, gotHeld, pending, held)
 		}
 	}
 	at := func(d time.Duration) time.Time { return t0.Add(d * time.Second) }
@@ -347,25 +339,32 @@ func TestLoopWriteFailure(t *testing.T) {
 	consume(t, c, sink, loopAgent(at(1)))
 	clock.set(at(2))
 	st.step(t)
-	check("after a failure", t0, 1)
+	check("after a failure", true, 1)
+
+	// The loop waits for the test: it reads the bound after the next step.
+	c.cfg.MaxPendingRows = 1
+	clock.set(at(3))
+	st.step(t)
+	check("beyond max_pending_rows", false, 0)
 
 	st.mu.Lock()
 	st.fail = false
 	st.mu.Unlock()
-	clock.set(at(3))
-	consume(t, c, sink, loopAgent(at(3)))
 	clock.set(at(4))
-	st.step(t)
-	check("after a write", at(4), 1)
+	consume(t, c, sink, loopAgent(at(4)))
 	clock.set(at(5))
 	st.step(t)
-	check("read back", at(5), 0)
+	check("after a write", false, 1)
+	clock.set(at(6))
+	st.step(t)
+	check("read back", false, 0)
 }
 
 // TestLoopExpiry: every write interval, the loop forgets what expired: the
 // state of the hosts not seen for the idle TTL, the agents not seen within
 // the alive window, and the warnings logged at least foldWarnInterval
-// before, except those of hosts whose agents folded hosts since.
+// before, except those of hosts whose agents folded hosts since and within
+// foldWarnInterval.
 func TestLoopExpiry(t *testing.T) {
 	st := newLoopStore()
 	c, sink, clock := loopConnector(t, st, loopInterval, nil)
@@ -391,9 +390,13 @@ func TestLoopExpiry(t *testing.T) {
 	expired := t0.Add(aliveWindow)
 	logged := expired.Add(-foldWarnInterval)
 	c.mu.Lock()
-	c.foldWarned[foldWarnKey{host: "logged"}] = &foldWarning{logged: logged, hosts: map[string]bool{}}
-	c.foldWarned[foldWarnKey{host: "recent"}] = &foldWarning{logged: logged.Add(time.Nanosecond), hosts: map[string]bool{}}
+	c.foldWarned[foldWarnKey{host: "logged"}] = &foldWarning{logged: logged, seen: logged, hosts: map[string]bool{}}
+	c.foldWarned[foldWarnKey{host: "recent"}] = &foldWarning{logged: logged.Add(time.Nanosecond),
+		seen: logged.Add(time.Nanosecond), hosts: map[string]bool{}}
 	c.foldWarned[foldWarnKey{host: "folding", servers: true}] = &foldWarning{logged: logged.Add(-time.Hour),
+		seen: logged.Add(time.Nanosecond), hosts: map[string]bool{"app-02": true}}
+	// It folded a host after it was logged, and none since.
+	c.foldWarned[foldWarnKey{host: "stopped"}] = &foldWarning{logged: logged.Add(-time.Hour), seen: logged,
 		hosts: map[string]bool{"app-02": true}}
 	c.cidrWarned["logged"], c.cidrWarned["recent"] = logged, logged.Add(time.Nanosecond)
 	c.inventoryWarned["logged"], c.inventoryWarned["recent"] = logged, logged.Add(time.Nanosecond)

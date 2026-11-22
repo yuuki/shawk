@@ -387,7 +387,16 @@ groups:
           severity: info
         annotations:
           summary: "shawk agent on {{ $labels.host_name }} does not trace Unix sockets"
-          description: "The kernel lacks BPF trampolines (fentry), or the programs on Unix sockets did not attach; dependencies of the host on its Unix sockets are not observed."
+          description: "Neither the BPF trampolines nor the fallback kprobes for Unix sockets attached; dependencies of the host on its Unix sockets are not observed."
+
+      - alert: ShawkProtocolsNotClassified
+        expr: shawk_agent_protocols_classified == 0
+        for: 1h
+        labels:
+          severity: info
+        annotations:
+          summary: "shawk agent on {{ $labels.host_name }} does not classify wire protocols"
+          description: "The agent was asked to classify the wire protocols of TCP connections (-classify-protocols), but the kernel lacks BPF trampolines (fentry) or the program did not attach; the protocols of its connections are not recorded."
 
       - alert: ShawkExportFailures
         expr: increase(shawk_agent_export_failures_total[15m]) > 3

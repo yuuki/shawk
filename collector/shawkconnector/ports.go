@@ -76,6 +76,10 @@ func parsePortRules(services []string, m map[string]DynamicPortsConfig) (*portRu
 			errs = append(errs, fmt.Errorf("port_agnostic_services: %q has spaces around it", s))
 			continue
 		}
+		if !pgText(s) {
+			errs = append(errs, fmt.Errorf("port_agnostic_services: %q is not UTF-8 without NUL", s))
+			continue
+		}
 		if !slices.Contains(r.services, s) {
 			r.services = append(r.services, s)
 		}
@@ -104,6 +108,9 @@ func parseDynamicPorts(name string, c DynamicPortsConfig) (dynamicPorts, error) 
 	}
 	if strings.TrimSpace(name) == "" {
 		return dynamicPorts{}, errors.New("dynamic_ports: a range has no name")
+	}
+	if !pgText(name) {
+		return dynamicPorts{}, fmt.Errorf("dynamic_ports: %q: a name must be UTF-8 without NUL", name)
 	}
 	switch c.Transport {
 	case "":

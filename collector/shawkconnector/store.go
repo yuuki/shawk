@@ -185,6 +185,9 @@ ON CONFLICT (host_id, unit, comm, service_name, (coalesce(user_id, -1))) DO UPDA
 	if len(h.edges) > 0 {
 		queueEdges(b, h)
 	}
+	if len(h.wire) > 0 {
+		queueWire(b, h)
+	}
 	if len(h.listeners) > 0 {
 		queueListeners(b, h)
 		queueUnixListeners(b, h)
@@ -262,65 +265,50 @@ ON CONFLICT (host_id, path, netns, process_id) DO UPDATE SET
 	}
 }
 
-// queueSessions writes the sessions of a host, and the periods in which its
-// agent dropped flows.
-//
-// The dropped flows are a counter of the run of the agent, which every
-// session of the run carries with the start of its counters, the same for
-// all of them: the sessions of one run written by several connectors, or
-// by one connector before and after a restart, or after a step of the clock
-// of the agent, have different starts. A run is therefore compared with
-// what PostgreSQL holds for the same run, whichever its sessions: drops
-// beyond the most it counted are recorded as a period from its latest
-// heartbeat (or the start of the session, if later, as after failed
-// requests) to the new heartbeat. A heartbeat written by another connector
-// may be ahead by the clock of that connector; the two ends are then
-// ordered rather than the drops skipped. The drops of a run not seen before
-// are recorded from the start of the session. Without the start of the
-// counters, as from an agent that does not send it, the session itself
-// stands for the run. A period that meets the latest period of the host
-// extends it. Times are by the clock of the connector, like heartbeats.
-//
-// The upsert of the host before has locked its row, so that the writes of a
-// host wait for each other and each compares with the one before.
-func queueSessions(b *pgx.Batch, h *hostChanges) {
-	var starts, beats []time.Time
-	var runs []*time.Time // nil if unknown
-	var udp []bool
-	var unixTraced []*bool // nil if the agent does not tell
-	var scopes, folds []string
-	var internals []*string
-	var dropped []int64
-	var skews []float64
-	var anyDropped bool
-	for t, s := range h.sessions {
-		starts = append(starts, t)
-		beats = append(beats, s.lastHeartbeat)
-		udp = append(udp, s.udpTraced)
-		unixTraced = append(unixTraced, s.unixTraced)
-		scopes = append(scopes, s.netnsScope)
-		dropped = append(dropped, s.dropped)
-		skews = append(skews, s.clockSkew.Seconds())
-		var run *time.Time
-		if !s.countersStarted.IsZero() {
-			run = &s.countersStarted
-		}
-		runs = append(runs, run)
-		folds = append(folds, s.peerFold)
-		var internal *string
-		if s.peerInternal != nil {
-			ps := make([]string, len(s.peerInternal))
-			for i, p := range s.peerInternal {
-				ps[i] = p.String()
-			}
-			v := strings.Join(ps, ",")
-			internal = &v
-		}
-		internals = append(internals, internal)
-		anyDropped = anyDropped || s.dropped > 0
+// queueWire writes the wire protocols of the TCP edges of a host, after
+// their edges, which the batch holds or PostgreSQL has: a protocol whose
+// edge is in neither is left out, as the edge was.
+func queueWire(b *pgx.Batch, h *hostChanges) {
+	var units, comms, services, users, roles, locals, peers, protocols []string
+	var ports []int32
+	var netns []int64
+	var firsts, lasts []time.Time
+	for k, s := range h.wire {
+		e := k.edge
+		units = append(units, e.unit)
+		comms = append(comms, e.comm)
+		services = append(services, e.service)
+		users = append(users, e.user)
+		roles = append(roles, e.role)
+		locals = append(locals, e.local.String())
+		peers = append(peers, peerString(e.peer, e.folded))
+		ports = append(ports, int32(e.port))
+		netns = append(netns, int64(e.netns))
+		protocols = append(protocols, k.protocol)
+		firsts = append(firsts, s.first)
+		lasts = append(lasts, s.last)
 	}
-	if anyDropped {
-		b.Queue(`
+	b.Queue(`
+INSERT INTO shawk.edge_protocols AS w (edge_id, protocol, first_seen, last_seen)
+SELECT e.id, u.protocol, u.f, u.l
+FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::text[],
+            $9::integer[], $10::bigint[], $11::text[], $12::timestamptz[], $13::timestamptz[])
+  AS u(unit, comm, service, uid, role, local, peer, port, netns, protocol, f, l)
+JOIN shawk.processes p ON p.host_id = $1 AND p.unit = u.unit AND p.comm = u.comm AND p.service_name = u.service
+  AND coalesce(p.user_id, -1) = coalesce(nullif(u.uid, '')::bigint, -1)
+JOIN shawk.edges e ON e.host_id = $1 AND e.role = u.role AND e.proto = 'tcp' AND e.local_addr = u.local::inet
+  AND e.remote_addr = u.peer::inet AND e.port = u.port AND e.netns = u.netns AND e.process_id = p.id
+ON CONFLICT (edge_id, protocol) DO UPDATE SET
+  first_seen = least(w.first_seen, excluded.first_seen),
+  last_seen  = greatest(w.last_seen, excluded.last_seen)`,
+		h.key, units, comms, services, users, roles, locals, peers, ports, netns, protocols, firsts, lasts)
+}
+
+// sessionDropsSQL records the periods in which the agent of a host dropped
+// flows, as queueSessions tells: its arguments are the host and the
+// starts, heartbeats, dropped flows, clock skews (in seconds) and starts
+// of the counters of its sessions.
+const sessionDropsSQL = `
 WITH u AS (
   -- One row per run: the sessions of a run in one batch count the same drops.
   SELECT DISTINCT ON (coalesce(u.run, u.started), u.run IS NULL) u.*
@@ -335,10 +323,12 @@ d AS (
          base.dropped AS base_dropped, base.beat AS base_beat
   FROM u
   CROSS JOIN LATERAL (
+    -- The session itself without the start of the counters, else the
+    -- sessions of the run, each read through an index.
     SELECT max(s.dropped_flows) AS dropped, max(s.last_heartbeat) AS beat
     FROM shawk.agent_sessions s
     WHERE s.host_id = $1
-      AND CASE WHEN u.run IS NULL THEN s.started_at = u.started ELSE s.counters_started = u.run END
+      AND (u.run IS NULL AND s.started_at = u.started OR s.counters_started = u.run)
   ) base
 ),
 e AS (
@@ -370,29 +360,91 @@ SELECT $1, p.started, p.since, p.until, p.n FROM p
 WHERE NOT EXISTS (SELECT FROM latest WHERE p.since <= latest.period_end AND p.until >= latest.period_start)
 ON CONFLICT (host_id, started_at, period_start) DO UPDATE SET
   period_end    = greatest(o.period_end, excluded.period_end),
-  dropped_flows = o.dropped_flows + excluded.dropped_flows`,
-			h.key, starts, beats, dropped, skews, runs)
+  dropped_flows = o.dropped_flows + excluded.dropped_flows`
+
+// queueSessions writes the sessions of a host, and the periods in which its
+// agent dropped flows.
+//
+// The dropped flows are a counter of the run of the agent, which every
+// session of the run carries with the start of its counters, the same for
+// all of them: the sessions of one run written by several connectors, or
+// by one connector before and after a restart, or after a step of the clock
+// of the agent, have different starts. A run is therefore compared with
+// what PostgreSQL holds for the same run, whichever its sessions: drops
+// beyond the most it counted are recorded as a period from its latest
+// heartbeat (or the start of the session, if later, as after failed
+// requests) to the new heartbeat. A heartbeat written by another connector
+// may be ahead by the clock of that connector; the two ends are then
+// ordered rather than the drops skipped. The drops of a run not seen before
+// are recorded from the start of the session. Without the start of the
+// counters, as from an agent that does not send it, the session itself
+// stands for the run. A period that meets the latest period of the host
+// extends it. Times are by the clock of the connector, like heartbeats.
+//
+// The upsert of the host before has locked its row, so that the writes of a
+// host wait for each other and each compares with the one before.
+func queueSessions(b *pgx.Batch, h *hostChanges) {
+	var starts, beats []time.Time
+	var runs []*time.Time // nil if unknown
+	var udp []bool
+	var unixTraced, classified []*bool // nil if the agent does not tell
+	var scopes, folds []string
+	var internals []*string
+	var dropped []int64
+	var skews []float64
+	var anyDropped bool
+	for t, s := range h.sessions {
+		starts = append(starts, t)
+		beats = append(beats, s.lastHeartbeat)
+		udp = append(udp, s.udpTraced)
+		unixTraced = append(unixTraced, s.unixTraced)
+		classified = append(classified, s.protocolsClassified)
+		scopes = append(scopes, s.netnsScope)
+		dropped = append(dropped, s.dropped)
+		skews = append(skews, s.clockSkew.Seconds())
+		var run *time.Time
+		if !s.countersStarted.IsZero() {
+			run = &s.countersStarted
+		}
+		runs = append(runs, run)
+		folds = append(folds, s.peerFold)
+		var internal *string
+		if s.peerInternal != nil {
+			ps := make([]string, len(s.peerInternal))
+			for i, p := range s.peerInternal {
+				ps[i] = p.String()
+			}
+			v := strings.Join(ps, ",")
+			internal = &v
+		}
+		internals = append(internals, internal)
+		anyDropped = anyDropped || s.dropped > 0
+	}
+	if anyDropped {
+		b.Queue(sessionDropsSQL, h.key, starts, beats, dropped, skews, runs)
 	}
 	// What the agent traces and folds is kept as of the latest heartbeat.
 	b.Queue(`
 INSERT INTO shawk.agent_sessions AS s (host_id, started_at, last_heartbeat, udp_traced, netns_scope, dropped_flows, clock_skew,
-                                       peer_fold, peer_internal, counters_started, unix_traced)
+                                       peer_fold, peer_internal, counters_started, unix_traced, protocols_classified)
 SELECT $1, u.started, u.beat, u.udp, u.scope, u.dropped, make_interval(secs => u.skew),
-       coalesce(nullif(u.fold, ''), 'none'), string_to_array(u.internal, ',')::cidr[], u.run, u.unix
+       coalesce(nullif(u.fold, ''), 'none'), string_to_array(u.internal, ',')::cidr[], u.run, u.unix, u.classified
 FROM unnest($2::timestamptz[], $3::timestamptz[], $4::boolean[], $5::text[], $6::bigint[], $7::float8[],
-            $8::text[], $9::text[], $10::timestamptz[], $11::boolean[])
-  AS u(started, beat, udp, scope, dropped, skew, fold, internal, run, unix)
+            $8::text[], $9::text[], $10::timestamptz[], $11::boolean[], $12::boolean[])
+  AS u(started, beat, udp, scope, dropped, skew, fold, internal, run, unix, classified)
 ON CONFLICT (host_id, started_at) DO UPDATE SET
   clock_skew       = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat THEN excluded.clock_skew ELSE s.clock_skew END,
   udp_traced       = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat THEN excluded.udp_traced ELSE s.udp_traced END,
   unix_traced      = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat THEN excluded.unix_traced ELSE s.unix_traced END,
+  protocols_classified = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat THEN excluded.protocols_classified
+                         ELSE s.protocols_classified END,
   netns_scope      = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat THEN excluded.netns_scope ELSE s.netns_scope END,
   peer_fold        = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat THEN excluded.peer_fold ELSE s.peer_fold END,
   peer_internal    = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat THEN excluded.peer_internal ELSE s.peer_internal END,
   counters_started = coalesce(s.counters_started, excluded.counters_started),
   dropped_flows    = greatest(s.dropped_flows, excluded.dropped_flows),
   last_heartbeat   = greatest(s.last_heartbeat, excluded.last_heartbeat)`,
-		h.key, starts, beats, udp, scopes, dropped, skews, folds, internals, runs, unixTraced)
+		h.key, starts, beats, udp, scopes, dropped, skews, folds, internals, runs, unixTraced, classified)
 }
 
 // queueListeners writes the listeners of a host: a row per listener with
@@ -642,7 +694,8 @@ const configLock = 0x73686179 // "shay"
 // and the rules of ports in one transaction, keeping the rows that stay, so
 // that the views see either the old rows or the new ones. It runs in READ
 // COMMITTED, whatever the default of the database, so that the statements
-// after the lock see what a connector that held it before wrote.
+// after the locks see what a connector that held them before wrote. As the
+// other writes, it takes the lock of migrations shared first.
 func (s *pgStore) syncConfig(ctx context.Context, cidrs []namedPrefix, ts []translation, ports *portRules) error {
 	prefixes := make([]string, 0, len(cidrs))
 	cidrNames := make([]string, 0, len(cidrs))
@@ -674,6 +727,9 @@ func (s *pgStore) syncConfig(ctx context.Context, cidrs []namedPrefix, ts []tran
 		dto = append(dto, int32(r.to))
 	}
 	return pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.ReadCommitted}, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared($1)`, int64(migrationLock)); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, int64(configLock)); err != nil {
 			return err
 		}
@@ -763,6 +819,9 @@ const inventoryLock = 0x73686169 // "shai"
 
 func (s *pgStore) syncInventory(ctx context.Context, inv *inventory, readAt time.Time) error {
 	return pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.ReadCommitted}, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared($1)`, int64(migrationLock)); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, int64(inventoryLock)); err != nil {
 			return err
 		}
@@ -871,6 +930,29 @@ ORDER BY h.host`, func(rows pgx.Rows) error {
 // of node states and maintenance windows by several connectors.
 const nodeStatesLock = 0x7368617a // "shaz"
 
+// continueNodeStatesSQL continues the latest states of hosts read again
+// with the same flags and reason within node_state_max_age(), as
+// writeNodeStates tells: its arguments are the hosts, their states (flags
+// joined by +) and reasons, and the time they were read.
+const continueNodeStatesSQL = `
+WITH u AS (
+  SELECT * FROM unnest($1::text[], $2::text[], $3::text[]) AS u(hostname, state, reason)
+), latest AS (
+  -- The latest state of each host, read through the index rather than
+  -- every state of the host sorted.
+  SELECT l.* FROM u CROSS JOIN LATERAL (
+    SELECT s.hostname, s.first_seen, s.last_seen, s.state, s.reason
+    FROM shawk.node_states s
+    WHERE s.hostname = u.hostname
+    ORDER BY s.first_seen DESC LIMIT 1
+  ) l
+)
+UPDATE shawk.node_states s SET last_seen = $4::timestamptz
+FROM u JOIN latest l ON l.hostname = u.hostname
+WHERE s.hostname = l.hostname AND s.first_seen = l.first_seen
+  AND l.state = string_to_array(u.state, '+') AND l.reason = u.reason
+  AND l.last_seen < $4::timestamptz AND l.last_seen >= $4::timestamptz - shawk.node_state_max_age()`
+
 // writeNodeStates records the states of nodes read from Slurm at a time. A
 // host whose latest state has the same flags and reason, read again within
 // node_state_max_age(), continues it; otherwise a new period starts at the
@@ -893,21 +975,7 @@ func (s *pgStore) writeNodeStates(ctx context.Context, at time.Time, nodes []nod
 			return err
 		}
 		b := &pgx.Batch{}
-		b.Queue(`
-WITH u AS (
-  SELECT * FROM unnest($1::text[], $2::text[], $3::text[]) AS u(hostname, state, reason)
-), latest AS (
-  SELECT DISTINCT ON (s.hostname) s.hostname, s.first_seen, s.last_seen, s.state, s.reason
-  FROM shawk.node_states s
-  WHERE s.hostname = ANY ($1::text[])
-  ORDER BY s.hostname, s.first_seen DESC
-)
-UPDATE shawk.node_states s SET last_seen = $4::timestamptz
-FROM u JOIN latest l ON l.hostname = u.hostname
-WHERE s.hostname = l.hostname AND s.first_seen = l.first_seen
-  AND l.state = string_to_array(u.state, '+') AND l.reason = u.reason
-  AND l.last_seen < $4::timestamptz AND l.last_seen >= $4::timestamptz - shawk.node_state_max_age()`,
-			hosts, states, reasons, at)
+		b.Queue(continueNodeStatesSQL, hosts, states, reasons, at)
 		b.Queue(`
 INSERT INTO shawk.node_states (hostname, first_seen, last_seen, state, reason)
 SELECT u.hostname, $4::timestamptz, $4::timestamptz, string_to_array(u.state, '+'), u.reason
@@ -975,9 +1043,18 @@ ON CONFLICT DO NOTHING`,
 	})
 }
 
+// refreshDependencies refreshes known_dependencies under the lock of
+// migrations, shared, as the writes: shawk.refresh_known_dependencies()
+// does not take it itself. It runs in READ COMMITTED, so that the refresh
+// reads the tables as a migration it waited for left them.
 func (s *pgStore) refreshDependencies(ctx context.Context) (int64, error) {
 	var n int64
-	err := s.pool.QueryRow(ctx, `SELECT shawk.refresh_known_dependencies()`).Scan(&n)
+	err := pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.ReadCommitted}, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared($1)`, int64(migrationLock)); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT shawk.refresh_known_dependencies()`).Scan(&n)
+	})
 	return n, err
 }
 
@@ -992,8 +1069,31 @@ FROM (SELECT now() - make_interval(secs => $1) AS c) t`,
 
 func (s *pgStore) peers(ctx context.Context, learnedTTL, formerWindow time.Duration) (peerRows, error) {
 	var out peerRows
-	// The endpoints name the peers of the outputs only, so the processes of
-	// Slurm jobs are named as Prometheus names them (process.peerName).
+	var err error
+	if out.endpoints, err = s.serviceEndpoints(ctx); err != nil {
+		return out, err
+	}
+	if out.clients, err = s.clientEndpoints(ctx); err != nil {
+		return out, err
+	}
+	if out.agents, err = s.agentAddrs(ctx); err != nil {
+		return out, err
+	}
+	if out.unix, err = s.unixEndpoints(ctx); err != nil {
+		return out, err
+	}
+	if out.learned, err = s.learnedTranslations(ctx, learnedTTL); err != nil || formerWindow == 0 {
+		return out, err
+	}
+	out.former, err = s.formerHolders(ctx, formerWindow)
+	return out, err
+}
+
+// serviceEndpoints reads the endpoints of services. The endpoints name the
+// peers of the outputs only, so the processes of Slurm jobs are named as
+// Prometheus names them (process.peerName).
+func (s *pgStore) serviceEndpoints(ctx context.Context) ([]endpointRow, error) {
+	var out []endpointRow
 	err := queryRows(ctx, s.pool, `SELECT host(addr), port, proto, host_id, service, last_seen, exact, slurm_job
 FROM shawk_v1.service_endpoints`,
 		func(rows pgx.Rows) error {
@@ -1009,15 +1109,18 @@ FROM shawk_v1.service_endpoints`,
 			}
 			if a, err := netip.ParseAddr(addr); err == nil {
 				e.key.addr, e.key.port = a.Unmap(), uint16(port)
-				out.endpoints = append(out.endpoints, e)
+				out = append(out, e)
 			}
 			return nil
 		})
-	if err != nil {
-		return out, err
-	}
-	// A folded server address, a network, is no server.
-	err = queryRows(ctx, s.pool, `SELECT host(client_addr), host(server_addr), port, proto, host_id, service, last_seen, slurm_job
+	return out, err
+}
+
+// clientEndpoints reads the client sides of connections, named like the
+// endpoints of services. A folded server address, a network, is no server.
+func (s *pgStore) clientEndpoints(ctx context.Context) ([]clientRow, error) {
+	var out []clientRow
+	err := queryRows(ctx, s.pool, `SELECT host(client_addr), host(server_addr), port, proto, host_id, service, last_seen, slurm_job
 FROM shawk_v1.client_endpoints
 WHERE masklen(server_addr) = CASE family(server_addr) WHEN 4 THEN 32 ELSE 128 END`,
 		func(rows pgx.Rows) error {
@@ -1036,14 +1139,18 @@ WHERE masklen(server_addr) = CASE family(server_addr) WHEN 4 THEN 32 ELSE 128 EN
 			if err1 == nil && err2 == nil {
 				c.key.client, c.key.server, c.key.port = ca.Unmap(), sa.Unmap(), uint16(port)
 				c.exact = true
-				out.clients = append(out.clients, c)
+				out = append(out, c)
 			}
 			return nil
 		})
-	if err != nil {
-		return out, err
-	}
-	err = queryRows(ctx, s.pool, `SELECT host(addr), host_id, last_seen, last_heartbeat, udp_traced, host,
+	return out, err
+}
+
+// agentAddrs reads the addresses of agents, with what each agent traces and
+// folds.
+func (s *pgStore) agentAddrs(ctx context.Context) ([]agentAddrRow, error) {
+	var out []agentAddrRow
+	err := queryRows(ctx, s.pool, `SELECT host(addr), host_id, last_seen, last_heartbeat, udp_traced, host,
   peer_fold, peer_internal::text[]
 FROM shawk_v1.agent_addrs`,
 		func(rows pgx.Rows) error {
@@ -1059,16 +1166,18 @@ FROM shawk_v1.agent_addrs`,
 			}
 			if a, err := netip.ParseAddr(addr); err == nil {
 				r.addr = a.Unmap()
-				out.agents = append(out.agents, r)
+				out = append(out, r)
 			}
 			return nil
 		})
-	if err != nil {
-		return out, err
-	}
-	// The services listening on Unix sockets, named as Prometheus names them
-	// like the endpoints above.
-	err = queryRows(ctx, s.pool, `SELECT host_id, path, netns, service, last_seen, slurm_job FROM shawk_v1.unix_endpoints`,
+	return out, err
+}
+
+// unixEndpoints reads the services listening on Unix sockets, named as
+// Prometheus names them like the endpoints of services.
+func (s *pgStore) unixEndpoints(ctx context.Context) ([]unixEndpointRow, error) {
+	var out []unixEndpointRow
+	err := queryRows(ctx, s.pool, `SELECT host_id, path, netns, service, last_seen, slurm_job FROM shawk_v1.unix_endpoints`,
 		func(rows pgx.Rows) error {
 			var u unixEndpointRow
 			var netns int64
@@ -1080,13 +1189,17 @@ FROM shawk_v1.agent_addrs`,
 				u.service = slurmJobService
 			}
 			u.netns = uint64(netns)
-			out.unix = append(out.unix, u)
+			out = append(out, u)
 			return nil
 		})
-	if err != nil {
-		return out, err
-	}
-	err = queryRows(ctx, s.pool, `SELECT host_id, proto, netns, host(client_addr), host(virtual_addr), virtual_port,
+	return out, err
+}
+
+// learnedTranslations reads the translations that agents learned and last
+// saw within ttl, by the clock of the database.
+func (s *pgStore) learnedTranslations(ctx context.Context, ttl time.Duration) ([]learnedRow, error) {
+	var out []learnedRow
+	err := queryRows(ctx, s.pool, `SELECT host_id, proto, netns, host(client_addr), host(virtual_addr), virtual_port,
   host(source_addr), host(backend_addr), backend_port, last_seen
 FROM shawk.learned_translations
 WHERE last_seen > now() - make_interval(secs => $1)`,
@@ -1109,13 +1222,9 @@ WHERE last_seen > now() - make_interval(secs => $1)`,
 			}
 			r.id.netns, r.id.vport, r.id.bport = uint64(netns), uint16(vport), uint16(bport)
 			r.id.client, r.id.virtual, r.id.source, r.id.backend = addrs[0], addrs[1], addrs[2], addrs[3]
-			out.learned = append(out.learned, r)
+			out = append(out, r)
 			return nil
-		}, learnedTTL.Seconds())
-	if err != nil || formerWindow == 0 {
-		return out, err
-	}
-	out.former, err = s.formerHolders(ctx, formerWindow)
+		}, ttl.Seconds())
 	return out, err
 }
 

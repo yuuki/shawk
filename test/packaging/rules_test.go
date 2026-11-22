@@ -48,6 +48,38 @@ func inline(expr string, records map[string]string) string {
 	return strings.TrimSpace(space.ReplaceAllString(expr, " "))
 }
 
+var (
+	ruleSelector = regexp.MustCompile(`(shawk:[a-z_:0-9]+)\{([^}]*)\}`)
+	metricOpen   = regexp.MustCompile(`(shawk_[a-z_]+)\{`)
+)
+
+// inlinePanel inlines the recording rules of the expression of a panel, as
+// inline does, with every value of the variables of its dashboard: the
+// matchers of variables (src=~"$src") are dropped, and the other matchers,
+// of labels that the rules pass on unchanged (network_transport), are
+// added to the selectors of the metrics in the expressions of the rules.
+func inlinePanel(t *testing.T, expr string, records map[string]string) string {
+	t.Helper()
+	expr = ruleSelector.ReplaceAllStringFunc(expr, func(s string) string {
+		m := ruleSelector.FindStringSubmatch(s)
+		e, ok := records[m[1]]
+		if !ok {
+			t.Fatalf("no recording rule %s", m[1])
+		}
+		var kept []string
+		for _, matcher := range strings.Split(m[2], ",") {
+			if matcher = strings.TrimSpace(matcher); !strings.Contains(matcher, `"$`) {
+				kept = append(kept, matcher)
+			}
+		}
+		if len(kept) > 0 {
+			e = metricOpen.ReplaceAllString(e, "${1}{"+strings.Join(kept, ", ")+", ")
+		}
+		return "(" + e + ")"
+	})
+	return inline(expr, nil)
+}
+
 // The series as Prometheus stores what the shawk connector sends: the app
 // on two hosts connects to postgres, whose host also runs an agent and also
 // serves an office PC without an agent.
@@ -338,6 +370,8 @@ load 1m
   shawk_agent_udp_traced{job="shawk-agent", host_name="app-03"} 0x30
   shawk_agent_unix_traced{job="shawk-agent", host_name="app-01"} 1x30
   shawk_agent_unix_traced{job="shawk-agent", host_name="app-03"} 0x30
+  shawk_agent_protocols_classified{job="shawk-agent", host_name="app-01"} 1x30
+  shawk_agent_protocols_classified{job="shawk-agent", host_name="app-03"} 0x30
   shawk_agent_export_failures_total{job="shawk-agent", host_name="app-01"} 0x30
   shawk_agent_export_failures_total{job="shawk-agent", host_name="app-03"} 0+1x30
   shawk_agent_cgroup_events_dropped_total{job="shawk-agent", host_name="app-01"} 0x30
@@ -350,6 +384,9 @@ eval instant at 20m ` + a("ShawkUDPNotTraced") + `
 
 eval instant at 20m ` + a("ShawkUnixNotTraced") + `
   shawk_agent_unix_traced{job="shawk-agent", host_name="app-03"} 0
+
+eval instant at 20m ` + a("ShawkProtocolsNotClassified") + `
+  shawk_agent_protocols_classified{job="shawk-agent", host_name="app-03"} 0
 
 # One failure a minute.
 eval instant at 20m ` + a("ShawkExportFailures") + `
@@ -432,7 +469,10 @@ eval instant at 23m ` + a("ShawkAgentDown") + `
 // attempt of the dependency details dashboard. Its denominator is the union
 // of the handshakes and the failures by reason, which the agents that send
 // the retransmissions send too: app-03 sends failures without handshakes,
-// and the dependency on redis-server has no failures.
+// and the dependency on redis-server has no failures. The processes of a
+// Slurm job connect to each other over TCP on ports of no rule
+// (port_agnostic_services, server_port 0), and over Unix sockets, whose
+// failures are not attempts of TCP.
 func TestSYNRetransmitRatio(t *testing.T) {
 	records, _ := loadRules(t)
 	d := loadJSON(t, grafana+"/dashboards/shawk-dependency.json")
@@ -446,11 +486,9 @@ func TestSYNRetransmitRatio(t *testing.T) {
 	if expr == "" {
 		t.Fatal("no panel of SYN retransmissions per attempt")
 	}
-	// All clients and servers: the recording rules are inlined, which takes
-	// no matchers.
-	expr = strings.ReplaceAll(expr, `{src=~"$src", dst=~"$dst"}`, "")
 	pg := `job="shop/app", shawk_role="client", service_peer_name="postgres", shawk_peer_agent="true", server_port="5432", network_transport="tcp"`
 	redis := `job="shop/app", instance="app-01", shawk_role="client", service_peer_name="redis-server", shawk_peer_agent="true", server_port="6379", network_transport="tcp"`
+	job := `job="slurm-job", instance="cn01", shawk_role="client", service_peer_name="slurm-job", shawk_peer_agent="true", server_port="0"`
 	script := `
 load 1m
   shawk_tcp_handshake_seconds_count{instance="app-01", ` + pg + `} 0+120x10
@@ -460,12 +498,16 @@ load 1m
   shawk_connection_failed_total{instance="app-03", ` + pg + `} 0+60x10
   shawk_tcp_handshake_seconds_count{` + redis + `} 0+60x10
   shawk_tcp_syn_retransmits_total{` + redis + `} 0+6x10
+  shawk_tcp_handshake_seconds_count{` + job + `, network_transport="tcp"} 0+60x10
+  shawk_tcp_syn_retransmits_total{` + job + `, network_transport="tcp"} 0+12x10
+  shawk_connection_failed_by_reason_total{` + job + `, network_transport="unix", error_type="refused"} 0+60x10
 
 # 0.5 SYNs/s over 2 handshakes/s and 0.5 failures/s of app-01; 0.1 SYNs/s
-# over 1 handshake/s.
-eval instant at 10m ` + inline(expr, records) + `
-  {src="shop/app", dst="postgres", server_port="5432"} 0.2
-  {src="shop/app", dst="redis-server", server_port="6379"} 0.1
+# over 1 handshake/s; 0.2 SYNs/s over 1 handshake/s over TCP.
+eval instant at 10m ` + inlinePanel(t, expr, records) + `
+  {src="shop/app", dst="postgres", server_port="5432", network_transport="tcp"} 0.2
+  {src="shop/app", dst="redis-server", server_port="6379", network_transport="tcp"} 0.1
+  {src="slurm-job", dst="slurm-job", server_port="0", network_transport="tcp"} 0.2
 `
 	promqltest.RunTest(t, script, promqltest.NewTestEngine(t, false, 0, promqltest.DefaultMaxSamplesPerQuery))
 }
@@ -486,15 +528,14 @@ func TestHostFailureRatio(t *testing.T) {
 	if expr == "" {
 		t.Fatal("no panel of the failure ratio by peer host")
 	}
-	expr = strings.ReplaceAll(expr, `{dst=~"$dst", src=~"$src", dst_host=~"$dst_host"}`, "")
 	script := hostSeries + `
 load 1m
   shawk_host_connection_failed_by_reason_total{job="slurmctld", instance="ctl-01", shawk_role="client", service_peer_name="slurmd", shawk_peer_agent="true", shawk_peer_host="node-01", server_port="6818", network_transport="tcp", error_type="refused"} 0+20x10
 
 # node-01: 1/3 failures/s over 1 connection/s; node-03: failures only.
-eval instant at 10m ` + inline(expr, records) + `
-  {src_host="ctl-01", src="slurmctld", dst_host="node-01", dst="slurmd", server_port="6818"} 0.25
-  {src_host="ctl-01", src="slurmctld", dst_host="node-03", dst="slurmd", server_port="6818"} 1
+eval instant at 10m ` + inlinePanel(t, expr, records) + `
+  {src_host="ctl-01", src="slurmctld", dst_host="node-01", dst="slurmd", server_port="6818", network_transport="tcp"} 0.25
+  {src_host="ctl-01", src="slurmctld", dst_host="node-03", dst="slurmd", server_port="6818", network_transport="tcp"} 1
 `
 	promqltest.RunTest(t, script, promqltest.NewTestEngine(t, false, 0, promqltest.DefaultMaxSamplesPerQuery))
 }

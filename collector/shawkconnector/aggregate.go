@@ -1,6 +1,8 @@
 package shawkconnector
 
 import (
+	"maps"
+	"math"
 	"net/netip"
 	"time"
 
@@ -107,6 +109,10 @@ type hostOutputs struct {
 	// interval, both by the clock of the agent. emitted is zero until the
 	// first interval of the host closes here, and after its clock went back.
 	latest, emitted time.Time
+	// seen is when the latest request of the host was received, by the clock
+	// of the connector: the host is held until the TTL after it, also while
+	// it has no series, so that emitted tells which of its inputs are new.
+	seen time.Time
 }
 
 type outResource struct {
@@ -376,7 +382,7 @@ func (a *aggregator) add(b *hostBatch, peerOf func(*edgeID) peer, now time.Time,
 	skew := now.Sub(ts)
 	toConnector := func(t time.Time) time.Time { return t.Add(skew) }
 
-	h := a.outputsOf(b)
+	h := a.outputsOf(b, now)
 	h.advance(ts)
 	for _, e := range b.edges {
 		a.addEdge(b, h, e, peerOf, ts, now, toConnector)
@@ -401,16 +407,16 @@ func (a *aggregator) add(b *hostBatch, peerOf func(*edgeID) peer, now time.Time,
 	}
 }
 
-// outputsOf returns the series of the host of a request, with its
-// identity as of the request.
-func (a *aggregator) outputsOf(b *hostBatch) *hostOutputs {
+// outputsOf returns the series of the host of a request received at now,
+// with its identity as of the request.
+func (a *aggregator) outputsOf(b *hostBatch, now time.Time) *hostOutputs {
 	h := a.hosts[b.key]
 	if h == nil {
 		h = &hostOutputs{inputs: map[inputKey]*inputState{}, resources: map[svcKey]*outResource{},
 			services: map[svcKey]time.Time{}}
 		a.hosts[b.key] = h
 	}
-	h.machineID, h.hostname = b.machineID, b.hostname
+	h.machineID, h.hostname, h.seen = b.machineID, b.hostname, now
 	return h
 }
 
@@ -553,7 +559,29 @@ func (r *outResource) account(key outKey, m outMetric, ik inputKey, pt point, dv
 		return
 	}
 	s.value += dv
-	s.count += dc
+	s.count = addCount(s.count, dc)
+}
+
+// addCount adds the increase dc to the count c of a histogram. A count that
+// would wrap stays at its maximum: a smaller count would be taken for a
+// reset.
+func addCount(c, dc uint64) uint64 {
+	if sum := c + dc; sum >= c {
+		return sum
+	}
+	return math.MaxUint64
+}
+
+// intValue is the value v of an output sum as the integer it is emitted
+// as. The inputs of an output are each below maxValue but their increases
+// may add up beyond what an int64 holds: v then stays at its maximum
+// rather than wrapping to a negative value, which would be taken for a
+// reset.
+func intValue(v float64) int64 {
+	if v >= maxValue {
+		return math.MaxInt64
+	}
+	return int64(v)
 }
 
 // clampTime returns t within [lo, hi].
@@ -688,9 +716,17 @@ func (a *aggregator) expireSeries(r *outResource, now time.Time) {
 }
 
 // expire drops the state of inputs, outputs and peers unused for the TTL,
-// including those of hosts that stopped sending.
+// including those of hosts that stopped sending. A host that still sends is
+// kept even without series, as of an idle node: the next interval it closes
+// here is not taken for its first.
 func (a *aggregator) expire(now time.Time) {
 	for host, h := range a.hosts {
+		// Everything the host holds was received no later than its latest
+		// request, so all of it expired with the host.
+		if now.Sub(h.seen) > a.ttl {
+			delete(a.hosts, host)
+			continue
+		}
 		for k, in := range h.inputs {
 			if now.Sub(in.seen) > a.ttl {
 				delete(h.inputs, k)
@@ -700,15 +736,20 @@ func (a *aggregator) expire(now time.Time) {
 			a.expireSeries(r, now)
 			if len(r.series) == 0 {
 				delete(h.resources, sk)
+				continue
+			}
+			// A gauge forgets its inputs when it is emitted, which it never is
+			// if the requests of its host do not close intervals; it also
+			// forgets those that expired, so that it holds no more inputs
+			// than the host.
+			for _, s := range r.series {
+				maps.DeleteFunc(s.gauge, func(k inputKey, _ gaugePoint) bool { return h.inputs[k] == nil })
 			}
 		}
 		for sk, t := range h.services {
 			if now.Sub(t) > a.ttl {
 				delete(h.services, sk)
 			}
-		}
-		if len(h.resources) == 0 && len(h.inputs) == 0 && len(h.services) == 0 {
-			delete(a.hosts, host)
 		}
 	}
 	expireUsed(a.peers, a.ttl, now)
@@ -824,7 +865,7 @@ func (s *outSeries) appendPoint(m pmetric.Metric, desc outMetric, ts pcommon.Tim
 	dp := m.Sum().DataPoints().AppendEmpty()
 	dp.SetStartTimestamp(start)
 	dp.SetTimestamp(ts)
-	dp.SetIntValue(int64(s.value))
+	dp.SetIntValue(intValue(s.value))
 	return dp.Attributes()
 }
 

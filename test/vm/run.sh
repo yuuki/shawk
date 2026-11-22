@@ -24,14 +24,15 @@
 # The tests run with SHAWK_TEST_STRICT=1, so that a skip fails, unless the
 # environment sets it. Kernels without BPF trampolines (aarch64 before 6.0,
 # including Rocky Linux 9.6) run with SHAWK_TEST_NO_TRAMPOLINES=1: Unix
-# sockets must be reported as not traced, and UDP must be traced with
-# kprobes. SHAWK_TEST_NO_UDP=1 declares a kernel with neither trampolines
-# nor kprobes, where UDP tracing must be reported unavailable. The initramfs holds the modules of
-# the NFS client for Rocky Linux 9 (from kernel-modules-core), which init
+# sockets and UDP must be traced with kprobes. SHAWK_TEST_NO_UDP=1 declares
+# a kernel with neither trampolines nor kprobes, where both must be reported
+# unavailable. The initramfs holds the NFS modules for Rocky Linux 9, which init
 # loads; the other kernels run with SHAWK_TEST_NO_NFS=1. It also holds the
 # modules of conntrack and nf_tables with NAT, from kernel-modules-core or
 # the modules package of the mainline build, for the tests of translations;
-# a kernel given by its path runs with SHAWK_TEST_NO_CONNTRACK=1. Further arguments of the test binaries can be given in
+# a kernel given by its path runs with SHAWK_TEST_NO_CONNTRACK=1. The
+# initramfs has no module of VXLAN, so every kernel runs with
+# SHAWK_TEST_NO_VXLAN=1. Further arguments of the test binaries can be given in
 # VM_TEST_ARGS, e.g. VM_TEST_ARGS='-test.run=TestUDP'.
 # VM_RCU_EXPEDITED=1 asks the test kernel to expedite RCU grace periods:
 # the map flips and probe teardown still wait for readers, with less delay
@@ -112,8 +113,7 @@ rocky9/x86_64)
 	nfmodules=$modules ;;
 rocky9/aarch64)
 	# arm64 has BPF trampolines since Linux 6.0, and RHEL 9.6 did not
-	# backport them: fentry programs load but do not attach, and UDP is
-	# traced with kprobes.
+	# backport them: the UDP and Unix socket tests require kprobes.
 	: "${no_trampolines:=1}"
 	pkg=$(fetch $rocky/aarch64/os/Packages/k/kernel-core-5.14.0-570.58.1.el9_6.aarch64.rpm \
 		f0eb542737285c1a7fd386a2cbb5f464228b847762d585d8bd47aa013512d7dd)
@@ -223,7 +223,7 @@ EOF
 
 # Unknown parameters of the kernel command line are passed to init as
 # environment variables.
-cmdline="console=$console panic=-1 quiet SHAWK_TEST_STRICT=${SHAWK_TEST_STRICT:-1} SHAWK_TEST_NO_UDP=${no_udp:-0} SHAWK_TEST_NO_TRAMPOLINES=${no_trampolines:-0} SHAWK_TEST_NO_NFS=${SHAWK_TEST_NO_NFS:-$no_nfs} SHAWK_TEST_NO_CONNTRACK=${SHAWK_TEST_NO_CONNTRACK:-$no_conntrack}"
+cmdline="console=$console panic=-1 quiet SHAWK_TEST_STRICT=${SHAWK_TEST_STRICT:-1} SHAWK_TEST_NO_UDP=${no_udp:-0} SHAWK_TEST_NO_TRAMPOLINES=${no_trampolines:-0} SHAWK_TEST_NO_NFS=${SHAWK_TEST_NO_NFS:-$no_nfs} SHAWK_TEST_NO_CONNTRACK=${SHAWK_TEST_NO_CONNTRACK:-$no_conntrack} SHAWK_TEST_NO_VXLAN=${SHAWK_TEST_NO_VXLAN:-1}"
 if [[ "$rcu_expedited" == 1 ]]; then
 	cmdline+=" rcupdate.rcu_expedited=1"
 fi

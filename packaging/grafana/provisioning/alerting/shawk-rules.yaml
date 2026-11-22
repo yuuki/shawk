@@ -164,7 +164,10 @@ groups:
           summary: "shawk agent on {{ $labels.host }} ({{ $labels.host_id }}) has not reported for {{ $values.B }} minutes"
 
       # Times of dependencies come from the clock of each host, heartbeats
-      # from the clock of the collector; a wrong clock misplaces both.
+      # from the clock of the collector; a wrong clock misplaces both. One
+      # series per host name, with the largest skew: two host ids of one
+      # name are alive together when a node boots with a new machine id
+      # within the alive window, or when two hosts have the same name.
       - uid: shawk-agent-clock-skew
         title: shawk agent clock skew
         condition: C
@@ -179,9 +182,10 @@ groups:
               rawQuery: true
               rawSql: |-
                 SELECT now() AS time, host,
-                       abs(extract(epoch FROM clock_skew))::float8 AS value
+                       max(abs(extract(epoch FROM clock_skew)))::float8 AS value
                 FROM shawk_v1.agents
                 WHERE alive AND abs(extract(epoch FROM clock_skew)) > 60
+                GROUP BY host
                 ORDER BY 1, 2
           - refId: B
             datasourceUid: __expr__

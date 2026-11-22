@@ -1,5 +1,12 @@
 # shawk
 
+[![AI Generated](https://img.shields.io/badge/AI%20Generated-Claude-orange?logo=anthropic)](https://claude.ai/claude-code)
+[![CI](https://github.com/yuuki/shawk/actions/workflows/test.yml/badge.svg)](https://github.com/yuuki/shawk/actions/workflows/test.yml)
+[![Security](https://github.com/yuuki/shawk/actions/workflows/security.yml/badge.svg)](https://github.com/yuuki/shawk/actions/workflows/security.yml)
+[![Release](https://img.shields.io/github/v/release/yuuki/shawk)](https://github.com/yuuki/shawk/releases)
+[![License](https://img.shields.io/github/license/yuuki/shawk)](LICENSE)
+[![Go version](https://img.shields.io/github/go-mod/go-version/yuuki/shawk)](go.mod)
+
 shawk records the network dependencies of your servers: which process talks
 to which TCP/UDP service on every host, or to which local service on its
 Unix socket, since when, until when, and how much.
@@ -13,8 +20,9 @@ this host in the last 90 days, and were we watching?*
 - Every process is covered without instrumentation, whatever its language
   or protocol, cron jobs and third-party software included.
 - Flows to the same service are bundled in the kernel and TCP is traced only
-  at connection state changes, so the agent can always run and does not
-  sample: a job that runs once a month is still seen.
+  at connection state changes (unless wire protocols are classified, below),
+  so the agent can always run and does not sample: a job that runs once a
+  month is still seen.
 - Each host's observation periods and the periods its agent dropped flows
   are recorded, so "not used" can be told apart from "not observed".
 - TCP and UDP sockets are observed, and the connections of Unix stream
@@ -26,6 +34,12 @@ this host in the last 90 days, and were we watching?*
   RDMA are not seen, even when their control connections over TCP are; TCP
   over IPoIB is. See [packaging/README.md](packaging/README.md#hpc-clusters)
   for HPC clusters.
+- Optionally (`-classify-protocols`), the first payload that each side of
+  a new TCP connection sends tells its protocol: the version of TLS, HTTP/1
+  or HTTP/2 in clear text, SSH, PostgreSQL and MySQL with or without a
+  request of TLS, Redis or Slurm, kept in PostgreSQL, so that clients still
+  on TLS 1.0 or in clear text are found. Its program runs on every TCP
+  send, so it is off by default.
 - Agents send OTLP to an OpenTelemetry Collector. Services are named the
   way OBI (OpenTelemetry eBPF Instrumentation) names them, so shawk's
   dependencies and OBI's application metrics share the same `job`.
@@ -51,10 +65,11 @@ The design is in [docs/design.md](docs/design.md).
 ## Requirements
 
 - Linux with BTF (`/sys/kernel/btf/vmlinux`): RHEL / Rocky Linux 9, or
-  upstream 5.14 or later. Unix sockets need BPF trampolines (fentry,
-  fexit), which arm64 has only since 6.0 (Rocky Linux 9.8); without them
-  they are not traced, and UDP is traced with kprobes, at about twice the
-  cost per datagram. The tested kernels
+  upstream 5.14 or later. UDP and Unix stream sockets use BPF trampolines
+  when available and fall back to kprobes, including on arm64 before 6.0
+  and Rocky Linux 9.6 on arm64. For UDP the fallback roughly doubles the
+  cost per datagram on arm64. Wire protocol classification (`-classify-protocols`) requires
+  trampolines. The tested kernels
   are listed in
   [design §3.5](docs/design.md#35-kernel-requirements-and-features-used).
   The agent runs as root with the capabilities that
@@ -151,6 +166,17 @@ SELECT client_host, client_service, port, last_seen, client_observed_until, obse
 FROM shawk_v1.dependencies_between(now() - interval '90 days', now())
 WHERE server_host = 'db-01' AND server_service = 'postgres';
 
+-- Which clients of PostgreSQL on 10.0.0.5 opened connections without
+-- asking for TLS in the last 30 days, and which clients of 10.0.0.5:443
+-- offered TLS below 1.2 (agents with -classify-protocols)? last_seen is
+-- the last new connection that showed the protocol. Rows of role 'server'
+-- tell what the server chose instead, and also name the clients without
+-- an agent by their address.
+SELECT host, service, client_addr, port, protocol, last_seen
+FROM shawk_v1.edge_protocols
+WHERE role = 'client' AND server_addr = '10.0.0.5' AND last_seen > now() - interval '30 days'
+  AND ((port = 5432 AND protocol = 'postgres') OR (port = 443 AND protocol IN ('tls_1_0', 'tls_1_1')));
+
 -- When was db-01 not observed, or only partly?
 SELECT * FROM shawk_v1.unobserved(now() - interval '90 days', now()) WHERE host = 'db-01';
 SELECT * FROM shawk_v1.partly_observed(now() - interval '90 days', now()) WHERE host = 'db-01';
@@ -228,7 +254,7 @@ rewritten from scratch in 2026.
 ## License
 
 [Apache License 2.0](LICENSE). The eBPF programs
-(`internal/tracer/bpf/shawk.bpf.c`, `shawk.h`) are dual-licensed
+(`internal/tracer/bpf/shawk.bpf.c`, `shawk.h`, `wire.h`) are dual-licensed
 [GPL-2.0-only](LICENSES/GPL-2.0-only.txt) OR
 [BSD-2-Clause](LICENSES/BSD-2-Clause.txt), because the kernel loads only
 GPL-compatible programs and the compiled object ships in the Apache-2.0

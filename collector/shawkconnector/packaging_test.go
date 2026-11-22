@@ -582,6 +582,73 @@ func TestPGDetailsFilterPeerCIDRs(t *testing.T) {
 	}
 }
 
+// TestPGDetailsFilterPrometheusNames: the dependency details panel selects
+// the dependencies by the names their sides have in Prometheus, which its
+// variables offer: slurm-job for the processes of Slurm jobs, which
+// PostgreSQL keeps under their own names, and ~other, which folds services
+// beyond max_services and peers beyond max_peers, with an agent or not. A
+// variable without values, as over a time range that Prometheus no longer
+// holds, selects every name rather than failing the query.
+func TestPGDetailsFilterPrometheusNames(t *testing.T) {
+	_, conn := migratedDB(t)
+	f := fixture{t, conn}
+	f.host("db-01", "postgres")
+	f.host("web-01", "web")
+	f.host("node-01")
+	f.host("node-02", "slurmstepd")
+	execAll(t, conn, `INSERT INTO shawk.processes (host_id, unit, comm, exe, service_name, first_seen, last_seen)
+		VALUES ('node-01', 'slurm/batch', 'a.out', '', 'a.out', now()-interval '30 days', now())`)
+	// A job connects to postgres, and slurmstepd to the job.
+	f.conn2("node-01", "a.out", "10.0.0.21", "db-01", "postgres", "10.0.0.10", 5432, "now()-interval '1 hour'", "now()")
+	f.conn2("node-02", "slurmstepd", "10.0.0.22", "node-01", "a.out", "10.0.0.21", 40000, "now()-interval '1 hour'", "now()")
+	f.conn2("web-01", "web", "10.0.0.11", "db-01", "postgres", "10.0.0.10", 5432, "now()-interval '1 hour'", "now()")
+	q := packagedSQL(t)["shawk-dependency.json/shawk / Dependency details/Dependencies in PostgreSQL/A#0"]
+	if q == "" {
+		t.Fatal("no query")
+	}
+	now := time.Now()
+	// run returns the client and server services of the rows the panel
+	// shows with the values src and dst of its variables.
+	run := func(src, dst []string) ([]string, error) {
+		sql := expandMacros(expandVars(q, map[string][]string{"src": src, "dst": dst}), now.Add(-6*time.Hour), now)
+		rows, err := conn.Query(context.Background(), "SELECT client_service, server_service FROM ("+sql+") d ORDER BY 1, 2")
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		var out []string
+		for rows.Next() {
+			vals, err := rows.Values()
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, fmt.Sprintf("%v %v", vals[0], vals[1]))
+		}
+		return out, rows.Err()
+	}
+	all := []string{"a.out postgres", "slurmstepd a.out", "web postgres"}
+	for _, c := range []struct {
+		src, dst, want []string
+	}{
+		{[]string{"slurm-job"}, []string{"postgres"}, []string{"a.out postgres"}},
+		{[]string{"slurmstepd"}, []string{"slurm-job"}, []string{"slurmstepd a.out"}},
+		// The job is slurm-job in Prometheus, not a.out.
+		{[]string{"a.out", "web"}, []string{"postgres"}, []string{"web postgres"}},
+		{[]string{"~other"}, []string{"postgres"}, []string{"a.out postgres", "web postgres"}},
+		{[]string{"slurmstepd", "web"}, []string{"~other"}, []string{"slurmstepd a.out", "web postgres"}},
+		{nil, []string{"postgres"}, []string{"a.out postgres", "web postgres"}},
+		{nil, nil, all},
+		{[]string{"postgres", "slurm-job", "slurmstepd", "web"}, []string{"postgres", "slurm-job"}, all},
+		// Quoted, a value a link sets stays a value.
+		{[]string{`web'] OR true OR '~other' = ANY (ARRAY['`}, nil, nil},
+	} {
+		got, err := run(c.src, c.dst)
+		if err != nil || !slices.Equal(got, c.want) {
+			t.Errorf("src %q, dst %q: %q, %v; want %q", c.src, c.dst, got, err, c.want)
+		}
+	}
+}
+
 // TestPGSilentAlertReinstall: the silent agent alert does not name a host
 // that was reinstalled under a new host id and is alive, nor fire together
 // with the Prometheus alert in the first 24 hours.
@@ -611,6 +678,42 @@ func TestPGSilentAlertReinstall(t *testing.T) {
 	rows.Close()
 	if !slices.Equal(got, []string{"[web-2 dead]"}) {
 		t.Errorf("silent agents = %v", got)
+	}
+}
+
+// TestPGClockSkewAlertSharedName: the clock skew alert has one series per
+// host name, labelled with the name only, also when two live host ids have
+// it, as a node that booted with a new machine id within the alive window;
+// its value is the largest skew.
+func TestPGClockSkewAlertSharedName(t *testing.T) {
+	_, conn := migratedDB(t)
+	execAll(t, conn,
+		`INSERT INTO shawk.hosts VALUES
+		   ('old','m1','node-1','k','v',now()-interval '30 days',now()-interval '3 minutes'),
+		   ('new','m2','node-1','k','v',now()-interval '2 minutes',now()),
+		   ('synced','m3','node-2','k','v',now()-interval '30 days',now()),
+		   ('silent','m4','node-3','k','v',now()-interval '30 days',now()-interval '1 hour')`,
+		`INSERT INTO shawk.agent_sessions (host_id, started_at, last_heartbeat, udp_traced, netns_scope, clock_skew) VALUES
+		   ('old', now()-interval '30 days', now()-interval '3 minutes', true, 'all', interval '120 seconds'),
+		   ('new', now()-interval '2 minutes', now(), true, 'all', interval '-90 seconds'),
+		   ('synced', now()-interval '30 days', now(), true, 'all', interval '1 second'),
+		   ('silent', now()-interval '30 days', now()-interval '1 hour', true, 'all', interval '300 seconds')`)
+	q := packagedSQL(t)["shawk-rules.yaml/shawk-agents/shawk agent clock skew/A/A#0"]
+	if q == "" {
+		t.Fatal("no query")
+	}
+	rows, err := conn.Query(context.Background(), q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for rows.Next() {
+		vals, _ := rows.Values()
+		got = append(got, fmt.Sprint(vals[1:]))
+	}
+	rows.Close()
+	if !slices.Equal(got, []string{"[node-1 120]"}) {
+		t.Errorf("skewed clocks = %v", got)
 	}
 }
 

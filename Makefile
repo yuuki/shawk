@@ -120,7 +120,7 @@ vuln: ## known vulnerabilities that the code of every module reaches (govulnchec
 complexity: ## rank the most complex functions with cccc (https://github.com/moznion/cccc); settings in cccc.toml
 	cccc --table --top-cognitive 20 .
 
-OCB_VERSION ?= v0.164.0
+OCB_VERSION ?= v0.165.0
 
 .PHONY: collector
 collector: ## build the collector with the shawk connector and VERSION (collector/_build/shawk-collector)

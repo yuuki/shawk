@@ -2,11 +2,15 @@ package tracer
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/netip"
+	"os"
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/cilium/ebpf"
 )
 
 // TestTCPIteratorSkips checks the connections that the TCP iterator of Linux
@@ -171,6 +175,127 @@ func TestTCPWalkFullFlowTable(t *testing.T) {
 		}
 		if tr.lastSkips != 0 || tr.skipping {
 			t.Errorf("walk %d: %d connections taken for skipped ones", i, tr.lastSkips)
+		}
+	}
+}
+
+// TestAdoptSkippedOwner checks that adopt_skipped() in iter/task_file keeps
+// the listener-attributed owner of an incoming TCP connection whose listener
+// is still open (empty comm, pid 0, SS_READY set), while assigning the
+// holding process as owner to outgoing connections and to incoming
+// connections whose listener is gone.
+func TestAdoptSkippedOwner(t *testing.T) {
+	skipIfNoNetwork(t, "tcp4")
+	run, ns := newNetNS(t)
+	var cOpen, sOpen, sClosed net.Conn
+	run(func() {
+		var lc net.ListenConfig
+		lc.SetMultipathTCP(false)
+		lnOpen, err := lc.Listen(t.Context(), "tcp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { lnOpen.Close() })
+		cOpen, err = net.Dial("tcp4", lnOpen.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { cOpen.Close() })
+		sOpen, err = lnOpen.Accept()
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { sOpen.Close() })
+
+		lnClosed, err := lc.Listen(t.Context(), "tcp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		cClosed, err := net.Dial("tcp4", lnClosed.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { cClosed.Close() })
+		sClosed, err = lnClosed.Accept()
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { sClosed.Close() })
+		lnClosed.Close()
+	})
+
+	tr := startTracer(t, Options{NetNS: ns})
+	states := tr.colls[0].Maps[bpfMapSockStates]
+
+	// Delete the socket storage entries so the next iter/task_file walk
+	// adopts all three through adopt_skipped(), as when iter/tcp skips them.
+	for _, c := range []net.Conn{cOpen, sOpen, sClosed} {
+		raw, err := c.(*net.TCPConn).SyscallConn()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var derr error
+		if err := raw.Control(func(fd uintptr) { derr = states.Delete(uint32(fd)) }); err != nil {
+			t.Fatal(err)
+		}
+		if derr != nil && !errors.Is(derr, ebpf.ErrKeyNotExist) {
+			t.Fatalf("deleting socket state of %v: %v", c.LocalAddr(), derr)
+		}
+	}
+
+	var skipsBefore uint64
+	if err := tr.iterSkips.Get(&skipsBefore); err != nil {
+		t.Fatal(err)
+	}
+	if err := tr.scanOwners(); err != nil {
+		t.Fatal(err)
+	}
+	var skipsAfter uint64
+	if err := tr.iterSkips.Get(&skipsAfter); err != nil {
+		t.Fatal(err)
+	}
+	if skipsAfter < skipsBefore+3 {
+		t.Errorf("iter_skips increased by %d, want at least 3", skipsAfter-skipsBefore)
+	}
+
+	const ssReady = 1 << 0
+	selfPID := uint32(os.Getpid())
+	for _, tc := range []struct {
+		name     string
+		conn     net.Conn
+		wantDir  Direction
+		wantPID  uint32
+		wantComm string
+	}{
+		{"incoming with open listener", sOpen, DirIn, 0, ""},
+		{"outgoing", cOpen, DirOut, selfPID, testComm},
+		{"incoming with closed listener", sClosed, DirIn, selfPID, testComm},
+	} {
+		raw, err := tc.conn.(*net.TCPConn).SyscallConn()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var (
+			ss   bpfShawkSockState
+			lerr error
+		)
+		if err := raw.Control(func(fd uintptr) { lerr = states.Lookup(uint32(fd), &ss) }); err != nil {
+			t.Fatal(err)
+		}
+		if lerr != nil {
+			t.Fatalf("%s: socket state lookup: %v", tc.name, lerr)
+		}
+		if ss.Flags&ssReady == 0 {
+			t.Errorf("%s: flags = %#x, want SS_READY set", tc.name, ss.Flags)
+		}
+		if Direction(ss.Key.Direction) != tc.wantDir {
+			t.Errorf("%s: direction = %v, want %v", tc.name, Direction(ss.Key.Direction), tc.wantDir)
+		}
+		if ss.Pid != tc.wantPID {
+			t.Errorf("%s: pid = %d, want %d", tc.name, ss.Pid, tc.wantPID)
+		}
+		if got := commString(ss.Key.Comm); got != tc.wantComm {
+			t.Errorf("%s: comm = %q, want %q", tc.name, got, tc.wantComm)
 		}
 	}
 }

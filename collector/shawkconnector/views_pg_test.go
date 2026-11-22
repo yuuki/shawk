@@ -3,6 +3,7 @@ package shawkconnector
 import (
 	"fmt"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -62,6 +63,26 @@ func TestPGEndpointsCurrentAddresses(t *testing.T) {
 	got := queryStrings(t, conn, `SELECT host(addr), port, exact FROM shawk_v1.service_endpoints`)
 	if !slices.Equal(got, []string{"10.0.1.50 443 true"}) {
 		t.Errorf("service_endpoints = %v", got)
+	}
+}
+
+// TestPGEndpointsWithoutListeners: a host without listeners, such as a UDP
+// server, has the endpoints of its server edges of the 7 days before its
+// latest one (#249).
+func TestPGEndpointsWithoutListeners(t *testing.T) {
+	_, conn := migratedDB(t)
+	f := fixture{t, conn}
+	f.host("dns-01", "unbound")
+	server := func(addr string, port int, first, last string) string {
+		return fmt.Sprintf(`INSERT INTO shawk.edges (host_id, process_id, role, proto, local_addr, remote_addr, port, netns, first_seen, last_seen)
+		  VALUES ('dns-01', (SELECT id FROM shawk.processes), 'server', 'udp', '%s', '10.0.0.11', %d, 1, %s, %s)`, addr, port, first, last)
+	}
+	execAll(t, conn,
+		server("10.0.0.53", 53, "now() - interval '1 day'", "now() - interval '1 hour'"),
+		server("10.0.0.53", 5353, "now() - interval '20 days'", "now() - interval '9 days'"))
+	got := queryStrings(t, conn, `SELECT host(addr), port, proto, host, service, exact FROM shawk_v1.service_endpoints`)
+	if want := []string{"10.0.0.53 53 udp dns-01 unbound true"}; !slices.Equal(got, want) {
+		t.Errorf("service_endpoints = %v, want %v", got, want)
 	}
 }
 
@@ -218,5 +239,44 @@ func TestPGUnobservedByNameBounds(t *testing.T) {
 		FROM shawk_v1.unobserved_by_name(now() - interval '1 hour', now() - interval '30 seconds', interval '1 minute')`)
 	if !slices.Equal(got, []string{"-60 -59"}) {
 		t.Errorf("unobserved_by_name with a tolerance of a minute = %v", got)
+	}
+}
+
+// TestPGLoopbackScope: the edges of a connection with a loopback address on
+// either side, such as a client that binds an address of its host and
+// connects to 127.0.0.1, are matched within their host and network
+// namespace on both sides alike: by address, by a server at the address
+// the client connected to (which takes precedence over translations), and
+// through learned translations, where the rows of other hosts do not
+// apply (#241).
+func TestPGLoopbackScope(t *testing.T) {
+	_, conn := migratedDB(t)
+	f := fixture{t, conn}
+	f.host("h1", "curl", "proxy")
+	f.host("h2")
+	f.host("db-01", "web")
+	f.host("db-02", "web")
+	hour, now := "now()-interval '1 hour'", "now()"
+	f.edge("h1", "curl", "client", "10.0.0.5", "127.0.0.1", 8080, hour, now)
+	f.edge("h1", "proxy", "server", "127.0.0.1", "10.0.0.5", 8080, hour, now)
+	// h1 learned that it translated these connections to db-01, and h2 that
+	// it translated those of a client of its own at 10.0.0.5 to db-02.
+	f.edge("db-01", "web", "server", "10.0.1.30", "10.0.0.5", 80, hour, now)
+	f.edge("db-02", "web", "server", "10.0.1.40", "10.0.0.5", 80, hour, now)
+	execAll(t, conn, `INSERT INTO shawk.learned_translations VALUES
+	  ('h1', 'tcp', 1, '10.0.0.5', '127.0.0.1', 8080, '10.0.0.5', '10.0.1.30', 80, now() - interval '1 hour', now()),
+	  ('h2', 'tcp', 1, '10.0.0.5', '127.0.0.1', 8080, '10.0.0.5', '10.0.1.40', 80, now() - interval '1 hour', now())`)
+	want := []string{
+		"- - 10.0.0.5 db-01 web 10.0.1.30 80 server - - -",
+		"- - 10.0.0.5 db-02 web 10.0.1.40 80 server - - -",
+		"h1 curl 10.0.0.5 h1 proxy 127.0.0.1 8080 both - - -",
+	}
+	for _, q := range []string{
+		translationDeps + ` FROM shawk_v1.dependencies`,
+		translationDeps + ` FROM shawk_v1.dependencies_between(now() - interval '2 hours', now())`,
+	} {
+		if got := queryStrings(t, conn, q); !slices.Equal(got, want) {
+			t.Errorf("%s:\n%s\nwant:\n%s", q, strings.Join(got, "\n"), strings.Join(want, "\n"))
+		}
 	}
 }

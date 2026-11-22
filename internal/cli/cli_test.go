@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"net/netip"
 	"strings"
 	"testing"
 
@@ -92,7 +93,7 @@ func TestPrintUnixFlows(t *testing.T) {
 			Comm: "docker"},
 		FlowStats: tracer.FlowStats{Conns: 2, ConnFails: 1, OpenConns: 1, PID: 42,
 			Fails: [tracer.NumFailReasons]uint64{tracer.FailRefused: 1}},
-	}})
+	}}, false)
 	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
 	if len(lines) != 3 {
 		t.Fatalf("output = %q", out.String())
@@ -101,5 +102,32 @@ func TestPrintUnixFlows(t *testing.T) {
 	want := []string{"-->", "unix", "-", "/run/docker.sock", "-", "docker", "42", "2", "1", "(refused:1)", "-", "-", "1", "-", "-"}
 	if strings.Join(got, " ") != strings.Join(want, " ") {
 		t.Errorf("row = %q, want %q", got, want)
+	}
+}
+
+func TestPrintWireProtocols(t *testing.T) {
+	var out bytes.Buffer
+	flows := []tracer.Flow{
+		{FlowKey: tracer.FlowKey{Direction: tracer.DirOut, Proto: tracer.ProtoTCP, LocalAddr: netip.MustParseAddr("10.0.0.1"),
+			RemoteAddr: netip.MustParseAddr("10.0.0.2"), Port: 5432, Comm: "psql"},
+			FlowStats: tracer.FlowStats{Conns: 2, PID: 7, Protocols: 1<<tracer.WirePostgres | 1<<tracer.WireTLS13}},
+		{FlowKey: tracer.FlowKey{Direction: tracer.DirIn, Proto: tracer.ProtoTCP, LocalAddr: netip.MustParseAddr("10.0.0.1"),
+			RemoteAddr: netip.MustParseAddr("10.0.0.3"), Port: 22, Comm: "sshd"},
+			FlowStats: tracer.FlowStats{Conns: 1, PID: 8}},
+	}
+	printFlows(&out, flows, true)
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 4 || !strings.HasSuffix(strings.TrimSpace(lines[1]), "WIRE") {
+		t.Fatalf("output = %q", out.String())
+	}
+	for _, want := range []string{"tls_1_3,postgres", "-"} {
+		found := false
+		for _, l := range lines[2:] {
+			f := strings.Fields(l)
+			found = found || f[len(f)-1] == want
+		}
+		if !found {
+			t.Errorf("no row ends with %q in %q", want, out.String())
+		}
 	}
 }
