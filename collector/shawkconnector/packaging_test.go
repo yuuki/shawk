@@ -145,12 +145,14 @@ func TestPackagedCollectorConfig(t *testing.T) {
 		}
 		return out
 	}
-	// The queues of the exporters to Prometheus stay enabled and do not
-	// block, so that the retries of a batch do not block the connector, and
-	// are bounded, so that they do not fill the memory of the collector
-	// while Prometheus is down: in points, since a batch holds what arrived
-	// within its timeout, and in bytes for OBI's requests, which are not
-	// batched and have a queue of their own (docs/design.md, section 5.3).
+	// The queues of the exporters stay enabled and do not block, so that the
+	// retries of a batch do not block the connector or the requests of OBI,
+	// and are bounded, so that they do not fill the memory of the collector
+	// while Prometheus or the trace store is down: in points for the
+	// connector, since a batch holds what arrived within its timeout; in
+	// bytes for OBI's metrics, which are not batched and have a queue of
+	// their own, and for OBI's spans, as large as their attributes
+	// (docs/design.md, sections 5.3 and 9).
 	batch, _ := doc.Processors["batch"].(map[string]any)
 	if batch["send_batch_max_size"] != 8192 {
 		t.Errorf("batch: send_batch_max_size = %v", batch["send_batch_max_size"])
@@ -158,17 +160,21 @@ func TestPackagedCollectorConfig(t *testing.T) {
 	queues := map[string]map[string]any{
 		"metrics/shawk-out": {"sizer": "items", "queue_size": 409600},
 		"metrics/obi":       {"sizer": "bytes", "queue_size": 67108864},
+		"traces/obi":        {"sizer": "bytes", "queue_size": 67108864},
 	}
 	sends, shared := map[string]bool{}, map[string]string{}
 	for name, p := range doc.Service.Pipelines {
-		for _, e := range toPrometheus(p.Exporters) {
+		for _, e := range p.Exporters {
+			if doc.Exporters[e] == nil {
+				continue // the connector, or undefined (below)
+			}
 			if other, ok := shared[e]; ok {
 				t.Errorf("%s: in %s and %s, whose requests share its queue", e, other, name)
 			}
 			shared[e] = name
 			want, ok := queues[name]
 			if !ok {
-				t.Errorf("%s: sends to Prometheus through %s, whose queue is not checked", name, e)
+				t.Errorf("%s: exports through %s, whose queue is not checked", name, e)
 				continue
 			}
 			sends[name] = true
@@ -206,7 +212,7 @@ func TestPackagedCollectorConfig(t *testing.T) {
 	}
 	for name := range queues {
 		if !sends[name] {
-			t.Errorf("%s sends nothing to Prometheus", name)
+			t.Errorf("%s exports through no exporter", name)
 		}
 	}
 }
