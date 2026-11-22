@@ -6,7 +6,8 @@
   and seqpacket sockets to named sockets, a path or an abstract name
   (`/run/postgresql/.s.PGSQL.5432`, php-fpm, `/run/docker.sock`, munge),
   at the connect and the close of the client (`fexit/unix_stream_connect`,
-  `fentry/unix_release`), which need BPF trampolines as UDP does:
+  `fentry/unix_release`, with kprobes on the same functions where BPF
+  trampolines do not attach, including on Rocky Linux 9.6 arm64, #220):
   connections, failed connects by reason (`refused`, `timeout` for a full
   backlog, `unreachable` for a permission denied, `local`, `aborted`) and
   open connections. Their traffic is not measured: a Unix socket keeps no
@@ -52,7 +53,7 @@
   twice the cost per datagram on arm64, and keep the direction of each
   socket in an LRU hash instead of socket local storage, which kprobes
   have not. The agent logs that UDP is traced with kprobes, and reports
-  `shawk.agent.udp.traced` 1. Unix sockets still need trampolines.
+  `shawk.agent.udp.traced` 1.
 
 ### Changed
 

@@ -387,7 +387,7 @@ groups:
           severity: info
         annotations:
           summary: "shawk agent on {{ $labels.host_name }} does not trace Unix sockets"
-          description: "The kernel lacks BPF trampolines (fentry), or the programs on Unix sockets did not attach; dependencies of the host on its Unix sockets are not observed."
+          description: "Neither the BPF trampolines nor the fallback kprobes for Unix sockets attached; dependencies of the host on its Unix sockets are not observed."
 
       - alert: ShawkExportFailures
         expr: increase(shawk_agent_export_failures_total[15m]) > 3

@@ -190,7 +190,7 @@ func Run(ctx context.Context, cfg Config) error {
 		cfg.Logger.Warn("UDP is not traced; see the error above (UDP tracing needs BPF trampolines, fentry, or else kprobes)")
 	}
 	if !tr.UnixEnabled() {
-		cfg.Logger.Warn("Unix sockets are not traced; see the error above (their tracing needs BPF trampolines, fexit)")
+		cfg.Logger.Warn("Unix sockets are not traced; see the error above (trampolines and fallback kprobes could not be attached)")
 	}
 	if cfg.NetNS != 0 && cfg.NetNS == procinfo.NetNSOf(1) {
 		cfg.Logger.Warn("only the initial network namespace is traced: connections of containers in other namespaces are not, " +

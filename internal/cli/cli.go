@@ -239,7 +239,7 @@ func runFlows(ctx context.Context, args []string, w, stderr io.Writer) error {
 		fmt.Fprintln(stderr, "warning: UDP is not traced: its programs could not be loaded (they need BPF trampolines, fentry)")
 	}
 	if !tr.UnixEnabled() {
-		fmt.Fprintln(stderr, "warning: Unix sockets are not traced: their programs could not be loaded (they need BPF trampolines, fexit)")
+		fmt.Fprintln(stderr, "warning: Unix sockets are not traced: trampolines and fallback kprobes could not be attached")
 	}
 	ticker := time.NewTicker(*interval)
 	defer ticker.Stop()

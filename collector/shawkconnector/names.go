@@ -220,7 +220,10 @@ var bpfPrograms = map[string]bool{
 	"shawk_skb_consume_udp":     true,
 	"shawk_skb_consume_udp_k":   true,
 	"shawk_tcp_receive_reset":   true,
+	"shawk_unix_connect_k":      true,
+	"shawk_unix_connect_ret":    true,
 	"shawk_unix_release":        true,
+	"shawk_unix_release_k":      true,
 	"shawk_unix_stream_connect": true,
 }
 
