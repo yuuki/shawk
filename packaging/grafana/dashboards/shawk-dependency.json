@@ -148,9 +148,9 @@
             "uid": "shawk-prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (src, dst, server_port) (shawk:dependency_connections:rate5m{src=~\"$src\", dst=~\"$dst\"})",
+          "expr": "sum by (src, dst, server_port, network_transport) (shawk:dependency_connections:rate5m{src=~\"$src\", dst=~\"$dst\"})",
           "range": true,
-          "legendFormat": "{{src}} → {{dst}}:{{server_port}}"
+          "legendFormat": "{{src}} → {{dst}}:{{server_port}}/{{network_transport}}"
         }
       ],
       "fieldConfig": {
@@ -200,9 +200,9 @@
             "uid": "shawk-prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (src, dst, server_port) (shawk:dependency_connection_failures:rate5m{src=~\"$src\", dst=~\"$dst\"})\n  / (sum by (src, dst, server_port) (shawk:dependency_connections:rate5m{src=~\"$src\", dst=~\"$dst\"})\n     + sum by (src, dst, server_port) (shawk:dependency_connection_failures:rate5m{src=~\"$src\", dst=~\"$dst\"}))",
+          "expr": "sum by (src, dst, server_port, network_transport) (shawk:dependency_connection_failures:rate5m{src=~\"$src\", dst=~\"$dst\"})\n  / (sum by (src, dst, server_port, network_transport) (shawk:dependency_connections:rate5m{src=~\"$src\", dst=~\"$dst\"})\n     + sum by (src, dst, server_port, network_transport) (shawk:dependency_connection_failures:rate5m{src=~\"$src\", dst=~\"$dst\"}))",
           "range": true,
-          "legendFormat": "{{src}} → {{dst}}:{{server_port}}"
+          "legendFormat": "{{src}} → {{dst}}:{{server_port}}/{{network_transport}}"
         }
       ],
       "fieldConfig": {
@@ -253,9 +253,9 @@
             "uid": "shawk-prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (src, dst, server_port) (shawk:dependency_request_bytes:rate5m{src=~\"$src\", dst=~\"$dst\"})",
+          "expr": "sum by (src, dst, server_port, network_transport) (shawk:dependency_request_bytes:rate5m{src=~\"$src\", dst=~\"$dst\"})",
           "range": true,
-          "legendFormat": "request {{src}} → {{dst}}:{{server_port}}"
+          "legendFormat": "request {{src}} → {{dst}}:{{server_port}}/{{network_transport}}"
         },
         {
           "refId": "B",
@@ -264,9 +264,9 @@
             "uid": "shawk-prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (src, dst, server_port) (shawk:dependency_response_bytes:rate5m{src=~\"$src\", dst=~\"$dst\"})",
+          "expr": "sum by (src, dst, server_port, network_transport) (shawk:dependency_response_bytes:rate5m{src=~\"$src\", dst=~\"$dst\"})",
           "range": true,
-          "legendFormat": "response {{src}} → {{dst}}:{{server_port}}"
+          "legendFormat": "response {{src}} → {{dst}}:{{server_port}}/{{network_transport}}"
         }
       ],
       "fieldConfig": {
@@ -316,9 +316,9 @@
             "uid": "shawk-prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (src, dst, server_port) (shawk:dependency_rtt_seconds_sum:rate5m{src=~\"$src\", dst=~\"$dst\"})\n  / sum by (src, dst, server_port) (shawk:dependency_rtt_seconds_count:rate5m{src=~\"$src\", dst=~\"$dst\"})",
+          "expr": "sum by (src, dst, server_port, network_transport) (shawk:dependency_rtt_seconds_sum:rate5m{src=~\"$src\", dst=~\"$dst\"})\n  / sum by (src, dst, server_port, network_transport) (shawk:dependency_rtt_seconds_count:rate5m{src=~\"$src\", dst=~\"$dst\"})",
           "range": true,
-          "legendFormat": "{{src}} → {{dst}}:{{server_port}}"
+          "legendFormat": "{{src}} → {{dst}}:{{server_port}}/{{network_transport}}"
         }
       ],
       "fieldConfig": {
@@ -369,9 +369,9 @@
             "uid": "shawk-prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (src, dst, server_port, shawk_role) (shawk:dependency_retransmits:rate5m{src=~\"$src\", dst=~\"$dst\"})",
+          "expr": "sum by (src, dst, server_port, network_transport, shawk_role) (shawk:dependency_retransmits:rate5m{src=~\"$src\", dst=~\"$dst\"})",
           "range": true,
-          "legendFormat": "{{shawk_role}} sends: {{src}} → {{dst}}:{{server_port}}"
+          "legendFormat": "{{shawk_role}} sends: {{src}} → {{dst}}:{{server_port}}/{{network_transport}}"
         }
       ],
       "fieldConfig": {
@@ -421,9 +421,9 @@
             "uid": "shawk-prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (src, dst, server_port) (shawk:dependency_open_connections{src=~\"$src\", dst=~\"$dst\"})",
+          "expr": "sum by (src, dst, server_port, network_transport) (shawk:dependency_open_connections{src=~\"$src\", dst=~\"$dst\"})",
           "range": true,
-          "legendFormat": "{{src}} → {{dst}}:{{server_port}}"
+          "legendFormat": "{{src}} → {{dst}}:{{server_port}}/{{network_transport}}"
         }
       ],
       "fieldConfig": {
@@ -472,9 +472,9 @@
             "uid": "shawk-prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (src, dst, server_port) (shawk:dependency_handshake_seconds_sum:rate5m{src=~\"$src\", dst=~\"$dst\"})\n  / sum by (src, dst, server_port) (shawk:dependency_handshake_seconds_count:rate5m{src=~\"$src\", dst=~\"$dst\"})",
+          "expr": "sum by (src, dst, server_port, network_transport) (shawk:dependency_handshake_seconds_sum:rate5m{src=~\"$src\", dst=~\"$dst\"})\n  / sum by (src, dst, server_port, network_transport) (shawk:dependency_handshake_seconds_count:rate5m{src=~\"$src\", dst=~\"$dst\"})",
           "range": true,
-          "legendFormat": "{{src}} → {{dst}}:{{server_port}}"
+          "legendFormat": "{{src}} → {{dst}}:{{server_port}}/{{network_transport}}"
         }
       ],
       "fieldConfig": {
@@ -525,9 +525,9 @@
             "uid": "shawk-prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (src, dst, server_port) (shawk:dependency_syn_retransmits:rate5m{src=~\"$src\", dst=~\"$dst\"})\n  / sum by (src, dst, server_port) (\n      shawk:dependency_handshake_seconds_count:rate5m{src=~\"$src\", dst=~\"$dst\"}\n      or shawk:dependency_connection_failures_by_reason:rate5m{src=~\"$src\", dst=~\"$dst\"})",
+          "expr": "sum by (src, dst, server_port, network_transport) (shawk:dependency_syn_retransmits:rate5m{src=~\"$src\", dst=~\"$dst\"})\n  / sum by (src, dst, server_port, network_transport) (\n      shawk:dependency_handshake_seconds_count:rate5m{src=~\"$src\", dst=~\"$dst\"}\n      or shawk:dependency_connection_failures_by_reason:rate5m{src=~\"$src\", dst=~\"$dst\", network_transport=\"tcp\"})",
           "range": true,
-          "legendFormat": "{{src}} → {{dst}}:{{server_port}}"
+          "legendFormat": "{{src}} → {{dst}}:{{server_port}}/{{network_transport}}"
         }
       ],
       "fieldConfig": {
@@ -555,7 +555,7 @@
           "sort": "desc"
         }
       },
-      "description": "SYNs that the client side retransmitted per connection attempt (a connect that times out retransmits several), established or failed: a SYN or its SYN-ACK was lost, or dropped by a firewall, a network policy or a server whose accept queue is full. The attempts are the handshakes and the failures by reason, which agents send with the retransmissions; connects with TCP_FASTOPEN_CONNECT have no handshake and raise the ratio."
+      "description": "SYNs that the client side retransmitted per connection attempt (a connect that times out retransmits several), established or failed: a SYN or its SYN-ACK was lost, or dropped by a firewall, a network policy or a server whose accept queue is full. The attempts are the handshakes and the failures by reason over TCP, which agents send with the retransmissions; connects with TCP_FASTOPEN_CONNECT have no handshake and raise the ratio."
     },
     {
       "id": 12,
@@ -579,9 +579,9 @@
             "uid": "shawk-prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (src, dst, server_port, error_type) (shawk:dependency_connection_failures_by_reason:rate5m{src=~\"$src\", dst=~\"$dst\"})",
+          "expr": "sum by (src, dst, server_port, network_transport, error_type) (shawk:dependency_connection_failures_by_reason:rate5m{src=~\"$src\", dst=~\"$dst\"})",
           "range": true,
-          "legendFormat": "{{src}} → {{dst}}:{{server_port}} {{error_type}}"
+          "legendFormat": "{{src}} → {{dst}}:{{server_port}}/{{network_transport}} {{error_type}}"
         }
       ],
       "fieldConfig": {
@@ -636,9 +636,9 @@
             "uid": "shawk-prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (src, dst, server_port) (shawk:dependency_request_datagrams:rate5m{src=~\"$src\", dst=~\"$dst\"})",
+          "expr": "sum by (src, dst, server_port, network_transport) (shawk:dependency_request_datagrams:rate5m{src=~\"$src\", dst=~\"$dst\"})",
           "range": true,
-          "legendFormat": "request {{src}} → {{dst}}:{{server_port}}"
+          "legendFormat": "request {{src}} → {{dst}}:{{server_port}}/{{network_transport}}"
         },
         {
           "refId": "B",
@@ -647,9 +647,9 @@
             "uid": "shawk-prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (src, dst, server_port) (shawk:dependency_response_datagrams:rate5m{src=~\"$src\", dst=~\"$dst\"})",
+          "expr": "sum by (src, dst, server_port, network_transport) (shawk:dependency_response_datagrams:rate5m{src=~\"$src\", dst=~\"$dst\"})",
           "range": true,
-          "legendFormat": "response {{src}} → {{dst}}:{{server_port}}"
+          "legendFormat": "response {{src}} → {{dst}}:{{server_port}}/{{network_transport}}"
         }
       ],
       "fieldConfig": {
@@ -701,7 +701,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT client_host, client_service, client_unit, CASE WHEN masklen(client_addr) = 0 THEN text(client_addr) ELSE host(client_addr) END AS client_addr,\n       server_host, server_service, CASE WHEN masklen(server_addr) = 0 THEN text(server_addr) ELSE host(server_addr) END AS server_addr, path, port, proto,\n       observed_by, first_seen, last_seen, client_observed_until, server_observed_until\nFROM shawk_v1.dependencies_between($__timeFrom(), $__timeTo())\n-- A side without a service (a peer without an agent) is named like\n-- in Prometheus: a name of peer_cidrs, ~unresolved or ~external; and\n-- ~other, which folds peers beyond max_peers, matches any of them.\nWHERE (coalesce(client_service, shawk_v1.peer_class(client_addr)) IN (${src:sqlstring})\n       OR (client_service IS NULL AND '~other' IN (${src:sqlstring})))\n  AND (coalesce(server_service, shawk_v1.peer_class(server_addr)) IN (${dst:sqlstring})\n       OR (server_service IS NULL AND '~other' IN (${dst:sqlstring})))\nORDER BY last_seen DESC\nLIMIT 500"
+          "rawSql": "WITH sel AS (SELECT ARRAY[${src:sqlstring}]::text[] AS src, ARRAY[${dst:sqlstring}]::text[] AS dst)\nSELECT client_host, client_service, client_unit, CASE WHEN masklen(client_addr) = 0 THEN text(client_addr) ELSE host(client_addr) END AS client_addr,\n       server_host, server_service, server_unit, CASE WHEN masklen(server_addr) = 0 THEN text(server_addr) ELSE host(server_addr) END AS server_addr, path, port, proto,\n       observed_by, first_seen, last_seen, client_observed_until, server_observed_until\nFROM shawk_v1.dependencies_between($__timeFrom(), $__timeTo()) d\nCROSS JOIN sel\n-- Each side is named as in Prometheus: a process of a Slurm job (unit\n-- slurm/*) slurm-job, and a side without a service (a peer without an\n-- agent) a name of peer_cidrs, ~unresolved or ~external. ~other, which\n-- folds services beyond max_services and peers beyond max_peers, with an\n-- agent or not, matches any side, and so does a variable without values,\n-- as over a time range that Prometheus no longer holds.\nCROSS JOIN LATERAL (\n  SELECT CASE WHEN d.client_unit LIKE 'slurm/%' THEN 'slurm-job'\n              ELSE coalesce(d.client_service, shawk_v1.peer_class(d.client_addr)) END AS client,\n         CASE WHEN d.server_unit LIKE 'slurm/%' THEN 'slurm-job'\n              ELSE coalesce(d.server_service, shawk_v1.peer_class(d.server_addr)) END AS server\n) n\nWHERE (cardinality(sel.src) = 0 OR n.client = ANY (sel.src) OR '~other' = ANY (sel.src))\n  AND (cardinality(sel.dst) = 0 OR n.server = ANY (sel.dst) OR '~other' = ANY (sel.dst))\nORDER BY last_seen DESC\nLIMIT 500"
         }
       ],
       "options": {

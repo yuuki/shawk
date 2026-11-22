@@ -3,7 +3,10 @@ package shawkconnector
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -177,10 +180,13 @@ FROM shawk_v1.unobserved_reasons(now() - interval '12 hours', now() - interval '
 // TestPGPlannedStops: hosts in a planned stop now, by the latest state if it
 // is fresh and planned (powering up too, but not once up), or a window in
 // progress; MAINT for 30 days since it started, whatever the other flags
-// (longmaint); and the silent agent alert does not name them.
+// (longmaint), counted again after a state that is not MAINT (remaint) or
+// that became stale (gapmaint, #248); and the silent agent alert does not
+// name them.
 func TestPGPlannedStops(t *testing.T) {
 	_, conn := migratedDB(t)
-	hosts := []string{"off", "stale", "down", "resuming", "booted", "maint", "maintflag", "longmaint", "remaint", "nothing"}
+	hosts := []string{"off", "stale", "down", "resuming", "booted", "maint", "maintflag", "longmaint", "remaint", "gapmaint",
+		"nothing"}
 	for _, h := range hosts {
 		execAll(t, conn,
 			fmt.Sprintf(`INSERT INTO shawk.hosts VALUES ('%[1]s','m','%[1]s','k','v',now()-interval '30 days',now()-interval '2 days')`, h),
@@ -200,13 +206,15 @@ func TestPGPlannedStops(t *testing.T) {
 		   ('longmaint', now()-interval '40 days', now()-interval '20 days', '{IDLE,MAINT}'),
 		   ('longmaint', now()-interval '20 days', now()-interval '1 minute', '{DOWN,MAINT}'),
 		   ('remaint', now()-interval '40 days', now()-interval '10 days', '{IDLE}'),
-		   ('remaint', now()-interval '10 days', now()-interval '1 minute', '{IDLE,MAINT}')`,
+		   ('remaint', now()-interval '10 days', now()-interval '1 minute', '{IDLE,MAINT}'),
+		   ('gapmaint', now()-interval '35 days', now()-interval '30 days 12 hours', '{IDLE,MAINT}'),
+		   ('gapmaint', now()-interval '1 minute', now(), '{IDLE,MAINT}')`,
 		`INSERT INTO shawk.maintenance_windows VALUES
 		   ('maint', now()-interval '1 hour', now()+interval '1 hour', 'firmware', now()-interval '2 hours'),
 		   ('nothing', now()-interval '3 hours', now()-interval '1 hour', '', now()-interval '4 hours')`)
-	got := queryStrings(t, conn, `SELECT host, cause FROM shawk_v1.planned_stops`)
-	if !slices.Equal(got, []string{"maint maintenance", "maintflag maintenance", "off power_saving", "remaint maintenance",
-		"resuming power_saving"}) {
+	got := queryStrings(t, conn, `SELECT host, cause, since > now() - interval '1 day' FROM shawk_v1.planned_stops`)
+	if !slices.Equal(got, []string{"gapmaint maintenance true", "maint maintenance true", "maintflag maintenance true",
+		"off power_saving false", "remaint maintenance false", "resuming power_saving true"}) {
 		t.Errorf("planned_stops = %v", got)
 	}
 	q := packagedSQL(t)["shawk-rules.yaml/shawk-agents/shawk agent silent/A/A#0"]
@@ -243,5 +251,50 @@ func TestPGPruneNodeStates(t *testing.T) {
 	}
 	if got := query(`SELECT array_to_string(state, '+') FROM shawk.node_states`); !slices.Equal(got, []string{"IDLE+POWERED_DOWN"}) {
 		t.Errorf("after prune = %v", got)
+	}
+}
+
+// TestPGFileStrings: a NUL or a byte that is not UTF-8 in the reasons of
+// node_states_file and maintenance_file, or in the error of an invalid
+// inventory_file, is written cleaned rather than making PostgreSQL refuse
+// the states, the windows or the record of the failure (#254).
+func TestPGFileStrings(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC().Truncate(time.Second)
+	files := map[string]string{
+		"states.json": fmt.Sprintf(`{"generated_at": %q, "nodes": [{"host": "cn001", "state": "DRAIN", "reason": "disk\u0000full"}]}`,
+			now.Format(time.RFC3339)),
+		"maintenance.json": fmt.Sprintf(`{"maintenance": [{"hosts": ["nfs01"], "start": %q, "end": %q, "reason": "fw\u0000"}]}`,
+			now.Add(-time.Hour).Format(time.RFC3339), now.Add(time.Hour).Format(time.RFC3339)),
+		// A zone may hold any text, NUL included.
+		"inventory.json": `{"hosts": [{"name": "cn001", "addrs": ["fe80::1%eth0\u0000"]}]}`,
+		// yaml quotes the start of a value it cannot decode, cut within a
+		// character.
+		"inventory2.yaml": "hosts:\n  - name: cn001\n    agent: éééééé\n",
+	}
+	for name, doc := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(doc), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c, _, conn := pgConnectorWith(t, func(cfg *Config) {
+		cfg.NodeStatesFile = filepath.Join(dir, "states.json")
+		cfg.MaintenanceFile = filepath.Join(dir, "maintenance.json")
+		cfg.InventoryFile = filepath.Join(dir, "inventory.json")
+	})
+	if got := queryStrings(t, conn, `SELECT hostname, array_to_string(state, '+'), reason FROM shawk.node_states`); !slices.Equal(got, []string{"cn001 DRAIN disk�full"}) {
+		t.Errorf("node_states = %q", got)
+	}
+	if got := queryStrings(t, conn, `SELECT hostname, reason FROM shawk.maintenance_windows`); !slices.Equal(got, []string{"nfs01 fw�"}) {
+		t.Errorf("maintenance_windows = %q", got)
+	}
+	const status = `SELECT error FROM shawk_v1.inventory_status WHERE failed_at IS NOT NULL`
+	if got := queryStrings(t, conn, status); len(got) != 1 || !strings.Contains(got[0], "has a zone") || !strings.Contains(got[0], `\x00`) {
+		t.Errorf("inventory_status error = %q", got)
+	}
+	c.cfg.InventoryFile = filepath.Join(dir, "inventory2.yaml")
+	c.syncInventory(context.Background())
+	if got := queryStrings(t, conn, status); len(got) != 1 || !strings.Contains(got[0], "cannot unmarshal") {
+		t.Errorf("inventory_status error = %q", got)
 	}
 }

@@ -50,6 +50,7 @@ type bpfShawkFlowStats struct {
 	HsBuckets  [11]uint32
 	SynRetrans uint32
 	Fails      [5]uint32
+	Protos     [16]uint8
 	_          [4]byte
 }
 
@@ -86,6 +87,11 @@ type bpfShawkOwner struct {
 	Scan     uint32
 }
 
+type bpfShawkPeek struct {
+	_   structs.HostLayout
+	Buf [1024]uint8
+}
+
 type bpfShawkPeerPrefix struct {
 	_         structs.HostLayout
 	Prefixlen uint32
@@ -103,7 +109,9 @@ type bpfShawkSockState struct {
 	Flags       uint32
 	HsUs        uint32
 	Walked      uint32
-	Pad         uint32
+	Peek        uint32
+	PeekPrefix  uint32
+	PeekSeq     uint32
 }
 
 type bpfShawkUdpKstate struct {
@@ -144,11 +152,26 @@ type bpfShawkUnixStats struct {
 	Pid       uint32
 }
 
-type bpfShawkXlatConn struct {
-	_   structs.HostLayout
-	Key bpfShawkXlatKey
-	Gen uint64
-}
+type bpfShawkWireProto uint32
+
+const (
+	bpfShawkWireProtoWIRE_UNKNOWN      bpfShawkWireProto = 0
+	bpfShawkWireProtoWIRE_TLS          bpfShawkWireProto = 1
+	bpfShawkWireProtoWIRE_TLS_10       bpfShawkWireProto = 2
+	bpfShawkWireProtoWIRE_TLS_11       bpfShawkWireProto = 3
+	bpfShawkWireProtoWIRE_TLS_12       bpfShawkWireProto = 4
+	bpfShawkWireProtoWIRE_TLS_13       bpfShawkWireProto = 5
+	bpfShawkWireProtoWIRE_HTTP1        bpfShawkWireProto = 6
+	bpfShawkWireProtoWIRE_HTTP2        bpfShawkWireProto = 7
+	bpfShawkWireProtoWIRE_SSH          bpfShawkWireProto = 8
+	bpfShawkWireProtoWIRE_POSTGRES     bpfShawkWireProto = 9
+	bpfShawkWireProtoWIRE_MYSQL        bpfShawkWireProto = 10
+	bpfShawkWireProtoWIRE_REDIS        bpfShawkWireProto = 11
+	bpfShawkWireProtoWIRE_SLURM        bpfShawkWireProto = 12
+	bpfShawkWireProtoWIRE_POSTGRES_TLS bpfShawkWireProto = 13
+	bpfShawkWireProtoWIRE_MYSQL_TLS    bpfShawkWireProto = 14
+	bpfShawkWireProtoWIRE_PROTOS       bpfShawkWireProto = 15
+)
 
 type bpfShawkXlatKey struct {
 	_       structs.HostLayout
@@ -160,14 +183,8 @@ type bpfShawkXlatKey struct {
 	Vport   uint16
 	Bport   uint16
 	Proto   uint8
-	Pad     [7]uint8
-}
-
-type bpfShawkXlatStats struct {
-	_     structs.HostLayout
-	Conns uint64
-	Live  int64
-	Gen   uint64
+	Idx     uint8
+	Pad     [6]uint8
 }
 
 type bpfUnixConnectArgs struct {
@@ -189,6 +206,7 @@ const (
 	bpfMapInternalPeers           = "internal_peers"
 	bpfMapListenPorts             = "listen_ports"
 	bpfMapMptcpOwners             = "mptcp_owners"
+	bpfMapPeeks                   = "peeks"
 	bpfMapSockStates              = "sock_states"
 	bpfMapUdpKstates              = "udp_kstates"
 	bpfMapUdpListenPorts          = "udp_listen_ports"
@@ -216,6 +234,7 @@ const (
 	bpfProgShawkSkbConsumeUdp     = "shawk_skb_consume_udp"
 	bpfProgShawkSkbConsumeUdpK    = "shawk_skb_consume_udp_k"
 	bpfProgShawkTcpReceiveReset   = "shawk_tcp_receive_reset"
+	bpfProgShawkTcpSendmsg        = "shawk_tcp_sendmsg"
 	bpfProgShawkUnixConnectK      = "shawk_unix_connect_k"
 	bpfProgShawkUnixConnectRet    = "shawk_unix_connect_ret"
 	bpfProgShawkUnixRelease       = "shawk_unix_release"
@@ -240,10 +259,10 @@ const (
 	bpfVarUnixTraced              = "unix_traced"
 	bpfVarUnusedCgroupEvent       = "unused_cgroup_event"
 	bpfVarUnusedIterRec           = "unused_iter_rec"
-	bpfVarUnusedXlatConn          = "unused_xlat_conn"
+	bpfVarUnusedWireProto         = "unused_wire_proto"
 	bpfVarUnusedXlatKey           = "unused_xlat_key"
-	bpfVarUnusedXlatStats         = "unused_xlat_stats"
 	bpfVarWalkGen                 = "walk_gen"
+	bpfVarWireTraced              = "wire_traced"
 	bpfVarXlatDrops               = "xlat_drops"
 )
 
@@ -305,6 +324,7 @@ type bpfProgramSpecs struct {
 	ShawkSkbConsumeUdp     *ebpf.ProgramSpec `ebpf:"shawk_skb_consume_udp"`
 	ShawkSkbConsumeUdpK    *ebpf.ProgramSpec `ebpf:"shawk_skb_consume_udp_k"`
 	ShawkTcpReceiveReset   *ebpf.ProgramSpec `ebpf:"shawk_tcp_receive_reset"`
+	ShawkTcpSendmsg        *ebpf.ProgramSpec `ebpf:"shawk_tcp_sendmsg"`
 	ShawkUnixConnectK      *ebpf.ProgramSpec `ebpf:"shawk_unix_connect_k"`
 	ShawkUnixConnectRet    *ebpf.ProgramSpec `ebpf:"shawk_unix_connect_ret"`
 	ShawkUnixRelease       *ebpf.ProgramSpec `ebpf:"shawk_unix_release"`
@@ -324,6 +344,7 @@ type bpfMapSpecs struct {
 	InternalPeers  *ebpf.MapSpec `ebpf:"internal_peers"`
 	ListenPorts    *ebpf.MapSpec `ebpf:"listen_ports"`
 	MptcpOwners    *ebpf.MapSpec `ebpf:"mptcp_owners"`
+	Peeks          *ebpf.MapSpec `ebpf:"peeks"`
 	SockStates     *ebpf.MapSpec `ebpf:"sock_states"`
 	UdpKstates     *ebpf.MapSpec `ebpf:"udp_kstates"`
 	UdpListenPorts *ebpf.MapSpec `ebpf:"udp_listen_ports"`
@@ -360,10 +381,10 @@ type bpfVariableSpecs struct {
 	UnixTraced        *ebpf.VariableSpec `ebpf:"unix_traced"`
 	UnusedCgroupEvent *ebpf.VariableSpec `ebpf:"unused_cgroup_event"`
 	UnusedIterRec     *ebpf.VariableSpec `ebpf:"unused_iter_rec"`
-	UnusedXlatConn    *ebpf.VariableSpec `ebpf:"unused_xlat_conn"`
+	UnusedWireProto   *ebpf.VariableSpec `ebpf:"unused_wire_proto"`
 	UnusedXlatKey     *ebpf.VariableSpec `ebpf:"unused_xlat_key"`
-	UnusedXlatStats   *ebpf.VariableSpec `ebpf:"unused_xlat_stats"`
 	WalkGen           *ebpf.VariableSpec `ebpf:"walk_gen"`
+	WireTraced        *ebpf.VariableSpec `ebpf:"wire_traced"`
 	XlatDrops         *ebpf.VariableSpec `ebpf:"xlat_drops"`
 }
 
@@ -395,6 +416,7 @@ type bpfMaps struct {
 	InternalPeers  *ebpf.Map `ebpf:"internal_peers"`
 	ListenPorts    *ebpf.Map `ebpf:"listen_ports"`
 	MptcpOwners    *ebpf.Map `ebpf:"mptcp_owners"`
+	Peeks          *ebpf.Map `ebpf:"peeks"`
 	SockStates     *ebpf.Map `ebpf:"sock_states"`
 	UdpKstates     *ebpf.Map `ebpf:"udp_kstates"`
 	UdpListenPorts *ebpf.Map `ebpf:"udp_listen_ports"`
@@ -418,6 +440,7 @@ func (m *bpfMaps) Close() error {
 		m.InternalPeers,
 		m.ListenPorts,
 		m.MptcpOwners,
+		m.Peeks,
 		m.SockStates,
 		m.UdpKstates,
 		m.UdpListenPorts,
@@ -455,10 +478,10 @@ type bpfVariables struct {
 	UnixTraced        *ebpf.Variable `ebpf:"unix_traced"`
 	UnusedCgroupEvent *ebpf.Variable `ebpf:"unused_cgroup_event"`
 	UnusedIterRec     *ebpf.Variable `ebpf:"unused_iter_rec"`
-	UnusedXlatConn    *ebpf.Variable `ebpf:"unused_xlat_conn"`
+	UnusedWireProto   *ebpf.Variable `ebpf:"unused_wire_proto"`
 	UnusedXlatKey     *ebpf.Variable `ebpf:"unused_xlat_key"`
-	UnusedXlatStats   *ebpf.Variable `ebpf:"unused_xlat_stats"`
 	WalkGen           *ebpf.Variable `ebpf:"walk_gen"`
+	WireTraced        *ebpf.Variable `ebpf:"wire_traced"`
 	XlatDrops         *ebpf.Variable `ebpf:"xlat_drops"`
 }
 
@@ -482,6 +505,7 @@ type bpfPrograms struct {
 	ShawkSkbConsumeUdp     *ebpf.Program `ebpf:"shawk_skb_consume_udp"`
 	ShawkSkbConsumeUdpK    *ebpf.Program `ebpf:"shawk_skb_consume_udp_k"`
 	ShawkTcpReceiveReset   *ebpf.Program `ebpf:"shawk_tcp_receive_reset"`
+	ShawkTcpSendmsg        *ebpf.Program `ebpf:"shawk_tcp_sendmsg"`
 	ShawkUnixConnectK      *ebpf.Program `ebpf:"shawk_unix_connect_k"`
 	ShawkUnixConnectRet    *ebpf.Program `ebpf:"shawk_unix_connect_ret"`
 	ShawkUnixRelease       *ebpf.Program `ebpf:"shawk_unix_release"`
@@ -507,6 +531,7 @@ func (p *bpfPrograms) Close() error {
 		p.ShawkSkbConsumeUdp,
 		p.ShawkSkbConsumeUdpK,
 		p.ShawkTcpReceiveReset,
+		p.ShawkTcpSendmsg,
 		p.ShawkUnixConnectK,
 		p.ShawkUnixConnectRet,
 		p.ShawkUnixRelease,

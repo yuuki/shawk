@@ -101,6 +101,9 @@ type edgeInput struct {
 	id          edgeID
 	first, last time.Time
 	values      map[valueKey]point
+	// wire are when connections of the edge showed each wire protocol, of
+	// wireProtocols; nil if none did.
+	wire map[string]span
 }
 
 // translationID identifies a translation of addresses that a host made:
@@ -164,8 +167,12 @@ type hostBatch struct {
 	// unixTraced tells whether the agent traces Unix sockets, nil if it
 	// does not tell (an agent before shawk.agent.unix.traced).
 	unixTraced *bool
-	netnsScope string
-	dropped    int64
+	// protocolsClassified tells whether the agent classifies the wire
+	// protocols of TCP connections, nil if it does not tell (an agent
+	// before shawk.agent.protocols.classified).
+	protocolsClassified *bool
+	netnsScope          string
+	dropped             int64
 	// droppedSince is the start of the counter of dropped flows, when the
 	// agent started, by the clock of the agent; zero if unknown.
 	droppedSince time.Time
@@ -212,9 +219,11 @@ const maxStringBytes = 4096
 // the sum of the increases of its inputs.
 const maxValue = 1 << 63
 
-// validValue tells whether v, the value of a point of an edge, is within
-// maxValue; NaN is not.
-func validValue(v float64) bool { return math.Abs(v) < maxValue }
+// validValue tells whether v, the value of a point of an edge, is a count
+// below maxValue. No metric of an edge is negative: a negative value would
+// be taken for a reset of its input and decrease the outputs it is added
+// to. NaN is not valid.
+func validValue(v float64) bool { return v >= 0 && v < maxValue }
 
 // parseResource decodes the metrics of one agent.
 func parseResource(rm pmetric.ResourceMetrics) (*hostBatch, error) {
@@ -287,31 +296,23 @@ func (b *hostBatch) addMetric(m pmetric.Metric) {
 	case metricEdgeFirst, metricEdgeLast:
 		forGauge(b, m, func(dp pmetric.NumberDataPoint, t time.Time) {
 			if e := b.edge(dp.Attributes()); e != nil {
-				if name == metricEdgeFirst {
-					e.first = t
-				} else {
-					e.last = t
-				}
+				setSeen(&e.first, &e.last, name == metricEdgeFirst, t)
 			}
+		})
+	case metricEdgeWireFirst, metricEdgeWireLast:
+		forGauge(b, m, func(dp pmetric.NumberDataPoint, t time.Time) {
+			b.addWire(dp.Attributes(), name == metricEdgeWireFirst, t)
 		})
 	case metricListenerFirst, metricListenerLast:
 		forGauge(b, m, func(dp pmetric.NumberDataPoint, t time.Time) {
 			if l := b.listener(dp.Attributes()); l != nil {
-				if name == metricListenerFirst {
-					l.first = t
-				} else {
-					l.last = t
-				}
+				setSeen(&l.first, &l.last, name == metricListenerFirst, t)
 			}
 		})
 	case metricTranslationFirst, metricTranslationLast:
 		forGauge(b, m, func(dp pmetric.NumberDataPoint, t time.Time) {
 			if x := b.translation(dp.Attributes()); x != nil {
-				if name == metricTranslationFirst {
-					x.first = t
-				} else {
-					x.last = t
-				}
+				setSeen(&x.first, &x.last, name == metricTranslationFirst, t)
 			}
 		})
 	default:
@@ -319,6 +320,42 @@ func (b *hostBatch) addMetric(m pmetric.Metric) {
 			b.addAgent(m, name)
 		}
 	}
+}
+
+// setSeen sets to t the time a series was first seen, or else the time it
+// was last seen.
+func setSeen(firstSeen, lastSeen *time.Time, first bool, t time.Time) {
+	if first {
+		*firstSeen = t
+	} else {
+		*lastSeen = t
+	}
+}
+
+// addWire records when a TCP edge, of the attributes of a point, first or
+// last saw a wire protocol. A protocol the connector does not know, as of a
+// newer agent, is dropped like a metric of the agent it does not know, and
+// logged as rarely; a protocol of another edge than TCP is invalid.
+func (b *hostBatch) addWire(a pcommon.Map, first bool, t time.Time) {
+	p := getString(a, attrWireProtocol)
+	if getString(a, attrTransport) != "tcp" || p == "" {
+		b.invalid++
+		return
+	}
+	if !wireProtocols[p] {
+		b.dropAgent(attrWireProtocol + "=" + p)
+		return
+	}
+	e := b.edge(a)
+	if e == nil {
+		return
+	}
+	if e.wire == nil {
+		e.wire = map[string]span{}
+	}
+	s := e.wire[p]
+	setSeen(&s.first, &s.last, first, t)
+	e.wire[p] = s
 }
 
 // addSums decodes the points of m, a sum of the edges named name.
@@ -402,6 +439,11 @@ func (b *hostBatch) addAgent(m pmetric.Metric, name string) {
 			traced := numberValue(dp) != 0
 			b.unixTraced = &traced
 		})
+	case metricAgentProtocolsClassified:
+		forGauge(b, m, func(dp pmetric.NumberDataPoint, _ time.Time) {
+			classified := numberValue(dp) != 0
+			b.protocolsClassified = &classified
+		})
 	case metricAgentUp:
 		b.final = true
 		forGauge(b, m, func(dp pmetric.NumberDataPoint, _ time.Time) {
@@ -439,6 +481,7 @@ var agentMetrics = map[string]agentMetric{
 	metricAgentUp:                  {gauge: true, attr: attrNetNSScope, valid: netnsScope},
 	metricAgentUDPTraced:           {gauge: true},
 	metricAgentUnixTraced:          {gauge: true},
+	metricAgentProtocolsClassified: {gauge: true},
 	metricAgentFlowsDropped:        {unit: "{update}"},
 	metricAgentCgroupsDropped:      {unit: "{event}"},
 	metricAgentReadsDropped:        {unit: "{read}"},
@@ -452,6 +495,32 @@ var agentMetrics = map[string]agentMetric{
 
 func isBPFProgram(s string) bool { return bpfPrograms[s] }
 
+// points returns the points of m, if m is of the type of the metric.
+func (d agentMetric) points(m pmetric.Metric) (pmetric.NumberDataPointSlice, bool) {
+	switch {
+	case d.gauge && m.Type() == pmetric.MetricTypeGauge:
+		return m.Gauge().DataPoints(), true
+	case !d.gauge && m.Type() == pmetric.MetricTypeSum:
+		return m.Sum().DataPoints(), true
+	}
+	return pmetric.NumberDataPointSlice{}, false
+}
+
+// appendTo appends the metric, named name, to ms as it is forwarded, and
+// returns its points, of which it has none yet.
+func (d agentMetric) appendTo(ms pmetric.MetricSlice, name string) pmetric.NumberDataPointSlice {
+	om := ms.AppendEmpty()
+	om.SetName(name)
+	om.SetUnit(d.unit)
+	if d.gauge {
+		return om.SetEmptyGauge().DataPoints()
+	}
+	sum := om.SetEmptySum()
+	sum.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
+	sum.SetIsMonotonic(true)
+	return sum.DataPoints()
+}
+
 // addAgentMetric keeps a metric of the agent to forward. It is made anew
 // from its description in agentMetrics, with the time and value of each
 // point and the attribute it may have; other attributes are left out. A
@@ -463,12 +532,10 @@ func (b *hostBatch) addAgentMetric(m pmetric.Metric) {
 	name := m.Name()
 	desc, ok := agentMetrics[name]
 	var dps pmetric.NumberDataPointSlice
-	switch {
-	case ok && desc.gauge && m.Type() == pmetric.MetricTypeGauge:
-		dps = m.Gauge().DataPoints()
-	case ok && !desc.gauge && m.Type() == pmetric.MetricTypeSum:
-		dps = m.Sum().DataPoints()
-	default:
+	if ok {
+		dps, ok = desc.points(m)
+	}
+	if !ok {
 		b.dropAgent(name)
 		return
 	}
@@ -485,17 +552,7 @@ func (b *hostBatch) addAgentMetric(m pmetric.Metric) {
 			continue
 		}
 		if !kept {
-			om := b.agent.AppendEmpty()
-			om.SetName(name)
-			om.SetUnit(desc.unit)
-			if desc.gauge {
-				out = om.SetEmptyGauge().DataPoints()
-			} else {
-				sum := om.SetEmptySum()
-				sum.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
-				sum.SetIsMonotonic(true)
-				out = sum.DataPoints()
-			}
+			out = desc.appendTo(b.agent, name)
 			b.agentPoints[name] = out
 		}
 		p := out.AppendEmpty()
@@ -530,6 +587,13 @@ func (b *hostBatch) dropAgent(name string) {
 	}
 }
 
+// maxUnixTime is the latest time of a gauge of Unix seconds the connector
+// takes, the end of the year 9999. A later time is no time an agent sends,
+// and one near 2^63 seconds wraps around in time.Unix to a time far before
+// 1970, which no cap on times ahead of the connector catches and which
+// would make PostgreSQL refuse the changes of the host.
+const maxUnixTime = 253402300799
+
 // forGauge calls f with the data points of a gauge of Unix seconds.
 func forGauge(b *hostBatch, m pmetric.Metric, f func(pmetric.NumberDataPoint, time.Time)) {
 	if m.Type() != pmetric.MetricTypeGauge {
@@ -540,7 +604,15 @@ func forGauge(b *hostBatch, m pmetric.Metric, f func(pmetric.NumberDataPoint, ti
 	for i := range dps.Len() {
 		dp := dps.At(i)
 		b.observe(dp.Timestamp())
-		f(dp, time.Unix(int64(numberValue(dp)), 0).UTC())
+		// A time before 1970 is no time an agent sends either, and one far
+		// before would make PostgreSQL refuse the changes of the host. NaN is
+		// not a time.
+		v := numberValue(dp)
+		if !(v >= 0 && v <= maxUnixTime) {
+			b.invalid++
+			continue
+		}
+		f(dp, time.Unix(int64(v), 0).UTC())
 	}
 }
 

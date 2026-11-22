@@ -341,7 +341,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT host, alive, agent_version, kernel, udp_traced, unix_traced, netns_scope, dropped_flows,\n       started_at AS observed_since, last_heartbeat, clock_skew,\n       peer_fold AS folds, array_to_string(peer_internal, ', ') AS internal_peers\nFROM shawk_v1.agents\nORDER BY alive, host"
+          "rawSql": "SELECT host, alive, agent_version, kernel, udp_traced, unix_traced, protocols_classified, netns_scope, dropped_flows,\n       started_at AS observed_since, last_heartbeat, clock_skew,\n       peer_fold AS folds, array_to_string(peer_internal, ', ') AS internal_peers\nFROM shawk_v1.agents\nORDER BY alive, host"
         }
       ],
       "options": {

@@ -30,7 +30,9 @@
 # loads; the other kernels run with SHAWK_TEST_NO_NFS=1. It also holds the
 # modules of conntrack and nf_tables with NAT, from kernel-modules-core or
 # the modules package of the mainline build, for the tests of translations;
-# a kernel given by its path runs with SHAWK_TEST_NO_CONNTRACK=1. Further arguments of the test binaries can be given in
+# a kernel given by its path runs with SHAWK_TEST_NO_CONNTRACK=1. The
+# initramfs has no module of VXLAN, so every kernel runs with
+# SHAWK_TEST_NO_VXLAN=1. Further arguments of the test binaries can be given in
 # VM_TEST_ARGS, e.g. VM_TEST_ARGS='-test.run=TestUDP'.
 #
 # Requires go, qemu-system-x86_64 or qemu-system-aarch64, cpio, gzip, curl,
@@ -213,7 +215,7 @@ EOF
 
 # Unknown parameters of the kernel command line are passed to init as
 # environment variables.
-cmdline="console=$console panic=-1 quiet SHAWK_TEST_STRICT=${SHAWK_TEST_STRICT:-1} SHAWK_TEST_NO_UDP=${no_udp:-0} SHAWK_TEST_NO_TRAMPOLINES=${no_trampolines:-0} SHAWK_TEST_NO_NFS=${SHAWK_TEST_NO_NFS:-$no_nfs} SHAWK_TEST_NO_CONNTRACK=${SHAWK_TEST_NO_CONNTRACK:-$no_conntrack}"
+cmdline="console=$console panic=-1 quiet SHAWK_TEST_STRICT=${SHAWK_TEST_STRICT:-1} SHAWK_TEST_NO_UDP=${no_udp:-0} SHAWK_TEST_NO_TRAMPOLINES=${no_trampolines:-0} SHAWK_TEST_NO_NFS=${SHAWK_TEST_NO_NFS:-$no_nfs} SHAWK_TEST_NO_CONNTRACK=${SHAWK_TEST_NO_CONNTRACK:-$no_conntrack} SHAWK_TEST_NO_VXLAN=${SHAWK_TEST_NO_VXLAN:-1}"
 opts=(-m 2G -smp 2 -nographic -no-reboot -kernel "$image" -initrd "$WORK/initramfs.gz" -append "$cmdline")
 host="$(uname -m)"
 host="${host/arm64/aarch64}"

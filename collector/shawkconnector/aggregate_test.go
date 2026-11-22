@@ -3,6 +3,7 @@ package shawkconnector
 import (
 	"fmt"
 	"maps"
+	"math"
 	"testing"
 	"time"
 
@@ -229,6 +230,97 @@ func TestOutputsByConnectorClock(t *testing.T) {
 }
 
 // testBatch decodes the request of an agent.
+// TestIdleHostKept: a host that sends no edges, as an idle node, keeps the
+// latest interval it closed here until it stops sending for the TTL, so
+// that its inputs are not taken as new and a late request is not emitted.
+func TestIdleHostKept(t *testing.T) {
+	a := newAggregator(15*time.Minute, 50, 200, false, t0.Add(-time.Hour))
+	b := testBatch(t, tAgent{host: "app-01", time: t0})
+	a.add(b, func(*edgeID) peer { return peer{} }, t0, pmetric.NewMetrics())
+	for _, at := range []time.Duration{time.Minute, 15 * time.Minute} {
+		a.expire(t0.Add(at))
+		if h := a.hosts[b.key]; h == nil || !h.emitted.Equal(t0) {
+			t.Errorf("%v after its request: host %+v, want it with the interval it closed at t0", at, h)
+		}
+	}
+	a.expire(t0.Add(15*time.Minute + time.Nanosecond))
+	if h := a.hosts[b.key]; h != nil {
+		t.Errorf("after the TTL: host %+v, want it forgotten", h)
+	}
+}
+
+// TestGaugeInputsExpire: the open connections of an output forget the
+// inputs that expired, even while the output lives on and no request of its
+// host closes an interval, which would emit it and forget them all.
+func TestGaugeInputsExpire(t *testing.T) {
+	a := newAggregator(15*time.Minute, 50, 200, false, t0.Add(-time.Hour))
+	edge := func(peer string) tEdge {
+		return tEdge{role: roleClient, proto: "tcp", local: "10.0.0.11", peer: peer, port: 5432, svc: "app", comm: "app",
+			opened: 1, count: 1}
+	}
+	db := func(*edgeID) peer { return peer{name: "db"} }
+	// Two edges to replicas of db, of one output, in requests that do not
+	// close intervals.
+	a.add(testBatch(t, tAgent{host: "app-01", time: t0, partial: true, edges: []tEdge{edge("10.0.0.10"), edge("10.0.0.20")}}),
+		db, t0, pmetric.NewMetrics())
+	// The first goes on, the second stops.
+	later := t0.Add(10 * time.Minute)
+	a.add(testBatch(t, tAgent{host: "app-01", time: later, partial: true, edges: []tEdge{edge("10.0.0.10")}}),
+		db, later, pmetric.NewMetrics())
+	a.expire(t0.Add(16 * time.Minute))
+	h := a.hosts[hostKey("", "app-01")]
+	var gauges int
+	for _, r := range h.resources {
+		for k, s := range r.series {
+			if k.metric != metricConnCount {
+				continue
+			}
+			gauges++
+			for ik := range s.gauge {
+				if h.inputs[ik] == nil {
+					t.Errorf("the gauge holds an input that expired, to %v", ik.edge.peer)
+				}
+			}
+			if len(s.gauge) != 1 {
+				t.Errorf("the gauge holds %d inputs, want 1", len(s.gauge))
+			}
+		}
+	}
+	if gauges != 1 {
+		t.Errorf("%d outputs of open connections, want 1", gauges)
+	}
+}
+
+// TestOutputsSaturate: an output whose inputs add up beyond what its type
+// holds stays at its maximum, rather than wrapping to a negative value or a
+// smaller count, which Prometheus would take for a reset.
+func TestOutputsSaturate(t *testing.T) {
+	r := &outResource{series: map[outKey]*outSeries{}}
+	sum, hist := outKey{metric: metricConnOpened}, outKey{metric: metricRTT}
+	for range 2 {
+		r.account(sum, outMetrics[metricConnOpened], inputKey{}, point{}, maxValue-1024, 0, t0, t0)
+		r.account(hist, outMetrics[metricRTT], inputKey{}, point{}, 1, math.MaxUint64-1, t0, t0)
+	}
+	out := pmetric.NewMetrics()
+	r.appendTo(svcKey{service: "app"}, &hostOutputs{hostname: "app-01"}, 0, t0, out)
+	ms := out.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics()
+	if ms.Len() != 2 {
+		t.Fatalf("%d metrics, want 2", ms.Len())
+	}
+	for i := range ms.Len() {
+		switch m := ms.At(i); m.Name() {
+		case metricConnOpened:
+			if v := m.Sum().DataPoints().At(0).IntValue(); v != math.MaxInt64 {
+				t.Errorf("sum = %d, want %d", v, int64(math.MaxInt64))
+			}
+		case metricRTT:
+			if c := m.Histogram().DataPoints().At(0).Count(); c != math.MaxUint64 {
+				t.Errorf("count = %d, want %d", c, uint64(math.MaxUint64))
+			}
+		}
+	}
+}
+
 func testBatch(t *testing.T, ta tAgent) *hostBatch {
 	t.Helper()
 	b, err := parseResource(ta.metrics().ResourceMetrics().At(0))

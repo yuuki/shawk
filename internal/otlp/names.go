@@ -26,6 +26,11 @@ const (
 	MetricConnFailedByReason = "shawk.connection.failed.by_reason"
 	MetricEdgeFirst          = "shawk.edge.first_seen"
 	MetricEdgeLast           = "shawk.edge.last_seen"
+	// Of TCP edges with -classify-protocols: when a connection whose first
+	// payload showed each wire protocol (shawk.wire_protocol) was first and
+	// last seen. PostgreSQL keeps them, Prometheus does not.
+	MetricEdgeWireFirst = "shawk.edge.wire_protocol.first_seen"
+	MetricEdgeWireLast  = "shawk.edge.wire_protocol.last_seen"
 
 	MetricListenerFirst = "shawk.listener.first_seen"
 	MetricListenerLast  = "shawk.listener.last_seen"
@@ -33,16 +38,20 @@ const (
 	MetricTranslationFirst = "shawk.translation.first_seen"
 	MetricTranslationLast  = "shawk.translation.last_seen"
 
-	MetricAgentUp             = "shawk.agent.up"
-	MetricAgentSegmentStart   = "shawk.agent.segment.start"
-	MetricAgentUDPTraced      = "shawk.agent.udp.traced"
-	MetricAgentUnixTraced     = "shawk.agent.unix.traced"
-	MetricAgentFlowsDropped   = "shawk.agent.flows.dropped"
-	MetricAgentCgroupsDropped = "shawk.agent.cgroup_events.dropped"
-	MetricAgentReadsDropped   = "shawk.agent.container_reads.dropped"
-	MetricAgentExportFailures = "shawk.agent.export.failures"
-	MetricAgentBPFRunCount    = "shawk.agent.bpf.run_count"
-	MetricAgentBPFRunTime     = "shawk.agent.bpf.run_time"
+	MetricAgentUp           = "shawk.agent.up"
+	MetricAgentSegmentStart = "shawk.agent.segment.start"
+	MetricAgentUDPTraced    = "shawk.agent.udp.traced"
+	MetricAgentUnixTraced   = "shawk.agent.unix.traced"
+	// MetricAgentProtocolsClassified tells, of an agent asked to classify
+	// the wire protocols of TCP connections (-classify-protocols), whether
+	// it does; others do not send it.
+	MetricAgentProtocolsClassified = "shawk.agent.protocols.classified"
+	MetricAgentFlowsDropped        = "shawk.agent.flows.dropped"
+	MetricAgentCgroupsDropped      = "shawk.agent.cgroup_events.dropped"
+	MetricAgentReadsDropped        = "shawk.agent.container_reads.dropped"
+	MetricAgentExportFailures      = "shawk.agent.export.failures"
+	MetricAgentBPFRunCount         = "shawk.agent.bpf.run_count"
+	MetricAgentBPFRunTime          = "shawk.agent.bpf.run_time"
 
 	MetricAgentTranslationsTraced  = "shawk.agent.translations.traced"
 	MetricAgentTranslationsDropped = "shawk.agent.translations.dropped"
@@ -85,6 +94,8 @@ const (
 	AttrNetNSScope   = "shawk.netns.scope"
 	AttrBPFProgram   = "shawk.bpf.program"
 	AttrErrorType    = "error.type"
+	// AttrWireProtocol is one of WireProtocols.
+	AttrWireProtocol = "shawk.wire_protocol"
 
 	// Attributes of a translation of addresses (see TranslationKey).
 	AttrTranslationClient      = "shawk.translation.client.address"
@@ -124,3 +135,11 @@ var FailReasons = [...]string{"refused", "timeout", "unreachable", "local", "abo
 
 // ErrorOther is the error.type of failures without one of FailReasons.
 const ErrorOther = "_OTHER"
+
+// WireProtocols are the values of shawk.wire_protocol, the protocols that
+// the first payload of a TCP connection shows, in the order of the bits of
+// EdgeStats.Protocols and of tracer.WireProtocol.
+var WireProtocols = [...]string{
+	"unknown", "tls", "tls_1_0", "tls_1_1", "tls_1_2", "tls_1_3", "http1", "http2_grpc", "ssh", "postgres", "mysql",
+	"redis", "slurm_rpc", "postgres_tls", "mysql_tls",
+}

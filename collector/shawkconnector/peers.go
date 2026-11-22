@@ -216,10 +216,14 @@ type resolver struct {
 	// when, with peer_hosts only, until they are written to PostgreSQL and
 	// read back into dbFormer (forgetHeld): while the database cannot be
 	// written or read, an address that moved to another host does not name
-	// its former holder again once the new one stops. localNames are the
-	// names of their hosts.
-	localHeld  map[netip.Addr]map[string]time.Time
-	localNames map[string]string
+	// its former holder again once the new one stops. Those whose changes
+	// are dropped are forgotten (droppedHeld), so that the holders not
+	// written are bounded with the pending changes. heldWritten are those
+	// written since the latest read, with when they held the addresses as
+	// written (wroteHeld). localNames are the names of their hosts.
+	localHeld   map[netip.Addr]map[string]time.Time
+	heldWritten map[netip.Addr]map[string]time.Time
+	localNames  map[string]string
 }
 
 // formerHolderWindow is how long after a host last held an address the
@@ -276,6 +280,7 @@ func newResolver(cidrs []namedPrefix, translations []translation) *resolver {
 		localServed:         map[clientKey]map[endpoint]time.Time{},
 		inferred:            map[string]int{},
 		localHeld:           map[netip.Addr]map[string]time.Time{},
+		heldWritten:         map[netip.Addr]map[string]time.Time{},
 		localNames:          map[string]string{},
 	}
 }
@@ -536,13 +541,66 @@ func (r *resolver) learnHost(b *hostBatch, now time.Time) {
 	}
 }
 
-// forgetHeld forgets the holders of addresses seen before t, once what was
-// seen then has been written to PostgreSQL and read back.
-func (r *resolver) forgetHeld(t time.Time) {
+// wroteHeld records that the changes of host written to PostgreSQL held
+// addrs, its addresses with when it held them: the holders seen no later
+// are forgotten once read back (forgetHeld). A holder seen since, by a
+// request whose changes were not yet pending, is kept for the next write.
+func (r *resolver) wroteHeld(host string, addrs map[netip.Addr]span) {
+	if !r.peerHosts || len(addrs) == 0 {
+		return
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	expireLearned(r.localHeld, t)
+	for a, s := range addrs {
+		if t, ok := r.localHeld[a][host]; ok && !t.After(s.last) {
+			learnTimed(r.heldWritten, a, host, s.last)
+		}
+	}
+}
+
+// droppedHeld forgets the holders of addresses seen no later than the
+// changes of host that were dropped, which held addrs: they will not be
+// written.
+func (r *resolver) droppedHeld(host string, addrs map[netip.Addr]span) {
+	if !r.peerHosts || len(addrs) == 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for a, s := range addrs {
+		forgetHolder(r.localHeld, a, host, s.last)
+	}
 	r.forgetNames()
+}
+
+// forgetHeld forgets the holders of addresses written to PostgreSQL, once
+// they have been read back.
+func (r *resolver) forgetHeld() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.heldWritten) == 0 {
+		return
+	}
+	for a, hs := range r.heldWritten {
+		for h, t := range hs {
+			forgetHolder(r.localHeld, a, h, t)
+		}
+	}
+	clear(r.heldWritten)
+	r.forgetNames()
+}
+
+// forgetHolder forgets that host held a, if it was last seen holding it no
+// later than t.
+func forgetHolder(held map[netip.Addr]map[string]time.Time, a netip.Addr, host string, t time.Time) {
+	hs := held[a]
+	if at, ok := hs[host]; !ok || at.After(t) {
+		return
+	}
+	delete(hs, host)
+	if len(hs) == 0 {
+		delete(held, a)
+	}
 }
 
 // forgetNames forgets the names of hosts that hold no address in
@@ -620,6 +678,7 @@ func (r *resolver) expire(t, now time.Time) {
 	expireLearned(r.localUnix, t)
 	expireLearned(r.localAddrs, now.Add(-aliveWindow))
 	expireLearned(r.localHeld, now.Add(-formerHolderWindow))
+	expireLearned(r.heldWritten, now.Add(-formerHolderWindow))
 	r.forgetNames()
 	for h, a := range r.localAgents {
 		if a.seen.Before(now.Add(-aliveWindow)) {
@@ -803,7 +862,7 @@ func (r *resolver) holderAgent(host, holder string, id *edgeID, now time.Time) (
 	case id.role == roleServer:
 		// Through a translation, the client connects to a virtual
 		// address, which its agent may fold.
-		v, through := r.foldedVirtual(a, holder, id, now)
+		v, through := r.foldedVirtual(host, a, holder, id, now)
 		if !through && !r.foldsPeer(a, holder, id.local, true, now) {
 			break
 		}
@@ -889,8 +948,12 @@ func (r *resolver) serverPeer(host string, id *edgeID, rules chooser, p peer, co
 	k := clientKey{id.peer, id.local, id.port, id.proto}
 	c := rules
 	c.add(r.localClients[k], r.dbClients[k], r.dbAge(now), 0)
-	if p.name = c.best.service; p.name != "" {
-		return p
+	direct := c.best.service
+	if direct != "" && !r.foldsServerAddr(p, id, now) {
+		// The client connected directly to this address, whatever it does
+		// with a virtual address that also reaches this host.
+		p.name = direct
+		return unfolded(p, covers)
 	}
 	if p.name = r.translatedClient(rules, id, now); p.name != "" {
 		// The client connected to the virtual address, which its agent
@@ -908,7 +971,25 @@ func (r *resolver) serverPeer(host string, id *edgeID, rules chooser, p peer, co
 		// SNAT keeps its name: the source forwards several clients.
 		return unfolded(p, covers)
 	}
+	if direct != "" {
+		// The live agent of the client folds this address itself, so its
+		// direct client edge is from before its configuration changed: the
+		// translations above come first, and otherwise it names the peer,
+		// which stays folded, without blaming a virtual address.
+		p.name, p.foldedVirtual = direct, netip.Addr{}
+	}
 	return p
+}
+
+// foldsServerAddr tells whether the live agent of the client of a server
+// edge, which folds the peer p of the edge, folds the address of the server
+// itself rather than only a virtual address that reaches it. r.mu is held.
+func (r *resolver) foldsServerAddr(p peer, id *edgeID, now time.Time) bool {
+	if p.foldedBy == "" {
+		return false
+	}
+	a, ok := r.agent(p.foldedBy, now)
+	return ok && r.foldsPeer(a, p.foldedBy, id.local, true, now)
 }
 
 // unfolded returns p with agent, as a peer whose agent folds nothing of
@@ -1008,7 +1089,9 @@ func (r *resolver) formerHolder(a netip.Addr, now time.Time) (string, bool) {
 // representative to name the service. So the backend is the host of the
 // peer only when it is the only one: the only backend of a static
 // translation, a single address, or the only address learned translations
-// sent the client to. r.mu is held.
+// sent the client to. Several hosts may have translated to that address,
+// as two directors in turn: they matter only for a loopback or shared
+// address, which is on the host that translated. r.mu is held.
 func (r *resolver) translatedHost(host string, id *edgeID, now time.Time) (string, bool) {
 	if t := r.virtualOf(id); t != nil {
 		if len(t.backends) == 1 && t.backends[0].prefix.IsSingleIP() {
@@ -1021,12 +1104,13 @@ func (r *resolver) translatedHost(host string, id *edgeID, now time.Time) (strin
 		return hostUnknown, false
 	}
 	b := bs[0]
+	onHost := r.sameHostAddr(b.backend, now)
 	for _, o := range bs[1:] {
-		if o.backend != b.backend || o.host != b.host {
+		if o.backend != b.backend || onHost && o.host != b.host {
 			return hostUnknown, false
 		}
 	}
-	if r.sameHostAddr(b.backend, now) {
+	if onHost {
 		// A backend at a loopback or shared address is on the host that
 		// translated the connections.
 		if b.host == host {
@@ -1375,10 +1459,10 @@ func (r *resolver) behindRelay(id *edgeID) bool {
 }
 
 // foldedVirtual returns a virtual address of a translation without sources,
-// static or learned (DNAT),
-// through which the client of a server edge reaches it, and that the agent a
-// of the client, on the host client, folds. r.mu is held.
-func (r *resolver) foldedVirtual(a agentHost, client string, id *edgeID, now time.Time) (netip.Addr, bool) {
+// static or learned (DNAT), through which the client of a server edge of
+// host reaches it, and that the agent a of the client, on the host client,
+// folds. r.mu is held.
+func (r *resolver) foldedVirtual(host string, a agentHost, client string, id *edgeID, now time.Time) (netip.Addr, bool) {
 	for i := range r.translations {
 		t := &r.translations[i]
 		if len(t.sources) > 0 || !t.has(id.proto) {
@@ -1391,15 +1475,14 @@ func (r *resolver) foldedVirtual(a agentHost, client string, id *edgeID, now tim
 		}
 	}
 	// Through a learned DNAT the client connects to its virtual address.
-	k := learnedServerKey{id.proto, id.local, id.port, id.peer}
-	for _, m := range []map[learnedClient]time.Time{r.localLearnedServers[k], r.dbLearnedServers[k]} {
-		for lc := range m {
-			if r.foldsPeer(a, client, lc.virtual, true, now) {
-				return lc.virtual, true
-			}
+	// Pick the smallest address so the choice does not depend on map order.
+	var best netip.Addr
+	for _, lc := range r.learnedClientsOf(host, id, now) {
+		if r.foldsPeer(a, client, lc.virtual, true, now) && (!best.IsValid() || lc.virtual.Less(best)) {
+			best = lc.virtual
 		}
 	}
-	return netip.Addr{}, false
+	return best, best.IsValid()
 }
 
 // translatedClient finds the client service of a server edge at a backend

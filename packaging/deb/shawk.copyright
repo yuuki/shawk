@@ -26,6 +26,7 @@ Comment: The eBPF object embedded in /usr/bin/shawk, compiled from the eBPF
 
 Files: internal/tracer/bpf/shawk.bpf.c
  internal/tracer/bpf/shawk.h
+ internal/tracer/bpf/wire.h
 Copyright: 2026 Yuuki Tsubouchi
 License: GPL-2 or BSD-2-clause
 Comment: The eBPF programs, which are loaded into the Linux kernel. The

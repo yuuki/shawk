@@ -465,17 +465,79 @@ func TestPGTranslationPrecedencePeriods(t *testing.T) {
 	}
 	c.flush(context.Background())
 	q := `SELECT client_service, server_service, last_seen > now() - interval '1 day'`
+	// In the 10 minutes between the two, neither served the client edge as
+	// far as their agents tell, so it keeps a row of its own then, as across
+	// the failover of TestPGTranslationGap.
 	for _, c := range []struct {
 		from string
 		want []string
 	}{
-		{"shawk.service_dependencies", []string{"app haproxy false", "app postgres true"}},
+		{"shawk.service_dependencies", []string{"app haproxy false", "app postgres true", "app ~unresolved false"}},
 		{"shawk.service_dependencies_between(now() - interval '1 day', now())", []string{"app postgres true"}},
-		{"shawk.service_dependencies_between(now() - interval '3 days', now())", []string{"app haproxy false", "app postgres true"}},
+		{"shawk.service_dependencies_between(now() - interval '3 days', now())", []string{"app haproxy false", "app postgres true",
+			"app ~unresolved false"}},
 	} {
 		if got := queryStrings(t, conn, q+" FROM "+c.from); !slices.Equal(got, c.want) {
 			t.Errorf("%s = %q, want %q", c.from, got, c.want)
 		}
+	}
+}
+
+// TestPGTranslationMatchedByAddress: an edge matched through a translation
+// and by address over other parts of its period keeps a row of its own for
+// the part neither covers, and its row matched by address has the period of
+// the other edge, on the client side as on the server side (#247).
+func TestPGTranslationMatchedByAddress(t *testing.T) {
+	_, conn := migratedDB(t)
+	f := fixture{t, conn}
+	for _, h := range [][]string{{"app-01", "app"}, {"app-02", "app"}, {"lb-01", "haproxy"}, {"db-01", "postgres"},
+		{"web-01", "web"}} {
+		f.host(h[0], h[1:]...)
+	}
+	ago := func(m int) string { return fmt.Sprintf("now() - interval '%d minutes'", m) }
+	execAll(t, conn, `INSERT INTO shawk.translations VALUES
+	  ('vip', 'virtual', 'tcp', '10.0.100.1', 5432), ('vip', 'backend', 'tcp', '10.0.1.10', 0),
+	  ('vip', 'backend', 'tcp', '10.0.1.11', 0),
+	  ('dnat', 'virtual', 'tcp', '10.0.100.2', 8080), ('dnat', 'backend', 'tcp', '10.0.1.20', 0)`)
+	// app-01 used the virtual address for two hours: lb-01, a relay with an
+	// agent, served it first, then db-01, then for the last hour db-02,
+	// which runs no agent.
+	f.edge("app-01", "app", "client", "10.0.0.11", "10.0.100.1", 5432, ago(120), "now()")
+	f.edge("lb-01", "haproxy", "server", "10.0.100.1", "10.0.0.11", 5432, ago(120), ago(90))
+	f.edge("db-01", "postgres", "server", "10.0.1.10", "10.0.0.11", 5432, ago(90), ago(60))
+	// app-02 connected to web-01 directly, then through the DNAT of the
+	// virtual address, which web-01 sees on the same server edge.
+	f.edge("app-02", "app", "client", "10.0.0.12", "10.0.1.20", 8080, ago(120), ago(90))
+	f.edge("app-02", "app", "client", "10.0.0.12", "10.0.100.2", 8080, ago(90), "now()")
+	f.edge("web-01", "web", "server", "10.0.1.20", "10.0.0.12", 8080, ago(120), "now()")
+	q := `SELECT coalesce(client_host, '-'), coalesce(server_host, '-'), host(server_addr), observed_by,
+	  coalesce(translation, '-'), round(extract(epoch FROM now() - first_seen) / 60)::int,
+	  round(extract(epoch FROM now() - last_seen) / 60)::int,
+	  client_observed_until IS NOT NULL, server_observed_until IS NOT NULL`
+	want := []string{
+		// The last hour of app-01 is a row of its own, from its start.
+		"app-01 - 10.0.100.1 client - 120 0 true false",
+		"app-01 db-01 10.0.1.10 both vip 90 60 false true",
+		"app-01 lb-01 10.0.100.1 both - 120 90 false true",
+		// The row matched by address ends with the direct client edge; web-01
+		// served app-02 through the translation after it.
+		"app-02 web-01 10.0.1.20 both - 120 90 true false",
+		"app-02 web-01 10.0.1.20 both dnat 90 0 true true",
+	}
+	for _, from := range []string{
+		"shawk_v1.dependencies",
+		"shawk_v1.dependencies_between(now() - interval '3 hours', now())",
+	} {
+		if got := queryStrings(t, conn, q+" FROM "+from); !slices.Equal(got, want) {
+			t.Errorf("%s:\n%s\nwant:\n%s", from, strings.Join(got, "\n"), strings.Join(want, "\n"))
+		}
+	}
+	// In the last half hour, the server edges of lb-01 and db-01 are out of
+	// the period, and app-01 is a row of its own.
+	got := queryStrings(t, conn, q+` FROM shawk_v1.dependencies_between(now() - interval '30 minutes', now())
+	  WHERE client_host = 'app-01'`)
+	if want := []string{"app-01 - 10.0.100.1 client - 120 0 true false"}; !slices.Equal(got, want) {
+		t.Errorf("in the last half hour:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
 	}
 }
 

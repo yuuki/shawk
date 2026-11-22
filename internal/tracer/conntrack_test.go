@@ -164,8 +164,30 @@ func TestTranslations(t *testing.T) {
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	if n := len(tr.xlatLast); n != 0 {
-		t.Errorf("%d idle translations kept", n)
+	for _, m := range []*ebpf.Map{tr.xlats, tr.xlatConns} {
+		if n := mapLen(t, m); n != 0 {
+			t.Errorf("%d entries left in %s", n, m)
+		}
+	}
+}
+
+// mapLen returns the number of keys of a hash map, which no program may
+// update meanwhile.
+func mapLen(t *testing.T, m *ebpf.Map) int {
+	t.Helper()
+	var prev any // nil for the first key
+	n := 0
+	for {
+		key := make([]byte, m.KeySize())
+		err := m.NextKey(prev, key)
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return n
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		n++
+		prev = key
 	}
 }
 
@@ -531,12 +553,12 @@ func TestTranslationsMissedDestroy(t *testing.T) {
 	collect(t, tr)
 	c := dialFrom(t, run, "tcp4", "10.99.0.1", "10.200.0.1:6432")
 	var stale []uint64
-	var staleVal bpfShawkXlatConn
+	var staleVal bpfShawkXlatKey
 	var key uint64
-	var val bpfShawkXlatConn
-	it := tr.xlatConnsMap.Iterate()
+	var val bpfShawkXlatKey
+	it := tr.xlatConns.Iterate()
 	for it.Next(&key, &val) {
-		if val.Key.Netns == ns {
+		if val.Netns == ns {
 			stale = append(stale, key)
 			staleVal = val
 		}
@@ -547,8 +569,8 @@ func TestTranslationsMissedDestroy(t *testing.T) {
 	// released tells whether the entry is gone, or now holds a translation
 	// that reused its memory.
 	released := func() bool {
-		var v bpfShawkXlatConn
-		err := tr.xlatConnsMap.Lookup(stale[0], &v)
+		var v bpfShawkXlatKey
+		err := tr.xlatConns.Lookup(stale[0], &v)
 		if errors.Is(err, ebpf.ErrKeyNotExist) {
 			return true
 		}
@@ -576,7 +598,8 @@ func TestTranslationsMissedDestroy(t *testing.T) {
 	} else {
 		releaseByReuse(t, released)
 	}
-	// The translation is idle: it is reported once more, and then deleted.
+	// The translation was confirmed in the interval that the next collection
+	// closes, and is no longer live: it is reported once more, and then not.
 	collect(t, tr)
 	snap := collect(t, tr)
 	for _, x := range snap.Translations {

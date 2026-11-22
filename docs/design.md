@@ -112,8 +112,11 @@ to the SYN-ACK in fixed buckets, the SYNs retransmitted, and the failures
 by reason (§3.2): the measurement of Pingmesh, taken passively on the
 connections hosts open anyway. Aggregating it by network location is
 proposed in [proposals/path-quality-zones.md](proposals/path-quality-zones.md).
+With `-classify-protocols`, a TCP flow also records the wire protocols
+that the first payloads of its connections showed, such as the version of
+TLS (§3.9).
 
-### 3.2 TCP: tracepoints and socket iterators only
+### 3.2 TCP: tracepoints and socket iterators
 
 | hook | role |
 |---|---|
@@ -125,7 +128,9 @@ proposed in [proposals/path-quality-zones.md](proposals/path-quality-zones.md).
 | `iter/task_file` | owners of adopted connections, MPTCP connections and listeners; stands in for `iter/tcp` where its walk skips connections (below) |
 
 Compared with the original kprobes (`tcp_v4_connect`, `inet_csk_accept`,
-`tcp_sendmsg`, `tcp_cleanup_rbuf`), this costs nothing per message: in the
+`tcp_sendmsg`, `tcp_cleanup_rbuf`), this costs nothing per message (the
+classification of wire protocols, which is opt-in, is the one exception,
+§3.9): in the
 paper the streaming method was cheapest for persistent connections and
 bundling paid on every message, while shawk pays per state change, about
 0.11 to 0.16 µs each and 1.1 to 1.6 µs per connection on Rocky Linux 9.8
@@ -148,7 +153,15 @@ Bytes are read from the cumulative counters of `struct tcp_sock`
 walk, and the difference to the last accounted value is added to the flow
 (SYN and FIN are subtracted; see shawk.bpf.c). A socket iterator walks only
 the network namespace of the thread that opens it, so the agent opens the
-iterators in every namespace of the host (`/proc/*/ns/net`, `/run/netns`).
+iterators in every namespace of the host, and reads them, one namespace at a
+time: the files it holds do not grow with the number of namespaces. The
+namespaces are found through the bind mounts of `ip netns`, CNI and Docker
+(`/run/netns`, `/var/run/netns`, `/run/docker/netns`), which keep their
+namespace, and through `/proc/*/ns/net`, whose process may exit, and its PID
+be reused in another namespace, before the walk. Each namespace keeps up to
+four paths, bind mounts first, then the lowest PIDs; the agent checks that
+the file it opened is the namespace it listed (device and inode), else it
+tries the next path, and skips the namespace for the walk when none is left.
 Where the TCP iterator does not lock each socket (before 5.19; RHEL 9 has
 the backport), a connection closing during a walk may rarely be counted
 twice.
@@ -269,9 +282,12 @@ not attach, kprobes on the same functions stand in for them (#118), with
 the same work: the direction of a socket is then kept in an LRU hash keyed
 by the socket, with its inode, which tells it from a former socket at the
 same address (`udp_kstates`, sized as the listening ports); a socket whose
-entry the LRU evicted is decided again by its next datagram. The agent
-logs that UDP is traced with kprobes. Without either it traces TCP and
-reports that UDP is not traced. Misattributions are listed in §10.
+entry the LRU evicted is decided again by its next datagram. The inode is
+that of its `struct socket`, not of its file, which the sockets of the
+kernel (nfsd, lockd, VXLAN) lack: with the inode 0 of their missing file,
+one would take the direction of a former one at its address (#256). The
+agent logs that UDP is traced with kprobes. Without either it traces TCP
+and reports that UDP is not traced. Misattributions are listed in §10.
 
 ### 3.4 Reading flows without losing updates
 
@@ -296,7 +312,7 @@ Linux 5.14 or later with BTF (`CONFIG_DEBUG_INFO_BTF`):
 | `bpf_sock_from_file`, `bpf_get_current_task_btf` | 5.11 |
 | cgroup pointer in `sock_cgroup_data` (else the owner of accepted connections is resolved in user space only) | 5.15, RHEL 9 |
 | TCP iterator that locks each socket (else rare double counting) | 5.19, RHEL 9 |
-| fentry, fexit (UDP and Unix sockets only) | 5.5 on x86_64, 6.0 on arm64 (RHEL 9 on arm64: 5.14.0-621, in 9.8, not in 9.6); both fall back to kprobes (`CONFIG_KPROBES`, `perf_event_open`) |
+| fentry, fexit (UDP, Unix sockets and wire protocols only) | 5.5 on x86_64, 6.0 on arm64 (RHEL 9 on arm64: 5.14.0-621, in 9.8, not in 9.6); UDP and Unix sockets fall back to kprobes (`CONFIG_KPROBES`, `perf_event_open`), wire protocols (§3.9) are not classified |
 | kprobes on the module nf_conntrack (translations, §3.7; `CONFIG_KPROBES`, the system call `perf_event_open`) | `__nf_conntrack_confirm`, and `nf_ct_destroy` since 5.19 and in RHEL 9, `destroy_conntrack` before |
 | kprobes on `ip_icmp_error` and `ipv6_icmp_error` (the ICMP errors of failed connects, §3.2; `CONFIG_KPROBES`, `perf_event_open`) | any; without them, the reasons of such failures race with `SO_ERROR` |
 
@@ -372,23 +388,28 @@ per packet.
   Ephemeral ports are dropped as in flows, so a change of the source port
   alone translates nothing.
 - `nf_ct_destroy` (`destroy_conntrack` before 5.19) runs when an entry
-  goes, so `xlats` counts live entries and a translation is in use in every
-  interval in which one of its connections is open, as edges are. An entry
-  outlives its connection by its conntrack timeout (up to 2 minutes), within
-  the margin of matching (§5.4); an established entry whose peer vanished
-  stays 5 days, but the rows it matches are still bounded by the edges. A
-  missed destroy (a kprobe is skipped while another BPF program runs on the
-  CPU) keeps a translation live until conntrack reuses the entry's memory.
+  goes, so `xlat_conns` holds the live entries and a translation is in use
+  in every interval in which one of its connections is open, as edges are.
+  An entry outlives its connection by its conntrack timeout (up to 2
+  minutes), within the margin of matching (§5.4); an established entry whose
+  peer vanished stays 5 days, but the rows it matches are still bounded by
+  the edges. A missed destroy (a kprobe is skipped while another BPF program
+  runs on the CPU) keeps a translation live until conntrack reuses the
+  entry's memory.
 - With folding (§3.6), a translation whose source, client or backend is
   outside the internal ranges is not learned, nor, with `all`, one whose
   virtual address is: no edge would match it, and the Internet clients of a
   published port stay out of the table. `-netns` restricts translations to
   one namespace.
-- Translations idle for an interval are deleted. `xlats` holds
-  `-max-flows` translations and `xlat_conns` four times as many live entries
-  (about 9 MiB at the default), allocated only once nf_conntrack is loaded
-  (most RHEL 9 hosts, whose firewalld loads it, and hosts with Docker or
-  kube-proxy). Overflow is counted in `shawk.agent.translations.dropped`; a
+- The translations confirmed in an interval are recorded in `xlats` with the
+  index of the flow maps, which user space reads and deletes after the flip
+  (§3.4); the programs alone add and delete the entries of `xlat_conns`.
+  User space thus writes nothing that a program may update at the same
+  time, and a confirm or a destroy during a read is not lost (#237).
+  `xlats` holds `-max-flows` translations confirmed in an interval and
+  `xlat_conns` four times as many live entries (about 9 MiB at the
+  default), allocated only once nf_conntrack is loaded (most RHEL 9 hosts,
+  whose firewalld loads it, and hosts with Docker or kube-proxy). Overflow is counted in `shawk.agent.translations.dropped`; a
   host with more live translated entries (`nf_conntrack_count`) needs a
   larger `-max-flows`, or a translation used only by long-lived connections
   that did not fit may end early.
@@ -434,8 +455,11 @@ functions that the socket operations point to, and so are never inlined:
   other namespaces through mounts; an abstract name is reached in the
   namespace of its client only. Listeners are found by the owner scans of §3.2 (every
   minute), since `iter/unix` exists only since Linux 5.17; a client of a
-  name that no scan found requests one at the next interval, so a new
-  server is named an interval later. The owner is chosen as for TCP: the
+  name that no scan found in its namespace requests one at the next
+  interval, so a new server is named an interval later, also when another
+  namespace listens on the name. A client that reaches the listener of a
+  path in another namespace through a mount requests such a scan again
+  after each periodic one. The owner is chosen as for TCP: the
   service rather than systemd for socket activation, the parent among its
   workers.
 - **Open connections** are entries of a table that is not flipped, one per
@@ -478,6 +502,145 @@ functions that the socket operations point to, and so are never inlined:
   1024 each (about 3.6 MiB at the default); a connection that does not fit
   is a dropped update (§10).
 
+### 3.9 Wire protocols of TCP connections
+
+A port does not tell which protocol a dependency speaks when the service
+is not on the port of its protocol, nor whether it uses TLS, and which
+version: the questions before TLS 1.0 and 1.1 are turned off on a server,
+or before a database is made to refuse clients in clear text. With
+`-classify-protocols` (off by default) the agent reads the first payload
+that the local socket of each new TCP connection sends, once, and records
+the wire protocol it shows in the flow: the request of a client, the answer
+or the greeting of a server. PostgreSQL keeps when each edge first and last
+saw each protocol (`shawk_v1.edge_protocols`, §6.2); Prometheus does not
+have them, so they add no series.
+
+| hook | role |
+|---|---|
+| `tp_btf/inet_sock_set_state` | marks, in the socket storage, the connections that a process opens in `connect(2)` and the incoming ones, once the program below is attached |
+| `fentry/tcp_sendmsg` | the first send of a marked connection, once established: up to 512 bytes of its data, from the memory of the process (one buffer, or the first 4 iovecs), are classified (`wire_classify()` in `internal/tracer/bpf/wire.h`) and wiped, and the mark is cleared; a first send of 4 bytes is held for the next one |
+
+- **Why a hook on every send.** No hook that runs once per connection sees
+  its first payload: the tracepoint of §3.2 runs before any data, and the
+  data is gone or not yet sent at the walks. Of the hooks that could stop
+  per socket, sockops programs see the headers of segments, not their
+  payload, and sk_msg programs run only for the sockets of a sockmap,
+  which replaces their protocol operations. So `fentry/tcp_sendmsg` runs on
+  every send and returns at once for the connections that sent.
+- **Cost.** An empty fentry program costs 0.03 to 0.04 µs per run on arm64
+  ([research/kernel-hooks](research/kernel-hooks/kernel_hooks.md) §2). A
+  saturated loopback request-response (`tcp_rr`) sends twice per round
+  trip, so the hook adds about 0.06 to 0.08 µs to its 3.2 to 3.9 µs, about
+  2 %, and the lookup of the socket storage adds to that. `-bpf-stats`
+  measures the program (`shawk_tcp_sendmsg`), not the trampoline around
+  it. The copy, the classification and the wipe run once per connection.
+  A kprobe has no socket storage and costs more per run, so where
+  trampolines are missing (§3.5) wire protocols are not classified. The
+  agent logs it and tells it (`shawk.agent.protocols.classified`,
+  `protocols_classified` of `shawk_v1.agents`, alert
+  `ShawkProtocolsNotClassified`), so that an edge without protocols is not
+  taken for one in clear text.
+- **What is read.** 512 bytes rather than the 64 the issue proposed. The
+  version field of a ClientHello of TLS 1.2 and 1.3 is 1.2 in both, and
+  the version offered is in the extension `supported_versions`. With a
+  server name of 22 bytes, that extension starts at byte 213 for Go 1.27,
+  252 for Python with OpenSSL 3.5, 267 for OpenSSL 3.0 and 279 for Java
+  21. It moves with the server name: a ClientHello of Java whose server
+  name is longer than about 245 bytes is `tls`. A first send of exactly 4
+  bytes that matches nothing is held and classified with the next send,
+  because Slurm before 24.05 sends the length of a message apart. The data
+  of the kernel (`ITER_KVEC`), pages (`ITER_BVEC`) and user memory that is
+  paged out are not read. The bytes read may hold credentials (an
+  `Authorization` header, the user of PostgreSQL, the `AUTH` of Redis):
+  they are wiped from the per-CPU buffer once classified, and only the
+  protocol leaves the kernel.
+- **Not classified**, rather than by the middle of their stream:
+  - connections that predate the agent;
+  - connections whose first payload `sendfile(2)` or `splice(2)` sends:
+    before Linux 6.5 through `tcp_sendpage()`, which the program does not
+    see, and since then as pages, which it does not read;
+  - the sockets of a sockmap with sk_msg programs, which send in
+    `tcp_bpf_sendmsg()`;
+  - connections that `sendmsg(2)` opens with `MSG_FASTOPEN`, with a
+    cookie or not, and those of `TCP_FASTOPEN_CONNECT` with a cookie,
+    whose SYN carries their first data;
+  - a client whose first send blocks before its handshake ends (a
+    blocking send in another thread than `connect(2)`, or after a
+    non-blocking `connect(2)`): the program runs before the send waits,
+    and the next send finds data sent;
+  - a send that preempts another run of the program on its CPU: the
+    recursion guard of trampolines (since Linux 5.12) skips it, and the
+    next send finds data sent;
+  - MPTCP connections, which send through their MPTCP socket;
+  - sockets restored in `TCP_REPAIR` (CRIU), whose queues are sent again;
+  - the sockets of the kernel (NFS, iSCSI), whose data is not read.
+- **Signatures.** The values are a fixed enum (`enum shawk_wire_proto`).
+  An answer is a first payload sent after the socket received data: a
+  server of PostgreSQL or Redis answers, while one of MySQL, SSH, SMTP or
+  POP3 greets first.
+
+  | value | first payload of a client | of a server |
+  |---|---|---|
+  | `tls_1_0`, `tls_1_1`, `tls_1_2`, `tls_1_3` | a ClientHello, by the highest version it offers: its version field below TLS 1.2, then `supported_versions` (GREASE skipped); also one in the format of SSL 2.0 (Java 6, OpenSSL 0.9.8), by its version | a ServerHello, by the version it chose: its version field below TLS 1.2, then `supported_versions`, which only TLS 1.3 sends, or, when the bytes read do not hold its extensions, a cipher suite that only TLS 1.3 has (`0x13xx`, and SM4 of RFC 8998) |
+  | `tls` | a ClientHello whose version the bytes read do not tell: `supported_versions` beyond 512 bytes, or a ClientHello split across records | the alert that refuses a client; a ServerHello split across records |
+  | `http1` | a request line in clear text: a method (`GET`, `POST`, ...) and a target of HTTP, a path, an absolute URI of `http` or `https`, `*` of `OPTIONS`, or the host and port of `CONNECT` | a status line (`HTTP/1.`) |
+  | `http2_grpc` | the preface of HTTP/2 in clear text (h2c, gRPC without TLS) | a SETTINGS frame |
+  | `ssh` | `SSH-` | `SSH-` |
+  | `postgres` | a StartupMessage of protocol 3.x, in clear text | as an answer: `N` alone, which refuses TLS or GSSAPI, an authentication request or an error |
+  | `postgres_tls` | an SSLRequest, which asks for TLS | as an answer: `S` alone, which accepts it |
+  | `mysql` | as an answer: a HandshakeResponse41 without `CLIENT_SSL` (MySQL, MariaDB) | the greeting of protocol 10, before it knows what the client asks |
+  | `mysql_tls` | as an answer: an SSLRequest, or a response with `CLIENT_SSL` | — |
+  | `redis` | an array of bulk strings (RESP of Redis, Valkey) | as an answer: a simple string in capitals ended by CR LF (`+OK`, `+PONG`; not the `+OK` text of a greeting of POP3), an error in capitals, a number, a bulk string, an array, a map or a set |
+  | `slurm_rpc` | a message of Slurm 2.3 or later, also to slurmdbd, whose length is that of the send (24.05 and later) or of the sends that follow the length (before; 22.05 to 23.11 send the length, the header, the credential and the body apart) | the same; the answers of slurmdbd, whose header has no version, are `unknown` |
+  | `unknown` | none of these | none of these |
+
+  `tls_1_0` includes SSL 3.0 and 2.0. A first record of TLS other than a
+  hello, or an alert sent by a client, is `unknown`: it is more likely the
+  length of another protocol (a message of 788 to 791 bytes of MongoDB
+  starts like one). The header of Slurm before 22.05 has an index of 2
+  bytes before the type. A StartupMessage starts its parameters with a
+  name, which tells it from a request of Kafka of the same length and
+  type. A GSSENCRequest and a CancelRequest of a client, and `G` of a
+  server, which accepts GSSAPI, add no protocol: libpq sends a
+  CancelRequest on a new connection in clear text whatever `sslmode` says,
+  and GSSAPI encrypts what follows without TLS. A greeting of MySQL is
+  taken also after data, the header of the PROXY protocol that a load
+  balancer sends first.
+- **Read as another protocol.** A client that sends the header of the
+  PROXY protocol first, as a load balancer does, is `unknown`. A tunnel of
+  HTTP `CONNECT` is `http1`, whatever it carries. A server of POP3 that
+  greets with `+OK` alone after the header of the PROXY protocol is
+  `redis`.
+- **Both sides.** A client tells what it offers or asks for, its server
+  what it chose. A client that offers TLS 1.3 to a server of TLS 1.2 is
+  `tls_1_3` on its side and `tls_1_2` on the server's; a client below TLS
+  1.2 cannot reach 1.2, so its side alone finds the clients to upgrade,
+  also those of servers without an agent. A client of PostgreSQL that asks
+  for TLS (`sslmode=prefer`) of a server that refuses it is `postgres_tls`
+  on its side and `postgres` on the server's. The server of MySQL greets
+  before it knows, so its side is `mysql` whatever its clients ask.
+- **TLS started later.** PostgreSQL and MySQL tell whether TLS is asked for
+  and, for PostgreSQL, accepted, but not its version; STARTTLS of SMTP or
+  LDAP is not seen. PostgreSQL 17 with `sslnegotiation=direct` starts with
+  TLS, of a known version. A client of PostgreSQL that asks for GSSAPI
+  first (`gssencmode=prefer` with Kerberos credentials) adds no protocol,
+  whatever follows. Kernel TLS (kTLS) is turned on after the handshake,
+  which the program reads as any other.
+- **Against the issue (#233).** The agent reads what the local socket
+  sends, not what it receives: a server is classified by its answer or its
+  greeting, and the hook runs on every send rather than costing nothing
+  after the first (see the cost above). The enum adds `tls`, of an unknown
+  version, and `postgres_tls` and `mysql_tls`, the clients that ask for
+  TLS. The protocols are in a view of their own, `edge_protocols`, rather
+  than a column of `dependencies`, since an edge may show several.
+- **Flows and series.** The program sets a byte per protocol in the flow of
+  the connection (`protos` of `struct shawk_flow_stats`), so that
+  connections of one flow classified at once on several CPUs set their
+  protocols without atomic operations and none is lost. The agent keeps
+  when each edge first and last saw each protocol, at the end of the
+  intervals that saw it, and sends both with the edge (§4.2), so a TCP edge
+  has at most two gauges per value of the enum.
+
 ## 4. The agent
 
 ### 4.1 Identity of processes and services
@@ -505,24 +668,26 @@ functions that the socket operations point to, and so are never inlined:
 - The processes of Slurm jobs (cgroup v2) are named by the structure of
   `system.slice/slurmstepd.scope/<job>/<step>/...`, whatever names the job
   directory (`job_<id>` before Slurm 26.05 or with `CgroupJobIdPaths=yes`,
-  the SLUID otherwise): `user/task_*` (`task_special` too, where
-  `pam_slurm_adopt` puts the processes it adopts) is named after the kind
-  of its step, `slurm/batch`, `slurm/step` (`step_<n>`,
-  `step_<n>+<component>`), `slurm/extern` or `slurm/interactive`, and the
-  directory of slurmstepd in a step (`slurm`; `slurm_processes` in the
-  documentation) and `<scope>/system` are `slurmstepd`, as Slurm's
-  `cgroup/v2` plugin makes them. The scope is `slurmstepd.scope`, or
-  `<node>_slurmstepd.scope` with `--enable-multiple-slurmd`, recognized
-  only under slices from the root (`system.slice`, or the slice of
-  `CgroupSlice`), where users cannot make cgroups; other hierarchies, and
-  cgroup v1, keep the rules above (`internal/procinfo/cgroup.go`).
+  the SLUID otherwise): `user/task_*` and the cgroups under it, containers
+  included (`task_special` too, where `pam_slurm_adopt` puts the processes
+  it adopts), are named after the kind of their step, `slurm/batch`,
+  `slurm/step` (`step_<n>`, `step_<n>+<component>`), `slurm/extern` or
+  `slurm/interactive`, and the directory of slurmstepd in a step (`slurm`;
+  `slurm_processes` in the documentation) and `<scope>/system` are
+  `slurmstepd`, as Slurm's `cgroup/v2` plugin makes them. The scope is
+  `slurmstepd.scope`, or `<node>_slurmstepd.scope` with
+  `--enable-multiple-slurmd`, recognized only under slices from the root
+  (`system.slice`, or the slice of `CgroupSlice`), where users cannot make
+  cgroups; other hierarchies, and cgroup v1, keep the rules above
+  (`internal/procinfo/cgroup.go`).
 - Container names are not trusted blindly. Docker merges image labels into
   container labels, so pod labels are believed only with the container name
   cri-dockerd gives, and Compose labels only with the name Compose gives.
   Only the outermost container of a cgroup, made by a runtime of the host,
   is named from its state: a user with delegated cgroups could otherwise
   create a cgroup named after any container. Host runtimes never create
-  cgroups inside a unit, so a container in a unit is named by id after the
+  cgroups inside a unit, so a container in a unit (a service or a scope,
+  which systemd delegates with `Delegate=yes`) is named by id after the
   unit (`user@1000.service/podman-0123456789ab`). Name parts are limited to
   `[A-Za-z0-9_.-]` and 253 characters, so they cannot add a level to the
   unit or the `job`.
@@ -606,14 +771,18 @@ functions that the socket operations point to, and so are never inlined:
   its flow takes the identity and the comm of the service. A process that exits before it is read
   takes the latest identity seen for the same unit and comm, and for the
   processes of Slurm jobs, whose units every job of every user shares, the
-  same cgroup (step) too. The agent reads `/proc/PID/cgroup` with the
-  executable. What `/proc` tells of a PID now in another cgroup than the
-  flow, one of them a job's, is not used: the PID was reused by another
-  job, or `pam_slurm_adopt` moved the process; nor is a read during which
-  the cgroup changed. A flow whose cgroup path is not known (its event was
-  dropped) learns it from its process if the process is still in that
-  cgroup (same inode); otherwise a process now in a job is not taken for
-  it.
+  same cgroup (step) too. The agent reads the executable, the comm and
+  `/proc/PID/cgroup` through one open `/proc/PID`, which fails once that
+  process exits, so that they are of one process: the executable is used
+  only with the comm read with it, and a process that exits while it is
+  read is taken as one that exited before. What `/proc` tells of a PID now
+  in another cgroup than the flow, one of them a job's, is not used: the
+  PID was reused by another job, or `pam_slurm_adopt` moved the process;
+  nor is an environment during whose read the process exited, executed
+  another executable or changed cgroup. A flow whose cgroup path is not
+  known (its event was dropped) learns it from its process if the process
+  is still in that cgroup (same inode); otherwise a process now in a job is
+  not taken for it.
 - Users, opt-in. With `-job-users`, a process of a Slurm job (a unit
   `slurm/...`) carries its user as `process.user.id`: the effective uid of
   `/proc/PID/status`, read with the executable in the interval. It is read
@@ -664,6 +833,7 @@ failures and open connections only.
 | `shawk.tcp.syn_retransmits` | Counter, `{segment}` | SYNs the active opens retransmitted, established or failed (TCP client side only) |
 | `shawk.connection.failed.by_reason` | Counter, `{connection}` | failed attempts with `error.type` (`refused`, `timeout`, `unreachable`, `local`, `aborted`, `_OTHER`; client side only: TCP, Unix, §3.8) |
 | `shawk.edge.first_seen`, `shawk.edge.last_seen` | Gauge, `s` | Unix time of the first and last activity |
+| `shawk.edge.wire_protocol.first_seen`, `.last_seen` | Gauge, `s` | with `shawk.wire_protocol`, the Unix time a connection first and last showed the wire protocol (TCP, `-classify-protocols`, §3.9), for the protocols seen |
 
 A failure reason is sent from its first occurrence on an edge, starting at
 that interval, so an edge does not carry six series of zeros and the
@@ -678,7 +848,7 @@ are sent as `shawk.translation.first_seen`/`last_seen` with the client,
 virtual, source and backend addresses and ports. The agent's own
 metrics are `shawk.agent.up` (with `shawk.netns.scope`),
 `shawk.agent.segment.start`, `shawk.agent.udp.traced`,
-`shawk.agent.unix.traced`, the drop counters
+`shawk.agent.unix.traced`, `shawk.agent.protocols.classified` (§3.9), the drop counters
 `shawk.agent.flows.dropped`, `shawk.agent.cgroup_events.dropped`,
 `shawk.agent.container_reads.dropped` and
 `shawk.agent.translations.dropped`, `shawk.agent.translations.traced`,
@@ -771,6 +941,14 @@ result and several connectors do not conflict. An edge whose `last_seen`
 alone advances is written once per write interval, and an idle edge that
 agents keep sending until its TTL is not written again.
 
+The wire protocols of TCP edges (§3.9) are upserted the same way into
+`edge_protocols`, after their edges in the same transaction: an edge whose
+protocol changed is written with it, so that the row of the protocol finds
+the row of its edge. `shawk.prune()` deletes them after the edges, in
+the same order, so that a write and a prune cannot deadlock. The rows of
+an edge it deletes go with the edge: up to 15 rows, which its batch size
+does not count.
+
 Edges and listeners of Unix sockets (§3.8) are written the same way to
 tables of their own, `unix_edges` and `unix_listeners`, since they have a
 name rather than addresses and a port; a listener of a Unix socket
@@ -782,11 +960,13 @@ The request that closes an interval upserts the segment into
 and the host's addresses, one row per period held (a period ends after 5
 minutes unseen). Liveness is thus judged by the connector's clock; the
 difference to the agent's is kept as `clock_skew`, shown and alerted on
-beyond a minute. Edges, listeners, translations and processes keep the
+beyond a minute. The segment starts no later than the request by the
+agent's clock, so that, converted with `clock_skew`, it never starts after
+its heartbeat. Edges, listeners, translations and processes keep the
 agent's times, capped at 2 minutes ahead of the connector, so a clock far
 ahead or an agent making times up cannot pin `last_seen` (`greatest()`),
 win the choice of most recently seen endpoint (§5.2) or escape the
-retention.
+retention; a first time after the last is taken as the last.
 
 While the database is down, changes accumulate in proportion to the number
 of edges, not to time, up to `max_pending_rows` (§5.5). Rows PostgreSQL
@@ -801,8 +981,9 @@ session already pending from requests received while the dropped changes
 were being written, which skipped the edges those changes held; one that
 ended before that start is not written.
 
-The session also keeps `peer_fold`, `peer_internal`, `unix_traced` (NULL
-for an agent that does not send it) and `counters_started`
+The session also keeps `peer_fold`, `peer_internal`, `unix_traced` and
+`protocols_classified` (NULL for an agent that does not send them) and
+`counters_started`
 (the start of the agent's drop counter, by its clock), which identifies one
 run of the agent across the sessions that several connectors, a connector
 restart or a clock step create. When the drops of a run exceed the most
@@ -814,8 +995,12 @@ each compares with the one before.
 A connector that does not migrate waits at start until the schema is at
 least its version (`shawk.schema_version()`), warns if it is newer, checks
 the migration history as `shawk-migrate` does, and refuses a schema from
-before the migrations were consolidated (§6). Writes and `shawk.prune()`
-take a shared advisory lock that migrations take exclusively.
+before the migrations were consolidated (§6). Writes, those of the
+configuration and of the inventory included, the refresh of
+`known_dependencies` and `shawk.prune()` take a shared advisory lock that
+migrations take exclusively, before any other lock, so that they wait for
+a migration rather than deadlock with it. A migration that cannot release
+its lock within 5 seconds closes its connection, which releases it.
 
 Rows last seen longer ago than `retention` (3 years) are deleted hourly by
 `shawk.prune()` in short batches, with sessions and partly observed
@@ -909,9 +1094,11 @@ last, unless another host held the address after that period began (beyond
 held it, not as of the load. Until what the connector saw is written and
 read back, the holders it saw itself count too, so that an address that
 moved while PostgreSQL could not be written does not name its former
-holder again once the new one stops. An address that left a host whose
-agent is still alive names no host. The names of `peer_cidrs` are ranges,
-not hosts. Through a translation, `pickBackend()` chooses a
+holder again once the new one stops; those of changes it drops (§5.1) no
+longer count, so that they are bounded with the pending rows (§5.5). An
+address that left a host whose agent is still alive names no host. The
+names of `peer_cidrs` are ranges, not hosts. Through a translation,
+`pickBackend()` chooses a
 representative to name the service, not the backend a connection reached,
 so a virtual address with several backends has host `~unknown`; the names
 of services do not change.
@@ -984,6 +1171,9 @@ the host name; `host.id` and `host.name` are promoted to labels.
   bytes, and in the family of peer hosts connections and failures by
   reason. A service that listens on Unix sockets only has no series of
   its own: it is the `service.peer.name` of its clients.
+- The wire protocols of edges (§3.9) are not forwarded, as series or as
+  labels: they would multiply the series of every TCP dependency by its
+  protocols. PostgreSQL has them.
 - Histograms are forwarded as sum and count only (mean RTT and connect
   time): buckets would add 10 series to every TCP client dependency. A
   handshake histogram with other bounds than §3.2 is dropped as invalid.
@@ -1143,7 +1333,11 @@ should have the same.
   the dependency ended is for the other side to tell, so a stopped agent
   does not make it look removed (§8). Where a server edge at the virtual
   address matches by address (a relay that runs an agent), the translation
-  is not used.
+  is not used. A matched edge that also matches an edge by address over
+  another period (such a relay served the client before, or the client
+  also connects to the backend directly) has that row over the period of
+  the other edge, with the rules above for `*_observed_until`, and its row
+  of its own covers what neither leaves.
 - In the names of peers, a client edge to a virtual address is named after
   the service at a backend, with the backend's `server.port` and
   `shawk.peer.agent`, unless a service was observed on a socket at the
@@ -1164,11 +1358,12 @@ should have the same.
   writes them to `shawk.learned_translations`. A client edge to a virtual
   address with no static translation is matched through the learned rows of
   its client address, virtual address and port, and with the server edges
-  at their backend from their source, in its scope (loopback in the host and
-  namespace of the row, a shared address on the host of the row, any host
-  otherwise). Overlapping rows within 2 minutes are combined (two directors
-  in turn), and the matched row covers only their span, so a client that
-  moved to another backend leaves the former. The rules above apply
+  at their backend from their source, in its scope (a loopback client or
+  virtual address in the host and namespace of the row, a shared address on
+  the host of the row, any host otherwise). Overlapping rows within 2
+  minutes are combined (two directors in turn), and the matched row covers
+  only their span, so a client that moved to another backend leaves the
+  former. The rules above apply
   otherwise, and static translations come first; the `translation` is
   `~learned`, so configured names may not start with `~`. In names, a match
   by address still comes first: docker-proxy serves the containers of its
@@ -1217,10 +1412,19 @@ connector holds, so the connector bounds it:
   bounded to 16 times the bound (an edge has at most 15), and endpoints
   inferred from listeners on unspecified addresses to the bound; those
   beyond are left out of Prometheus or named from PostgreSQL after the next
-  load (§5.2).
+  load (§5.2). The wire protocols of an edge (§3.9) are held with it, one
+  per value of their enum: a point of another value, as of a newer agent,
+  is dropped and logged at most once a minute, and one without a value or
+  of an edge that is not of TCP is invalid.
 - Pending rows (`max_pending_rows`, 10 million), kept while writes fail or
   the schema is not ready. Beyond the bound, the changes of the hosts
-  pending longest are dropped whole, as with rejected rows (§5.1).
+  pending longest are dropped whole, as with rejected rows (§5.1). Of
+  these, at most 16 sessions per host, each with the ranges its agent keeps
+  exact: an agent starts a segment when it starts or after it could not
+  send for its idle TTL, so more are pending only when it restarts faster
+  than they are written. A new one beyond is not written, and logged at
+  most once a minute; the host is not observed over it if it ends before
+  the pending sessions are written.
 
 Agent strings are cut to 4096 bytes and `shawk.peer.internal` to 4096
 ranges. The defaults are far above what one connector serves and what a
@@ -1322,7 +1526,11 @@ by `slurm_node` of the inventory (§5.6), when it reads the file, and writes
 the host: the state of a past gap stays with the host it had then. Nodes
 the inventory does not map are left out, with a warning when they change,
 and the reading is written again until they are mapped; without an
-inventory, the file names hosts (`host`).
+inventory, the file names hosts (`host`). Host and node names, in both
+files, follow the rules of the inventory (§5.6). Reasons are free text,
+cut to 4096 bytes, with NUL and bytes that are not UTF-8 replaced as in
+the strings of agents: PostgreSQL refuses them, and one of them would
+fail the write of every host.
 
 - **Gaps.** `unobserved_reasons()` cuts the gaps of host names
   (`unobserved_by_name()`), whose states and windows these are: a node
@@ -1336,11 +1544,13 @@ inventory, the file names hosts (`host`).
   after that. A file whose `generated_at` is older is not written, with a
   warning; one more than 10 seconds ahead is invalid (the file is
   generated on the host of the connector). When a file cannot be read, is
-  invalid (an empty file is) or is larger than 16 MiB, as the inventory,
-  what was written from it stays, and the states become stale. Flags are
-  names (`DOWN`, `POWERED_DOWN`), as `scontrol` gives them; the `*` of a
-  node that does not respond becomes `NOT_RESPONDING`, and the symbols of
-  `sinfo` (`idle~`) are invalid.
+  invalid (an empty file is, as is one of several YAML documents or one
+  that is only `null`; `{}` or `maintenance: []` says that there is no
+  window) or is larger than 16 MiB, as the inventory, what was written
+  from it stays, and the states become stale. Flags are names (`DOWN`,
+  `POWERED_DOWN`), as `scontrol` gives them; the `*` of a node that does
+  not respond becomes `NOT_RESPONDING`, and the symbols of `sinfo`
+  (`idle~`) are invalid.
 - **Maintenance windows** are written by the clock of the database
   (`maintenance_windows`) when the file changes, and count from when they
   were written, so a window registered afterwards does not make a past
@@ -1364,7 +1574,10 @@ inventory, the file names hosts (`host`).
   while it boots. Maintenance: a window of the file, or the flag `MAINT` of
   a reservation of Slurm, which is registered with an end; alerts are
   stopped for 30 days at most from the first of the states with `MAINT`
-  that follow each other, whatever their other flags and reasons.
+  that follow each other, whatever their other flags and reasons. A state
+  follows the one before if it was read while that one was fresh, so a
+  reservation read after the states became stale (a node left out of the
+  file for a while) counts from its own start.
   `unobserved_reasons()` reports the state as Slurm had it, `MAINT`
   included, without this bound.
 
@@ -1386,13 +1599,14 @@ which must be run again after every `shawk-migrate` that applies migrations.
 ```
 hosts(id, machine_id, hostname, kernel, agent_version, first_seen, last_seen)
 agent_sessions(host_id, started_at, last_heartbeat, udp_traced, netns_scope, dropped_flows, clock_skew,
-               peer_fold, peer_internal, counters_started, unix_traced)
+               peer_fold, peer_internal, counters_started, unix_traced, protocols_classified)
 partial_observations(host_id, started_at, period_start, period_end, dropped_flows)  -- periods with drops
 host_addrs(host_id, addr, first_seen, last_seen)  -- one row per period
 processes(id, host_id, unit, comm, exe, service_name, user_id, first_seen, last_seen)
   -- unique (host_id, unit, comm, service_name, user_id); user_id only for processes of jobs (job_users)
 edges(id, host_id, process_id, role, proto, local_addr, remote_addr, port, netns, first_seen, last_seen)
   -- remote_addr is the network 0.0.0.0/0 or ::/0 for folded peers
+edge_protocols(edge_id, protocol, first_seen, last_seen)  -- wire protocols of TCP edges (§3.9), pruned alone or with their edge
 unix_edges(id, host_id, process_id, path, netns, first_seen, last_seen)  -- clients of Unix sockets (§3.8)
 unix_listeners(host_id, process_id, path, netns, first_seen, last_seen)  -- every known owner of a listening Unix socket
 listeners(host_id, process_id, proto, addr, port, netns, first_seen, last_seen)  -- the latest owner
@@ -1440,16 +1654,16 @@ names in PostgreSQL and Prometheus match.
 
 | view or function | |
 |---|---|
-| `dependencies` | one row per logical dependency: the client edge and the server edge matched by addresses and port over all time (loopback within a host and netns, addresses held by several hosts at once within a host), or through a translation (§5.4), when `virtual_addr`, `virtual_port` and `translation` (`~learned` for a learned one) tell what the client connected to. `observed_by` is `both`, `client` or `server`; a one-sided row means no agent on the other side, an undescribed NAT or load balancer between, or one of the own rows of §5.4. `client_observed_until` and `server_observed_until` are the latest heartbeats of the hosts (or NULL, §5.4): an old `last_seen` with a recent `observed_until` means no longer used; both old means no longer observed. An address `0.0.0.0/0` or `::/0` stands for folded peers (§3.6), named `~external`. `port` is that of the edges, also under the rules of ports (§5.3): between two hosts it tells the connections of different processes apart. A dependency over a Unix socket (§3.8) has `proto` `unix`, port 0, no addresses, and `path`, the last column (NULL otherwise), the name of the socket: its client edge is matched with the owners of the listeners of the name on its host (in the namespace of the client, else, for a path, in the only namespace that has one) whose periods overlap it, within 2 minutes; a matched row lasts the part of the client edge the owner held the listener, except that the row of the first owner starts with the client edge and that of the last ends with it, as a row of TCP spans both its edges (a client keeps the connections it opened after the listener closed, or keeps trying), never longer than the client edge; it has `server_host` the client's and `observed_by` `both`, and an unmatched edge is a row of its own observed by the client. |
+| `dependencies` | one row per logical dependency: the client edge and the server edge matched by addresses and port over all time (edges with a loopback address on either side within a host and netns, addresses held by several hosts at once within a host), or through a translation (§5.4), when `virtual_addr`, `virtual_port` and `translation` (`~learned` for a learned one) tell what the client connected to. `observed_by` is `both`, `client` or `server`; a one-sided row means no agent on the other side, an undescribed NAT or load balancer between, or one of the own rows of §5.4. `client_observed_until` and `server_observed_until` are the latest heartbeats of the hosts (or NULL, §5.4): an old `last_seen` with a recent `observed_until` means no longer used; both old means no longer observed. An address `0.0.0.0/0` or `::/0` stands for folded peers (§3.6), named `~external`. `port` is that of the edges, also under the rules of ports (§5.3): between two hosts it tells the connections of different processes apart. A dependency over a Unix socket (§3.8) has `proto` `unix`, port 0, no addresses, and `path`, the last column (NULL otherwise), the name of the socket: its client edge is matched with the owners of the listeners of the name on its host (in the namespace of the client, else, for a path, in the only namespace that has one) whose periods overlap it, within 2 minutes; a matched row lasts the part of the client edge the owner held the listener, except that the row of the first owner starts with the client edge and that of the last ends with it, as a row of TCP spans both its edges (a client keeps the connections it opened after the listener closed, or keeps trying), never longer than the client edge; it has `server_host` the client's and `observed_by` `both`, and an unmatched edge is a row of its own observed by the client. |
 | `graph_nodes`, `graph_edges` | the dependency map between services in the format of the Grafana Node Graph; a peer without a service is named by `peer_class`, and a dependency on a port of `port_agnostic_services` or `dynamic_ports` (§5.3) has port 0 |
 | `peer_class(addr)` | the name of a peer without a known service, as in `service.peer.name`: the narrowest range of `peer_cidrs`, `~unresolved` for an address not routed on the Internet or no address (the server of a Unix socket without a listener), `~external` otherwise, including the networks of folded peers |
 | `dependency_changes` | dependencies between services that appeared, or disappeared while a host that saw them kept observing for 15 minutes; port 0 for those of `port_agnostic_services` and `dynamic_ports` (§5.3), so that a run of srun on a new port is not new |
 | `kernel_chosen_ports` | a hint for the rules of ports (§5.3): the services whose port the kernel chose in the last 30 days that no rule covers (`service`, `slurm_job` for processes of Slurm jobs, `proto`, `hosts`, `ports` distinct, `port_min`, `port_max`, `first_seen`, and `last_seen`, when the kernel last chose one). Rules apply to the address clients reach, so a listener on an unspecified address is covered only when they cover every address its host held meanwhile, but loopback and link-local; a process that binds the port it was given leaves after 30 days. A UDP client socket taken for a server (§10) appears too |
-| `service_endpoints` | addresses and ports services accept connections on: the last known listeners of each host (unspecified addresses expanded to the host's addresses) and its server edges, for hosts that reported in the last 30 days, except addresses another host took over since; `slurm_job` if a process of a Slurm job serves it; used by the connector (§5.2) |
+| `service_endpoints` | addresses and ports services accept connections on: the last known listeners of each host (unspecified addresses expanded to the host's addresses) and its server edges of the 7 days before its latest report, also of a host without listeners such as a UDP server, for hosts that reported in the last 30 days, except addresses another host took over since; `slurm_job` if a process of a Slurm job serves it; used by the connector (§5.2) |
 | `unix_endpoints` | the names of the Unix sockets services listen on (`path`, `netns`, host, service, `slurm_job`), seen within an hour of the latest listener of Unix sockets of the host, for hosts that reported in the last 30 days; used by the connector (§5.2) |
 | `client_endpoints` | the client sides of connections in the last hour (client address, server address, port, client service, `slurm_job` if the client is a process of a Slurm job); used by the connector to name the peer of a server edge |
 | `agent_addrs` | addresses of hosts whose agent closed an interval in the last 5 minutes, with what the agent traces and folds; used by the connector |
-| `agents` | the latest segment of every host and whether its agent is alive; the last columns, `peer_fold` and `peer_internal`, tell what the agent folds and the ranges it keeps exact, and `unix_traced` whether it traces Unix sockets (NULL if it does not tell) |
+| `agents` | the latest segment of every host and whether its agent is alive. `unix_traced` tells whether the agent traces Unix sockets, and `protocols_classified` whether it classifies wire protocols (§3.9); both are NULL if the agent does not tell. `peer_fold` and `peer_internal` tell what the agent folds and the ranges it keeps exact. `protocols_classified` is the last column (migration 0002) |
 | `unobserved(since, until, tolerance)` | the periods in which each host was not observed; Grafana overlays them as annotations |
 | `unobserved_by_name(since, until, tolerance)` | the same over the sessions of all the host ids of each host name, for nodes whose machine id changed (§4.1), where `unobserved()` reports the time after the last heartbeat of each old id; two machines that share a name hide each other's gaps |
 | `unobserved_reasons(since, until, tolerance)` | the periods of `unobserved_by_name()` cut by what explains them (§5.7): `cause` is `maintenance` or `power_saving` for a planned stop and NULL otherwise, `node_state` the state of Slurm then (flags joined by `+`, NULL if none was read or it was stale) and `reason` that of Slurm or of the maintenance window, which takes precedence. The gaps are per host name, as the states and windows are, since a node that power saving boots often may get a new host id at every boot. `unobserved()` and `unobserved_by_name()` do not change |
@@ -1458,6 +1672,7 @@ names in PostgreSQL and Prometheus match.
 | `never_observed()` | the hosts of the inventory (§5.6) expected to run an agent whose agent never reported within the retention (no host has their name): `host`, `slurm_node`, `roles`, and `seen_as`, the hosts whose agents reported an address of the host, as an agent whose `host.name` differs from the inventory would |
 | `inventory`, `inventory_addrs` | the hosts of the inventory with their addresses (`host`, `slurm_node`, `roles`, `agent`, `addrs`), and one row per address with its host: join an address on `addr` to name its host |
 | `inventory_status` | when the inventory was last read from a valid file (`read_at`, NULL if never), the latest failure since (`failed_at`, `error`), and how many hosts it has; no row before a connector with `inventory_file` read it |
+| `edge_protocols` | the wire protocols of TCP edges (§3.9), one row per edge and protocol: `host`, `host_id`, `service`, `unit`, `role` and `proto` of the side that saw it, `client_addr` and `server_addr` whichever side that was (a network for folded peers), `port`, `netns`, `protocol`, `first_seen`, `last_seen`. A client tells what it offers or asks for, a server what it chose. `last_seen` is the end of the last interval in which a new connection showed the protocol, not the last use of the edge. An edge without rows had no connection classified; `protocols_classified` of `agents` tells whether its agent classifies. The clients of PostgreSQL at 10.0.0.5 that do not ask for TLS: `WHERE role = 'client' AND server_addr = '10.0.0.5' AND port = 5432 AND protocol = 'postgres'`. Rows of `role` `server` tell what the server chose (`postgres` also for a client that asked for TLS and was refused), and give the address of the client, also of one without an agent, which `dependencies` names on `client_addr`, `server_addr` and `port` |
 | `job_edges` | the edges of the processes of Slurm jobs, those to Unix sockets included (with `path`), with the user of the process (`user_id`, NULL if unknown), host, unit, service and executable: which users connected to what, and when. For administrators: only its owner reads it (below) |
 | `dependencies_between(since, until)`, `graph_edges_between`, `graph_nodes_between`, `dependency_changes_between` | the same for the dependencies active in a period. They take the edges active in the period with a margin of 15 minutes before matching, so a recent window does not scan the history (about 0.3 s instead of 3 s with a million edges) and both sides of a connection are matched at the edges of the period; the dashboards and alerts use them. A dependency appeared in a period when it was first seen in it and is not in `known_dependencies` from before it, so one that comes back on new edges (a new container, an hourly job) did not appear |
 
@@ -1540,6 +1755,15 @@ shows a failure ratio of 100%. With `networks`, a table gives the
 connections and bytes of the selected services by the networks of the
 client and the server.
 
+The dependency details dashboard selects services from Prometheus, and its
+table of `dependencies_between()` names each side as Prometheus does
+(§5.3): `slurm-job` for a process of a Slurm job (unit `slurm/*`), which
+the table shows under its own name and unit, and `peer_class()` for a side
+without a service. `~other` can fold any service, with an agent or not, and
+matches every side. A selection without values, as over a time range that
+Prometheus no longer holds while PostgreSQL does (`retention`), matches
+every side too.
+
 PostgreSQL alerts use the time series format, with every row at `now()` so
 each series has a value at the last time; a query that finds nothing
 returns No Data, which the rules treat as Normal. New and disappeared
@@ -1553,7 +1777,10 @@ than a row missing from the result, so a stopped agent does not look like
 a removed dependency. Stopped agents are alerted by Prometheus
 (`ShawkAgentDown`) for 24 hours, then from `shawk_v1.agents` for 30 days,
 labelled with the host id; a host reinstalled under the same name and
-alive is not alerted. Neither alerts hosts in a planned stop (§5.7): the
+alive is not alerted. A clock off by more than a minute is alerted per host
+name, with the largest skew of its live host ids, so that a node that
+booted with a new machine id within the alive window is one series.
+Neither alerts hosts in a planned stop (§5.7): the
 Grafana alert excludes `shawk_v1.planned_stops`, and `ShawkAgentDown` the
 nodes a Slurm exporter reports in power saving (powered down, powering down
 or up, with no flag but `IDLE`, `ALLOCATED`, `MIXED`, `CLOUD` and
@@ -1572,17 +1799,24 @@ the periods from `unobserved()` and `partly_observed()` as annotations, so
 the absence of a dependency is not read as disuse over them. The table of
 gaps of the fleet dashboard gives their reasons (`unobserved_reasons()`),
 per host name as `unobserved_by_name()`: the old ids of a node whose
-machine id changed have gaps in the annotations, not in the table. SYN
-retransmissions per connection attempt (handshakes plus failures) exceed 1
-when connects time out, and `TCP_FASTOPEN_CONNECT` connects, which have no
-handshake, raise them. OBI panels use a minimum interval of a minute, since
+machine id changed have gaps in the annotations, not in the table. The
+panels keep `network_transport` beside `server_port`, as the recording
+rules do: port 0 is that of Unix sockets and of the servers of
+`port_agnostic_services` and `dynamic_ports` (§5.3), and TCP and UDP share
+the numbers of ports. SYN retransmissions per connection attempt
+(handshakes plus failures over TCP) exceed 1 when connects time out, and
+`TCP_FASTOPEN_CONNECT` connects, which have no handshake, raise them. OBI
+panels use a minimum interval of a minute, since
 OBI exports every 60 seconds by default.
 
 Where the absence of a dependency is read (the changes dashboard, and the
 observation periods of the fleet dashboard), the panels say that only TCP,
 UDP and Unix stream sockets are observed; the fleet dashboard shows which
 agents trace Unix sockets (`unix_traced`), and `ShawkUnixNotTraced` alerts,
-as `ShawkUDPNotTraced`, on agents that do not. `ShawkConnectionFailureRate`
+as `ShawkUDPNotTraced`, on agents that do not. It also shows which agents
+classify wire protocols (`protocols_classified`, §3.9), and
+`ShawkProtocolsNotClassified` alerts on the agents asked to that cannot.
+`ShawkConnectionFailureRate`
 leaves out the failed connects to Unix sockets that no listener serves
 (`~unresolved`): glibc tries the socket of nscd from every process that
 looks up a user or a host, and most hosts do not run nscd; the dashboards
@@ -1764,6 +1998,14 @@ only the protocols it parses. shawk runs beside it:
 - **Connections that predate the agent** are counted from the adoption on.
   One accepted by a listener with a backlog of 0 that is gone is recorded
   as outgoing.
+- **Wire protocols** (§3.9) come from the first payload that a socket
+  sends, once per connection. Some connections are not classified (those
+  that predate the agent, `sendfile(2)` first, TCP Fast Open, MPTCP), so an
+  edge without rows in `edge_protocols` is not proof of clear text.
+  STARTTLS and a later switch to another protocol are not seen, and a
+  signature can match another protocol that starts the same way (§3.9).
+  `last_seen` tells the last new connection that showed a protocol, not
+  the last use of the edge.
 - **Unix sockets** (§3.8): their traffic is not measured, only their
   connections. A failed connect has the name the client asked for, which
   differs from the server's when the client reaches it through a link or a
@@ -1779,10 +2021,22 @@ only the protocols it parses. shawk runs beside it:
   the agent are not adopted when both sides bound names and the listener is
   gone. More open connections than the table holds (half of `-max-flows`)
   are dropped updates, and the period is partly observed.
+- **Wire protocols** (§3.9) are those of the first payload of each
+  connection, with `-classify-protocols` only, whose program runs on every
+  TCP send. The version of TLS that PostgreSQL and MySQL start later, and
+  STARTTLS, are not seen, and a client and its server tell different
+  versions of TLS. Some connections are not classified (§3.9): an edge
+  without a protocol is no evidence of clear text, even from an agent that
+  classifies. The signatures are matched on the first bytes, so a protocol
+  that starts like another one is taken for it, and others are `unknown`.
 - **Clocks**: first and last seen times come from each host's clock, capped
-  at 2 minutes ahead of the connector (§5.1), as does the segment start;
+  at 2 minutes ahead of the connector (§5.1); so does the segment start,
+  capped at the request that carries it, which `clock_skew` converts;
   heartbeats come from the connector's clock, compared with PostgreSQL's.
-  Keep clocks synchronized (chrony); `clock_skew` shows hosts that are not.
+  A series seen again after its host's clock stepped back to before its
+  first time takes the new time as its first time too, so that it is never
+  first seen after it was last seen. Keep clocks synchronized (chrony);
+  `clock_skew` shows hosts that are not.
 - **Agents report the addresses of their hosts**, unverified:
   `host_identity: certificate` ties requests to a host, not to addresses.
   What a host reports at an address another live host holds alone does not

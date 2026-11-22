@@ -3,9 +3,9 @@ package shawkconnector
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"net/netip"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 )
@@ -59,10 +59,10 @@ func (t *translation) reaches(local netip.Addr, port uint16) (fixed, same bool) 
 			continue
 		}
 		switch b.port {
-		case port:
-			fixed = true
 		case 0:
 			same = true
+		case port:
+			fixed = true
 		}
 	}
 	return fixed, same
@@ -72,6 +72,9 @@ func (t *translation) reaches(local netip.Addr, port uint16) (fixed, same bool) 
 // to them on, through which a server at local on port is reached.
 func (t *translation) clientEnds(local netip.Addr, port uint16) []netip.AddrPort {
 	fixed, same := t.reaches(local, port)
+	if !fixed && !same {
+		return nil
+	}
 	var out []netip.AddrPort
 	for _, v := range t.virtual {
 		vp := v.Port()
@@ -82,7 +85,7 @@ func (t *translation) clientEnds(local netip.Addr, port uint16) []netip.AddrPort
 				continue
 			}
 			vp = port
-		case !fixed && vp != port:
+		case !fixed && (!same || vp != port):
 			continue
 		}
 		out = append(out, netip.AddrPortFrom(v.Addr(), vp))
@@ -94,39 +97,13 @@ func (t *translation) clientEnds(local netip.Addr, port uint16) []netip.AddrPort
 // configuration, ordered by name. Two translations may not share a virtual
 // address and port, so that a client edge reaches at most one.
 func parseTranslations(m map[string]TranslationConfig) ([]translation, error) {
-	names := make([]string, 0, len(m))
-	for name := range m {
-		names = append(names, name)
-	}
-	sort.Strings(names)
 	var out []translation
 	var errs []error
-	type virtualKey struct {
-		addr  netip.Addr
-		proto string
-	}
-	seen := map[virtualKey]map[uint16]string{} // virtual address -> port -> translation
-	for _, name := range names {
+	claims := virtualClaims{}
+	for _, name := range slices.Sorted(maps.Keys(m)) {
 		t, err := parseTranslation(name, m[name])
-		if err != nil {
-			errs = append(errs, err)
-			continue
-		}
-		for _, v := range t.virtual {
-			for _, proto := range t.protos {
-				k := virtualKey{v.Addr(), proto}
-				ports := seen[k]
-				if ports == nil {
-					ports = map[uint16]string{}
-					seen[k] = ports
-				}
-				for p, other := range ports {
-					if p == v.Port() || p == 0 || v.Port() == 0 {
-						err = fmt.Errorf("translations: %s/%s is in both %s and %s", formatAddrPort(v), proto, other, name)
-					}
-				}
-				ports[v.Port()] = name
-			}
+		if err == nil {
+			err = claims.claim(&t)
 		}
 		if err != nil {
 			errs = append(errs, err)
@@ -137,17 +114,58 @@ func parseTranslations(m map[string]TranslationConfig) ([]translation, error) {
 	return out, errors.Join(errs...)
 }
 
-func parseTranslation(name string, c TranslationConfig) (translation, error) {
-	t := translation{name: name}
-	fail := func(format string, args ...any) (translation, error) {
-		return translation{}, fmt.Errorf("translations: %s: "+format, append([]any{name}, args...)...)
+// virtualClaims are the translations that the virtual addresses belong to,
+// by address and transport, then by port, 0 for every port.
+type virtualClaims map[virtualKey]map[uint16]string
+
+type virtualKey struct {
+	addr  netip.Addr
+	proto string
+}
+
+// claim records the virtual addresses of a translation, and returns an
+// error if one of them, on the same port or with one of the two for every
+// port, belongs to another translation already.
+func (c virtualClaims) claim(t *translation) error {
+	var err error
+	for _, v := range t.virtual {
+		for _, proto := range t.protos {
+			k := virtualKey{v.Addr(), proto}
+			ports := c[k]
+			if ports == nil {
+				ports = map[uint16]string{}
+				c[k] = ports
+			}
+			for p, other := range ports {
+				if p == v.Port() || p == 0 || v.Port() == 0 {
+					err = fmt.Errorf("translations: %s/%s is in both %s and %s", formatAddrPort(v), proto, other, t.name)
+				}
+			}
+			ports[v.Port()] = t.name
+		}
 	}
+	return err
+}
+
+func parseTranslation(name string, c TranslationConfig) (translation, error) {
 	if strings.TrimSpace(name) == "" {
 		return translation{}, errors.New("translations: a translation has no name")
 	}
-	if strings.HasPrefix(name, "~") {
+	if !pgText(name) {
+		return translation{}, fmt.Errorf("translations: %q: a name must be UTF-8 without NUL", name)
+	}
+	t := translation{name: name}
+	if err := t.parse(c); err != nil {
+		return translation{}, fmt.Errorf("translations: %s: %w", name, err)
+	}
+	return t, nil
+}
+
+// parse fills a translation, which has its name, from its configuration.
+func (t *translation) parse(c TranslationConfig) error {
+	if strings.HasPrefix(t.name, "~") {
 		// ~learned names the rows matched through learned translations.
-		return fail("a name may not start with ~, which names learned translations (%s)", learnedName)
+		return fmt.Errorf("a name may not start with ~, which names learned translations (%s)", learnedName)
 	}
 	switch c.Transport {
 	case "":
@@ -155,25 +173,40 @@ func parseTranslation(name string, c TranslationConfig) (translation, error) {
 	case "tcp", "udp":
 		t.protos = []string{c.Transport}
 	default:
-		return fail("transport must be tcp, udp or empty, not %q", c.Transport)
+		return fmt.Errorf("transport must be tcp, udp or empty, not %q", c.Transport)
 	}
 	if len(c.Virtual) == 0 {
-		return fail("no virtual address")
+		return errors.New("no virtual address")
 	}
 	if len(c.Backends) == 0 {
-		return fail("no backend")
+		return errors.New("no backend")
 	}
-	allPorts := false
-	for _, s := range c.Virtual {
+	allPorts, err := t.parseVirtual(c.Virtual)
+	if err != nil {
+		return fmt.Errorf("virtual: %w", err)
+	}
+	if err := t.parseBackends(c.Backends, allPorts); err != nil {
+		return fmt.Errorf("backends: %w", err)
+	}
+	if err := t.parseSources(c.Sources); err != nil {
+		return fmt.Errorf("sources: %w", err)
+	}
+	return nil
+}
+
+// parseVirtual parses the virtual addresses of a translation, and tells
+// whether one of them is for every port.
+func (t *translation) parseVirtual(virtual []string) (allPorts bool, err error) {
+	for _, s := range virtual {
 		p, port, err := parseEndpoint(s)
 		if err != nil {
-			return fail("virtual: %v", err)
+			return false, err
 		}
 		if !p.IsSingleIP() {
-			return fail("virtual: %s is a range; list the addresses", s)
+			return false, fmt.Errorf("%s is a range; list the addresses", s)
 		}
 		if p.Addr().IsUnspecified() {
-			return fail("virtual: %s is unspecified", s)
+			return false, fmt.Errorf("%s is unspecified", s)
 		}
 		ap := netip.AddrPortFrom(p.Addr(), port)
 		if !slices.Contains(t.virtual, ap) {
@@ -181,33 +214,44 @@ func parseTranslation(name string, c TranslationConfig) (translation, error) {
 		}
 		allPorts = allPorts || port == 0
 	}
-	for _, s := range c.Backends {
+	return allPorts, nil
+}
+
+// parseBackends parses the backends of a translation; allPorts tells that
+// one of its virtual addresses is for every port.
+func (t *translation) parseBackends(backends []string, allPorts bool) error {
+	for _, s := range backends {
 		p, port, err := parseEndpoint(s)
 		if err != nil {
-			return fail("backends: %v", err)
+			return err
 		}
 		if port != 0 && allPorts {
 			// Every port of a virtual address cannot reach one port.
-			return fail("backends: %s has a port, but a virtual address has none", s)
+			return fmt.Errorf("%s has a port, but a virtual address has none", s)
 		}
 		b := backend{prefix: p, port: port}
 		if !slices.Contains(t.backends, b) {
 			t.backends = append(t.backends, b)
 		}
 	}
-	for _, s := range c.Sources {
+	return nil
+}
+
+// parseSources parses the sources of a translation.
+func (t *translation) parseSources(sources []string) error {
+	for _, s := range sources {
 		p, port, err := parseEndpoint(s)
 		if err != nil {
-			return fail("sources: %v", err)
+			return err
 		}
 		if port != 0 {
-			return fail("sources: %s has a port", s)
+			return fmt.Errorf("%s has a port", s)
 		}
 		if !slices.Contains(t.sources, p) {
 			t.sources = append(t.sources, p)
 		}
 	}
-	return t, nil
+	return nil
 }
 
 // parseEndpoint parses an address or a range with an optional port:

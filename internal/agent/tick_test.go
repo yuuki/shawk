@@ -21,6 +21,8 @@ import (
 type fakeSource struct {
 	snaps []*tracer.Snapshot
 	err   error
+	// protocols is whether the tracer classifies wire protocols.
+	protocols bool
 }
 
 func (f *fakeSource) Collect() (*tracer.Snapshot, error) {
@@ -37,6 +39,7 @@ func (f *fakeSource) Collect() (*tracer.Snapshot, error) {
 
 func (f *fakeSource) UDPEnabled() bool                            { return true }
 func (f *fakeSource) UnixEnabled() bool                           { return true }
+func (f *fakeSource) ProtocolsEnabled() bool                      { return f.protocols }
 func (f *fakeSource) TranslationsTraced() bool                    { return true }
 func (f *fakeSource) ProgramStats() ([]tracer.ProgramStat, error) { return nil, nil }
 
@@ -143,6 +146,66 @@ func TestTickMergesFlows(t *testing.T) {
 	}
 	if series != 2 {
 		t.Errorf("%d series of %s, want one per role", series, otlp.MetricConnOpened)
+	}
+}
+
+// TestTickWireProtocols checks that the wire protocols of a flow are sent
+// on its edge, and that an agent tells whether it classifies them only if
+// it was asked to: one not asked sends no gauge, which the alert of
+// unclassified protocols would fire on.
+func TestTickWireProtocols(t *testing.T) {
+	for _, c := range []struct {
+		name               string
+		requested, enabled bool
+		wantGauge          bool
+		wantClassified     int64
+	}{
+		{"not requested", false, false, false, 0},
+		{"classified", true, true, true, 1},
+		{"not classified", true, false, true, 0},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := flow(tracer.DirOut, 5432, unknownCgroup, 1)
+			if c.enabled {
+				f.Protocols = 1<<tracer.WirePostgres | 1<<tracer.WireTLS13
+			}
+			src := &fakeSource{protocols: c.enabled, snaps: []*tracer.Snapshot{{Flows: []tracer.Flow{f}}}}
+			exp := &fakeExporter{}
+			a := newTestAgent(src, exp, 0, time.Now())
+			a.cfg.ClassifyProtocols = c.requested
+			if err := a.tick(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			wire := map[string]bool{}
+			var gauge bool
+			var classified int64
+			for _, rm := range exp.sent[0].ResourceMetrics {
+				for _, sm := range rm.ScopeMetrics {
+					for _, m := range sm.Metrics {
+						switch m.Name {
+						case otlp.MetricEdgeWireFirst:
+							for _, p := range m.GetGauge().GetDataPoints() {
+								wire[attrs(p.Attributes)[otlp.AttrWireProtocol]] = true
+							}
+						case otlp.MetricAgentProtocolsClassified:
+							gauge = true
+							classified = m.GetGauge().GetDataPoints()[0].GetAsInt()
+						}
+					}
+				}
+			}
+			want := map[string]bool{}
+			if c.enabled {
+				want = map[string]bool{"postgres": true, "tls_1_3": true}
+			}
+			if !maps.Equal(wire, want) {
+				t.Errorf("wire protocols %v, want %v", wire, want)
+			}
+			if gauge != c.wantGauge || classified != c.wantClassified {
+				t.Errorf("%s sent %v (%d), want %v (%d)", otlp.MetricAgentProtocolsClassified, gauge, classified,
+					c.wantGauge, c.wantClassified)
+			}
+		})
 	}
 }
 

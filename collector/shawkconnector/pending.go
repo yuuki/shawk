@@ -59,6 +59,13 @@ type edgeRowKey struct {
 	procKey
 }
 
+// wireRowKey identifies a row of shawk.edge_protocols: a wire protocol of
+// a TCP edge.
+type wireRowKey struct {
+	edge     edgeRowKey
+	protocol string
+}
+
 // listenerRowKey identifies a listener and its owner: a listener that
 // changes hands has a row per owner, which keeps its history. A listener
 // of transportUnix has a path and no address. kernelChosen tells that the
@@ -80,11 +87,13 @@ type sessionRow struct {
 	// of the agent, from the latest request.
 	clockSkew time.Duration
 	udpTraced bool
-	// unixTraced tells whether the agent traces Unix sockets, nil if it
+	// unixTraced tells whether the agent traces Unix sockets, and
+	// protocolsClassified whether it classifies wire protocols, nil if it
 	// does not tell.
-	unixTraced *bool
-	netnsScope string
-	dropped    int64
+	unixTraced          *bool
+	protocolsClassified *bool
+	netnsScope          string
+	dropped             int64
 	// countersStarted is when the counters of the agent started, by the
 	// clock of the agent as it sends it: the same for every session of one
 	// run of the agent, whatever connector writes them and however its clock
@@ -108,6 +117,7 @@ type hostChanges struct {
 	addrs        map[netip.Addr]span
 	processes    map[procKey]*procRow
 	edges        map[edgeRowKey]span
+	wire         map[wireRowKey]span // the wire protocols of edges, whose edges are in edges
 	listeners    map[listenerRowKey]span
 	translations map[translationID]span
 }
@@ -119,15 +129,18 @@ func newHostChanges(key string) *hostChanges {
 		addrs:        map[netip.Addr]span{},
 		processes:    map[procKey]*procRow{},
 		edges:        map[edgeRowKey]span{},
+		wire:         map[wireRowKey]span{},
 		listeners:    map[listenerRowKey]span{},
 		translations: map[translationID]span{},
 	}
 }
 
 // size is the number of rows to write: the host, and its sessions,
-// addresses, processes, edges, listeners and translations.
+// addresses, processes, edges with their wire protocols, listeners and
+// translations.
 func (h *hostChanges) size() int {
-	return 1 + len(h.sessions) + len(h.addrs) + len(h.processes) + len(h.edges) + len(h.listeners) + len(h.translations)
+	return 1 + len(h.sessions) + len(h.addrs) + len(h.processes) + len(h.edges) + len(h.wire) + len(h.listeners) +
+		len(h.translations)
 }
 
 func (h *hostChanges) setHost(machineID, hostname, kernel, version string, t time.Time) {
@@ -137,11 +150,27 @@ func (h *hostChanges) setHost(machineID, hostname, kernel, version string, t tim
 	h.span.merge(span{t, t})
 }
 
-func (h *hostChanges) addSession(start time.Time, s sessionRow) {
+// maxSessions bounds the sessions pending of a host. An agent starts a new
+// segment only when it starts, or after it could not send for its idle TTL,
+// so a host has several sessions pending only when that happened while
+// writes failed. Each holds the ranges its agent keeps exact (up to
+// maxInternalPeers), which an agent sending a new segment start with every
+// request would otherwise make the connector hold without bound. A new
+// session beyond is not written: the host may show as not observed over
+// it, if it ends before the sessions pending are written.
+const maxSessions = 16
+
+// addSession records a session that starts at start, and tells whether it
+// is held: whether it was, or the host has fewer than maxSessions.
+func (h *hostChanges) addSession(start time.Time, s sessionRow) bool {
 	cur := h.sessions[start]
+	if cur == nil && len(h.sessions) >= maxSessions {
+		return false
+	}
 	if cur == nil || !s.lastHeartbeat.Before(cur.lastHeartbeat) {
 		h.sessions[start] = &s
 	}
+	return true
 }
 
 // floorSessions makes the sessions start no earlier than floor, by the
@@ -184,6 +213,12 @@ func (h *hostChanges) addEdge(k edgeRowKey, s span) {
 	h.edges[k] = cur
 }
 
+func (h *hostChanges) addWire(k wireRowKey, s span) {
+	cur := h.wire[k]
+	cur.merge(s)
+	h.wire[k] = cur
+}
+
 func (h *hostChanges) addListener(k listenerRowKey, s span) {
 	cur := h.listeners[k]
 	cur.merge(s)
@@ -197,8 +232,9 @@ func (h *hostChanges) addTranslation(k translationID, s span) {
 }
 
 // merge adds the changes of o, which are older, back into h after o failed
-// to be written.
-func (h *hostChanges) merge(o *hostChanges) {
+// to be written, and returns how many sessions of o it left out beyond
+// maxSessions.
+func (h *hostChanges) merge(o *hostChanges) (dropped int) {
 	if o.hostname != "" {
 		if h.hostname == "" {
 			h.machineID, h.hostname, h.kernel, h.version = o.machineID, o.hostname, o.kernel, o.version
@@ -206,7 +242,9 @@ func (h *hostChanges) merge(o *hostChanges) {
 		h.span.merge(o.span)
 	}
 	for t, s := range o.sessions {
-		h.addSession(t, *s)
+		if !h.addSession(t, *s) {
+			dropped++
+		}
 	}
 	for a, s := range o.addrs {
 		h.addAddr(a, s)
@@ -217,12 +255,16 @@ func (h *hostChanges) merge(o *hostChanges) {
 	for k, s := range o.edges {
 		h.addEdge(k, s)
 	}
+	for k, s := range o.wire {
+		h.addWire(k, s)
+	}
 	for k, s := range o.listeners {
 		h.addListener(k, s)
 	}
 	for k, s := range o.translations {
 		h.addTranslation(k, s)
 	}
+	return dropped
 }
 
 // changes accumulates the changes of every host until they are written. To
@@ -235,11 +277,17 @@ type changes struct {
 	pending  map[string]*hostChanges
 	// accepted are the spans last accepted for writing, with when they were
 	// last reported.
-	acceptedEdges        map[string]map[edgeRowKey]acceptedSpan
+	acceptedEdges map[string]map[edgeRowKey]acceptedSpan
+	// acceptedWire are those of the wire protocols of edges, by edge and
+	// protocol, so that an edge is held once whatever its protocols.
+	acceptedWire         map[string]map[edgeRowKey]map[string]acceptedSpan
 	acceptedListeners    map[string]map[listenerRowKey]acceptedSpan
 	acceptedTranslations map[string]map[translationID]acceptedSpan
 	// floors bound the start of the sessions of hosts.
 	floors map[string]sessionFloor
+	// droppedSessions counts the sessions left out beyond maxSessions, until
+	// they are taken.
+	droppedSessions int
 }
 
 // minAgentIdleTTL is the shortest idle TTL of an agent: an edge active that
@@ -281,6 +329,7 @@ func newChanges(ttl time.Duration, jobUsers bool) *changes {
 		jobUsers:             jobUsers,
 		pending:              map[string]*hostChanges{},
 		acceptedEdges:        map[string]map[edgeRowKey]acceptedSpan{},
+		acceptedWire:         map[string]map[edgeRowKey]map[string]acceptedSpan{},
 		acceptedListeners:    map[string]map[listenerRowKey]acceptedSpan{},
 		acceptedTranslations: map[string]map[translationID]acceptedSpan{},
 		floors:               map[string]sessionFloor{},
@@ -322,19 +371,14 @@ func (c *changes) add(b *hostBatch, now time.Time) {
 	h := c.host(b.key)
 	h.setHost(b.machineID, b.hostname, b.kernel, b.agentVersion, now)
 	f := c.advanceFloor(b, skew, now)
-	if !b.segmentStart.IsZero() && !b.limited {
-		start := b.segmentStart
-		if start.Before(f.start) {
-			start = f.start
-		}
-		s := sessionRow{lastHeartbeat: now, clockSkew: skew, udpTraced: b.udpTraced, unixTraced: b.unixTraced,
-			netnsScope: b.netnsScope, dropped: b.dropped, peerFold: b.peerFold, peerInternal: b.peerInternal}
-		s.countersStarted = b.droppedSince
-		h.addSession(start, s)
-	}
-	// The host holds its addresses as of the requests that close intervals,
-	// like its heartbeat.
+	// The host holds its addresses, and its session goes on, as of the
+	// requests that close intervals, like its heartbeat: those of the agent
+	// carry its segment start. Series dropped in the interval end the
+	// session.
 	if b.final {
+		if !b.segmentStart.IsZero() && !b.limited {
+			c.addSegment(b, h, f, skew, now)
+		}
 		for _, a := range b.addrs {
 			h.addAddr(a, span{now, now})
 		}
@@ -342,6 +386,31 @@ func (c *changes) add(b *hostBatch, now time.Time) {
 	c.addEdges(b, h, latest, now)
 	c.addListeners(b, h, latest, now)
 	c.addTranslations(b, h, latest, now)
+}
+
+// addSegment records the session of a request received at now that closes
+// an interval, f being the session floor of its host and skew how far the
+// clock of the connector is ahead of the clock of the agent.
+func (c *changes) addSegment(b *hostBatch, h *hostChanges, f sessionFloor, skew time.Duration, now time.Time) {
+	// A segment starts no later than the request that carries it, by the
+	// clock of the agent, so that converted with the clock skew the session
+	// never starts after its heartbeat, and a time the agent makes up is
+	// written within what PostgreSQL holds. Nor does it start before the
+	// floor.
+	start := b.segmentStart
+	if t := now.Add(-skew).Truncate(time.Second); start.After(t) {
+		start = t
+	}
+	if start.Before(f.start) {
+		start = f.start
+	}
+	s := sessionRow{lastHeartbeat: now, clockSkew: skew, udpTraced: b.udpTraced, unixTraced: b.unixTraced,
+		protocolsClassified: b.protocolsClassified,
+		netnsScope:          b.netnsScope, dropped: b.dropped, peerFold: b.peerFold, peerInternal: b.peerInternal}
+	s.countersStarted = b.droppedSince
+	if !h.addSession(start, s) {
+		c.droppedSessions++
+	}
 }
 
 // advanceFloor updates the session floor of the host of a request received
@@ -371,11 +440,18 @@ func (c *changes) advanceFloor(b *hostBatch, skew time.Duration, now time.Time) 
 	return f
 }
 
-// addEdges records the edges of a request received at now, and their
-// processes, if they changed since they were last accepted for writing.
-// Their times are no later than latest.
+// addEdges records the edges of a request received at now, their wire
+// protocols and their processes, if they changed since they were last
+// accepted for writing. Their times are no later than latest. An edge is
+// written with a wire protocol that changed, so that the row of the
+// protocol finds the row of its edge.
 func (c *changes) addEdges(b *hostBatch, h *hostChanges, latest, now time.Time) {
 	edges := acceptedOf(c.acceptedEdges, b.key)
+	wire := c.acceptedWire[b.key]
+	if wire == nil {
+		wire = map[edgeRowKey]map[string]acceptedSpan{}
+		c.acceptedWire[b.key] = wire
+	}
 	for _, e := range b.edges {
 		if e.last.IsZero() {
 			continue
@@ -384,7 +460,22 @@ func (c *changes) addEdges(b *hostBatch, h *hostChanges, latest, now time.Time) 
 		pk := c.procKey(&e.id.process)
 		k := edgeRowKey{role: e.id.role, proto: e.id.proto, path: e.id.path, local: e.id.local, peer: e.id.peer, folded: e.id.folded,
 			port: e.id.port, netns: e.id.netns, procKey: pk}
-		if !accept(edges, k, s, now) {
+		changed := accept(edges, k, s, now)
+		for p, ws := range e.wire {
+			if ws.last.IsZero() {
+				continue
+			}
+			acc := wire[k]
+			if acc == nil {
+				acc = map[string]acceptedSpan{}
+				wire[k] = acc
+			}
+			if ws := observedSpan(ws.first, ws.last, latest); accept(acc, p, ws, now) {
+				h.addWire(wireRowKey{edge: k, protocol: p}, ws)
+				changed = true
+			}
+		}
+		if !changed {
 			continue
 		}
 		h.addProcess(pk, e.id.exe, s)
@@ -446,10 +537,12 @@ func acceptedOf[K comparable](m map[string]map[K]acceptedSpan, host string) map[
 }
 
 // observedSpan is the span of an observation first and last seen at those
-// times, first being zero if not known, and no later than latest.
+// times, first being zero if not known, and no later than latest. A first
+// time after the last, which older agents sent after their clock stepped
+// back, is the last.
 func observedSpan(first, last, latest time.Time) span {
 	s := span{first, last}
-	if s.first.IsZero() {
+	if s.first.IsZero() || s.first.After(s.last) {
 		s.first = s.last
 	}
 	return s.notAfter(latest)
@@ -475,7 +568,7 @@ func (c *changes) take() map[string]*hostChanges {
 
 // restore puts back changes that failed to be written.
 func (c *changes) restore(h *hostChanges) {
-	c.host(h.key).merge(h)
+	c.droppedSessions += c.host(h.key).merge(h)
 }
 
 // forget is called when changes of a host were dropped at now. The spans
@@ -484,15 +577,20 @@ func (c *changes) restore(h *hostChanges) {
 // starts no earlier than the idle TTL of an agent before now. So do the
 // sessions already pending, of requests received while the dropped changes
 // were being written: those requests skipped the edges the changes held.
+// A floor already later, after series of the host were dropped
+// (advanceFloor), stays: it is never moved back.
 func (c *changes) forget(key string, now time.Time) {
 	delete(c.acceptedEdges, key)
+	delete(c.acceptedWire, key)
 	delete(c.acceptedListeners, key)
 	delete(c.acceptedTranslations, key)
 	f, ok := c.floors[key]
 	if !ok {
 		return
 	}
-	f.start = now.Add(-f.skew).Add(-minAgentIdleTTL).Truncate(time.Second)
+	if t := now.Add(-f.skew).Add(-minAgentIdleTTL).Truncate(time.Second); t.After(f.start) {
+		f.start = t
+	}
 	c.floors[key] = f
 	if h := c.pending[key]; h != nil {
 		h.floorSessions(f.start)
@@ -501,11 +599,11 @@ func (c *changes) forget(key string, now time.Time) {
 
 // bound drops the pending changes of whole hosts, those pending the longest
 // first, until at most max rows are pending, and forgets them as dropped at
-// now. It returns the hosts and rows dropped.
-func (c *changes) bound(max int, now time.Time) (hosts, rows int) {
+// now. It returns the changes dropped.
+func (c *changes) bound(max int, now time.Time) (dropped []*hostChanges) {
 	size := c.pendingSize()
 	if size <= max {
-		return 0, 0
+		return nil
 	}
 	pending := slices.SortedFunc(maps.Values(c.pending), func(a, b *hostChanges) int {
 		return cmp.Or(a.first.Compare(b.first), strings.Compare(a.key, b.key))
@@ -514,51 +612,43 @@ func (c *changes) bound(max int, now time.Time) (hosts, rows int) {
 		if size <= max {
 			break
 		}
-		n := h.size()
-		size -= n
-		hosts++
-		rows += n
+		size -= h.size()
+		dropped = append(dropped, h)
 		delete(c.pending, h.key)
 		c.forget(h.key, now)
 	}
-	return hosts, rows
+	return dropped
 }
 
 // expire forgets accepted spans not reported for the TTL.
 func (c *changes) expire(now time.Time) {
-	for host, m := range c.acceptedEdges {
-		for k, a := range m {
-			if now.Sub(a.seen) > c.ttl {
-				delete(m, k)
-			}
-		}
-		if len(m) == 0 {
-			delete(c.acceptedEdges, host)
+	expireAccepted(c.acceptedEdges, now, c.ttl)
+	for host, edges := range c.acceptedWire {
+		expireAccepted(edges, now, c.ttl)
+		if len(edges) == 0 {
+			delete(c.acceptedWire, host)
 		}
 	}
-	for host, m := range c.acceptedListeners {
-		for k, a := range m {
-			if now.Sub(a.seen) > c.ttl {
-				delete(m, k)
-			}
-		}
-		if len(m) == 0 {
-			delete(c.acceptedListeners, host)
-		}
-	}
-	for host, m := range c.acceptedTranslations {
-		for k, a := range m {
-			if now.Sub(a.seen) > c.ttl {
-				delete(m, k)
-			}
-		}
-		if len(m) == 0 {
-			delete(c.acceptedTranslations, host)
-		}
-	}
+	expireAccepted(c.acceptedListeners, now, c.ttl)
+	expireAccepted(c.acceptedTranslations, now, c.ttl)
 	for host, f := range c.floors {
 		if now.Sub(f.seen) > c.ttl {
 			delete(c.floors, host)
+		}
+	}
+}
+
+// expireAccepted forgets the spans of m not reported for ttl, and the owners
+// left without any: the hosts, or the edges of the wire protocols of a host.
+func expireAccepted[O, K comparable](m map[O]map[K]acceptedSpan, now time.Time, ttl time.Duration) {
+	for owner, acc := range m {
+		for k, a := range acc {
+			if now.Sub(a.seen) > ttl {
+				delete(acc, k)
+			}
+		}
+		if len(acc) == 0 {
+			delete(m, owner)
 		}
 	}
 }

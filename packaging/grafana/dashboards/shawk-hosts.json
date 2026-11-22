@@ -26,10 +26,10 @@
           "uid": "shawk-prometheus"
         },
         "query": {
-          "query": "label_values({__name__=~\"shawk:host_dependency_connections:rate5m|shawk:host_dependency_connection_failures_by_reason:rate5m\"}, dst)",
+          "query": "label_values({__name__=~\"shawk:host_dependency_connections:rate5m|shawk:host_dependency_connection_failures_by_reason:rate5m|shawk:host_dependency_request_bytes:rate5m|shawk:host_dependency_response_bytes:rate5m\"}, dst)",
           "refId": "dst"
         },
-        "definition": "label_values({__name__=~\"shawk:host_dependency_connections:rate5m|shawk:host_dependency_connection_failures_by_reason:rate5m\"}, dst)",
+        "definition": "label_values({__name__=~\"shawk:host_dependency_connections:rate5m|shawk:host_dependency_connection_failures_by_reason:rate5m|shawk:host_dependency_request_bytes:rate5m|shawk:host_dependency_response_bytes:rate5m\"}, dst)",
         "refresh": 2,
         "multi": true,
         "includeAll": true,
@@ -45,10 +45,10 @@
           "uid": "shawk-prometheus"
         },
         "query": {
-          "query": "label_values({__name__=~\"shawk:host_dependency_connections:rate5m|shawk:host_dependency_connection_failures_by_reason:rate5m\", dst=~\"$dst\"}, src)",
+          "query": "label_values({__name__=~\"shawk:host_dependency_connections:rate5m|shawk:host_dependency_connection_failures_by_reason:rate5m|shawk:host_dependency_request_bytes:rate5m|shawk:host_dependency_response_bytes:rate5m\", dst=~\"$dst\"}, src)",
           "refId": "src"
         },
-        "definition": "label_values({__name__=~\"shawk:host_dependency_connections:rate5m|shawk:host_dependency_connection_failures_by_reason:rate5m\", dst=~\"$dst\"}, src)",
+        "definition": "label_values({__name__=~\"shawk:host_dependency_connections:rate5m|shawk:host_dependency_connection_failures_by_reason:rate5m|shawk:host_dependency_request_bytes:rate5m|shawk:host_dependency_response_bytes:rate5m\", dst=~\"$dst\"}, src)",
         "refresh": 2,
         "multi": true,
         "includeAll": true,
@@ -64,10 +64,10 @@
           "uid": "shawk-prometheus"
         },
         "query": {
-          "query": "label_values({__name__=~\"shawk:host_dependency_connections:rate5m|shawk:host_dependency_connection_failures_by_reason:rate5m\", dst=~\"$dst\", src=~\"$src\"}, dst_host)",
+          "query": "label_values({__name__=~\"shawk:host_dependency_connections:rate5m|shawk:host_dependency_connection_failures_by_reason:rate5m|shawk:host_dependency_request_bytes:rate5m|shawk:host_dependency_response_bytes:rate5m\", dst=~\"$dst\", src=~\"$src\"}, dst_host)",
           "refId": "dst_host"
         },
-        "definition": "label_values({__name__=~\"shawk:host_dependency_connections:rate5m|shawk:host_dependency_connection_failures_by_reason:rate5m\", dst=~\"$dst\", src=~\"$src\"}, dst_host)",
+        "definition": "label_values({__name__=~\"shawk:host_dependency_connections:rate5m|shawk:host_dependency_connection_failures_by_reason:rate5m|shawk:host_dependency_request_bytes:rate5m|shawk:host_dependency_response_bytes:rate5m\", dst=~\"$dst\", src=~\"$src\"}, dst_host)",
         "refresh": 2,
         "multi": true,
         "includeAll": true,
@@ -169,7 +169,7 @@
           "editorMode": "code",
           "instant": true,
           "format": "table",
-          "expr": "sum by (src_host, src, dst_host, dst, server_port) (shawk:host_dependency_connections:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})"
+          "expr": "sum by (src_host, src, dst_host, dst, server_port, network_transport) (shawk:host_dependency_connections:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})"
         },
         {
           "refId": "failures",
@@ -180,7 +180,7 @@
           "editorMode": "code",
           "instant": true,
           "format": "table",
-          "expr": "sum by (src_host, src, dst_host, dst, server_port) (shawk:host_dependency_connection_failures_by_reason:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})"
+          "expr": "sum by (src_host, src, dst_host, dst, server_port, network_transport) (shawk:host_dependency_connection_failures_by_reason:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})"
         }
       ],
       "transformations": [
@@ -201,7 +201,8 @@
               "src": "client",
               "dst_host": "server host",
               "dst": "server",
-              "server_port": "port"
+              "server_port": "port",
+              "network_transport": "transport"
             }
           }
         },
@@ -251,9 +252,9 @@
             "uid": "shawk-prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (src_host, dst_host, dst, server_port, error_type) (shawk:host_dependency_connection_failures_by_reason:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})",
+          "expr": "sum by (src_host, dst_host, dst, server_port, network_transport, error_type) (shawk:host_dependency_connection_failures_by_reason:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})",
           "range": true,
-          "legendFormat": "{{src_host}} → {{dst_host}} ({{dst}}:{{server_port}}) {{error_type}}"
+          "legendFormat": "{{src_host}} → {{dst_host}} ({{dst}}:{{server_port}}/{{network_transport}}) {{error_type}}"
         }
       ],
       "fieldConfig": {
@@ -304,9 +305,9 @@
             "uid": "shawk-prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (src_host, src, dst_host, dst, server_port) (shawk:host_dependency_connection_failures_by_reason:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})\n  / (sum by (src_host, src, dst_host, dst, server_port) (shawk:host_dependency_connection_failures_by_reason:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})\n     + (sum by (src_host, src, dst_host, dst, server_port) (shawk:host_dependency_connections:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"}) or 0 * sum by (src_host, src, dst_host, dst, server_port) (shawk:host_dependency_connection_failures_by_reason:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})))",
+          "expr": "sum by (src_host, src, dst_host, dst, server_port, network_transport) (shawk:host_dependency_connection_failures_by_reason:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})\n  / (sum by (src_host, src, dst_host, dst, server_port, network_transport) (shawk:host_dependency_connection_failures_by_reason:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})\n     + (sum by (src_host, src, dst_host, dst, server_port, network_transport) (shawk:host_dependency_connections:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"}) or 0 * sum by (src_host, src, dst_host, dst, server_port, network_transport) (shawk:host_dependency_connection_failures_by_reason:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})))",
           "range": true,
-          "legendFormat": "{{src_host}} ({{src}}) → {{dst_host}} ({{dst}}:{{server_port}})"
+          "legendFormat": "{{src_host}} ({{src}}) → {{dst_host}} ({{dst}}:{{server_port}}/{{network_transport}})"
         }
       ],
       "fieldConfig": {
@@ -357,9 +358,9 @@
             "uid": "shawk-prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (src_host, src, dst_host, dst, server_port) (shawk:host_dependency_connections:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})",
+          "expr": "sum by (src_host, src, dst_host, dst, server_port, network_transport) (shawk:host_dependency_connections:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})",
           "range": true,
-          "legendFormat": "{{src_host}} ({{src}}) → {{dst_host}} ({{dst}}:{{server_port}})"
+          "legendFormat": "{{src_host}} ({{src}}) → {{dst_host}} ({{dst}}:{{server_port}}/{{network_transport}})"
         }
       ],
       "fieldConfig": {
@@ -410,9 +411,9 @@
             "uid": "shawk-prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (src_host, src, dst_host, dst, server_port) (shawk:host_dependency_handshake_seconds_sum:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})\n  / sum by (src_host, src, dst_host, dst, server_port) (shawk:host_dependency_handshake_seconds_count:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})",
+          "expr": "sum by (src_host, src, dst_host, dst, server_port, network_transport) (shawk:host_dependency_handshake_seconds_sum:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})\n  / sum by (src_host, src, dst_host, dst, server_port, network_transport) (shawk:host_dependency_handshake_seconds_count:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})",
           "range": true,
-          "legendFormat": "{{src_host}} ({{src}}) → {{dst_host}} ({{dst}}:{{server_port}})"
+          "legendFormat": "{{src_host}} ({{src}}) → {{dst_host}} ({{dst}}:{{server_port}}/{{network_transport}})"
         }
       ],
       "fieldConfig": {
@@ -463,9 +464,9 @@
             "uid": "shawk-prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (src_host, src, dst_host, dst, server_port) (shawk:host_dependency_syn_retransmits:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})",
+          "expr": "sum by (src_host, src, dst_host, dst, server_port, network_transport) (shawk:host_dependency_syn_retransmits:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})",
           "range": true,
-          "legendFormat": "{{src_host}} ({{src}}) → {{dst_host}} ({{dst}}:{{server_port}})"
+          "legendFormat": "{{src_host}} ({{src}}) → {{dst_host}} ({{dst}}:{{server_port}}/{{network_transport}})"
         }
       ],
       "fieldConfig": {
@@ -516,9 +517,9 @@
             "uid": "shawk-prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (src_host, src, dst_host, dst, server_port, shawk_role) (shawk:host_dependency_retransmits:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})",
+          "expr": "sum by (src_host, src, dst_host, dst, server_port, network_transport, shawk_role) (shawk:host_dependency_retransmits:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})",
           "range": true,
-          "legendFormat": "{{src_host}} → {{dst_host}} ({{dst}}:{{server_port}}) sent by {{shawk_role}}"
+          "legendFormat": "{{src_host}} → {{dst_host}} ({{dst}}:{{server_port}}/{{network_transport}}) sent by {{shawk_role}}"
         }
       ],
       "fieldConfig": {
@@ -569,9 +570,9 @@
             "uid": "shawk-prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (src_host, src, dst_host, dst, server_port) (shawk:host_dependency_request_bytes:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})",
+          "expr": "sum by (src_host, src, dst_host, dst, server_port, network_transport) (shawk:host_dependency_request_bytes:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})",
           "range": true,
-          "legendFormat": "request {{src_host}} ({{src}}) → {{dst_host}} ({{dst}}:{{server_port}})"
+          "legendFormat": "request {{src_host}} ({{src}}) → {{dst_host}} ({{dst}}:{{server_port}}/{{network_transport}})"
         },
         {
           "refId": "B",
@@ -581,8 +582,8 @@
           },
           "editorMode": "code",
           "range": true,
-          "expr": "sum by (src_host, src, dst_host, dst, server_port) (shawk:host_dependency_response_bytes:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})",
-          "legendFormat": "response {{src_host}} ({{src}}) → {{dst_host}} ({{dst}}:{{server_port}})"
+          "expr": "sum by (src_host, src, dst_host, dst, server_port, network_transport) (shawk:host_dependency_response_bytes:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})",
+          "legendFormat": "response {{src_host}} ({{src}}) → {{dst_host}} ({{dst}}:{{server_port}}/{{network_transport}})"
         }
       ],
       "fieldConfig": {
@@ -635,7 +636,7 @@
           "editorMode": "code",
           "instant": true,
           "format": "table",
-          "expr": "sum by (src, src_network, dst, dst_network, server_port) (shawk:host_dependency_connections:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\", network_transport!=\"unix\"})"
+          "expr": "sum by (src, src_network, dst, dst_network, server_port, network_transport) (shawk:host_dependency_connections:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\", network_transport!=\"unix\"})"
         },
         {
           "refId": "request",
@@ -646,7 +647,7 @@
           "editorMode": "code",
           "instant": true,
           "format": "table",
-          "expr": "sum by (src, src_network, dst, dst_network, server_port) (shawk:host_dependency_request_bytes:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})"
+          "expr": "sum by (src, src_network, dst, dst_network, server_port, network_transport) (shawk:host_dependency_request_bytes:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})"
         },
         {
           "refId": "response",
@@ -657,7 +658,7 @@
           "editorMode": "code",
           "instant": true,
           "format": "table",
-          "expr": "sum by (src, src_network, dst, dst_network, server_port) (shawk:host_dependency_response_bytes:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})"
+          "expr": "sum by (src, src_network, dst, dst_network, server_port, network_transport) (shawk:host_dependency_response_bytes:rate5m{dst=~\"$dst\", src=~\"$src\", dst_host=~\"$dst_host\"})"
         }
       ],
       "transformations": [
@@ -679,7 +680,8 @@
               "src_network": "client network",
               "dst": "server",
               "dst_network": "server network",
-              "server_port": "port"
+              "server_port": "port",
+              "network_transport": "transport"
             }
           }
         },

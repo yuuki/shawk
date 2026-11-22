@@ -182,3 +182,16 @@ func TestHandshakeContract(t *testing.T) {
 		}
 	}
 }
+
+// TestWireProtocolContract checks that the wire protocols of the tracer, by
+// their bits, are those that the agent sends.
+func TestWireProtocolContract(t *testing.T) {
+	if tracer.NumWireProtocols != len(otlp.WireProtocols) {
+		t.Fatalf("%d wire protocols in the tracer, %d in OTLP", tracer.NumWireProtocols, len(otlp.WireProtocols))
+	}
+	for p := range tracer.WireProtocol(tracer.NumWireProtocols) {
+		if p.String() != otlp.WireProtocols[p] {
+			t.Errorf("wire protocol %d is %s in the tracer and %s in OTLP", p, p, otlp.WireProtocols[p])
+		}
+	}
+}

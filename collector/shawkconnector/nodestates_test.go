@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func TestParseNodeStates(t *testing.T) {
@@ -40,6 +41,23 @@ nodes:
 		t.Errorf("JSON = %+v, %v", ns, err)
 	}
 
+	// A reason is free text, cleaned for PostgreSQL and cut (#254).
+	reason := func(r string) string {
+		t.Helper()
+		ns, err := parseNodeStates([]byte(`{"generated_at": "2026-10-31T12:00:00Z", "nodes": [{"host": "cn001", "state": "DRAIN", "reason": "`+
+			r+`"}]}`), t0)
+		if err != nil || len(ns.nodes) != 1 {
+			t.Fatalf("reason %.20q: %+v, %v", r, ns, err)
+		}
+		return ns.nodes[0].reason
+	}
+	if got := reason(`a\u0000\tb\n`); got != "a\uFFFD\tb\n" {
+		t.Errorf("reason with NUL = %q", got)
+	}
+	if got := reason(strings.Repeat("é", maxStringBytes)); len(got) != maxStringBytes || !utf8.ValidString(got) {
+		t.Errorf("long reason has %d bytes, valid UTF-8 %t", len(got), utf8.ValidString(got))
+	}
+
 	// Flags joined in a list element are split, and * of a node that does
 	// not respond is a flag.
 	ns, err = parseNodeStates([]byte("generated_at: 2026-10-31T12:00:00Z\nnodes: [{host: cn001, state: [IDLE*+POWERED_DOWN]}]\n"), t0)
@@ -47,8 +65,23 @@ nodes:
 		t.Errorf("not responding = %+v, %v", ns, err)
 	}
 
+	// Explicit YAML document start and end markers on a single document.
+	ns, err = parseNodeStates([]byte("---\ngenerated_at: 2026-10-31T12:00:00Z\nnodes: [{host: cn001, state: IDLE}]\n...\n"), t0)
+	if err != nil || len(ns.nodes) != 1 || ns.nodes[0].host != "cn001" {
+		t.Errorf("single doc markers = %+v, %v", ns, err)
+	}
+
 	for _, bad := range []struct{ name, doc string }{
 		{"empty", ""},
+		{"whitespace only", "   \n  \n"},
+		{"comments only", "# no states yet\n"},
+		{"bare document marker", "---\n"},
+		{"empty document markers", "---\n...\n"},
+		{"null", "null\n"},
+		{"tilde null", "~\n"},
+		{"two documents", "generated_at: 2026-10-31T12:00:00Z\nnodes: [{host: cn001, state: IDLE}]\n---\ngenerated_at: 2026-10-31T12:00:00Z\nnodes: [{host: cn002, state: DOWN}]\n"},
+		{"trailing empty document", "generated_at: 2026-10-31T12:00:00Z\nnodes: [{host: cn001, state: IDLE}]\n---\n"},
+		{"leading empty document", "---\n---\ngenerated_at: 2026-10-31T12:00:00Z\nnodes: [{host: cn001, state: IDLE}]\n"},
 		{"symbol of sinfo", "generated_at: 2026-10-31T12:00:00Z\nnodes: [{host: cn001, state: idle~}]\n"},
 		{"unknown field", "generated_at: 2026-10-31T12:00:00Z\nnode: []\n"},
 		{"no time", "nodes: [{host: cn001, state: IDLE}]\n"},
@@ -59,6 +92,9 @@ nodes:
 		{"no state", "generated_at: 2026-10-31T12:00:00Z\nnodes: [{host: cn001}]\n"},
 		{"empty flag", "generated_at: 2026-10-31T12:00:00Z\nnodes: [{host: cn001, state: IDLE+}]\n"},
 		{"twice", "generated_at: 2026-10-31T12:00:00Z\nnodes: [{host: cn001, state: IDLE}, {host: cn001, state: DOWN}]\n"},
+		// PostgreSQL refuses text with NUL (#254).
+		{"NUL in a host", `{"generated_at": "2026-10-31T12:00:00Z", "nodes": [{"host": "cn\u0000", "state": "IDLE"}]}`},
+		{"control character in a node", `{"generated_at": "2026-10-31T12:00:00Z", "nodes": [{"node": "cn\u0001", "state": "IDLE"}]}`},
 	} {
 		if ns, err := parseNodeStates([]byte(bad.doc), t0); err == nil {
 			t.Errorf("%s: parsed %+v", bad.name, ns)
@@ -114,21 +150,72 @@ maintenance:
 		!ws[0].start.Equal(time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)) || ws[1].reason != "firmware" {
 		t.Errorf("windows = %+v", ws)
 	}
-	if ws, err := parseMaintenance([]byte("maintenance: []\n")); err != nil || len(ws) != 0 {
-		t.Errorf("no windows = %+v, %v", ws, err)
+	ws, err = parseMaintenance([]byte(`{"maintenance": [{"hosts": ["nfs01"], "start": "2026-11-01T00:00:00Z",
+	  "end": "2026-11-02T00:00:00Z", "reason": "fw\u0000"}]}`))
+	if err != nil || len(ws) != 1 || ws[0].reason != "fw\uFFFD" {
+		t.Errorf("reason = %+v, %v", ws, err)
 	}
-	for _, bad := range []struct{ name, doc string }{
-		{"empty", ""},
-		{"unknown field", "windows: []\n"},
-		{"no end", "maintenance: [{hosts: [cn001], start: 2026-11-01T00:00:00Z}]\n"},
-		{"end before start", "maintenance: [{hosts: [cn001], start: 2026-11-01T00:00:00Z, end: 2026-11-01T00:00:00Z}]\n"},
-		{"too long", "maintenance: [{hosts: [cn001], start: 2026-11-01T00:00:00Z, end: 2026-12-02T00:00:00Z}]\n"},
-		{"no hosts", "maintenance: [{hosts: [], start: 2026-11-01T00:00:00Z, end: 2026-11-02T00:00:00Z}]\n"},
-		{"same start", "maintenance: [{hosts: [cn001], start: 2026-11-01T00:00:00Z, end: 2026-11-02T00:00:00Z}," +
-			" {hosts: [cn001], start: 2026-11-01T09:00:00+09:00, end: 2026-11-03T00:00:00Z}]\n"},
+	for _, empty := range []struct{ name, doc string }{
+		{"empty list", "maintenance: []\n"},
+		{"empty mapping", "{}\n"},
+		{"empty mapping JSON", "{}"},
+		{"doc marker empty mapping", "---\n{}\n"},
+		{"doc markers empty mapping", "---\n{}\n...\n"},
+		{"doc marker empty list", "---\nmaintenance: []\n"},
+		{"doc markers empty list", "---\nmaintenance: []\n...\n"},
+		{"comment before empty mapping", "# no scheduled maintenance\n{}\n"},
+		{"comment after empty mapping", "{}\n# trailing comment\n"},
+		{"comment after document end", "maintenance: []\n...\n# trailing comment\n"},
 	} {
-		if ws, err := parseMaintenance([]byte(bad.doc)); err == nil {
+		if ws, err := parseMaintenance([]byte(empty.doc)); err != nil || len(ws) != 0 {
+			t.Errorf("%s: no windows = %+v, %v", empty.name, ws, err)
+		}
+	}
+	for _, bad := range []struct{ name, doc, want string }{
+		{"empty", "", "the file is empty"},
+		{"whitespace only", "   \n  \n", "the file is empty"},
+		{"comments only", "# no windows yet\n", "the file is empty"},
+		{"bare document marker", "---\n", "the file is empty"},
+		{"doc marker comment", "---\n# comment only\n", "the file is empty"},
+		{"yaml directive empty doc", "%YAML 1.1\n---\n", "the file is empty"},
+		{"empty document markers", "---\n...\n", "the file is empty"},
+		{"bare document end", "...\n", ""},
+		{"null", "null\n", "the file is empty"},
+		{"Null", "Null\n", "the file is empty"},
+		{"NULL", "NULL\n", "the file is empty"},
+		{"tilde null", "~\n", "the file is empty"},
+		{"doc marker null", "---\nnull\n", "the file is empty"},
+		{"doc marker tilde", "---\n~\n", "the file is empty"},
+		{"explicit null tag", "!!null ''\n", "the file is empty"},
+		{"two documents", "maintenance: [{hosts: [cn001], start: 2026-11-01T00:00:00Z, end: 2026-11-02T00:00:00Z}]\n" +
+			"---\nmaintenance: [{hosts: [cn002], start: 2026-11-01T00:00:00Z, end: 2026-11-02T00:00:00Z}]\n", "more than one YAML document"},
+		{"leading empty document", "---\n---\nmaintenance: [{hosts: [cn001], start: 2026-11-01T00:00:00Z, end: 2026-11-02T00:00:00Z}]\n", "more than one YAML document"},
+		{"trailing empty document", "maintenance: []\n---\n", "more than one YAML document"},
+		{"trailing empty document with end", "maintenance: []\n---\n...\n", "more than one YAML document"},
+		{"two empty mappings", "{}\n---\n{}\n", "more than one YAML document"},
+		{"two empty documents", "---\n---\n", "more than one YAML document"},
+		{"concatenated JSON", "{} {}", ""},
+		{"sequence", "[]\n", ""},
+		{"quoted empty string", "\"\"\n", ""},
+		{"explicit null mapping", "!!null {}\n", ""},
+		{"explicit map scalar", "!!map\n", ""},
+		{"unknown field", "windows: []\n", "windows"},
+		{"no end", "maintenance: [{hosts: [cn001], start: 2026-11-01T00:00:00Z}]\n", ""},
+		{"end before start", "maintenance: [{hosts: [cn001], start: 2026-11-01T00:00:00Z, end: 2026-11-01T00:00:00Z}]\n", ""},
+		{"too long", "maintenance: [{hosts: [cn001], start: 2026-11-01T00:00:00Z, end: 2026-12-02T00:00:00Z}]\n", ""},
+		{"no hosts", "maintenance: [{hosts: [], start: 2026-11-01T00:00:00Z, end: 2026-11-02T00:00:00Z}]\n", ""},
+		{"same start", "maintenance: [{hosts: [cn001], start: 2026-11-01T00:00:00Z, end: 2026-11-02T00:00:00Z}," +
+			" {hosts: [cn001], start: 2026-11-01T09:00:00+09:00, end: 2026-11-03T00:00:00Z}]\n", ""},
+		{"empty host", "maintenance: [{hosts: [''], start: 2026-11-01T00:00:00Z, end: 2026-11-02T00:00:00Z}]\n", ""},
+		{"NUL in a host", `{"maintenance": [{"hosts": ["nfs\u0000"], "start": "2026-11-01T00:00:00Z", "end": "2026-11-02T00:00:00Z"}]}`, ""},
+	} {
+		ws, err := parseMaintenance([]byte(bad.doc))
+		if err == nil {
 			t.Errorf("%s: parsed %+v", bad.name, ws)
+			continue
+		}
+		if bad.want != "" && !strings.Contains(err.Error(), bad.want) {
+			t.Errorf("%s: error %q, want %q", bad.name, err, bad.want)
 		}
 	}
 }
@@ -489,5 +576,62 @@ func TestMaintenanceFileInvalid(t *testing.T) {
 		if st.windowSyncs != step.writes || len(st.windows) != 1 {
 			t.Errorf("%s: %d writes of %+v, want %d of one window", step.name, st.windowSyncs, st.windows, step.writes)
 		}
+	}
+}
+
+// TestMaintenanceFilePreservedOnEmptyAndMultiDoc: empty, comments-only,
+// null or multi-document YAML in maintenance_file leaves the registered
+// maintenance windows untouched; explicit {} or maintenance: [] clears them.
+func TestMaintenanceFilePreservedOnEmptyAndMultiDoc(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "maintenance.yaml")
+	windows := "maintenance: [{hosts: [cn001], start: 2026-11-01T00:00:00Z, end: 2026-11-02T00:00:00Z, reason: firmware}]\n"
+	write := func(doc string) {
+		t.Helper()
+		if err := os.WriteFile(file, []byte(doc), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(windows)
+	c, st, _, _ := testConnector(t, func(cfg *Config) { cfg.MaintenanceFile = file })
+	ctx := context.Background()
+	if st.windowSyncs != 1 || len(st.windows) != 1 || st.windows[0].host != "cn001" {
+		t.Fatalf("at start: %d writes of %+v", st.windowSyncs, st.windows)
+	}
+
+	for _, bad := range []struct{ name, doc string }{
+		{"empty", ""},
+		{"comments only", "# commented out\n"},
+		{"bare document marker", "---\n"},
+		{"empty document markers", "---\n...\n"},
+		{"null", "null\n"},
+		{"tilde null", "~\n"},
+		{"leading empty document", "---\n---\n" + windows},
+		{"two documents", windows + "---\nmaintenance: [{hosts: [cn002], start: 2026-11-01T00:00:00Z, end: 2026-11-02T00:00:00Z}]\n"},
+		{"trailing empty document", "maintenance: []\n---\n"},
+	} {
+		write(bad.doc)
+		c.syncNodeStates(ctx)
+		if st.windowSyncs != 1 || len(st.windows) != 1 || st.windows[0].host != "cn001" {
+			t.Fatalf("%s: %d writes of %+v, want 1 write keeping cn001", bad.name, st.windowSyncs, st.windows)
+		}
+	}
+
+	// Explicit empty mapping clears registered windows.
+	write("{}\n")
+	c.syncNodeStates(ctx)
+	if st.windowSyncs != 2 || len(st.windows) != 0 {
+		t.Fatalf("explicit {}: %d writes of %+v, want 2 writes of none", st.windowSyncs, st.windows)
+	}
+
+	// Restore and verify explicit maintenance: [] clears registered windows too.
+	write(windows)
+	c.syncNodeStates(ctx)
+	if st.windowSyncs != 3 || len(st.windows) != 1 {
+		t.Fatalf("restored: %d writes of %+v, want 3 writes of one", st.windowSyncs, st.windows)
+	}
+	write("maintenance: []\n")
+	c.syncNodeStates(ctx)
+	if st.windowSyncs != 4 || len(st.windows) != 0 {
+		t.Fatalf("explicit maintenance: []: %d writes of %+v, want 4 writes of none", st.windowSyncs, st.windows)
 	}
 }

@@ -46,6 +46,9 @@ type tEdge struct {
 	reasons map[string]tReason
 	// netns is the network namespace, 4026531840 if empty.
 	netns string
+	// wire are when the edge saw each wire protocol, sent as
+	// shawk.edge.wire_protocol.first_seen and last_seen.
+	wire map[string]span
 }
 
 // tReason is a reason of failure of an edge: its count since start, t0 if
@@ -93,6 +96,8 @@ type tAgent struct {
 	noUDP bool
 	// unixTraced is sent as shawk.agent.unix.traced if not nil.
 	unixTraced *bool
+	// classified is sent as shawk.agent.protocols.classified if not nil.
+	classified *bool
 	netnsScope string
 	// dropped is sent as shawk.agent.flows.dropped, counted since
 	// droppedSince (t0 if zero), when either is set.
@@ -287,6 +292,15 @@ func (ta tAgent) metrics() pmetric.Metrics {
 			dp.SetTimestamp(now)
 			dp.SetIntValue(t.Unix())
 		}
+		for p, w := range e.wire {
+			for name, t := range map[string]time.Time{metricEdgeWireFirst: w.first, metricEdgeWireLast: w.last} {
+				dp := metric(name, pmetric.MetricTypeGauge).Gauge().DataPoints().AppendEmpty()
+				attrs(dp.Attributes())
+				dp.Attributes().PutStr(attrWireProtocol, p)
+				dp.SetTimestamp(now)
+				dp.SetIntValue(t.Unix())
+			}
+		}
 	}
 	for _, l := range ta.listeners {
 		first, last := l.first, l.last
@@ -372,6 +386,13 @@ func (ta tAgent) metrics() pmetric.Metrics {
 		dp := metric(metricAgentUnixTraced, pmetric.MetricTypeGauge).Gauge().DataPoints().AppendEmpty()
 		dp.SetTimestamp(now)
 		if *ta.unixTraced {
+			dp.SetIntValue(1)
+		}
+	}
+	if ta.classified != nil {
+		dp := metric(metricAgentProtocolsClassified, pmetric.MetricTypeGauge).Gauge().DataPoints().AppendEmpty()
+		dp.SetTimestamp(now)
+		if *ta.classified {
 			dp.SetIntValue(1)
 		}
 	}

@@ -44,6 +44,34 @@ func (t *Tracer) Collect() (*Snapshot, error) {
 			clear(t.unixMissing)
 		}
 	}
+	t.setListenerOwners(listeners)
+	listeners = append(listeners, t.unixListeners()...)
+
+	flows, unixFlows, err := t.flip()
+	if err != nil {
+		return nil, err
+	}
+	flows = t.attribute(flows)
+	t.noteMissingUnixListeners(unixFlows)
+	flows = append(flows, unixFlows...)
+	t.tryConntrack(time.Now())
+	// The flows are drained already: an error with the translations loses
+	// those of the interval only.
+	xlats, err := t.collectTranslations()
+	if err != nil {
+		t.warnOnce("reading the translations of addresses", err)
+	}
+	t.warnOnIncrease(t.flowBusy, "some flow updates were dropped because the flow table was being updated on the same CPU, not because it was full")
+	snap := &Snapshot{Flows: flows, Listeners: listeners, Translations: xlats}
+	if err := t.readDrops(snap); err != nil {
+		return nil, err
+	}
+	return snap, nil
+}
+
+// setListenerOwners gives the TCP and UDP listeners their preferred owner
+// of the last owner scan.
+func (t *Tracer) setListenerOwners(listeners []Listener) {
 	for i := range listeners {
 		k := listenerKey(&listeners[i])
 		if o, ok := preferredOwner(t.owners[k]); ok {
@@ -55,32 +83,25 @@ func (t *Tracer) Collect() (*Snapshot, error) {
 			listeners[i].Comm = ""
 		}
 	}
+}
 
-	listeners = append(listeners, t.unixListeners()...)
-
-	flows, unixFlows, err := t.flip()
-	if err != nil {
-		return nil, err
-	}
-	flows = t.attribute(flows)
+// noteMissingUnixListeners requests an owner scan when a client connected
+// to a name that no scan found a listener of in the network namespace of
+// the client: a server that started since the last scan.
+func (t *Tracer) noteMissingUnixListeners(unixFlows []Flow) {
 	for i := range unixFlows {
-		// A client connected to a name that no scan found a listener of: a
-		// server that started since the last scan.
-		if f := &unixFlows[i]; f.Conns > 0 && !t.hasUnixListener(f.Path) && !t.unixMissing[f.Path] {
-			t.unixMissing[f.Path] = true
+		f := &unixFlows[i]
+		k := unixListenerKey{netns: f.NetNS, path: f.Path}
+		if f.Conns > 0 && !t.hasUnixListener(k) && !t.unixMissing[k] {
+			t.unixMissing[k] = true
 			t.ownerMissing = true
 		}
 	}
-	flows = append(flows, unixFlows...)
-	t.tryConntrack(time.Now())
-	// The flows are drained already: an error with the translations loses
-	// those of the interval only.
-	xlats, err := t.collectTranslations()
-	if err != nil {
-		t.warnOnce("reading the translations of addresses", err)
-	}
-	t.warnOnIncrease(t.flowBusy, "some flow updates were dropped because the flow table was being updated on the same CPU, not because it was full")
-	snap := &Snapshot{Flows: flows, Listeners: listeners, Translations: xlats}
+}
+
+// readDrops reads the counters of what the programs dropped into a
+// snapshot, and warns when translations were dropped.
+func (t *Tracer) readDrops(snap *Snapshot) error {
 	counters := []struct {
 		v   *ebpf.Variable
 		dst *uint64
@@ -95,10 +116,10 @@ func (t *Tracer) Collect() (*Snapshot, error) {
 	}
 	for _, c := range counters {
 		if err := c.v.Get(c.dst); err != nil {
-			return nil, err
+			return err
 		}
 	}
-	return snap, nil
+	return nil
 }
 
 // flip switches the active flow maps and drains the previous ones: the
@@ -274,10 +295,14 @@ func (t *Tracer) attribute(flows []Flow) []Flow {
 	return out
 }
 
-// The buckets and reasons of struct shawk_flow_stats are those of FlowStats.
+// The buckets, reasons and wire protocols of struct shawk_flow_stats are
+// those of FlowStats.
 var (
 	_ [len(bpfShawkFlowStats{}.HsBuckets)]struct{} = [len(FlowStats{}.Handshakes)]struct{}{}
 	_ [len(bpfShawkFlowStats{}.Fails)]struct{}     = [len(FlowStats{}.Fails)]struct{}{}
+	_ [bpfShawkWireProtoWIRE_PROTOS]struct{}       = [NumWireProtocols]struct{}{}
+	// A byte per wire protocol.
+	_ [len(bpfShawkFlowStats{}.Protos) - NumWireProtocols]struct{}
 )
 
 func convertFlow(k *bpfShawkFlowKey, v *bpfShawkFlowStats) Flow {
@@ -314,6 +339,11 @@ func convertFlow(k *bpfShawkFlowKey, v *bpfShawkFlowStats) Flow {
 	}
 	for i, n := range v.Fails {
 		f.Fails[i] = uint64(n)
+	}
+	for p, seen := range v.Protos[:NumWireProtocols] {
+		if seen != 0 {
+			f.Protocols |= 1 << p
+		}
 	}
 	return f
 }
