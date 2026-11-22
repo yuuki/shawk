@@ -41,7 +41,8 @@ jobs:
         with:
           category: /language:go
 
-  # Known vulnerabilities that the code of every module reaches.
+  # Known vulnerabilities that the code of every module, and the collector
+  # of the releases, reach (make vuln).
   govulncheck:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -50,7 +51,14 @@ jobs:
         with:
           persist-credentials: false
       - uses: actions/setup-go@v7.0.0
+        id: go
         with:
           go-version-file: go.mod
-      - name: govulncheck
-        run: make vuln
+      - name: govulncheck of the modules
+        run: make vuln-modules
+      # The collector that the releases build from the sources that ocb
+      # generates (collector/_build), with the components of
+      # collector/builder-config.yaml; also when the modules failed.
+      - name: govulncheck of the collector of the releases
+        if: ${{ !cancelled() && steps.go.outcome == 'success' }}
+        run: make vuln-collector
