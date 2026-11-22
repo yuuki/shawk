@@ -1298,20 +1298,28 @@ Prometheus needs `--web.enable-otlp-receiver`,
 out-of-order window.
 
 A store that takes Prometheus remote write, such as VictoriaMetrics, whose
-OTLP receiver does not translate names as Prometheus's does, gets the same
-series from the `prometheus_remote_write` exporter of the collector
-(`packaging/collector/config.yaml`). Its translation
+OTLP receiver does not translate names as Prometheus's does by default,
+gets the same series from the `prometheus_remote_write` exporter of the
+collector (`packaging/collector/config.yaml`). Its translation
 `UnderscoreEscapingWithSuffixes`, the default of the exporter and of
-Prometheus, gives the names above and the same `job` and `instance`, and
-`resource_constant_labels` with `included: [host.id, host.name]` the
-labels of `promote_resource_attributes`. Its queue (`remote_write_queue`)
-holds batches of the batch processor, a few MiB each for 8192 points:
-while the store is down, the default of 10000 would fill the memory of the
-collector until `memory_limiter` refuses the requests of agents, so that
-PostgreSQL gets nothing either until the store is back. The example holds
-50; batches beyond are dropped, which leaves gaps but no wrong totals,
-since counters are cumulative. The store must take points as late as
-Prometheus does with its window.
+Prometheus, gives the names above and the same `job` and `instance`;
+`resource_constant_labels` with `included: [host.id, host.name]` gives the
+labels of `promote_resource_attributes`; and `disable_scope_info: true`
+leaves out `otel_scope_name`, which the exporter would put on every series
+and Prometheus does not. Its queue (`remote_write_queue`) holds batches of
+the batch processor, a few MiB each once `send_batch_max_size` bounds them
+to 8192 points: the outputs of a host arrive whole, so a batch is
+otherwise as large as the largest host makes it. While the store is down,
+the default of 10000 would fill the memory of the collector until
+`memory_limiter` refuses the requests of agents, so that PostgreSQL gets
+nothing either until the store is back. The example holds 50, to size to
+the fleet; batches beyond are dropped and leave gaps, and a new series
+whose first points are dropped counts from its next ones. The queue must
+stay enabled: without it, the retries of a batch (up to 5 minutes by
+default) would block the connector, and with it the requests of agents.
+OBI's metrics, which are not batched, take an instance of their own, so
+that they do not fill the queue of the connector. The store must take
+points as late as Prometheus does with its window.
 
 The OTLP receiver of Prometheus writes whatever it is sent, so anyone who
 could push could write `shawk_agent_up` and silence `ShawkAgentDown`. The

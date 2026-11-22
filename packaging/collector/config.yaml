@@ -153,11 +153,14 @@ exporters:
       Authorization: ${env:SHAWK_PROMETHEUS_AUTHORIZATION}
   # Or Prometheus remote write, to VictoriaMetrics or another store that
   # takes it (docs/design.md, section 5.3): replace otlp_http/prometheus
-  # with it in the pipelines. Its translation of names (the default) and its
-  # labels from host.id and host.name are those of the OTLP receiver of
-  # Prometheus with packaging/prometheus/prometheus.yml. The store must be
-  # protected as Prometheus is: whoever can write to it can silence the
-  # alerts on agents.
+  # with it in metrics/shawk-out, and set send_batch_max_size: 8192 in the
+  # batch processor. metrics/obi, which is not batched, takes another
+  # instance with the same settings, so that the requests of OBI do not
+  # fill the queue of the connector. Its names (the default translation)
+  # and labels (host_id and host_name, no scope) are those of the OTLP
+  # receiver of Prometheus with packaging/prometheus/prometheus.yml. The
+  # store must be protected as Prometheus is: whoever can write to it can
+  # silence the alerts on agents.
   # prometheus_remote_write/victoriametrics:
   #   http:
   #     endpoint: https://victoriametrics.example:8428/api/v1/write
@@ -168,11 +171,16 @@ exporters:
   #   translation_strategy: UnderscoreEscapingWithSuffixes
   #   resource_constant_labels:
   #     included: [host.id, host.name]
-  #   # Batches of the batch processor, a few MiB each. While the store is
-  #   # down the queue fills; the default of 10000 would take the memory of
-  #   # the collector, and memory_limiter would then refuse the requests of
-  #   # agents, for PostgreSQL too. Batches beyond the queue are dropped,
-  #   # which leaves gaps in the cumulative counters, not wrong totals.
+  #   # Without it every series would have otel_scope_name.
+  #   disable_scope_info: true
+  #   # Batches of the batch processor, a few MiB each with
+  #   # send_batch_max_size: 8192; size the queue to the fleet. While the
+  #   # store is down the queue fills: the default of 10000 would take the
+  #   # memory of the collector, and memory_limiter would then refuse the
+  #   # requests of agents, for PostgreSQL too. Keep the queue enabled:
+  #   # without it, the retries of a batch would block the connector, and
+  #   # with it the requests of agents. Batches beyond the queue are
+  #   # dropped, which leaves gaps in the series.
   #   remote_write_queue:
   #     queue_size: 50
   # Tempo or another trace store, over TLS with the client certificate of

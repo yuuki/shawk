@@ -135,11 +135,13 @@ give each client its own user.
 To send to VictoriaMetrics or another store that takes Prometheus remote
 write, use the exporter `prometheus_remote_write/victoriametrics` of
 `collector/config.yaml` (commented out) in place of
-`otlp_http/prometheus`. Its names and its labels `host_id` and
-`host_name` are those of the OTLP receiver of Prometheus with
-`prometheus.yml`, which the rules and dashboards expect; the rules of
-`shawk-rules.yml` then run in the ruler of the store (vmalert for
-VictoriaMetrics). Keep its queue small: while the store is down, the
+`otlp_http/prometheus`, and another instance of it for OBI. Its names and
+labels, `host_id` and `host_name` among them, are those of the OTLP
+receiver of Prometheus with `prometheus.yml`, which the rules and
+dashboards expect. The rules of `shawk-rules.yml` then need the ruler of
+the store, such as vmalert for VictoriaMetrics; MetricsQL differs from
+PromQL in details such as `rate()` and the lookback, so check when the
+alerts fire there. Keep its queue small: while the store is down, the
 queue holds batches in the memory of the collector.
 
 ## Collector

@@ -8,9 +8,7 @@ import (
 
 // TestPrometheusNames checks the names Prometheus gives to the metrics the
 // shawk connector sends (the contract of §4.3 of the design), with the
-// default translation of its OTLP receiver, which the prometheus_remote_write
-// exporter of the collector makes too (UnderscoreEscapingWithSuffixes, with
-// the same otlptranslator).
+// default translation of its OTLP receiver.
 func TestPrometheusNames(t *testing.T) {
 	namer := otlptranslator.MetricNamer{WithMetricSuffixes: true}
 	for _, tc := range []struct {
