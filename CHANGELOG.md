@@ -42,6 +42,12 @@
   `memory_limiter` refused the requests of agents, and PostgreSQL got
   nothing either (`docs/design.md` §9). Bring an edited
   `/etc/shawk/collector.yaml` in line with the example.
+* `packaging/collector/config.yaml` splits the requests of `otlp_grpc/traces`
+  into at most 3 MiB of encoded spans (`sending_queue.batch`), below the
+  4 MiB a gRPC receiver takes by default. A batch of 8192 spans of more
+  than 512 bytes each, as with long SQL queries, was refused whole with
+  `ResourceExhausted`, which the exporter does not retry, so that all its
+  spans were lost (`docs/design.md` §9).
 
 ## [v0.10.1](https://github.com/yuuki/shawk/compare/v0.10.0...v0.10.1) (2026-11-21)
 

@@ -238,9 +238,22 @@ exporters:
     # PostgreSQL too. Keep the queue enabled, and not blocking: the retries
     # of a batch would otherwise block the batch processor, and with it the
     # requests of OBI. Spans beyond the queue are dropped.
+    #
+    # Requests of at most 3 MiB of encoded spans: a gRPC receiver refuses a
+    # message larger than 4 MiB by default (the OTLP receiver without
+    # max_recv_msg_size_mib), after decompression, and the exporter does not
+    # retry it, so that a batch of 8192 spans of more than 512 bytes each
+    # would be lost whole. The batcher of the queue, with min_size 0, merges
+    # nothing and splits batches by their encoded bytes; a span larger than
+    # max_size alone is dropped and logged ("Failed to split request").
+    # Lower max_size for a store that takes less.
     sending_queue:
       sizer: bytes
       queue_size: 67108864
+      batch:
+        sizer: bytes
+        min_size: 0
+        max_size: 3145728
 
 service:
   pipelines:

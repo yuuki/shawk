@@ -1950,6 +1950,22 @@ about 700 MiB, which must fit, beside what the connector holds (§5.5),
 under the soft limit of `memory_limiter`: 60% of the memory of the
 collector in the example.
 
+A batch of 8192 spans is larger than the 4 MiB a gRPC receiver takes by
+default (the OTLP receiver of a collector without `max_recv_msg_size_mib`)
+once its spans average 512 encoded bytes, as with long SQL queries. The
+receiver checks the size after decompression, so compression does not
+help, and refuses the whole batch with `ResourceExhausted`, which the
+exporter does not retry: every span of it would be lost
+(`otelcol_exporter_send_failed_spans`). The batcher of the queue therefore
+splits batches into requests of at most 3 MiB of encoded spans
+(`batch` with `sizer: bytes` and `max_size`), below the 4 MiB as the
+requests of agents are (§4.3); with `min_size: 0` it merges nothing, which
+the batch processor does. A span larger than `max_size` alone is dropped
+and logged (`Failed to split request`), the rest of its batch is sent. A
+batch takes its room in the queue until all its requests are sent, so the
+bound above holds. A store whose receiver takes less needs a smaller
+`max_size`.
+
 ## 10. Limitations
 
 - **TCP, UDP and Unix stream sockets only.** "Observed and not used" holds

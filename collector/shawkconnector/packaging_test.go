@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"slices"
 	"strings"
@@ -152,7 +153,9 @@ func TestPackagedCollectorConfig(t *testing.T) {
 	// connector, since a batch holds what arrived within its timeout; in
 	// bytes for OBI's metrics, which are not batched and have a queue of
 	// their own, and for OBI's spans, as large as their attributes
-	// (docs/design.md, sections 5.3 and 9).
+	// (docs/design.md, sections 5.3 and 9). The queue of OBI's spans splits
+	// batches into requests below the 4 MiB of a gRPC receiver, without
+	// merging them; the other queues do not batch.
 	batch, _ := doc.Processors["batch"].(map[string]any)
 	if batch["send_batch_max_size"] != 8192 {
 		t.Errorf("batch: send_batch_max_size = %v", batch["send_batch_max_size"])
@@ -160,7 +163,8 @@ func TestPackagedCollectorConfig(t *testing.T) {
 	queues := map[string]map[string]any{
 		"metrics/shawk-out": {"sizer": "items", "queue_size": 409600},
 		"metrics/obi":       {"sizer": "bytes", "queue_size": 67108864},
-		"traces/obi":        {"sizer": "bytes", "queue_size": 67108864},
+		"traces/obi": {"sizer": "bytes", "queue_size": 67108864,
+			"batch": map[string]any{"sizer": "bytes", "min_size": 0, "max_size": 3145728}},
 	}
 	sends, shared := map[string]bool{}, map[string]string{}
 	for name, p := range doc.Service.Pipelines {
@@ -183,7 +187,8 @@ func TestPackagedCollectorConfig(t *testing.T) {
 			ex, _ := doc.Exporters[e].(map[string]any)
 			q, _ := ex["sending_queue"].(map[string]any)
 			if q["enabled"] == false || q["block_on_overflow"] == true || q["wait_for_result"] == true ||
-				q["sizer"] != want["sizer"] || q["queue_size"] != want["queue_size"] {
+				q["sizer"] != want["sizer"] || q["queue_size"] != want["queue_size"] ||
+				!reflect.DeepEqual(q["batch"], want["batch"]) {
 				t.Errorf("%s: sending_queue of %s = %v, want %v, enabled and not blocking", name, e, q, want)
 			}
 		}
