@@ -148,7 +148,7 @@ jobs:
   # Linux 9 and upstream releases older than the runner's, on x86_64 (with
   # KVM) and on aarch64 (emulated).
   kernels:
-    name: kernel ${{ matrix.kernel }} ${{ matrix.arch }}
+    name: kernel ${{ matrix.kernel }} ${{ matrix.arch }}${{ matrix.shard && format(' ({0})', matrix.shard) || '' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
@@ -159,7 +159,25 @@ jobs:
           - { kernel: rocky9, arch: aarch64, qemu: qemu-system-arm }
           - { kernel: "5.14", arch: x86_64, qemu: qemu-system-x86 }
           - { kernel: "5.15", arch: x86_64, qemu: qemu-system-x86 }
-          - { kernel: "5.15", arch: aarch64, qemu: qemu-system-arm }
+          # This emulated guest takes about 20 minutes. Split its tests by
+          # name across separate VMs, without running BPF tests concurrently
+          # in one kernel. The three patterns cover every Test, Example and
+          # Fuzz name, including new tests; the other guests still run all.
+          - kernel: "5.15"
+            arch: aarch64
+            qemu: qemu-system-arm
+            shard: A-S
+            test-args: '-test.run=^Test[A-S]'
+          - kernel: "5.15"
+            arch: aarch64
+            qemu: qemu-system-arm
+            shard: T
+            test-args: '-test.run=^TestT'
+          - kernel: "5.15"
+            arch: aarch64
+            qemu: qemu-system-arm
+            shard: remaining
+            test-args: '-test.run=^(Test([^A-T]|$)|Example|Fuzz)'
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -184,6 +202,8 @@ jobs:
           # The script checks the SHA-256 of what an older cache holds.
           restore-keys: kernel-${{ matrix.kernel }}-${{ matrix.arch }}-
       - name: Tests in the virtual machine
+        env:
+          VM_TEST_ARGS: ${{ matrix.test-args }}
         run: test/vm/run.sh ${{ matrix.kernel }} ${{ matrix.arch }}
 
   # The same tests on an arm64 host, with its own kernel and JIT.
