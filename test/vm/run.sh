@@ -6,8 +6,9 @@
 #
 # KERNEL is one of
 #   rocky9   Rocky Linux 9.6 (5.14.0-570), the primary target
-#   5.14     upstream 5.14.21: the old layout of sock_cgroup_data, and a TCP
-#            iterator that does not lock sockets
+#   5.14     upstream 5.14.21: the old layout of sock_cgroup_data, a TCP
+#            iterator that does not lock sockets, and a false positive of
+#            RCU Tasks Trace that does not fail the run (test/vm/init)
 #   5.15     upstream 5.15.224, a long-term release: a TCP iterator that does
 #            not lock sockets
 # or the path of a kernel image. The upstream kernels are the builds of

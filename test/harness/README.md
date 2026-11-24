@@ -57,6 +57,19 @@ the architecture of the host, and emulates it otherwise (slow). Without
 `rpm2cpio` or `dpkg-deb`, as on macOS, `bsdtar` extracts the kernel packages.
 On macOS, Homebrew has `qemu`, `xz` and `coreutils` (`timeout`).
 
+The init of the VM ([`test/vm/init`](../vm/init)) fails the run when the
+kernel was tainted while the tests ran, e.g. by a warning, and prints the
+kernel log. A warning of the kernel itself that the tests set off is
+listed in `knownWarnings` with the one kernel release that has it, and
+does not fail the run on that kernel: the init prints it, provided the
+tests added `TAINT_WARN` alone and every warning or bug they logged is
+known. The only one is on upstream 5.14.21: RCU Tasks Trace warns in
+`trc_read_check_handler` (`kernel/rcu/tasks.h:889`, `:897` or `:906`) when
+the IPI that checks a task runs after the grace period dropped its count,
+a false positive that BPF trampolines set off at random, fixed in 5.16
+(cbe0d8d91415) and in 5.15.y since 5.15.130. The same warning fails the run
+on any other kernel.
+
 CI sets `VM_RCU_EXPEDITED=1` to shorten the RCU grace periods that map
 flips and probe teardown wait for. This keeps the wait for readers and
 spends more CPU to reduce latency, especially under emulation; it does
