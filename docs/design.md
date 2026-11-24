@@ -1918,6 +1918,54 @@ only the protocols it parses. shawk runs beside it:
 - Dependencies seen by shawk but absent from OBI's service graph show where
   application-layer instrumentation is missing.
 
+OBI's traces go through the batch processor (`traces/obi`, at most 8192
+spans a batch) to a trace store such as Tempo (`otlp_grpc/traces`), whose
+queue is bounded as those to Prometheus are (§5.3). It stays enabled and
+does not block, so that the retries of a batch (for 5 minutes by default)
+do not block the batch processor, and with it the requests of OBI. It
+counts the encoded bytes of the batches (`sizer: bytes`), not spans: a span
+is as large as the attributes OBI reads from the applications (paths,
+URLs, SQL queries). Measured as pdata, as the receiver makes them, a mix
+of the spans of HTTP, gRPC, SQL and Redis requests takes about 750 bytes of
+memory a span (250 encoded), an internal span without attributes 235 bytes
+and one with a query of 2 KiB 3 KB, while memory stays within 1.3 to 3.5
+times the encoded bytes. The default counts 1000 batches, which hold 200
+seconds of spans whatever their rate, since the batch processor sends what
+arrived within 200 ms: about 250 MB at 100 000 spans a minute, but about
+5.7 GiB once batches are full (41 000 spans a second). While the store is
+down that memory grows with the rate of spans, until `memory_limiter`,
+which measures the whole collector, refuses the requests of agents, so that
+PostgreSQL gets nothing either until the store is back. The example holds
+64 MiB, about 200 MiB in memory whatever the rate, or 270 000 spans of 250
+encoded bytes, which last 2.7 minutes at 100 000 spans a minute: size it
+to the fleet and to the memory of the collector. With this sizer,
+`otelcol_exporter_queue_size` and `otelcol_exporter_queue_capacity` are in
+bytes, and the queue fills while the store is down at the rate of
+`otelcol_exporter_enqueue_size_bytes_sum`, which the collector reports at
+the `detailed` level of its telemetry. Spans beyond are dropped
+(`otelcol_exporter_enqueue_failed_spans`), as are those still not sent when
+their retries end (`otelcol_exporter_send_failed_spans`), and their traces
+miss them. With the queues to Prometheus, those of the example hold up to
+about 700 MiB, which must fit, beside what the connector holds (§5.5),
+under the soft limit of `memory_limiter`: 60% of the memory of the
+collector in the example.
+
+A batch of 8192 spans is larger than the 4 MiB a gRPC receiver takes by
+default (the OTLP receiver of a collector without `max_recv_msg_size_mib`)
+once its spans average 512 encoded bytes, as with long SQL queries. The
+receiver checks the size after decompression, so compression does not
+help, and refuses the whole batch with `ResourceExhausted`, which the
+exporter does not retry: every span of it would be lost
+(`otelcol_exporter_send_failed_spans`). The batcher of the queue therefore
+splits batches into requests of at most 3 MiB of encoded spans
+(`batch` with `sizer: bytes` and `max_size`), below the 4 MiB as the
+requests of agents are (§4.3); with `min_size: 0` it merges nothing, which
+the batch processor does. A span larger than `max_size` alone is dropped
+and logged (`Failed to split request`), the rest of its batch is sent. A
+batch takes its room in the queue until all its requests are sent, so the
+bound above holds. A store whose receiver takes less needs a smaller
+`max_size`.
+
 ## 10. Limitations
 
 - **TCP, UDP and Unix stream sockets only.** "Observed and not used" holds
