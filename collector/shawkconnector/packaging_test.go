@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"slices"
 	"strings"
@@ -135,11 +136,66 @@ func TestPackagedCollectorConfig(t *testing.T) {
 			t.Errorf("%s: %s is not in collector.env", name, m[1])
 		}
 	}
+	toPrometheus := func(exporters []string) []string {
+		var out []string
+		for _, name := range exporters {
+			e, _ := doc.Exporters[name].(map[string]any)
+			if endpoint, _ := e["endpoint"].(string); strings.HasSuffix(endpoint, "/api/v1/otlp") {
+				out = append(out, name)
+			}
+		}
+		return out
+	}
+	// The queues of the exporters stay enabled and do not block, so that the
+	// retries of a batch do not block the connector or the requests of OBI,
+	// and are bounded, so that they do not fill the memory of the collector
+	// while Prometheus or the trace store is down: in points for the
+	// connector, since a batch holds what arrived within its timeout; in
+	// bytes for OBI's metrics, which are not batched and have a queue of
+	// their own, and for OBI's spans, as large as their attributes
+	// (docs/design.md, sections 5.3 and 9). The queue of OBI's spans splits
+	// batches into requests below the 4 MiB of a gRPC receiver, without
+	// merging them; the other queues do not batch.
+	batch, _ := doc.Processors["batch"].(map[string]any)
+	if batch["send_batch_max_size"] != 8192 {
+		t.Errorf("batch: send_batch_max_size = %v", batch["send_batch_max_size"])
+	}
+	queues := map[string]map[string]any{
+		"metrics/shawk-out": {"sizer": "items", "queue_size": 409600},
+		"metrics/obi":       {"sizer": "bytes", "queue_size": 67108864},
+		"traces/obi": {"sizer": "bytes", "queue_size": 67108864,
+			"batch": map[string]any{"sizer": "bytes", "min_size": 0, "max_size": 3145728}},
+	}
+	sends, shared := map[string]bool{}, map[string]string{}
 	for name, p := range doc.Service.Pipelines {
+		// An exporter has one instance, and one queue, per signal.
+		signal, _, _ := strings.Cut(name, "/")
+		for _, e := range p.Exporters {
+			if doc.Exporters[e] == nil {
+				continue // the connector, or undefined (below)
+			}
+			if other, ok := shared[signal+" "+e]; ok {
+				t.Errorf("%s: in %s and %s, whose requests share its queue", e, other, name)
+			}
+			shared[signal+" "+e] = name
+			want, ok := queues[name]
+			if !ok {
+				t.Errorf("%s: exports through %s, whose queue is not checked", name, e)
+				continue
+			}
+			sends[name] = true
+			ex, _ := doc.Exporters[e].(map[string]any)
+			q, _ := ex["sending_queue"].(map[string]any)
+			if q["enabled"] == false || q["block_on_overflow"] == true || q["wait_for_result"] == true ||
+				q["sizer"] != want["sizer"] || q["queue_size"] != want["queue_size"] ||
+				!reflect.DeepEqual(q["batch"], want["batch"]) {
+				t.Errorf("%s: sending_queue of %s = %v, want %v, enabled and not blocking", name, e, q, want)
+			}
+		}
 		// Points of other sources carry the clocks of their hosts; batched,
 		// one host with a wrong clock makes Prometheus drop the others.
 		if slicesContains(p.Receivers, "otlp") && slicesContains(p.Processors, "batch") &&
-			slicesContains(p.Exporters, "otlp_http/prometheus") {
+			len(toPrometheus(p.Exporters)) > 0 {
 			t.Errorf("%s: batches points of several hosts for Prometheus", name)
 		}
 		for _, r := range p.Receivers {
@@ -159,6 +215,16 @@ func TestPackagedCollectorConfig(t *testing.T) {
 			if doc.Exporters[e] == nil && doc.Connectors[e] == nil {
 				t.Errorf("%s: undefined exporter %s", name, e)
 			}
+		}
+	}
+	for name := range queues {
+		if !sends[name] {
+			t.Errorf("%s exports through no exporter", name)
+		}
+	}
+	for _, name := range []string{"metrics/shawk-out", "metrics/obi"} {
+		if len(toPrometheus(doc.Service.Pipelines[name].Exporters)) == 0 {
+			t.Errorf("%s sends nothing to Prometheus", name)
 		}
 	}
 }

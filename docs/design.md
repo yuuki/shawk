@@ -1300,6 +1300,37 @@ Prometheus needs `--web.enable-otlp-receiver`,
 `otlp.promote_resource_attributes: [host.id, host.name]` and a 30-minute
 out-of-order window.
 
+The exporter to Prometheus queues what it sends (`sending_queue`), so that
+the connector, which hands its outputs to the batch processor within the
+request of an agent, does not wait for Prometheus: without the queue, or
+with one that blocks when full, the retries of a batch (for 5 minutes by
+default) would block the batch processor, then the connector, and with it
+the requests of agents. The queue counts points (`sizer: items`), the
+batches being retried included, about 600 bytes of memory each (measured
+on outputs of the connector; encoded, a third of it). Its default counts
+1000 batches, which bounds no number of points: the batch processor sends
+what arrived within 200 ms, a few hundred points for a fleet whose agents
+send at different times, up to `send_batch_max_size`. While Prometheus is
+down the queue fills; by default, a large fleet or large hosts make batches
+that would fill the memory of the collector (1000 batches of 8192 points
+take about 4.5 GiB) until `memory_limiter` refuses the requests of agents,
+so that PostgreSQL gets nothing either until Prometheus is back. The
+example holds 409 600 points, under 250 MiB, which last 4 minutes for a
+fleet whose outputs are 100 000 points a minute, where 50 batches would
+last 10 seconds: size it to the fleet (the rate of
+`otelcol_exporter_sent_metric_points`) and to the memory of the collector.
+`send_batch_max_size` bounds batches to 8192 points: the outputs of a host
+arrive whole, and a batch larger than the queue would be refused. Points
+beyond are dropped (`otelcol_exporter_enqueue_failed_metric_points`) and
+leave gaps, possibly in part of the outputs of a host; the next points of a
+series carry its totals, but a new series whose first points are dropped
+counts from its next ones. OBI's metrics, which are not batched, take an
+exporter of their own (`otlp_http/obi`), so that they do not fill the queue
+of the connector; its queue counts the encoded bytes of their requests
+(`sizer: bytes`, 64 MiB, up to about 3.5 times as much in memory), since a
+request is as large as an export of OBI and their points range from
+counters to histograms with buckets.
+
 A store that takes Prometheus remote write, such as VictoriaMetrics, whose
 OTLP receiver does not translate names as Prometheus's does by default,
 gets the same series from the `prometheus_remote_write` exporter of the
@@ -1309,20 +1340,16 @@ Prometheus, gives the names above and the same `job` and `instance`;
 `resource_constant_labels` with `included: [host.id, host.name]` gives the
 labels of `promote_resource_attributes`; and `disable_scope_info: true`
 leaves out `otel_scope_name`, which the exporter would put on every series
-and Prometheus does not. Its queue (`remote_write_queue`) holds batches of
-the batch processor, a few MiB each once `send_batch_max_size` bounds them
-to 8192 points: the outputs of a host arrive whole, so a batch is
-otherwise as large as the largest host makes it. While the store is down,
-the default of 10000 would fill the memory of the collector until
-`memory_limiter` refuses the requests of agents, so that PostgreSQL gets
-nothing either until the store is back. The example holds 50, to size to
-the fleet; batches beyond are dropped and leave gaps, and a new series
-whose first points are dropped counts from its next ones. The queue must
-stay enabled: without it, the retries of a batch (up to 5 minutes by
-default) would block the connector, and with it the requests of agents.
-OBI's metrics, which are not batched, take an instance of their own, so
-that they do not fill the queue of the connector. The store must take
-points as late as Prometheus does with its window.
+and Prometheus does not. Its queue (`remote_write_queue`) counts batches,
+whatever their size, since the exporter counts nothing else: the example
+holds 50, at most about 225 MiB of batches of 8192 points but 10 seconds
+for the fleet above, so size it to the outage to cover and to the memory
+of the collector; the default of 10000 would fill that memory as above. It
+must stay enabled for the same reason, and batches beyond it are dropped
+and leave gaps. OBI's metrics take an instance of their own, as they take
+`otlp_http/obi`; its queue counts their requests, each as large as an
+export of OBI. The store must take points as late as Prometheus does with
+its window.
 
 The OTLP receiver of Prometheus writes whatever it is sent, so anyone who
 could push could write `shawk_agent_up` and silence `ShawkAgentDown`. The
@@ -1893,6 +1920,54 @@ only the protocols it parses. shawk runs beside it:
   host name anyway.
 - Dependencies seen by shawk but absent from OBI's service graph show where
   application-layer instrumentation is missing.
+
+OBI's traces go through the batch processor (`traces/obi`, at most 8192
+spans a batch) to a trace store such as Tempo (`otlp_grpc/traces`), whose
+queue is bounded as those to Prometheus are (§5.3). It stays enabled and
+does not block, so that the retries of a batch (for 5 minutes by default)
+do not block the batch processor, and with it the requests of OBI. It
+counts the encoded bytes of the batches (`sizer: bytes`), not spans: a span
+is as large as the attributes OBI reads from the applications (paths,
+URLs, SQL queries). Measured as pdata, as the receiver makes them, a mix
+of the spans of HTTP, gRPC, SQL and Redis requests takes about 750 bytes of
+memory a span (250 encoded), an internal span without attributes 235 bytes
+and one with a query of 2 KiB 3 KB, while memory stays within 1.3 to 3.5
+times the encoded bytes. The default counts 1000 batches, which hold 200
+seconds of spans whatever their rate, since the batch processor sends what
+arrived within 200 ms: about 250 MB at 100 000 spans a minute, but about
+5.7 GiB once batches are full (41 000 spans a second). While the store is
+down that memory grows with the rate of spans, until `memory_limiter`,
+which measures the whole collector, refuses the requests of agents, so that
+PostgreSQL gets nothing either until the store is back. The example holds
+64 MiB, about 200 MiB in memory whatever the rate, or 270 000 spans of 250
+encoded bytes, which last 2.7 minutes at 100 000 spans a minute: size it
+to the fleet and to the memory of the collector. With this sizer,
+`otelcol_exporter_queue_size` and `otelcol_exporter_queue_capacity` are in
+bytes, and the queue fills while the store is down at the rate of
+`otelcol_exporter_enqueue_size_bytes_sum`, which the collector reports at
+the `detailed` level of its telemetry. Spans beyond are dropped
+(`otelcol_exporter_enqueue_failed_spans`), as are those still not sent when
+their retries end (`otelcol_exporter_send_failed_spans`), and their traces
+miss them. With the queues to Prometheus, those of the example hold up to
+about 700 MiB, which must fit, beside what the connector holds (§5.5),
+under the soft limit of `memory_limiter`: 60% of the memory of the
+collector in the example.
+
+A batch of 8192 spans is larger than the 4 MiB a gRPC receiver takes by
+default (the OTLP receiver of a collector without `max_recv_msg_size_mib`)
+once its spans average 512 encoded bytes, as with long SQL queries. The
+receiver checks the size after decompression, so compression does not
+help, and refuses the whole batch with `ResourceExhausted`, which the
+exporter does not retry: every span of it would be lost
+(`otelcol_exporter_send_failed_spans`). The batcher of the queue therefore
+splits batches into requests of at most 3 MiB of encoded spans
+(`batch` with `sizer: bytes` and `max_size`), below the 4 MiB as the
+requests of agents are (§4.3); with `min_size: 0` it merges nothing, which
+the batch processor does. A span larger than `max_size` alone is dropped
+and logged (`Failed to split request`), the rest of its batch is sent. A
+batch takes its room in the queue until all its requests are sent, so the
+bound above holds. A store whose receiver takes less needs a smaller
+`max_size`.
 
 ## 10. Limitations
 
