@@ -321,6 +321,9 @@ arm64) and in VMs (`make vm-test`) on Rocky Linux 9.6 (x86_64, aarch64),
 upstream 5.14 (x86_64) and 5.15 (x86_64, aarch64); on aarch64 before 6.0
 the UDP and Unix socket tests require the kprobe fallback.
 `TestUDPKprobes` and `TestUnixKprobes` force it on the other kernels.
+A VM run fails when the kernel was tainted while the tests ran, e.g. by a
+warning; the one exception is a false positive of RCU Tasks Trace that
+upstream 5.14 reports at random (`test/harness/README.md`).
 All struct accesses use CO-RE. `make compat` checks every attach target,
 helper, CO-RE relocation and `BPF_PROG`
 parameter list against the BTF of Rocky Linux 9.6 and its nf_conntrack

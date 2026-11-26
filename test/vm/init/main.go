@@ -10,7 +10,8 @@
 // after the other, prints a line with the exit
 // status of the first that failed (or 0), and reboots, which ends QEMU
 // started with -no-reboot. A kernel tainted while the commands ran, e.g. by
-// a warning, fails the run and prints the kernel log.
+// a warning, fails the run and prints the kernel log, unless only the known
+// warnings of that kernel tainted it (knownWarnings), which it prints.
 //
 // Each line of /vm/commands is a working directory followed by the program
 // and its arguments, separated by spaces.
@@ -51,17 +52,30 @@ func run() (status int) {
 	}
 	var uts unix.Utsname
 	unix.Uname(&uts)
-	fmt.Printf("init: Linux %s %s\n", unix.ByteSliceToString(uts.Release[:]), unix.ByteSliceToString(uts.Machine[:]))
+	release := unix.ByteSliceToString(uts.Release[:])
+	fmt.Printf("init: Linux %s %s\n", release, unix.ByteSliceToString(uts.Machine[:]))
 	loadModules("/vm/modules")
 
+	klog := openKernelLog()
 	taint := tainted()
 	defer func() {
-		if t := tainted(); t != taint {
-			fmt.Printf("init: the kernel was tainted (%s -> %s) while the tests ran:\n", taint, t)
-			printKernelLog()
-			if status == 0 {
-				status = 1
+		t := tainted()
+		if t == taint {
+			return
+		}
+		msgs, complete := klog.messages()
+		if excuses, ok := excusedTaint(release, taint, t, msgs, complete); ok {
+			fmt.Printf("init: the kernel was tainted (%s -> %s) while the tests ran, by known warnings of Linux %s only, which do not fail the run:\n", taint, t, release)
+			for _, e := range excuses {
+				fmt.Printf("init:   %s: %s\n", e.header, e.reason)
 			}
+			printKernelLog()
+			return
+		}
+		fmt.Printf("init: the kernel was tainted (%s -> %s) while the tests ran:\n", taint, t)
+		printKernelLog()
+		if status == 0 {
+			status = 1
 		}
 	}()
 

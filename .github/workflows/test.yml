@@ -105,8 +105,8 @@ jobs:
         with:
           go-version-file: go.mod
       # The mirrors of the runners are slow at times: the install has a time
-      # limit and retries of its own, so that a slow mirror does not take
-      # the time of the tests.
+      # limit and retries of its own, each from another mirror, so that a
+      # slow mirror does not take the time of the tests.
       - name: Install tools
         timeout-minutes: 10
         run: scripts/apt-install.sh clang llvm rpm2cpio cpio
