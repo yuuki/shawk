@@ -229,6 +229,70 @@ func TestPackagedCollectorConfig(t *testing.T) {
 	}
 }
 
+func TestPackagedSQLiteCollectorConfig(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join(packaging, "collector/config-sqlite.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Receivers  map[string]any `yaml:"receivers"`
+		Processors map[string]any `yaml:"processors"`
+		Exporters  map[string]any `yaml:"exporters"`
+		Connectors map[string]any `yaml:"connectors"`
+		Service    struct {
+			Pipelines map[string]struct {
+				Receivers  []string `yaml:"receivers"`
+				Processors []string `yaml:"processors"`
+				Exporters  []string `yaml:"exporters"`
+			} `yaml:"pipelines"`
+		} `yaml:"service"`
+	}
+	if err := yaml.Unmarshal(b, &doc); err != nil {
+		t.Fatal(err)
+	}
+	raw, ok := doc.Connectors["shawk"].(map[string]any)
+	if !ok {
+		t.Fatal("no shawk connector")
+	}
+	cfg := createDefaultConfig()
+	if err := confmap.NewFromStringMap(raw).Unmarshal(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Error(err)
+	}
+	if cfg.SQLite.Path != "/var/lib/shawk-collector/shawk.db" || cfg.SQLite.BusyTimeout != 5*time.Second ||
+		cfg.Postgres.DSN != "" || cfg.Postgres.DSNFile != "" || cfg.HostIdentity != hostIdentityCertificate {
+		t.Errorf("config = %+v", cfg)
+	}
+	// Verify TLS + client cert on otlp/shawk (gRPC only) and bounded exporter queue.
+	protocols, _ := doc.Receivers["otlp/shawk"].(map[string]any)["protocols"].(map[string]any)
+	if protocols["http"] != nil {
+		t.Error("otlp/shawk: HTTP carries no client certificate to the connector")
+	}
+	grpcProto, _ := protocols["grpc"].(map[string]any)
+	tls, _ := grpcProto["tls"].(map[string]any)
+	if tls["client_ca_file"] == nil || tls["cert_file"] == nil || tls["key_file"] == nil {
+		t.Errorf("otlp/shawk grpc: no TLS with client certificates: %v", grpcProto)
+	}
+	if grpcProto["max_recv_msg_size_mib"] != 16 {
+		t.Errorf("otlp/shawk: max_recv_msg_size_mib = %v", grpcProto["max_recv_msg_size_mib"])
+	}
+	ex, _ := doc.Exporters["otlp_http/prometheus"].(map[string]any)
+	q, _ := ex["sending_queue"].(map[string]any)
+	if q["sizer"] != "items" || q["queue_size"] != 409600 {
+		t.Errorf("otlp_http/prometheus sending_queue = %v", q)
+	}
+	for name, p := range doc.Service.Pipelines {
+		if slicesContains(p.Processors, "batch") && slicesContains(p.Exporters, "shawk") {
+			t.Errorf("%s: batch processor before connector merges agent requests", name)
+		}
+	}
+	if _, err := os.ReadFile(filepath.Join(packaging, "systemd/shawk-collector-sqlite.conf")); err != nil {
+		t.Errorf("missing sqlite drop-in: %v", err)
+	}
+}
+
 func slicesContains(ss []string, s string) bool {
 	for _, x := range ss {
 		if x == s {

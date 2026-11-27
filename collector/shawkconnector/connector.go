@@ -26,11 +26,12 @@ type shawkConnector struct {
 	log  *zap.Logger
 	next consumer.Metrics
 
-	// newStore opens the store; replaced in tests.
-	newStore func(ctx context.Context, dsn string) (store, error)
-	store    store
-	resolver *resolver
-	limits   *limits
+	// newStore and newSQLite open the store; replaced in tests.
+	newStore  func(ctx context.Context, dsn string) (store, error)
+	newSQLite func(ctx context.Context, cfg SQLiteConfig, learnedTTL time.Duration) (store, error)
+	store     store
+	resolver  *resolver
+	limits    *limits
 
 	mu      sync.Mutex
 	agg     *aggregator
@@ -152,6 +153,9 @@ func newConnector(set connector.Settings, cfg *Config, next consumer.Metrics) (*
 		log:      set.Logger,
 		next:     next,
 		newStore: newPGStore,
+		newSQLite: func(ctx context.Context, cfg SQLiteConfig, learnedTTL time.Duration) (store, error) {
+			return newSQLiteStore(ctx, cfg, learnedTTL)
+		},
 		resolver: res,
 		limits:   newLimits(cfg.MaxHosts, cfg.MaxSeriesPerHost, cfg.IdleTTL),
 		agg:      agg,
@@ -178,20 +182,41 @@ func (c *shawkConnector) Capabilities() consumer.Capabilities {
 }
 
 func (c *shawkConnector) Start(ctx context.Context, _ component.Host) error {
-	dsn := c.cfg.Postgres.DSN
-	if c.cfg.Postgres.DSNFile != "" {
-		b, err := os.ReadFile(c.cfg.Postgres.DSNFile)
+	var st store
+	var err error
+	if c.cfg.useSQLite() {
+		st, err = c.newSQLite(ctx, c.cfg.SQLite, c.cfg.IdleTTL)
 		if err != nil {
-			return fmt.Errorf("reading postgres.dsn_file: %w", err)
+			return err
 		}
-		dsn = strings.TrimSpace(string(b))
-		if dsn == "" {
-			return fmt.Errorf("postgres.dsn_file %s is empty", c.cfg.Postgres.DSNFile)
+		if ss, ok := st.(*sqliteStore); ok {
+			ss.now = c.now
 		}
-	}
-	st, err := c.newStore(ctx, dsn)
-	if err != nil {
-		return err
+		applied, err := st.migrate(ctx)
+		if err != nil {
+			st.close()
+			return fmt.Errorf("migrating the SQLite schema: %w", err)
+		}
+		if len(applied) > 0 {
+			c.log.Info("migrated the SQLite schema", zap.Strings("applied", applied))
+		}
+		c.ready = true
+	} else {
+		dsn := c.cfg.Postgres.DSN
+		if c.cfg.Postgres.DSNFile != "" {
+			b, err := os.ReadFile(c.cfg.Postgres.DSNFile)
+			if err != nil {
+				return fmt.Errorf("reading postgres.dsn_file: %w", err)
+			}
+			dsn = strings.TrimSpace(string(b))
+			if dsn == "" {
+				return fmt.Errorf("postgres.dsn_file %s is empty", c.cfg.Postgres.DSNFile)
+			}
+		}
+		st, err = c.newStore(ctx, dsn)
+		if err != nil {
+			return err
+		}
 	}
 	c.store = st
 
@@ -240,19 +265,19 @@ func (c *shawkConnector) prepare(ctx context.Context) bool {
 	}
 	rows, err := c.store.peers(ctx, c.cfg.IdleTTL, former)
 	if err != nil {
-		c.log.Warn("reading the names of peers from PostgreSQL", zap.Error(err))
+		c.log.Warn("reading the names of peers from the store", zap.Error(err))
 		return true
 	}
 	c.resolver.load(rows, at)
 	// The holders of addresses written before, which the loop does in turn
-	// with this read, are read back from PostgreSQL now.
+	// with this read, are read back from the store now.
 	c.resolver.forgetHeld()
 	return true
 }
 
-// prepareSchemaOnly migrates the schema if configured to, or checks that
-// it is not older than the connector, if that is still pending, and
-// reports whether writes may proceed.
+// prepareSchemaOnly migrates the schema if configured to (always for
+// SQLite), or checks that it is not older than the connector, if that is
+// still pending, and reports whether writes may proceed.
 func (c *shawkConnector) prepareSchemaOnly(ctx context.Context) bool {
 	c.mu.Lock()
 	ready := c.ready
@@ -260,7 +285,16 @@ func (c *shawkConnector) prepareSchemaOnly(ctx context.Context) bool {
 	if ready {
 		return true
 	}
-	if c.cfg.Postgres.Migrate {
+	if c.cfg.useSQLite() {
+		applied, err := c.store.migrate(ctx)
+		if err != nil {
+			c.log.Error("migrating the SQLite schema; writes wait until it succeeds", zap.Error(err))
+			return false
+		}
+		if len(applied) > 0 {
+			c.log.Info("migrated the SQLite schema", zap.Strings("applied", applied))
+		}
+	} else if c.cfg.Postgres.Migrate {
 		applied, err := c.store.migrate(ctx)
 		if err != nil {
 			c.log.Error("migrating the PostgreSQL schema; writes wait until it succeeds", zap.Error(err))
@@ -382,10 +416,18 @@ func (c *shawkConnector) expireWarnings(now time.Time) {
 // pruneBatch bounds the rows deleted per table in one transaction.
 const pruneBatch = 10000
 
+func (c *shawkConnector) storeName() string {
+	if c.cfg.useSQLite() {
+		return "SQLite"
+	}
+	return "PostgreSQL"
+}
+
 // pruneIfDue deletes the rows older than the retention, once an hour, in
-// batches so that no transaction holds locks for long.
+// batches so that no transaction holds locks for long. With SQLite, the
+// internal peer-resolution cache always prunes on its fixed windows.
 func (c *shawkConnector) pruneIfDue(ctx context.Context) {
-	if c.cfg.Retention == 0 || c.now().Sub(c.lastPrune) < time.Hour {
+	if (!c.cfg.useSQLite() && c.cfg.Retention == 0) || c.now().Sub(c.lastPrune) < time.Hour {
 		return
 	}
 	c.mu.Lock()
@@ -400,7 +442,11 @@ func (c *shawkConnector) pruneIfDue(ctx context.Context) {
 		n, err := c.store.prune(pctx, c.cfg.Retention, pruneBatch)
 		cancel()
 		if err != nil {
-			c.log.Error("deleting rows older than the retention", zap.Error(err))
+			if c.cfg.useSQLite() {
+				c.log.Error("deleting expired rows from SQLite cache", zap.Error(err))
+			} else {
+				c.log.Error("deleting rows older than the retention", zap.Error(err))
+			}
 			return
 		}
 		total += n
@@ -410,7 +456,11 @@ func (c *shawkConnector) pruneIfDue(ctx context.Context) {
 	}
 	c.lastPrune = c.now()
 	if total > 0 {
-		c.log.Info("deleted rows older than the retention", zap.Int64("rows", total), zap.Duration("retention", c.cfg.Retention))
+		if c.cfg.useSQLite() {
+			c.log.Info("deleted expired rows from SQLite cache", zap.Int64("rows", total))
+		} else {
+			c.log.Info("deleted rows older than the retention", zap.Int64("rows", total), zap.Duration("retention", c.cfg.Retention))
+		}
 	}
 }
 
@@ -421,7 +471,7 @@ const refreshInterval = 5 * time.Minute
 
 // refreshIfDue brings the history of dependencies up to date.
 func (c *shawkConnector) refreshIfDue(ctx context.Context) {
-	if c.now().Sub(c.lastRefresh) < refreshInterval {
+	if c.cfg.useSQLite() || c.now().Sub(c.lastRefresh) < refreshInterval {
 		return
 	}
 	c.mu.Lock()
@@ -482,7 +532,7 @@ func (c *shawkConnector) flush(ctx context.Context) bool {
 		case isDataError(err):
 			// Writing these changes again would fail again and block the
 			// host for good; drop them.
-			c.log.Error("dropping changes that PostgreSQL rejects", zap.String("host", h.hostname),
+			c.log.Error("dropping changes that "+c.storeName()+" rejects", zap.String("host", h.hostname),
 				zap.Int("rows", h.size()), zap.Error(err))
 			c.mu.Lock()
 			c.changes.forget(h.key, c.now())
@@ -500,7 +550,7 @@ func (c *shawkConnector) flush(ctx context.Context) bool {
 		c.mu.Lock()
 		size := c.changes.pendingSize()
 		c.mu.Unlock()
-		c.log.Error("writing to PostgreSQL; the changes are kept for the next write",
+		c.log.Error("writing to "+c.storeName()+"; the changes are kept for the next write",
 			zap.Int("hosts", failed), zap.Int("pending_rows", size), zap.Error(lastErr))
 	}
 	return failed == 0
@@ -508,7 +558,7 @@ func (c *shawkConnector) flush(ctx context.Context) bool {
 
 // boundPending drops the changes of the hosts pending the longest beyond
 // max_pending_rows, after they could not be written. As after changes that
-// PostgreSQL rejects, the edges and listeners agents still send are written
+// the store rejects, the edges and listeners agents still send are written
 // again, and the next session of such a host starts no earlier than the
 // idle TTL of an agent before now: the time in between shows as not
 // observed. The holders of addresses the connector saw in them are
@@ -525,7 +575,7 @@ func (c *shawkConnector) boundPending() {
 		rows += h.size()
 		c.resolver.droppedHeld(h.key, h.addrs)
 	}
-	c.log.Error("dropping the changes of hosts that could not be written to PostgreSQL, beyond max_pending_rows; "+
+	c.log.Error("dropping the changes of hosts that could not be written to "+c.storeName()+", beyond max_pending_rows; "+
 		"the hosts are not observed over them", zap.Int("hosts", len(dropped)), zap.Int("rows", rows),
 		zap.Int("max_pending_rows", c.cfg.MaxPendingRows))
 }
@@ -877,11 +927,14 @@ func (c *shawkConnector) downstreamError(err error, now time.Time) {
 		zap.Int("failures", n), zap.Error(err))
 }
 
-// isDataError tells whether PostgreSQL rejected the data itself (SQLSTATE
-// classes 22, data exception, and 23, integrity constraint violation),
-// rather than failing for a reason that may pass, such as a lost
-// connection.
+// isDataError tells whether PostgreSQL or SQLite rejected the data itself
+// (PostgreSQL SQLSTATE classes 22 and 23; SQLite constraint/mismatch/toobig),
+// rather than failing for a reason that may pass, such as a lost connection
+// or busy lock.
 func isDataError(err error) bool {
+	if isSQLiteDataError(err) {
+		return true
+	}
 	var pgErr *pgconn.PgError
 	if !errors.As(err, &pgErr) {
 		return false

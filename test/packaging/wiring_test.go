@@ -100,3 +100,140 @@ eval instant at 5m ` + inline(gap, nil) + `
 `
 	promqltest.RunTest(t, script, promqltest.NewTestEngine(t, false, 0, promqltest.DefaultMaxSamplesPerQuery))
 }
+
+func TestLiteMapDashboardWiring(t *testing.T) {
+	d := loadJSON(t, filepath.Join(grafana, "dashboards-lite/shawk-map-live.json"))
+	var svcQuery string
+	for _, v := range d["templating"].(map[string]any)["list"].([]any) {
+		v := v.(map[string]any)
+		if v["name"] == "service" {
+			if v["allValue"] != ".*" {
+				t.Errorf("service variable allValue = %v, want .*", v["allValue"])
+			}
+			svcQuery = v["query"].(map[string]any)["query"].(string)
+		}
+	}
+	m := regexp.MustCompile(`^query_result\((.*)\)$`).FindStringSubmatch(svcQuery)
+	if m == nil {
+		t.Fatalf("unexpected service variable query %q", svcQuery)
+	}
+	svcExpr := m[1]
+
+	var nodesExpr, edgesExpr string
+	for _, p := range d["panels"].([]any) {
+		p := p.(map[string]any)
+		if p["type"] != "nodeGraph" {
+			continue
+		}
+		for _, tgt := range p["targets"].([]any) {
+			tgt := tgt.(map[string]any)
+			switch tgt["refId"] {
+			case "nodes":
+				nodesExpr = tgt["expr"].(string)
+			case "edges":
+				edgesExpr = tgt["expr"].(string)
+			}
+		}
+	}
+	if nodesExpr == "" || edgesExpr == "" {
+		t.Fatalf("missing nodes/edges expr in shawk-map-live.json")
+	}
+	allNodes := strings.ReplaceAll(nodesExpr, `"$service"`, `".*"`)
+	allEdges := strings.ReplaceAll(edgesExpr, `"$service"`, `".*"`)
+	hopNodes := strings.ReplaceAll(nodesExpr, `"$service"`, `"shop/app"`)
+	hopEdges := strings.ReplaceAll(edgesExpr, `"$service"`, `"shop/app"`)
+
+	script := wiringSeries + `
+load 1m
+  shawk:dependency_connections:rate5m{src="shop/app", dst="shop/app", server_port="8080", network_transport="tcp"} 3x10
+  shawk:dependency_connections:rate5m{src="resolver", dst="~external", server_port="53", network_transport="tcp"} 2x10
+  shawk:dependency_connection_failures:rate5m{src="Web Content", dst="dead-db", server_port="5432", network_transport="tcp"} 4x10
+  shawk:dependency_response_datagrams:rate5m{src="ntp-client", dst="ntp-server", server_port="123", network_transport="udp"} 5x10
+
+# $service variable includes both src and dst across TCP, failures, and UDP request/response rules.
+eval instant at 5m ` + svcExpr + `
+  {service="shop/app"} 1
+  {service="postgres"} 1
+  {service="resolver"} 1
+  {service="~external"} 1
+  {service="Web Content"} 1
+  {service="dead-db"} 1
+  {service="ntp-client"} 1
+  {service="ntp-server"} 1
+
+# All services: TCP+UDP on same pair, self-loop, failure-only, response-only UDP, and sanitized edge id.
+eval instant at 5m ` + allEdges + `
+  {dst="postgres", id="shop/app__postgres", source="shop/app", src="shop/app", target="postgres"} 1
+  {dst="shop/app", id="shop/app__shop/app", source="shop/app", src="shop/app", target="shop/app"} 3
+  {dst="~external", id="resolver__~external", source="resolver", src="resolver", target="~external"} 2
+  {dst="dead-db", id="Web_Content__dead-db", source="Web Content", src="Web Content", target="dead-db"} 0
+  {dst="ntp-server", id="ntp-client__ntp-server", source="ntp-client", src="ntp-client", target="ntp-server"} 0
+
+# Node stat uses max(out, in) so self-loop shop/app->shop/app (3) + shop/app->postgres (1) = 4, not double-counted.
+eval instant at 5m ` + allNodes + `
+  {id="shop/app", title="shop/app"} 4
+  {id="postgres", title="postgres"} 1
+  {id="resolver", title="resolver"} 2
+  {id="~external", title="~external"} 2
+  {id="Web Content", title="Web Content"} 0
+  {id="dead-db", title="dead-db"} 0
+  {id="ntp-client", title="ntp-client"} 0
+  {id="ntp-server", title="ntp-server"} 0
+
+# Selecting one service shows only its 1-hop neighborhood.
+eval instant at 5m ` + hopEdges + `
+  {dst="postgres", id="shop/app__postgres", source="shop/app", src="shop/app", target="postgres"} 1
+  {dst="shop/app", id="shop/app__shop/app", source="shop/app", src="shop/app", target="shop/app"} 3
+
+eval instant at 5m ` + hopNodes + `
+  {id="shop/app", title="shop/app"} 4
+  {id="postgres", title="postgres"} 1
+`
+	promqltest.RunTest(t, script, promqltest.NewTestEngine(t, false, 0, promqltest.DefaultMaxSamplesPerQuery))
+}
+
+func TestLiteFleetDashboardWiring(t *testing.T) {
+	d := loadJSON(t, filepath.Join(grafana, "dashboards-lite/shawk-fleet-live.json"))
+	var silentExpr, upExpr, dropsExpr string
+	for _, p := range d["panels"].([]any) {
+		p := p.(map[string]any)
+		switch p["title"] {
+		case "Silent agents (24h)":
+			silentExpr = p["targets"].([]any)[0].(map[string]any)["expr"].(string)
+		case "Live agents":
+			for _, tgt := range p["targets"].([]any) {
+				tgt := tgt.(map[string]any)
+				switch tgt["refId"] {
+				case "up":
+					upExpr = tgt["expr"].(string)
+				case "drops":
+					dropsExpr = tgt["expr"].(string)
+				}
+			}
+		}
+	}
+	if silentExpr == "" || upExpr == "" || dropsExpr == "" {
+		t.Fatalf("missing expected queries in shawk-fleet-live.json")
+	}
+
+	script := `
+# host-a is live (with two netns_scope labels from a restart) and has drops;
+# host-b stopped 20m ago after dropping flows and must count as silent only.
+load 5m
+  shawk_agent_up{host_name="host-a", shawk_netns_scope="host"} 1x10
+  shawk_agent_up{host_name="host-a", shawk_netns_scope="all"} 1x10
+  shawk_agent_flows_dropped_total{host_name="host-a"} 0+1x10
+  shawk_agent_up{host_name="host-b", shawk_netns_scope="all"} 1 1 1 1 1 _ _ _ _ _
+  shawk_agent_flows_dropped_total{host_name="host-b"} 0 2 4 6 8 _ _ _ _ _
+
+eval instant at 45m ` + silentExpr + `
+  {} 1
+
+eval instant at 45m ` + upExpr + `
+  {host_name="host-a"} 1
+
+eval instant at 45m ` + dropsExpr + `
+  {host_name="host-a"} 9
+`
+	promqltest.RunTest(t, script, promqltest.NewTestEngine(t, false, 0, promqltest.DefaultMaxSamplesPerQuery))
+}

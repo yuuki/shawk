@@ -1,0 +1,98 @@
+# Configuration of the collector with the shawk connector in SQLite
+# lightweight mode (single collector, without PostgreSQL; docs/design.md).
+#
+# Peer-resolution state and optional inventory fallback are kept in an
+# embedded SQLite database owned exclusively by this collector process.
+# Grafana reads Prometheus only (packaging/grafana/dashboards-lite/ alongside
+# shawk-application.json). Install the systemd drop-in
+# packaging/systemd/shawk-collector-sqlite.conf so /var/lib/shawk-collector
+# is writable under ProtectSystem=strict.
+receivers:
+  # shawk agents only (-otlp-cert-file and -otlp-key-file). A request of an
+  # agent stays below 3 MiB; the limits leave room. gRPC only: the connector
+  # checks the client certificate of every request (host_identity), which
+  # the receiver passes on over gRPC, not over HTTP.
+  otlp/shawk:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4327
+        max_recv_msg_size_mib: 16
+        tls:
+          cert_file: /etc/shawk/tls/collector.crt
+          key_file: /etc/shawk/tls/collector.key
+          client_ca_file: /etc/shawk/tls/agents-ca.crt
+
+connectors:
+  shawk:
+    # Single-connector internal store: no PostgreSQL required. Do not share
+    # one database file across multiple collectors.
+    sqlite:
+      path: /var/lib/shawk-collector/shawk.db
+      busy_timeout: 5s
+    write_interval: 1m
+    idle_ttl: 15m
+    max_peers: 50
+    max_services: 200
+    peer_cidrs:
+      office-lan: 192.168.10.0/24
+    # Optional static inventory for peer host resolution (docs/design.md §5.6).
+    # inventory_file: /etc/shawk/inventory.yaml
+    # Optional relays without an agent (docs/design.md §5.4).
+    # translations:
+    #   postgres-vip:
+    #     virtual: [10.0.100.1:5432]
+    #     backends: [10.0.1.10, 10.0.1.11]
+    #     transport: tcp
+    keep_peer_address: false
+    # Optional metrics per peer host (shawk_host_*; docs/design.md §5.3).
+    # peer_hosts: true
+    # max_peer_hosts: 500
+    # peer_host_services: [slurmctld, prometheus]
+    # networks:
+    #   mgmt: 10.0.0.0/16
+    #   ib: 10.10.0.0/16
+    host_identity: certificate
+    max_hosts: 10000
+    max_series_per_host: 100000
+    max_pending_rows: 10000000
+    # Dynamic port aggregation rules (docs/design.md §5.3).
+    # port_agnostic_services: [srun, salloc, slurm-job]
+    # dynamic_ports:
+    #   srun:
+    #     hosts: [10.1.0.0/16]
+    #     transport: tcp
+    #     ports: 60001-63000
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 20
+  batch:
+    send_batch_max_size: 8192
+
+exporters:
+  # Prometheus started with --web.enable-otlp-receiver and
+  # packaging/prometheus/web.yml.
+  otlp_http/prometheus:
+    endpoint: https://prometheus.example:9090/api/v1/otlp
+    tls:
+      ca_file: /etc/shawk/tls/prometheus-ca.crt
+    headers:
+      Authorization: ${env:SHAWK_PROMETHEUS_AUTHORIZATION}
+    sending_queue:
+      sizer: items
+      queue_size: 409600
+
+service:
+  pipelines:
+    # No batch processor before the connector: one request of an agent is
+    # one interval of its host.
+    metrics/shawk-in:
+      receivers: [otlp/shawk]
+      processors: [memory_limiter]
+      exporters: [shawk]
+    metrics/shawk-out:
+      receivers: [shawk]
+      processors: [batch]
+      exporters: [otlp_http/prometheus]

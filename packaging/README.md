@@ -6,12 +6,13 @@ order of the steps and what the files leave out.
 
 | path | what |
 |---|---|
-| `systemd/` | units of the agent and the collector, and their environment files |
+| `systemd/` | units of the agent and the collector, their environment files, and optional drop-ins (`shawk-agent-reserved-cpus.conf`, `shawk-collector-sqlite.conf`) |
 | `collector/config.yaml` | the collector: `otlp/shawk` for agents, `otlp` for OBI, the shawk connector, exporters to Prometheus (OTLP, or remote write) and a trace store |
+| `collector/config-sqlite.yaml` | single-collector configuration in SQLite lightweight mode (without PostgreSQL) |
 | `collector/front.yaml` | a front collector that spreads agents over several connectors by `host.id` and `host.name`; read its caveats first |
 | `postgres/` | roles (`shawk_owner`, `shawk_connector`, `shawk_grafana`), database and privileges |
 | `prometheus/` | settings for the OTLP push, TLS and users (`web.yml`), recording rules and alerts (`shawk-rules.yml`) |
-| `grafana/` | data sources (uids `shawk-postgres`, `shawk-prometheus`), dashboards and alert rules |
+| `grafana/` | data sources (uids `shawk-postgres`, `shawk-prometheus`), dashboards (`dashboards/` for PostgreSQL + Prometheus, `dashboards-lite/` for Prometheus only) and alert rules |
 
 ## Agent
 
@@ -188,6 +189,33 @@ OTEL_EXPORTER_OTLP_CLIENT_KEY=/etc/obi/tls/obi.key
 Set `SHAWK_GRAFANA_PROMETHEUS_PASSWORD` and put the CA of Prometheus at
 `/etc/grafana/tls/prometheus-ca.crt`, then adjust the URLs and credentials
 in `grafana/provisioning/datasources/shawk.yaml`.
+
+## SQLite lightweight mode (without PostgreSQL)
+
+For a single-collector deployment that needs live service dependency metrics
+and maps without running PostgreSQL (`docs/design.md` §5.8):
+
+1. Use `packaging/collector/config-sqlite.yaml` as `/etc/shawk/collector.yaml`.
+2. Install the drop-in so `/var/lib/shawk-collector` is writable under
+   `ProtectSystem=strict`:
+
+```sh
+sudo install -D -m 0644 packaging/systemd/shawk-collector-sqlite.conf \
+  /etc/systemd/system/shawk-collector.service.d/sqlite.conf
+sudo systemctl daemon-reload
+sudo systemctl restart shawk-collector
+```
+
+3. In Grafana, provision only the `shawk-prometheus` data source and load
+   `packaging/grafana/dashboards-lite/` (`shawk-map-live.json`,
+   `shawk-fleet-live.json`, `shawk-hosts-live.json`) alongside
+   `shawk-application.json`.
+
+The embedded SQLite database is internal to one collector process (protected
+by an exclusive lock file) and keeps peer-resolution state only (up to 30
+days). Long-term history, change alerts, `unobserved()` coverage gaps,
+multi-hop walks, `job_users`, `node_states_file` and `maintenance_file`
+require PostgreSQL mode.
 
 ## Upgrading
 

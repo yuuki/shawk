@@ -3,14 +3,19 @@ package shawkconnector
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
 // Config configures the shawk connector.
 type Config struct {
 	Postgres PostgresConfig `mapstructure:"postgres"`
+	// SQLite configures an embedded SQLite store instead of PostgreSQL, for
+	// single-connector lightweight deployments where Grafana reads
+	// Prometheus only (docs/design.md).
+	SQLite SQLiteConfig `mapstructure:"sqlite"`
 	// WriteInterval is how often the changes of every host are written to
-	// PostgreSQL and the names of peers are reloaded from it.
+	// the store and the names of peers are reloaded from it.
 	WriteInterval time.Duration `mapstructure:"write_interval"`
 	// IdleTTL is how long an output series is sent after its input stopped.
 	IdleTTL time.Duration `mapstructure:"idle_ttl"`
@@ -28,9 +33,9 @@ type Config struct {
 	// InventoryFile is a file in YAML or JSON that lists the hosts expected
 	// in the fleet, with all their addresses, roles and node names in
 	// Slurm (inventory.go). The connector reads it every write interval and
-	// writes it to PostgreSQL; while it cannot be read or is invalid, the
+	// writes it to the store; while it cannot be read or is invalid, the
 	// contents last read stay. Unset, the connector leaves the inventory in
-	// PostgreSQL as it is.
+	// the store as it is.
 	InventoryFile string `mapstructure:"inventory_file"`
 	// KeepPeerAddress keeps network.peer.address in the output. It raises
 	// the number of series with the number of peer addresses.
@@ -61,7 +66,8 @@ type Config struct {
 	Networks map[string]string `mapstructure:"networks"`
 	// Retention is how long rows are kept in PostgreSQL after they were
 	// last seen; zero keeps them forever. The connector deletes older rows
-	// every hour.
+	// every hour. With sqlite, each internal cache table keeps its own
+	// fixed window (up to 30 days).
 	Retention time.Duration `mapstructure:"retention"`
 	// Translations are relays without an agent that rewrite the addresses of
 	// connections (load balancers, virtual addresses, TCP proxies), by name.
@@ -107,7 +113,7 @@ type Config struct {
 	// until idle_ttl after their latest. Further ones are dropped until
 	// some expire, and the host is not observed meanwhile.
 	MaxSeriesPerHost int `mapstructure:"max_series_per_host"`
-	// MaxPendingRows bounds the rows kept for PostgreSQL while they cannot
+	// MaxPendingRows bounds the rows kept for the store while they cannot
 	// be written. Beyond it, the changes of the hosts pending the longest
 	// are dropped, and the hosts are not observed over them.
 	MaxPendingRows int `mapstructure:"max_pending_rows"`
@@ -132,6 +138,35 @@ type PostgresConfig struct {
 	// Migrate applies the bundled migrations at start. The role then needs
 	// to own the schemas shawk and shawk_v1.
 	Migrate bool `mapstructure:"migrate"`
+}
+
+// SQLiteConfig configures the embedded SQLite store of the connector
+// (single-connector lightweight mode, without PostgreSQL).
+type SQLiteConfig struct {
+	// Path is the path to the SQLite database file, or ":memory:" for
+	// in-memory operation.
+	Path string `mapstructure:"path"`
+	// BusyTimeout is how long SQLite waits on a busy lock before failing
+	// (default 5s).
+	BusyTimeout time.Duration `mapstructure:"busy_timeout"`
+}
+
+func (c *Config) useSQLite() bool { return c.SQLite.Path != "" }
+
+func validateSQLitePath(path string) error {
+	if strings.TrimSpace(path) == "" {
+		return errors.New("sqlite.path must not be blank")
+	}
+	if strings.ContainsRune(path, 0) {
+		return errors.New("sqlite.path must not contain NUL")
+	}
+	if path == ":memory:" {
+		return nil
+	}
+	if strings.HasPrefix(path, "file:") || strings.ContainsAny(path, "?#") {
+		return errors.New("sqlite.path must be a plain file path or :memory:, not a URI")
+	}
+	return nil
 }
 
 // maxWriteInterval is the longest write interval.
@@ -164,8 +199,35 @@ func createDefaultConfig() *Config {
 // Validate checks the configuration.
 func (c *Config) Validate() error {
 	var errs []error
-	if (c.Postgres.DSN == "") == (c.Postgres.DSNFile == "") {
+	hasPG := c.Postgres.DSN != "" || c.Postgres.DSNFile != ""
+	hasSQLite := c.useSQLite()
+	switch {
+	case hasPG && hasSQLite:
+		errs = append(errs, errors.New("set only one of postgres and sqlite"))
+	case !hasPG && !hasSQLite:
+		errs = append(errs, errors.New("postgres: set exactly one of dsn and dsn_file, or set sqlite.path"))
+	case hasPG && (c.Postgres.DSN == "") == (c.Postgres.DSNFile == ""):
 		errs = append(errs, errors.New("postgres: set exactly one of dsn and dsn_file"))
+	}
+	if hasSQLite {
+		if err := validateSQLitePath(c.SQLite.Path); err != nil {
+			errs = append(errs, err)
+		}
+		if c.SQLite.BusyTimeout < 0 {
+			errs = append(errs, errors.New("sqlite.busy_timeout must not be negative"))
+		}
+		if c.Postgres.Migrate {
+			errs = append(errs, errors.New("postgres.migrate cannot be set with sqlite"))
+		}
+		if c.JobUsers {
+			errs = append(errs, errors.New("job_users is not supported with sqlite"))
+		}
+		if c.NodeStatesFile != "" {
+			errs = append(errs, errors.New("node_states_file is not supported with sqlite"))
+		}
+		if c.MaintenanceFile != "" {
+			errs = append(errs, errors.New("maintenance_file is not supported with sqlite"))
+		}
 	}
 	if c.WriteInterval <= 0 || c.WriteInterval > maxWriteInterval {
 		// Connectors learn the agents of the hosts they do not receive from
@@ -176,7 +238,9 @@ func (c *Config) Validate() error {
 		// Inputs must outlive a few intervals of the agents (15s) and delays.
 		errs = append(errs, errors.New("idle_ttl must be at least 2m and not shorter than write_interval"))
 	}
-	if c.Retention != 0 && c.Retention < 24*time.Hour {
+	if c.Retention < 0 {
+		errs = append(errs, errors.New("retention must not be negative"))
+	} else if !hasSQLite && c.Retention != 0 && c.Retention < 24*time.Hour {
 		errs = append(errs, errors.New("retention must be zero (keep forever) or at least 24h"))
 	}
 	if c.MaxPeers < 1 {
