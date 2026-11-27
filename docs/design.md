@@ -1656,6 +1656,46 @@ fail the write of every host.
 
 Slurm partitions and states are not labels of the metrics of shawk.
 
+### 5.8 SQLite lightweight mode
+
+For small to medium single-connector deployments that want shawk's
+Prometheus metrics and live 1-hop service map without running PostgreSQL,
+the connector can use an embedded SQLite store (`sqlite.path`) instead of
+`postgres` (`collector/shawkconnector/sqlite.go`). It uses pure-Go SQLite
+(`modernc.org/sqlite`), keeping the collector static (`CGO_ENABLED=0`) and
+compatible with `MemoryDenyWriteExecute=yes` of its systemd unit.
+
+- **Scope.** SQLite is an internal persistence store of one collector
+  process, not a public SQL contract like `shawk_v1`. It persists only the
+  state `store.peers()` and `inventory_file` fallback need: hosts with their
+  latest heartbeat and folding settings, `host_addrs` (30 days), TCP/UDP and
+  Unix `listeners` (latest 1-hour window per host, kept 30 days for stopped
+  hosts), server-side `server_endpoints` aggregated without client addresses
+  (7 days relative to each host's latest report, kept 30 days for stopped
+  hosts), `client_endpoints` (1 hour) and `learned_translations` (`idle_ttl`).
+  Across collector restarts and dead hosts, `service.peer.name`,
+  `shawk.peer.host` and `shawk.peer.agent` keep the same semantics as with
+  PostgreSQL, and all Prometheus metrics and recording rules remain unchanged.
+- **Bounds and locking.** A file-backed database acquires an exclusive
+  non-blocking `flock` on `<path>.lock` so two collectors cannot open the
+  same file. It runs in WAL mode (`synchronous=NORMAL`, single serialized
+  connection with per-connection PRAGMAs re-applied via driver connection hook,
+  `cache_size=-16384`, `mmap_size=0`, `auto_vacuum=INCREMENTAL`), migrates
+  its internal schema on start via `PRAGMA user_version` (failing start and
+  releasing the lock on a newer or unreadable schema), and prunes each table
+  hourly in bounded batches on its fixed window with incremental vacuuming
+  regardless of `retention`.
+- **What stays PostgreSQL-only.** `job_users`, `node_states_file`,
+  `maintenance_file` and `postgres.migrate` are refused by configuration
+  validation when `sqlite.path` is set. Multi-connector scaling, multi-year
+  `first_seen`/`last_seen` dependency history, `dependency_changes` alerts,
+  `unobserved()`/`partly_observed()` coverage proofs, `edge_protocols` and
+  recursive N-hop maps require PostgreSQL.
+- **Packaging.** `packaging/collector/config-sqlite.yaml`, the drop-in
+  `packaging/systemd/shawk-collector-sqlite.conf` (`StateDirectory=shawk-collector`),
+  and Prometheus-only dashboards `packaging/grafana/dashboards-lite/`
+  (`shawk-map-live.json`, `shawk-fleet-live.json`, `shawk-hosts-live.json`).
+
 ## 6. PostgreSQL
 
 PostgreSQL 14 or later (multiranges). The schema ships with the connector

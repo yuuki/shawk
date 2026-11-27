@@ -317,14 +317,14 @@ func (c *shawkConnector) syncInventory(ctx context.Context) {
 // be read.
 func (c *shawkConnector) writeInventory(ctx context.Context, inv *inventory, readAt time.Time) {
 	if err := c.store.syncInventory(ctx, inv, readAt); err != nil {
-		c.log.Warn("writing the inventory to PostgreSQL", zap.Error(err))
+		c.log.Warn("writing the inventory to "+c.storeName(), zap.Error(err))
 		c.inventoryUnwritten = true
 		return
 	}
 	c.inventoryUnwritten = false
 }
 
-// inventoryUnreadable keeps the inventory read before, from PostgreSQL if
+// inventoryUnreadable keeps the inventory read before, from the store if
 // the connector has read none since it started, writes it if it could not
 // be written when it was read, and records the failure.
 // A failure is logged when it changes, and at most once an hour while it
@@ -343,14 +343,14 @@ func (c *shawkConnector) inventoryUnreadable(ctx context.Context, err error, at 
 	if c.inventory.Load() == nil {
 		inv, err := c.store.inventory(ctx)
 		if err != nil {
-			c.log.Warn("reading the inventory from PostgreSQL", zap.Error(err))
+			c.log.Warn("reading the inventory from "+c.storeName(), zap.Error(err))
 		} else if inv != nil {
 			c.inventory.Store(inv)
 			c.inventoryFromStore = true
 		}
 	}
 	if err := c.store.inventoryFailed(ctx, at, msg); err != nil {
-		c.log.Warn("recording the failure to read inventory_file in PostgreSQL", zap.Error(err))
+		c.log.Warn("recording the failure to read inventory_file in "+c.storeName(), zap.Error(err))
 	}
 }
 

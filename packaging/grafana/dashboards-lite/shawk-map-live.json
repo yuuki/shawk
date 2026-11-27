@@ -1,0 +1,261 @@
+{
+  "uid": "shawk-map-live",
+  "title": "shawk / Dependency map (live)",
+  "description": "Live 1-hop service dependency map from Prometheus, for deployments without PostgreSQL.",
+  "tags": [
+    "shawk",
+    "shawk-lite"
+  ],
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "version": 1,
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "refresh": "1m",
+  "timezone": "",
+  "templating": {
+    "list": [
+      {
+        "name": "service",
+        "label": "Service",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "shawk-prometheus"
+        },
+        "query": {
+          "query": "query_result(count by (service) (label_replace(count by (src) ({__name__=~\"shawk:dependency_connections:rate5m|shawk:dependency_connection_failures:rate5m|shawk:dependency_request_datagrams:rate5m|shawk:dependency_response_datagrams:rate5m\"}), \"service\", \"$1\", \"src\", \"(.*)\")) or count by (service) (label_replace(count by (dst) ({__name__=~\"shawk:dependency_connections:rate5m|shawk:dependency_connection_failures:rate5m|shawk:dependency_request_datagrams:rate5m|shawk:dependency_response_datagrams:rate5m\"}), \"service\", \"$1\", \"dst\", \"(.*)\")))",
+          "refId": "service"
+        },
+        "definition": "query_result(count by (service) (label_replace(count by (src) ({__name__=~\"shawk:dependency_connections:rate5m|shawk:dependency_connection_failures:rate5m|shawk:dependency_request_datagrams:rate5m|shawk:dependency_response_datagrams:rate5m\"}), \"service\", \"$1\", \"src\", \"(.*)\")) or count by (service) (label_replace(count by (dst) ({__name__=~\"shawk:dependency_connections:rate5m|shawk:dependency_connection_failures:rate5m|shawk:dependency_request_datagrams:rate5m|shawk:dependency_response_datagrams:rate5m\"}), \"service\", \"$1\", \"dst\", \"(.*)\")))",
+        "regex": "/service=\"([^\"]+)\"/",
+        "refresh": 2,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {},
+        "sort": 1
+      }
+    ]
+  },
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "links": [
+    {
+      "asDropdown": true,
+      "includeVars": false,
+      "keepTime": true,
+      "tags": [
+        "shawk"
+      ],
+      "title": "shawk",
+      "type": "dashboards"
+    }
+  ],
+  "panels": [
+    {
+      "id": 1,
+      "type": "nodeGraph",
+      "title": "Live dependencies of $service (1-hop)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "shawk-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 18
+      },
+      "targets": [
+        {
+          "refId": "nodes",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "expr": "label_replace(max by (id) (label_replace(sum by (src) (shawk:dependency_connections:rate5m{src=~\"$service\"} or shawk:dependency_connections:rate5m{dst=~\"$service\"} or (shawk:dependency_connection_failures:rate5m{src=~\"$service\"} * 0) or (shawk:dependency_connection_failures:rate5m{dst=~\"$service\"} * 0) or (shawk:dependency_request_datagrams:rate5m{src=~\"$service\"} * 0) or (shawk:dependency_request_datagrams:rate5m{dst=~\"$service\"} * 0) or (shawk:dependency_response_datagrams:rate5m{src=~\"$service\"} * 0) or (shawk:dependency_response_datagrams:rate5m{dst=~\"$service\"} * 0)), \"id\", \"$1\", \"src\", \"(.*)\") or label_replace(sum by (dst) (shawk:dependency_connections:rate5m{src=~\"$service\"} or shawk:dependency_connections:rate5m{dst=~\"$service\"} or (shawk:dependency_connection_failures:rate5m{src=~\"$service\"} * 0) or (shawk:dependency_connection_failures:rate5m{dst=~\"$service\"} * 0) or (shawk:dependency_request_datagrams:rate5m{src=~\"$service\"} * 0) or (shawk:dependency_request_datagrams:rate5m{dst=~\"$service\"} * 0) or (shawk:dependency_response_datagrams:rate5m{src=~\"$service\"} * 0) or (shawk:dependency_response_datagrams:rate5m{dst=~\"$service\"} * 0)), \"id\", \"$1\", \"dst\", \"(.*)\")), \"title\", \"$1\", \"id\", \"(.*)\")"
+        },
+        {
+          "refId": "edges",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "expr": "label_replace(label_replace(label_replace(label_replace(label_replace(label_join(sum by (src, dst) (shawk:dependency_connections:rate5m{src=~\"$service\"} or shawk:dependency_connections:rate5m{dst=~\"$service\"} or (shawk:dependency_connection_failures:rate5m{src=~\"$service\"} * 0) or (shawk:dependency_connection_failures:rate5m{dst=~\"$service\"} * 0) or (shawk:dependency_request_datagrams:rate5m{src=~\"$service\"} * 0) or (shawk:dependency_request_datagrams:rate5m{dst=~\"$service\"} * 0) or (shawk:dependency_response_datagrams:rate5m{src=~\"$service\"} * 0) or (shawk:dependency_response_datagrams:rate5m{dst=~\"$service\"} * 0)), \"id\", \"__\", \"src\", \"dst\"), \"id\", \"${1}_${2}\", \"id\", \"(.*?)[^A-Za-z0-9_.:/~-]+(.*)\"), \"id\", \"${1}_${2}\", \"id\", \"(.*?)[^A-Za-z0-9_.:/~-]+(.*)\"), \"id\", \"${1}_${2}\", \"id\", \"(.*?)[^A-Za-z0-9_.:/~-]+(.*)\"), \"source\", \"$1\", \"src\", \"(.*)\"), \"target\", \"$1\", \"dst\", \"(.*)\")"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "renameByRegex",
+          "options": {
+            "regex": "^Value( #.*)?$",
+            "renamePattern": "mainstat"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "src": true,
+              "dst": true
+            }
+          }
+        }
+      ],
+      "options": {
+        "nodes": {
+          "mainStatUnit": "cps"
+        },
+        "edges": {
+          "mainStatUnit": "cps"
+        }
+      },
+      "description": "1-hop dependencies active in Prometheus around the selected services (edge mainstat is connections/s; node mainstat is peak outgoing or incoming connections/s; failure-only and UDP edges are included at 0 conn/s). Use PostgreSQL mode (shawk-map) for multi-hop walks and long-term history."
+    },
+    {
+      "id": 2,
+      "type": "table",
+      "title": "Active dependencies",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "shawk-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 18,
+        "w": 24,
+        "h": 10
+      },
+      "targets": [
+        {
+          "refId": "conn",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "expr": "sum by (src, dst, server_port, network_transport) (shawk:dependency_connections:rate5m{src=~\"$service\"} or shawk:dependency_connections:rate5m{dst=~\"$service\"})"
+        },
+        {
+          "refId": "req",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "expr": "sum by (src, dst, server_port, network_transport) (shawk:dependency_request_bytes:rate5m{src=~\"$service\"} or shawk:dependency_request_bytes:rate5m{dst=~\"$service\"})"
+        },
+        {
+          "refId": "resp",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "expr": "sum by (src, dst, server_port, network_transport) (shawk:dependency_response_bytes:rate5m{src=~\"$service\"} or shawk:dependency_response_bytes:rate5m{dst=~\"$service\"})"
+        },
+        {
+          "refId": "fail",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "expr": "sum by (src, dst, server_port, network_transport) (shawk:dependency_connection_failures:rate5m{src=~\"$service\"} or shawk:dependency_connection_failures:rate5m{dst=~\"$service\"})"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            },
+            "renameByName": {
+              "Value #conn": "Connections/s",
+              "Value #req": "Request B/s",
+              "Value #resp": "Response B/s",
+              "Value #fail": "Failures/s"
+            }
+          }
+        }
+      ],
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Request B/s"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "Bps"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Response B/s"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "Bps"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

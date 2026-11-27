@@ -65,7 +65,10 @@ func provisionedDatasources(t *testing.T) map[string]string {
 	return out
 }
 
-var grafanaVar = regexp.MustCompile(`\$\{?(\w+)(:\w+)?\}?`)
+var (
+	grafanaVar   = regexp.MustCompile(`\$\{?(\w+)(:\w+)?\}?`)
+	captureRefRe = regexp.MustCompile(`^\$\{?[0-9]+\}?$`)
+)
 
 // expandVars replaces the Grafana variables of a PromQL expression.
 func expandVars(expr string) string {
@@ -73,8 +76,8 @@ func expandVars(expr string) string {
 		switch {
 		case strings.Contains(s, "__rate_interval"), strings.Contains(s, "__interval"):
 			return "5m"
-		case s == "$1":
-			return s // label_replace references
+		case captureRefRe.MatchString(s):
+			return s // label_replace references ($1, ${1}, $2, ...)
 		}
 		return "x"
 	})
@@ -84,11 +87,17 @@ func TestDashboards(t *testing.T) {
 	records, _ := loadRules(t)
 	datasources := provisionedDatasources(t)
 	files, _ := filepath.Glob(filepath.Join(grafana, "dashboards/*.json"))
+	liteFiles, _ := filepath.Glob(filepath.Join(grafana, "dashboards-lite/*.json"))
 	if len(files) < 4 {
 		t.Fatalf("%d dashboards", len(files))
 	}
+	if len(liteFiles) < 3 {
+		t.Fatalf("%d lite dashboards", len(liteFiles))
+	}
+	allFiles := append(slices.Clone(files), liteFiles...)
 	uids := map[string]bool{}
-	for _, f := range files {
+	for _, f := range allFiles {
+		isLite := strings.Contains(filepath.ToSlash(f), "/dashboards-lite/")
 		d := loadJSON(t, f)
 		uid, _ := d["uid"].(string)
 		if uid == "" || uids[uid] {
@@ -111,6 +120,9 @@ func TestDashboards(t *testing.T) {
 			if ds, ok := o["datasource"].(map[string]any); ok {
 				uid, _ := ds["uid"].(string)
 				typ, _ := ds["type"].(string)
+				if isLite && typ == "grafana-postgresql-datasource" {
+					t.Errorf("%s: lite dashboard must not use PostgreSQL data source %s", f, uid)
+				}
 				if typ != "grafana" && datasources[uid] != typ {
 					t.Errorf("%s: data source %s of type %s is not provisioned", f, uid, typ)
 				}
@@ -119,8 +131,10 @@ func TestDashboards(t *testing.T) {
 			if !ok {
 				if q, ok := o["query"].(map[string]any); ok {
 					expr, _ = q["query"].(string)
-					// label_values(metric, label) is a Grafana function.
+					// label_values(metric, label) and query_result(expr) are Grafana functions.
 					if m := regexp.MustCompile(`^label_values\((.*), \w+\)$`).FindStringSubmatch(expr); m != nil {
+						expr = m[1]
+					} else if m := regexp.MustCompile(`^query_result\((.*)\)$`).FindStringSubmatch(expr); m != nil {
 						expr = m[1]
 					} else {
 						expr = ""
@@ -157,17 +171,13 @@ func TestDashboards(t *testing.T) {
 	}
 }
 
-// The peer hosts dashboard populates its variables from recording rules.
+// The peer hosts dashboards populate their variables from recording rules.
 // UDP edges emit byte metrics rather than connections or failures, so each
 // variable must match both byte recording rules (for asymmetric or
 // response-only flows as well) alongside connections and failures, keep
 // query and definition in sync, and only query rules that keep its label.
 func TestHostsDashboardVariables(t *testing.T) {
 	records, _ := loadRules(t)
-	d := loadJSON(t, filepath.Join(grafana, "dashboards/shawk-hosts.json"))
-	templating, _ := d["templating"].(map[string]any)
-	list, _ := templating["list"].([]any)
-	wantVars := map[string]bool{"dst": false, "src": false, "dst_host": false}
 	wantRules := []string{
 		"shawk:host_dependency_connections:rate5m",
 		"shawk:host_dependency_connection_failures_by_reason:rate5m",
@@ -176,54 +186,60 @@ func TestHostsDashboardVariables(t *testing.T) {
 	}
 	labelValuesRe := regexp.MustCompile(`^label_values\((.*), (\w+)\)$`)
 	p := parser.NewParser(parser.Options{})
-	for _, item := range list {
-		v, _ := item.(map[string]any)
-		name, _ := v["name"].(string)
-		if _, ok := wantVars[name]; !ok {
-			continue
-		}
-		wantVars[name] = true
-		q, _ := v["query"].(map[string]any)
-		query, _ := q["query"].(string)
-		def, _ := v["definition"].(string)
-		if query == "" || query != def {
-			t.Errorf("variable %s: query %q != definition %q", name, query, def)
-		}
-		m := labelValuesRe.FindStringSubmatch(query)
-		if m == nil || m[2] != name {
-			t.Errorf("variable %s: unexpected label_values query %q", name, query)
-			continue
-		}
-		parsed, err := p.ParseExpr(expandVars(m[1]))
-		if err != nil {
-			t.Errorf("variable %s: %v\n%s", name, err, m[1])
-			continue
-		}
-		vs, ok := parsed.(*parser.VectorSelector)
-		if !ok {
-			t.Errorf("variable %s: selector %q parsed as %T, want *parser.VectorSelector", name, m[1], parsed)
-			continue
-		}
-		var nameMatcher interface{ Matches(string) bool }
-		for _, lm := range vs.LabelMatchers {
-			if lm.Name == "__name__" {
-				nameMatcher = lm
-				break
+	for _, rel := range []string{"dashboards/shawk-hosts.json", "dashboards-lite/shawk-hosts-live.json"} {
+		d := loadJSON(t, filepath.Join(grafana, rel))
+		templating, _ := d["templating"].(map[string]any)
+		list, _ := templating["list"].([]any)
+		wantVars := map[string]bool{"dst": false, "src": false, "dst_host": false}
+		for _, item := range list {
+			v, _ := item.(map[string]any)
+			name, _ := v["name"].(string)
+			if _, ok := wantVars[name]; !ok {
+				continue
+			}
+			wantVars[name] = true
+			q, _ := v["query"].(map[string]any)
+			query, _ := q["query"].(string)
+			def, _ := v["definition"].(string)
+			if query == "" || query != def {
+				t.Errorf("%s variable %s: query %q != definition %q", rel, name, query, def)
+			}
+			m := labelValuesRe.FindStringSubmatch(query)
+			if m == nil || m[2] != name {
+				t.Errorf("%s variable %s: unexpected label_values query %q", rel, name, query)
+				continue
+			}
+			parsed, err := p.ParseExpr(expandVars(m[1]))
+			if err != nil {
+				t.Errorf("%s variable %s: %v\n%s", rel, name, err, m[1])
+				continue
+			}
+			vs, ok := parsed.(*parser.VectorSelector)
+			if !ok {
+				t.Errorf("%s variable %s: selector %q parsed as %T, want *parser.VectorSelector", rel, name, m[1], parsed)
+				continue
+			}
+			var nameMatcher interface{ Matches(string) bool }
+			for _, lm := range vs.LabelMatchers {
+				if lm.Name == "__name__" {
+					nameMatcher = lm
+					break
+				}
+			}
+			if nameMatcher == nil {
+				t.Errorf("%s variable %s: no __name__ matcher in %q", rel, name, m[1])
+				continue
+			}
+			for _, rule := range wantRules {
+				if !nameMatcher.Matches(rule) {
+					t.Errorf("%s variable %s: __name__ matcher in %q does not match %s", rel, name, m[1], rule)
+				}
 			}
 		}
-		if nameMatcher == nil {
-			t.Errorf("variable %s: no __name__ matcher in %q", name, m[1])
-			continue
-		}
-		for _, rule := range wantRules {
-			if !nameMatcher.Matches(rule) {
-				t.Errorf("variable %s: __name__ matcher in %q does not match %s", name, m[1], rule)
+		for name, seen := range wantVars {
+			if !seen {
+				t.Errorf("%s: missing variable %s", rel, name)
 			}
-		}
-	}
-	for name, seen := range wantVars {
-		if !seen {
-			t.Errorf("shawk-hosts.json: missing variable %s", name)
 		}
 	}
 	for _, rule := range wantRules {
@@ -242,7 +258,7 @@ func TestHostsDashboardVariables(t *testing.T) {
 			t.Errorf("recording rule %s: expected sum by (...) expression, got %T", rule, parsed)
 			continue
 		}
-		for name := range wantVars {
+		for _, name := range []string{"dst", "src", "dst_host"} {
 			if !slices.Contains(agg.Grouping, name) {
 				t.Errorf("recording rule %s does not preserve label %s (grouping: %v)", rule, name, agg.Grouping)
 			}

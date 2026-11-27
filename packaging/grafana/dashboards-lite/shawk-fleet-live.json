@@ -1,0 +1,635 @@
+{
+  "uid": "shawk-fleet-live",
+  "title": "shawk / Fleet (live)",
+  "description": "Agent health and collection coverage from Prometheus, for deployments without PostgreSQL.",
+  "tags": [
+    "shawk",
+    "shawk-lite"
+  ],
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "version": 1,
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "refresh": "1m",
+  "timezone": "",
+  "templating": {
+    "list": []
+  },
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "links": [
+    {
+      "asDropdown": true,
+      "includeVars": false,
+      "keepTime": true,
+      "tags": [
+        "shawk"
+      ],
+      "title": "shawk",
+      "type": "dashboards"
+    }
+  ],
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Agents sending",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "shawk-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "instant": true,
+          "range": false,
+          "expr": "count(shawk_agent_up) or vector(0)"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        }
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Silent agents (24h)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "shawk-prometheus"
+      },
+      "gridPos": {
+        "x": 6,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "instant": true,
+          "range": false,
+          "expr": "count(group by (host_name) (max_over_time(shawk_agent_up[24h])) unless group by (host_name) (shawk_agent_up)) or vector(0)"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "description": "Hosts that sent metrics in the last 24 hours but are not sending now."
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Agents without UDP tracing",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "shawk-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "instant": true,
+          "range": false,
+          "expr": "count(shawk_agent_udp_traced == 0) or vector(0)"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Agents without Unix tracing",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "shawk-prometheus"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "instant": true,
+          "range": false,
+          "expr": "count(shawk_agent_unix_traced == 0) or vector(0)"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "values": false
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 5,
+      "type": "table",
+      "title": "Live agents",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "shawk-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 4,
+        "w": 24,
+        "h": 9
+      },
+      "targets": [
+        {
+          "refId": "up",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "expr": "max by (host_name) (shawk_agent_up)"
+        },
+        {
+          "refId": "udp",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "expr": "min by (host_name) (shawk_agent_udp_traced)"
+        },
+        {
+          "refId": "unix",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "expr": "min by (host_name) (shawk_agent_unix_traced)"
+        },
+        {
+          "refId": "drops",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "expr": "sum by (host_name) (increase(shawk_agent_flows_dropped_total[1h])) and on (host_name) group by (host_name) (shawk_agent_up)"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "joinByField",
+          "options": {
+            "byField": "host_name",
+            "mode": "outer"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "Time 1": true,
+              "Time 2": true,
+              "Time 3": true,
+              "Time 4": true
+            },
+            "renameByName": {
+              "host_name": "Host",
+              "Value #up": "Up",
+              "Value #udp": "UDP traced",
+              "Value #unix": "Unix traced",
+              "Value #drops": "Dropped flows (1h)"
+            }
+          }
+        }
+      ],
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "description": "Agents currently pushing to Prometheus. Only TCP, UDP and Unix stream sockets are observed."
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Agents sending over time",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "shawk-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 13,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "count(shawk_agent_up)",
+          "range": true,
+          "legendFormat": "agents"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Dropped flow updates",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "shawk-prometheus"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 13,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (host_name) (increase(shawk_agent_flows_dropped_total[$__rate_interval]))",
+          "range": true,
+          "legendFormat": "{{host_name}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Flow updates the kernel dropped because the flow table was full; raise -max-flows."
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Export failures",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "shawk-prometheus"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 13,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (host_name) (increase(shawk_agent_export_failures_total[$__rate_interval]))",
+          "range": true,
+          "legendFormat": "{{host_name}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Requests the agents failed to send to the collector."
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Dropped cgroup events and container reads",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "shawk-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 21,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (host_name) (increase(shawk_agent_cgroup_events_dropped_total[$__rate_interval]))",
+          "range": true,
+          "legendFormat": "cgroup {{host_name}}"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (host_name) (increase(shawk_agent_container_reads_dropped_total[$__rate_interval]))",
+          "range": true,
+          "legendFormat": "container {{host_name}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "RDMA traffic (hint)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "shawk-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 21,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "shawk-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (host_name) (rate(shawk_agent_rdma_io_bytes_total[$__rate_interval]))",
+          "range": true,
+          "legendFormat": "{{host_name}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          },
+          "unit": "Bps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Bytes sent and received by RDMA ports (InfiniBand, RoCE) as a hint of traffic shawk does not observe."
+    }
+  ]
+}

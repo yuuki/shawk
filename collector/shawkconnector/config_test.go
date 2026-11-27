@@ -79,3 +79,41 @@ func TestWriteIntervalBound(t *testing.T) {
 		t.Error("a write_interval beyond the alive window of agents was accepted")
 	}
 }
+
+func TestConfigValidateSQLite(t *testing.T) {
+	ok := createDefaultConfig()
+	ok.SQLite.Path = "/var/lib/shawk-collector/shawk.db"
+	ok.SQLite.BusyTimeout = 5 * time.Second
+	ok.PeerCIDRs = map[string]string{"office-lan": "192.168.10.0/24"}
+	ok.PeerHosts = true
+	ok.Networks = map[string]string{"mgmt": "10.0.0.0/16"}
+	if err := ok.Validate(); err != nil {
+		t.Errorf("valid sqlite config: %v", err)
+	}
+	mem := *ok
+	mem.SQLite.Path = ":memory:"
+	if err := mem.Validate(); err != nil {
+		t.Errorf(":memory: sqlite config: %v", err)
+	}
+	for name, mod := range map[string]func(*Config){
+		"both postgres dsn and sqlite":      func(c *Config) { c.Postgres.DSN = "postgres://x" },
+		"both postgres dsn_file and sqlite": func(c *Config) { c.Postgres.DSNFile = "/etc/shawk/postgres-dsn" },
+		"postgres migrate with sqlite":      func(c *Config) { c.Postgres.Migrate = true },
+		"negative busy_timeout":             func(c *Config) { c.SQLite.BusyTimeout = -time.Second },
+		"negative retention":                func(c *Config) { c.Retention = -time.Hour },
+		"blank sqlite path":                 func(c *Config) { c.SQLite.Path = "   " },
+		"nul in sqlite path":                func(c *Config) { c.SQLite.Path = "/tmp/a\x00b.db" },
+		"file uri sqlite path":              func(c *Config) { c.SQLite.Path = "file:/tmp/shawk.db" },
+		"query uri sqlite path":             func(c *Config) { c.SQLite.Path = "/tmp/shawk.db?mode=ro" },
+		"fragment uri sqlite path":          func(c *Config) { c.SQLite.Path = "/tmp/shawk.db#frag" },
+		"job_users with sqlite":             func(c *Config) { c.JobUsers = true },
+		"node_states_file with sqlite":      func(c *Config) { c.NodeStatesFile = "/etc/shawk/node-states.json" },
+		"maintenance_file with sqlite":      func(c *Config) { c.MaintenanceFile = "/etc/shawk/maintenance.yaml" },
+	} {
+		c := *ok
+		mod(&c)
+		if err := c.Validate(); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}
