@@ -167,6 +167,9 @@ type hostBatch struct {
 	// unixTraced tells whether the agent traces Unix sockets, nil if it
 	// does not tell (an agent before shawk.agent.unix.traced).
 	unixTraced *bool
+	// translationsTraced tells whether the agent learns the translations
+	// of addresses its host makes, nil if it does not tell.
+	translationsTraced *bool
 	// protocolsClassified tells whether the agent classifies the wire
 	// protocols of TCP connections, nil if it does not tell (an agent
 	// before shawk.agent.protocols.classified).
@@ -443,6 +446,11 @@ func (b *hostBatch) addAgent(m pmetric.Metric, name string) {
 		forGauge(b, m, func(dp pmetric.NumberDataPoint, _ time.Time) {
 			classified := numberValue(dp) != 0
 			b.protocolsClassified = &classified
+		})
+	case metricAgentTranslationsTraced:
+		forGauge(b, m, func(dp pmetric.NumberDataPoint, _ time.Time) {
+			traced := numberValue(dp) != 0
+			b.translationsTraced = &traced
 		})
 	case metricAgentUp:
 		b.final = true

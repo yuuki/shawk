@@ -371,6 +371,9 @@ var dashboardVars = map[string][]string{
 	"dst":       {"postgres"},
 	"direction": {"both"},
 	"depth":     {"2"},
+	// The impact dashboard.
+	"host":         {"db-01"},
+	"min_coverage": {"1"},
 }
 
 var sqlstringVar = regexp.MustCompile(`\$\{(\w+):sqlstring\}`)
@@ -468,8 +471,13 @@ func TestPGPackaged(t *testing.T) {
 		peerFold: foldIn, peerInternal: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}})
 	h.addAddr(addrOf("10.0.0.30"), span{now, now})
 	h.addProcess(procKey{"x.service", "x", "x", ""}, "/usr/bin/x", span{now, now})
-	h.addEdge(edgeRowKey{role: "client", proto: "tcp", local: addrOf("10.0.0.30"), peer: addrOf("10.0.0.10"), port: 5432,
-		netns: 1, procKey: procKey{"x.service", "x", "x", ""}}, span{now, now})
+	client := edgeRowKey{role: "client", proto: "tcp", local: addrOf("10.0.0.30"), peer: addrOf("10.0.0.10"), port: 5432,
+		netns: 1, procKey: procKey{"x.service", "x", "x", ""}}
+	h.addEdge(client, span{now, now})
+	h.addActivity(client, now)
+	sock := edgeRowKey{role: "client", proto: transportUnix, path: "/run/x.sock", netns: 1, procKey: procKey{"x.service", "x", "x", ""}}
+	h.addEdge(sock, span{now, now})
+	h.addActivity(sock, now)
 	h.addEdge(edgeRowKey{role: "server", proto: "tcp", local: addrOf("10.0.0.30"), peer: addrOf("0.0.0.0"), folded: true,
 		port: 9000, netns: 1, procKey: procKey{"x.service", "x", "x", ""}}, span{now, now})
 	h.addListener(listenerRowKey{proto: "tcp", addr: addrOf("0.0.0.0"), port: 9000, netns: 1, procKey: procKey{"x.service", "x", "x", ""}}, span{now, now})
@@ -494,6 +502,23 @@ func TestPGPackaged(t *testing.T) {
 
 	if _, err := conn.Exec(ctx, "RESET ROLE; SET ROLE shawk_grafana"); err != nil {
 		t.Fatal(err)
+	}
+	// Grafana reads the impact of removing a host through the contract, and
+	// not the functions behind it: app and x use the postgres of db-01, and
+	// the clients of x depend on it in turn.
+	for q, want := range map[string]int{
+		`SELECT count(*) FROM shawk_v1.impact('db-01', now() - interval '6 hours', now())`:                   3,
+		`SELECT direct FROM shawk_v1.impact_verdict('db-01', now() - interval '6 hours', now())`:             2,
+		`SELECT count(*) FROM shawk_v1.coverage(now() - interval '6 hours', now(), ARRAY['db-01'])`:          1,
+		`SELECT count(*) FROM shawk_v1.impact('db-01', now() - interval '6 hours', now(), 'postgres', 5432)`: 3,
+	} {
+		var n int
+		if err := conn.QueryRow(ctx, q).Scan(&n); err != nil || n != want {
+			t.Errorf("%s as shawk_grafana: %d, %v; want %d", q, n, err, want)
+		}
+	}
+	if _, err := conn.Exec(ctx, `SELECT count(*) FROM shawk.dependents('db-01', now() - interval '6 hours', now(), NULL, NULL, NULL, 3)`); err == nil {
+		t.Error("shawk_grafana reads shawk.dependents")
 	}
 	queries := packagedSQL(t)
 	if len(queries) < 15 {
@@ -563,6 +588,10 @@ func TestPGPackaged(t *testing.T) {
 		"shawk-fleet.json/shawk / Fleet/Partly observed periods in the time range/A#0",
 		"shawk-dependency.json/shawk / Dependency details/Partly observed/Anno#0",
 		"shawk-changes.json/shawk / Changes/Partly observed/Anno#0",
+		"shawk-impact.json/shawk / Impact/Verdict/A#0",
+		"shawk-impact.json/shawk / Impact/Dependents/A#0",
+		"shawk-impact.json/shawk / Impact/Observation of the host/A#0",
+		"shawk-impact.json/shawk / Impact/Gaps of the host/A#0",
 	} {
 		if _, ok := rows[want]; !ok {
 			t.Errorf("no query %s; have %v", want, keys(rows))
@@ -938,5 +967,98 @@ func TestPGMapCraftedVariables(t *testing.T) {
 				t.Errorf("%s: depth %q: %v, %v; want invalid input syntax for type integer", name, depth, got, err)
 			}
 		}
+	}
+}
+
+// TestPGImpactDashboard: the variable of the impact dashboard lists the
+// hosts with an agent and those of the inventory, and the values of its
+// variables, which a link can set (?var-host=, ?var-depth=,
+// ?var-min_coverage=), stay values: a quote does not end a string, and a
+// depth or a coverage that is not a number fails the query.
+func TestPGImpactDashboard(t *testing.T) {
+	_, conn := migratedDB(t)
+	f := fixture{t, conn}
+	f.host("db-01", "postgres")
+	f.host("app-01", "app")
+	f.conn2("app-01", "app", "10.0.0.11", "db-01", "postgres", "10.0.0.10", 5432, "now()-interval '1 hour'", "now()")
+	execAll(t, conn, `INSERT INTO shawk.inventory_hosts (host, agent) VALUES ('sfa-01', false), ('db-01', true)`)
+
+	b, err := os.ReadFile(filepath.Join(packaging, "grafana/dashboards/shawk-impact.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dashboard struct {
+		Templating struct {
+			List []struct {
+				Name, Type, Query string
+			}
+		}
+	}
+	if err := json.Unmarshal(b, &dashboard); err != nil {
+		t.Fatal(err)
+	}
+	var hosts string
+	for _, v := range dashboard.Templating.List {
+		if v.Name == "host" && v.Type == "query" {
+			hosts = v.Query
+		}
+	}
+	if got := queryStrings(t, conn, hosts); !slices.Equal(got, []string{"app-01", "db-01", "sfa-01"}) {
+		t.Errorf("the hosts of the variable (%s) = %v, want app-01, db-01 and sfa-01", hosts, got)
+	}
+
+	all := packagedSQL(t)
+	const verdict = "shawk-impact.json/shawk / Impact/Verdict/A#0"
+	now := time.Now()
+	// run runs a query with the values of vars, or else those of db-01,
+	// and returns its first column.
+	run := func(name string, vars map[string][]string) ([]string, error) {
+		sql := expandVars(expandVars(all[name], vars), map[string][]string{"host": {"db-01"}, "depth": {"3"}, "min_coverage": {"1"}})
+		rows, err := conn.Query(context.Background(), expandMacros(sql, now.Add(-6*time.Hour), now))
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		var out []string
+		for rows.Next() {
+			vals, err := rows.Values()
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, fmt.Sprint(vals[0]))
+		}
+		return out, rows.Err()
+	}
+	if got, err := run(verdict, nil); err != nil || !slices.Equal(got, []string{"UNSAFE"}) {
+		t.Fatalf("verdict on db-01 = %v, %v; want UNSAFE", got, err)
+	}
+	if got, err := run(verdict, map[string][]string{"host": {"app-01"}}); err != nil || !slices.Equal(got, []string{"SAFE"}) {
+		t.Errorf("verdict on app-01 = %v, %v; want SAFE", got, err)
+	}
+	// Quoted, the value names no host: never safe.
+	if got, err := run(verdict, map[string][]string{"host": {"app-01' OR 'x' = 'x"}}); err != nil || !slices.Equal(got, []string{"INCONCLUSIVE"}) {
+		t.Errorf("crafted host: verdict = %v, %v; want INCONCLUSIVE", got, err)
+	}
+	// A value that is no number is an error, as is a coverage of a
+	// percentage: the unit is that of the function, from 0 to 1.
+	for name, c := range map[string]struct {
+		query string
+		vars  map[string][]string
+	}{
+		"depth":        {"shawk-impact.json/shawk / Impact/Dependents/A#0", map[string][]string{"depth": {"3) UNION SELECT 'SAFE' --"}}},
+		"min_coverage": {verdict, map[string][]string{"min_coverage": {"0 + 1"}}},
+		"no coverage":  {verdict, map[string][]string{"min_coverage": {"0"}}},
+		"a percentage": {verdict, map[string][]string{"min_coverage": {"99.9"}}},
+	} {
+		if got, err := run(c.query, c.vars); err == nil {
+			t.Errorf("crafted %s: %s returned %v, want an error", name, c.query, got)
+		}
+	}
+	// The dependents and the observation of the host.
+	if got, err := run("shawk-impact.json/shawk / Impact/Dependents/A#0", nil); err != nil || !slices.Equal(got, []string{"1"}) {
+		t.Errorf("depths of the dependents of db-01 = %v, %v; want one of depth 1", got, err)
+	}
+	if got, err := run("shawk-impact.json/shawk / Impact/Observation of the host/A#0", nil); err != nil || !slices.Equal(got, []string{"db-01"}) {
+		t.Errorf("observation of db-01 = %v, %v", got, err)
 	}
 }

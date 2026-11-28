@@ -156,6 +156,10 @@ collector: collector-sources ## build the collector with the shawk connector and
 shawk-migrate: ## build the command that applies the PostgreSQL schema
 	cd collector && CGO_ENABLED=0 $(GO) build -trimpath -o ../shawk-migrate ./cmd/shawk-migrate
 
+.PHONY: shawk-impact
+shawk-impact: ## build the command that tells what removing a host or a service would break, from PostgreSQL
+	cd collector && CGO_ENABLED=0 $(GO) build -trimpath -o ../shawk-impact ./cmd/shawk-impact
+
 .PHONY: test-root
 test-root: ## tests that load the BPF programs into the running kernel
 	$(GO) test -c -o tracer.test ./internal/tracer/
@@ -224,5 +228,5 @@ compat: rocky9.btf rocky9-nf_conntrack.btf ## check the BPF programs against the
 # pg-down and slurm-down remove it.
 .PHONY: clean
 clean:
-	rm -rf shawk shawk-migrate tracer.test bench.txt rocky9.btf rocky9-nf_conntrack.btf collector/_build \
+	rm -rf shawk shawk-migrate shawk-impact tracer.test bench.txt rocky9.btf rocky9-nf_conntrack.btf collector/_build \
 		$(filter-out build/harness,$(wildcard build/*))

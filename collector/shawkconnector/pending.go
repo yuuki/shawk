@@ -66,6 +66,66 @@ type wireRowKey struct {
 	protocol string
 }
 
+// activityHours is how many hours a month of the activity of an edge
+// holds: those of a month of 31 days.
+const activityHours = 31 * 24
+
+// activityRowKey identifies a row of shawk.edge_activity, or of
+// shawk.unix_edge_activity for an edge of transportUnix: a month of the
+// activity of an edge. month is the start of the month in UTC, in Unix
+// seconds.
+type activityRowKey struct {
+	edge  edgeRowKey
+	month int64
+}
+
+// activityBits are the hours of a month in which an edge was active: bit i,
+// from the left, is the hour that starts i hours after the month.
+type activityBits [activityHours / 8]byte
+
+// activityOf returns the month of a time and its hour in the month.
+func activityOf(t time.Time) (month int64, hour int) {
+	t = t.UTC()
+	start := time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, time.UTC)
+	return start.Unix(), int(t.Sub(start) / time.Hour)
+}
+
+func (b *activityBits) set(hour int) { b[hour/8] |= 0x80 >> (hour % 8) }
+
+func (b *activityBits) has(hour int) bool { return b[hour/8]&(0x80>>(hour%8)) != 0 }
+
+// merge adds the hours of o.
+func (b *activityBits) merge(o *activityBits) {
+	for i := range b {
+		b[i] |= o[i]
+	}
+}
+
+// String returns the hours as PostgreSQL reads a bit string: a character 0
+// or 1 per hour.
+func (b *activityBits) String() string {
+	out := make([]byte, activityHours)
+	for i := range out {
+		out[i] = '0'
+		if b.has(i) {
+			out[i] = '1'
+		}
+	}
+	return string(out)
+}
+
+// established tells whether a connection of an edge was established since
+// the agent counts them: one it opened, or one that is open (an adopted
+// connection is counted open only).
+func established(e *edgeInput) bool {
+	return e.values[valueKey{metric: metricConnOpened}].value > 0 || e.values[valueKey{metric: metricConnCount}].value > 0
+}
+
+// sameHour tells whether two times are in the same hour, in UTC.
+func sameHour(a, b time.Time) bool {
+	return a.Truncate(time.Hour).Equal(b.Truncate(time.Hour))
+}
+
 // listenerRowKey identifies a listener and its owner: a listener that
 // changes hands has a row per owner, which keeps its history. A listener
 // of transportUnix has a path and no address. kernelChosen tells that the
@@ -87,11 +147,13 @@ type sessionRow struct {
 	// of the agent, from the latest request.
 	clockSkew time.Duration
 	udpTraced bool
-	// unixTraced tells whether the agent traces Unix sockets, and
-	// protocolsClassified whether it classifies wire protocols, nil if it
-	// does not tell.
+	// unixTraced tells whether the agent traces Unix sockets,
+	// protocolsClassified whether it classifies wire protocols, and
+	// translationsTraced whether it learns the translations of addresses
+	// of its host, nil if it does not tell.
 	unixTraced          *bool
 	protocolsClassified *bool
+	translationsTraced  *bool
 	netnsScope          string
 	dropped             int64
 	// countersStarted is when the counters of the agent started, by the
@@ -113,11 +175,15 @@ type hostChanges struct {
 	kernel, version     string
 	span
 
-	sessions     map[time.Time]*sessionRow
-	addrs        map[netip.Addr]span
-	processes    map[procKey]*procRow
-	edges        map[edgeRowKey]span
-	wire         map[wireRowKey]span // the wire protocols of edges, whose edges are in edges
+	sessions  map[time.Time]*sessionRow
+	addrs     map[netip.Addr]span
+	processes map[procKey]*procRow
+	edges     map[edgeRowKey]span
+	wire      map[wireRowKey]span              // the wire protocols of edges, whose edges are in edges
+	activity  map[activityRowKey]*activityBits // the hours edges were active in, whose edges are in edges
+	// established are the edges of Unix sockets, among edges, of which a
+	// connection was established: the others are failed attempts only.
+	established  map[edgeRowKey]struct{}
 	listeners    map[listenerRowKey]span
 	translations map[translationID]span
 }
@@ -130,17 +196,19 @@ func newHostChanges(key string) *hostChanges {
 		processes:    map[procKey]*procRow{},
 		edges:        map[edgeRowKey]span{},
 		wire:         map[wireRowKey]span{},
+		activity:     map[activityRowKey]*activityBits{},
+		established:  map[edgeRowKey]struct{}{},
 		listeners:    map[listenerRowKey]span{},
 		translations: map[translationID]span{},
 	}
 }
 
 // size is the number of rows to write: the host, and its sessions,
-// addresses, processes, edges with their wire protocols, listeners and
-// translations.
+// addresses, processes, edges with their wire protocols and the months of
+// their activity, listeners and translations.
 func (h *hostChanges) size() int {
-	return 1 + len(h.sessions) + len(h.addrs) + len(h.processes) + len(h.edges) + len(h.wire) + len(h.listeners) +
-		len(h.translations)
+	return 1 + len(h.sessions) + len(h.addrs) + len(h.processes) + len(h.edges) + len(h.wire) + len(h.activity) +
+		len(h.listeners) + len(h.translations)
 }
 
 func (h *hostChanges) setHost(machineID, hostname, kernel, version string, t time.Time) {
@@ -219,6 +287,23 @@ func (h *hostChanges) addWire(k wireRowKey, s span) {
 	h.wire[k] = cur
 }
 
+// addActivity records that an edge was active at t: the hour of t in its
+// month.
+func (h *hostChanges) addActivity(k edgeRowKey, t time.Time) {
+	month, hour := activityOf(t)
+	h.activityOf(activityRowKey{edge: k, month: month}).set(hour)
+}
+
+// activityOf returns the hours pending of a month of an edge.
+func (h *hostChanges) activityOf(k activityRowKey) *activityBits {
+	bits := h.activity[k]
+	if bits == nil {
+		bits = new(activityBits)
+		h.activity[k] = bits
+	}
+	return bits
+}
+
 func (h *hostChanges) addListener(k listenerRowKey, s span) {
 	cur := h.listeners[k]
 	cur.merge(s)
@@ -257,6 +342,12 @@ func (h *hostChanges) merge(o *hostChanges) (dropped int) {
 	}
 	for k, s := range o.wire {
 		h.addWire(k, s)
+	}
+	for k, bits := range o.activity {
+		h.activityOf(k).merge(bits)
+	}
+	for k := range o.established {
+		h.established[k] = struct{}{}
 	}
 	for k, s := range o.listeners {
 		h.addListener(k, s)
@@ -405,8 +496,8 @@ func (c *changes) addSegment(b *hostBatch, h *hostChanges, f sessionFloor, skew 
 		start = f.start
 	}
 	s := sessionRow{lastHeartbeat: now, clockSkew: skew, udpTraced: b.udpTraced, unixTraced: b.unixTraced,
-		protocolsClassified: b.protocolsClassified,
-		netnsScope:          b.netnsScope, dropped: b.dropped, peerFold: b.peerFold, peerInternal: b.peerInternal}
+		protocolsClassified: b.protocolsClassified, translationsTraced: b.translationsTraced,
+		netnsScope: b.netnsScope, dropped: b.dropped, peerFold: b.peerFold, peerInternal: b.peerInternal}
 	s.countersStarted = b.droppedSince
 	if !h.addSession(start, s) {
 		c.droppedSessions++
@@ -445,6 +536,22 @@ func (c *changes) advanceFloor(b *hostBatch, skew time.Duration, now time.Time) 
 // accepted for writing. Their times are no later than latest. An edge is
 // written with a wire protocol that changed, so that the row of the
 // protocol finds the row of its edge.
+//
+// An edge is last seen at the end of the latest interval in which its
+// agent saw it active: the hour of that time is an hour of its activity
+// (shawk.edge_activity). It is recorded when the edge is new here and when
+// the time moves into another hour, so that an edge active all along is
+// written with its activity once an hour, and an edge whose changes were
+// dropped again with the hour the agent still tells.
+//
+// The hour in which a new edge was first seen is recorded only when it is
+// that of the time it was last seen, or the one before: the start of the
+// stretch that the edge is active in now. An older one would be an hour
+// alone, far from the others: the edge of a connection that has been open
+// for weeks is new to a connector that just started, or that records
+// hours since an upgrade, and the hours since it was first seen were not
+// recorded, not idle. An hour that is not recorded tells nothing; an hour
+// alone would tell that the dependency stopped after it.
 func (c *changes) addEdges(b *hostBatch, h *hostChanges, latest, now time.Time) {
 	edges := acceptedOf(c.acceptedEdges, b.key)
 	wire := c.acceptedWire[b.key]
@@ -460,6 +567,7 @@ func (c *changes) addEdges(b *hostBatch, h *hostChanges, latest, now time.Time) 
 		pk := c.procKey(&e.id.process)
 		k := edgeRowKey{role: e.id.role, proto: e.id.proto, path: e.id.path, local: e.id.local, peer: e.id.peer, folded: e.id.folded,
 			port: e.id.port, netns: e.id.netns, procKey: pk}
+		prev, known := edges[k]
 		changed := accept(edges, k, s, now)
 		for p, ws := range e.wire {
 			if ws.last.IsZero() {
@@ -480,6 +588,15 @@ func (c *changes) addEdges(b *hostBatch, h *hostChanges, latest, now time.Time) 
 		}
 		h.addProcess(pk, e.id.exe, s)
 		h.addEdge(k, s)
+		if k.proto == transportUnix && established(e) {
+			h.established[k] = struct{}{}
+		}
+		if !known && !s.first.Before(s.last.Truncate(time.Hour).Add(-time.Hour)) {
+			h.addActivity(k, s.first)
+		}
+		if !known || s.last.After(prev.last) && !sameHour(s.last, prev.last) {
+			h.addActivity(k, s.last)
+		}
 	}
 }
 

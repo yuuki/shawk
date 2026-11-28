@@ -1,0 +1,521 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/url"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+
+	"github.com/yuuki/shawk/collector/shawkconnector"
+)
+
+// The tests in this file run against PostgreSQL when SHAWK_TEST_POSTGRES_DSN
+// is a URL of a role that may create databases and roles, as those of the
+// connector: each creates its own database and drops it at the end.
+
+// testDB returns the connection string of a new database with the schema,
+// and a connection to it.
+func testDB(t *testing.T) (string, *pgx.Conn) {
+	t.Helper()
+	base := os.Getenv("SHAWK_TEST_POSTGRES_DSN")
+	if base == "" {
+		t.Skip("SHAWK_TEST_POSTGRES_DSN is not set")
+	}
+	ctx := context.Background()
+	admin, err := pgx.Connect(ctx, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := fmt.Sprintf("shawk_impact_test_%d", time.Now().UnixNano())
+	if _, err := admin.Exec(ctx, "CREATE DATABASE "+name); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		admin.Exec(ctx, "DROP DATABASE "+name+" WITH (FORCE)")
+		admin.Close(ctx)
+	})
+	u, err := url.Parse(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.Path = "/" + name
+	conn, err := pgx.Connect(ctx, u.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close(ctx) })
+	if _, err := shawkconnector.Migrate(ctx, conn); err != nil {
+		t.Fatal(err)
+	}
+	return u.String(), conn
+}
+
+// The period of the tests: the 90 days before testUntil.
+var testUntil = time.Date(2026, 10, 30, 0, 0, 0, 0, time.UTC)
+
+// fleet writes a small fleet over the period of the tests: app-01 uses the
+// postgres of db-01 all along, billing of batch-01 on the first of each
+// month, and web-01 uses app-01. idle-01 is used by nothing; gap-01 neither,
+// but was not observed for an hour.
+const fleet = `
+INSERT INTO shawk.hosts
+SELECT h, 'm', h, 'k', 'v', '2026-07-01T00:00:00Z', '2026-10-30T00:00:00Z'
+FROM unnest(ARRAY['db-01', 'app-01', 'web-01', 'batch-01', 'idle-01', 'gap-01']) h;
+INSERT INTO shawk.agent_sessions (host_id, started_at, last_heartbeat, udp_traced, unix_traced, netns_scope)
+SELECT id, '2026-07-01T00:00:00Z', '2026-10-30T00:00:00Z', true, true, 'all' FROM shawk.hosts WHERE id <> 'gap-01';
+INSERT INTO shawk.agent_sessions (host_id, started_at, last_heartbeat, udp_traced, unix_traced, netns_scope) VALUES
+  ('gap-01', '2026-07-01T00:00:00Z', '2026-09-01T00:00:00Z', true, true, 'all'),
+  ('gap-01', '2026-09-01T01:03:00Z', '2026-10-30T00:00:00Z', true, true, 'all');
+-- An address per host, held while its agent reported.
+INSERT INTO shawk.host_addrs VALUES
+  ('db-01', '10.0.0.10', '2026-07-01T00:00:00Z', '2026-10-30T00:00:00Z'),
+  ('app-01', '10.0.0.11', '2026-07-01T00:00:00Z', '2026-10-30T00:00:00Z'),
+  ('web-01', '10.0.0.12', '2026-07-01T00:00:00Z', '2026-10-30T00:00:00Z'),
+  ('batch-01', '10.0.0.13', '2026-07-01T00:00:00Z', '2026-10-30T00:00:00Z'),
+  ('idle-01', '10.0.0.14', '2026-07-01T00:00:00Z', '2026-10-30T00:00:00Z'),
+  ('gap-01', '10.0.0.15', '2026-07-01T00:00:00Z', '2026-09-01T00:00:00Z'),
+  ('gap-01', '10.0.0.15', '2026-09-01T01:03:00Z', '2026-10-30T00:00:00Z');
+-- old-01 was last seen two weeks before the period.
+INSERT INTO shawk.hosts VALUES ('old-01', 'm', 'old-01', 'k', 'v', '2026-07-01T00:00:00Z', '2026-07-15T00:00:00Z');
+INSERT INTO shawk.agent_sessions (host_id, started_at, last_heartbeat, udp_traced, unix_traced, netns_scope)
+VALUES ('old-01', '2026-07-01T00:00:00Z', '2026-07-15T00:00:00Z', true, true, 'all');
+INSERT INTO shawk.host_addrs VALUES ('old-01', '10.0.0.16', '2026-07-01T00:00:00Z', '2026-07-15T00:00:00Z');
+INSERT INTO shawk.processes (host_id, unit, comm, exe, service_name, first_seen, last_seen) VALUES
+  ('db-01', 'postgresql.service', 'postgres', '', 'postgres', '2026-07-01T00:00:00Z', '2026-10-30T00:00:00Z'),
+  ('app-01', 'app.service', 'puma', '', 'shop/app', '2026-07-01T00:00:00Z', '2026-10-30T00:00:00Z'),
+  ('web-01', 'nginx.service', 'nginx', '', 'nginx', '2026-07-01T00:00:00Z', '2026-10-30T00:00:00Z'),
+  ('batch-01', 'billing.service', 'billing', '', 'billing', '2026-07-01T00:00:00Z', '2026-10-30T00:00:00Z');
+INSERT INTO shawk.edges (host_id, process_id, role, proto, local_addr, remote_addr, port, netns, first_seen, last_seen)
+SELECT e.host, p.id, e.role, 'tcp', e.local::inet, e.remote::inet, e.port, 4026531840, e.first::timestamptz, e.last::timestamptz
+FROM (VALUES
+  ('app-01', 'client', '10.0.0.11', '10.0.0.10', 5432, '2026-08-01T00:00:00Z', '2026-10-30T00:00:00Z'),
+  ('db-01', 'server', '10.0.0.10', '10.0.0.11', 5432, '2026-08-01T00:00:00Z', '2026-10-30T00:00:00Z'),
+  ('web-01', 'client', '10.0.0.12', '10.0.0.11', 8080, '2026-08-01T00:00:00Z', '2026-10-30T00:00:00Z'),
+  ('app-01', 'server', '10.0.0.11', '10.0.0.12', 8080, '2026-08-01T00:00:00Z', '2026-10-30T00:00:00Z'),
+  ('batch-01', 'client', '10.0.0.13', '10.0.0.10', 5432, '2026-08-01T01:00:00Z', '2026-10-01T03:00:00Z'),
+  ('db-01', 'server', '10.0.0.10', '10.0.0.13', 5432, '2026-08-01T01:00:00Z', '2026-10-01T03:00:00Z')
+) AS e(host, role, local, remote, port, first, last)
+JOIN shawk.processes p ON p.host_id = e.host;
+-- Every hour for app and web, and from 1 to 3 on the first of each month
+-- for billing.
+INSERT INTO shawk.edge_activity
+SELECT e.id, m, CASE WHEN e.host_id = 'batch-01' OR e.remote_addr = '10.0.0.13'
+                     THEN ('0111' || repeat('0', 740))::bit(744) ELSE repeat('1', 744)::bit(744) END
+FROM shawk.edges e, unnest(ARRAY['2026-08-01T00:00:00Z', '2026-09-01T00:00:00Z', '2026-10-01T00:00:00Z']::timestamptz[]) m;
+`
+
+// reader is a role that reads the contract only, as Grafana does.
+const reader = `
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'shawk_impact_reader') THEN CREATE ROLE shawk_impact_reader NOLOGIN; END IF;
+END $$;
+GRANT USAGE ON SCHEMA shawk_v1 TO shawk_impact_reader;
+GRANT SELECT ON ALL TABLES IN SCHEMA shawk_v1 TO shawk_impact_reader;
+`
+
+// impact runs the command over the period of the tests as the role that
+// reads the contract only, and returns its exit status and output.
+func impact(t *testing.T, dsn string, args ...string) (int, string) {
+	t.Helper()
+	var out, errOut bytes.Buffer
+	args = append([]string{"-dsn", dsn + "?options=-c%20role%3Dshawk_impact_reader", "-until", testUntil.Format(time.RFC3339)}, args...)
+	code := run(context.Background(), args, &out, &errOut)
+	if errOut.Len() > 0 {
+		t.Logf("stderr: %s", errOut.String())
+	}
+	return code, out.String()
+}
+
+// TestPGReport: the command reads the verdict, the dependents and the
+// coverage of a target as a role that reads the contract only, and its
+// exit status tells the verdict.
+func TestPGReport(t *testing.T) {
+	dsn, conn := testDB(t)
+	ctx := context.Background()
+	for _, q := range []string{fleet, reader} {
+		if _, err := conn.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() { conn.Exec(ctx, "DROP OWNED BY shawk_impact_reader") })
+
+	code, out := impact(t, dsn, "-host", "db-01")
+	want := `Target   db-01
+Period   2026-08-01T00:00:00Z to 2026-10-30T00:00:00Z (90d)
+
+Verdict  UNSAFE: active dependents
+         2 dependents used it in the period, and 1 more depends on them (to depth 3)
+
+Dependents
+DEPTH  CLIENT            SERVER           PORT      SEEN BY  CADENCE     LAST SEEN             NEXT ACTIVITY
+1      app-01 shop/app   db-01 postgres   5432/tcp  both     continuous  2026-10-30T00:00:00Z  now
+1      batch-01 billing  db-01 postgres   5432/tcp  both     monthly     2026-10-01T03:00:00Z  about 2026-10-31T01:00:00Z
+2      web-01 nginx      app-01 shop/app  8080/tcp  both     -           2026-10-30T00:00:00Z  -
+The cadence is read to depth 1 (-cadence-depth).
+
+Observation of the hosts that tell
+HOST   ROLE    COVERAGE  NOT OBSERVED  GAPS  PARTLY OBSERVED  NO UDP  NO UNIX  ONE NETNS
+db-01  target  1         0s            0     0s               0s      0s       0s
+and 3 clients observed all along
+The coverage is from 0 to 1. A gap of 3m or less is not counted: an agent that
+restarts within it is not seen to.
+
+Only TCP, UDP and Unix stream sockets are observed. A host looks unused when it is used
+over RDMA, less often than the period, or only forwards packets: a router, a hypervisor,
+and a load balancer or gateway whose translations its agent does not learn (IPVS at its
+defaults) and the configuration does not give (docs/design.md, sections 6.3 and 10).
+`
+	if code != exitUnsafe || out != want {
+		t.Errorf("db-01: exit status %d, want %d\n%s\nwant:\n%s", code, exitUnsafe, out, want)
+	}
+
+	// The clients of the target only, of the service on its port.
+	code, out = impact(t, dsn, "-host", "db-01", "-service", "postgres", "-port", "5432", "-proto", "tcp", "-depth", "1", "-limit", "1")
+	if code != exitUnsafe || !strings.Contains(out, "Target   db-01 (service postgres, port 5432, tcp)\n") ||
+		!strings.Contains(out, "2 dependents used it in the period\n") || !strings.Contains(out, "and 1 more row (-limit 0 shows all)\n") ||
+		strings.Contains(out, "web-01") {
+		t.Errorf("postgres on db-01: exit status %d\n%s", code, out)
+	}
+
+	// The cadence of every depth, when asked for.
+	code, out = impact(t, dsn, "-host", "db-01", "-cadence-depth", "3")
+	if code != exitUnsafe || !strings.Contains(out, "2      web-01 nginx      app-01 shop/app  8080/tcp  both     continuous  2026-10-30T00:00:00Z  now\n") ||
+		strings.Contains(out, "The cadence is read") {
+		t.Errorf("db-01 with the cadence of every depth: exit status %d\n%s", code, out)
+	}
+
+	code, out = impact(t, dsn, "-host", "idle-01")
+	if code != exitSafe || !strings.Contains(out, "Verdict  SAFE\n         nothing used it in the period, of which the history covers 1 (1 is all of it)\n") {
+		t.Errorf("idle-01: exit status %d, want %d\n%s", code, exitSafe, out)
+	}
+
+	// An hour without an agent: inconclusive, unless the caller accepts it.
+	code, out = impact(t, dsn, "-host", "gap-01")
+	if code != exitInconclusive || !strings.Contains(out, "Verdict  INCONCLUSIVE: insufficient observation coverage\n") ||
+		!strings.Contains(out, "         - not observed by an agent for 1h of the period\n") ||
+		!strings.Contains(out, "Not observed\n  2026-09-01T00:03:00Z to 2026-09-01T01:03:00Z (1h)\n") ||
+		!strings.Contains(out, "gap-01  target  0.999537  1h") {
+		t.Errorf("gap-01: exit status %d, want %d\n%s", code, exitInconclusive, out)
+	}
+	// The coverage is a part of the period, as in the report and in
+	// PostgreSQL: 0.999 accepts the hour, 1 and 0.9996 do not, and a
+	// percentage is refused.
+	code, out = impact(t, dsn, "-host", "gap-01", "-min-coverage", "0.999")
+	if code != exitSafe || !strings.Contains(out, "the history covers 0.999537 (1 is all of it)\n         Accepted with -min-coverage 0.999:\n") {
+		t.Errorf("gap-01 with -min-coverage 0.999: exit status %d, want %d\n%s", code, exitSafe, out)
+	}
+	for coverage, want := range map[string]int{"0.9996": exitInconclusive, "1": exitInconclusive, "1.0": exitInconclusive,
+		"99.9": exitUsage, "100": exitUsage} {
+		if code, out = impact(t, dsn, "-host", "gap-01", "-min-coverage", coverage); code != want {
+			t.Errorf("gap-01 with -min-coverage %s: exit status %d, want %d\n%s", coverage, code, want, out)
+		}
+	}
+	// A host last seen before the period: its gap is the whole period, and
+	// is listed.
+	code, out = impact(t, dsn, "-host", "old-01")
+	if code != exitInconclusive || !strings.Contains(out, "         - not observed by an agent for 90d of the period\n") ||
+		!strings.Contains(out, "Not observed\n  2026-08-01T00:00:00Z to 2026-10-30T00:00:00Z (90d)\n") {
+		t.Errorf("old-01: exit status %d, want %d\n%s", code, exitInconclusive, out)
+	}
+
+	// A name that nothing knows is never safe.
+	code, out = impact(t, dsn, "-host", "db-O1")
+	if code != exitInconclusive || !strings.Contains(out, "no agent ever reported as db-O1, and the inventory has no such host: check the name") {
+		t.Errorf("db-O1: exit status %d, want %d\n%s", code, exitInconclusive, out)
+	}
+	// Nor is a service that the host does not have, or a port nothing
+	// listens on.
+	code, out = impact(t, dsn, "-host", "idle-01", "-service", "postgress")
+	if code != exitInconclusive || !strings.Contains(out, "no process of idle-01 had the service postgress in the period: check the name") {
+		t.Errorf("postgress on idle-01: exit status %d, want %d\n%s", code, exitInconclusive, out)
+	}
+	code, out = impact(t, dsn, "-host", "idle-01", "-port", "5433")
+	if code != exitInconclusive || !strings.Contains(out, "nothing listened on port 5433 of idle-01 in the period: check the port") {
+		t.Errorf("port 5433 of idle-01: exit status %d, want %d\n%s", code, exitInconclusive, out)
+	}
+	// A period before the agents: nothing was watched then.
+	if code, out = impact(t, dsn, "-host", "idle-01", "-lookback", "52w"); code != exitInconclusive {
+		t.Errorf("idle-01 over a year: exit status %d, want %d\n%s", code, exitInconclusive, out)
+	}
+
+	code, out = impact(t, dsn, "-host", "db-01", "-json")
+	var r report
+	if err := json.Unmarshal([]byte(out), &r); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if code != exitUnsafe || r.Verdict != verdictUnsafe || r.Direct != 2 || r.Transitive != 1 || len(r.Dependents) != 3 ||
+		r.Coverage != 1 || len(r.Observers) != 4 || r.Observers[0].Host != "db-01" || r.Observers[0].Role != "target" ||
+		!r.Until.Equal(testUntil) || !r.Since.Equal(testUntil.Add(-90*24*time.Hour)) {
+		t.Errorf("exit status %d, report = %+v", code, r)
+	}
+	if d := r.Dependents[1]; d.Cadence == nil || *d.Cadence != "monthly" || d.PeriodSeconds == nil || *d.PeriodSeconds != 30*86400 ||
+		d.Runs == nil || *d.Runs != 3 || d.NextExpected == nil || !d.NextExpected.Equal(time.Date(2026, 10, 31, 1, 0, 0, 0, time.UTC)) {
+		t.Errorf("the dependency of billing = %+v", d)
+	}
+	if d := r.Dependents[2]; d.Depth != 2 || d.Cadence != nil || r.CadenceDepth != 1 || r.Incomplete != "" {
+		t.Errorf("the dependent of depth 2 = %+v", d)
+	}
+	code, out = impact(t, dsn, "-host", "old-01", "-json")
+	if err := json.Unmarshal([]byte(out), &r); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if code != exitInconclusive || len(r.Gaps) != 1 || r.Gaps[0].Cause != "agent" || !r.Gaps[0].Start.Equal(r.Since) || !r.Gaps[0].End.Equal(r.Until) {
+		t.Errorf("old-01: exit status %d, gaps = %+v", code, r.Gaps)
+	}
+
+	// A connector that keeps 30 days pruned: the first 60 days of the
+	// period tell nothing, of a host observed all along either.
+	if _, err := conn.Exec(ctx, "SELECT shawk.prune('2026-09-30T00:00:00Z')"); err != nil {
+		t.Fatal(err)
+	}
+	code, out = impact(t, dsn, "-host", "idle-01")
+	if code != exitInconclusive ||
+		!strings.Contains(out, "         - the first 60d of the period are before the retention of the connector: the dependencies last seen then are deleted\n") ||
+		!strings.Contains(out, "Not observed\n  2026-08-01T00:00:00Z to 2026-09-30T00:00:00Z (60d), before the retention of the connector\n") ||
+		strings.Contains(out, "not observed by an agent") {
+		t.Errorf("idle-01 after a prune: exit status %d, want %d\n%s", code, exitInconclusive, out)
+	}
+	if code, out = impact(t, dsn, "-host", "idle-01", "-lookback", "30d"); code != exitSafe {
+		t.Errorf("idle-01 within the retention: exit status %d, want %d\n%s", code, exitSafe, out)
+	}
+
+	// The command writes nothing and reads the contract only.
+	if _, err := conn.Exec(ctx, "REVOKE USAGE ON SCHEMA shawk_v1 FROM shawk_impact_reader"); err != nil {
+		t.Fatal(err)
+	}
+	if code, out = impact(t, dsn, "-host", "db-01"); code != exitError || out != "" {
+		t.Errorf("without access to shawk_v1: exit status %d, want %d\n%s", code, exitError, out)
+	}
+}
+
+// orderFleet writes clients of db-01 whose names the collations of databases
+// order differently: en_US.utf8, which the postgres image of CI has, ignores
+// "-", "~" and the case at first, where C, which test/harness/postgres.sh
+// has, compares the bytes. alpha-01 has two services, with an address each,
+// and clients outside the fleet use db-01 too. No client was observed for
+// an hour, so that the report tells how each was.
+const orderFleet = `
+INSERT INTO shawk.hosts
+SELECT h, 'm', h, 'k', 'v', '2026-07-01T00:00:00Z', '2026-10-30T00:00:00Z'
+FROM unnest(ARRAY['db-01', 'alpha-01', 'Bravo-01', 'charlie-01', '-dash-01']) h;
+INSERT INTO shawk.agent_sessions (host_id, started_at, last_heartbeat, udp_traced, unix_traced, netns_scope)
+VALUES ('db-01', '2026-07-01T00:00:00Z', '2026-10-30T00:00:00Z', true, true, 'all');
+INSERT INTO shawk.agent_sessions (host_id, started_at, last_heartbeat, udp_traced, unix_traced, netns_scope)
+SELECT h.id, s.started::timestamptz, s.ended::timestamptz, true, true, 'all'
+FROM shawk.hosts h,
+     (VALUES ('2026-07-01T00:00:00Z', '2026-09-01T00:00:00Z'), ('2026-09-01T01:03:00Z', '2026-10-30T00:00:00Z')) AS s(started, ended)
+WHERE h.id <> 'db-01';
+INSERT INTO shawk.host_addrs VALUES ('db-01', '10.0.0.10', '2026-07-01T00:00:00Z', '2026-10-30T00:00:00Z');
+INSERT INTO shawk.host_addrs
+SELECT a.host, a.addr::inet, s.started::timestamptz, s.ended::timestamptz
+FROM (VALUES ('alpha-01', '10.0.0.21'), ('alpha-01', '10.0.0.25'), ('Bravo-01', '10.0.0.22'), ('charlie-01', '10.0.0.23'),
+             ('-dash-01', '10.0.0.24')) AS a(host, addr),
+     (VALUES ('2026-07-01T00:00:00Z', '2026-09-01T00:00:00Z'), ('2026-09-01T01:03:00Z', '2026-10-30T00:00:00Z')) AS s(started, ended);
+INSERT INTO shawk.processes (host_id, unit, comm, exe, service_name, first_seen, last_seen)
+SELECT p.host, p.svc || '.service', p.svc, '', p.svc, '2026-07-01T00:00:00Z', '2026-10-30T00:00:00Z'
+FROM (VALUES ('db-01', 'postgres'), ('alpha-01', 'alpha'), ('alpha-01', 'Zeta'), ('Bravo-01', 'bravo'), ('charlie-01', 'charlie'),
+             ('-dash-01', 'dash')) AS p(host, svc);
+-- Both sides of the connections of the clients, in the order of en_US.utf8,
+-- and what db-01 saw of the clients outside the fleet, folded.
+WITH c(host, svc, addr) AS (
+  VALUES ('alpha-01', 'alpha', '10.0.0.21'), ('alpha-01', 'Zeta', '10.0.0.25'), ('Bravo-01', 'bravo', '10.0.0.22'),
+         ('charlie-01', 'charlie', '10.0.0.23'), ('-dash-01', 'dash', '10.0.0.24')
+)
+INSERT INTO shawk.edges (host_id, process_id, role, proto, local_addr, remote_addr, port, netns, first_seen, last_seen)
+SELECT e.host, p.id, e.role, 'tcp', e.local::inet, e.remote::cidr, 5432, 4026531840, '2026-08-01T00:00:00Z', '2026-10-30T00:00:00Z'
+FROM (
+  SELECT c.host, c.svc, 'client' AS role, c.addr AS local, '10.0.0.10' AS remote FROM c
+  UNION ALL
+  SELECT 'db-01', 'postgres', 'server', '10.0.0.10', c.addr FROM c
+  UNION ALL
+  SELECT 'db-01', 'postgres', 'server', '10.0.0.10', '0.0.0.0/0'
+) e
+JOIN shawk.processes p ON p.host_id = e.host AND p.service_name = e.svc;
+INSERT INTO shawk.edge_activity
+SELECT e.id, m, repeat('1', 744)::bit(744)
+FROM shawk.edges e, unnest(ARRAY['2026-08-01T00:00:00Z', '2026-09-01T00:00:00Z', '2026-10-01T00:00:00Z']::timestamptz[]) m;
+`
+
+// TestPGReportOrder: the dependents and the hosts of a report are in the
+// order of the bytes of their names, whatever the collation of the
+// database: in the text, where -limit keeps the first of them, and in the
+// JSON, which is compared as the command wrote it.
+func TestPGReportOrder(t *testing.T) {
+	dsn, conn := testDB(t)
+	ctx := context.Background()
+	for _, q := range []string{orderFleet, reader} {
+		if _, err := conn.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() { conn.Exec(ctx, "DROP OWNED BY shawk_impact_reader") })
+
+	code, out := impact(t, dsn, "-host", "db-01")
+	want := `Target   db-01
+Period   2026-08-01T00:00:00Z to 2026-10-30T00:00:00Z (90d)
+
+Verdict  UNSAFE: active dependents
+         6 dependents used it in the period
+
+Dependents
+DEPTH  CLIENT              SERVER          PORT      SEEN BY  CADENCE     LAST SEEN             NEXT ACTIVITY
+1      -dash-01 dash       db-01 postgres  5432/tcp  both     continuous  2026-10-30T00:00:00Z  now
+1      Bravo-01 bravo      db-01 postgres  5432/tcp  both     continuous  2026-10-30T00:00:00Z  now
+1      alpha-01 Zeta       db-01 postgres  5432/tcp  both     continuous  2026-10-30T00:00:00Z  now
+1      alpha-01 alpha      db-01 postgres  5432/tcp  both     continuous  2026-10-30T00:00:00Z  now
+1      charlie-01 charlie  db-01 postgres  5432/tcp  both     continuous  2026-10-30T00:00:00Z  now
+1      0.0.0.0 ~external   db-01 postgres  5432/tcp  server   continuous  2026-10-30T00:00:00Z  now
+
+Observation of the hosts that tell
+HOST        ROLE    COVERAGE  NOT OBSERVED  GAPS  PARTLY OBSERVED  NO UDP  NO UNIX  ONE NETNS
+db-01       target  1         0s            0     0s               0s      0s       0s
+-dash-01    client  0.999537  1h            1     0s               0s      0s       0s
+Bravo-01    client  0.999537  1h            1     0s               0s      0s       0s
+alpha-01    client  0.999537  1h            1     0s               0s      0s       0s
+charlie-01  client  0.999537  1h            1     0s               0s      0s       0s
+The coverage is from 0 to 1. A gap of 3m or less is not counted: an agent that
+restarts within it is not seen to.
+
+Only TCP, UDP and Unix stream sockets are observed. A host looks unused when it is used
+over RDMA, less often than the period, or only forwards packets: a router, a hypervisor,
+and a load balancer or gateway whose translations its agent does not learn (IPVS at its
+defaults) and the configuration does not give (docs/design.md, sections 6.3 and 10).
+`
+	if code != exitUnsafe || out != want {
+		t.Errorf("db-01: exit status %d, want %d\n%s\nwant:\n%s", code, exitUnsafe, out, want)
+	}
+
+	// The limit keeps the first dependents and the first clients of that
+	// order.
+	code, out = impact(t, dsn, "-host", "db-01", "-limit", "2")
+	if code != exitUnsafe ||
+		!strings.Contains(out, "\n1      -dash-01 dash   db-01 postgres  5432/tcp  both     continuous  2026-10-30T00:00:00Z  now\n"+
+			"1      Bravo-01 bravo  db-01 postgres  5432/tcp  both     continuous  2026-10-30T00:00:00Z  now\n"+
+			"and 4 more rows (-limit 0 shows all)\n") ||
+		!strings.Contains(out, "\n-dash-01  client  0.999537  1h            1     0s               0s      0s       0s\n"+
+			"Bravo-01  client  0.999537  1h            1     0s               0s      0s       0s\n"+
+			"and 2 more clients not observed all along (-limit 0 shows all)\n") ||
+		strings.Contains(out, "alpha-01") || strings.Contains(out, "charlie-01") || strings.Contains(out, "~external") {
+		t.Errorf("db-01 with -limit 2: exit status %d, want %d\n%s", code, exitUnsafe, out)
+	}
+
+	code, out = impact(t, dsn, "-host", "db-01", "-json")
+	var r report
+	if err := json.Unmarshal([]byte(out), &r); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	var dependents, observers []string
+	for _, d := range r.Dependents {
+		host := "-"
+		if d.ClientHost != nil {
+			host = *d.ClientHost
+		}
+		dependents = append(dependents, host+" "+d.ClientService)
+	}
+	for _, o := range r.Observers {
+		observers = append(observers, o.Host)
+	}
+	wantDependents := []string{"-dash-01 dash", "Bravo-01 bravo", "alpha-01 Zeta", "alpha-01 alpha", "charlie-01 charlie", "- ~external"}
+	wantObservers := []string{"db-01", "-dash-01", "Bravo-01", "alpha-01", "charlie-01"}
+	if code != exitUnsafe || !slices.Equal(dependents, wantDependents) || !slices.Equal(observers, wantObservers) {
+		t.Errorf("db-01 as JSON: exit status %d, dependents %q, want %q; observers %q, want %q",
+			code, dependents, wantDependents, observers, wantObservers)
+	}
+}
+
+// TestPGReportNow: without -until the period ends now, by the clock of the
+// database, and the connection string may be in a file.
+func TestPGReportNow(t *testing.T) {
+	dsn, conn := testDB(t)
+	ctx := context.Background()
+	if _, err := conn.Exec(ctx, `
+INSERT INTO shawk.hosts VALUES ('h', 'm', 'idle-01', 'k', 'v', now() - interval '2 days', now());
+INSERT INTO shawk.agent_sessions (host_id, started_at, last_heartbeat, udp_traced, unix_traced, netns_scope)
+VALUES ('h', now() - interval '2 days', now(), true, true, 'all')`); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(t.TempDir(), "dsn")
+	if err := os.WriteFile(file, []byte(dsn+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	if code := run(ctx, []string{"-dsn-file", file, "-host", "idle-01", "-lookback", "1d", "-json"}, &out, &errOut); code != exitSafe {
+		t.Fatalf("exit status %d, want %d: %s", code, exitSafe, errOut.String())
+	}
+	var r report
+	if err := json.Unmarshal(out.Bytes(), &r); err != nil {
+		t.Fatal(err)
+	}
+	if r.Verdict != verdictSafe || r.Until.Sub(r.Since) != 24*time.Hour || time.Since(r.Until) > time.Minute || time.Until(r.Until) > time.Minute {
+		t.Errorf("report = %+v", r)
+	}
+	// A period that reaches before the agent started is not watched in full.
+	out.Reset()
+	if code := run(ctx, []string{"-dsn", dsn, "-host", "idle-01", "-lookback", "3d"}, &out, &errOut); code != exitInconclusive {
+		t.Errorf("over 3 days: exit status %d, want %d\n%s", code, exitInconclusive, out.String())
+	}
+	if code := run(ctx, []string{"-dsn-file", filepath.Join(t.TempDir(), "none"), "-host", "idle-01"}, &out, &errOut); code != exitError {
+		t.Errorf("without the file of the connection string: exit status %d, want %d", code, exitError)
+	}
+}
+
+// TestPGNeedsTheSchema: against a database without the functions of the
+// impact, as one that was not migrated, the command fails with what it
+// needs, and gives no verdict.
+func TestPGNeedsTheSchema(t *testing.T) {
+	dsn, conn := testDB(t)
+	ctx := context.Background()
+	for _, drop := range []string{
+		`DROP FUNCTION shawk_v1.impact_verdict(text, timestamptz, timestamptz, text, integer, text, numeric, interval)`,
+		`DROP SCHEMA shawk_v1 CASCADE`,
+	} {
+		if _, err := conn.Exec(ctx, drop); err != nil {
+			t.Fatal(err)
+		}
+		var out, errOut bytes.Buffer
+		if code := run(ctx, []string{"-dsn", dsn, "-host", "db-01"}, &out, &errOut); code != exitError || out.Len() != 0 ||
+			!strings.Contains(errOut.String(), "the database has no shawk_v1.impact_verdict(): the impact report needs the PostgreSQL schema") {
+			t.Errorf("after %s: exit status %d, stdout %q, stderr %q", drop, code, out.String(), errOut.String())
+		}
+	}
+}
+
+// TestPGReportCutShort: when the list of the dependents fails after the
+// verdict was read, as when it runs out of time, the verdict is written
+// all the same, with what is missing, and the command fails: a verdict
+// that was reached is not lost, and a report cut short is not taken for a
+// whole one.
+func TestPGReportCutShort(t *testing.T) {
+	dsn, conn := testDB(t)
+	ctx := context.Background()
+	for _, q := range []string{fleet, reader,
+		// The role may read the verdict, not the dependents.
+		`REVOKE EXECUTE ON FUNCTION shawk_v1.impact(text, timestamptz, timestamptz, text, integer, text, integer, integer) FROM PUBLIC`} {
+		if _, err := conn.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() { conn.Exec(ctx, "DROP OWNED BY shawk_impact_reader") })
+	code, out := impact(t, dsn, "-host", "db-01")
+	if code != exitError || !strings.Contains(out, "Verdict  UNSAFE: active dependents\n") ||
+		!strings.Contains(out, "\nThe rest of the report is missing: the dependents: ") || strings.Contains(out, "\nDependents\n") {
+		t.Errorf("db-01 without the dependents: exit status %d, want %d\n%s", code, exitError, out)
+	}
+	code, out = impact(t, dsn, "-host", "idle-01", "-json")
+	var r report
+	if err := json.Unmarshal([]byte(out), &r); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if code != exitError || r.Verdict != verdictSafe || !strings.HasPrefix(r.Incomplete, "the dependents: ") || len(r.Observers) != 1 {
+		t.Errorf("idle-01 without the dependents: exit status %d, want %d; report %+v", code, exitError, r)
+	}
+}

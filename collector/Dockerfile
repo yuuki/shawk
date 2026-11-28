@@ -1,7 +1,9 @@
 # Image of the collector with the shawk connector, built by goreleaser from
 # the binaries of a release. Mount the configuration at
-# /etc/shawk/collector.yaml. shawk-migrate is included to apply the schema:
+# /etc/shawk/collector.yaml. shawk-migrate is included to apply the schema,
+# and shawk-impact to tell what removing a host would break:
 #   docker run --rm --entrypoint /shawk-migrate IMAGE -dsn postgres://...
+#   docker run --rm --entrypoint /shawk-impact IMAGE -dsn postgres://... -host db-01
 #
 # The base image is pinned by the digest of its index (all platforms); to
 # update it, take the Docker-Content-Digest of
@@ -10,6 +12,7 @@ FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c
 ARG TARGETPLATFORM
 COPY $TARGETPLATFORM/shawk-collector /shawk-collector
 COPY $TARGETPLATFORM/shawk-migrate /shawk-migrate
+COPY $TARGETPLATFORM/shawk-impact /shawk-impact
 COPY LICENSE build/notices/shawk-collector/THIRD_PARTY_NOTICES /licenses/
 EXPOSE 4317 4318 4327 4328
 ENTRYPOINT ["/shawk-collector"]

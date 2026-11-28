@@ -61,6 +61,7 @@ The design is in [docs/design.md](docs/design.md).
 | PostgreSQL | whether a dependency exists and when (views of the schema `shawk_v1`) |
 | Prometheus | how much flows: connections, failures, bytes, RTT, connect time, retransmissions |
 | Grafana | dashboards and alerts |
+| `shawk-impact` | reads PostgreSQL: what removing a host or a service would break, and whether it was watched |
 
 ## Requirements
 
@@ -113,9 +114,10 @@ for OBI.
 ### Collector
 
 A release ships an OpenTelemetry Collector that includes the connector:
-the deb and rpm packages `shawk-collector` (with `shawk-migrate` and the
-PostgreSQL scripts) and the image `ghcr.io/yuuki/shawk-collector`. To build
-it yourself, run `make collector shawk-migrate`.
+the deb and rpm packages `shawk-collector` (with `shawk-migrate`,
+`shawk-impact` and the PostgreSQL scripts) and the image
+`ghcr.io/yuuki/shawk-collector`. To build it yourself, run `make collector
+shawk-migrate shawk-impact`.
 
 [packaging/](packaging/README.md) has the configuration of the collector,
 PostgreSQL, Prometheus and Grafana, and the steps to set them up. The
@@ -142,6 +144,7 @@ The Grafana dashboards:
   the selected services, and failures and connect time by peer host; with
   `networks`, the networks the connections use.
 - **Changes**: dependencies that appeared or disappeared.
+- **Impact**: what removing a host would break, as `shawk-impact` below.
 - **Application layer (OBI)**: OBI's RED metrics next to the dependencies of
   the same service.
 
@@ -163,9 +166,69 @@ minutes.
 
 </details>
 
+Before removing a host or a service, `shawk-impact` tells what would
+break and whether the answer can be trusted:
+
+```console
+$ shawk-impact -dsn-file /etc/shawk/impact-dsn -host db-01 -service postgres -lookback 90d
+Target   db-01 (service postgres)
+Period   2026-08-01T00:00:00Z to 2026-10-30T00:00:00Z (90d)
+
+Verdict  UNSAFE: active dependents
+         2 dependents used it in the period, and 1 more depends on them (to depth 3)
+
+Dependents
+DEPTH  CLIENT            SERVER           PORT      SEEN BY  CADENCE     LAST SEEN             NEXT ACTIVITY
+1      app-01 shop/app   db-01 postgres   5432/tcp  both     continuous  2026-10-30T00:00:00Z  now
+1      batch-01 billing  db-01 postgres   5432/tcp  both     monthly     2026-10-01T03:00:00Z  about 2026-10-31T01:00:00Z
+2      web-01 nginx      app-01 shop/app  8080/tcp  both     -           2026-10-30T00:00:00Z  -
+The cadence is read to depth 1 (-cadence-depth).
+
+Observation of the hosts that tell
+HOST   ROLE    COVERAGE  NOT OBSERVED  GAPS  PARTLY OBSERVED  NO UDP  NO UNIX  ONE NETNS
+db-01  target  1         0s            0     0s               0s      0s       0s
+and 3 clients observed all along
+The coverage is from 0 to 1. A gap of 3m or less is not counted: an agent that
+restarts within it is not seen to.
+
+Only TCP, UDP and Unix stream sockets are observed. A host looks unused when it is used
+over RDMA, less often than the period, or only forwards packets: a router, a hypervisor,
+and a load balancer or gateway whose translations its agent does not learn (IPVS at its
+defaults) and the configuration does not give (docs/design.md, sections 6.3 and 10).
+```
+
+- `UNSAFE`: something used the target in the period. The cadence of each
+  dependent tells when it would break: at once, or at the next run of a
+  batch (an estimate from the hours in which it was active). The clients
+  whose connections the host relays in its kernel (a load balancer, a NAT
+  gateway) are dependents too, listed with the server `~relay`.
+- `SAFE`: nothing used it, and the history tells so for the whole period:
+  its agent watched it, and the period is within the retention.
+- `INCONCLUSIVE`: nothing was seen to use it, but the history cannot tell
+  that nothing did (a gap of the agent, a period longer than the
+  retention, dropped flows, UDP not traced, no agent at all, a container
+  host whose agent does not learn the clients it masquerades), or the
+  host has no such service or port, so the absence of dependents proves
+  nothing. `-min-coverage 0.999` accepts gaps, as a part of the period
+  from 0 to 1.
+
+The exit status is 0 for `SAFE` and for nothing else, 3 for `UNSAFE` and 4
+for `INCONCLUSIVE`, and `-json` writes the report for a script. It needs
+PostgreSQL: the SQLite lightweight mode keeps no history to tell from, and
+the command refuses it. The cadences need the hours of activity that
+connectors record from this version on; before that they are `unknown`.
+The rules, and what the verdict cannot see, are in
+[design §6.3](docs/design.md#63-impact-of-removing-a-host-or-a-service).
+
 In SQL:
 
 ```sql
+-- Can db-01 go, and what depends on it? The verdict, then its dependents
+-- with their cadence, over the last 90 days (as shawk-impact reads them).
+SELECT * FROM shawk_v1.impact_verdict('db-01', now() - interval '90 days', now());
+SELECT depth, client_host, client_service, server_service, port, cadence, last_seen, next_expected
+FROM shawk_v1.impact('db-01', now() - interval '90 days', now(), target_service => 'postgres');
+
 -- Who used postgres on db-01 in the last 90 days, and were they observed?
 SELECT client_host, client_service, port, last_seen, client_observed_until, observed_by
 FROM shawk_v1.dependencies_between(now() - interval '90 days', now())

@@ -190,6 +190,96 @@ Set `SHAWK_GRAFANA_PROMETHEUS_PASSWORD` and put the CA of Prometheus at
 `/etc/grafana/tls/prometheus-ca.crt`, then adjust the URLs and credentials
 in `grafana/provisioning/datasources/shawk.yaml`.
 
+## Before removing a host
+
+`shawk-impact`, in the `shawk-collector` packages and the image, tells
+what removing a host, or a service or a port of it, would break, from
+PostgreSQL ([design §6.3](../docs/design.md#63-impact-of-removing-a-host-or-a-service)):
+
+```sh
+shawk-impact -dsn-file /etc/shawk/impact-dsn -host db-01                       # the whole host, over 90 days
+shawk-impact -dsn-file /etc/shawk/impact-dsn -host db-01 -service postgres -port 5432 -lookback 26w
+shawk-impact -dsn-file /etc/shawk/impact-dsn -host db-01 -json | jq .verdict
+```
+
+- It reads `shawk_v1` and writes nothing: give it the connection string
+  of a role with the privileges of `shawk_grafana`, in a file only its
+  users read, not that of `shawk_connector`. It needs PostgreSQL: against
+  the SQLite lightweight mode it fails, since that mode keeps no history
+  to tell from.
+- Its exit status is the verdict: 0 `SAFE` and nothing else, 3 `UNSAFE`,
+  4 `INCONCLUSIVE`; 1 for a failure, also when the verdict was printed
+  and the list of the dependents then failed, and 2 for an invalid
+  command line or `-h`. A runbook or a pipeline can refuse to go on
+  unless it is 0.
+- `SAFE` takes a history that tells that nothing used the target over the
+  whole period. It is `INCONCLUSIVE` at best for a host without an agent
+  or a name that no agent reported under; for a service that the host
+  does not run or a port that no socket of it listens on, as a name
+  mistyped would be; for a period that reaches before the first agent, or
+  before the `retention` of the connector, whose dependencies are
+  deleted; and for a host whose clock is behind, for that long before
+  now. `-min-coverage 0.999` accepts gaps, which the report then lists:
+  a part of the period from 0 to 1, as in the functions and the
+  dashboard; a percentage is refused.
+- A host that relays connections in its kernel (a load balancer, a NAT
+  gateway, a node that forwards to the pods of other nodes) has the
+  clients of the translations its agent learned, and of the virtual
+  addresses it holds, as dependents, with the server `~relay`. They count
+  for each service of the host as well, since nothing tells which one
+  keeps the translations; name a port to narrow the question. A host that
+  only forwards packets is not seen to be used: a router, a hypervisor,
+  and a director or a gateway whose translations its agent does not learn
+  (IPVS at its defaults, without `net.ipv4.vs.conntrack=1`) and that
+  `translations` of the connector does not describe. The report says so
+  at its end.
+- A host whose pods or containers are reached from outside through a
+  port it publishes with masquerade (a NodePort) shows those clients as
+  its own address, like its kubelet. The translations its agent learns
+  tell them apart, and such clients are dependents; an agent that folds
+  external peers (`-fold-external in`, the default) or traces no
+  translation does not learn them, and the verdict on the host is then
+  `INCONCLUSIVE` (`masquerade_not_traced`) rather than `SAFE`. The same
+  holds for a Docker host at its defaults, whose `docker-proxy` connects
+  to the containers over the bridge. The coverage of such a host is 0
+  while those connections last, which no `-min-coverage` accepts. Run
+  the agents of such hosts with `-fold-external none` to decide it, and
+  allow for the time before the change: the verdict stays `INCONCLUSIVE`
+  until the period asked for starts after it, so ask with a `-lookback`
+  no longer than the time since (9 days, 10 days after the change), or
+  wait for the lookback to pass. Translations are also missing for
+  connections older than the agent and when its table of translations
+  overflowed (`shawk_agent_translations_dropped_total` in Prometheus,
+  which PostgreSQL does not hold): watch that counter on such hosts.
+- The period (`-lookback`, 90 days, an hour at least) must be longer than
+  the rarest job that matters: a job of every quarter is not a dependent
+  over 90 days in which it did not run.
+- The cadence of a dependent (`continuous`, `daily`, `weekly`, `monthly`,
+  ...) is read from the hours in which it was active, which connectors
+  record from this version on: it is `unknown` for what was last active
+  before the connectors were upgraded, and until a dependency has a day,
+  or three runs, of hours. It is read for the dependents of depth 1
+  (`-cadence-depth`), and `-` for the others.
+
+The dashboard **shawk / Impact** shows the same for a whole host over the
+time range, and the functions take the place of both in SQL:
+
+```sql
+SELECT * FROM shawk_v1.impact_verdict('db-01', now() - interval '90 days', now(), target_service => 'postgres');
+SELECT * FROM shawk_v1.impact('db-01', now() - interval '90 days', now(), target_service => 'postgres');
+SELECT * FROM shawk_v1.coverage(now() - interval '90 days', now(), ARRAY['db-01', 'app-01']);
+SELECT * FROM shawk_v1.coverage_gaps(now() - interval '90 days', now(), ARRAY['db-01']);
+```
+
+A period of months over a large fleet may take longer than the 30
+seconds `setup.sql` gives the statements of `shawk_grafana`: the panels
+then fail, and `shawk-impact` sets its own limit (`-timeout`, 5 minutes),
+and prints the verdict even when the list of the dependents then runs
+out of time. On a fleet
+of 2000 hosts with 500000 dependencies in 90 days, the verdict takes 5
+to 7 seconds and `shawk-impact` at its defaults 13 to 19, several times
+that on a database under load (design §6.3).
+
 ## SQLite lightweight mode (without PostgreSQL)
 
 For a single-collector deployment that needs live service dependency metrics
@@ -214,8 +304,9 @@ sudo systemctl restart shawk-collector
 The embedded SQLite database is internal to one collector process (protected
 by an exclusive lock file) and keeps peer-resolution state only (up to 30
 days). Long-term history, change alerts, `unobserved()` coverage gaps,
-multi-hop walks, `job_users`, `node_states_file` and `maintenance_file`
-require PostgreSQL mode.
+multi-hop walks, the impact of removing a host (`shawk-impact`, which
+refuses this mode, and the dashboard shawk / Impact), `job_users`,
+`node_states_file` and `maintenance_file` require PostgreSQL mode.
 
 ## Upgrading
 
@@ -223,6 +314,22 @@ The connector of the example does not migrate (`migrate: false`). It waits
 until the schema is at least its own version, and warns when the schema is
 newer. Run `shawk-migrate` and `grants.sql` before or while upgrading the
 collectors, and upgrade all of them, along with the agents.
+
+Migration 0004 adds the hours in which each dependency was active
+(`shawk.edge_activity`), which the connectors record from then on, and
+migration 0005 the functions of the impact. The hours take about 190
+bytes per edge, a side of a dependency, and month in which it was active,
+for the retention: with edges active in two months of three on average,
+the table is larger than `shawk.edges` itself (401 MB against 364 MB for
+1.1 million edges). A connector of an earlier version writes none, so
+upgrade all the connectors before reading cadences (`shawk-impact`). The
+connectors also record the cutoff of their retention from then on: a
+period that reaches before it is `INCONCLUSIVE`. The migration starts
+that record from the oldest edge the database still holds, so a period
+that reaches before it is `INCONCLUSIVE` right after the upgrade too. In
+a database whose edges are all recent, that start is recent as well and
+does not move back: periods that reach before it stay `INCONCLUSIVE`
+until they no longer do.
 
 ## HPC clusters
 
