@@ -1335,6 +1335,11 @@ func TestPGImpactOfARelay(t *testing.T) {
 	// outside: they need it too.
 	f.watched("gw-01", "10.0.0.1", "198.51.100.1")
 	f.learned("gw-01", "10.0.0.11", "203.0.113.9", 443, "198.51.100.1", "203.0.113.9", 443, day(1, 0), day(2, 0))
+	// So does a container of gw-01 itself, whose address the host does not
+	// report as its own: the agent saw its client edge on the host, so it
+	// is no dependent of it.
+	f.edge("gw-01", "curl", "client", "172.17.0.3", "203.0.113.9", 443, day(1, 0), day(2, 0))
+	f.learned("gw-01", "172.17.0.3", "203.0.113.9", 443, "198.51.100.1", "203.0.113.9", 443, day(1, 0), day(2, 0))
 	checkRows(t, "dependents of gw-01", f.impact(`'gw-01', %s, %s`), []string{
 		"1 - ~unresolved 10.0.0.11 -> gw-01 ~relay 443 server unknown",
 	})
