@@ -295,7 +295,7 @@ func isSQLite(dsn string) bool {
 			return true
 		}
 	}
-	info, err := os.Stat(dsn)
+	info, err := os.Stat(dsn) //nolint:gosec // G703: what the command line gives, only to tell a file from a connection string
 	return err == nil && !info.IsDir()
 }
 
