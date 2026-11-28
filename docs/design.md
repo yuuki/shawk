@@ -1811,10 +1811,11 @@ services:
   empty, as a generator that failed leaves it. A service must list its
   dependencies: `dependencies: []` approves none, and a service without
   the key is an error rather than a service approved to have none. A
-  baseline of no service is written `services: []`. A name is a name of
-  PostgreSQL, of 511 bytes at most, without control characters; a port is
-  0 to 65535, where 0 stands for every port; the transport is `tcp` or
-  `udp`. A service listed twice is refused, a dependency listed twice is
+  baseline of no service is written `services: []`. A name is any name
+  that PostgreSQL may hold (valid UTF-8 without NUL, of 4096 bytes at
+  most, §5.5), so that whatever an agent names a service, a baseline can
+  approve a dependency on it; a port is 0 to 65535, where 0 stands for
+  every port; the transport is `tcp` or `udp`. A service listed twice is refused, a dependency listed twice is
   one. The failure is logged and recorded with its time, for every
   connector (`shawk_v1.baseline_status`) and for Prometheus
   (`shawk.baseline.file.failed`): a baseline that no longer follows its
@@ -1864,8 +1865,9 @@ The last four are of the connector, under `job="shawk-connector"`.
   writes and does not hold. The names of peers are what agents send: at
   most 1000 drifting dependencies are sent, in the order of their service,
   peer, port and transport so that the same ones are sent every time, and
-  the others are counted in `shawk_baseline_drift_truncated`. Names of
-  peers are cut to 511 bytes, as `service.peer.name` is.
+  the others are counted in `shawk_baseline_drift_truncated`. The names
+  of services and peers are cut to 511 bytes, as `service.peer.name` is,
+  and two that are the same once cut are one series.
 - **Unknown is not zero.** While evaluations fail, the last result is
   sent for 15 minutes, then only the time of the evaluation: a drift that
   is no longer known is not told, and neither is its absence, and
@@ -3216,10 +3218,12 @@ bound above holds. A store whose receiver takes less needs a smaller
     anew, or a new executable in the unit of a service, is another
     service, which the baseline of the first does not judge:
     `shawk_baseline_new_services` counts those that appear, and nothing
-    more is told of them. A service that is renamed has no baseline until
-    its file is, and alerts nothing meanwhile
-    (`absent(shawk_baseline_dependencies{job="..."})` alerts on it). A
-    peer that is renamed is a drift for each service that uses it.
+    more is told of them. A service that is renamed, by a release or by
+    an agent that names services otherwise (`-service-name-fallback`), is
+    such a new service: it is counted once, when it appears, and nothing
+    judges it until a baseline is written under its new name, while the
+    baseline of the old name judges nothing. A peer that is renamed is a
+    drift for each service that uses it.
   - *What a baseline tells apart.* The name of a server, its port and the
     transport: a server of the same name at another address is no drift,
     `~external` does not tell one public address from another, and

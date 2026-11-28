@@ -9,9 +9,9 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
-	"unicode"
 	"unicode/utf8"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -158,20 +158,22 @@ func (fd baselineFileDepend) dependency() (BaselineDependency, error) {
 	return d, nil
 }
 
-// checkBaselineName checks the name of a service or of a peer: what
-// PostgreSQL holds as a name, which the connector cuts to maxPeerName
-// bytes for Prometheus. A name of shawk may start with ~ (~external,
+// checkBaselineName checks the name of a service or of a peer: any name
+// that PostgreSQL may hold, so that whatever an agent names a service, a
+// baseline can hold it and approve a dependency on it. The connector keeps
+// the strings of agents up to maxStringBytes, as text of PostgreSQL: valid
+// UTF-8 without NUL. A name of shawk may start with ~ (~external,
 // ~kernel:nfs).
 func checkBaselineName(s string) error {
 	switch {
 	case s == "":
 		return errors.New("empty")
-	case len(s) > maxPeerName:
-		return fmt.Errorf("longer than %d bytes", maxPeerName)
+	case len(s) > maxStringBytes:
+		return fmt.Errorf("longer than %d bytes", maxStringBytes)
 	case !utf8.ValidString(s):
 		return errors.New("not valid UTF-8")
-	case strings.IndexFunc(s, unicode.IsControl) >= 0:
-		return errors.New("has control characters")
+	case strings.ContainsRune(s, 0):
+		return errors.New("has a NUL character")
 	}
 	return nil
 }
@@ -220,29 +222,13 @@ func (b *Baseline) dependencies() int {
 	return n
 }
 
-// The form in which Marshal writes a baseline: a dependency per line, so
-// that a change of one is a line of a diff.
-type baselineOut struct {
-	Services []baselineOutService `yaml:"services"`
-}
-
-type baselineOutService struct {
-	Service      string              `yaml:"service"`
-	Dependencies []baselineOutDepend `yaml:"dependencies"`
-}
-
-type baselineOutDepend struct {
-	Peer  string `yaml:"peer"`
-	Port  int    `yaml:"port"`
-	Proto string `yaml:"proto"`
-}
-
 // Marshal writes a baseline as a file that ParseBaseline reads back to the
 // same baseline: YAML, with the services and their dependencies in the
-// order of Normalize and a dependency per line. The baseline is checked as
-// ParseBaseline checks a file, so that what is written can be read.
+// order of Normalize and a dependency per line, so that a change of one is
+// a line of a diff. The baseline is checked as ParseBaseline checks a
+// file, so that what is written can be read.
 func (b *Baseline) Marshal() ([]byte, error) {
-	out := baselineOut{Services: make([]baselineOutService, 0, len(b.Services))}
+	services := &yaml.Node{Kind: yaml.SequenceNode}
 	seen := map[string]bool{}
 	for _, s := range b.Services {
 		if err := checkBaselineName(s.Service); err != nil {
@@ -252,24 +238,22 @@ func (b *Baseline) Marshal() ([]byte, error) {
 			return nil, fmt.Errorf("service %q is listed twice", s.Service)
 		}
 		seen[s.Service] = true
-		os := baselineOutService{Service: s.Service, Dependencies: make([]baselineOutDepend, 0, len(s.Dependencies))}
+		deps := &yaml.Node{Kind: yaml.SequenceNode}
 		for _, d := range s.Dependencies {
 			if _, err := (baselineFileDepend{Peer: d.Peer, Port: &d.Port, Proto: d.Proto}).dependency(); err != nil {
 				return nil, fmt.Errorf("service %q: %w", s.Service, err)
 			}
-			os.Dependencies = append(os.Dependencies, baselineOutDepend(d))
+			dep := yamlMapping("peer", yamlString(d.Peer), "port", &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!int", Value: strconv.Itoa(d.Port)},
+				"proto", yamlString(d.Proto))
+			dep.Style = yaml.FlowStyle
+			deps.Content = append(deps.Content, dep)
 		}
-		out.Services = append(out.Services, os)
+		services.Content = append(services.Content, yamlMapping("service", yamlString(s.Service), "dependencies", deps))
 	}
-	var doc yaml.Node
-	if err := doc.Encode(out); err != nil {
-		return nil, err
-	}
-	flowDependencies(&doc)
 	var buf bytes.Buffer
 	enc := yaml.NewEncoder(&buf)
 	enc.SetIndent(2)
-	if err := enc.Encode(&doc); err != nil {
+	if err := enc.Encode(yamlMapping("services", services)); err != nil {
 		return nil, err
 	}
 	if err := enc.Close(); err != nil {
@@ -278,21 +262,27 @@ func (b *Baseline) Marshal() ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// flowDependencies gives the mappings of dependencies of an encoded
-// baseline the flow style, {peer: ..., port: ..., proto: ...}, a line each.
-func flowDependencies(n *yaml.Node) {
-	if n.Kind == yaml.MappingNode {
-		for i := 0; i+1 < len(n.Content); i += 2 {
-			if n.Content[i].Value == "dependencies" && n.Content[i+1].Kind == yaml.SequenceNode {
-				for _, d := range n.Content[i+1].Content {
-					d.Style = yaml.FlowStyle
-				}
-			}
-		}
+// yamlString is a string of a baseline file. The encoder quotes what YAML
+// would read as something else than the string. It would write a string
+// with a line break as a block of several lines, and one that starts with
+// a line break as a block that its own parser does not read back: such a
+// string is quoted, on one line, as every name of a file under review.
+func yamlString(v string) *yaml.Node {
+	n := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: v}
+	if strings.ContainsAny(v, "\n\r") {
+		n.Style = yaml.DoubleQuotedStyle
 	}
-	for _, c := range n.Content {
-		flowDependencies(c)
+	return n
+}
+
+// yamlMapping is a mapping of keys, which are words of the format, and
+// their values.
+func yamlMapping(pairs ...any) *yaml.Node {
+	m := &yaml.Node{Kind: yaml.MappingNode}
+	for i := 0; i+1 < len(pairs); i += 2 {
+		m.Content = append(m.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: pairs[i].(string)}, pairs[i+1].(*yaml.Node))
 	}
+	return m
 }
 
 // readBaseline reads and validates baseline_file.
@@ -472,7 +462,7 @@ func (c *shawkConnector) emitBaseline(ctx context.Context) {
 // over a period that ended at until to out, at now. The series of a
 // service are on a resource of the service, so that Prometheus gives them
 // its job, as it gives the series of its dependencies; they carry no
-// address and no host. The names of peers are cut as service.peer.name is.
+// address and no host.
 func appendBaselineMetrics(out pmetric.Metrics, r *baselineReport, until, now time.Time, fresh bool) {
 	ts := pcommon.NewTimestampFromTime(now)
 	gauge := func(rm pmetric.ResourceMetrics, name, unit string) pmetric.NumberDataPointSlice {
@@ -509,31 +499,47 @@ func appendBaselineMetrics(out pmetric.Metrics, r *baselineReport, until, now ti
 	point(gauge(own, metricBaselineDriftTruncated, "{dependency}"), int64(r.truncated))
 	point(gauge(own, metricBaselineNewServices, "{service}"), int64(r.newServices))
 
-	// The drift of each service, with the peers cut: two that are the same
-	// once cut are one series, with the hosts of the one that has most.
+	// The names of services and peers are cut as the labels of the other
+	// outputs are: two that are the same once cut are one series, with the
+	// larger of their values.
 	type key struct {
 		peer  string
 		port  int
 		proto string
 	}
-	drift := map[string]map[key]int{}
-	for _, d := range r.drift {
-		k := key{cutLabel(d.peer, maxPeerName), d.port, d.proto}
-		if drift[d.service] == nil {
-			drift[d.service] = map[key]int{}
-		}
-		drift[d.service][k] = max(drift[d.service][k], d.hosts)
+	type service struct {
+		dependencies int
+		drift        map[key]int
 	}
+	services := map[string]*service{}
+	var names []string
 	for _, s := range r.services {
+		name := cutLabel(s.service, maxPeerName)
+		if services[name] == nil {
+			services[name] = &service{drift: map[key]int{}}
+			names = append(names, name)
+		}
+		services[name].dependencies = max(services[name].dependencies, s.dependencies)
+	}
+	for _, d := range r.drift {
+		// The contract gives the drift of the services of the baseline
+		// only; that of another service has no resource to be sent on.
+		if s := services[cutLabel(d.service, maxPeerName)]; s != nil {
+			k := key{cutLabel(d.peer, maxPeerName), d.port, d.proto}
+			s.drift[k] = max(s.drift[k], d.hosts)
+		}
+	}
+	slices.Sort(names)
+	for _, name := range names {
+		s := services[name]
 		rm := out.ResourceMetrics().AppendEmpty()
-		rm.Resource().Attributes().PutStr(attrServiceName, s.service)
+		rm.Resource().Attributes().PutStr(attrServiceName, name)
 		point(gauge(rm, metricBaselineDependencies, "{dependency}"), int64(s.dependencies))
-		ds := drift[s.service]
-		if len(ds) == 0 {
+		if len(s.drift) == 0 {
 			continue
 		}
-		keys := make([]key, 0, len(ds))
-		for k := range ds {
+		keys := make([]key, 0, len(s.drift))
+		for k := range s.drift {
 			keys = append(keys, k)
 		}
 		slices.SortFunc(keys, func(x, y key) int {
@@ -541,7 +547,7 @@ func appendBaselineMetrics(out pmetric.Metrics, r *baselineReport, until, now ti
 		})
 		dps := gauge(rm, metricBaselineDriftHosts, "{host}")
 		for _, k := range keys {
-			attrs := point(dps, int64(ds[k]))
+			attrs := point(dps, int64(s.drift[k]))
 			attrs.PutStr(attrPeerService, k.peer)
 			attrs.PutInt(attrServerPort, int64(k.port))
 			attrs.PutStr(attrTransport, k.proto)

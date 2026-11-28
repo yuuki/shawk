@@ -2,6 +2,7 @@ package shawkconnector
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -73,8 +74,8 @@ func TestParseBaselineInvalid(t *testing.T) {
 		"negative port":     {"services:\n  - service: a\n    dependencies: [{peer: b, port: -1, proto: tcp}]\n", "not from 0 to 65535"},
 		"proto":             {"services:\n  - service: a\n    dependencies: [{peer: b, port: 1, proto: unix}]\n", "not tcp or udp"},
 		"no proto":          {"services:\n  - service: a\n    dependencies: [{peer: b, port: 1}]\n", "not tcp or udp"},
-		"control character": {"services:\n  - service: \"a\\nb\"\n    dependencies: []\n", "control characters"},
-		"long name":         {"services:\n  - service: " + strings.Repeat("a", maxPeerName+1) + "\n    dependencies: []\n", "longer than"},
+		"NUL":               {"services:\n  - service: \"a\\0b\"\n    dependencies: []\n", "NUL"},
+		"long name":         {"services:\n  - service: " + strings.Repeat("a", maxStringBytes+1) + "\n    dependencies: []\n", "longer than"},
 		"two documents":     {"services: []\n---\nservices: []\n", "more than one YAML document"},
 		"not a mapping":     {"- a\n", "cannot unmarshal"},
 	} {
@@ -104,6 +105,16 @@ func TestBaselineMarshal(t *testing.T) {
 		{Service: "batch/report"},
 	}}
 	b.Normalize()
+	// Whatever an agent names a service, a baseline holds it: a line
+	// break, a tab, a character that ends a line for some readers.
+	odd := &Baseline{Services: []BaselineService{{Service: "a\nb", Dependencies: []BaselineDependency{
+		{"tab\there", 1, "tcp"}, {"\u2028", 2, "tcp"}, {"\x1b[2J", 3, "udp"}, {strings.Repeat("n", maxStringBytes), 4, "tcp"}}}}}
+	odd.Normalize()
+	if text, err := odd.Marshal(); err != nil {
+		t.Errorf("Marshal of odd names: %v", err)
+	} else if back, err := ParseBaseline(text); err != nil || !reflect.DeepEqual(back, odd) {
+		t.Errorf("odd names read back as %+v, %v\n%s", back, err, text)
+	}
 	out, err := b.Marshal()
 	if err != nil {
 		t.Fatal(err)
@@ -136,7 +147,8 @@ func TestBaselineMarshal(t *testing.T) {
 		{Services: []BaselineService{{Service: ""}}},
 		{Services: []BaselineService{{Service: "a"}, {Service: "a"}}},
 		{Services: []BaselineService{{Service: "a", Dependencies: []BaselineDependency{{"b", 70000, "tcp"}}}}},
-		{Services: []BaselineService{{Service: "a", Dependencies: []BaselineDependency{{"b\n", 1, "tcp"}}}}},
+		{Services: []BaselineService{{Service: "a", Dependencies: []BaselineDependency{{"b\x00", 1, "tcp"}}}}},
+		{Services: []BaselineService{{Service: "a\xff"}}},
 		{Services: []BaselineService{{Service: "a", Dependencies: []BaselineDependency{{"b", 1, "sctp"}}}}},
 	} {
 		if out, err := bad.Marshal(); err == nil {
@@ -365,31 +377,38 @@ func TestBaselineMetricsNeverRead(t *testing.T) {
 	}
 }
 
-// TestBaselineMetricsBounded: the names of peers are cut as
-// service.peer.name is, and two that are the same once cut are one series.
+// TestBaselineMetricsBounded: the names of services and peers are cut as
+// the labels of the other outputs are, and two that are the same once cut
+// are one series.
 func TestBaselineMetricsBounded(t *testing.T) {
 	long := strings.Repeat("p", maxPeerName)
-	r := &baselineReport{read: true, services: []baselineCount{{"a", 0}},
-		drift: []driftRow{{"a", long + "x", 80, "tcp", 2}, {"a", long + "y", 80, "tcp", 5}, {"b", "c", 1, "tcp", 1}}}
+	r := &baselineReport{read: true, services: []baselineCount{{"a", 0}, {long + "1", 3}, {long + "2", 7}},
+		drift: []driftRow{{"a", long + "x", 80, "tcp", 2}, {"a", long + "y", 80, "tcp", 5}, {"b", "c", 1, "tcp", 1},
+			{long + "1", "c", 1, "tcp", 4}, {long + "2", "c", 1, "tcp", 2}, {long + "2", "d", 1, "tcp", 1}}}
 	md := pmetric.NewMetrics()
 	now := t0
 	appendBaselineMetrics(md, r, now, now, true)
 	var got []string
 	for _, s := range flatten(md) {
-		if s.metric == metricBaselineDriftHosts {
-			if len(s.peer) != maxPeerName {
-				t.Errorf("peer of %d bytes", len(s.peer))
-			}
-			got = append(got, s.job+" "+itoa(s.port)+" "+itoa(int64(s.value)))
+		if len(s.peer) > maxPeerName || len(s.job) > maxPeerName {
+			t.Errorf("a job of %d bytes and a peer of %d", len(s.job), len(s.peer))
+		}
+		if s.metric == metricBaselineDriftHosts || s.metric == metricBaselineDependencies {
+			got = append(got, fmt.Sprintf("%s %d %s %d %d", s.metric, len(s.job), s.peer[:min(1, len(s.peer))], s.port, int64(s.value)))
 		}
 	}
+	slices.Sort(got)
 	// The drift of a service that is not in the baseline is not sent: the
 	// contract returns none, and no resource would carry it.
-	if want := []string{"a 80 5"}; !slices.Equal(got, want) {
-		t.Errorf("drift series %q, want %q", got, want)
+	want := []string{
+		"shawk.baseline.dependencies 1  0 0", "shawk.baseline.dependencies 511  0 7",
+		"shawk.baseline.drift.hosts 1 p 80 5", "shawk.baseline.drift.hosts 511 c 1 4", "shawk.baseline.drift.hosts 511 d 1 1",
 	}
-	if md.DataPointCount() != 6 {
-		t.Errorf("%d data points, want 6", md.DataPointCount())
+	if !slices.Equal(got, want) {
+		t.Errorf("series %q, want %q", got, want)
+	}
+	if md.DataPointCount() != 9 {
+		t.Errorf("%d data points, want 9", md.DataPointCount())
 	}
 }
 
@@ -449,6 +468,33 @@ func FuzzParseBaseline(f *testing.F) {
 		again, err := back.Marshal()
 		if err != nil || string(again) != string(out) {
 			t.Fatalf("Marshal is not stable: %v\n%s\n%s", err, out, again)
+		}
+	})
+}
+
+// FuzzBaselineNames: whatever names PostgreSQL may hold for a service and
+// its peers, a baseline with them is written to a file that is read back
+// to the same baseline, and names that it cannot hold are refused by both.
+func FuzzBaselineNames(f *testing.F) {
+	for _, s := range []string{"shop/app", "~external", "null", "~", "a: b", "#x", " lead", "trail ", "a\nb", "\t", "'", "\"", "{}", "[]",
+		"- x", "? x", "!!str", "&a", "*a", "|", ">", "%", "@", "`", "yes", "0x1f", "1e3", "\u2028", "\u0085", "\ufeff", "é", "\x7f", ""} {
+		f.Add(s, s+"/peer", uint16(443))
+	}
+	f.Fuzz(func(t *testing.T, service, peer string, port uint16) {
+		b := &Baseline{Services: []BaselineService{{Service: service, Dependencies: []BaselineDependency{
+			{peer, int(port), "tcp"}, {service, 0, "udp"}}}}}
+		b.Normalize()
+		valid := checkBaselineName(service) == nil && checkBaselineName(peer) == nil
+		out, err := b.Marshal()
+		if (err == nil) != valid {
+			t.Fatalf("Marshal of %q and %q: %v, but the names are valid: %t", service, peer, err, valid)
+		}
+		if !valid {
+			return
+		}
+		back, err := ParseBaseline(out)
+		if err != nil || !reflect.DeepEqual(back, b) {
+			t.Fatalf("%q and %q are read back as %+v, %v\n%s", service, peer, back, err, out)
 		}
 	})
 }

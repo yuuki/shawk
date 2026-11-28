@@ -438,8 +438,9 @@ groups:
   # read the same PostgreSQL. A service without a baseline has no series
   # and is not judged: shawk_baseline_dependencies{job} tells the services
   # that have one, so that `absent(shawk_baseline_dependencies{job="..."})`
-  # alerts when a service that must have one has none, as after it was
-  # renamed.
+  # alerts when a service that must have one is not in the file. A service
+  # that is renamed is a new service without a baseline, which
+  # ShawkNewServiceWithoutBaseline tells once, when it appears.
   - name: shawk-baseline
     rules:
       # A dependency that the baseline does not hold, on a server that shawk
