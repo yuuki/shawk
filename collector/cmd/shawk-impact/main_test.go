@@ -334,9 +334,10 @@ and 1 client observed all along
 The coverage is from 0 to 1. A gap of 3m or less is not counted: an agent that
 restarts within it is not seen to.
 
-Only TCP, UDP and Unix stream sockets are observed: a host used over RDMA, one that
-only forwards packets, or one used less often than the period, looks unused
-(docs/design.md, sections 6.3 and 10).
+Only TCP, UDP and Unix stream sockets are observed. A host looks unused when it is used
+over RDMA, less often than the period, or only forwards packets: a router, a hypervisor,
+and a load balancer or gateway whose translations its agent does not learn (IPVS at its
+defaults) and the configuration does not give (docs/design.md, sections 6.3 and 10).
 `
 	if got := out.String(); got != want {
 		t.Errorf("report:\n%s\nwant:\n%s", got, want)
@@ -391,7 +392,10 @@ func TestWriteVerdicts(t *testing.T) {
 		"udp_not_traced":  "its agent did not trace UDP for 1h",
 		"unix_not_traced": "its agent did not trace Unix sockets, or did not tell, for 2h",
 		"netns_limited":   "its agent traced one network namespace only for 1m",
-		"a_new_reason":    "a_new_reason",
+		"masquerade_not_traced": "a pod or a container of it accepted connections from an address of the host itself, and its agent did not " +
+			"learn the translations that would tell clients outside it, masqueraded by the host, from its own (it traces " +
+			"none, or folds external peers: -fold-external none)",
+		"a_new_reason": "a_new_reason",
 	} {
 		r.Verdict, r.Reasons, r.Caveats, r.Target.Port, r.Target.Service = verdictInconclusive, []string{reason}, nil, 5432, "postgres"
 		if reason == "unknown_port" {

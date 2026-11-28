@@ -23,9 +23,15 @@
 * The clients whose connections a host relays in its kernel (a load
   balancer, a NAT gateway, a node that forwards to pods of other nodes)
   are its dependents, with the server service `~relay`: those of the
-  translations its agent learned, and of a virtual address it holds. A
-  host that only routes or bridges is not seen to be used
-  (`docs/design.md` §10).
+  translations its agent learned, and of a virtual address it holds; also
+  the clients from outside that a host masqueraded to a pod or a
+  container of its own, which the pod sees as the address of the host. A
+  host whose agent could not learn those (it folds external peers, the
+  default, or traces no translation) while a pod of it accepted
+  connections from an address of the host is `INCONCLUSIVE`
+  (`masquerade_not_traced`). A host that only forwards packets, as a
+  router, a hypervisor or an IPVS director at its defaults, is not seen
+  to be used (`docs/design.md` §10).
 * PostgreSQL, migration `0005_impact.sql`: the functions
   `shawk_v1.impact()`, `impact_verdict()`, `coverage()` and
   `coverage_gaps()`, which `shawk-impact` and the new dashboard
@@ -43,10 +49,12 @@
   first and last seen, so the hours start with this version: the cadence
   of what was last active before is `unknown`. The same migration records
   the cutoff of the retention (`shawk.retention`, written by
-  `shawk.prune()`), before which nothing counts as observed for the
-  impact, and whether a connection of a client edge of a Unix socket was
-  ever established (`shawk.unix_edges.established`), so that failed
-  attempts at a socket nothing serves are no dependency.
+  `shawk.prune()` and started by the migration from the oldest edge the
+  database holds), before which nothing counts as observed for the
+  impact; whether a connection of a client edge of a Unix socket was ever
+  established (`shawk.unix_edges.established`), so that failed attempts
+  at a socket nothing serves are no dependency; and whether the agent of
+  a session learns translations (`shawk.agent_sessions.translations_traced`).
 
 **Upgrading.** Run `shawk-migrate` and `grants.sql` again (migrations 0004
 and 0005), and upgrade every connector: one of an earlier version records

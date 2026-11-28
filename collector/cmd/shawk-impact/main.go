@@ -100,7 +100,7 @@ func parse(args []string, stderr io.Writer) (*config, error) {
 	fs.StringVar(&c.dsnFile, "dsn-file", "", "file that holds the connection string")
 	fs.BoolVar(&c.asJSON, "json", false, "write the report as JSON")
 	fs.IntVar(&c.limit, "limit", 50, "dependents to list in the text report; 0 for all")
-	fs.DurationVar(&c.timeout, "timeout", 2*time.Minute, "how long the queries may take; also the statement_timeout of their transaction")
+	fs.DurationVar(&c.timeout, "timeout", 5*time.Minute, "how long the queries may take; also the statement_timeout of their transaction")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil, err

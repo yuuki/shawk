@@ -191,9 +191,10 @@ and 3 clients observed all along
 The coverage is from 0 to 1. A gap of 3m or less is not counted: an agent that
 restarts within it is not seen to.
 
-Only TCP, UDP and Unix stream sockets are observed: a host used over RDMA, one that
-only forwards packets, or one used less often than the period, looks unused
-(docs/design.md, sections 6.3 and 10).
+Only TCP, UDP and Unix stream sockets are observed. A host looks unused when it is used
+over RDMA, less often than the period, or only forwards packets: a router, a hypervisor,
+and a load balancer or gateway whose translations its agent does not learn (IPVS at its
+defaults) and the configuration does not give (docs/design.md, sections 6.3 and 10).
 ```
 
 - `UNSAFE`: something used the target in the period. The cadence of each
@@ -205,8 +206,9 @@ only forwards packets, or one used less often than the period, looks unused
   its agent watched it, and the period is within the retention.
 - `INCONCLUSIVE`: nothing was seen to use it, but the history cannot tell
   that nothing did (a gap of the agent, a period longer than the
-  retention, dropped flows, UDP not traced, no agent at all), or the host
-  has no such service or port, so the absence of dependents proves
+  retention, dropped flows, UDP not traced, no agent at all, a container
+  host whose agent does not learn the clients it masquerades), or the
+  host has no such service or port, so the absence of dependents proves
   nothing. `-min-coverage 0.999` accepts gaps, as a part of the period
   from 0 to 1.
 

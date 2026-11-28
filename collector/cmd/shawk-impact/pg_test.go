@@ -168,9 +168,10 @@ and 3 clients observed all along
 The coverage is from 0 to 1. A gap of 3m or less is not counted: an agent that
 restarts within it is not seen to.
 
-Only TCP, UDP and Unix stream sockets are observed: a host used over RDMA, one that
-only forwards packets, or one used less often than the period, looks unused
-(docs/design.md, sections 6.3 and 10).
+Only TCP, UDP and Unix stream sockets are observed. A host looks unused when it is used
+over RDMA, less often than the period, or only forwards packets: a router, a hypervisor,
+and a load balancer or gateway whose translations its agent does not learn (IPVS at its
+defaults) and the configuration does not give (docs/design.md, sections 6.3 and 10).
 `
 	if code != exitUnsafe || out != want {
 		t.Errorf("db-01: exit status %d, want %d\n%s\nwant:\n%s", code, exitUnsafe, out, want)

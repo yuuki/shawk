@@ -1014,7 +1014,9 @@ wrote before it told.
 `shawk.prune()` records the latest cutoff it was called with
 (`shawk.retention`): the time before it is not observed for the impact
 (§6.3), since the edges last seen then are deleted while the session of
-an agent that goes on is kept whole.
+an agent that goes on is kept whole. The migration that adds the record
+starts it from the oldest time an edge still kept was last seen, for the
+prunes before it (§6.3).
 
 - **Why a bit per hour and a row per month.** A row per run of activity
   would have no bound (26000 rows a year for a job of every 20 minutes),
@@ -1066,8 +1068,9 @@ session already pending from requests received while the dropped changes
 were being written, which skipped the edges those changes held; one that
 ended before that start is not written.
 
-The session also keeps `peer_fold`, `peer_internal`, `unix_traced` and
-`protocols_classified` (NULL for an agent that does not send them) and
+The session also keeps `peer_fold`, `peer_internal`, `unix_traced`,
+`protocols_classified` and `translations_traced` (NULL for an agent that
+does not send them, or a connector that did not keep them) and
 `counters_started`
 (the start of the agent's drop counter, by its clock), which identifies one
 run of the agent across the sessions that several connectors, a connector
@@ -1784,7 +1787,7 @@ which must be run again after every `shawk-migrate` that applies migrations.
 ```
 hosts(id, machine_id, hostname, kernel, agent_version, first_seen, last_seen)
 agent_sessions(host_id, started_at, last_heartbeat, udp_traced, netns_scope, dropped_flows, clock_skew,
-               peer_fold, peer_internal, counters_started, unix_traced, protocols_classified)
+               peer_fold, peer_internal, counters_started, unix_traced, protocols_classified, translations_traced)
 partial_observations(host_id, started_at, period_start, period_end, dropped_flows)  -- periods with drops
 host_addrs(host_id, addr, first_seen, last_seen)  -- one row per period
 processes(id, host_id, unit, comm, exe, service_name, user_id, first_seen, last_seen)
@@ -1865,7 +1868,7 @@ names in PostgreSQL and Prometheus match.
 | `job_edges` | the edges of the processes of Slurm jobs, those to Unix sockets included (with `path`), with the user of the process (`user_id`, NULL if unknown), host, unit, service and executable: which users connected to what, and when. For administrators: only its owner reads it (below) |
 | `dependencies_between(since, until)`, `graph_edges_between`, `graph_nodes_between`, `dependency_changes_between` | the same for the dependencies active in a period. They take the edges active in the period with a margin of 15 minutes before matching, so a recent window does not scan the history (about 0.3 s instead of 3 s with a million edges) and both sides of a connection are matched at the edges of the period; the dashboards and alerts use them. A dependency appeared in a period when it was first seen in it and is not in `known_dependencies` from before it, so one that comes back on new edges (a new container, an hourly job) did not appear |
 | `impact(target_host, since, until, target_service, target_port, target_proto, max_depth, cadence_depth)` | what removing a host would break (§6.3): its dependents in the period, one row per dependent, server and port. `depth` is 1 for the clients of the target and n for the clients of a dependent of depth n-1, up to `max_depth` (3; 1 to 10); `client_host`, `client_service` and, for a client without an agent, `client_addr`, with the name of its address as its service and the host the inventory gives the address; `server_host`, `server_service` (NULL if unknown; `~unknown` for a socket without a known owner; `~relay` for a client whose connections the host relays in its kernel, with the virtual port as `port`), `port` (0 under the rules of ports, §5.3) and `proto`; `first_seen`, `last_seen`, `observed_by`; `cadence` (`continuous`, `daily`, `weekly`, `monthly`, `periodic`, `irregular`, `one-off`, `dormant` or `unknown`), `period` and `next_expected` of a dependent with a period, and `runs`, for the dependents up to `cadence_depth` (1; 0 to 10) and NULL beyond. `target_service`, `target_port` and `target_proto` (NULL by default) narrow the target to a service, a port and a transport |
-| `impact_verdict(target_host, since, until, target_service, target_port, target_proto, min_coverage, tolerance)` | whether the target can be removed (§6.3), one row: `verdict` is `UNSAFE` (it has dependents), `INCONCLUSIVE` (none was seen, but the history does not tell so for `min_coverage` of the period, a part from 0 to 1, 1 by default) or `SAFE`; `reasons` tell why (`active_dependents`; `unknown_host`, `no_agent`, `not_observed`, `before_retention`, `dropped_flows`, `netns_limited`, `udp_not_traced`, `unix_not_traced`, `unknown_service`, `unknown_port`) and `caveats` the same shortfalls where they did not decide the verdict; `direct` counts the dependents, those of depth 1 of `impact()`; `coverage` is the part of the period, from 0 to 1 and cut rather than rounded, for which the history tells all that the target covers; `unobserved`, `gaps` and `partly_observed` as in `coverage()`. It fails for a period that is empty, a `min_coverage` that is not above 0 and up to 1, a `tolerance` that is not from 0 to 1 hour, a `target_proto` other than `tcp`, `udp` and `unix`, `unix` without a service or with a port, and a `target_port` that is no port |
+| `impact_verdict(target_host, since, until, target_service, target_port, target_proto, min_coverage, tolerance)` | whether the target can be removed (§6.3), one row: `verdict` is `UNSAFE` (it has dependents), `INCONCLUSIVE` (none was seen, but the history does not tell so for `min_coverage` of the period, a part from 0 to 1, 1 by default) or `SAFE`; `reasons` tell why (`active_dependents`; `unknown_host`, `no_agent`, `not_observed`, `before_retention`, `dropped_flows`, `netns_limited`, `udp_not_traced`, `unix_not_traced`, `masquerade_not_traced`, `unknown_service`, `unknown_port`) and `caveats` the same shortfalls where they did not decide the verdict; `direct` counts the dependents, those of depth 1 of `impact()`; `coverage` is the part of the period, from 0 to 1 and cut rather than rounded, for which the history tells all that the target covers; `unobserved`, `gaps` and `partly_observed` as in `coverage()`. It fails for a period that is empty, a `min_coverage` that is not above 0 and up to 1, a `tolerance` that is not from 0 to 1 hour, a `target_proto` other than `tcp`, `udp` and `unix`, `unix` without a service or with a port, and a `target_port` that is no port |
 | `coverage(since, until, hosts, tolerance)` | how much of a period the history tells what each host of `hosts` (every host that reported since `since` if NULL) was used for, by name: `host`, `agent` (false for a name no agent reported under), `observed` (from 0 to 1, cut), `unobserved` and its `gaps`, of which `before_retention` precedes the retention of the connector, `partly_observed` and `dropped_flows` (`partly_observed()`), and the time observed without UDP (`udp_untraced`), without Unix sockets or by an agent that does not tell (`unix_untraced`), or in one network namespace only (`netns_limited`). Unlike `unobserved_by_name()`, a session ends earlier by the time the clock of its host is behind, and nothing is observed before the retention (§6.3) |
 | `coverage_gaps(since, until, hosts, tolerance)` | the gaps of `coverage()`, which the verdict counts: `host`, `gap_start`, `gap_end` and `cause`, `retention` for the time before the retention of the connector and `agent` for the time in which no agent of the name observed. A name that no agent reported in the period has one gap, the whole period |
 
@@ -1945,12 +1948,22 @@ limits (§10). From them:
   relay shows nowhere. Its clients are its dependents all the same, with
   the server service `~relay` and the virtual address and port they
   connected to: the clients of the translations its agents learned from
-  conntrack (§5.4), unless the client or the backend is on the host
-  itself; the clients that reached a backend through a virtual address the
-  host held, by a translation of the configuration or one another host
-  learned; and the clients that the backends of a translation of the
-  configuration saw alone, while the host held its virtual address, since
-  they may have come through it.
+  conntrack (§5.4), unless the client is on the host itself; the clients
+  that reached a backend through a virtual address the host held, by a
+  translation of the configuration or one another host learned; and what
+  the backends of a translation of the configuration saw while the host
+  held its virtual address, since it may have come through it: the
+  clients that a backend saw alone, and, through a translation with
+  sources, whatever a backend saw from a source, also when a client with
+  an agent explains the edge, as the health checks of the director do,
+  since a backend cannot tell the clients behind a source apart.
+- **A backend on the host itself** changes one thing. When the host
+  keeps the address of the client (a published port), the server edge has
+  that address: the client is the dependent of the service, once, and the
+  translation adds nothing. When the host replaces the address of the
+  client by its own (masquerade, as kube-proxy does for a NodePort), the
+  server edge has an address of the host, and the translation alone tells
+  the client: it stays a `~relay` dependent.
 - **What counts for a service of a host**: the clients of the service;
   those of a socket of the host without a known owner (`~unknown`, §4.1)
   and those the host relays (`~relay`), since either may be the service's
@@ -1986,6 +1999,23 @@ limits (§10). From them:
   NodePort with masquerade) is the source of the clients outside it, and a
   process on the host has a client edge that the agent matches with its
   server (§6.2).
+- **Nor does a client on the target, for an edge that others share.** A
+  pod sees the kubelet that probes it and every client that its node
+  masqueraded as one peer, the bridge of the node: one server edge, which
+  matches the client edge of the kubelet and so looks like the node's
+  own. The evidence of a client outside wins over that explanation: the
+  translation that the agent learned names it (above). Where the agent
+  learned none because it could not, nothing tells: an agent that does
+  not trace translations, or that folds the peers outside its internal
+  ranges (§3.6, the default), whose translations it does not learn
+  (§3.7), leaves the clients from outside that the host masqueraded
+  nowhere in the history. The verdict on such a host is then not `SAFE`
+  for the time a socket of it accepted connections from an address of
+  the host in a network namespace in which no client of the host has
+  that address (`masquerade_not_traced`). A server in the namespace of
+  its client is reached by nothing that the host masqueraded, since what
+  is delivered locally is not translated on its way out: a host that
+  talks to itself over its own address stays its own.
 - **A dependent with an agent is followed**: the clients of its service on
   its host are the dependents of the next depth, up to `max_depth`. Each
   dependent is reported once, at the depth it is first reached, with the
@@ -2105,12 +2135,30 @@ A dependent of the last four has a `period`, the median interval, and
     agent that goes on whole, so the sessions alone would tell that a host
     was observed, and unused, in a time whose dependencies are gone.
     `shawk.prune()` records its cutoff (`shawk.retention`), and the time
-    before it is not observed, whatever the sessions say;
+    before it is not observed, whatever the sessions say. What was pruned
+    before that record existed is not known, so the migration starts it
+    from what the history itself tells: the oldest time an edge still
+    kept was last seen. A prune deletes every edge last seen before its
+    cutoff, so that time is no earlier than the latest cutoff, and before
+    it the history holds no dependency that ended, whether none did or
+    all were deleted. Without a start, a period longer than the retention
+    would look whole from the upgrade to the next prune, and for good
+    where none follows (a retention of 0, connectors stopped). The time
+    of the migration would be safe too, and would make every period that
+    starts before the upgrade `INCONCLUSIVE` for as long as the period,
+    with the history at hand. A prune that its bound of rows cut short
+    leaves older edges, so the start may be earlier than that cutoff
+    until the next prune records its own;
   - without dropped flows (`dropped_flows`, `partly_observed()`), in every
     network namespace (`netns_limited`), with UDP unless the target is of
     another transport (`udp_not_traced`), and with Unix sockets when the
     target is a service without a port, whose clients on the host may use
-    one (`unix_not_traced`).
+    one (`unix_not_traced`);
+  - *with the translations that tell masqueraded clients*, for a whole
+    host of which a pod or a container accepted connections from an
+    address of the host itself (`masquerade_not_traced`, above):
+    `agent_sessions` keeps whether the agent traces translations
+    (`translations_traced`) and what it folds (`peer_fold`).
 
   `coverage()` reports it per host and `coverage_gaps()` lists its gaps
   with their cause, `agent` or `retention`, also for a name that no agent
@@ -2138,9 +2186,12 @@ A dependent of the last four has a `period`, the median interval, and
 
 **Cost.** The functions read the dependencies of the period once, like the
 dashboards, then the edges, the hours, the sessions and the addresses of
-the hosts they find through their indexes; the addresses that hosts held
-are read whole, as `dependencies_between()` reads them for the shared
-ones. On a synthetic fleet of 2000 hosts with 1.1 million edges, of which
+the hosts they find through their indexes. Of the addresses that hosts
+held, they read the periods that meet the period asked for and, of each
+host, those of its last report before it, found from its last heartbeat:
+not the history of the retention, which is millions of periods where
+pods or nodes come and go (`dependencies_between()` still reads it, for
+the shared addresses). On a synthetic fleet of 2000 hosts with 1.1 million edges, of which
 500000 dependencies are in a period of 90 days, `dependencies_between()`
 takes 3.0 seconds, the verdict 4.3, and `impact()` 4.4 at depth 1 (179
 dependents with their cadences), 5.0 at depth 2 (7263 rows) and 6.2 at
@@ -2160,7 +2211,11 @@ hub (the best of several runs on a shared machine).
   (`TestPGImpactPlans`).
 - **The runs of a cadence are read in one pass** over the stretches of
   active and blind time in the order they start, so the cost grows with
-  the hours recorded, not their square.
+  the hours recorded, not their square. So are the stretches in which a
+  host reported addresses, over its periods in the order they start: a
+  join of every period with every stretch of its host took minutes for
+  3 million periods, where the verdict over 7 days now takes 3 seconds,
+  as without them.
 - **The verdict does not walk**, and the cadence is read for the depth
   asked for: what decides is computed first, and `shawk-impact` prints the
   verdict even when the list of the dependents then fails or runs out of
@@ -2335,10 +2390,14 @@ line, and a failure 1.
   the service asked for. A cadence that was not read prints as `-`, with
   the depth it is read to (`-cadence-depth`).
 - **The period ends at the clock of the database**, with which the
-  heartbeats are compared, and its `statement_timeout` (`-timeout`, 2
+  heartbeats are compared, and its `statement_timeout` (`-timeout`, 5
   minutes) is set in the transaction, which a connection pooler accepts
   where it refuses the setting at the connection: the 30 seconds of
-  Grafana are short for months of a large fleet.
+  Grafana are short for months of a large fleet, and a database under
+  load took close to 2 minutes for the fleet of §6.3.
+- **It tells what it cannot see** at the end of every report: a host
+  that only forwards packets looks unused (§10), which is what an
+  operator who asks about a director or a gateway must know.
 - **It needs PostgreSQL** (§5.8): a connection string that names a file
   of SQLite, or a database without `shawk_v1.impact_verdict()`, is an
   error that says so.
@@ -2603,10 +2662,22 @@ bound above holds. A store whose receiver takes less needs a smaller
   - *What no socket shows.* A host that only forwards packets is not seen
     to be used: a router, a hypervisor whose guests have the addresses, a
     bridge, and a load balancer whose kernel keeps no conntrack entry of
-    what it forwards (IPVS without `net.ipv4.vs.conntrack`) and for which
-    no translation is configured. The clients of a relay are its
-    dependents only through the translations its agent learned or the
-    configuration gives (§5.4). Nor are protocols other than TCP, UDP and
+    what it forwards (IPVS at its defaults, without
+    `net.ipv4.vs.conntrack=1`, #139) and for which no translation is
+    configured. The clients of a relay are its dependents only through
+    the translations its agent learned or the configuration gives (§5.4):
+    an active director with neither, whose clients have no agent, is
+    `SAFE` while it forwards their traffic. `shawk-impact` says so under
+    every report.
+  - *Masquerade.* The clients from outside that a host masqueraded to a
+    pod or a container of its own are told by the translations its agent
+    learned, and the verdict is not `SAFE` where the agent traces none or
+    folds external peers (§6.3). Translations are also missing for
+    connections confirmed before the agent started, when the table of the
+    agent overflowed (`shawk.agent.translations.dropped`), and with a
+    datapath without netfilter conntrack (§3.7): such a client then shows
+    only as the address of the host, which a client on the host may
+    explain. Nor are protocols other than TCP, UDP and
     Unix stream sockets seen (RDMA, SCTP, ICMP, VRRP), nor what a service
     needs to run at all without a connection: a container runtime, a
     supervisor.

@@ -228,7 +228,19 @@ shawk-impact -dsn-file /etc/shawk/impact-dsn -host db-01 -json | jq .verdict
   addresses it holds, as dependents, with the server `~relay`. They count
   for each service of the host as well, since nothing tells which one
   keeps the translations; name a port to narrow the question. A host that
-  only routes or bridges (a router, a hypervisor) is not seen to be used.
+  only forwards packets is not seen to be used: a router, a hypervisor,
+  and a director or a gateway whose translations its agent does not learn
+  (IPVS at its defaults, without `net.ipv4.vs.conntrack=1`) and that
+  `translations` of the connector does not describe. The report says so
+  at its end.
+- A host whose pods or containers are reached from outside through a
+  port it publishes with masquerade (a NodePort) shows those clients as
+  its own address, like its kubelet. The translations its agent learns
+  tell them apart, and such clients are dependents; an agent that folds
+  external peers (`-fold-external in`, the default) or traces no
+  translation does not learn them, and the verdict on the host is then
+  `INCONCLUSIVE` (`masquerade_not_traced`) rather than `SAFE`. Run the
+  agents of such hosts with `-fold-external none` to decide it.
 - The period (`-lookback`, 90 days, an hour at least) must be longer than
   the rarest job that matters: a job of every quarter is not a dependent
   over 90 days in which it did not run.
@@ -251,7 +263,9 @@ SELECT * FROM shawk_v1.coverage_gaps(now() - interval '90 days', now(), ARRAY['d
 
 A period of months over a large fleet may take longer than the 30
 seconds `setup.sql` gives the statements of `shawk_grafana`: the panels
-then fail, and `shawk-impact` sets its own limit (`-timeout`). On a fleet
+then fail, and `shawk-impact` sets its own limit (`-timeout`, 5 minutes),
+and prints the verdict even when the list of the dependents then runs
+out of time. On a fleet
 of 2000 hosts with 500000 dependencies in 90 days, the verdict takes
 about 4 seconds and `shawk-impact` at its defaults 12 to 16 (design §6.3).
 
@@ -299,7 +313,9 @@ the table is larger than `shawk.edges` itself (401 MB against 364 MB for
 1.1 million edges). A connector of an earlier version writes none, so
 upgrade all the connectors before reading cadences (`shawk-impact`). The
 connectors also record the cutoff of their retention from then on: a
-period that reaches before it is `INCONCLUSIVE`.
+period that reaches before it is `INCONCLUSIVE`. The migration starts
+that record from the oldest edge the database still holds, so a period
+that reaches before it is `INCONCLUSIVE` right after the upgrade too.
 
 ## HPC clusters
 

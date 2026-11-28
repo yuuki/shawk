@@ -161,9 +161,10 @@ func writeText(w io.Writer, r *report, limit int) error {
 		fmt.Fprint(w, "The coverage is from 0 to 1. A gap of 3m or less is not counted: an agent that\n"+
 			"restarts within it is not seen to.\n")
 	}
-	_, err := fmt.Fprint(w, "\nOnly TCP, UDP and Unix stream sockets are observed: a host used over RDMA, one that\n"+
-		"only forwards packets, or one used less often than the period, looks unused\n"+
-		"(docs/design.md, sections 6.3 and 10).\n")
+	_, err := fmt.Fprint(w, "\nOnly TCP, UDP and Unix stream sockets are observed. A host looks unused when it is used\n"+
+		"over RDMA, less often than the period, or only forwards packets: a router, a hypervisor,\n"+
+		"and a load balancer or gateway whose translations its agent does not learn (IPVS at its\n"+
+		"defaults) and the configuration does not give (docs/design.md, sections 6.3 and 10).\n")
 	return err
 }
 
@@ -242,6 +243,10 @@ func describeShortfall(r *report, code string) string {
 		return fmt.Sprintf("its agent did not trace Unix sockets, or did not tell, for %s", seconds(t.UnixUntracedSeconds))
 	case "netns_limited":
 		return fmt.Sprintf("its agent traced one network namespace only for %s", seconds(t.NetnsLimitedSeconds))
+	case "masquerade_not_traced":
+		return "a pod or a container of it accepted connections from an address of the host itself, and its agent did not " +
+			"learn the translations that would tell clients outside it, masqueraded by the host, from its own (it traces " +
+			"none, or folds external peers: -fold-external none)"
 	}
 	return printable(code)
 }
