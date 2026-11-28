@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
+	"unicode"
 
 	"github.com/yuuki/shawk/collector/shawkconnector"
 )
@@ -154,13 +157,15 @@ func FuzzDriftText(f *testing.F) {
 	f.Fuzz(func(t *testing.T, service, peer string) {
 		d := testDependency(peer, 443, "tcp")
 		d.Service, d.Hosts, d.Addresses, d.NamedBy = service, []string{peer, service}, []string{service}, peer
+		d.Processes, d.KernelChosen, d.Port, d.Ports = []string{peer, service}, true, 0, []int{443}
 		at := testUntil
 		r := &driftReport{Since: testUntil.Add(-time.Hour), Until: testUntil, Verdict: verdictDrift, Reasons: []string{peer},
-			Caveats:  []string{"stale_baseline", "unlocked_service", "not_observed", service},
+			Caveats:  []string{"stale_baseline", "unlocked_service", "not_observed", "no_host", service},
 			Baseline: &baselineState{ReadAt: &at, FailedAt: &at, Error: &peer, Services: 1, Dependencies: 1},
 			Asked:    []string{service}, Unlocked: []string{service, peer}, Drift: []dependency{d},
-			NotObserved: []baselineService{{Service: service, ShortHosts: []string{peer}}},
+			NotObserved: []baselineService{{Service: service, ShortHosts: []string{peer}}, {Service: peer, Reasons: []string{"unknown_service"}}},
 			NewServices: []newService{{Service: peer, FirstSeen: at, Hosts: []string{service}}}}
+		checkJSON(t, r)
 		text := r.text(0)
 		for _, c := range text {
 			if c != '\n' && (c < ' ' || c == 0x7f || c == 0x85 || c == 0x2028 || c == 0x2029 || c == 0x1b) {
@@ -175,4 +180,61 @@ func FuzzDriftText(f *testing.F) {
 			t.Fatalf("the table of the drift:\n%s", table)
 		}
 	})
+}
+
+// checkJSON checks a report as JSON: one document that holds no character
+// that does not print as it is, and that is read back to the same values,
+// whatever the names of the report hold.
+func checkJSON(t testing.TB, report any) {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := writeJSON(&buf, report); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range buf.String() {
+		if c != '\n' && !unicode.IsPrint(c) {
+			t.Fatalf("the JSON report holds %U as it is\n%q", c, buf.String())
+		}
+	}
+	var plain bytes.Buffer
+	enc := json.NewEncoder(&plain)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(report); err != nil {
+		t.Fatal(err)
+	}
+	var got, want any
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatalf("the JSON report is not JSON: %v\n%s", err, buf.String())
+	}
+	if err := json.Unmarshal(plain.Bytes(), &want); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("the JSON report is read back as %v, want %v", got, want)
+	}
+}
+
+// TestJSONShowsWhatItHolds: the JSON reports write as escapes the
+// characters that encoding/json writes as they are and that a terminal or
+// a viewer acts on.
+func TestJSONShowsWhatItHolds(t *testing.T) {
+	names := []string{"csi\u009b2J", "evil\u202egnp.exe", "zero\u200bwidth", "sep\u2028\u2029", "bom\ufeff", "nel\u0085", "soft\u00adhyphen",
+		"plane\U000e0001tag", "esc\x1b[2J", "ok-\u6c7a\u6e08-\u00e9"}
+	d := testDependency("p", 443, "tcp")
+	d.Hosts, d.Processes = names, names
+	r := &driftReport{Verdict: verdictDrift, Asked: names, Drift: []dependency{d}}
+	checkJSON(t, r)
+	var buf bytes.Buffer
+	if err := writeJSON(&buf, r); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"csi\u009b2J"`, `"evil\u202egnp.exe"`, `"plane\udb40\udc01tag"`, `"esc\u001b[2J"`, "\"ok-\u6c7a\u6e08-\u00e9\""} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("no %s in\n%s", want, buf.String())
+		}
+	}
+	rules := testReport(t, target{Host: names[1], Unit: names[0]}, formatJSON, ingressSources,
+		testFlow(egress, names[2], "tcp", "10.0.0.1/32", 80, names[3]))
+	checkJSON(t, rules)
+	checkJSON(t, testBaselineReport(baselineService{Service: names[4], Dependencies: []dependency{d}, ShortHosts: names}))
 }

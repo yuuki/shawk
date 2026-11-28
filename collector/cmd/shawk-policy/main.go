@@ -36,7 +36,8 @@ Usage:
 
   rules     the connections of a host, or of a systemd unit of it, over a period,
             as an nftables ruleset or a systemd drop-in that allows them and denies
-            the rest
+            the rest. The ruleset is an audit form, which counts and logs what it
+            would deny, unless -enforce asks for the one that rejects
   baseline  the dependencies of services over a period as a baseline file, which
             the connector reads once it is approved (baseline_file)
   drift     the dependencies of the services of the baseline that it does not hold
@@ -44,8 +45,11 @@ Usage:
 The rules and the baseline are COMPLETE when the history tells every connection of
 the target for the whole period, and INCOMPLETE when it does not (a gap of the
 agent, a period that reaches before the retention, dropped flows, UDP not traced,
-no agent) or the target is not known. Rules made from an incomplete history deny
-what was not seen: they are written only with -allow-incomplete, and say so.
+no agent, several machines under one host name, an agent that did not learn the
+addresses that the host rewrites its connections to) or the target is not known.
+Rules made from an incomplete history deny what was not seen: a file that blocks
+is written only with -allow-incomplete, and says so. No drift is CLEAN only when
+every host that runs the services was observed; it is INCONCLUSIVE otherwise.
 
 Exit status: 0 COMPLETE, or no drift, and nothing else; 3 DRIFT; 4 INCOMPLETE, or
 INCONCLUSIVE for a drift that cannot be told; 1 when the command fails; 2 when the

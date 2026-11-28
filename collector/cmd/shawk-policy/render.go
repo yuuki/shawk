@@ -67,23 +67,18 @@ func writeJSON(w io.Writer, v any) error {
 
 // escapeJSON replaces the characters of a JSON document that do not
 // print with their \u escapes. Outside its strings a document holds
-// ASCII only, so such a character is within a string, where the escape
-// stands for it.
+// printing ASCII and line breaks only, so such a character is within a
+// string, where the escape stands for it: U+007F too, which is ASCII and
+// which encoding/json writes as it is.
 func escapeJSON(doc []byte) []byte {
-	clean := true
-	for _, r := range string(doc) {
-		if r > unicode.MaxASCII && !unicode.IsPrint(r) {
-			clean = false
-			break
-		}
-	}
-	if clean {
+	hidden := func(r rune) bool { return r != '\n' && !unicode.IsPrint(r) }
+	if !bytes.ContainsFunc(doc, hidden) {
 		return doc
 	}
 	var out bytes.Buffer
 	for _, r := range string(doc) {
 		switch {
-		case r <= unicode.MaxASCII || unicode.IsPrint(r):
+		case !hidden(r):
 			out.WriteRune(r)
 		case r > 0xffff:
 			hi, lo := utf16.EncodeRune(r)
