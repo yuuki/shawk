@@ -266,8 +266,9 @@ seconds `setup.sql` gives the statements of `shawk_grafana`: the panels
 then fail, and `shawk-impact` sets its own limit (`-timeout`, 5 minutes),
 and prints the verdict even when the list of the dependents then runs
 out of time. On a fleet
-of 2000 hosts with 500000 dependencies in 90 days, the verdict takes
-about 4 seconds and `shawk-impact` at its defaults 12 to 16 (design §6.3).
+of 2000 hosts with 500000 dependencies in 90 days, the verdict takes 5
+to 7 seconds and `shawk-impact` at its defaults 13 to 19, several times
+that on a database under load (design §6.3).
 
 ## SQLite lightweight mode (without PostgreSQL)
 

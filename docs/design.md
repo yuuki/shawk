@@ -2191,16 +2191,20 @@ held, they read the periods that meet the period asked for and, of each
 host, those of its last report before it, found from its last heartbeat:
 not the history of the retention, which is millions of periods where
 pods or nodes come and go (`dependencies_between()` still reads it, for
-the shared addresses). On a synthetic fleet of 2000 hosts with 1.1 million edges, of which
-500000 dependencies are in a period of 90 days, `dependencies_between()`
-takes 3.0 seconds, the verdict 4.3, and `impact()` 4.4 at depth 1 (179
-dependents with their cadences), 5.0 at depth 2 (7263 rows) and 6.2 at
-depth 3 (126260 rows): about twice the dependencies of the period, at any
+the shared addresses). On a synthetic fleet of 2000 hosts with 1.1
+million edges, of which 500000 dependencies are in a period of 90 days,
+`dependencies_between()` takes 4.1 to 4.8 seconds, the verdict 5.4 to
+7.4, and `impact()` 4.8 to 7.0 at depth 1 (179 dependents with their
+cadences), 5.7 to 8.9 at depth 2 (7263 rows) and 7.9 to 10.8 at depth 3
+(126260 rows): once to twice the dependencies of the period, at any
 depth. The cadence costs 0.3 to 0.9 milliseconds per dependent, for 1 to
 150 runs: 4 more seconds for a hub with 3559 dependents, and 100 for the
 rows of depth 3 above, which is why it is read for depth 1 unless asked.
-`shawk-impact` at its defaults takes 12 seconds there, and 16 for the
-hub (the best of several runs on a shared machine).
+`shawk-impact` at its defaults takes 13 to 14 seconds there, and 17 to
+19 for the hub. These are the best and the worst of five runs on a
+machine shared with other work, at load averages of 9 to 17; at 25 to
+35 the command took 83 and 109 seconds, which is why its time limit is
+5 minutes.
 
 - **The joins hash.** `shawk.dependents()` joins the dependencies of the
   period with each other, and they are the rows of a function, of which
