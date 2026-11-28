@@ -458,6 +458,50 @@ type fakeStore struct {
 	// hold, when not nil, is called by write before it writes, outside the
 	// lock: it may block, and the error it returns fails the write.
 	hold func(*hostChanges) error
+	// baseline is the baseline written, baselineSyncs how many times it
+	// was, and baselineFails the failures recorded; report is what
+	// baselineReport returns, reportErr its error and reports the periods
+	// it was asked for.
+	baseline      *Baseline
+	baselineSyncs int
+	baselineFails []string
+	report        *baselineReport
+	reportErr     error
+	reports       [][2]time.Time
+	// hostsSince is since when the hosts of the last report run a service.
+	hostsSince time.Time
+}
+
+func (s *fakeStore) syncBaseline(_ context.Context, b *Baseline, _ time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.fail {
+		return errFake
+	}
+	s.baseline = b
+	s.baselineSyncs++
+	return nil
+}
+
+func (s *fakeStore) baselineFailed(_ context.Context, _ time.Time, msg string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.baselineFails = append(s.baselineFails, msg)
+	return nil
+}
+
+func (s *fakeStore) baselineReport(_ context.Context, since, until, hostsSince time.Time, _, _ int) (*baselineReport, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reports = append(s.reports, [2]time.Time{since, until})
+	s.hostsSince = hostsSince
+	if s.reportErr != nil {
+		return nil, s.reportErr
+	}
+	if s.report == nil {
+		return &baselineReport{}, nil
+	}
+	return s.report, nil
 }
 
 func (s *fakeStore) schemaVersion(context.Context) (int, error) {
@@ -620,6 +664,7 @@ type series struct {
 	transport                              string
 	errType                                string
 	peerHost                               string // shawk.peer.host
+	baselinePeer                           string // shawk.baseline.peer
 	localNet, peerNet                      string // shawk.local.network, shawk.peer.network
 	agent                                  bool
 	port                                   int64
@@ -627,6 +672,42 @@ type series struct {
 	count                                  uint64
 	// buckets are those of a histogram, nil for one without bounds.
 	buckets []uint64
+}
+
+// sentStrings returns every string that metrics hold as an attribute of a
+// resource or of a point, as it is: what the connector sends, and not
+// what getString would make of it.
+func sentStrings(md pmetric.Metrics) []string {
+	var out []string
+	add := func(m pcommon.Map) {
+		m.Range(func(_ string, v pcommon.Value) bool {
+			if v.Type() == pcommon.ValueTypeStr {
+				out = append(out, v.Str())
+			}
+			return true
+		})
+	}
+	rms := md.ResourceMetrics()
+	for i := range rms.Len() {
+		add(rms.At(i).Resource().Attributes())
+		sms := rms.At(i).ScopeMetrics()
+		for j := range sms.Len() {
+			ms := sms.At(j).Metrics()
+			for k := range ms.Len() {
+				switch m := ms.At(k); m.Type() {
+				case pmetric.MetricTypeSum:
+					for l := range m.Sum().DataPoints().Len() {
+						add(m.Sum().DataPoints().At(l).Attributes())
+					}
+				case pmetric.MetricTypeGauge:
+					for l := range m.Gauge().DataPoints().Len() {
+						add(m.Gauge().DataPoints().At(l).Attributes())
+					}
+				}
+			}
+		}
+	}
+	return out
 }
 
 func flatten(md pmetric.Metrics) []series {
@@ -651,7 +732,7 @@ func flatten(md pmetric.Metrics) []series {
 						agent: agent.Bool(), errType: getString(a, attrErrorType), peerHost: getString(a, attrPeerHost),
 						localNet: getString(a, attrLocalNetwork), peerNet: getString(a, attrPeerNetwork),
 						role: getString(a, attrRole), dir: getString(a, attrIODirection), port: port, value: v, count: c,
-						transport: getString(a, attrTransport)})
+						transport: getString(a, attrTransport), baselinePeer: getString(a, attrBaselinePeer)})
 				}
 				switch m.Type() {
 				case pmetric.MetricTypeSum:

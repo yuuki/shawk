@@ -305,8 +305,187 @@ The embedded SQLite database is internal to one collector process (protected
 by an exclusive lock file) and keeps peer-resolution state only (up to 30
 days). Long-term history, change alerts, `unobserved()` coverage gaps,
 multi-hop walks, the impact of removing a host (`shawk-impact`, which
-refuses this mode, and the dashboard shawk / Impact), `job_users`,
+refuses this mode, and the dashboard shawk / Impact), rules and the
+baseline of dependencies (`shawk-policy`, `baseline_file`), `job_users`,
 `node_states_file` and `maintenance_file` require PostgreSQL mode.
+
+## Rules and a baseline of dependencies
+
+`shawk-policy`, in the `shawk-collector` packages and the image, writes
+least-privilege rules and a baseline of dependencies for review, from
+PostgreSQL ([design §6.4](../docs/design.md#64-least-privilege-rules-and-the-baseline-of-dependencies)).
+It applies nothing, and reads `shawk_v1` only: give it the connection
+string of `shawk-impact`, a role with the privileges of `shawk_grafana`.
+
+```sh
+shawk-policy rules -dsn-file /etc/shawk/impact-dsn -host app-01                      # the report: what rules would hold
+shawk-policy rules -dsn-file /etc/shawk/impact-dsn -host app-01 -format nftables > app-01.audit.nft
+shawk-policy rules -dsn-file /etc/shawk/impact-dsn -host app-01 -format nftables -enforce > app-01.nft
+shawk-policy rules -dsn-file /etc/shawk/impact-dsn -host app-01 -unit app.service -format systemd -enforce
+```
+
+- Read the top of the file first: the status, what the rules pin, what
+  they leave out, and what shawk cannot observe. The exit status is 0 for
+  `COMPLETE` and nothing else, and 4 for `INCOMPLETE`, when no file that
+  blocks is written unless `-allow-incomplete`. The rules of a host whose
+  agent folds peers (`-fold-external in`, the default) are `INCOMPLETE`:
+  such an agent does not learn a destination that the host rewrites to an
+  address outside its internal ranges.
+- Load the audit form before the form that rejects. `-format nftables`
+  writes the audit form, which rejects nothing:
+
+  ```sh
+  nft -c -f app-01.audit.nft && nft -f app-01.audit.nft
+  nft list counters table inet shawk_policy    # egress_unlisted, ingress_unlisted: what no rule lists
+  journalctl -k -g 'shawk-policy unlisted'     # the same, with addresses and ports (10 lines a second at most)
+  nft reset counters table inet shawk_policy   # a few minutes later, only if the table started the connection tracking
+  ```
+
+  The counters count every packet that the opening side of a connection
+  sends, where no rule lists the connection, for as long as it lives: a
+  tunnel or a session that stays open keeps counting after the counters
+  are cleared, and so does a connection that was open before the table
+  on a host that tracked connections already. Leave the table for as
+  long as the slowest job of the host takes to come round, and longer
+  than the longest silence of its open connections. Only while
+  the counters stay at 0, load the form that rejects (`nft -f app-01.nft`
+  replaces the table in one transaction); it lets the connections that
+  are established at that moment go on, listed or not, until they end.
+  What the counters show and no history of shawk holds: the outer packets
+  of tunnels that the kernel makes (VXLAN, Geneve, WireGuard), the
+  virtual services of a host that balances with IPVS (use `-ingress none`
+  there; `shawk-policy` was not run on such a host), and destinations
+  that the host rewrites.
+- Know what the audit form cannot show; the file lists it. A connection
+  whose opening side sends nothing while you watch is not counted. On a
+  host where the table itself started the connection tracking (nothing
+  used it before), a TCP connection that was open at that moment is
+  counted once, with its next packet, and not after the counters are
+  cleared: the tracking cannot tell which side opened it. Restart its
+  service under the audit form to have it compared with the rules. Until
+  the counters are cleared they also hold listed connections that were
+  taken up from their answering side.
+- Check two things before loading a table on a host that tracks no
+  connection yet (no firewall, no NAT, no container runtime). The table
+  starts the connection tracking of the kernel, which keeps at most
+  `net.netfilter.nf_conntrack_max` connections and drops the packets of
+  new ones when its table is full (`nf_conntrack: table full, dropping
+  packet` in the kernel log): on a host with very many connections,
+  compare `ss -s` with the limit and raise it first. And the form that
+  rejects, loaded without the audit form on such a host, stops the open
+  connections whose peer sends next. The audit form uses the connection
+  labels 125 to 127. It compares a connection that no rule lists, and
+  one that was open before it, with every rule at every packet of its
+  opening side: with 400 rules, a sender on such a connection had a
+  tenth of its rate left on an idle machine and a sixth on a loaded one,
+  and with a few rules nothing was measured. A host with much traffic
+  that no rule lists (a tunnel of the kernel) is slowed like this for as
+  long as the audit form is loaded.
+- Look for another table that takes traffic out of the connection
+  tracking (`nft list ruleset | grep notrack`; a DNS cache on the node
+  does it for port 53). The form that rejects refuses the answers of such
+  traffic although a rule lists the connection; the audit form counts
+  them.
+- A connection keeps its label when the table is loaded again. If you
+  take a rule out of the file by hand and load it again, a connection
+  that the rule listed when it began is not counted: it is compared with
+  the rules when it is opened again.
+- A rule of UDP has a second rule for the other way, between the same
+  port on both sides of the same peer (`udp sport P udp dport P`), for
+  sockets that send and receive first on one port (gossip, NTP between
+  peers, IKE). No other port is opened: a peer that starts from another
+  port later than the tracking remembers the exchange is not listed, and
+  the audit form counts it.
+- A drop-in of systemd has no audit form: it blocks every address that it
+  does not list, for every IP protocol, as soon as the unit restarts with
+  it. Check it with `systemd-analyze verify app.service`, and the host
+  with the audit form first. The table is one of its own
+  (`nft delete table inet shawk_policy` removes it).
+- Write the rules again when peers change: they pin addresses.
+
+To alert on a service that does something its baseline does not hold:
+
+1. Write a baseline from a period, and review it:
+
+   ```sh
+   shawk-policy baseline -dsn-file /etc/shawk/impact-dsn -service shop/app -service shop/worker > baseline.yaml
+   ```
+
+   The file ends with `end: {services: N, dependencies: N}`, which tells
+   that it is whole: keep the line last, and its counts right when you
+   edit the file by hand (or write `end: {}`). A dependency on a server
+   that listens on a port the kernel chose is written
+   `port: kernel-chosen`: it approves the ports that the kernel chooses
+   for servers of that name, so a restart on another such port is no
+   drift, and a server of the same name on a fixed port is one. Port 0
+   approves every port. Whether the kernel chose a port is known by the
+   host of the server and the number of the port: a process on that host
+   that has the kernel choose the number of a fixed port of the server
+   makes a connection to the fixed port pass. In Prometheus such a
+   dependency has `server_port="0"`, and the alert says "a port that
+   changes at every run". With `-all`, every name that was seen in the
+   period has a baseline, also a tool that ran once: `drift` stays
+   `CLEAN` for a service that runs nowhere while the hosts that ran it
+   are observed.
+2. Give it to every connector (`baseline_file: /etc/shawk/baseline.yaml`
+   in `collector/config.yaml`), readable by `shawk-collector`. The
+   connector reads it every write interval; a file that is invalid, or
+   that was cut short, keeps the baseline read before, and
+   `ShawkBaselineFileInvalid` alerts. It alerts too when the file is
+   valid and PostgreSQL does not take it.
+3. Load `prometheus/shawk-rules.yml`: `ShawkBaselineDrift` fires for a
+   dependency that the baseline does not hold, once per service, server,
+   port and transport. Three alerts tell where no drift is no answer:
+   `ShawkBaselineNotEvaluated` (critical: no connector evaluates the
+   drift), `ShawkBaselineHostsNotObserved` (a host that runs a service
+   was not observed: its agent is stopped, or its clock is behind) and
+   `ShawkBaselineServiceWithoutHosts` (no process of a service of the
+   file was ever seen: check its name). A service that no host runs now
+   is judged on the hosts that ran it last: where they are observed it
+   did nothing and nothing fires, and where one of them is silent it may
+   run there still, and `ShawkBaselineHostsNotObserved` fires until the
+   host reports again, another host runs the service, or the service is
+   taken out of the file. A host runs a service for
+   `baseline_host_memory` (a week) after a process of it was last seen
+   there, so a host that was removed alerts until then: shorten it where
+   hosts come and go (1 hour at least; a memory shorter than the period
+   that is evaluated counts as that period). A host that is installed
+   again under its name replaces its first machine as soon as it
+   reports. This reads the host name and the order of the reports only:
+   another machine that reports under the name of a host whose agent is
+   merely stopped makes that host count as gone, and a reinstall under
+   another name, or with both machines reporting for a while, is not
+   seen as one and alerts until the memory ends.
+   `prometheus/tests` holds unit tests of these alerts
+   (`promtool test rules baseline.test.yml`).
+4. When it fires, `shawk-policy drift -service NAME` lists the hosts and
+   the addresses, and the process when it is one of another name in a
+   unit of the service: the services of a unit judge such a process
+   together, and what none of them approves is one finding. Units that
+   unrelated processes share are the exception: the jobs of Slurm
+   (`slurm/...`), login sessions (`session.scope`), `systemd-run` without
+   a name and the units of a user (`user@N.service`) judge nothing, since
+   a baseline of `python3` would otherwise judge every program of every
+   user beside it. `drift` lists what such processes did next to a
+   service of the baseline, under the drift, and no alert fires for it:
+   give the tools that matter a baseline of their own name. A process
+   that leaves the unit of its service for such a unit
+   (`systemd-run --scope`) is judged by no baseline, and shows in the
+   list only where a service of the baseline runs in that same unit, and
+   among the new services only if its name is new to the fleet: a `curl`
+   that does so shows nowhere unless `curl` has a baseline. To approve a
+   dependency, add its line to the file, or write the service again and
+   review the difference. Write it with `-merge` and the file of the
+   connector: a file written for some services without it is a part of
+   the baseline (it says `NOT A WHOLE BASELINE` at its top), and deployed
+   alone it takes the baseline of the other services away:
+
+   ```sh
+   shawk-policy baseline -dsn-file /etc/shawk/impact-dsn -service shop/app -merge baseline.yaml > new.yaml
+   ```
+
+A service that is not in the file is not judged. The baseline needs
+PostgreSQL: `baseline_file` is refused with the SQLite lightweight mode.
 
 ## Upgrading
 
@@ -330,6 +509,22 @@ that reaches before it is `INCONCLUSIVE` right after the upgrade too. In
 a database whose edges are all recent, that start is recent as well and
 does not move back: periods that reach before it stay `INCONCLUSIVE`
 until they no longer do.
+
+Migration 0006 adds the tables of the baseline and the functions that
+`shawk-policy` and the connector read (`policy_flows()`,
+`baseline_drift()` and the others). It changes no table that holds
+history. A connector of an earlier version ignores them; one with
+`baseline_file` needs the migration, and waits for it like any other.
+Migrations 0005 and 0006 are released together: 0006 comes with the
+last text of 0005, which changed until then. A database that a build
+from before that release migrated (a build of a development branch)
+must be created again: a migration is applied once, by its number, so
+`shawk-migrate` calls such a database up to date and leaves it as it is.
+With an earlier 0006, `shawk-policy` fails on it. With an earlier 0005
+alone, the commands run with the earlier `coverage_gaps()`,
+`dependents()` and `impact()`, whose order follows the collation of the
+database. Drop such a database, or its schemas `shawk` and `shawk_v1`,
+and migrate again.
 
 ## HPC clusters
 

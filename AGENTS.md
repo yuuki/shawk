@@ -7,14 +7,15 @@
 - Strings from agents go through `cleanString` and the size cuts before PostgreSQL; the agent sends valid UTF-8 only.
 - BPF programs run for every process: trace TCP at state changes and walks, never per message, except the opt-in program of wire protocols (design §3.9), which must return at once for connections that sent; keep the per-datagram UDP programs short.
 - Prometheus outputs carry no addresses (unless `keep_peer_address`); every new label needs a bound on its cardinality.
+- A test runs a command in a network namespace only through `collector/cmd/shawk-policy/netnsguard_test.go`, which refuses the namespace of the test itself: an nftables table loaded there filters the machine that runs the tests.
 
 ## Compatibility contracts
 - PostgreSQL schema `shawk_v1`, public: `collector/shawkconnector/migrations/`; a change is a new migration.
-- Prometheus names and labels, public: `collector/shawkconnector/names.go`, `aggregate.go`, `packaging/prometheus/shawk-rules.yml`, `packaging/grafana/`.
+- Prometheus names and labels, public: `collector/shawkconnector/names.go`, `aggregate.go`, `baseline.go`, `packaging/prometheus/shawk-rules.yml`, `packaging/grafana/`.
 - Unit and service names (`procinfo.Unit`, `ServiceName`): stored in PostgreSQL and used as `job` in Prometheus.
 - Agent ↔ connector, released together: `internal/otlp/names.go` ↔ `collector/shawkconnector/names.go`, golden `collector/shawkconnector/testdata/agent-request.json`.
 - BPF: structs of `internal/tracer/bpf/shawk.h` ↔ `bpf_bpfel.go` ↔ `collect.go`, `iter.go`, `conntrack.go`; enums mirrored in `types.go`.
-- Agent flags (`internal/cli/cli.go`, `packaging/systemd/agent.env`); connector configuration keys (`config.go`, `packaging/collector/config.yaml`); flags, exit statuses (0 is `SAFE` alone) and JSON of `shawk-impact` (`collector/cmd/shawk-impact`).
+- Agent flags (`internal/cli/cli.go`, `packaging/systemd/agent.env`); connector configuration keys (`config.go`, `packaging/collector/config.yaml`); flags, exit statuses (0 is `SAFE` alone) and JSON of `shawk-impact` (`collector/cmd/shawk-impact`); the same of `shawk-policy` (0 is `COMPLETE` or `CLEAN` alone) and the format of `baseline_file` (`collector/cmd/shawk-policy`, `baseline.go`).
 - The systemd units and their sandbox: `packaging/systemd/`.
 
 ## Before opening a pull request

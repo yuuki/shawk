@@ -1,0 +1,4 @@
+go test fuzz v1
+string("ì")
+string("\n0")
+uint16(443)

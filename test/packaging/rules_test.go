@@ -2,9 +2,14 @@ package packaging
 
 import (
 	"log/slog"
+	"maps"
+	"os/exec"
+	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/rulefmt"
@@ -465,6 +470,192 @@ eval instant at 23m ` + a("ShawkAgentDown") + `
 	}
 }
 
+// TestBaselineAlerts evaluates the alerts of the baseline of dependencies
+// over what a connector sends.
+func TestBaselineAlerts(t *testing.T) {
+	_, alerts := loadRules(t)
+	a := func(name string) string {
+		e, ok := alerts[name]
+		if !ok {
+			t.Fatalf("no alert %s", name)
+		}
+		return inline(e, nil)
+	}
+	drift := `{job="shop/app", service_peer_name="billing/api", server_port="8443", network_transport="tcp"}`
+	// The connectors evaluate every 5 minutes until 40m, when they stop for
+	// good; the second reads a file that an edit broke from 20m to 25m.
+	// From 10m, 120 hosts of shop/app connect to billing/api, 3 to an
+	// address that shawk cannot name, and curl appears. One host of
+	// shop/app is not observed from 15m to 25m, and no host runs
+	// batch/report. A drift on one host of shop/web is told once, at 30m.
+	script := `
+load 1m
+  shawk_baseline_evaluation_timestamp_seconds{job="shawk-connector"} 0 0 0 0 0 300x4 600x4 900x4 1200x4 1500x4 1800x4 2100x4 2400
+  shawk_baseline_file_failed{job="shawk-connector"} 0x19 1x5 0x15
+  shawk_baseline_drift_truncated{job="shawk-connector", shawk_baseline_peer="named"} 0x29 12x10
+  shawk_baseline_drift_truncated{job="shawk-connector", shawk_baseline_peer="unresolved"} 0x19 7x20
+  shawk_baseline_new_services{job="shawk-connector"} 0x9 1x30
+  shawk_baseline_dependencies{job="shop/app"} 3x40
+  shawk_baseline_hosts{job="shop/app"} 120x40
+  shawk_baseline_hosts_unobserved{job="shop/app"} 0x14 1x10 0x15
+  shawk_baseline_hosts{job="batch/report"} 0x40
+  shawk_baseline_hosts_unobserved{job="batch/report"} 0x40
+  shawk_baseline_drift_hosts` + drift + ` _x10 100x4 120x25
+  shawk_baseline_drift_hosts{job="shop/app", service_peer_name="~unresolved", server_port="22", network_transport="tcp"} _x10 3x30
+  shawk_baseline_drift_hosts{job="shop/web", service_peer_name="~external", server_port="4444", network_transport="tcp"} _x30 1
+
+eval instant at 5m ` + a("ShawkBaselineDrift") + `
+
+eval instant at 12m ` + a("ShawkBaselineDrift") + `
+  ` + drift + ` 100
+
+eval instant at 20m ` + a("ShawkBaselineDrift") + `
+  ` + drift + ` 120
+
+# A drift on one host is a drift.
+eval instant at 30m ` + a("ShawkBaselineDrift") + `
+  ` + drift + ` 120
+  {job="shop/web", service_peer_name="~external", server_port="4444", network_transport="tcp"} 1
+
+eval instant at 20m ` + a("ShawkBaselineDriftUnresolved") + `
+  {job="shop/app", service_peer_name="~unresolved", server_port="22", network_transport="tcp"} 3
+
+eval instant at 12m ` + a("ShawkNewServiceWithoutBaseline") + `
+  {} 1
+
+eval instant at 5m ` + a("ShawkNewServiceWithoutBaseline") + `
+
+eval instant at 22m ` + a("ShawkBaselineFileInvalid") + `
+  {} 1
+
+eval instant at 30m ` + a("ShawkBaselineFileInvalid") + `
+
+# What is cut of the drift is told by the peers it is on.
+eval instant at 35m ` + a("ShawkBaselineDriftTruncated") + `
+  {} 12
+
+eval instant at 25m ` + a("ShawkBaselineDriftTruncated") + `
+
+eval instant at 25m ` + a("ShawkBaselineDriftUnresolvedTruncated") + `
+  {} 7
+
+eval instant at 10m ` + a("ShawkBaselineDriftUnresolvedTruncated") + `
+
+# A host that runs a service and was not observed, and a service that no
+# host runs: no drift is no answer for them.
+eval instant at 20m ` + a("ShawkBaselineHostsNotObserved") + `
+  {job="shop/app"} 1
+
+eval instant at 30m ` + a("ShawkBaselineHostsNotObserved") + `
+
+eval instant at 20m ` + a("ShawkBaselineServiceWithoutHosts") + `
+  {job="batch/report"} 0
+
+# While the connectors evaluate every 5 minutes the last evaluation is at
+# most 5 minutes old; the alert fires once it is 15 minutes old, also after
+# the series of the connectors are gone.
+eval instant at 39m ` + a("ShawkBaselineNotEvaluated") + `
+
+eval instant at 55m ` + a("ShawkBaselineNotEvaluated") + `
+
+eval instant at 56m ` + a("ShawkBaselineNotEvaluated") + `
+  {} 960
+
+eval instant at 600m ` + a("ShawkBaselineNotEvaluated") + `
+  {} 33600
+
+# The alert goes on for 30 days after the last series, and then nothing
+# tells that a baseline was ever evaluated.
+eval instant at 43000m ` + a("ShawkBaselineNotEvaluated") + `
+  {} 2577600
+
+eval instant at 43300m ` + a("ShawkBaselineNotEvaluated") + `
+
+# The drift that the connectors last told holds for 30 minutes after they
+# stopped, at 40m: by then the alert above has fired, at 56m and, with its
+# "for" of 5 minutes, at 61m at the latest. No time is left in which a
+# drift went away and nothing tells that it is no longer evaluated.
+eval instant at 62m ` + a("ShawkBaselineDrift") + `
+  ` + drift + ` 120
+
+eval instant at 69m ` + a("ShawkBaselineDrift") + `
+  ` + drift + ` 120
+
+eval instant at 71m ` + a("ShawkBaselineDrift") + `
+`
+	promqltest.RunTest(t, script, promqltest.NewTestEngine(t, false, 0, promqltest.DefaultMaxSamplesPerQuery))
+
+	// A connector whose evaluations fail from the first one tells that the
+	// last success was at 0: the alert has a series to fire on, and its
+	// value is the time since then, which is the whole of the clock. (The
+	// clock of this test starts at 0; that of Prometheus does not.)
+	never := `
+load 1m
+  shawk_baseline_evaluation_timestamp_seconds{job="shawk-connector"} 0x30
+  shawk_baseline_evaluation_failed{job="shawk-connector"} 1x30
+
+eval instant at 16m ` + a("ShawkBaselineNotEvaluated") + `
+  {} 960
+
+eval instant at 30m ` + a("ShawkBaselineNotEvaluated") + `
+  {} 1800
+`
+	promqltest.RunTest(t, never, promqltest.NewTestEngine(t, false, 0, promqltest.DefaultMaxSamplesPerQuery))
+}
+
+// TestBaselineAlertSettings: how long each alert of the baseline waits and
+// how severe it is are part of what it promises: a drift on a named peer
+// and the loss of its evaluation page at once, or within 5 minutes, and
+// the alert that the evaluation stopped fires before a drift that was
+// firing resolves.
+func TestBaselineAlertSettings(t *testing.T) {
+	rgs, errs := rulefmt.ParseFile(rulesFile, false, model.UTF8Validation, parser.NewParser(parser.Options{}), slog.New(slog.DiscardHandler))
+	if len(errs) > 0 {
+		t.Fatal(errs)
+	}
+	got := map[string]string{}
+	exprs := map[string]string{}
+	for _, g := range rgs.Groups {
+		if g.Name != "shawk-baseline" {
+			continue
+		}
+		for _, r := range g.Rules {
+			got[r.Alert] = time.Duration(r.For).String() + " " + r.Labels["severity"]
+			exprs[r.Alert] = r.Expr
+		}
+	}
+	want := map[string]string{
+		"ShawkBaselineDrift":                    "0s critical",
+		"ShawkBaselineDriftUnresolved":          "15m0s warning",
+		"ShawkBaselineNotEvaluated":             "5m0s critical",
+		"ShawkBaselineHostsNotObserved":         "10m0s warning",
+		"ShawkBaselineServiceWithoutHosts":      "10m0s warning",
+		"ShawkBaselineFileInvalid":              "10m0s warning",
+		"ShawkBaselineDriftTruncated":           "0s critical",
+		"ShawkBaselineDriftUnresolvedTruncated": "15m0s warning",
+		"ShawkNewServiceWithoutBaseline":        "0s info",
+	}
+	if !maps.Equal(got, want) {
+		t.Errorf("alerts of the baseline wait and are as severe as %v, want %v", got, want)
+	}
+	// The drift holds for longer after its last series than the alert of
+	// the evaluation takes to fire after the last evaluation: the 900
+	// seconds of its expression and its "for".
+	hold := regexp.MustCompile(`shawk_baseline_drift_hosts\{[^}]*\}\[(\d+)m\]`)
+	stale := regexp.MustCompile(`> (\d+)$`).FindStringSubmatch(strings.TrimSpace(exprs["ShawkBaselineNotEvaluated"]))
+	for _, name := range []string{"ShawkBaselineDrift", "ShawkBaselineDriftUnresolved"} {
+		m := hold.FindStringSubmatch(exprs[name])
+		if m == nil || stale == nil {
+			t.Fatalf("%s: %q, and the alert of the evaluation %q", name, exprs[name], exprs["ShawkBaselineNotEvaluated"])
+		}
+		held, _ := strconv.Atoi(m[1])
+		after, _ := strconv.Atoi(stale[1])
+		if fires := time.Duration(after)*time.Second + 5*time.Minute; time.Duration(held)*time.Minute <= fires {
+			t.Errorf("%s holds for %dm, and ShawkBaselineNotEvaluated fires after %s: a gap", name, held, fires)
+		}
+	}
+}
+
 // TestSYNRetransmitRatio evaluates the panel of SYN retransmissions per
 // attempt of the dependency details dashboard. Its denominator is the union
 // of the handshakes and the failures by reason, which the agents that send
@@ -538,4 +729,25 @@ eval instant at 10m ` + inlinePanel(t, expr, records) + `
   {src_host="ctl-01", src="slurmctld", dst_host="node-03", dst="slurmd", server_port="6818", network_transport="tcp"} 1
 `
 	promqltest.RunTest(t, script, promqltest.NewTestEngine(t, false, 0, promqltest.DefaultMaxSamplesPerQuery))
+}
+
+// TestPromtoolRules runs the unit tests of the alerts with promtool, which
+// evaluates the rules as Prometheus does, with their "for" and their
+// annotations, where it is installed.
+func TestPromtoolRules(t *testing.T) {
+	promtool, err := exec.LookPath("promtool")
+	if err != nil {
+		t.Skip("promtool is not available")
+	}
+	tests, err := filepath.Glob("../../packaging/prometheus/tests/*.test.yml")
+	if err != nil || len(tests) == 0 {
+		t.Fatalf("no unit tests of the rules: %v", err)
+	}
+	for _, file := range tests {
+		cmd := exec.Command(promtool, "test", "rules", filepath.Base(file))
+		cmd.Dir = filepath.Dir(file)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Errorf("promtool test rules %s: %v\n%s", file, err, out)
+		}
+	}
 }

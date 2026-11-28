@@ -56,8 +56,104 @@
   at a socket nothing serves are no dependency; and whether the agent of
   a session learns translations (`shawk.agent_sessions.translations_traced`).
 
+* `shawk-policy`, in the `shawk-collector` packages and image: rules that
+  allow what a host was seen to do, and a baseline of the dependencies of
+  services, both written for review; it applies nothing (#232).
+  `shawk-policy rules -host NAME` reports the connections of a host over a
+  period (`-lookback`, 90 days) and writes them as a table of nftables
+  (`-format nftables`; `-ingress sources`, `ports` or `none` for what the
+  host accepts) or, for a service unit, as a drop-in of systemd with
+  `IPAddressDeny=` and `IPAddressAllow=` (`-format systemd -unit NAME
+  -enforce`), under comments that tell what the rules pin and leave out,
+  and what shawk cannot observe. The table is an audit form unless
+  `-enforce` asks for the one that rejects: it has the same rules, and
+  counts and logs what they do not list instead of refusing it, so that
+  what no history of shawk holds (the outer packets of tunnels that the
+  kernel makes, the virtual services of IPVS, a destination that the host
+  rewrites) shows before it breaks, and so that the connection tracking
+  takes up the connections that are open. The audit form labels a
+  connection that no rule lists (connection labels 125 to 127) and counts
+  every packet of its opening side for as long as it lives, also of the
+  connections that were open before the table on a host that tracked
+  connections already; the file tells what the counters cannot show. A
+  flow of UDP on one port allows its peer the other way too, between that
+  port on both sides. A rule denies what was not seen: when the history does not
+  tell every connection of the target (`INCOMPLETE`: a gap of the agent,
+  a period before the retention, dropped flows, UDP not traced, no agent,
+  a name that shawk does not know, two machines under one host name, an
+  agent that did not learn the addresses that the host rewrites its
+  connections to, as one that folds peers), the command writes no file
+  that blocks unless `-allow-incomplete`, and exits 4; 0 is `COMPLETE`
+  and nothing else. `RestrictAddressFamilies=` is written as a comment,
+  and iptables and the policies of Kubernetes and Cilium are not written
+  (`docs/design.md` §6.4).
+* A baseline of dependencies, and alerts on what it does not hold (#232).
+  `shawk-policy baseline -service NAME` writes the dependencies of
+  services over a period as a file (`-merge FILE` replaces services in
+  one), which ends with a line that tells it is whole (`end:`); the
+  connector reads it with the new `baseline_file`, refuses one that was
+  cut short, writes it to PostgreSQL and tells Prometheus, every write
+  interval, the dependencies of those services that it does not hold:
+  `shawk_baseline_drift_hosts{job, service_peer_name, server_port,
+  network_transport}`, one series whatever the number of hosts, without
+  addresses, at most 20 per service and 1000 in all, with
+  `shawk_baseline_dependencies{job}`,
+  `shawk_baseline_drift_truncated{shawk_baseline_peer}` and
+  `shawk_baseline_new_services`. No drift is an answer only where the
+  drift is known, and the connector tells where it is not:
+  `shawk_baseline_hosts{job}` and `shawk_baseline_hosts_unobserved{job}`
+  (a host runs a service for the new `baseline_host_memory`, a week,
+  after a process of it was last seen there, so a host whose agent
+  stopped is not observed rather than forgotten),
+  `shawk_baseline_evaluation_timestamp_seconds` (0 before an evaluation
+  succeeded), `shawk_baseline_evaluation_attempt_timestamp_seconds`,
+  `shawk_baseline_evaluation_failed` and `shawk_baseline_file_failed`.
+  A process of another name in a unit that runs services of the baseline,
+  or in a unit below it, is judged by those services together: what none
+  of them holds is one finding. A unit that unrelated processes share
+  (the jobs of Slurm, login sessions, `systemd-run` without a name, the
+  units of a user) judges nothing; `shawk-policy drift` lists what
+  processes did there next to a service of the baseline
+  (`shawk_v1.baseline_unjudged()`), and no alert fires for it. A server
+  on a port that the kernel chose is written `port: kernel-chosen` in
+  the file, which approves such ports of servers of that name and no
+  fixed port. A service of the baseline that runs nowhere is judged on
+  the hosts that ran it last: where they are observed it did nothing, so
+  that `baseline -all` followed by `drift` is `CLEAN`, and where one of
+  them is silent it may run there still (`INCONCLUSIVE`,
+  `ShawkBaselineHostsNotObserved`); a host that was installed again under
+  its name replaces its first machine. `packaging/prometheus/shawk-rules.yml` has
+  the alerts `ShawkBaselineDrift`, `ShawkBaselineDriftUnresolved`,
+  `ShawkBaselineNotEvaluated`, `ShawkBaselineHostsNotObserved`,
+  `ShawkBaselineServiceWithoutHosts`, `ShawkBaselineFileInvalid`,
+  `ShawkBaselineDriftTruncated`, `ShawkBaselineDriftUnresolvedTruncated`
+  and `ShawkNewServiceWithoutBaseline`, with unit tests for promtool in
+  `packaging/prometheus/tests`. `shawk-policy drift` lists the drift with
+  its hosts and addresses, and exits 0 for none, 3 for a drift and 4 when
+  it cannot tell, as when a host that runs a service was not observed. A
+  service without a baseline is not judged. `baseline_file` is refused
+  with the SQLite lightweight mode.
+* PostgreSQL, migration `0006_policy.sql`: the functions
+  `shawk_v1.policy_flows()`, `policy_verdict()`, `policy_gaps()`,
+  `baseline_observed()`, `baseline_verdict()`, `baseline_drift()` and
+  `baseline_new_services()` and the views `shawk_v1.baseline` and
+  `baseline_status`, which `shawk-policy` and the connector read, and the
+  tables of the baseline, and `baseline_unjudged()`. What they return is
+  ordered by the bytes of names, whatever the collation of the database.
+  Migrations `0005_impact.sql` and `0006_policy.sql` are released
+  together: their texts changed until the release, and 0006 comes with
+  the last text of 0005. A database that a build from before this
+  release migrated must be created again: a migration is applied once by
+  its number, so `shawk-migrate` calls such a database up to date and
+  leaves it as it is. With an earlier 0006, `shawk-policy` fails on it;
+  with an earlier 0005 alone, the commands run with the earlier
+  `coverage_gaps()`, `dependents()` and `impact()`, whose order follows
+  the collation of the database. Drop the database, or its schemas
+  `shawk` and `shawk_v1`, and migrate again; a database that only
+  released versions migrated (up to `0004`) upgrades as usual.
+
 **Upgrading.** Run `shawk-migrate` and `grants.sql` again (migrations 0004
-and 0005), and upgrade every connector: one of an earlier version records
+to 0006), and upgrade every connector: one of an earlier version records
 no hours, and the cadences of its hosts read `unknown`. The hours cost
 about 190 bytes per edge, a side of a dependency, and month in which it
 was active, kept for the retention: the table `shawk.edge_activity` can be
@@ -81,6 +177,15 @@ double where the edges are most of it.
   failed connection gives its cause and the SQLSTATE of the server. The
   flags, the variable and the exit statuses are unchanged
   (`docs/design.md` §6).
+* The connector replaces the control characters of the strings that
+  agents send (names of services, units, hosts and peers), the separators
+  of lines U+2028 and U+2029 and the marks that turn the direction of a
+  text around (U+202A to U+202E, U+2066 to U+2069) with U+FFFD, as it
+  replaced bytes that are no UTF-8. Such a name reached PostgreSQL and
+  the labels of Prometheus as it was, and a name with a line break wrote
+  lines of its own into the text of an alert. A service whose name held
+  such a character gets a new name in PostgreSQL and a new `job` in
+  Prometheus from this version on (`docs/design.md` §5.5).
 
 ## [v0.11.0](https://github.com/yuuki/shawk/compare/v0.10.1...v0.11.0) (2026-11-26)
 

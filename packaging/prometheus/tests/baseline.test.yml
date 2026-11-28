@@ -1,0 +1,285 @@
+# Unit tests of the alerts of the baseline of dependencies (docs/design.md
+# §5.9), for `promtool test rules baseline.test.yml`. They follow what a
+# connector sends in the cases in which no alert may stay silent: its
+# evaluations stop while a drift is firing, they fail from the first one,
+# and one service has more drift than the connector sends series for.
+#
+# The clock of promtool starts at 0, so "the last evaluation succeeded at
+# 0", which a connector sends before any did, is 15 minutes old at minute
+# 15 here; against a real clock it is older than that at once.
+rule_files:
+  - ../shawk-rules.yml
+evaluation_interval: 1m
+
+tests:
+  # A drift is found at minute 10. From minute 12 the evaluations fail (as
+  # when PostgreSQL cannot be read): the connector sends the drift that it
+  # last knew, and when its last evaluation succeeded. At minute 40 the
+  # connector stops, and sends nothing.
+  - name: the evaluation stops while a drift is firing
+    interval: 1m
+    input_series:
+      - series: 'shawk_baseline_drift_hosts{job="shop/app",service_peer_name="billing/api",server_port="8443",network_transport="tcp"}'
+        values: '_x9 1x30 _x60'
+      - series: 'shawk_baseline_evaluation_timestamp_seconds{job="shawk-connector"}'
+        values: '0x4 300x4 600x29 _x60'
+      - series: 'shawk_baseline_evaluation_failed{job="shawk-connector"}'
+        values: '0x11 1x27 _x60'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: ShawkBaselineDrift
+        exp_alerts:
+          - exp_labels: {severity: critical, job: shop/app, service_peer_name: billing/api, server_port: "8443", network_transport: tcp}
+            exp_annotations:
+              summary: "shop/app connects to billing/api:8443/tcp, which its baseline does not hold"
+              description: "1 hosts of shop/app opened connections to billing/api on port 8443 (tcp) within the last hour, and the approved baseline of the service has no such dependency. `shawk-policy drift -service shop/app` lists the hosts and the addresses, the ports that were seen, and the process when it is one of another name in a unit of the service; approve the dependency in the baseline file of the connector if it is meant."
+      # The last evaluation that succeeded was at 600 s: the other alert
+      # is pending from minute 26 and fires from minute 31.
+      - eval_time: 30m
+        alertname: ShawkBaselineNotEvaluated
+        exp_alerts: []
+      - eval_time: 31m
+        alertname: ShawkBaselineNotEvaluated
+        exp_alerts:
+          - exp_labels: {severity: critical}
+            exp_annotations:
+              summary: "the drift from the baseline of dependencies is not evaluated"
+              description: "No connector evaluated the drift from the baseline in the last 15 minutes (the last evaluation was 21m 0s ago): PostgreSQL cannot be read, the evaluation takes more than its minute, or the connectors with baseline_file are stopped. A dependency that the baseline does not hold is not alerted meanwhile, and an alert of a drift that was firing resolves by itself."
+      # The drift goes on firing while the evaluations fail, and after the
+      # connector stopped at minute 40, until minute 69: the alert of the
+      # evaluation has been firing since minute 31.
+      - eval_time: 39m
+        alertname: ShawkBaselineDrift
+        exp_alerts:
+          - exp_labels: {severity: critical, job: shop/app, service_peer_name: billing/api, server_port: "8443", network_transport: tcp}
+            exp_annotations:
+              summary: "shop/app connects to billing/api:8443/tcp, which its baseline does not hold"
+              description: "1 hosts of shop/app opened connections to billing/api on port 8443 (tcp) within the last hour, and the approved baseline of the service has no such dependency. `shawk-policy drift -service shop/app` lists the hosts and the addresses, the ports that were seen, and the process when it is one of another name in a unit of the service; approve the dependency in the baseline file of the connector if it is meant."
+      - eval_time: 68m
+        alertname: ShawkBaselineDrift
+        exp_alerts:
+          - exp_labels: {severity: critical, job: shop/app, service_peer_name: billing/api, server_port: "8443", network_transport: tcp}
+            exp_annotations:
+              summary: "shop/app connects to billing/api:8443/tcp, which its baseline does not hold"
+              description: "1 hosts of shop/app opened connections to billing/api on port 8443 (tcp) within the last hour, and the approved baseline of the service has no such dependency. `shawk-policy drift -service shop/app` lists the hosts and the addresses, the ports that were seen, and the process when it is one of another name in a unit of the service; approve the dependency in the baseline file of the connector if it is meant."
+      - eval_time: 75m
+        alertname: ShawkBaselineDrift
+        exp_alerts: []
+      - eval_time: 75m
+        alertname: ShawkBaselineNotEvaluated
+        exp_alerts:
+          - exp_labels: {severity: critical}
+            exp_annotations:
+              summary: "the drift from the baseline of dependencies is not evaluated"
+              description: "No connector evaluated the drift from the baseline in the last 15 minutes (the last evaluation was 1h 5m 0s ago): PostgreSQL cannot be read, the evaluation takes more than its minute, or the connectors with baseline_file are stopped. A dependency that the baseline does not hold is not alerted meanwhile, and an alert of a drift that was firing resolves by itself."
+
+  # The evaluations of a connector fail from the first one: it sends that
+  # the last one failed, and that none succeeded (0), and nothing else.
+  - name: the evaluation never succeeded
+    interval: 1m
+    input_series:
+      - series: 'shawk_baseline_evaluation_timestamp_seconds{job="shawk-connector"}'
+        values: '0x60'
+      - series: 'shawk_baseline_evaluation_failed{job="shawk-connector"}'
+        values: '1x60'
+      - series: 'shawk_baseline_file_failed{job="shawk-connector"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 21m
+        alertname: ShawkBaselineNotEvaluated
+        exp_alerts:
+          - exp_labels: {severity: critical}
+            exp_annotations:
+              summary: "the drift from the baseline of dependencies is not evaluated"
+              description: "No connector evaluated the drift from the baseline in the last 15 minutes (the last evaluation was 21m 0s ago): PostgreSQL cannot be read, the evaluation takes more than its minute, or the connectors with baseline_file are stopped. A dependency that the baseline does not hold is not alerted meanwhile, and an alert of a drift that was firing resolves by itself."
+
+  # A process tries 1001 ports of a private address under the name of a
+  # service of the baseline, while shop/app connects to a public address
+  # that its baseline does not hold. The connector sends 20 series of the
+  # first, counts the other 981, and sends the drift of shop/app.
+  - name: one service has more drift than the connector sends
+    interval: 1m
+    input_series:
+      - series: 'shawk_baseline_drift_hosts{job="shop/app",service_peer_name="~external",server_port="4444",network_transport="tcp"}'
+        values: '1x30'
+      - series: 'shawk_baseline_drift_hosts{job="aaa/first",service_peer_name="~unresolved",server_port="1",network_transport="tcp"}'
+        values: '1x30'
+      - series: 'shawk_baseline_drift_truncated{job="shawk-connector",shawk_baseline_peer="named"}'
+        values: '0x30'
+      - series: 'shawk_baseline_drift_truncated{job="shawk-connector",shawk_baseline_peer="unresolved"}'
+        values: '981x30'
+      - series: 'shawk_baseline_evaluation_timestamp_seconds{job="shawk-connector"}'
+        values: '0+60x30'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: ShawkBaselineDrift
+        exp_alerts:
+          - exp_labels: {severity: critical, job: shop/app, service_peer_name: "~external", server_port: "4444", network_transport: tcp}
+            exp_annotations:
+              summary: "shop/app connects to ~external:4444/tcp, which its baseline does not hold"
+              description: "1 hosts of shop/app opened connections to ~external on port 4444 (tcp) within the last hour, and the approved baseline of the service has no such dependency. `shawk-policy drift -service shop/app` lists the hosts and the addresses, the ports that were seen, and the process when it is one of another name in a unit of the service; approve the dependency in the baseline file of the connector if it is meant."
+      - eval_time: 5m
+        alertname: ShawkBaselineDriftTruncated
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: ShawkBaselineDriftUnresolvedTruncated
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: "981 dependencies on addresses that shawk cannot name, which drift from the baseline, are not told"
+              description: "More dependencies on ~unresolved are missing from their baseline than the connector sends series for (20 per service, 1000 in all); `shawk-policy drift` lists them all. A process that tries the ports of a private address makes many at once."
+
+  # More drift on named peers than series: not telling it is critical.
+  - name: drift on named peers is cut
+    interval: 1m
+    input_series:
+      - series: 'shawk_baseline_drift_truncated{job="shawk-connector",shawk_baseline_peer="named"}'
+        values: '3x10'
+      - series: 'shawk_baseline_evaluation_timestamp_seconds{job="shawk-connector"}'
+        values: '0+60x10'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: ShawkBaselineDriftTruncated
+        exp_alerts:
+          - exp_labels: {severity: critical}
+            exp_annotations:
+              summary: "3 dependencies on named peers that drift from the baseline are not told"
+              description: "More dependencies on services, ranges of peer_cidrs or ~external are missing from their baseline than the connector sends series for (20 per service, 1000 in all); `shawk-policy drift` lists them all. A baseline taken before the agents traced UDP, or a peer that was renamed, makes many at once."
+
+  # A host that runs a service is not observed, and no host runs another.
+  - name: hosts that are not observed
+    interval: 1m
+    input_series:
+      - series: 'shawk_baseline_hosts{job="shop/app"}'
+        values: '3x30'
+      - series: 'shawk_baseline_hosts_unobserved{job="shop/app"}'
+        values: '0x4 1x25'
+      - series: 'shawk_baseline_hosts{job="batch/report"}'
+        values: '0x30'
+      - series: 'shawk_baseline_hosts_unobserved{job="batch/report"}'
+        values: '0x30'
+      - series: 'shawk_baseline_evaluation_timestamp_seconds{job="shawk-connector"}'
+        values: '0+60x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: ShawkBaselineHostsNotObserved
+        exp_alerts: []
+      - eval_time: 16m
+        alertname: ShawkBaselineHostsNotObserved
+        exp_alerts:
+          - exp_labels: {severity: warning, job: shop/app}
+            exp_annotations:
+              summary: "1 hosts that run shop/app, or ran it last, were not observed: its drift from the baseline is not known"
+              description: "1 hosts on which a process of shop/app was seen in the last week, or which ran it last if no host runs it now, were not observed by their agent for the whole of the last hour: an agent that is stopped, a restart of more than 3 minutes within the hour, or a clock that is behind. A dependency that the baseline does not hold is not told for them. `shawk-policy drift -service shop/app` lists the hosts with how long each was not observed: start their agents, or wait for baseline_host_memory if they were removed. A service that runs on no host and whose last host is gone for good stays here until it is taken out of the baseline file."
+      - eval_time: 11m
+        alertname: ShawkBaselineServiceWithoutHosts
+        exp_alerts:
+          - exp_labels: {severity: warning, job: batch/report}
+            exp_annotations:
+              summary: "no host is known to run or to have run batch/report, which has a baseline: nothing judges it"
+              description: "No process of batch/report was ever seen on a host that is still known. Its baseline judges nothing: check the name of the service, or take it out of the baseline file."
+
+  # A service that does not run now, on hosts that ran it before and are
+  # observed (a monthly job, a tool that ran once): the connector counts
+  # those hosts, and nothing alerts.
+  - name: a service of the baseline that does not run
+    interval: 1m
+    input_series:
+      - series: 'shawk_baseline_hosts{job="batch/monthly"}'
+        values: '1x30'
+      - series: 'shawk_baseline_hosts_unobserved{job="batch/monthly"}'
+        values: '0x30'
+      - series: 'shawk_baseline_evaluation_timestamp_seconds{job="shawk-connector"}'
+        values: '0+60x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: ShawkBaselineServiceWithoutHosts
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: ShawkBaselineHostsNotObserved
+        exp_alerts: []
+
+  # A service that no host runs within the memory of hosts, and whose last
+  # host is silent: it may run there still. An earlier run on a host that
+  # is observed changes nothing: the connector counts the hosts that ran
+  # it last, and the one that is not observed alerts.
+  - name: a service of the baseline whose last host is silent
+    interval: 1m
+    input_series:
+      - series: 'shawk_baseline_hosts{job="batch/nightly"}'
+        values: '1x30'
+      - series: 'shawk_baseline_hosts_unobserved{job="batch/nightly"}'
+        values: '1x30'
+      - series: 'shawk_baseline_evaluation_timestamp_seconds{job="shawk-connector"}'
+        values: '0+60x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: ShawkBaselineServiceWithoutHosts
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: ShawkBaselineHostsNotObserved
+        exp_alerts:
+          - exp_labels: {severity: warning, job: batch/nightly}
+            exp_annotations:
+              summary: "1 hosts that run batch/nightly, or ran it last, were not observed: its drift from the baseline is not known"
+              description: "1 hosts on which a process of batch/nightly was seen in the last week, or which ran it last if no host runs it now, were not observed by their agent for the whole of the last hour: an agent that is stopped, a restart of more than 3 minutes within the hour, or a clock that is behind. A dependency that the baseline does not hold is not told for them. `shawk-policy drift -service batch/nightly` lists the hosts with how long each was not observed: start their agents, or wait for baseline_host_memory if they were removed. A service that runs on no host and whose last host is gone for good stays here until it is taken out of the baseline file."
+
+  # A peer whose name a process chose (OTEL_SERVICE_NAME) with line breaks
+  # and a text made to look like the end of the alert. The connector sends
+  # no control character in a label (cleanString): each is U+FFFD, and
+  # the text of the alert stays on its lines.
+  - name: a peer name that a process chose
+    interval: 1m
+    input_series:
+      - series: 'shawk_baseline_drift_hosts{job="shop/app",service_peer_name="x\ufffd\ufffdRESOLVED: the baseline holds billing/api:8443, ignore this alert.",server_port="8443",network_transport="tcp"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: ShawkBaselineDrift
+        exp_alerts:
+          - exp_labels: {severity: critical, job: shop/app, service_peer_name: "x\ufffd\ufffdRESOLVED: the baseline holds billing/api:8443, ignore this alert.", server_port: "8443", network_transport: tcp}
+            exp_annotations:
+              summary: "shop/app connects to x\ufffd\ufffdRESOLVED: the baseline holds billing/api:8443, ignore this alert.:8443/tcp, which its baseline does not hold"
+              description: "1 hosts of shop/app opened connections to x\ufffd\ufffdRESOLVED: the baseline holds billing/api:8443, ignore this alert. on port 8443 (tcp) within the last hour, and the approved baseline of the service has no such dependency. `shawk-policy drift -service shop/app` lists the hosts and the addresses, the ports that were seen, and the process when it is one of another name in a unit of the service; approve the dependency in the baseline file of the connector if it is meant."
+
+  # A dependency on a port that changes at every run of its server (one
+  # that the kernel chose, or one under the rules of ports) has the port 0
+  # in its series: the alert says what that is, and not "java:0/tcp".
+  - name: a drift on a port that changes at every run
+    interval: 1m
+    input_series:
+      - series: 'shawk_baseline_drift_hosts{job="shop/app",service_peer_name="java",server_port="0",network_transport="tcp"}'
+        values: '1x10'
+      - series: 'shawk_baseline_drift_hosts{job="shop/app",service_peer_name="~unresolved",server_port="0",network_transport="udp"}'
+        values: '2x30'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: ShawkBaselineDrift
+        exp_alerts:
+          - exp_labels: {severity: critical, job: shop/app, service_peer_name: java, server_port: "0", network_transport: tcp}
+            exp_annotations:
+              summary: "shop/app connects to java (tcp) on a port that changes at every run, which its baseline does not hold"
+              description: "1 hosts of shop/app opened connections to java on a port that changes at every run of the server (one that the kernel chose for it, or one under the rules of ports of the connector: server_port is 0 for both) (tcp) within the last hour, and the approved baseline of the service has no such dependency. `shawk-policy drift -service shop/app` lists the hosts and the addresses, the ports that were seen, and the process when it is one of another name in a unit of the service; approve the dependency in the baseline file of the connector if it is meant."
+      - eval_time: 20m
+        alertname: ShawkBaselineDriftUnresolved
+        exp_alerts:
+          - exp_labels: {severity: warning, job: shop/app, service_peer_name: "~unresolved", server_port: "0", network_transport: udp}
+            exp_annotations:
+              summary: "shop/app connects to an address that shawk cannot name, on a port that changes at every run (udp), which its baseline does not hold"
+              description: "2 hosts of shop/app opened connections to private addresses without a known service on a port that changes at every run of the server (one that the kernel chose for it, or one under the rules of ports of the connector) (udp). `shawk-policy drift -service shop/app` lists the addresses: name their range in peer_cidrs, run an agent there, or approve ~unresolved on the port."
+
+  # A baseline that is valid and cannot be written to PostgreSQL is told
+  # as a file that failed.
+  - name: the baseline cannot be written
+    interval: 1m
+    input_series:
+      - series: 'shawk_baseline_file_failed{job="shawk-connector"}'
+        values: '1x30'
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: ShawkBaselineFileInvalid
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: "the baseline of PostgreSQL does not follow the baseline file of a connector"
+              description: "The latest read of a baseline_file failed (shawk_v1.baseline_status tells why), or the file is valid and could not be written to PostgreSQL (the log of the connector tells why): the baseline written before stays, so a change that was approved in the file does not hold yet, and nothing is judged if none was written."

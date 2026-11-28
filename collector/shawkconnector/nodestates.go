@@ -278,11 +278,11 @@ func parseMaintenance(b []byte) ([]maintenanceWindow, error) {
 }
 
 // cleanReason makes a reason of Slurm or of a maintenance window, free text,
-// acceptable to PostgreSQL (see cleanString), cut to maxStringBytes as the
+// acceptable to PostgreSQL (see pgClean), cut to maxStringBytes as the
 // strings of agents: a reason PostgreSQL refuses would fail the states or
 // windows of every host.
 func cleanReason(s string) string {
-	return cleanString(cutLabel(s, maxStringBytes))
+	return pgClean(cutLabel(s, maxStringBytes))
 }
 
 // parseWindowTimes parses the start and the end of a maintenance window,

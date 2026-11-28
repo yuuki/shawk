@@ -62,6 +62,7 @@ The design is in [docs/design.md](docs/design.md).
 | Prometheus | how much flows: connections, failures, bytes, RTT, connect time, retransmissions |
 | Grafana | dashboards and alerts |
 | `shawk-impact` | reads PostgreSQL: what removing a host or a service would break, and whether it was watched |
+| `shawk-policy` | reads PostgreSQL: writes, for review, the rules that allow what a host was seen to do, and a baseline of the dependencies of services; the connector alerts on what the baseline does not hold |
 
 ## Requirements
 
@@ -115,9 +116,9 @@ for OBI.
 
 A release ships an OpenTelemetry Collector that includes the connector:
 the deb and rpm packages `shawk-collector` (with `shawk-migrate`,
-`shawk-impact` and the PostgreSQL scripts) and the image
+`shawk-impact`, `shawk-policy` and the PostgreSQL scripts) and the image
 `ghcr.io/yuuki/shawk-collector`. To build it yourself, run `make collector
-shawk-migrate shawk-impact`.
+shawk-migrate shawk-impact shawk-policy`.
 
 [packaging/](packaging/README.md) has the configuration of the collector,
 PostgreSQL, Prometheus and Grafana, and the steps to set them up. The
@@ -219,6 +220,103 @@ the command refuses it. The cadences need the hours of activity that
 connectors record from this version on; before that they are `unknown`.
 The rules, and what the verdict cannot see, are in
 [design §6.3](docs/design.md#63-impact-of-removing-a-host-or-a-service).
+
+The same history tells what a host may be allowed to do. `shawk-policy`
+writes it as rules for a person to review, and applies nothing:
+
+```console
+$ shawk-policy rules -dsn-file /etc/shawk/impact-dsn -host app-01 -format nftables > app-01.audit.nft
+$ nft -f app-01.audit.nft                            # the audit form: it rejects nothing
+$ nft list counters table inet shawk_policy          # the packets of what the rules do not list (also logged)
+$ shawk-policy rules -dsn-file /etc/shawk/impact-dsn -host app-01 -format nftables -enforce > app-01.nft
+$ shawk-policy rules -dsn-file /etc/shawk/impact-dsn -host app-01 -unit app.service -format systemd -enforce
+...
+# Status   COMPLETE: an agent observed the target for the whole period, so the history tells every
+#          TCP and UDP connection that its sockets made in it
+...
+[Service]
+IPAddressDeny=any
+IPAddressAllow=localhost
+
+# egress 5432/tcp: shop/postgres on db-01, of shop/app, last seen 2026-11-28T06:00:00Z
+IPAddressAllow=10.0.0.10
+```
+
+- A rule denies what was not seen, so the command tells what the history
+  does not hold. When it is `INCOMPLETE` (a gap of the agent, a period
+  before the retention, dropped flows, UDP not traced, no agent, a host
+  or a unit that shawk does not know, two machines under one host name,
+  an agent that did not learn the addresses the host rewrites its
+  connections to, which is so while it folds peers, its default) it
+  writes no file that blocks, unless `-allow-incomplete`, and its exit
+  status is 4: 0 is `COMPLETE` and nothing else.
+- **A file that blocks is asked for.** `-format nftables` writes the
+  audit form: the same rules, and what they do not list is counted and
+  logged instead of rejected. Load it first: some of what a host needs is
+  in no history of shawk (the outer packets of a VXLAN or WireGuard
+  tunnel, the virtual services of IPVS, a destination that the host
+  rewrites), and the audit form shows it before anything breaks. Its
+  counters count every packet of a connection that no rule lists, for as
+  long as the connection lives, so a tunnel that stays up keeps counting
+  after the counters are cleared; the file says what they cannot show (a
+  connection that sends nothing while you watch, a TCP connection that
+  was open when the table itself started the connection tracking, and a
+  connection whose rule was taken out of the file after it began), and
+  what the audit form costs on a host with hundreds of rules.
+  The audit form also lets the tracking take up the connections that are
+  open, which the form that rejects would otherwise stop. `-enforce`
+  writes the form that rejects; the drop-in of systemd has no audit form,
+  and needs it.
+- A rule pins the addresses that the sockets saw. Every file says, above
+  its rules, how many addresses it pins, which peers shawk could not
+  name, what was last seen before the period and so is denied, and what
+  shawk cannot observe. A table of nftables filters TCP and UDP only; a
+  drop-in of systemd blocks every IP protocol to the addresses it does
+  not list.
+- The formats are a table of nftables for a host (`-ingress ports` opens
+  what it accepts to every source) and a drop-in of systemd for a service
+  unit. `RestrictAddressFamilies=` is a comment, since shawk does not
+  record the families of sockets; iptables and the policies of Kubernetes
+  and Cilium are not written
+  ([design §6.4](docs/design.md#64-least-privilege-rules-and-the-baseline-of-dependencies)).
+
+A baseline locks what a service may depend on. `shawk-policy baseline`
+writes it from a period as a file to review; once approved, the connector
+reads it (`baseline_file`) and tells Prometheus the dependencies of those
+services that the file does not hold:
+
+```console
+$ shawk-policy baseline -dsn-file /etc/shawk/impact-dsn -service shop/app -merge baseline.yaml > new.yaml
+$ diff baseline.yaml new.yaml        # review, then deploy new.yaml as the baseline_file of the connector
+$ shawk-policy drift -dsn-file /etc/shawk/impact-dsn
+Verdict  DRIFT: 1 dependency is not in the baseline of 1 service
+
+Not in the baseline
+SERVICE   PEER         PORT      HOSTS           NAMED BY  FIRST SEEN            LAST SEEN             ADDRESSES  NOTES
+shop/app  billing/api  8443/tcp  app-01, app-02  edge      2026-11-28T05:40:00Z  2026-11-28T06:00:00Z  10.0.0.40
+```
+
+The alert `ShawkBaselineDrift` fires once per service, server, port and
+transport, whatever the number of hosts, and carries no address. A service
+without a baseline is not judged, except that a process of another name
+in a unit that runs services of the baseline is judged by them together,
+once. That holds for the unit of a workload, not for a unit that
+unrelated processes share (the jobs of Slurm in `slurm/batch`, login
+sessions): there a process is judged by the baseline of its own name or
+by none, and `shawk-policy drift` lists what it did next to a service of
+the baseline, without an alert. `shawk-policy drift` exits 3 for a drift,
+0 for none and 4 when it cannot tell: no drift is an answer only when
+every host that runs the services was observed, so a host whose agent is
+stopped makes it `INCONCLUSIVE`, and `ShawkBaselineHostsNotObserved` and
+`ShawkBaselineNotEvaluated` alert where the drift is not known. A service
+that runs nowhere at the moment is judged on the hosts that ran it last:
+where they are observed it did nothing (`baseline -all` followed by
+`drift` is `CLEAN`), and where one of them is silent it may run there
+still, and the verdict is `INCONCLUSIVE`. A baseline file
+ends with the line `end:`, which tells that it is whole: one that was cut
+short is refused. A server on a port that the kernel chose is written
+`port: kernel-chosen`, which approves such ports of servers of that name
+and no fixed port.
 
 In SQL:
 

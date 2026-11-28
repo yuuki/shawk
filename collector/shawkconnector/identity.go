@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"google.golang.org/grpc/credentials"
@@ -75,13 +76,41 @@ func certificateID(cert *x509.Certificate) string {
 }
 
 // cleanString makes a string from an agent acceptable to PostgreSQL, which
-// refuses text with NUL or that is not valid UTF-8: such bytes become
-// U+FFFD, as the agent replaces them.
+// refuses text with NUL or that is not valid UTF-8, and to what shows it:
+// such bytes become U+FFFD, as the agent replaces them, and so do the
+// control characters, the separators of lines and paragraphs and the
+// characters that turn the direction of a text around. A name is what a
+// process declares (docs/design.md §4.1), and it becomes a label of
+// Prometheus and a part of the text of an alert, where a line break would
+// add lines that the alert did not write.
 func cleanString(s string) string {
+	if pgText(s) && !strings.ContainsFunc(s, hiddenRune) {
+		return s
+	}
+	return strings.Map(func(r rune) rune {
+		if hiddenRune(r) {
+			return utf8.RuneError
+		}
+		return r
+	}, strings.ToValidUTF8(s, "�"))
+}
+
+// pgClean makes a text acceptable to PostgreSQL, and no more: free text
+// that an operator wrote, as the reason of a node state, or the message
+// of an error, keeps its line breaks.
+func pgClean(s string) string {
 	if pgText(s) {
 		return s
 	}
 	return strings.ReplaceAll(strings.ToValidUTF8(s, "�"), "\x00", "�")
+}
+
+// hiddenRune tells the characters that cleanString replaces: the controls
+// (NUL, line breaks, escape, U+0080 to U+009F), U+2028 and U+2029, and
+// the marks of the direction of a text (U+202A to U+202E, U+2066 to
+// U+2069).
+func hiddenRune(r rune) bool {
+	return unicode.IsControl(r) || r == 0x2028 || r == 0x2029 || (r >= 0x202a && r <= 0x202e) || (r >= 0x2066 && r <= 0x2069)
 }
 
 // pgText tells whether PostgreSQL accepts a string as text: valid UTF-8
