@@ -116,6 +116,9 @@ func FuzzBaselineText(f *testing.F) {
 		r := testBaselineReport(baselineService{Service: service, Dependencies: []dependency{d}, ShortHosts: []string{peer},
 			Reasons: []string{peer}, Caveats: []string{service}})
 		r.Merged = service
+		// The baseline of the connector holds services that the file does
+		// not: their names are in the first lines of the file.
+		r.deployed = []string{peer, service, peer + " " + service}
 		want := &shawkconnector.Baseline{Services: []shawkconnector.BaselineService{{Service: service,
 			Dependencies: []shawkconnector.BaselineDependency{{Peer: peer, Port: int(port), Proto: proto}}}}}
 		if _, err := want.Marshal(); err != nil {
@@ -138,6 +141,9 @@ func FuzzBaselineText(f *testing.F) {
 			if !oneCommentLine(l) {
 				t.Fatalf("the line %q above the file is no comment\n%s", l, text)
 			}
+		}
+		if !strings.Contains(head, "# NOT A WHOLE BASELINE: ") || len(r.Outside) == 0 {
+			t.Fatalf("the file does not tell that it lacks services of the baseline of the connector (%q)\n%s", r.Outside, head)
 		}
 		for _, in := range []string{text, "services:\n" + file} {
 			got, err := shawkconnector.ParseBaseline([]byte(in))

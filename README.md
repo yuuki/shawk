@@ -259,8 +259,10 @@ IPAddressAllow=10.0.0.10
   counters count every packet of a connection that no rule lists, for as
   long as the connection lives, so a tunnel that stays up keeps counting
   after the counters are cleared; the file says what they cannot show (a
-  connection that sends nothing while you watch, and a TCP connection
-  that was open when the table itself started the connection tracking).
+  connection that sends nothing while you watch, a TCP connection that
+  was open when the table itself started the connection tracking, and a
+  connection whose rule was taken out of the file after it began), and
+  what the audit form costs on a host with hundreds of rules.
   The audit form also lets the tracking take up the connections that are
   open, which the form that rejects would otherwise stop. `-enforce`
   writes the form that rejects; the drop-in of systemd has no audit form,
