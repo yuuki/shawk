@@ -184,14 +184,14 @@ um AS MATERIALIZED (
   WHERE named_dependencies.judged IS NOT NULL
     AND p.service_name IN (SELECT js.service FROM js)
     AND shawk.shared_unit(p.unit) = named_dependencies.shared
-    AND p.unit <> ''
     AND p.last_seen >= least(coalesce(named_dependencies.members_since, named_dependencies.since - interval '15 minutes'),
                              named_dependencies.since - interval '15 minutes')
     AND p.first_seen <= named_dependencies.until
 ),
 -- The dependencies of the processes whose own service is not in judged,
 -- each with the services of judged that run in its unit, or in a unit
--- above it, on its host.
+-- above it, on its host. A process without a unit has none: an empty
+-- name has no part, so it is next to nothing, with `shared` too.
 mate AS MATERIALIZED (
   SELECT x.id, array_agg(DISTINCT um.service COLLATE "C" ORDER BY um.service COLLATE "C") AS judges
   FROM d0 x
