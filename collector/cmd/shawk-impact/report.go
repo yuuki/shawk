@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // The verdicts of shawk_v1.impact_verdict.
@@ -84,17 +86,21 @@ type report struct {
 
 // dependent is a row of shawk_v1.impact.
 type dependent struct {
-	Depth         int        `json:"depth"`
-	ClientHost    *string    `json:"client_host"`
-	ClientService string     `json:"client_service"`
-	ClientAddr    *string    `json:"client_addr"`
-	ServerHost    string     `json:"server_host"`
-	ServerService *string    `json:"server_service"`
-	Port          int        `json:"port"`
-	Proto         string     `json:"proto"`
-	FirstSeen     time.Time  `json:"first_seen"`
-	LastSeen      time.Time  `json:"last_seen"`
-	ObservedBy    string     `json:"observed_by"`
+	Depth         int       `json:"depth"`
+	ClientHost    *string   `json:"client_host"`
+	ClientService string    `json:"client_service"`
+	ClientAddr    *string   `json:"client_addr"`
+	ServerHost    string    `json:"server_host"`
+	ServerService *string   `json:"server_service"`
+	Port          int       `json:"port"`
+	Proto         string    `json:"proto"`
+	FirstSeen     time.Time `json:"first_seen"`
+	LastSeen      time.Time `json:"last_seen"`
+	ObservedBy    string    `json:"observed_by"`
+	// Relayed tells a client whose connections the server host relays in
+	// its kernel (server_service ~relay), rather than one that a process
+	// of the host serves.
+	Relayed       bool       `json:"relayed"`
 	Cadence       *string    `json:"cadence"`
 	PeriodSeconds *float64   `json:"period_seconds"`
 	NextExpected  *time.Time `json:"next_expected"`
@@ -213,6 +219,13 @@ SELECT verdict, reasons, caveats, direct, coverage::float8, coverage::text
 FROM shawk_v1.impact_verdict($1, $2, $3, $4, $5, $6, $7::numeric)`,
 		t[0], period[0], period[1], t[1], t[2], t[3], o.minCoverage).
 		Scan(&r.Verdict, &reasons, &caveats, &r.Direct, &r.Coverage, &r.coverage); err != nil {
+		// A database without the schema, or with one older than the
+		// functions of the impact: nothing to give a verdict from.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && (pgErr.Code == "42883" || pgErr.Code == "3F000") {
+			return nil, fmt.Errorf("the database has no shawk_v1.impact_verdict(): the impact report needs the PostgreSQL schema of "+
+				"shawk, migrated by shawk-migrate up to 0005_impact.sql (the SQLite lightweight mode has none): %s", pgErr.Message)
+		}
 		return nil, fmt.Errorf("the verdict: %w", err)
 	}
 	r.Reasons, r.Caveats = append(r.Reasons, reasons...), append(r.Caveats, caveats...)
@@ -257,6 +270,7 @@ FROM shawk_v1.impact($1, $2, $3, $4, $5, $6, $7, $8)`, t[0], period[0], period[1
 		err := row.Scan(&d.Depth, &d.ClientHost, &d.ClientService, &d.ClientAddr, &d.ServerHost, &d.ServerService, &d.Port,
 			&d.Proto, &d.FirstSeen, &d.LastSeen, &d.ObservedBy, &d.Cadence, &d.PeriodSeconds, &d.NextExpected, &d.Runs)
 		d.FirstSeen, d.LastSeen = d.FirstSeen.UTC(), d.LastSeen.UTC()
+		d.Relayed = d.ServerService != nil && *d.ServerService == "~relay"
 		if d.NextExpected != nil {
 			next := d.NextExpected.UTC()
 			d.NextExpected = &next

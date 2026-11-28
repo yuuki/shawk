@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -134,6 +136,26 @@ func TestUsage(t *testing.T) {
 	if code := run(context.Background(), []string{"-h"}, &out, &errOut); code != exitUsage || !strings.Contains(errOut.String(), "Exit status") ||
 		strings.Contains(errOut.String(), "secret") || out.Len() != 0 {
 		t.Errorf("-h: exit status %d, %q", code, errOut.String())
+	}
+	// A database of the SQLite lightweight mode has no history to give a
+	// verdict from: the command says so, and reads nothing.
+	file := filepath.Join(t.TempDir(), "state")
+	if err := os.WriteFile(file, []byte("SQLite format 3\x00"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, dsn := range []string{file, "/var/lib/shawk-collector/shawk.db", "file:/var/lib/shawk-collector/shawk.db?mode=ro",
+		"sqlite:///var/lib/shawk-collector/shawk.db", "shawk.sqlite3"} {
+		out.Reset()
+		errOut.Reset()
+		if code := run(context.Background(), []string{"-host", "db-01", "-dsn", dsn}, &out, &errOut); code != exitError || out.Len() != 0 ||
+			!strings.Contains(errOut.String(), "the impact report needs PostgreSQL: the SQLite lightweight mode") {
+			t.Errorf("-dsn %s: exit status %d, stdout %q, stderr %q", dsn, code, out.String(), errOut.String())
+		}
+	}
+	for _, dsn := range []string{"postgres://shawk@db.invalid/shawk", "host=db.invalid dbname=shawk.db", "postgresql://u@h/x.db"} {
+		if isSQLite(dsn) {
+			t.Errorf("%s is taken for a file of SQLite", dsn)
+		}
 	}
 	// Without a connection string, a valid command line fails.
 	t.Setenv("SHAWK_POSTGRES_DSN", "")
@@ -384,6 +406,49 @@ func TestWriteVerdicts(t *testing.T) {
 			"         nothing was seen to use it in the period, but it was not watched enough to tell\n         - "+want+"\n") {
 			t.Errorf("%s:\n%s", reason, out.String())
 		}
+	}
+}
+
+// TestWriteServers: a client that the host relays, and one of a socket
+// without a known owner, are told from the clients of the service asked
+// for: by the name of their server, which the report explains.
+func TestWriteServers(t *testing.T) {
+	r := testReport()
+	r.Target = target{Host: "lvs-01", Service: "keepalived"}
+	r.Dependents = []dependent{
+		{Depth: 1, ClientHost: ptr("app-01"), ClientService: "app", ServerHost: "lvs-01", ServerService: ptr("~relay"), Port: 5432,
+			Proto: "tcp", ObservedBy: "both", Cadence: ptr("continuous"), Relayed: true},
+		{Depth: 1, ClientService: "~unresolved", ClientAddr: ptr("10.0.5.5"), ServerHost: "lvs-01", ServerService: ptr("~unknown"),
+			Port: 179, Proto: "tcp", ObservedBy: "server", Cadence: ptr("one-off")},
+	}
+	var out bytes.Buffer
+	if err := writeText(&out, r, 0); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"1      app-01 app            lvs-01 ~relay    5432/tcp  both     continuous",
+		"\n~relay: the host relays the connections of this client in its kernel (a load balancer, a\n",
+		"each of its services, since shawk does not know which one keeps the translations.\n",
+		"\n~unknown: a socket of the host whose owner is not known accepted the connections of this\n",
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("report without %q:\n%s", want, out.String())
+		}
+	}
+	// Not where no such server is listed.
+	out.Reset()
+	if err := writeText(&out, testReport(), 0); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out.String(), "~relay") || strings.Contains(out.String(), "~unknown:") {
+		t.Errorf("report:\n%s", out.String())
+	}
+	out.Reset()
+	if err := writeJSON(&out, r); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), `"relayed": true`) || strings.Count(out.String(), `"relayed": false`) != 1 {
+		t.Errorf("report as JSON:\n%s", out.String())
 	}
 }
 

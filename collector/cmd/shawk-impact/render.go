@@ -109,6 +109,17 @@ func writeText(w io.Writer, r *report, limit int) error {
 		if slices.ContainsFunc(shown, func(d dependent) bool { return d.Cadence == nil }) {
 			fmt.Fprintf(w, "The cadence is read to depth %d (-cadence-depth).\n", r.CadenceDepth)
 		}
+		// What the servers that are no service stand for, so that their
+		// clients are not taken for clients of the service asked for.
+		if slices.ContainsFunc(shown, func(d dependent) bool { return d.Relayed }) {
+			fmt.Fprint(w, "~relay: the host relays the connections of this client in its kernel (a load balancer, a\n"+
+				"NAT gateway), on the port shown. No process of the host accepts them; they count for\n"+
+				"each of its services, since shawk does not know which one keeps the translations.\n")
+		}
+		if slices.ContainsFunc(shown, func(d dependent) bool { return d.ServerService != nil && *d.ServerService == "~unknown" }) {
+			fmt.Fprint(w, "~unknown: a socket of the host whose owner is not known accepted the connections of this\n"+
+				"client; they count for each of its services.\n")
+		}
 	}
 
 	// The target, and the clients whose agents did not observe all along,

@@ -330,3 +330,24 @@ VALUES ('h', now() - interval '2 days', now(), true, true, 'all')`); err != nil 
 		t.Errorf("without the file of the connection string: exit status %d, want %d", code, exitError)
 	}
 }
+
+// TestPGNeedsTheSchema: against a database without the functions of the
+// impact, as one that was not migrated, the command fails with what it
+// needs, and gives no verdict.
+func TestPGNeedsTheSchema(t *testing.T) {
+	dsn, conn := testDB(t)
+	ctx := context.Background()
+	for _, drop := range []string{
+		`DROP FUNCTION shawk_v1.impact_verdict(text, timestamptz, timestamptz, text, integer, text, numeric, interval)`,
+		`DROP SCHEMA shawk_v1 CASCADE`,
+	} {
+		if _, err := conn.Exec(ctx, drop); err != nil {
+			t.Fatal(err)
+		}
+		var out, errOut bytes.Buffer
+		if code := run(ctx, []string{"-dsn", dsn, "-host", "db-01"}, &out, &errOut); code != exitError || out.Len() != 0 ||
+			!strings.Contains(errOut.String(), "the database has no shawk_v1.impact_verdict(): the impact report needs the PostgreSQL schema") {
+			t.Errorf("after %s: exit status %d, stdout %q, stderr %q", drop, code, out.String(), errOut.String())
+		}
+	}
+}

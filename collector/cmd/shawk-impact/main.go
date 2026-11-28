@@ -267,6 +267,38 @@ func exitStatus(verdict string, stderr io.Writer) int {
 	return exitError
 }
 
+// errNeedsPostgres is the answer to a database of the SQLite lightweight
+// mode of the connector (docs/design.md §5.8), which keeps the latest
+// state that names peers: no dependency of a period, no hour of activity,
+// and not when hosts were observed. Nothing in it tells that a host was
+// not used, so there is no verdict to give from it, not even a partial
+// one.
+var errNeedsPostgres = errors.New("the impact report needs PostgreSQL: the SQLite lightweight mode of the connector keeps " +
+	"neither the dependencies of a period nor when hosts were observed, so nothing in it tells that a host is unused " +
+	"(docs/design.md, section 5.8)")
+
+// isSQLite tells whether a connection string names a file of SQLite rather
+// than a PostgreSQL database, which a URL or keywords and values name: a
+// file: or sqlite: URI, or the path of a file.
+func isSQLite(dsn string) bool {
+	lower := strings.ToLower(dsn)
+	for _, scheme := range []string{"file:", "sqlite:", "sqlite3:"} {
+		if strings.HasPrefix(lower, scheme) {
+			return true
+		}
+	}
+	if strings.Contains(dsn, "://") || strings.Contains(dsn, "=") {
+		return false
+	}
+	for _, ext := range []string{".db", ".sqlite", ".sqlite3"} {
+		if strings.HasSuffix(lower, ext) {
+			return true
+		}
+	}
+	info, err := os.Stat(dsn)
+	return err == nil && !info.IsDir()
+}
+
 // query connects to PostgreSQL and reads the report. It returns the report
 // with an error when the verdict was read and what follows it failed.
 func query(ctx context.Context, c *config) (*report, error) {
@@ -283,6 +315,9 @@ func query(ctx context.Context, c *config) (*report, error) {
 	}
 	if dsn == "" {
 		return nil, errors.New("set -dsn, -dsn-file or $SHAWK_POSTGRES_DSN")
+	}
+	if isSQLite(dsn) {
+		return nil, errNeedsPostgres
 	}
 	cfg, err := pgx.ParseConfig(dsn)
 	if err != nil {
