@@ -575,8 +575,23 @@ r AS MATERIALIZED (
 -- kubelet that probes the pod): the edge then looks like the target's own,
 -- and the translation alone tells the client outside it.
 lt AS (
-  SELECT l.proto, l.client_addr, l.virtual_addr, l.virtual_port, min(l.first_seen) AS first_seen, max(l.last_seen) AS last_seen
-  FROM shawk.learned_translations l
+  SELECT l.proto, l.client_addr, l.virtual_addr, l.virtual_port, l.backend_port,
+         min(l.first_seen) AS first_seen, max(l.last_seen) AS last_seen
+  FROM (
+    -- backend_port is the port of a backend on the target itself, an
+    -- address it holds or one a socket of it serves on: the client is one
+    -- of that port too, NULL for a backend elsewhere.
+    SELECT x.proto, x.client_addr, x.virtual_addr, x.virtual_port, x.source_addr, x.backend_addr, x.host_id,
+           x.first_seen, x.last_seen,
+           CASE WHEN EXISTS (SELECT FROM ha
+                             WHERE ha.hostname = dependents.target_host AND ha.addr = x.backend_addr
+                               AND ha.held_until >= x.first_seen AND ha.held_from <= x.last_seen)
+                  OR EXISTS (SELECT FROM shawk.edges e
+                             WHERE e.host_id = x.host_id AND e.role = 'server' AND e.proto = x.proto
+                               AND e.local_addr = x.backend_addr AND e.port = x.backend_port)
+                THEN x.backend_port END AS backend_port
+    FROM shawk.learned_translations x
+  ) l
   WHERE l.host_id IN (SELECT t.id FROM t)
     AND l.last_seen >= dependents.since AND l.first_seen <= dependents.until
     AND NOT (l.client_addr << inet '127.0.0.0/8' OR l.client_addr = inet '::1')
@@ -593,7 +608,7 @@ lt AS (
                            AND e.remote_addr = l.client_addr
                            AND e.last_seen >= dependents.since - interval '15 minutes'
                            AND e.first_seen <= dependents.until + interval '15 minutes'))
-  GROUP BY l.proto, l.client_addr, l.virtual_addr, l.virtual_port
+  GROUP BY l.proto, l.client_addr, l.virtual_addr, l.virtual_port, l.backend_port
 ),
 -- The clients that the target relayed, each once per virtual address and
 -- port: those of the connections above, by the name that an agent on the
@@ -610,17 +625,17 @@ lt AS (
 relay AS (
   SELECT -row_number() OVER () AS id, y.*
   FROM (
-    SELECT DISTINCT ON (x.client_host, x.client_service, x.client_unit, x.client_addr, x.server_addr, x.port, x.proto)
+    SELECT DISTINCT ON (x.client_host, x.client_service, x.client_unit, x.client_addr, x.server_addr, x.port, x.proto, x.backend_port)
            x.client_host, x.client_service, x.client_unit, x.client_addr,
            x.server_host, NULL::text AS server_service, NULL::text AS server_unit, x.server_addr, x.port, x.proto,
            x.first_seen, x.last_seen, x.observed_by, NULL::inet AS virtual_addr, NULL::integer AS virtual_port, NULL::text AS path,
            dependents.target_host AS srv_host, '~relay'::text AS srv_service, NULL::text AS srv_unit,
-           coalesce(x.client_host, ci.host) AS cli_host
+           coalesce(x.client_host, ci.host) AS cli_host, x.backend_port
     FROM (
       SELECT c.client_host, c.client_service, c.client_unit, lt.client_addr,
              CASE WHEN c.client_host IS NULL THEN dependents.target_host END AS server_host,
              lt.virtual_addr AS server_addr, lt.virtual_port AS port, lt.proto, lt.first_seen, lt.last_seen,
-             CASE WHEN c.client_host IS NULL THEN 'server' ELSE 'both' END AS observed_by
+             CASE WHEN c.client_host IS NULL THEN 'server' ELSE 'both' END AS observed_by, lt.backend_port
       FROM lt
       LEFT JOIN (
         SELECT DISTINCT d.client_host, d.client_service, d.client_unit, d.client_addr, d.proto,
@@ -629,7 +644,7 @@ relay AS (
       ) c ON c.client_addr = lt.client_addr AND c.addr = lt.virtual_addr AND c.port = lt.virtual_port AND c.proto = lt.proto
       UNION ALL
       SELECT d.client_host, d.client_service, d.client_unit, d.client_addr, NULL,
-             d.virtual_addr, d.virtual_port, d.proto, d.first_seen, d.last_seen, 'client'
+             d.virtual_addr, d.virtual_port, d.proto, d.first_seen, d.last_seen, 'client', NULL
       FROM d
       JOIN ha ON ha.addr = d.virtual_addr AND ha.hostname = dependents.target_host
       WHERE d.virtual_addr IS NOT NULL
@@ -638,7 +653,8 @@ relay AS (
         AND ha.held_from <= least(d.last_seen, dependents.until)
       UNION ALL
       SELECT NULL, NULL, NULL, d.client_addr, d.server_host,
-             v.addr::inet, CASE WHEN v.port = 0 THEN d.port ELSE v.port END, d.proto, d.first_seen, d.last_seen, 'server'
+             v.addr::inet, CASE WHEN v.port = 0 THEN d.port ELSE v.port END, d.proto, d.first_seen, d.last_seen, 'server',
+             CASE WHEN d.server_host = dependents.target_host THEN d.port END
       FROM shawk.translations v
       JOIN ha ON ha.addr = v.addr::inet AND ha.hostname = dependents.target_host
       JOIN shawk.translations b ON b.name = v.name AND b.proto = v.proto AND b.side = 'backend'
@@ -656,7 +672,7 @@ relay AS (
     ) x
     LEFT JOIN shawk.inventory_addrs ci ON x.client_host IS NULL AND ci.addr = x.client_addr
     WHERE x.client_host IS DISTINCT FROM dependents.target_host
-    ORDER BY x.client_host, x.client_service, x.client_unit, x.client_addr, x.server_addr, x.port, x.proto,
+    ORDER BY x.client_host, x.client_service, x.client_unit, x.client_addr, x.server_addr, x.port, x.proto, x.backend_port,
              x.observed_by, x.first_seen
   ) y
 ),
@@ -700,9 +716,14 @@ direct AS (
         AND r.client_service IS DISTINCT FROM '~unknown'
     END
   UNION ALL
-  SELECT y.*
+  -- A client that the target relays to a backend of its own is one of the
+  -- port of the backend as of the virtual port it connected to.
+  SELECT y.id, y.client_host, y.client_service, y.client_unit, y.client_addr,
+         y.server_host, y.server_service, y.server_unit, y.server_addr, y.port, y.proto,
+         y.first_seen, y.last_seen, y.observed_by, y.virtual_addr, y.virtual_port, y.path,
+         y.srv_host, y.srv_service, y.srv_unit, y.cli_host
   FROM relay y
-  WHERE (dependents.target_port IS NULL OR y.port = dependents.target_port)
+  WHERE (dependents.target_port IS NULL OR dependents.target_port IN (y.port, y.backend_port))
     AND (dependents.target_proto IS NULL OR y.proto = dependents.target_proto)
 ),
 -- The dependents with an agent, by the depths they are reached at. The

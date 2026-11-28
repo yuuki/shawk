@@ -1333,6 +1333,29 @@ func TestPGImpactOwnAddress(t *testing.T) {
 		t.Errorf("node-a, with the translation: %s, want %s", got, want)
 	}
 	checkRows(t, "dependents of port 30080 of node-a", f.impact(`'node-a', %s, %s, target_port => 30080`), outside)
+	// The client outside is one of the port of the pod too, to which the
+	// node relays it: also when the client that explains the edge of the
+	// pod is a process of the unit that serves the port, a helper of the
+	// service in the namespace of the host, which is part of that target.
+	f.exec(`UPDATE shawk.edges SET process_id = (SELECT process_id FROM shawk.edges WHERE role = 'server') WHERE role = 'client'`)
+	for _, target := range []string{`'node-a', %s, %s`, `'node-a', %s, %s, 'web'`, `'node-a', %s, %s, target_port => 30080`,
+		`'node-a', %s, %s, target_port => 8080`, `'node-a', %s, %s, 'web', 8080`} {
+		checkRows(t, "dependents of "+target+", probed by the service itself", f.impact(target), outside)
+		want := "UNSAFE {active_dependents} {} 1 1.000000"
+		if strings.Contains(target, "30080") {
+			// No socket listens on the port that the kernel translates.
+			want = "UNSAFE {active_dependents} {unknown_port} 1 1.000000"
+		}
+		if got := f.verdict(target); got != want {
+			t.Errorf("%s, probed by the service itself: %s, want %s", target, got, want)
+		}
+	}
+	// Not of another port of the node.
+	f.listens("node-a", "sshd", 22)
+	if got, want := f.verdict(`'node-a', %s, %s, target_port => 22`), "SAFE {} {} 0 1.000000"; got != want {
+		t.Errorf("port 22 of node-a: %s, want %s", got, want)
+	}
+	f.exec(`UPDATE shawk.edges SET process_id = (SELECT id FROM shawk.processes WHERE service_name = 'kubelet') WHERE role = 'client'`)
 	// A port that the node publishes without replacing the address of the
 	// client: the pod sees the client, whose row it is, once.
 	f.edge("node-a", "web", "server", "10.244.1.7", "198.51.100.7", 8080, day(1, 0), day(2, 0))
@@ -1527,6 +1550,18 @@ func TestPGImpactOfARelay(t *testing.T) {
 	checkRows(t, "dependents of fnat-01", f.impact(`'fnat-01', %s, %s`), []string{
 		"1 - ~unresolved 10.0.0.6 -> fnat-01 ~relay 5432 server unknown",
 	})
+	// The same for a backend on the host of the virtual address, on
+	// another port, which a process of its own unit explains: the clients
+	// behind the source are those of the port of the backend too.
+	f.watched("fnat-03", "10.0.0.8", "10.0.100.3")
+	f.exec(`INSERT INTO shawk.translations VALUES
+		('local', 'virtual', 'tcp', '10.0.100.3', 443), ('local', 'backend', 'tcp', '10.0.0.8', 8443), ('local', 'source', 'tcp', '10.0.0.8', 0)`)
+	f.listens("fnat-03", "web", 8443)
+	f.both("fnat-03", "web", "10.0.0.8", "fnat-03", "web", "10.0.0.8", 8443, impactSince, impactUntil)
+	for _, target := range []string{`'fnat-03', %s, %s`, `'fnat-03', %s, %s, target_port => 443`, `'fnat-03', %s, %s, target_port => 8443`,
+		`'fnat-03', %s, %s, 'web', 8443`} {
+		checkRows(t, "dependents of "+target, f.impact(target), []string{"1 - ~unresolved 10.0.0.8 -> fnat-03 ~relay 443 server unknown"})
+	}
 	if got, want := f.verdict(`'fnat-01', %s, %s`), "UNSAFE {active_dependents} {} 1 1.000000"; got != want {
 		t.Errorf("fnat-01: %s, want %s", got, want)
 	}

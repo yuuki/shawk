@@ -1963,7 +1963,10 @@ limits (§10). From them:
   translation adds nothing. When the host replaces the address of the
   client by its own (masquerade, as kube-proxy does for a NodePort), the
   server edge has an address of the host, and the translation alone tells
-  the client: it stays a `~relay` dependent.
+  the client: it stays a `~relay` dependent. Such a client counts for the
+  port of the backend as for the virtual port it connected to: the edge
+  of the backend may be explained by a process of its own unit, which is
+  part of a target that is that port.
 - **What counts for a service of a host**: the clients of the service;
   those of a socket of the host without a known owner (`~unknown`, §4.1)
   and those the host relays (`~relay`), since either may be the service's
