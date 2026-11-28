@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -293,6 +294,141 @@ defaults) and the configuration does not give (docs/design.md, sections 6.3 and 
 	}
 	if code, out = impact(t, dsn, "-host", "db-01"); code != exitError || out != "" {
 		t.Errorf("without access to shawk_v1: exit status %d, want %d\n%s", code, exitError, out)
+	}
+}
+
+// orderFleet writes clients of db-01 whose names the collations of databases
+// order differently: en_US.utf8, which the postgres image of CI has, ignores
+// "-", "~" and the case at first, where C, which test/harness/postgres.sh
+// has, compares the bytes. alpha-01 has two services, with an address each,
+// and clients outside the fleet use db-01 too. No client was observed for
+// an hour, so that the report tells how each was.
+const orderFleet = `
+INSERT INTO shawk.hosts
+SELECT h, 'm', h, 'k', 'v', '2026-07-01T00:00:00Z', '2026-10-30T00:00:00Z'
+FROM unnest(ARRAY['db-01', 'alpha-01', 'Bravo-01', 'charlie-01', '-dash-01']) h;
+INSERT INTO shawk.agent_sessions (host_id, started_at, last_heartbeat, udp_traced, unix_traced, netns_scope)
+VALUES ('db-01', '2026-07-01T00:00:00Z', '2026-10-30T00:00:00Z', true, true, 'all');
+INSERT INTO shawk.agent_sessions (host_id, started_at, last_heartbeat, udp_traced, unix_traced, netns_scope)
+SELECT h.id, s.started::timestamptz, s.ended::timestamptz, true, true, 'all'
+FROM shawk.hosts h,
+     (VALUES ('2026-07-01T00:00:00Z', '2026-09-01T00:00:00Z'), ('2026-09-01T01:03:00Z', '2026-10-30T00:00:00Z')) AS s(started, ended)
+WHERE h.id <> 'db-01';
+INSERT INTO shawk.host_addrs VALUES ('db-01', '10.0.0.10', '2026-07-01T00:00:00Z', '2026-10-30T00:00:00Z');
+INSERT INTO shawk.host_addrs
+SELECT a.host, a.addr::inet, s.started::timestamptz, s.ended::timestamptz
+FROM (VALUES ('alpha-01', '10.0.0.21'), ('alpha-01', '10.0.0.25'), ('Bravo-01', '10.0.0.22'), ('charlie-01', '10.0.0.23'),
+             ('-dash-01', '10.0.0.24')) AS a(host, addr),
+     (VALUES ('2026-07-01T00:00:00Z', '2026-09-01T00:00:00Z'), ('2026-09-01T01:03:00Z', '2026-10-30T00:00:00Z')) AS s(started, ended);
+INSERT INTO shawk.processes (host_id, unit, comm, exe, service_name, first_seen, last_seen)
+SELECT p.host, p.svc || '.service', p.svc, '', p.svc, '2026-07-01T00:00:00Z', '2026-10-30T00:00:00Z'
+FROM (VALUES ('db-01', 'postgres'), ('alpha-01', 'alpha'), ('alpha-01', 'Zeta'), ('Bravo-01', 'bravo'), ('charlie-01', 'charlie'),
+             ('-dash-01', 'dash')) AS p(host, svc);
+-- Both sides of the connections of the clients, in the order of en_US.utf8,
+-- and what db-01 saw of the clients outside the fleet, folded.
+WITH c(host, svc, addr) AS (
+  VALUES ('alpha-01', 'alpha', '10.0.0.21'), ('alpha-01', 'Zeta', '10.0.0.25'), ('Bravo-01', 'bravo', '10.0.0.22'),
+         ('charlie-01', 'charlie', '10.0.0.23'), ('-dash-01', 'dash', '10.0.0.24')
+)
+INSERT INTO shawk.edges (host_id, process_id, role, proto, local_addr, remote_addr, port, netns, first_seen, last_seen)
+SELECT e.host, p.id, e.role, 'tcp', e.local::inet, e.remote::cidr, 5432, 4026531840, '2026-08-01T00:00:00Z', '2026-10-30T00:00:00Z'
+FROM (
+  SELECT c.host, c.svc, 'client' AS role, c.addr AS local, '10.0.0.10' AS remote FROM c
+  UNION ALL
+  SELECT 'db-01', 'postgres', 'server', '10.0.0.10', c.addr FROM c
+  UNION ALL
+  SELECT 'db-01', 'postgres', 'server', '10.0.0.10', '0.0.0.0/0'
+) e
+JOIN shawk.processes p ON p.host_id = e.host AND p.service_name = e.svc;
+INSERT INTO shawk.edge_activity
+SELECT e.id, m, repeat('1', 744)::bit(744)
+FROM shawk.edges e, unnest(ARRAY['2026-08-01T00:00:00Z', '2026-09-01T00:00:00Z', '2026-10-01T00:00:00Z']::timestamptz[]) m;
+`
+
+// TestPGReportOrder: the dependents and the hosts of a report are in the
+// order of the bytes of their names, whatever the collation of the
+// database: in the text, where -limit keeps the first of them, and in the
+// JSON, which is compared as the command wrote it.
+func TestPGReportOrder(t *testing.T) {
+	dsn, conn := testDB(t)
+	ctx := context.Background()
+	for _, q := range []string{orderFleet, reader} {
+		if _, err := conn.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() { conn.Exec(ctx, "DROP OWNED BY shawk_impact_reader") })
+
+	code, out := impact(t, dsn, "-host", "db-01")
+	want := `Target   db-01
+Period   2026-08-01T00:00:00Z to 2026-10-30T00:00:00Z (90d)
+
+Verdict  UNSAFE: active dependents
+         6 dependents used it in the period
+
+Dependents
+DEPTH  CLIENT              SERVER          PORT      SEEN BY  CADENCE     LAST SEEN             NEXT ACTIVITY
+1      -dash-01 dash       db-01 postgres  5432/tcp  both     continuous  2026-10-30T00:00:00Z  now
+1      Bravo-01 bravo      db-01 postgres  5432/tcp  both     continuous  2026-10-30T00:00:00Z  now
+1      alpha-01 Zeta       db-01 postgres  5432/tcp  both     continuous  2026-10-30T00:00:00Z  now
+1      alpha-01 alpha      db-01 postgres  5432/tcp  both     continuous  2026-10-30T00:00:00Z  now
+1      charlie-01 charlie  db-01 postgres  5432/tcp  both     continuous  2026-10-30T00:00:00Z  now
+1      0.0.0.0 ~external   db-01 postgres  5432/tcp  server   continuous  2026-10-30T00:00:00Z  now
+
+Observation of the hosts that tell
+HOST        ROLE    COVERAGE  NOT OBSERVED  GAPS  PARTLY OBSERVED  NO UDP  NO UNIX  ONE NETNS
+db-01       target  1         0s            0     0s               0s      0s       0s
+-dash-01    client  0.999537  1h            1     0s               0s      0s       0s
+Bravo-01    client  0.999537  1h            1     0s               0s      0s       0s
+alpha-01    client  0.999537  1h            1     0s               0s      0s       0s
+charlie-01  client  0.999537  1h            1     0s               0s      0s       0s
+The coverage is from 0 to 1. A gap of 3m or less is not counted: an agent that
+restarts within it is not seen to.
+
+Only TCP, UDP and Unix stream sockets are observed. A host looks unused when it is used
+over RDMA, less often than the period, or only forwards packets: a router, a hypervisor,
+and a load balancer or gateway whose translations its agent does not learn (IPVS at its
+defaults) and the configuration does not give (docs/design.md, sections 6.3 and 10).
+`
+	if code != exitUnsafe || out != want {
+		t.Errorf("db-01: exit status %d, want %d\n%s\nwant:\n%s", code, exitUnsafe, out, want)
+	}
+
+	// The limit keeps the first dependents and the first clients of that
+	// order.
+	code, out = impact(t, dsn, "-host", "db-01", "-limit", "2")
+	if code != exitUnsafe ||
+		!strings.Contains(out, "\n1      -dash-01 dash   db-01 postgres  5432/tcp  both     continuous  2026-10-30T00:00:00Z  now\n"+
+			"1      Bravo-01 bravo  db-01 postgres  5432/tcp  both     continuous  2026-10-30T00:00:00Z  now\n"+
+			"and 4 more rows (-limit 0 shows all)\n") ||
+		!strings.Contains(out, "\n-dash-01  client  0.999537  1h            1     0s               0s      0s       0s\n"+
+			"Bravo-01  client  0.999537  1h            1     0s               0s      0s       0s\n"+
+			"and 2 more clients not observed all along (-limit 0 shows all)\n") ||
+		strings.Contains(out, "alpha-01") || strings.Contains(out, "charlie-01") || strings.Contains(out, "~external") {
+		t.Errorf("db-01 with -limit 2: exit status %d, want %d\n%s", code, exitUnsafe, out)
+	}
+
+	code, out = impact(t, dsn, "-host", "db-01", "-json")
+	var r report
+	if err := json.Unmarshal([]byte(out), &r); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	var dependents, observers []string
+	for _, d := range r.Dependents {
+		host := "-"
+		if d.ClientHost != nil {
+			host = *d.ClientHost
+		}
+		dependents = append(dependents, host+" "+d.ClientService)
+	}
+	for _, o := range r.Observers {
+		observers = append(observers, o.Host)
+	}
+	wantDependents := []string{"-dash-01 dash", "Bravo-01 bravo", "alpha-01 Zeta", "alpha-01 alpha", "charlie-01 charlie", "- ~external"}
+	wantObservers := []string{"db-01", "-dash-01", "Bravo-01", "alpha-01", "charlie-01"}
+	if code != exitUnsafe || !slices.Equal(dependents, wantDependents) || !slices.Equal(observers, wantObservers) {
+		t.Errorf("db-01 as JSON: exit status %d, dependents %q, want %q; observers %q, want %q",
+			code, dependents, wantDependents, observers, wantObservers)
 	}
 }
 

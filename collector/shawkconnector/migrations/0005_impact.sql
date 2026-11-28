@@ -284,7 +284,8 @@ $$;
 -- with its cause: retention for the time before the retention, agent for
 -- the time in which no agent of the name observed. Unlike
 -- unobserved_by_name(), a name that no agent reported under has a gap, the
--- whole period.
+-- whole period. The rows are in the order of the hosts, their names
+-- compared by bytes, and of the gaps of each.
 CREATE FUNCTION shawk_v1.coverage_gaps(since timestamptz, until timestamptz, hosts text[],
                                        tolerance interval DEFAULT '3 minutes')
 RETURNS TABLE (host text, gap_start timestamptz, gap_end timestamptz, cause text)
@@ -297,7 +298,7 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
     SELECT x, 'agent' FROM unnest(shawk.period(coverage_gaps.since, coverage_gaps.until) - o.observed - o.pruned) AS x
   ) g
   WHERE coverage_gaps.since < coverage_gaps.until
-  ORDER BY o.host, lower(g.gap)
+  ORDER BY o.host COLLATE "C", lower(g.gap)
 $$;
 
 -- shawk_v1.dependencies_between() for shawk.dependents(), with the plans it
@@ -318,9 +319,10 @@ $$;
 -- that makes its client a dependent, with the depth, and the dependent,
 -- its server and the port as impact() reports them: cli_host, cli_service,
 -- cli_addr, srv_host, srv_service and dep_port. gid numbers the rows of
--- impact(). The other columns are those of the dependency, which find its
--- edges; a client that the target relays (srv_service ~relay) has the
--- virtual address and port as those of its server.
+-- impact(), in their order. The other columns are those of the
+-- dependency, which find its edges; a client that the target relays
+-- (srv_service ~relay) has the virtual address and port as those of its
+-- server.
 --
 -- The function joins the dependencies of the period with each other, and
 -- they are the rows of a function, of which the planner knows nothing: it
@@ -422,13 +424,16 @@ hs AS (
 ),
 -- The periods of an address in the order they started, numbered by the
 -- runs of periods of one name, and when a run of another name started
--- after each run (taken) and ended before it (released).
+-- after each run (taken) and ended before it (released). Periods that
+-- start together are in the order of their names by bytes ("C"), so that
+-- the runs do not change with the collation of the database.
 ho AS (
   SELECT y.hostname, y.addr, y.first_seen, y.last_seen, y.stretch,
-         sum(y.other) OVER (PARTITION BY y.addr ORDER BY y.first_seen, y.hostname) AS run
+         sum(y.other) OVER (PARTITION BY y.addr ORDER BY y.first_seen, y.hostname COLLATE "C") AS run
   FROM (
     SELECT hq.*,
-           (hq.hostname IS DISTINCT FROM lag(hq.hostname) OVER (PARTITION BY hq.addr ORDER BY hq.first_seen, hq.hostname))::integer AS other
+           (hq.hostname IS DISTINCT FROM lag(hq.hostname) OVER (PARTITION BY hq.addr
+                                                                 ORDER BY hq.first_seen, hq.hostname COLLATE "C"))::integer AS other
     FROM hq
   ) y
 ),
@@ -478,9 +483,10 @@ cand AS (
     AND ha.held_until >= greatest(d.first_seen, dependents.since)
     AND ha.held_from <= least(d.last_seen, dependents.until)
 ),
--- Their service: the latest known owner of a listener on the port. An
--- address the host of the client holds too is its own: the gateway of a
--- container bridge, which every host has.
+-- Their service: the latest known owner of a listener on the port, the
+-- first by bytes ("C") of those last seen together. An address the host of
+-- the client holds too is its own: the gateway of a container bridge,
+-- which every host has.
 srv AS (
   SELECT DISTINCT ON (c.id, c.host) c.id, c.host, l.service, l.unit
   FROM (SELECT cand.*, bool_or(cand.host = cand.client_host) OVER (PARTITION BY cand.id) AS own FROM cand) c
@@ -493,10 +499,10 @@ srv AS (
       AND l.addr IN (c.server_addr, inet '0.0.0.0', inet '::')
       AND l.last_seen >= dependents.since - interval '15 minutes'
       AND l.first_seen <= c.last_seen + interval '15 minutes'
-    ORDER BY l.last_seen DESC, p.service_name, p.unit LIMIT 1
+    ORDER BY l.last_seen DESC, p.service_name COLLATE "C", p.unit COLLATE "C" LIMIT 1
   ) l ON true
   WHERE NOT c.own OR c.host = c.client_host
-  ORDER BY c.id, c.host, l.service
+  ORDER BY c.id, c.host, l.service COLLATE "C"
 ),
 -- The services that the client of a Unix socket without a server may have
 -- reached: the owners of the listeners of the name on its host in the
@@ -621,7 +627,11 @@ lt AS (
 -- backend saw from a source, also when a client with an agent explains
 -- the edge, since the backend cannot tell the clients behind a source
 -- apart. They are clients of the target on the virtual address and port,
--- of no process of it: ~relay.
+-- of no process of it: ~relay. Of the rows of a client, one is kept: the
+-- first by who saw it (both sides, the client, the server), then the one
+-- first seen; of those first seen together, the one last seen latest,
+-- then the first by the name of its server by bytes ("C"), so that the
+-- same data gives the same row.
 relay AS (
   SELECT -row_number() OVER () AS id, y.*
   FROM (
@@ -673,7 +683,7 @@ relay AS (
     LEFT JOIN shawk.inventory_addrs ci ON x.client_host IS NULL AND ci.addr = x.client_addr
     WHERE x.client_host IS DISTINCT FROM dependents.target_host
     ORDER BY x.client_host, x.client_service, x.client_unit, x.client_addr, x.server_addr, x.port, x.proto, x.backend_port,
-             x.observed_by, x.first_seen
+             x.observed_by COLLATE "C", x.first_seen, x.last_seen DESC, x.server_host COLLATE "C"
   ) y
 ),
 -- The dependencies on the target. Those of a service are on the service,
@@ -765,8 +775,8 @@ hit AS (
                     WHERE nc.host = r.client_host AND nc.service = r.client_service AND nc.depth <= n.depth)
     AND r.id NOT IN (SELECT x.id FROM direct x)
 )
-SELECT dense_rank() OVER (ORDER BY x.depth, x.cli_host, x.cli_service, x.cli_addr, x.srv_host, x.srv_service,
-                                   x.dep_port, x.proto),
+SELECT dense_rank() OVER (ORDER BY x.depth, x.cli_host COLLATE "C", x.cli_service COLLATE "C", x.cli_addr,
+                                   x.srv_host COLLATE "C", x.srv_service COLLATE "C", x.dep_port, x.proto COLLATE "C"),
        x.depth, x.cli_host, x.cli_service, x.cli_addr, x.srv_host, x.srv_service, x.dep_port, x.proto,
        x.first_seen, x.last_seen, x.observed_by,
        x.client_host, x.client_service, x.client_unit, x.client_addr,
@@ -793,6 +803,12 @@ $$;
 -- agent has client_addr, the name of its address as its service
 -- (peer_class) and the host the inventory gives its address, if any; one
 -- with an agent has no client_addr. observed_by tells which sides saw it.
+--
+-- The rows are in the order of depth, client_host (the clients without a
+-- host last), client_service, client_addr, server_host, server_service,
+-- port and proto. Names are compared by bytes ("C"), whatever the
+-- collation of the database: the same data gives the same rows in the
+-- same order.
 --
 -- The server of a dependency that its client alone saw is the host that
 -- held the address then, the host of the client for loopback and for an
@@ -867,8 +883,10 @@ grp AS (
          min(s.first_seen) AS first_seen, max(s.last_seen) AS last_seen,
          bool_or(s.observed_by IN ('both', 'client')) AS by_client,
          bool_or(s.observed_by IN ('both', 'server')) AS by_server,
-         -- The hosts whose agents saw it: one of each side at most.
-         max(s.client_host) AS client_agent, max(s.server_host) AS server_agent
+         -- The hosts whose agents saw it: one of each side at most, or
+         -- the last by bytes ("C") of the backends that saw a client of
+         -- a relay.
+         max(s.client_host COLLATE "C") AS client_agent, max(s.server_host COLLATE "C") AS server_agent
   FROM sel s
   GROUP BY s.gid, s.depth, s.cli_host, s.cli_service, s.cli_addr, s.srv_host, s.srv_service, s.dep_port, s.proto
 ),
@@ -969,7 +987,8 @@ SELECT g.depth, g.cli_host, g.cli_service, g.cli_addr, g.srv_host, g.srv_service
        c.cadence, c.period, c.next_expected, c.runs
 FROM grp g
 LEFT JOIN cad c ON c.gid = g.gid
-ORDER BY g.depth, g.cli_host, g.cli_service, g.cli_addr, g.srv_host, g.srv_service, g.dep_port, g.proto
+ORDER BY g.depth, g.cli_host COLLATE "C", g.cli_service COLLATE "C", g.cli_addr,
+         g.srv_host COLLATE "C", g.srv_service COLLATE "C", g.dep_port, g.proto COLLATE "C"
 $$;
 
 -- Whether a host, or a service or port of it, can be removed, from what

@@ -432,13 +432,23 @@ func (f impactFixture) both(clientHost, clientSvc, clientAddr, serverHost, serve
 
 // impact returns the dependents of a target over the period of the tests:
 // "depth client_host client_service client_addr -> server_host
-// server_service port observed_by cadence".
+// server_service port observed_by cadence", sorted by bytes.
 func (f impactFixture) impact(target string) []string {
+	f.t.Helper()
+	// Sorted as text, with "-" for no host, which is not the order of
+	// impact(): TestPGImpactOrder checks that one.
+	out := f.impactInOrder(target)
+	slices.Sort(out)
+	return out
+}
+
+// impactInOrder is impact with the rows in the order of shawk_v1.impact().
+func (f impactFixture) impactInOrder(target string) []string {
 	f.t.Helper()
 	rows, err := f.conn.Query(context.Background(), fmt.Sprintf(`
 SELECT depth || ' ' || coalesce(client_host, '-') || ' ' || client_service || ' ' || coalesce(host(client_addr), '-')
        || ' -> ' || server_host || ' ' || coalesce(server_service, '-') || ' ' || port || ' ' || observed_by || ' ' || coalesce(cadence, '-')
-FROM shawk_v1.impact(%s) ORDER BY 1`, fmt.Sprintf(target, ts(impactSince), ts(impactUntil))))
+FROM shawk_v1.impact(%s)`, fmt.Sprintf(target, ts(impactSince), ts(impactUntil))))
 	if err != nil {
 		f.t.Fatal(err)
 	}
@@ -581,6 +591,99 @@ func TestPGImpact(t *testing.T) {
 	if got := queryStrings(t, f.conn, `SELECT count(*) FROM shawk_v1.impact('db-01', '2026-09-02T00:00:00Z', '2026-09-01T00:00:00Z')`); !slices.Equal(got, []string{"0"}) {
 		t.Errorf("%v dependents in an empty period", got)
 	}
+}
+
+// TestPGImpactOrder: the rows of impact() and of coverage_gaps() are in an
+// order that the collation of the database does not change: names are
+// compared by bytes. The names here are those that collations disagree on:
+// en_US.utf8, which the postgres image of CI has, ignores "-", "~" and the
+// case at first, where C, which test/harness/postgres.sh has, puts "-"
+// before the capitals, the capitals before the small letters and "~" last.
+// The rows are compared as the functions give them, not sorted here.
+func TestPGImpactOrder(t *testing.T) {
+	_, conn := migratedDB(t)
+	f := newImpactFixture(t, conn)
+	f.watched("db-01", "10.0.0.10")
+	f.watched("alpha-01", "10.0.0.21", "10.0.0.25")
+	f.watched("Bravo-01", "10.0.0.22")
+	f.watched("charlie-01", "10.0.0.23")
+	f.watched("-dash-01", "10.0.0.24")
+	// The clients of db-01, in the order of en_US.utf8: by host, and those
+	// of alpha-01, each with an address of its own, by service.
+	for _, c := range []struct{ host, svc, addr string }{
+		{"alpha-01", "alpha", "10.0.0.21"},
+		{"alpha-01", "Zeta", "10.0.0.25"},
+		{"Bravo-01", "bravo", "10.0.0.22"},
+		{"charlie-01", "charlie", "10.0.0.23"},
+		{"-dash-01", "dash", "10.0.0.24"},
+	} {
+		f.both(c.host, c.svc, c.addr, "db-01", "postgres", "10.0.0.10", 5432, impactSince, impactUntil)
+	}
+	// charlie also uses another service of db-01, whose name comes before
+	// postgres by bytes alone.
+	f.both("charlie-01", "charlie", "10.0.0.23", "db-01", "Zed", "10.0.0.10", 7000, impactSince, impactUntil)
+	// An address of alpha-01 that the inventory alone knows, and the
+	// clients outside the fleet, folded: no agent, so the name of the
+	// address is their service.
+	f.exec(`INSERT INTO shawk.inventory_hosts (host, agent) VALUES ('alpha-01', true)`)
+	f.exec(`INSERT INTO shawk.inventory_addrs VALUES ('10.0.9.9', 'alpha-01')`)
+	f.edge("db-01", "postgres", "server", "10.0.0.10", "10.0.9.9", 5432, impactSince, impactUntil)
+	f.activeWith("db-01", "postgres", 5432, "10.0.9.9", impactSince, impactUntil, time.Hour, 1)
+	f.edge("db-01", "postgres", "server", "10.0.0.10", "0.0.0.0/0", 5432, impactSince, impactUntil)
+	f.exec(`UPDATE shawk.edges SET remote_addr = '0.0.0.0/0' WHERE remote_addr = '0.0.0.0'`)
+	f.activeWith("db-01", "postgres", 5432, "0.0.0.0/0", impactSince, impactUntil, time.Hour, 1)
+	// The clients of the clients.
+	f.watched("apple-01", "10.0.0.31")
+	f.watched("Web-01", "10.0.0.32")
+	f.both("apple-01", "apple", "10.0.0.31", "Bravo-01", "bravo", "10.0.0.22", 8080, impactSince, impactUntil)
+	f.both("Web-01", "web", "10.0.0.32", "alpha-01", "alpha", "10.0.0.21", 8080, impactSince, impactUntil)
+
+	checkRows(t, "dependents of db-01, in the order of impact()", f.impactInOrder(`'db-01', %s, %s`), []string{
+		"1 -dash-01 dash - -> db-01 postgres 5432 both continuous",
+		"1 Bravo-01 bravo - -> db-01 postgres 5432 both continuous",
+		"1 alpha-01 Zeta - -> db-01 postgres 5432 both continuous",
+		"1 alpha-01 alpha - -> db-01 postgres 5432 both continuous",
+		"1 alpha-01 ~unresolved 10.0.9.9 -> db-01 postgres 5432 server continuous",
+		"1 charlie-01 charlie - -> db-01 Zed 7000 both continuous",
+		"1 charlie-01 charlie - -> db-01 postgres 5432 both continuous",
+		// The clients without a host come last.
+		"1 - ~external 0.0.0.0 -> db-01 postgres 5432 server continuous",
+		"2 Web-01 web - -> alpha-01 alpha 8080 both -",
+		"2 apple-01 apple - -> Bravo-01 bravo 8080 both -",
+	})
+
+	// The gaps of hosts that were not observed at the end of the period,
+	// and of a name that no agent reported under.
+	for _, h := range []string{"able-02", "-odd-02", "Zulu-02"} {
+		f.host(h)
+		f.observed(h, impactSince.Add(-time.Hour), day(60, 0))
+	}
+	// Not queryStrings, which sorts.
+	rows, err := conn.Query(context.Background(),
+		`SELECT host FROM shawk_v1.coverage_gaps($1, $2, ARRAY['able-02', '~none', '-odd-02', 'Zulu-02'])`, impactSince, impactUntil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"-odd-02", "Zulu-02", "able-02", "~none"}; !slices.Equal(got, want) {
+		t.Errorf("the hosts of coverage_gaps(), in its order: %v, want %v", got, want)
+	}
+
+	// The service of a dependency that its client alone saw is the latest
+	// owner of the listener: of two last seen together, the first by bytes.
+	f.watched("srv-01", "10.0.0.40")
+	f.listens("srv-01", "alpha", 9000)
+	f.exec(`INSERT INTO shawk.listener_owners (host_id, process_id, proto, addr, port, netns, first_seen, last_seen)
+		VALUES ('srv-01', $1, 'tcp', '0.0.0.0', 9000, $2, $3, $4)`,
+		f.process("srv-01", "Zed", impactSince, impactUntil), int64(impactNetns), impactSince, impactUntil)
+	f.edge("charlie-01", "charlie", "client", "10.0.0.23", "10.0.0.40", 9000, impactSince, impactUntil)
+	f.activeWith("charlie-01", "charlie", 9000, "10.0.0.40", impactSince, impactUntil, time.Hour, 1)
+	checkRows(t, "dependents of srv-01", f.impactInOrder(`'srv-01', %s, %s`), []string{
+		"1 charlie-01 charlie - -> srv-01 Zed 9000 client continuous",
+	})
 }
 
 // TestPGImpactDepth: the dependents are followed to max_depth, which is 10
