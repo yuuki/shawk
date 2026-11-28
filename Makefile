@@ -80,12 +80,14 @@ lint: ## golangci-lint (.golangci.yml) in every module, and go.mod and go.sum ti
 fmt: ## format the Go code of every module (gofmt, through golangci-lint)
 	@set -e; for m in $(MODULES); do (cd $$m && $(GOLANGCI_LINT) fmt ./...); done
 
+# zizmor's online audits need GH_TOKEN; without one (or with GH_TOKEN= on the
+# command line) it runs offline.
 # gh-actions-lock checks that .github/workflows/actions.lock pins every
 # action the workflows use; with GH_TOKEN it also verifies each pin upstream.
 .PHONY: lint-actions
 lint-actions: ## lint (actionlint) and audit (zizmor) the workflows of .github, and check their lockfile
 	$(GO_RUN_TOOL) github.com/rhysd/actionlint/cmd/actionlint@$(ACTIONLINT_VERSION)
-	$(ZIZMOR) $(if $(GH_TOKEN),,--offline) .
+	$(if $(GH_TOKEN),$(ZIZMOR) .,env -u GH_TOKEN $(ZIZMOR) --offline .)
 	$(GH_ACTIONS_LOCK) $(if $(GH_TOKEN),--verify,--verify-local)
 
 # Pin the actions in .github/workflows/actions.lock after a `uses:` changed,
