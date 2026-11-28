@@ -1706,6 +1706,12 @@ error that says to drop the schemas `shawk` and `shawk_v1` (losing their
 history) and migrate again. A database is set up with
 `packaging/postgres/setup.sql`, then `shawk-migrate`, then `grants.sql`,
 which must be run again after every `shawk-migrate` that applies migrations.
+A connection string may hold a password, so neither `shawk-migrate` nor the
+connector prints one: the usage of `-dsn` names `$SHAWK_POSTGRES_DSN`
+without its value, usage errors do not quote an argument that could be a
+connection string, and a connection string that pgx cannot parse gives
+`invalid PostgreSQL connection string` without the error of pgx, which
+quotes it.
 
 ### 6.1 Tables (internal, schema `shawk`)
 

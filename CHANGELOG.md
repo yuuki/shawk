@@ -1,3 +1,17 @@
+## Unreleased
+
+### Fixed
+
+* `shawk-migrate -h` printed the value of `$SHAWK_POSTGRES_DSN` as the
+  default of `-dsn`, with its password, as did the usage that follows an
+  invalid flag. The usage now names the variable only. Usage errors no
+  longer quote an argument that could be a connection string, and a
+  connection string that cannot be parsed gives `invalid PostgreSQL
+  connection string`, as the connector does: the error of pgx quoted it
+  and did not hide every form of its password (`password = x`, a
+  password with `@`). The flags, the variable and the exit statuses are
+  unchanged (`docs/design.md` §6).
+
 ## [v0.11.0](https://github.com/yuuki/shawk/compare/v0.10.1...v0.11.0) (2026-11-26)
 
 ### Added
