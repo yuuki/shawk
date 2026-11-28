@@ -207,9 +207,9 @@ func writeRulesReport(b *strings.Builder, r *rulesReport, limit int) {
 			ru := &shown[i]
 			peer := commentName(ru.Peer)
 			if len(ru.PeerHosts) > 0 {
-				peer += " (" + commentNames(ru.PeerHosts) + ")"
+				peer += " (" + describeStrings(ru.PeerHosts, 3) + ")"
 			}
-			tb.row(ru.Direction, ru.ports()+"/"+ru.Proto, peer, describeAddresses(ru.Addresses, 3), commentNames(ru.Services),
+			tb.row(ru.Direction, ru.ports()+"/"+ru.Proto, peer, describeAddresses(ru.Addresses, 3), describeStrings(ru.Services, 3),
 				formatTime(ru.LastSeen), describeNotes(ru))
 		}
 		tb.writeTo(b)
@@ -265,9 +265,9 @@ func ruleComment(ru *rule) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s %s/%s: %s", ru.Direction, ru.ports(), ru.Proto, commentName(ru.Peer))
 	if len(ru.PeerHosts) > 0 {
-		fmt.Fprintf(&b, " on %s", commentNames(ru.PeerHosts))
+		fmt.Fprintf(&b, " on %s", describeStrings(ru.PeerHosts, 3))
 	}
-	fmt.Fprintf(&b, ", of %s, last seen %s", commentNames(ru.Services), formatTime(ru.LastSeen))
+	fmt.Fprintf(&b, ", of %s, last seen %s", describeStrings(ru.Services, 3), formatTime(ru.LastSeen))
 	if notes := describeNotes(ru); notes != "" {
 		fmt.Fprintf(&b, " [%s]", notes)
 	}
@@ -310,8 +310,26 @@ func nftMatch(ps []netip.Prefix, v4 bool, side string) string {
 	for i, p := range ps {
 		parts[i] = address(p)
 	}
-	return family + " " + side + " { " + strings.Join(parts, ", ") + " }"
+	if len(parts) <= nftPerLine {
+		return family + " " + side + " { " + strings.Join(parts, ", ") + " }"
+	}
+	// A set of many addresses, a few per line: a server with thousands of
+	// clients is one rule, which a reviewer can still read.
+	var b strings.Builder
+	b.WriteString(family + " " + side + " {")
+	for i := 0; i < len(parts); i += nftPerLine {
+		end := min(i+nftPerLine, len(parts))
+		b.WriteString("\n\t\t\t" + strings.Join(parts[i:end], ", "))
+		if end < len(parts) {
+			b.WriteString(",")
+		}
+	}
+	b.WriteString("\n\t\t}")
+	return b.String()
 }
+
+// nftPerLine is how many addresses of a set are written on a line.
+const nftPerLine = 4
 
 // nftRules returns the lines of a rule: one per family of its addresses.
 func nftRules(ru *rule) []string {

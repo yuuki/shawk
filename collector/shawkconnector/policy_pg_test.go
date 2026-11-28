@@ -406,6 +406,49 @@ func TestPGBaselineObserved(t *testing.T) {
 	}
 }
 
+// TestPGNamedDependencyPorts: the port of a dependency between services is
+// that of shawk.dependency_port(), which the names are read without a call
+// of per row: 0 for a server of port_agnostic_services, for a process of a
+// Slurm job when slurm-job is one, whether an agent saw its side or its
+// listener names it, and for a port in a range of dynamic_ports.
+func TestPGNamedDependencyPorts(t *testing.T) {
+	f := newPolicyFixture(t)
+	f.host("app-01", "10.0.0.11")
+	f.host("login-01", "10.0.0.60")
+	f.hostObserved("cn-01", "10.0.0.70", 100*days, 2*days)
+	f.proc("app-01", "app.service", "shop/app")
+	f.proc("login-01", "session.scope", "srun")
+	f.proc("login-01", "slurm/step", "python3")
+	f.proc("login-01", "x.service", "x")
+	f.proc("cn-01", "slurm/batch", "solver")
+	f.pair("app-01", "shop/app", "10.0.0.11", "login-01", "srun", "10.0.0.60", 41000, 20*days, 0)
+	f.pair("app-01", "shop/app", "10.0.0.11", "login-01", "python3", "10.0.0.60", 42000, 20*days, 0)
+	f.pair("app-01", "shop/app", "10.0.0.11", "login-01", "x", "10.0.0.60", 8080, 20*days, 0)
+	f.pair("app-01", "shop/app", "10.0.0.11", "login-01", "x", "10.0.0.60", 31500, 20*days, 0)
+	// The agent of cn-01 stopped: its job is named by its listener.
+	f.listener("cn-01", "solver", "0.0.0.0", 43000, "NULL")
+	f.edge("app-01", "shop/app", "client", "tcp", "10.0.0.11", "10.0.0.70", 43000, 20*days, 0)
+	f.edge("app-01", "shop/app", "client", "tcp", "10.0.0.11", "192.0.2.7", 31500, 20*days, 0)
+	ports := func() []string {
+		return f.query(time.Hour, `SELECT server_name, port, dependency_port, named_by,
+			dependency_port = shawk.dependency_port(server_name, coalesce(server_unit, CASE WHEN server_name = 'solver' THEN 'slurm/' END),
+			                                        server_addr, port, proto)
+			FROM shawk.named_dependencies($1, $2)`)
+	}
+	want := []string{"python3 42000 42000 edge true", "solver 43000 43000 endpoint true", "srun 41000 41000 edge true",
+		"x 31500 31500 edge true", "x 8080 8080 edge true", "~external 31500 31500 address true"}
+	if got := ports(); !slices.Equal(got, want) {
+		t.Errorf("without rules of ports: %v, want %v", got, want)
+	}
+	f.exec(`INSERT INTO shawk.port_agnostic_services VALUES ('srun'), ('slurm-job')`)
+	f.exec(`INSERT INTO shawk.dynamic_ports VALUES ('nodeports', 'tcp', '10.0.0.0/24', 30000, 32767), ('udp', 'udp', '0.0.0.0/0', 1, 65535)`)
+	want = []string{"python3 42000 0 edge true", "solver 43000 0 endpoint true", "srun 41000 0 edge true",
+		"x 31500 0 edge true", "x 8080 8080 edge true", "~external 31500 31500 address true"}
+	if got := ports(); !slices.Equal(got, want) {
+		t.Errorf("with rules of ports: %v, want %v", got, want)
+	}
+}
+
 // TestPGNamedByEndpoint: a server that no agent saw the side of keeps the
 // name of the service that listens at its address, so that a stopped
 // agent, or one that folds its clients, does not make the dependencies on

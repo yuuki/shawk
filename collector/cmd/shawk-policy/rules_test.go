@@ -287,7 +287,10 @@ var (
 		"\t\tmeta l4proto != { tcp, udp } accept":        true,
 		"\t\tcounter reject with icmpx admin-prohibited": true, "\t\tcounter drop": true,
 	}
-	nftRule = regexp.MustCompile(`^\t\t(?:(ip6?) ([sd]addr) (\{ [0-9a-f.:/, ]+ \}|[0-9a-f.:/]+) |meta nfproto (ipv[46]) )?(tcp|udp) dport (\d+)(?:-(\d+))? accept$`)
+	// A set of more addresses than fit a line is written over several,
+	// which nftJoin puts back on one.
+	nftSetLines = regexp.MustCompile(`(?m) \{\n((?:\t\t\t[0-9a-f.:/]+(?:, [0-9a-f.:/]+)*,?\n)+)\t\t\} `)
+	nftRule     = regexp.MustCompile(`^\t\t(?:(ip6?) ([sd]addr) (\{ [0-9a-f.:/, ]+ \}|[0-9a-f.:/]+) |meta nfproto (ipv[46]) )?(tcp|udp) dport (\d+)(?:-(\d+))? accept$`)
 )
 
 // parseNftables reads a table that writeNftables wrote and returns what it
@@ -295,6 +298,16 @@ var (
 // frame of the table, nor a rule of a flow.
 func parseNftables(t testing.TB, text string) []string {
 	t.Helper()
+	text = nftSetLines.ReplaceAllStringFunc(text, func(set string) string {
+		lines := strings.Split(strings.TrimSuffix(nftSetLines.FindStringSubmatch(set)[1], "\n"), "\n")
+		for i, l := range lines {
+			if more := strings.HasSuffix(l, ","); more != (i < len(lines)-1) {
+				t.Fatalf("a line of a set ends or goes on where it should not: %q", set)
+			}
+			lines[i] = strings.TrimSuffix(strings.TrimPrefix(l, "\t\t\t"), ",")
+		}
+		return " { " + strings.Join(lines, ", ") + " } "
+	})
 	var out []string
 	chain := ""
 	for i, line := range strings.Split(strings.TrimSuffix(text, "\n"), "\n") {

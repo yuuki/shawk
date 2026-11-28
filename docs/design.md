@@ -71,7 +71,9 @@ throughout and still be used (§10).
   never by a cross-database join.
 - Grafana is the user interface; dashboards and alerts are in `packaging/`
   (§8). `shawk-impact` reads PostgreSQL to tell what removing a host would
-  break (§6.3).
+  break (§6.3), and `shawk-policy` to write, for review, the rules that
+  allow what a host was seen to do and a baseline of the dependencies of
+  services, against which the connector reports a drift (§6.4).
 
 shawk promises two contracts: the views and functions of the PostgreSQL
 schema `shawk_v1`, and the names and labels of its metrics in Prometheus.
@@ -1567,6 +1569,11 @@ connector holds, so the connector bounds it:
   row of 93 bytes of bits per month, however long the writes fail within
   the month.
 
+- The baseline (`baseline_file`, §5.9) is not held: the connector keeps
+  the result of its last evaluation, at most 1000 drifting dependencies
+  and one count per service of the file, of which there are at most
+  10000.
+
 Agent strings are cut to 4096 bytes and `shawk.peer.internal` to 4096
 ranges. The defaults are far above what one connector serves and what a
 large host sends (16384 flows per interval by default; a much larger
@@ -1754,8 +1761,8 @@ compatible with `MemoryDenyWriteExecute=yes` of its systemd unit.
   hourly in bounded batches on its fixed window with incremental vacuuming
   regardless of `retention`.
 - **What stays PostgreSQL-only.** `job_users`, `node_states_file`,
-  `maintenance_file` and `postgres.migrate` are refused by configuration
-  validation when `sqlite.path` is set. Multi-connector scaling, multi-year
+  `maintenance_file`, `baseline_file` (§5.9) and `postgres.migrate` are
+  refused by configuration validation when `sqlite.path` is set. Multi-connector scaling, multi-year
   `first_seen`/`last_seen` dependency history, `dependency_changes` alerts,
   `unobserved()`/`partly_observed()` coverage proofs, `edge_protocols`,
   recursive N-hop maps, the hours of activity (§5.1) and the impact of
@@ -1765,11 +1772,110 @@ compatible with `MemoryDenyWriteExecute=yes` of its systemd unit.
   SQLite: the store keeps the state that names peers, 7 days of server
   endpoints without their clients and no observation periods, so nothing
   in it tells that a host was not used, and a verdict from it would be
-  from part of the data.
+  from part of the data. Nor do rules or a baseline come from it (§6.4):
+  `shawk-policy` refuses it the same way.
 - **Packaging.** `packaging/collector/config-sqlite.yaml`, the drop-in
   `packaging/systemd/shawk-collector-sqlite.conf` (`StateDirectory=shawk-collector`),
   and Prometheus-only dashboards `packaging/grafana/dashboards-lite/`
   (`shawk-map-live.json`, `shawk-fleet-live.json`, `shawk-hosts-live.json`).
+
+### 5.9 Baseline of dependencies
+
+`baseline_file` lists, per service, the dependencies that an operator
+approved, and the connector tells Prometheus the dependencies of those
+services that are not among them: the drift (§6.4). It is YAML or JSON, as
+`shawk-policy baseline` writes it for review (§8):
+
+```yaml
+services:
+  - service: shop/app                 # as in PostgreSQL and the job label
+    dependencies:
+      - {peer: shop/postgres, port: 5432, proto: tcp}
+      - {peer: ~external, port: 443, proto: tcp}
+      - {peer: resolvers, port: 53, proto: udp}   # a range of peer_cidrs
+  - service: batch/report
+    dependencies: []                  # approved to have none
+```
+
+- **Loading**, as the inventory (§5.6): the connector reads the file at
+  start and every write interval and, when its contents changed (whatever
+  their order and layout), replaces the baseline in PostgreSQL in one
+  transaction under an advisory lock (`shawk.baseline_services`,
+  `shawk.baseline_dependencies`); it records the time it read them either
+  way (`shawk.baseline_state`). Every connector should read the same file:
+  the last to write wins. A connector without `baseline_file` leaves the
+  baseline as it is, and evaluates nothing.
+- **A file that would approve something else than was written is
+  refused**, and the baseline read before stays: one that cannot be read,
+  is larger than 16 MiB, has unknown fields or several documents, or is
+  empty, as a generator that failed leaves it. A service must list its
+  dependencies: `dependencies: []` approves none, and a service without
+  the key is an error rather than a service approved to have none. A
+  baseline of no service is written `services: []`. A name is a name of
+  PostgreSQL, of 511 bytes at most, without control characters; a port is
+  0 to 65535, where 0 stands for every port; the transport is `tcp` or
+  `udp`. A service listed twice is refused, a dependency listed twice is
+  one. The failure is logged and recorded with its time, for every
+  connector (`shawk_v1.baseline_status`) and for Prometheus
+  (`shawk.baseline.file.failed`): a baseline that no longer follows its
+  file must not go unnoticed.
+- **Evaluation.** Every 5 minutes the connector reads
+  `shawk_v1.baseline_drift()` over the last hour, up to 5 minutes ago,
+  when both sides of a new connection are written (§8), and
+  `shawk_v1.baseline_new_services()` over the same period, in one
+  read-only transaction of a minute at most. The period starts an hour
+  before the previous one ended, so that what was written late, by an
+  agent whose clock is behind or after PostgreSQL was down, is still
+  judged; after evaluations failed for long it reaches back 24 hours at
+  most. A connector that restarts starts from the last hour: what drifted
+  before is in PostgreSQL, and `shawk-policy drift -lookback` reads it.
+- **Why the connector evaluates, in SQL.** The drift is a question about
+  the fleet, and PostgreSQL is the truth of attribution (§5.2): the names
+  that the connector gives peers as it aggregates are the best guess of
+  that moment, and a server shows as `~unresolved` until its listener is
+  written. A drift judged there would alert on names that settle a minute
+  later. The connector therefore reads the contract, like Grafana and
+  `shawk-policy drift`, and only sends what it reads; it holds no copy of
+  the baseline in memory, only the result of the last evaluation.
+
+The result is sent with every write interval, so that its series have no
+gaps, on a resource per service whose `service.name` is the service, so
+that Prometheus gives the series the `job` of the series of its
+dependencies (§5.3):
+
+| Prometheus name | |
+|---|---|
+| `shawk_baseline_drift_hosts{job, service_peer_name, server_port, network_transport}` | a dependency that the baseline of the service does not hold; the value is the number of hosts of the service that have it |
+| `shawk_baseline_dependencies{job}` | the dependencies of the baseline of a service: the services that are judged |
+| `shawk_baseline_drift_truncated` | the dependencies that drift beyond those sent |
+| `shawk_baseline_new_services` | the services without a baseline first seen in the period, which nothing judges (§6.4) |
+| `shawk_baseline_evaluation_timestamp_seconds` | the end of the period last evaluated |
+| `shawk_baseline_file_failed` | 1 while the latest read of a `baseline_file` failed |
+
+The last four are of the connector, under `job="shawk-connector"`.
+
+- **No address and no host.** A series is a service, a peer by its name, a
+  port and a transport: the labels of the series of the dependency itself.
+  The hosts are a count, so a release that opens a new connection on 500
+  hosts is one series, and one alert. `shawk-policy drift` lists the hosts
+  and the addresses from PostgreSQL.
+- **Bounds.** The `job` of a series is a service of the file: at most
+  10000 services, with 100000 dependencies in all, which the connector
+  writes and does not hold. The names of peers are what agents send: at
+  most 1000 drifting dependencies are sent, in the order of their service,
+  peer, port and transport so that the same ones are sent every time, and
+  the others are counted in `shawk_baseline_drift_truncated`. Names of
+  peers are cut to 511 bytes, as `service.peer.name` is.
+- **Unknown is not zero.** While evaluations fail, the last result is
+  sent for 15 minutes, then only the time of the evaluation: a drift that
+  is no longer known is not told, and neither is its absence, and
+  `ShawkBaselineNotEvaluated` alerts on the time (§8). Before a baseline
+  was read from a valid file nothing is judged and only
+  `shawk_baseline_file_failed` is sent.
+- **Several connectors** with `baseline_file` evaluate the same
+  PostgreSQL and send the same series; the alerts take their maximum.
+- **Not with SQLite** (§5.8), which keeps no dependencies of a period:
+  `baseline_file` is refused by configuration validation.
 
 ## 6. PostgreSQL
 

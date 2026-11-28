@@ -63,18 +63,40 @@ CREATE TABLE shawk.baseline_state (
 -- a socket, then the most recently seen. named_by tells where the name of
 -- the server comes from: edge (an agent saw the server side), endpoint, or
 -- address (peer_class).
-CREATE FUNCTION shawk.named_dependencies(since timestamptz, until timestamptz)
+--
+-- The names are made for the rows that the caller reads only: those of a
+-- host on either side (of_host), of clients with an agent (clients_only),
+-- of the services of of_services, and of the services that have a
+-- baseline (with_baseline). A name costs calls of peer_class and of
+-- dependency_port, a few seconds for the hundreds of thousands of
+-- dependencies of a period of months, which the rows of one host or one
+-- service do not need.
+--
+-- Nested loops are on within the function, whatever its caller sets
+-- (policy_flows turns them off): the dependencies of the period and the
+-- endpoints are read through indexes, a host at a time. The JIT compiler
+-- is off: the costs of these plans start it, and it takes 2 seconds to
+-- compile what then runs for one.
+CREATE FUNCTION shawk.named_dependencies(since timestamptz, until timestamptz, of_host text DEFAULT NULL,
+                                         clients_only boolean DEFAULT false, of_services text[] DEFAULT NULL,
+                                         with_baseline boolean DEFAULT false)
 RETURNS TABLE (
   client_host text, client_service text, client_unit text, client_addr inet,
   server_host text, server_service text, server_unit text, server_addr inet,
   port integer, proto text, first_seen timestamptz, last_seen timestamptz, observed_by text,
   virtual_addr inet, virtual_port integer,
   client_name text, server_name text, named_by text, dependency_port integer)
-LANGUAGE sql STABLE ROWS 100000 SET search_path = pg_catalog, pg_temp AS $$
+LANGUAGE sql STABLE ROWS 100000 SET search_path = pg_catalog, pg_temp SET enable_nestloop = on SET jit = off AS $$
 WITH d AS MATERIALIZED (
   SELECT row_number() OVER () AS id, x.*
   FROM shawk_v1.dependencies_between(named_dependencies.since, named_dependencies.until) x
   WHERE x.proto <> 'unix'
+    AND (named_dependencies.of_host IS NULL
+         OR x.client_host = named_dependencies.of_host OR x.server_host = named_dependencies.of_host)
+    AND (NOT named_dependencies.clients_only OR x.client_host IS NOT NULL)
+    AND (named_dependencies.of_services IS NULL OR x.client_service = ANY (named_dependencies.of_services))
+    AND (NOT named_dependencies.with_baseline
+         OR x.client_service IN (SELECT s.service FROM shawk.baseline_services s))
 ),
 -- The rows whose server no agent saw, of clients with an agent.
 u AS (
@@ -89,18 +111,25 @@ ep AS MATERIALIZED (
   FROM shawk_v1.service_endpoints e
   WHERE EXISTS (SELECT FROM u)
 ),
+-- The backends of the rows whose server is a virtual address of a
+-- translation of the configuration: few, and found before the endpoints
+-- are read, so that the endpoints are not read once per row.
+vb AS MATERIALIZED (
+  SELECT u.id, u.proto, b.addr, CASE WHEN b.port = 0 THEN u.port ELSE b.port END AS port
+  FROM shawk.translations v
+  JOIN u ON u.proto = v.proto AND u.server_addr = v.addr AND v.port IN (0, u.port)
+  JOIN shawk.translations b ON b.side = 'backend' AND b.name = v.name AND b.proto = v.proto
+  WHERE v.side = 'virtual'
+),
 cand AS (
   SELECT u.id, ep.service, ep.slurm_job, 0 AS via, ep.host = u.client_host AS own, ep.exact, ep.last_seen
   FROM u
   JOIN ep ON ep.addr = u.server_addr AND ep.port = u.port AND ep.proto = u.proto
   WHERE ep.host = u.client_host OR NOT u.host_local
   UNION ALL
-  SELECT u.id, ep.service, ep.slurm_job, 1, false, ep.exact, ep.last_seen
-  FROM u
-  JOIN shawk.translations v
-    ON v.side = 'virtual' AND v.proto = u.proto AND v.addr = u.server_addr AND v.port IN (0, u.port)
-  JOIN shawk.translations b ON b.side = 'backend' AND b.name = v.name AND b.proto = v.proto
-  JOIN ep ON ep.proto = u.proto AND ep.addr <<= b.addr AND ep.port = CASE WHEN b.port = 0 THEN u.port ELSE b.port END
+  SELECT vb.id, ep.service, ep.slurm_job, 1, false, ep.exact, ep.last_seen
+  FROM vb
+  JOIN ep ON ep.proto = vb.proto AND ep.port = vb.port AND ep.addr <<= vb.addr
 ),
 pick AS (
   SELECT DISTINCT ON (c.id) c.id, c.service, c.slurm_job
@@ -114,8 +143,14 @@ SELECT d.client_host, d.client_service, d.client_unit, d.client_addr,
        coalesce(d.client_service, shawk_v1.peer_class(d.client_addr)),
        n.server_name,
        CASE WHEN d.server_service IS NOT NULL THEN 'edge' WHEN p.id IS NOT NULL THEN 'endpoint' ELSE 'address' END,
-       shawk.dependency_port(n.server_name, coalesce(d.server_unit, CASE WHEN p.slurm_job THEN 'slurm/' END),
-                             d.server_addr, d.port, d.proto)
+       -- The port of shawk.dependency_port(), read from its tables here
+       -- rather than by a call of it per row.
+       CASE WHEN n.server_name IN (SELECT a.service FROM shawk.port_agnostic_services a)
+              OR ((d.server_unit LIKE 'slurm/%' OR p.slurm_job)
+                  AND EXISTS (SELECT FROM shawk.port_agnostic_services a WHERE a.service = 'slurm-job'))
+              OR EXISTS (SELECT FROM shawk.dynamic_ports r
+                         WHERE r.proto = d.proto AND d.port BETWEEN r.port_from AND r.port_to AND d.server_addr <<= r.addr)
+            THEN 0 ELSE d.port END
 FROM d
 LEFT JOIN pick p ON p.id = d.id
 CROSS JOIN LATERAL (
@@ -204,6 +239,13 @@ $$;
 -- peer is the name of the other side, as baseline_observed() names it,
 -- and peer_host its host, for a peer whose agent saw the connection; they
 -- tell the reviewer what a rule is for and pin nothing.
+--
+-- The edges of the host are joined with its dependencies, which are the
+-- rows of a function, of which the planner knows nothing: it would join
+-- the few rows it expects in nested loops, which take a quarter of a
+-- minute for a host with thousands of clients. As in shawk.dependents(),
+-- nested loops are off, so that the joins hash, and so is the JIT
+-- compiler, which the costs of such a plan start for nothing.
 CREATE FUNCTION shawk_v1.policy_flows(target_host text, since timestamptz, until timestamptz,
                                       target_unit text DEFAULT NULL)
 RETURNS TABLE (
@@ -211,7 +253,7 @@ RETURNS TABLE (
   peer_addr inet, port integer, port_from integer, port_to integer,
   peer text, peer_host text, translated boolean, kernel_chosen boolean,
   first_seen timestamptz, last_seen timestamptz)
-LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp SET enable_nestloop = off SET jit = off AS $$
 WITH e AS MATERIALIZED (
   SELECT e.id, e.host_id, e.process_id, e.role, e.proto, e.local_addr, e.remote_addr, e.port, e.netns,
          e.first_seen, e.last_seen, p.service_name AS service, p.unit,
@@ -226,13 +268,12 @@ WITH e AS MATERIALIZED (
 ),
 nd AS MATERIALIZED (
   SELECT d.*
-  FROM shawk.named_dependencies(policy_flows.since, policy_flows.until) d
-  WHERE (d.client_host = policy_flows.target_host OR d.server_host = policy_flows.target_host)
-    AND EXISTS (SELECT FROM e WHERE e.in_period)
+  FROM shawk.named_dependencies(policy_flows.since, policy_flows.until, policy_flows.target_host) d
+  WHERE EXISTS (SELECT FROM e WHERE e.in_period)
 ),
 -- The names of the servers of the client edges, the ports of their
 -- dependencies, and whether the kernel chose the port of a server.
-eg AS (
+eg AS MATERIALIZED (
   SELECT e.id,
          string_agg(DISTINCT d.server_name, ', ') AS peer,
          string_agg(DISTINCT d.server_host, ', ') AS peer_host,
@@ -250,7 +291,7 @@ eg AS (
   GROUP BY e.id
 ),
 -- The names of the clients of the server edges.
-ig AS (
+ig AS MATERIALIZED (
   SELECT e.id,
          string_agg(DISTINCT d.client_name, ', ') AS peer,
          string_agg(DISTINCT d.client_host, ', ') AS peer_host
@@ -451,10 +492,8 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
          (array_agg(DISTINCT coalesce(d.virtual_addr, d.server_addr) ORDER BY coalesce(d.virtual_addr, d.server_addr)))[1:50],
          CASE WHEN bool_or(d.named_by = 'edge') THEN 'edge' WHEN bool_or(d.named_by = 'endpoint') THEN 'endpoint'
               ELSE 'address' END
-  FROM shawk.named_dependencies(baseline_observed.since, baseline_observed.until) d
-  WHERE d.client_host IS NOT NULL
-    AND baseline_observed.since < baseline_observed.until
-    AND (baseline_observed.services IS NULL OR d.client_service = ANY (baseline_observed.services))
+  FROM shawk.named_dependencies(baseline_observed.since, baseline_observed.until, NULL, true, baseline_observed.services) d
+  WHERE baseline_observed.since < baseline_observed.until
   GROUP BY 1, 2, 3, 4
   ORDER BY 1, 2, 3, 4
 $$;
@@ -573,11 +612,8 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
          (array_agg(DISTINCT coalesce(d.virtual_addr, d.server_addr) ORDER BY coalesce(d.virtual_addr, d.server_addr)))[1:50],
          CASE WHEN bool_or(d.named_by = 'edge') THEN 'edge' WHEN bool_or(d.named_by = 'endpoint') THEN 'endpoint'
               ELSE 'address' END
-  FROM shawk.named_dependencies(baseline_drift.since, baseline_drift.until) d
-  WHERE d.client_host IS NOT NULL
-    AND baseline_drift.since < baseline_drift.until
-    AND EXISTS (SELECT FROM shawk.baseline_services s WHERE s.service = d.client_service)
-    AND (baseline_drift.services IS NULL OR d.client_service = ANY (baseline_drift.services))
+  FROM shawk.named_dependencies(baseline_drift.since, baseline_drift.until, NULL, true, baseline_drift.services, true) d
+  WHERE baseline_drift.since < baseline_drift.until
     AND NOT EXISTS (
       SELECT FROM shawk.baseline_dependencies b
       WHERE b.service = d.client_service AND b.peer = d.server_name AND b.proto = d.proto
