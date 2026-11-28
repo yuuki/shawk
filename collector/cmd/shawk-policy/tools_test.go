@@ -21,20 +21,25 @@ import (
 // skipped where the tools are missing, or where a network namespace cannot
 // be made.
 
-// inNetns returns the start of a command that runs in a new network
-// namespace, as root or as root of a new user namespace.
-func inNetns(t *testing.T) []string {
+// inNetns returns what makes new network namespaces for the commands of a
+// test, as root or as root of a new user namespace; the commands run
+// through the guard of netnsguard_test.go, which keeps them out of the
+// namespace of the test. The test is skipped where nft cannot run in a
+// namespace of its own.
+func inNetns(t *testing.T) netnsMaker {
 	t.Helper()
 	if _, err := exec.LookPath("nft"); err != nil {
 		t.Skip("nft is not available")
 	}
+	own := ownNetns(t)
 	for _, c := range [][]string{{"unshare", "-n"}, {"unshare", "-rn"}} {
-		if exec.Command(c[0], append(c[1:], "nft", "list", "ruleset")...).Run() == nil {
-			return c
+		m := netnsMaker{own: own, unshare: c}
+		if m.command("nft", "list", "ruleset").Run() == nil {
+			return m
 		}
 	}
 	t.Skip("nft cannot run in a network namespace of its own here (unshare -n, unshare -rn)")
-	return nil
+	return netnsMaker{}
 }
 
 // span is a range of addresses.
@@ -364,14 +369,14 @@ func listedSpans(t *testing.T, doc []byte, enforce bool) []string {
 // loadNftables checks a table with nft, loads it into the kernel of a new
 // network namespace, twice as a table that is written again would be, and
 // returns what the kernel then holds, as JSON.
-func loadNftables(t *testing.T, netns []string, text string) []byte {
+func loadNftables(t *testing.T, netns netnsMaker, text string) []byte {
 	t.Helper()
 	file := filepath.Join(t.TempDir(), "policy.nft")
 	if err := os.WriteFile(file, []byte(text), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	script := `nft -c -f "$1" && nft -f "$1" && nft -f "$1" && nft -j list ruleset`
-	cmd := exec.Command(netns[0], append(netns[1:], "sh", "-c", script, "sh", file)...)
+	cmd := netns.command("sh", "-c", script, "sh", file)
 	var out, errOut bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errOut
 	if err := cmd.Run(); err != nil {
@@ -470,8 +475,8 @@ func TestNftablesRefused(t *testing.T) {
 	if err := os.WriteFile(file, []byte(text), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command(netns[0], append(netns[1:], "nft", "-c", "-f", file)...).CombinedOutput(); err == nil {
-		t.Errorf("nft accepts an address that is none: %s", out)
+	if out, err := netns.command("nft", "-c", "-f", file).CombinedOutput(); err == nil || refused(err) {
+		t.Errorf("nft accepts an address that is none, or was not run: %v: %s", err, out)
 	}
 }
 

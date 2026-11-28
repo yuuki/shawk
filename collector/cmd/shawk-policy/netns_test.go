@@ -20,16 +20,28 @@ import (
 // interfaces, one for the host of the rules and one for its peers, with
 // the kernel's own nftables and connection tracking. They tell what no
 // reading of the text of a table can: what a table lets pass, and what its
-// counters count. They are skipped where the namespaces cannot be made.
+// counters count. They are skipped where the namespaces cannot be made,
+// and where a namespace cannot be proven to be another than the one that
+// the test itself runs in: every command that they run in a namespace goes
+// through netLab.command, and so through the guard of netnsguard_test.go.
 //
 // The test binary is its own helper: started with netHelperEnv set, it
 // serves or opens connections in the namespace it was started in, and
 // does what the lines of its standard input ask.
 
-const netHelperEnv = "SHAWK_POLICY_TEST_NET_HELPER"
+const (
+	netHelperEnv = "SHAWK_POLICY_TEST_NET_HELPER"
+	// netHelperNetnsEnv is the network namespace that a helper is meant
+	// to run in: it does nothing anywhere else.
+	netHelperNetnsEnv = "SHAWK_POLICY_TEST_NET_HELPER_NETNS"
+)
 
 func TestMain(m *testing.M) {
 	if spec := os.Getenv(netHelperEnv); spec != "" {
+		if id, err := os.Readlink("/proc/self/ns/net"); err != nil || id == "" || id != os.Getenv(netHelperNetnsEnv) {
+			fmt.Printf("refused: the helper is in the network namespace %q, not in %q (%v)\n", id, os.Getenv(netHelperNetnsEnv), err)
+			os.Exit(netnsRefused)
+		}
 		os.Exit(netHelper(strings.Fields(spec)))
 	}
 	os.Exit(m.Run())
@@ -131,7 +143,7 @@ func netHelper(args []string) int {
 // the address 10.0.0.11, and p, with the addresses of its peers.
 type netLab struct {
 	t    *testing.T
-	h, p []string
+	h, p *heldNetns
 }
 
 // netFlow is a connection that a helper holds.
@@ -146,70 +158,75 @@ type netFlow struct {
 	opened bool
 }
 
-// newNetLab makes the namespaces, or skips the test.
+// newNetLab makes the namespaces, or skips the test. A namespace is used
+// only once its holder told that it is another than that of the test
+// (holdNetns): the test is skipped when that cannot be told.
 func newNetLab(t *testing.T) *netLab {
 	t.Helper()
-	unshare := inNetns(t)
+	maker := inNetns(t)
 	for _, tool := range []string{"nsenter", "ip", "sleep"} {
 		if _, err := exec.LookPath(tool); err != nil {
 			t.Skipf("%s is not available", tool)
 		}
 	}
 	lab := &netLab{t: t}
-	hold := func(start []string) []string {
-		cmd := exec.Command(start[0], append(start[1:], "sleep", "600")...)
-		if err := cmd.Start(); err != nil {
-			t.Skipf("no network namespace: %v", err)
-		}
-		t.Cleanup(func() { _ = cmd.Process.Kill(); _, _ = cmd.Process.Wait() })
-		enter := []string{"nsenter", "-t", strconv.Itoa(cmd.Process.Pid), "-n"}
-		if unshare[1] == "-rn" {
-			// As root of a user namespace of its own.
-			enter = append(enter, "-U", "--preserve-credentials")
-		}
-		// The namespace is there once the command that holds it runs in it.
-		for range 100 {
-			if exec.Command(enter[0], append(enter[1:], "true")...).Run() == nil {
-				return enter
-			}
-			time.Sleep(20 * time.Millisecond)
-		}
-		t.Skip("the network namespace cannot be entered (nsenter)")
-		return nil
+	var err error
+	if lab.h, err = holdNetns(maker.own, maker.unshare, nil, maker.userns()); err != nil {
+		t.Skipf("no network namespace for the host of the test: %v", err)
 	}
-	lab.h = hold(unshare)
+	t.Cleanup(lab.h.release)
 	// The namespace of the peers is made from within that of the host, so
 	// that one user namespace owns both.
-	lab.p = hold(append(append([]string{}, lab.h...), "unshare", "-n"))
-	peer := lab.p[2]
-	setup := [][]string{
-		append(append([]string{}, lab.h...), "ip", "link", "set", "lo", "up"),
-		append(append([]string{}, lab.h...), "ip", "link", "add", "va", "type", "veth", "peer", "name", "vb", "netns", peer),
-		append(append([]string{}, lab.h...), "ip", "addr", "add", "10.0.0.11/24", "dev", "va"),
-		append(append([]string{}, lab.h...), "ip", "link", "set", "va", "up"),
-		append(append([]string{}, lab.p...), "ip", "link", "set", "lo", "up"),
-		append(append([]string{}, lab.p...), "ip", "link", "set", "vb", "up"),
+	if lab.p, err = holdNetns(maker.own, []string{"unshare", "-n"}, lab.h, maker.userns()); err != nil {
+		t.Skipf("no network namespace for the peers of the test: %v", err)
+	}
+	t.Cleanup(lab.p.release)
+	peer := strconv.Itoa(lab.p.cmd.Process.Pid)
+	type step struct {
+		ns   *heldNetns
+		args []string
+	}
+	setup := []step{
+		{lab.h, []string{"ip", "link", "set", "lo", "up"}},
+		{lab.h, []string{"ip", "link", "add", "va", "type", "veth", "peer", "name", "vb", "netns", peer}},
+		{lab.h, []string{"ip", "addr", "add", "10.0.0.11/24", "dev", "va"}},
+		{lab.h, []string{"ip", "link", "set", "va", "up"}},
+		{lab.p, []string{"ip", "link", "set", "lo", "up"}},
+		{lab.p, []string{"ip", "link", "set", "vb", "up"}},
 	}
 	for _, a := range []string{"10.0.0.10", "10.0.0.12", "10.0.0.53", "10.0.0.99", "10.0.0.200"} {
-		setup = append(setup, append(append([]string{}, lab.p...), "ip", "addr", "add", a+"/24", "dev", "vb"))
+		setup = append(setup, step{lab.p, []string{"ip", "addr", "add", a + "/24", "dev", "vb"}})
 	}
 	for i, c := range setup {
-		if out, err := exec.Command(c[0], c[1:]...).CombinedOutput(); err != nil {
-			if i < 2 {
+		if out, err := lab.command(c.ns, c.args...).CombinedOutput(); err != nil {
+			if i < 2 && !refused(err) {
 				t.Skipf("the namespaces cannot be joined: %v: %s", err, out)
 			}
-			t.Fatalf("%v: %v: %s", c, err, out)
+			t.Fatalf("%v: %v: %s", c.args, err, out)
 		}
 	}
 	return lab
 }
 
+// command returns a command that runs in a namespace of the lab. Every
+// command of these tests that is meant for a namespace is made here: it
+// runs through the guard, and the test fails when the namespace is not
+// proven to be another than that of the test.
+func (lab *netLab) command(ns *heldNetns, args ...string) *exec.Cmd {
+	lab.t.Helper()
+	cmd, err := ns.command(args...)
+	if err != nil {
+		lab.t.Fatalf("nothing is run: %v", err)
+	}
+	return cmd
+}
+
 // helper starts the test binary as a helper in a namespace and waits
 // until it is ready.
-func (lab *netLab) helper(ns []string, spec string) *netFlow {
+func (lab *netLab) helper(ns *heldNetns, spec string) *netFlow {
 	lab.t.Helper()
-	cmd := exec.Command(ns[0], append(ns[1:], os.Args[0])...)
-	cmd.Env = append(os.Environ(), netHelperEnv+"="+spec)
+	cmd := lab.command(ns, os.Args[0])
+	cmd.Env = append(os.Environ(), netHelperEnv+"="+spec, netHelperNetnsEnv+"="+ns.id)
 	in, err := cmd.StdinPipe()
 	if err != nil {
 		lab.t.Fatal(err)
@@ -224,6 +241,9 @@ func (lab *netLab) helper(ns []string, spec string) *netFlow {
 	lab.t.Cleanup(func() { _ = in.Close(); _ = cmd.Process.Kill(); _ = cmd.Wait() })
 	f := &netFlow{t: lab.t, name: spec, cmd: cmd, in: in, out: bufio.NewScanner(out)}
 	f.opened = f.out.Scan() && f.out.Text() == "ready"
+	if strings.HasPrefix(f.out.Text(), "refused") {
+		lab.t.Fatalf("the helper %q: %s", spec, f.out.Text())
+	}
 	return f
 }
 
@@ -235,7 +255,7 @@ func (f *netFlow) end() {
 }
 
 // serve answers messages on addresses of a namespace.
-func (lab *netLab) serve(ns []string, addrs ...string) {
+func (lab *netLab) serve(ns *heldNetns, addrs ...string) {
 	lab.t.Helper()
 	if f := lab.helper(ns, "serve "+strings.Join(addrs, " ")); !f.opened {
 		lab.t.Fatalf("the helper cannot serve %v: %s", addrs, f.out.Text())
@@ -243,7 +263,7 @@ func (lab *netLab) serve(ns []string, addrs ...string) {
 }
 
 // flow opens a connection from an address of a namespace.
-func (lab *netLab) flow(ns []string, proto, local, remote string) *netFlow {
+func (lab *netLab) flow(ns *heldNetns, proto, local, remote string) *netFlow {
 	lab.t.Helper()
 	return lab.helper(ns, "flow "+proto+" "+local+" "+remote)
 }
@@ -277,7 +297,7 @@ func (lab *netLab) load(text string) {
 	if err := os.WriteFile(file, []byte(text), 0o600); err != nil {
 		lab.t.Fatal(err)
 	}
-	if out, err := exec.Command(lab.h[0], append(lab.h[1:], "nft", "-f", file)...).CombinedOutput(); err != nil {
+	if out, err := lab.command(lab.h, "nft", "-f", file).CombinedOutput(); err != nil {
 		lab.t.Fatalf("nft refuses the table: %v: %s\n%s", err, out, text)
 	}
 }
@@ -289,7 +309,7 @@ func (lab *netLab) load(text string) {
 func (lab *netLab) counters() (egress, ingress int) {
 	lab.t.Helper()
 	time.Sleep(300 * time.Millisecond)
-	out, err := exec.Command(lab.h[0], append(lab.h[1:], "nft", "-j", "reset", "counters", "table", "inet", nftTable)...).Output()
+	out, err := lab.command(lab.h, "nft", "-j", "reset", "counters", "table", "inet", nftTable).Output()
 	if err != nil {
 		lab.t.Fatalf("nft reset counters: %v", err)
 	}
@@ -490,7 +510,7 @@ func TestOtherWayOfUDPWithPackets(t *testing.T) {
 	lab.load(render(r))
 	for _, c := range []struct {
 		what          string
-		ns            []string
+		ns            *heldNetns
 		local, remote string
 		want          int
 	}{
