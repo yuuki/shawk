@@ -968,12 +968,12 @@ $$;
 -- without dropped flows (dropped_flows), in every network namespace
 -- (netns_limited), with UDP unless target_proto is another transport
 -- (udp_not_traced), with Unix sockets when the target is a service
--- without a port (unix_not_traced), and, when the target is a whole host
--- of which a pod or a container accepted connections from an address of
--- the host itself, with the translations that tell the clients the host
--- masqueraded (masquerade_not_traced: the agent does not trace them, or
--- folds the peers outside its internal ranges, whose translations it does
--- not learn). A target that no agent reported under
+-- without a port (unix_not_traced), and, when a pod or a container of the
+-- target accepted connections from an address of the host itself, with
+-- the translations that tell the clients the host masqueraded
+-- (masquerade_not_traced: the agent does not trace them, or folds the
+-- peers outside its internal ranges, whose translations it does not
+-- learn). A target that no agent reported under
 -- has a coverage of 0: unknown_host, or no_agent for a host of the
 -- inventory, whose clients without an agent nothing would tell.
 -- min_coverage is 1 by default: any gap makes the verdict INCONCLUSIVE.
@@ -1067,23 +1067,27 @@ BEGIN
     blind := blind + o.unix_untraced;
     shortfalls := shortfalls || 'unix_not_traced'::text;
   END IF;
-  -- A socket of the host that accepted connections from an address of the
-  -- host itself, in a network namespace in which no client of the host has
-  -- that address: a pod or a container reached over the bridge. Its clients
-  -- on the host go with the host, but the same edge is that of the clients
-  -- outside it whose address the host replaced by its own (masquerade, as
-  -- for a NodePort), which only the translations that the agent learned
-  -- tell: they are dependents (~relay). While the agent did not learn them
-  -- all, nothing tells that there was none.
-  IF target_service IS NULL AND target_port IS NULL AND NOT isempty(o.translations_untold) THEN
+  -- A socket of the target that accepted connections from an address of
+  -- the host itself, in a network namespace in which no client of the host
+  -- has that address: a pod or a container reached over the bridge. Its
+  -- clients on the host may be part of the target, but the same edge is
+  -- that of the clients outside the host whose address the host replaced
+  -- by its own (masquerade, as for a NodePort), which only the
+  -- translations that the agent learned tell: they are dependents
+  -- (~relay). While the agent did not learn them all, nothing tells that
+  -- there was none.
+  IF NOT isempty(o.translations_untold) THEN
     SELECT coalesce(range_agg(tstzrange(greatest(s.first_seen, since),
                                         greatest(least(s.last_seen, until), greatest(s.first_seen, since)), '[]')), '{}')
     INTO masqueraded
     FROM shawk.hosts h
     JOIN shawk.edges s ON s.host_id = h.id AND s.role = 'server'
+    JOIN shawk.processes p ON p.id = s.process_id
     WHERE h.hostname = target_host
       AND s.last_seen >= since AND s.first_seen <= until
       AND (target_proto IS NULL OR s.proto = target_proto)
+      AND (target_port IS NULL OR s.port = target_port)
+      AND (target_service IS NULL OR p.service_name IN (target_service, '~unknown'))
       AND NOT (s.remote_addr << inet '127.0.0.0/8' OR s.remote_addr = inet '::1')
       AND EXISTS (SELECT FROM shawk.hosts h2
                   JOIN shawk.host_addrs a ON a.host_id = h2.id

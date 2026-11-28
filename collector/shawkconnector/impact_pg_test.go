@@ -1361,6 +1361,18 @@ func TestPGImpactOwnAddress(t *testing.T) {
 		if got, want := f.verdict(`'node-a', %s, %s, target_proto => 'udp'`), "SAFE {} {} 0 1.000000"; got != want {
 			t.Errorf("node-a over UDP, of an agent that %s: %s, want %s", name, got, want)
 		}
+		// The pod alone has the kubelet as a dependent, with the caveat;
+		// its port, used by none but the pod itself, is not SAFE either.
+		if got, want := f.verdict(`'node-a', %s, %s, 'web'`), "UNSAFE {active_dependents} {masquerade_not_traced} 1 0.000000"; got != want {
+			t.Errorf("web of node-a, of an agent that %s: %s, want %s", name, got, want)
+		}
+		f.exec(`UPDATE shawk.processes SET service_name = 'web', unit = 'web.service' WHERE service_name = 'kubelet'`)
+		for _, target := range []string{`'node-a', %s, %s, 'web'`, `'node-a', %s, %s, target_port => 8080`} {
+			if got, want := f.verdict(target), "INCONCLUSIVE {masquerade_not_traced} {} 0 0.000000"; got != want {
+				t.Errorf("%s, used by the pod itself, of an agent that %s: %s, want %s", target, name, got, want)
+			}
+		}
+		f.exec(`UPDATE shawk.processes SET service_name = 'kubelet', unit = 'kubelet.service' WHERE comm = 'kubelet'`)
 	}
 	// For the time of the edge of the pod only, and only while the agent
 	// did not learn: the pod is gone after day 30, and the agent learns

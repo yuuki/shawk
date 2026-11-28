@@ -2154,9 +2154,9 @@ A dependent of the last four has a `period`, the median interval, and
     another transport (`udp_not_traced`), and with Unix sockets when the
     target is a service without a port, whose clients on the host may use
     one (`unix_not_traced`);
-  - *with the translations that tell masqueraded clients*, for a whole
-    host of which a pod or a container accepted connections from an
-    address of the host itself (`masquerade_not_traced`, above):
+  - *with the translations that tell masqueraded clients*, for a target
+    of which a pod or a container accepted connections from an address
+    of the host itself (`masquerade_not_traced`, above):
     `agent_sessions` keeps whether the agent traces translations
     (`translations_traced`) and what it folds (`peer_fold`).
 
