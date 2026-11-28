@@ -336,22 +336,54 @@ shawk-policy rules -dsn-file /etc/shawk/impact-dsn -host app-01 -unit app.servic
 
   ```sh
   nft -c -f app-01.audit.nft && nft -f app-01.audit.nft
-  nft reset counters table inet shawk_policy   # a few minutes later: until then the open connections count
   nft list counters table inet shawk_policy    # egress_unlisted, ingress_unlisted: what no rule lists
   journalctl -k -g 'shawk-policy unlisted'     # the same, with addresses and ports (10 lines a second at most)
+  nft reset counters table inet shawk_policy   # a few minutes later, only if the table started the connection tracking
   ```
 
-  Leave it for as long as the slowest job of the host takes to come
-  round, and longer than the longest silence of its open connections.
-  Only while the counters stay at 0, load the form that rejects
-  (`nft -f app-01.nft` replaces the table in one transaction). What the
-  counters show and no history of shawk holds: the outer packets of
-  tunnels that the kernel makes (VXLAN, Geneve, WireGuard), the virtual
-  services of a host that balances with IPVS (use `-ingress none`
+  The counters count every packet that the opening side of a connection
+  sends, where no rule lists the connection, for as long as it lives: a
+  tunnel or a session that stays open keeps counting after the counters
+  are cleared, and so does a connection that was open before the table
+  on a host that tracked connections already. Leave the table for as
+  long as the slowest job of the host takes to come round, and longer
+  than the longest silence of its open connections. Only while
+  the counters stay at 0, load the form that rejects (`nft -f app-01.nft`
+  replaces the table in one transaction); it lets the connections that
+  are established at that moment go on, listed or not, until they end.
+  What the counters show and no history of shawk holds: the outer packets
+  of tunnels that the kernel makes (VXLAN, Geneve, WireGuard), the
+  virtual services of a host that balances with IPVS (use `-ingress none`
   there; `shawk-policy` was not run on such a host), and destinations
-  that the host rewrites. Loaded without the audit form on a host that
-  did not track connections, the form that rejects stops the open
-  connections whose peer sends next.
+  that the host rewrites.
+- Know what the audit form cannot show; the file lists it. A connection
+  whose opening side sends nothing while you watch is not counted. On a
+  host where the table itself started the connection tracking (nothing
+  used it before), a TCP connection that was open at that moment is
+  counted once, with its next packet, and not after the counters are
+  cleared: the tracking cannot tell which side opened it. Restart its
+  service under the audit form to have it compared with the rules. Until
+  the counters are cleared they also hold listed connections that were
+  taken up from their answering side.
+- Check two things before loading a table on a host that tracks no
+  connection yet (no firewall, no NAT, no container runtime). The table
+  starts the connection tracking of the kernel, which keeps at most
+  `net.netfilter.nf_conntrack_max` connections and drops the packets of
+  new ones when its table is full (`nf_conntrack: table full, dropping
+  packet` in the kernel log): on a host with very many connections,
+  compare `ss -s` with the limit and raise it first. And the form that
+  rejects, loaded without the audit form on such a host, stops the open
+  connections whose peer sends next. The audit form uses the connection
+  labels 125 to 127 and compares the connections that were open before
+  it with the rules at every packet of their opening side: it costs
+  processor time on a host with much traffic on old connections, for as
+  long as it is loaded.
+- A rule of UDP has a second rule for the other way, between the same
+  port on both sides of the same peer (`udp sport P udp dport P`), for
+  sockets that send and receive first on one port (gossip, NTP between
+  peers, IKE). No other port is opened: a peer that starts from another
+  port later than the tracking remembers the exchange is not listed, and
+  the audit form counts it.
 - A drop-in of systemd has no audit form: it blocks every address that it
   does not list, for every IP protocol, as soon as the unit restarts with
   it. Check it with `systemd-analyze verify app.service`, and the host

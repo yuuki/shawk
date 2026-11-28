@@ -64,14 +64,26 @@
 #                                  and the kernel log, lines with "shawk-policy unlisted"
 # To remove it:                    nft delete table inet shawk_policy
 #
+# Before loading it, on a host where no other table tracks connections
+#   The table matches the state of connections, so loading it starts the connection
+#   tracking of the kernel. The tracking keeps at most net.netfilter.nf_conntrack_max
+#   connections, and when its table is full the kernel drops the packets of new ones
+#   ("nf_conntrack: table full, dropping packet" in the kernel log). On a host with very
+#   many connections, compare their number (ss -s) with the limit (modprobe nf_conntrack;
+#   sysctl net.netfilter.nf_conntrack_max) and raise the limit first. This is read from
+#   the documentation of the kernel: shawk-policy was not run on such a host.
+#
 # Before loading this file
-#   Load the audit form first (the same command without -enforce), clear its counters
-#   after a few minutes (nft reset counters table inet shawk_policy), and load this file
-#   only while they stay at 0 for as long as the slowest job of the host takes to come
-#   round. The audit form also starts the connection tracking of the kernel if nothing
-#   used it before, so that the connections that are open are known when this file is
-#   loaded. Without it, on such a host, this file stops the open connections whose peer
-#   sends next: their next packet is a new connection for the tracking, in no rule.
+#   Load the audit form first (the same command without -enforce) and load this file only
+#   while its counters stay at 0 for as long as the slowest job of the host takes to come
+#   round: the audit form tells how to read them. This file accepts every connection that
+#   is established when it is loaded, listed or not, until that connection ends, and
+#   refuses it when it is opened again (after a restart of the service or of the host).
+#   The audit form counts such connections; this file cannot.
+#   The audit form also starts the connection tracking of the kernel if nothing used it
+#   before, so that the connections that are open are known when this file is loaded.
+#   Without it, on such a host, this file stops the open connections whose peer sends
+#   next: their next packet is a new connection for the tracking, in no rule.
 #   This file replaces the audit table in one transaction.
 
 table inet shawk_policy

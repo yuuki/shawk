@@ -64,22 +64,60 @@
 #                                  and the kernel log, lines with "shawk-policy unlisted"
 # To remove it:                    nft delete table inet shawk_policy
 #
+# Before loading it, on a host where no other table tracks connections
+#   The table matches the state of connections, so loading it starts the connection
+#   tracking of the kernel. The tracking keeps at most net.netfilter.nf_conntrack_max
+#   connections, and when its table is full the kernel drops the packets of new ones
+#   ("nf_conntrack: table full, dropping packet" in the kernel log). On a host with very
+#   many connections, compare their number (ss -s) with the limit (modprobe nf_conntrack;
+#   sysctl net.netfilter.nf_conntrack_max) and raise the limit first. This is read from
+#   the documentation of the kernel: shawk-policy was not run on such a host.
+#
 # How to go from this file to rules that reject
-#   1. Load this audit form. Nothing is rejected. If the host did not track connections
-#      before, loading it starts the tracking: the connections that are open are taken up
-#      as their next packets pass (net.netfilter.nf_conntrack_tcp_loose = 1, the default).
-#   2. A few minutes later, clear the counters: nft reset counters table inet shawk_policy
-#      Until then they also count the connections that were open before the table.
-#   3. Leave it for as long as the slowest job of the host takes to come round, and longer
+#   1. Load this audit form. Nothing is rejected.
+#   2. Read the counters and the kernel log. egress_unlisted counts the packets that the
+#      host sends on the connections that it opened and that no rule lists.
+#      ingress_unlisted counts those that it receives on the connections that others
+#      opened and that no rule lists.
+#      Every such packet counts, for as long as the connection lives: a connection that
+#      stays open keeps counting after the counters are cleared, and so does one that was
+#      open before this table, where the host tracked connections already. The log has
+#      the first packet of a connection, and every packet of one that was open before
+#      the table (at most 10 lines a second).
+#   3. Only where this table started the connection tracking (no other table used it):
+#      a few minutes after loading, clear the counters:
+#          nft reset counters table inet shawk_policy
+#      The tracking took up the connections that were open from their next packet,
+#      whichever side sent it (net.netfilter.nf_conntrack_tcp_loose = 1, the default), so
+#      until then the counters also hold connections that a rule lists, seen from the
+#      side that answers: in the log, a line whose source port (SPT) is the port of a rule.
+#   4. Leave it for as long as the slowest job of the host takes to come round, and longer
 #      than the longest silence of its open connections (TCP keepalive: 2 hours by default).
-#      The counters count the packets that no rule lists, of each such connection until its
-#      peer answers: a kernel tunnel, a rewritten destination, a job the period did not see.
-#   4. Only while the counters stay at 0: write the rejecting form (the same command with
-#      -enforce) and load it. It replaces this table in one transaction, and the
-#      connections that the tracking knows by then stay established.
+#   5. Only while the counters stay at 0: write the rejecting form (the same command with
+#      -enforce) and load it. It replaces this table in one transaction. The connections
+#      that are established by then stay, listed or not, until they end.
 #   Loading the rejecting form on a host that did not track connections, without this
 #   audit first, stops the open connections whose peer sends next: the tracking does not
 #   know them, and takes their next packet for a new connection that no rule lists.
+#
+# What the counters of this audit form cannot show
+#   - A connection whose opening side sends nothing while you watch (idle, without
+#     keepalive).
+#   - Where this table started the connection tracking: a TCP connection that was open
+#     at that moment. It is counted once, with the packet that took it up, and not after
+#     step 3: the tracking cannot tell which side opened it. It is compared with the
+#     rules when it is opened again (restart its service under this audit form to see
+#     it). An exchange of UDP that was going on then is followed from the side that sent
+#     next: one that a rule lists the other way keeps counting until it pauses for longer
+#     than net.netfilter.nf_conntrack_udp_timeout_stream.
+#
+# What this audit form costs
+#   The connections that were open before a table with its labels was loaded are compared
+#   with the rules at every packet of their opening side, until they end; those that
+#   begin under it, at their first packet (and at every packet if no rule lists them).
+#   It uses the connection labels 125, 126 and 127: nft refuses the file as a whole on a
+#   kernel without connection labels, and it must not be loaded where another tool uses
+#   the same labels (conntrack -L -o labels shows them).
 
 table inet shawk_policy
 delete table inet shawk_policy
@@ -91,10 +129,17 @@ table inet shawk_policy {
 	chain output {
 		type filter hook output priority filter; policy accept;
 
-		ct state established,related accept
+		# A connection that begins under this table gets the label 125, and one that no rule
+		# lists the label 126 (below). The others that began under it pass here.
+		ct state new,related ct label set 125
+		ct state established,related ct label 125 ct label & 126 != 126 accept
 		oifname "lo" accept
 		# shawk observes TCP and UDP only: nothing else is filtered.
 		meta l4proto != { tcp, udp } accept
+		# What is left of the established connections: those that no rule listed, and those
+		# that were open before the table. The packets of the side that answers pass here;
+		# those of the side that opened the connection are compared with the rules, each one.
+		ct direction reply accept
 
 		# egress 1-65535/tcp: srun, of shop/app, last seen 2026-11-28T00:00:00Z
 		ip daddr 10.0.0.60 tcp dport 1-65535 accept
@@ -118,17 +163,29 @@ table inet shawk_policy {
 		# egress 53/udp: ~unresolved, of shop/app, last seen 2026-11-28T00:00:00Z
 		ip daddr 10.0.0.53 udp dport 53 accept
 
-		# What no rule lists: counted and logged, not rejected (audit form).
-		counter name "egress_unlisted" limit rate 10/second burst 20 packets log prefix "shawk-policy unlisted egress: "
+		# What no rule lists: counted, and logged at its first packet; not rejected (audit form).
+		# The later packets of a connection that has the label:
+		ct label 126 counter name "egress_unlisted" accept
+		# A TCP connection that the tracking takes up after its start: counted once, not labelled.
+		ct state new tcp flags & (fin | syn | rst | ack) != syn counter name "egress_unlisted" limit rate 10/second burst 20 packets log prefix "shawk-policy unlisted egress: " accept
+		# The first packet of a connection, and every packet of one that cannot have a label.
+		ct label set 126 counter name "egress_unlisted" limit rate 10/second burst 20 packets log prefix "shawk-policy unlisted egress: "
 	}
 
 	chain input {
 		type filter hook input priority filter; policy accept;
 
-		ct state established,related accept
+		# A connection that begins under this table gets the label 125, and one that no rule
+		# lists the label 127 (below). The others that began under it pass here.
+		ct state new,related ct label set 125
+		ct state established,related ct label 125 ct label & 127 != 127 accept
 		iifname "lo" accept
 		# shawk observes TCP and UDP only: nothing else is filtered.
 		meta l4proto != { tcp, udp } accept
+		# What is left of the established connections: those that no rule listed, and those
+		# that were open before the table. The packets of the side that answers pass here;
+		# those of the side that opened the connection are compared with the rules, each one.
+		ct direction reply accept
 
 		# ingress 22/tcp: ~unresolved, of sshd, last seen 2026-11-28T00:00:00Z
 		ip saddr { 10.0.5.5, 10.0.5.6 } tcp dport 22 accept
@@ -142,7 +199,12 @@ table inet shawk_policy {
 		# ingress 53/udp from 53: ~unresolved, of shop/app, last seen 2026-11-28T00:00:00Z [the other way of a UDP rule]
 		ip saddr 10.0.0.53 udp sport 53 udp dport 53 accept
 
-		# What no rule lists: counted and logged, not rejected (audit form).
-		counter name "ingress_unlisted" limit rate 10/second burst 20 packets log prefix "shawk-policy unlisted ingress: "
+		# What no rule lists: counted, and logged at its first packet; not rejected (audit form).
+		# The later packets of a connection that has the label:
+		ct label 127 counter name "ingress_unlisted" accept
+		# A TCP connection that the tracking takes up after its start: counted once, not labelled.
+		ct state new tcp flags & (fin | syn | rst | ack) != syn counter name "ingress_unlisted" limit rate 10/second burst 20 packets log prefix "shawk-policy unlisted ingress: " accept
+		# The first packet of a connection, and every packet of one that cannot have a label.
+		ct label set 127 counter name "ingress_unlisted" limit rate 10/second burst 20 packets log prefix "shawk-policy unlisted ingress: "
 	}
 }

@@ -479,12 +479,29 @@ func nftRules(ru *rule) []string {
 // their own, so that loading them replaces no other rule of the host.
 const nftTable = "shawk_policy"
 
-// The counters of the table, which count the first packet of what no rule
+// The counters of the table, which count the packets of what no rule
 // lists: named, so that `nft list counters` reads them and `nft reset
 // counters` clears them.
 const (
 	nftEgressCounter  = "egress_unlisted"
 	nftIngressCounter = "ingress_unlisted"
+)
+
+// The connection labels of the audit form. A label is a bit that the
+// connection tracking of the kernel keeps with a connection, apart from
+// every other label: the mark of a connection is one value that other
+// tools write and read as a whole (wg-quick writes it for the datagrams of
+// its tunnel, and rules of routing read it), so a table that must break
+// nothing leaves it alone. The highest bits are the least likely to be
+// another tool's.
+const (
+	// nftLabelBegan is of a connection that began while the table was
+	// loaded: its first packet was compared with the rules.
+	nftLabelBegan = 125
+	// nftLabelEgress and nftLabelIngress are of a connection that no rule
+	// listed, by the chain that saw it begin.
+	nftLabelEgress  = 126
+	nftLabelIngress = 127
 )
 
 // nftLogLimit bounds the lines that the table writes to the kernel log.
@@ -498,6 +515,17 @@ const nftLogLimit = "limit rate 10/second burst 20 packets"
 // and logged, and then, in the enforcing form only, refused: the audit
 // form, the default, lets it pass, so that what the history lacks shows
 // before it breaks anything.
+//
+// The audit form must show a connection that no rule lists for as long as
+// it lives, not at its first packet alone: one that began before the
+// counters were cleared would otherwise never show again, and the form
+// that rejects would let it go on until the tracking forgets it (a
+// restart), and refuse it then. So the audit form labels such a
+// connection and counts every packet that the side that opened it sends.
+// It also compares with the rules the connections that the tracking knew
+// before the table, which the form that rejects accepts as established:
+// what it counts is what would be refused if every connection were opened
+// again.
 func writeNftables(b *strings.Builder, r *rulesReport) {
 	audit := r.Mode != modeEnforce
 	b.WriteString("#!/usr/sbin/nft -f\n")
@@ -530,35 +558,81 @@ func writeNftables(b *strings.Builder, r *rulesReport) {
 		"To read what no rule lists:      nft list counters table inet "+nftTable,
 		"                                 and the kernel log, lines with \"shawk-policy unlisted\"",
 		"To remove it:                    nft delete table inet "+nftTable,
+		"",
+		"Before loading it, on a host where no other table tracks connections",
+		"  The table matches the state of connections, so loading it starts the connection",
+		"  tracking of the kernel. The tracking keeps at most net.netfilter.nf_conntrack_max",
+		"  connections, and when its table is full the kernel drops the packets of new ones",
+		"  (\"nf_conntrack: table full, dropping packet\" in the kernel log). On a host with very",
+		"  many connections, compare their number (ss -s) with the limit (modprobe nf_conntrack;",
+		"  sysctl net.netfilter.nf_conntrack_max) and raise the limit first. This is read from",
+		"  the documentation of the kernel: shawk-policy was not run on such a host.",
 		"")
 	if audit {
 		comment(b, "",
 			"How to go from this file to rules that reject",
-			"  1. Load this audit form. Nothing is rejected. If the host did not track connections",
-			"     before, loading it starts the tracking: the connections that are open are taken up",
-			"     as their next packets pass (net.netfilter.nf_conntrack_tcp_loose = 1, the default).",
-			"  2. A few minutes later, clear the counters: nft reset counters table inet "+nftTable,
-			"     Until then they also count the connections that were open before the table.",
-			"  3. Leave it for as long as the slowest job of the host takes to come round, and longer",
+			"  1. Load this audit form. Nothing is rejected.",
+			"  2. Read the counters and the kernel log. "+nftEgressCounter+" counts the packets that the",
+			"     host sends on the connections that it opened and that no rule lists.")
+		if r.Ingress != ingressNone {
+			comment(b, "",
+				"     "+nftIngressCounter+" counts those that it receives on the connections that others",
+				"     opened and that no rule lists.")
+		}
+		comment(b, "",
+			"     Every such packet counts, for as long as the connection lives: a connection that",
+			"     stays open keeps counting after the counters are cleared, and so does one that was",
+			"     open before this table, where the host tracked connections already. The log has",
+			"     the first packet of a connection, and every packet of one that was open before",
+			"     the table (at most 10 lines a second).",
+			"  3. Only where this table started the connection tracking (no other table used it):",
+			"     a few minutes after loading, clear the counters:",
+			"         nft reset counters table inet "+nftTable,
+			"     The tracking took up the connections that were open from their next packet,",
+			"     whichever side sent it (net.netfilter.nf_conntrack_tcp_loose = 1, the default), so",
+			"     until then the counters also hold connections that a rule lists, seen from the",
+			"     side that answers: in the log, a line whose source port (SPT) is the port of a rule.",
+			"  4. Leave it for as long as the slowest job of the host takes to come round, and longer",
 			"     than the longest silence of its open connections (TCP keepalive: 2 hours by default).",
-			"     The counters count the packets that no rule lists, of each such connection until its",
-			"     peer answers: a kernel tunnel, a rewritten destination, a job the period did not see.",
-			"  4. Only while the counters stay at 0: write the rejecting form (the same command with",
-			"     -enforce) and load it. It replaces this table in one transaction, and the",
-			"     connections that the tracking knows by then stay established.",
+			"  5. Only while the counters stay at 0: write the rejecting form (the same command with",
+			"     -enforce) and load it. It replaces this table in one transaction. The connections",
+			"     that are established by then stay, listed or not, until they end.",
 			"  Loading the rejecting form on a host that did not track connections, without this",
 			"  audit first, stops the open connections whose peer sends next: the tracking does not",
-			"  know them, and takes their next packet for a new connection that no rule lists.")
+			"  know them, and takes their next packet for a new connection that no rule lists.",
+			"",
+			"What the counters of this audit form cannot show",
+			"  - A connection whose opening side sends nothing while you watch (idle, without",
+			"    keepalive).",
+			"  - Where this table started the connection tracking: a TCP connection that was open",
+			"    at that moment. It is counted once, with the packet that took it up, and not after",
+			"    step 3: the tracking cannot tell which side opened it. It is compared with the",
+			"    rules when it is opened again (restart its service under this audit form to see",
+			"    it). An exchange of UDP that was going on then is followed from the side that sent",
+			"    next: one that a rule lists the other way keeps counting until it pauses for longer",
+			"    than net.netfilter.nf_conntrack_udp_timeout_stream.",
+			"",
+			"What this audit form costs",
+			"  The connections that were open before a table with its labels was loaded are compared",
+			"  with the rules at every packet of their opening side, until they end; those that",
+			"  begin under it, at their first packet (and at every packet if no rule lists them).",
+			fmt.Sprintf("  It uses the connection labels %d, %d and %d: nft refuses the file as a whole on a",
+				nftLabelBegan, nftLabelEgress, nftLabelIngress),
+			"  kernel without connection labels, and it must not be loaded where another tool uses",
+			"  the same labels (conntrack -L -o labels shows them).")
 	} else {
 		comment(b, "",
 			"Before loading this file",
-			"  Load the audit form first (the same command without -enforce), clear its counters",
-			"  after a few minutes (nft reset counters table inet "+nftTable+"), and load this file",
-			"  only while they stay at 0 for as long as the slowest job of the host takes to come",
-			"  round. The audit form also starts the connection tracking of the kernel if nothing",
-			"  used it before, so that the connections that are open are known when this file is",
-			"  loaded. Without it, on such a host, this file stops the open connections whose peer",
-			"  sends next: their next packet is a new connection for the tracking, in no rule.",
+			"  Load the audit form first (the same command without -enforce) and load this file only",
+			"  while its counters stay at 0 for as long as the slowest job of the host takes to come",
+			"  round: the audit form tells how to read them. This file accepts every connection that",
+			"  is established when it is loaded, listed or not, until that connection ends, and",
+			"  refuses it when it is opened again (after a restart of the service or of the host).",
+			"  The audit form counts such connections; this file cannot.",
+			"  The audit form also starts the connection tracking of the kernel if nothing used it",
+			"  before, so that the connections that are open are known when this file is loaded.",
+			"  Without it, on such a host, this file stops the open connections whose peer sends",
+			"  next: their next packet is a new connection for the tracking, in no rule.",
 			"  This file replaces the audit table in one transaction.")
 	}
 	fmt.Fprintf(b, "\ntable inet %s\ndelete table inet %s\n\ntable inet %s {\n", nftTable, nftTable, nftTable)
@@ -567,12 +641,27 @@ func writeNftables(b *strings.Builder, r *rulesReport) {
 		fmt.Fprintf(b, "\tcounter %s { }\n", nftIngressCounter)
 	}
 	b.WriteString("\n")
-	chain := func(name, direction, loopback, counter, verdict string) {
+	chain := func(name, direction, loopback, counter, verdict string, label int) {
 		fmt.Fprintf(b, "\tchain %s {\n\t\ttype filter hook %s priority filter; policy accept;\n\n", name, name)
-		b.WriteString("\t\tct state established,related accept\n")
+		if audit {
+			comment(b, "\t\t",
+				fmt.Sprintf("A connection that begins under this table gets the label %d, and one that no rule", nftLabelBegan),
+				fmt.Sprintf("lists the label %d (below). The others that began under it pass here.", label))
+			fmt.Fprintf(b, "\t\tct state new,related ct label set %d\n", nftLabelBegan)
+			fmt.Fprintf(b, "\t\tct state established,related ct label %d ct label & %d != %d accept\n", nftLabelBegan, label, label)
+		} else {
+			b.WriteString("\t\tct state established,related accept\n")
+		}
 		fmt.Fprintf(b, "\t\t%s \"lo\" accept\n", loopback)
 		comment(b, "\t\t", "shawk observes TCP and UDP only: nothing else is filtered.")
 		b.WriteString("\t\tmeta l4proto != { tcp, udp } accept\n")
+		if audit {
+			comment(b, "\t\t",
+				"What is left of the established connections: those that no rule listed, and those",
+				"that were open before the table. The packets of the side that answers pass here;",
+				"those of the side that opened the connection are compared with the rules, each one.")
+			b.WriteString("\t\tct direction reply accept\n")
+		}
 		for i := range r.Rules {
 			if ru := &r.Rules[i]; ru.Direction == direction {
 				b.WriteString("\n")
@@ -583,22 +672,28 @@ func writeNftables(b *strings.Builder, r *rulesReport) {
 			}
 		}
 		b.WriteString("\n")
+		log := fmt.Sprintf("%s log prefix \"shawk-policy unlisted %s: \"", nftLogLimit, direction)
 		if audit {
-			comment(b, "\t\t", "What no rule lists: counted and logged, not rejected (audit form).")
-			fmt.Fprintf(b, "\t\tcounter name \"%s\" %s log prefix \"shawk-policy unlisted %s: \"\n", counter, nftLogLimit, direction)
+			comment(b, "\t\t", "What no rule lists: counted, and logged at its first packet; not rejected (audit form).",
+				"The later packets of a connection that has the label:")
+			fmt.Fprintf(b, "\t\tct label %d counter name \"%s\" accept\n", label, counter)
+			comment(b, "\t\t", "A TCP connection that the tracking takes up after its start: counted once, not labelled.")
+			fmt.Fprintf(b, "\t\tct state new tcp flags & (fin | syn | rst | ack) != syn counter name \"%s\" %s accept\n", counter, log)
+			comment(b, "\t\t", "The first packet of a connection, and every packet of one that cannot have a label.")
+			fmt.Fprintf(b, "\t\tct label set %d counter name \"%s\" %s\n", label, counter, log)
 		} else {
 			comment(b, "\t\t", "What no rule lists: logged, counted and refused.")
-			fmt.Fprintf(b, "\t\t%s log prefix \"shawk-policy unlisted %s: \"\n", nftLogLimit, direction)
+			fmt.Fprintf(b, "\t\t%s\n", log)
 			fmt.Fprintf(b, "\t\tcounter name \"%s\" %s\n", counter, verdict)
 		}
 		b.WriteString("\t}\n")
 	}
 	// A connection that the host opens and the rules deny fails at once,
 	// rather than after the time limit of its client.
-	chain("output", egress, "oifname", nftEgressCounter, "reject with icmpx admin-prohibited")
+	chain("output", egress, "oifname", nftEgressCounter, "reject with icmpx admin-prohibited", nftLabelEgress)
 	if r.Ingress != ingressNone {
 		b.WriteString("\n")
-		chain("input", ingress, "iifname", nftIngressCounter, "drop")
+		chain("input", ingress, "iifname", nftIngressCounter, "drop", nftLabelIngress)
 	}
 	b.WriteString("}\n")
 }

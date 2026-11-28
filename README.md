@@ -227,7 +227,7 @@ writes it as rules for a person to review, and applies nothing:
 ```console
 $ shawk-policy rules -dsn-file /etc/shawk/impact-dsn -host app-01 -format nftables > app-01.audit.nft
 $ nft -f app-01.audit.nft                            # the audit form: it rejects nothing
-$ nft list counters table inet shawk_policy          # what the rules do not list, counted (and logged)
+$ nft list counters table inet shawk_policy          # the packets of what the rules do not list (also logged)
 $ shawk-policy rules -dsn-file /etc/shawk/impact-dsn -host app-01 -format nftables -enforce > app-01.nft
 $ shawk-policy rules -dsn-file /etc/shawk/impact-dsn -host app-01 -unit app.service -format systemd -enforce
 ...
@@ -255,9 +255,14 @@ IPAddressAllow=10.0.0.10
   logged instead of rejected. Load it first: some of what a host needs is
   in no history of shawk (the outer packets of a VXLAN or WireGuard
   tunnel, the virtual services of IPVS, a destination that the host
-  rewrites), and the audit form shows it before anything breaks. It also
-  lets the connection tracking of the kernel take up the connections that
-  are open, which the form that rejects would otherwise stop. `-enforce`
+  rewrites), and the audit form shows it before anything breaks. Its
+  counters count every packet of a connection that no rule lists, for as
+  long as the connection lives, so a tunnel that stays up keeps counting
+  after the counters are cleared; the file says what they cannot show (a
+  connection that sends nothing while you watch, and a TCP connection
+  that was open when the table itself started the connection tracking).
+  The audit form also lets the tracking take up the connections that are
+  open, which the form that rejects would otherwise stop. `-enforce`
   writes the form that rejects; the drop-in of systemd has no audit form,
   and needs it.
 - A rule pins the addresses that the sockets saw. Every file says, above

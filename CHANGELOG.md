@@ -71,8 +71,13 @@
   what no history of shawk holds (the outer packets of tunnels that the
   kernel makes, the virtual services of IPVS, a destination that the host
   rewrites) shows before it breaks, and so that the connection tracking
-  takes up the connections that are open. A flow of UDP allows its peer
-  both ways. A rule denies what was not seen: when the history does not
+  takes up the connections that are open. The audit form labels a
+  connection that no rule lists (connection labels 125 to 127) and counts
+  every packet of its opening side for as long as it lives, also of the
+  connections that were open before the table on a host that tracked
+  connections already; the file tells what the counters cannot show. A
+  flow of UDP on one port allows its peer the other way too, between that
+  port on both sides. A rule denies what was not seen: when the history does not
   tell every connection of the target (`INCOMPLETE`: a gap of the agent,
   a period before the retention, dropped flows, UDP not traced, no agent,
   a name that shawk does not know, two machines under one host name, an

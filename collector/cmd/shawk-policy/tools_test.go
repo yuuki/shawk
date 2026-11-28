@@ -145,10 +145,89 @@ func nftAddrs(t *testing.T, v any) []span {
 	return nil
 }
 
+// describeExpr writes an expression of a rule as nft lists it in JSON, in
+// a line: what the frame of a chain is compared by.
+func describeExpr(e map[string]any) string {
+	side := func(v any) string {
+		var name func(v any) string
+		name = func(v any) string {
+			m, ok := v.(map[string]any)
+			switch {
+			case !ok:
+				return strings.Trim(fmt.Sprint(v), "[]")
+			case m["ct"] != nil:
+				return "ct " + m["ct"].(map[string]any)["key"].(string)
+			case m["meta"] != nil:
+				return "meta " + m["meta"].(map[string]any)["key"].(string)
+			case m["payload"] != nil:
+				p := m["payload"].(map[string]any)
+				return fmt.Sprint(p["protocol"], " ", p["field"])
+			case m["&"] != nil:
+				and := m["&"].([]any)
+				return name(and[0]) + " & " + name(and[1])
+			case m["set"] != nil:
+				return "{" + name(m["set"]) + "}"
+			}
+			return fmt.Sprint(v)
+		}
+		return name(v)
+	}
+	for k, v := range e {
+		switch k {
+		case "match":
+			m := v.(map[string]any)
+			return fmt.Sprintf("%s %s %s", side(m["left"]), m["op"], side(m["right"]))
+		case "mangle":
+			m := v.(map[string]any)
+			return fmt.Sprintf("set %s %s", side(m["key"]), side(m["value"]))
+		case "counter":
+			return "counter " + fmt.Sprint(v)
+		case "limit":
+			m := v.(map[string]any)
+			return fmt.Sprintf("limit %v/%v burst %v", m["rate"], m["per"], m["burst"])
+		case "log":
+			return fmt.Sprintf("log %q", v.(map[string]any)["prefix"])
+		case "reject":
+			m := v.(map[string]any)
+			return fmt.Sprintf("reject %v %v", m["type"], m["expr"])
+		default:
+			return k
+		}
+	}
+	return ""
+}
+
+// nftFrame is what a chain holds beside the rules of its flows, in its
+// order, as describeExpr writes it: before the flows what the chain
+// accepts whatever they are, and after them what it does with the rest.
+// The audit form counts and logs the rest and lets it pass, and follows
+// the connections that no rule lists; the form that rejects logs the rest,
+// then counts and refuses it.
+func nftFrame(chain string, enforce bool) (before, after []string) {
+	ifname, counter, label, direction, verdict := "oifname", nftEgressCounter, nftLabelEgress, egress, "reject icmpx admin-prohibited"
+	if chain == "input" {
+		ifname, counter, label, direction, verdict = "iifname", nftIngressCounter, nftLabelIngress, ingress, "drop"
+	}
+	log := fmt.Sprintf("limit 10/second burst 20; log %q", "shawk-policy unlisted "+direction+": ")
+	common := []string{"meta " + ifname + " == lo; accept", "meta l4proto != {tcp udp}; accept"}
+	if enforce {
+		return append([]string{"ct state in established related; accept"}, common...), []string{log, "counter " + counter + "; " + verdict}
+	}
+	before = append([]string{
+		fmt.Sprintf("ct state in related new; set ct label %d", nftLabelBegan),
+		fmt.Sprintf("ct state in established related; ct label in %d; ct label & %d != %d; accept", nftLabelBegan, label, label),
+	}, common...)
+	return append(before, "ct direction == reply; accept"), []string{
+		fmt.Sprintf("ct label in %d; counter %s; accept", label, counter),
+		fmt.Sprintf("ct state in new; tcp flags & fin syn rst ack != syn; counter %s; %s; accept", counter, log),
+		fmt.Sprintf("set ct label %d; counter %s; %s", label, counter, log),
+	}
+}
+
 // listedSpans reads what the table that nft lists as JSON allows: the
-// rules of its chains output and input but those of their frame, which it
-// checks are there, and end as the form of the table does: enforce tells
-// the form that rejects, rather than the audit form.
+// rules of the flows of its chains output and input. It checks that the
+// other rules of a chain are those of the frame of its form, in their
+// places: enforce tells the form that rejects, rather than the audit form.
 func listedSpans(t *testing.T, doc []byte, enforce bool) []string {
 	t.Helper()
 	var listing struct {
@@ -187,75 +266,67 @@ func listedSpans(t *testing.T, doc []byte, enforce bool) []string {
 			t.Fatal(err)
 		}
 		direction := map[string]string{"output": egress, "input": ingress}[ru.Chain]
-		last := ru.Expr[len(ru.Expr)-1]
-		if _, accept := last["accept"]; !accept {
-			frame[ru.Chain] = append(frame[ru.Chain], strings.Join(sortedMapKeys(last), ","))
-			continue
-		}
+		// The rule of a flow matches the family or the addresses of its
+		// peer and its ports, and accepts; every other rule is of the
+		// frame.
 		var spans []span
 		proto, ports, side := "", "", ""
-		framed := ""
+		_, accepts := ru.Expr[len(ru.Expr)-1]["accept"]
+		flow := accepts && len(ru.Expr) >= 2
 		for _, e := range ru.Expr[:len(ru.Expr)-1] {
-			m, ok := e["match"].(map[string]any)
-			if !ok {
-				t.Fatalf("nft lists the expression %v", e)
-			}
-			left := m["left"].(map[string]any)
+			m, _ := e["match"].(map[string]any)
+			left, _ := m["left"].(map[string]any)
+			p, _ := left["payload"].(map[string]any)
+			field, _ := p["field"].(string)
+			meta, _ := left["meta"].(map[string]any)
 			switch {
-			case left["ct"] != nil:
-				framed = "established"
-			case left["meta"] != nil && strings.HasSuffix(left["meta"].(map[string]any)["key"].(string), "ifname"):
-				framed = "loopback " + fmt.Sprint(m["right"])
-			case left["meta"] != nil && left["meta"].(map[string]any)["key"] == "l4proto":
-				framed = fmt.Sprint("other protocols ", m["op"])
-			case left["meta"] != nil && left["meta"].(map[string]any)["key"] == "nfproto":
+			case !flow:
+			case m == nil || m["op"] != "==":
+				flow = false
+			case meta != nil && meta["key"] == "nfproto":
 				spans = []span{map[string]span{"ipv4": allV4, "ipv6": allV6}[m["right"].(string)]}
-			default:
-				p := left["payload"].(map[string]any)
-				field := p["field"].(string)
-				switch {
-				case field == "dport" || field == "sport":
-					proto = p["protocol"].(string)
-					var of string
-					switch r := m["right"].(type) {
-					case float64:
-						of = fmt.Sprintf("%d-%d", int(r), int(r))
-					case map[string]any:
-						rg := r["range"].([]any)
-						of = fmt.Sprintf("%d-%d", int(rg[0].(float64)), int(rg[1].(float64)))
-					default:
-						t.Fatalf("nft lists the ports %v", m["right"])
-					}
-					// The source port is matched by the other way of a
-					// UDP rule only, before the same port as the
-					// destination.
-					switch {
-					case field == "sport" && side == "" && proto == "udp":
-						side, ports = "between", of
-					case field == "dport" && side == "":
-						side, ports = "to", of
-					case field == "dport" && side == "between" && ports == of && proto == "udp":
-					default:
-						t.Fatalf("nft lists a match of the ports %v in the rule %v", p, ru.Expr)
-					}
-				case (field == "daddr") == (direction == egress) && (field == "daddr" || field == "saddr"):
-					spans = nftAddrs(t, m["right"])
-					for _, s := range spans {
-						if s.lo.Is4() != (p["protocol"] == "ip") {
-							t.Fatalf("nft lists %s as an address of %v", s.lo, p["protocol"])
-						}
-					}
+			case field == "dport" || field == "sport":
+				proto = p["protocol"].(string)
+				var of string
+				switch r := m["right"].(type) {
+				case float64:
+					of = fmt.Sprintf("%d-%d", int(r), int(r))
+				case map[string]any:
+					rg := r["range"].([]any)
+					of = fmt.Sprintf("%d-%d", int(rg[0].(float64)), int(rg[1].(float64)))
 				default:
-					t.Fatalf("nft lists a match of %v in the chain %s", p, ru.Chain)
+					t.Fatalf("nft lists the ports %v", m["right"])
 				}
+				// The source port is matched by the other way of a
+				// UDP rule only, before the same port as the
+				// destination.
+				switch {
+				case field == "sport" && side == "" && proto == "udp":
+					side, ports = "between", of
+				case field == "dport" && side == "":
+					side, ports = "to", of
+				case field == "dport" && side == "between" && ports == of && proto == "udp":
+				default:
+					t.Fatalf("nft lists a match of the ports %v in the rule %v", p, ru.Expr)
+				}
+			case (field == "daddr") == (direction == egress) && (field == "daddr" || field == "saddr"):
+				spans = nftAddrs(t, m["right"])
+				for _, s := range spans {
+					if s.lo.Is4() != (p["protocol"] == "ip") {
+						t.Fatalf("nft lists %s as an address of %v", s.lo, p["protocol"])
+					}
+				}
+			default:
+				flow = false
 			}
 		}
-		if framed != "" {
-			frame[ru.Chain] = append(frame[ru.Chain], framed)
+		if !flow || proto == "" || direction == "" {
+			parts := make([]string, len(ru.Expr))
+			for i, e := range ru.Expr {
+				parts[i] = describeExpr(e)
+			}
+			frame[ru.Chain] = append(frame[ru.Chain], strings.Join(parts, "; "))
 			continue
-		}
-		if m, ok := ru.Expr[0]["match"].(map[string]any); !ok || m["op"] != "==" || proto == "" || direction == "" {
-			t.Fatalf("nft lists the rule %v", ru.Expr)
 		}
 		if spans == nil {
 			spans = []span{allV4, allV6}
@@ -264,26 +335,18 @@ func listedSpans(t *testing.T, doc []byte, enforce bool) []string {
 		by[k] = append(by[k], spans...)
 		frame[ru.Chain] = append(frame[ru.Chain], "flow")
 	}
-	// What a chain accepts whatever the flows, before them, and what it
-	// does with the rest, after them.
-	// The audit form counts and logs the rest, and lets it pass; the form
-	// that rejects logs it, then counts and refuses it.
 	for name, got := range frame {
-		end := []string{"log"}
-		if enforce {
-			end = append(end, map[string]string{"output": "reject", "input": "drop"}[name])
-		}
-		want := []string{"established", "loopback lo", "other protocols !="}
-		for range len(got) - 3 - len(end) {
+		before, after := nftFrame(name, enforce)
+		want := slices.Clone(before)
+		for range len(got) - len(before) - len(after) {
 			want = append(want, "flow")
 		}
-		want = append(want, end...)
+		want = append(want, after...)
 		if !slices.Equal(got, want) {
-			t.Fatalf("the chain %s holds %v, want %v", name, got, want)
+			t.Fatalf("the chain %s holds\n%s\nwant\n%s", name, strings.Join(got, "\n"), strings.Join(want, "\n"))
 		}
 	}
-	// A counter per chain, by name, that the last rule of the chain counts
-	// in.
+	// A counter per chain, by name, that the chain counts in.
 	for name, counter := range map[string]string{"output": nftEgressCounter, "input": nftIngressCounter} {
 		_, chain := frame[name]
 		declared := strings.Contains(string(doc), `"counter": {"family": "inet", "name": "`+counter+`"`)
@@ -296,15 +359,6 @@ func listedSpans(t *testing.T, doc []byte, enforce bool) []string {
 		t.Fatalf("nft lists no chain output\n%s", doc)
 	}
 	return describeSpans(by)
-}
-
-func sortedMapKeys(m map[string]any) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	slices.Sort(out)
-	return out
 }
 
 // loadNftables checks a table with nft, loads it into the kernel of a new

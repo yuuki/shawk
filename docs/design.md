@@ -2631,7 +2631,12 @@ reviewer can widen a rule to the range he knows.
   containers that a host forwards do not pass `input` and `output`, and
   the report tells when the sockets of the flows are in several network
   namespaces. Rules of a host cannot tell its units apart, so the format
-  takes no unit.
+  takes no unit. The table matches the state of connections, so loading
+  it starts the connection tracking of the kernel on a host where nothing
+  used it: every file says, among the checks before loading, that the
+  tracking keeps at most `nf_conntrack_max` connections and that the
+  kernel drops the packets of new ones when its table is full. This is
+  read from the documentation of the kernel, not run.
 - **The audit form is the default; a file that blocks is asked for.**
   Without `-enforce` the table ends there: what no rule lists passes, and
   the counters and the log show it. With `-enforce` it is then refused
@@ -2657,23 +2662,80 @@ reviewer can widen a rule to the range he knows.
   - *destinations that the host rewrites*, where an agent did not learn
     them (above);
   - *what the host forwards*.
+- **The audit form shows a connection for as long as it lives.** A
+  counter that counted the first packet of what no rule lists would give
+  a false answer for exactly the traffic that matters: a connection that
+  began before the counters were cleared (a tunnel of the kernel, a
+  session that stays open) never shows again, the form that rejects lets
+  it go on as established, and it is refused when it is opened again,
+  after a restart. So the audit form gives a **connection label** to the
+  connection that no rule lists (126 in `output`, 127 in `input`) and
+  counts every packet that its opening side sends, where the form that
+  rejects has one rule for what is established:
+  - a connection that begins under the table gets the label 125 with its
+    first packet, and its later packets pass at the first rule of the
+    chain unless it has the label of what no rule lists;
+  - what is left of the established connections are those with that
+    label, and those that were open before the table (no label: the
+    tracking of a host that tracked connections already knows which side
+    opened them). The packets of their answering side pass
+    (`ct direction reply`), and those of their opening side are compared
+    with the rules, each one: a connection that a rule lists now passes
+    uncounted, the others are counted. The log has the first packet of a
+    labelled connection only, and every packet of one that cannot have a
+    label, within the same limit;
+  - the lines of the flows are the same in both forms, in the same order,
+    and every rule of the frame of the audit form accepts or goes on: it
+    rejects nothing. It counts what the form that rejects would refuse
+    if every connection were opened again, which is more than that form
+    refuses at the moment it is loaded.
+
+  *Labels, not the mark.* The mark of a connection is one value that
+  other tools write and read as a whole: `wg-quick` sets it for the
+  datagrams of its own tunnel, which is the first thing the audit form
+  must show, and rules of routing read it. A label is a bit apart from
+  the others, and setting one changes no other. The labels are the three
+  highest; the file names them, says that `nft` refuses it as a whole on
+  a kernel without connection labels, and that it must not be loaded
+  where another tool uses the same ones. The kernel gives the storage of
+  labels to the connections that begin while a rule uses labels, which
+  is why one that was open before cannot have one. *What it costs*: such
+  a connection is compared with the rules at every packet of its opening
+  side until it ends; one that begins under the table, once.
+
+  *What it cannot show*, which the file says: a connection whose opening
+  side sends nothing during the watch; and, on a host where the table
+  itself started the tracking, a TCP connection that was open at that
+  moment. The tracking takes such a connection up from its next packet,
+  whichever side sends it (`nf_conntrack_tcp_loose`), so it cannot tell
+  which side opened it: following it would count a listed connection for
+  as long as it lives whenever its server spoke first. It is counted
+  once, with that packet (a rule for TCP packets that begin a tracked
+  connection without being a SYN), and compared for good when it is
+  opened again. An exchange of UDP that was going on at that moment
+  cannot be told from a new one: it is followed from the side that sent
+  next, and one that a rule lists the other way keeps counting until it
+  pauses. Both limits are of hosts that tracked no connection before;
+  where the host did, every connection that sends is compared.
 - **From the audit form to rules that reject.** The files tell the
-  procedure, which also keeps open connections alive. The table matches
-  `ct state`, so loading it starts the connection tracking of the kernel
-  on a host where nothing used it. The tracking then does not know the
+  procedure, which also keeps open connections alive. On a host where
+  nothing used the connection tracking, the tracking does not know the
   connections that are open: it takes the next packet of each for a new
   connection, which no rule lists when the peer sends it (the answer of a
   server to a client of the host comes from the port of the server, and
   what a server of the host sends goes to the port of its client). Loaded
   directly, the form that rejects stops those connections. Loaded first,
   the audit form lets those packets pass, and the tracking takes the
-  connections up (`nf_conntrack_tcp_loose`, 1 by default): so (1) load
-  the audit form; (2) a few minutes later, clear its counters, which
-  until then count the connections that were open; (3) leave it for as
-  long as the slowest job of the host takes to come round, and longer
-  than the longest silence of its open connections; (4) only while the
-  counters stay at 0, write the form that rejects and load it, which
-  replaces the table in one transaction.
+  connections up: so (1) load the audit form; (2) read its counters and
+  the log; (3) only where the table started the tracking, clear the
+  counters a few minutes later, since until then they hold listed
+  connections that were taken up from their answering side; (4) leave it
+  for as long as the slowest job of the host takes to come round, and
+  longer than the longest silence of its open connections; (5)
+  only while the counters stay at 0, write the form that rejects and
+  load it, which replaces the table in one transaction. The connections
+  that are established by then stay, listed or not, until they end, which
+  the form that rejects says of itself.
 - **systemd** (`-format systemd -enforce`), for a service unit: a drop-in
   with `IPAddressDeny=any`, `IPAddressAllow=localhost` and an
   `IPAddressAllow=` per address. The setting has one list for both

@@ -386,13 +386,22 @@ var (
 		"\t\toifname \"lo\" accept":                                   true, "\t\tiifname \"lo\" accept": true,
 		"\t\tmeta l4proto != { tcp, udp } accept": true,
 		"\tcounter egress_unlisted { }":           true, "\tcounter ingress_unlisted { }": true,
-		// The end of a chain of the audit form, and of the form that rejects.
-		"\t\tcounter name \"egress_unlisted\" limit rate 10/second burst 20 packets log prefix \"shawk-policy unlisted egress: \"":   true,
-		"\t\tcounter name \"ingress_unlisted\" limit rate 10/second burst 20 packets log prefix \"shawk-policy unlisted ingress: \"": true,
-		"\t\tlimit rate 10/second burst 20 packets log prefix \"shawk-policy unlisted egress: \"":                                    true,
-		"\t\tlimit rate 10/second burst 20 packets log prefix \"shawk-policy unlisted ingress: \"":                                   true,
-		"\t\tcounter name \"egress_unlisted\" reject with icmpx admin-prohibited":                                                    true,
-		"\t\tcounter name \"ingress_unlisted\" drop":                                                                                 true,
+		// The end of a chain of the form that rejects.
+		"\t\tlimit rate 10/second burst 20 packets log prefix \"shawk-policy unlisted egress: \"":  true,
+		"\t\tlimit rate 10/second burst 20 packets log prefix \"shawk-policy unlisted ingress: \"": true,
+		"\t\tcounter name \"egress_unlisted\" reject with icmpx admin-prohibited":                  true,
+		"\t\tcounter name \"ingress_unlisted\" drop":                                               true,
+		// What the audit form has in their place, and around the flows.
+		"\t\tct state new,related ct label set 125":                                  true,
+		"\t\tct state established,related ct label 125 ct label & 126 != 126 accept": true,
+		"\t\tct state established,related ct label 125 ct label & 127 != 127 accept": true,
+		"\t\tct direction reply accept":                                              true,
+		"\t\tct label 126 counter name \"egress_unlisted\" accept":                   true,
+		"\t\tct label 127 counter name \"ingress_unlisted\" accept":                  true,
+		"\t\tct state new tcp flags & (fin | syn | rst | ack) != syn counter name \"egress_unlisted\" limit rate 10/second burst 20 packets log prefix \"shawk-policy unlisted egress: \" accept":   true,
+		"\t\tct state new tcp flags & (fin | syn | rst | ack) != syn counter name \"ingress_unlisted\" limit rate 10/second burst 20 packets log prefix \"shawk-policy unlisted ingress: \" accept": true,
+		"\t\tct label set 126 counter name \"egress_unlisted\" limit rate 10/second burst 20 packets log prefix \"shawk-policy unlisted egress: \"":                                                 true,
+		"\t\tct label set 127 counter name \"ingress_unlisted\" limit rate 10/second burst 20 packets log prefix \"shawk-policy unlisted ingress: \"":                                               true,
 	}
 	// A set of more addresses than fit a line is written over several,
 	// which nftJoin puts back on one.
@@ -601,8 +610,8 @@ func TestWriteNftables(t *testing.T) {
 		t.Errorf("the form that rejects allows\n%s\nand the audit form\n%s", strings.Join(rejecting, "\n"), strings.Join(audit, "\n"))
 	}
 	for form, ends := range map[string][2]string{
-		modeAudit: {"\t\tcounter name \"egress_unlisted\" limit rate 10/second burst 20 packets log prefix \"shawk-policy unlisted egress: \"\n\t}\n",
-			"\t\tcounter name \"ingress_unlisted\" limit rate 10/second burst 20 packets log prefix \"shawk-policy unlisted ingress: \"\n\t}\n"},
+		modeAudit: {"\t\tct label set 126 counter name \"egress_unlisted\" limit rate 10/second burst 20 packets log prefix \"shawk-policy unlisted egress: \"\n\t}\n",
+			"\t\tct label set 127 counter name \"ingress_unlisted\" limit rate 10/second burst 20 packets log prefix \"shawk-policy unlisted ingress: \"\n\t}\n"},
 		modeEnforce: {"\t\tcounter name \"egress_unlisted\" reject with icmpx admin-prohibited\n\t}\n",
 			"\t\tcounter name \"ingress_unlisted\" drop\n\t}\n"},
 	} {
@@ -612,6 +621,78 @@ func TestWriteNftables(t *testing.T) {
 		refuses := regexp.MustCompile(`(?m)^[^#\n]*\b(reject|drop)\b`).MatchString(text)
 		if !strings.Contains(text, ends[0]) || !strings.Contains(text, ends[1]) || refuses != (form == modeEnforce) {
 			t.Errorf("the %s form ends its chains otherwise, or refuses: %t\n%s", form, refuses, text)
+		}
+	}
+	// The two forms hold the same lines for the flows, in the same order:
+	// what the audit form compares a connection with is what the form that
+	// rejects accepts. They differ in their frame alone: the audit form
+	// follows the connections that no rule lists, and every rule of its
+	// frame lets the packet pass or go on.
+	frames := map[string][]string{}
+	for _, form := range []string{modeAudit, modeEnforce} {
+		r.Mode = form
+		var flows []string
+		for _, line := range strings.Split(render(r), "\n") {
+			switch {
+			case strings.HasPrefix(strings.TrimSpace(line), "#") || !strings.HasPrefix(line, "\t\t"):
+			case nftRule.MatchString(line) || strings.HasPrefix(line, "\t\t\t") || strings.HasSuffix(line, "{") || strings.HasPrefix(line, "\t\t} "):
+				flows = append(flows, line)
+			default:
+				frames[form] = append(frames[form], strings.TrimSpace(line))
+			}
+		}
+		frames[form+" flows"] = flows
+	}
+	if !slices.Equal(frames[modeAudit+" flows"], frames[modeEnforce+" flows"]) || len(frames[modeAudit+" flows"]) == 0 {
+		t.Errorf("the lines of the flows differ between the forms:\n%s\nand\n%s", strings.Join(frames[modeAudit+" flows"], "\n"),
+			strings.Join(frames[modeEnforce+" flows"], "\n"))
+	}
+	wantFrames := map[string][]string{
+		modeEnforce: {
+			"type filter hook output priority filter; policy accept;",
+			"ct state established,related accept", `oifname "lo" accept`, "meta l4proto != { tcp, udp } accept",
+			`limit rate 10/second burst 20 packets log prefix "shawk-policy unlisted egress: "`,
+			`counter name "egress_unlisted" reject with icmpx admin-prohibited`,
+			"type filter hook input priority filter; policy accept;",
+			"ct state established,related accept", `iifname "lo" accept`, "meta l4proto != { tcp, udp } accept",
+			`limit rate 10/second burst 20 packets log prefix "shawk-policy unlisted ingress: "`,
+			`counter name "ingress_unlisted" drop`,
+		},
+		modeAudit: {
+			"type filter hook output priority filter; policy accept;",
+			"ct state new,related ct label set 125", "ct state established,related ct label 125 ct label & 126 != 126 accept",
+			`oifname "lo" accept`, "meta l4proto != { tcp, udp } accept", "ct direction reply accept",
+			`ct label 126 counter name "egress_unlisted" accept`,
+			`ct state new tcp flags & (fin | syn | rst | ack) != syn counter name "egress_unlisted" limit rate 10/second burst 20 packets log prefix "shawk-policy unlisted egress: " accept`,
+			`ct label set 126 counter name "egress_unlisted" limit rate 10/second burst 20 packets log prefix "shawk-policy unlisted egress: "`,
+			"type filter hook input priority filter; policy accept;",
+			"ct state new,related ct label set 125", "ct state established,related ct label 125 ct label & 127 != 127 accept",
+			`iifname "lo" accept`, "meta l4proto != { tcp, udp } accept", "ct direction reply accept",
+			`ct label 127 counter name "ingress_unlisted" accept`,
+			`ct state new tcp flags & (fin | syn | rst | ack) != syn counter name "ingress_unlisted" limit rate 10/second burst 20 packets log prefix "shawk-policy unlisted ingress: " accept`,
+			`ct label set 127 counter name "ingress_unlisted" limit rate 10/second burst 20 packets log prefix "shawk-policy unlisted ingress: "`,
+		},
+	}
+	for form, want := range wantFrames {
+		if !slices.Equal(frames[form], want) {
+			t.Errorf("the frame of the %s form:\n%s\nwant:\n%s", form, strings.Join(frames[form], "\n"), strings.Join(want, "\n"))
+		}
+	}
+	// The audit form tells what its counters count and what they cannot
+	// show, and both forms what to check on a host that tracks no
+	// connection yet.
+	for form, wants := range map[string][]string{
+		modeAudit: {"# How to go from this file to rules that reject\n", "#      stays open keeps counting after the counters are cleared",
+			"# What the counters of this audit form cannot show\n", "#   - A connection whose opening side sends nothing while you watch",
+			"# What this audit form costs\n", "net.netfilter.nf_conntrack_max"},
+		modeEnforce: {"# Before loading this file\n", "is established when it is loaded, listed or not", "net.netfilter.nf_conntrack_max"},
+	} {
+		r.Mode = form
+		text := render(r)
+		for _, want := range wants {
+			if !strings.Contains(text, want) {
+				t.Errorf("the %s form does not tell %q:\n%s", form, want, text)
+			}
 		}
 	}
 }
