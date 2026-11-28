@@ -108,8 +108,19 @@
   `shawk_baseline_evaluation_timestamp_seconds` (0 before an evaluation
   succeeded), `shawk_baseline_evaluation_attempt_timestamp_seconds`,
   `shawk_baseline_evaluation_failed` and `shawk_baseline_file_failed`.
-  A process of another name in a unit that runs a service of the baseline
-  is judged as that service. `packaging/prometheus/shawk-rules.yml` has
+  A process of another name in a unit that runs services of the baseline,
+  or in a unit below it, is judged by those services together: what none
+  of them holds is one finding. A unit that unrelated processes share
+  (the jobs of Slurm, login sessions, `systemd-run` without a name, the
+  units of a user) judges nothing; `shawk-policy drift` lists what
+  processes did there next to a service of the baseline
+  (`shawk_v1.baseline_unjudged()`), and no alert fires for it. A server
+  on a port that the kernel chose is written `port: kernel-chosen` in
+  the file, which approves such ports of servers of that name and no
+  fixed port. A service of the baseline that runs nowhere is judged on
+  the hosts that ran it and are observed, so that `baseline -all`
+  followed by `drift` is `CLEAN`; a host that was installed again under
+  its name replaces its first machine. `packaging/prometheus/shawk-rules.yml` has
   the alerts `ShawkBaselineDrift`, `ShawkBaselineDriftUnresolved`,
   `ShawkBaselineNotEvaluated`, `ShawkBaselineHostsNotObserved`,
   `ShawkBaselineServiceWithoutHosts`, `ShawkBaselineFileInvalid`,
@@ -125,8 +136,15 @@
   `baseline_observed()`, `baseline_verdict()`, `baseline_drift()` and
   `baseline_new_services()` and the views `shawk_v1.baseline` and
   `baseline_status`, which `shawk-policy` and the connector read, and the
-  tables of the baseline. What they return is ordered by the bytes of
-  names, whatever the collation of the database.
+  tables of the baseline, and `baseline_unjudged()`. What they return is
+  ordered by the bytes of names, whatever the collation of the database.
+  A database that a build from before this release migrated must be
+  created again: the texts of `0005_impact.sql` and `0006_policy.sql`
+  changed until the release, a migration is applied once by its number,
+  and `shawk-migrate` calls such a database up to date while the commands
+  fail on it. Drop the database, or its schemas `shawk` and `shawk_v1`,
+  and migrate again; a database that only released versions migrated
+  (up to `0004`) upgrades as usual.
 
 **Upgrading.** Run `shawk-migrate` and `grants.sql` again (migrations 0004
 to 0006), and upgrade every connector: one of an earlier version records
@@ -153,6 +171,15 @@ double where the edges are most of it.
   failed connection gives its cause and the SQLSTATE of the server. The
   flags, the variable and the exit statuses are unchanged
   (`docs/design.md` §6).
+* The connector replaces the control characters of the strings that
+  agents send (names of services, units, hosts and peers), the separators
+  of lines U+2028 and U+2029 and the marks that turn the direction of a
+  text around (U+202A to U+202E, U+2066 to U+2069) with U+FFFD, as it
+  replaced bytes that are no UTF-8. Such a name reached PostgreSQL and
+  the labels of Prometheus as it was, and a name with a line break wrote
+  lines of its own into the text of an alert. A service whose name held
+  such a character gets a new name in PostgreSQL and a new `job` in
+  Prometheus from this version on (`docs/design.md` §5.5).
 
 ## [v0.11.0](https://github.com/yuuki/shawk/compare/v0.10.1...v0.11.0) (2026-11-26)
 

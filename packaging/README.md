@@ -401,28 +401,51 @@ To alert on a service that does something its baseline does not hold:
 
    The file ends with `end: {services: N, dependencies: N}`, which tells
    that it is whole: keep the line last, and its counts right when you
-   edit the file by hand (or write `end: {}`).
+   edit the file by hand (or write `end: {}`). A dependency on a server
+   that listens on a port the kernel chose is written
+   `port: kernel-chosen`: it approves the ports that the kernel chooses
+   for servers of that name, so a restart on another such port is no
+   drift, and a server of the same name on a fixed port is one. Port 0
+   approves every port. With `-all`, every name that was seen in the
+   period has a baseline, also a tool that ran once: `drift` stays
+   `CLEAN` for a service that runs nowhere while the hosts that ran it
+   are observed.
 2. Give it to every connector (`baseline_file: /etc/shawk/baseline.yaml`
    in `collector/config.yaml`), readable by `shawk-collector`. The
    connector reads it every write interval; a file that is invalid, or
    that was cut short, keeps the baseline read before, and
-   `ShawkBaselineFileInvalid` alerts.
+   `ShawkBaselineFileInvalid` alerts. It alerts too when the file is
+   valid and PostgreSQL does not take it.
 3. Load `prometheus/shawk-rules.yml`: `ShawkBaselineDrift` fires for a
    dependency that the baseline does not hold, once per service, server,
    port and transport. Three alerts tell where no drift is no answer:
    `ShawkBaselineNotEvaluated` (critical: no connector evaluates the
    drift), `ShawkBaselineHostsNotObserved` (a host that runs a service
    was not observed: its agent is stopped, or its clock is behind) and
-   `ShawkBaselineServiceWithoutHosts` (no host is known to run a service
-   of the file). A host runs a service for `baseline_host_memory` (a
-   week) after a process of it was last seen there, so a host that was
-   removed alerts until then: shorten it where hosts come and go.
+   `ShawkBaselineServiceWithoutHosts` (a service of the file runs
+   nowhere and no host that ran it is observed; a service that does not
+   run now on observed hosts does not fire). A host runs a service for
+   `baseline_host_memory` (a week) after a process of it was last seen
+   there, so a host that was removed alerts until then: shorten it where
+   hosts come and go (1 hour at least; a memory shorter than the period
+   that is evaluated counts as that period). A host that is installed
+   again under its name replaces its first machine as soon as it
+   reports.
    `prometheus/tests` holds unit tests of these alerts
    (`promtool test rules baseline.test.yml`).
 4. When it fires, `shawk-policy drift -service NAME` lists the hosts and
    the addresses, and the process when it is one of another name in a
-   unit of the service. To approve the dependency, add its line to the
-   file, or write the service again and review the difference:
+   unit of the service: the services of a unit judge such a process
+   together, and what none of them approves is one finding. Units that
+   unrelated processes share are the exception: the jobs of Slurm
+   (`slurm/...`), login sessions (`session.scope`), `systemd-run` without
+   a name and the units of a user (`user@N.service`) judge nothing, since
+   a baseline of `python3` would otherwise judge every program of every
+   user beside it. `drift` lists what such processes did next to a
+   service of the baseline, under the drift, and no alert fires for it:
+   give the tools that matter a baseline of their own name. To approve a
+   dependency, add its line to the file, or write the service again and
+   review the difference:
 
    ```sh
    shawk-policy baseline -dsn-file /etc/shawk/impact-dsn -service shop/app -merge baseline.yaml > new.yaml
@@ -459,6 +482,12 @@ Migration 0006 adds the tables of the baseline and the functions that
 `baseline_drift()` and the others). It changes no table that holds
 history. A connector of an earlier version ignores them; one with
 `baseline_file` needs the migration, and waits for it like any other.
+A database that a build from before the release of 0005 and 0006
+migrated (a build of a development branch) must be created again: their
+texts changed until the release, and a migration is applied once, by its
+number, so `shawk-migrate` calls such a database up to date while
+`shawk-policy` and `shawk-impact` fail on it. Drop it, or its schemas
+`shawk` and `shawk_v1`, and migrate again.
 
 ## HPC clusters
 

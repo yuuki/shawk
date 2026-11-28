@@ -297,13 +297,22 @@ shop/app  billing/api  8443/tcp  app-01, app-02  edge      2026-11-28T05:40:00Z 
 The alert `ShawkBaselineDrift` fires once per service, server, port and
 transport, whatever the number of hosts, and carries no address. A service
 without a baseline is not judged, except that a process of another name
-in a unit that runs a service of the baseline is judged as that service.
-`shawk-policy drift` exits 3 for a drift, 0 for none and 4 when it cannot
-tell: no drift is an answer only when every host that runs the services
-was observed, so a host whose agent is stopped makes it `INCONCLUSIVE`,
-and `ShawkBaselineHostsNotObserved` and `ShawkBaselineNotEvaluated` alert
-where the drift is not known. A baseline file ends with the line `end:`,
-which tells that it is whole: one that was cut short is refused.
+in a unit that runs services of the baseline is judged by them together,
+once. That holds for the unit of a workload, not for a unit that
+unrelated processes share (the jobs of Slurm in `slurm/batch`, login
+sessions): there a process is judged by the baseline of its own name or
+by none, and `shawk-policy drift` lists what it did next to a service of
+the baseline, without an alert. `shawk-policy drift` exits 3 for a drift,
+0 for none and 4 when it cannot tell: no drift is an answer only when
+every host that runs the services was observed, so a host whose agent is
+stopped makes it `INCONCLUSIVE`, and `ShawkBaselineHostsNotObserved` and
+`ShawkBaselineNotEvaluated` alert where the drift is not known. A service
+that runs nowhere at the moment, on hosts that are observed, is no such
+case: `baseline -all` followed by `drift` is `CLEAN`. A baseline file
+ends with the line `end:`, which tells that it is whole: one that was cut
+short is refused. A server on a port that the kernel chose is written
+`port: kernel-chosen`, which approves such ports of servers of that name
+and no fixed port.
 
 In SQL:
 

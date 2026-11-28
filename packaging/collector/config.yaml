@@ -130,7 +130,8 @@ connectors:
     # (shawk_baseline_hosts_unobserved; alert ShawkBaselineHostsNotObserved)
     # instead of being left out: an agent that stopped is told, and so is a
     # host that was removed. From 1h to 2160h; a fleet whose hosts come and
-    # go may shorten it.
+    # go may shorten it. A memory shorter than the period that is evaluated
+    # (an hour, and more after evaluations failed) counts as that period.
     # baseline_host_memory: 168h
     # Servers that listen on a port chosen anew at every run, such as srun
     # and salloc of Slurm without SrunPortRange: their dependencies are
