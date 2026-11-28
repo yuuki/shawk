@@ -536,12 +536,20 @@ func (c *changes) advanceFloor(b *hostBatch, skew time.Duration, now time.Time) 
 // protocol finds the row of its edge.
 //
 // An edge is last seen at the end of the latest interval in which its
-// agent saw it active, and first seen at the end of the first: the hours of
-// those times are the hours of its activity (shawk.edge_activity). They are
-// recorded when the edge is new here and when a time moves into another
-// hour, so that an edge active all along is written with its activity once
-// an hour, and an edge whose changes were dropped again with the hours the
-// agent still tells.
+// agent saw it active: the hour of that time is an hour of its activity
+// (shawk.edge_activity). It is recorded when the edge is new here and when
+// the time moves into another hour, so that an edge active all along is
+// written with its activity once an hour, and an edge whose changes were
+// dropped again with the hour the agent still tells.
+//
+// The hour in which a new edge was first seen is recorded only when it is
+// that of the time it was last seen, or the one before: the start of the
+// stretch that the edge is active in now. An older one would be an hour
+// alone, far from the others: the edge of a connection that has been open
+// for weeks is new to a connector that just started, or that records
+// hours since an upgrade, and the hours since it was first seen were not
+// recorded, not idle. An hour that is not recorded tells nothing; an hour
+// alone would tell that the dependency stopped after it.
 func (c *changes) addEdges(b *hostBatch, h *hostChanges, latest, now time.Time) {
 	edges := acceptedOf(c.acceptedEdges, b.key)
 	wire := c.acceptedWire[b.key]
@@ -581,7 +589,7 @@ func (c *changes) addEdges(b *hostBatch, h *hostChanges, latest, now time.Time) 
 		if k.proto == transportUnix && established(e) {
 			h.established[k] = struct{}{}
 		}
-		if !known || s.first.Before(prev.first) && !sameHour(s.first, prev.first) {
+		if !known && !s.first.Before(s.last.Truncate(time.Hour).Add(-time.Hour)) {
 			h.addActivity(k, s.first)
 		}
 		if !known || s.last.After(prev.last) && !sameHour(s.last, prev.last) {

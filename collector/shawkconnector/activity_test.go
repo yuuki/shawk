@@ -1,6 +1,7 @@
 package shawkconnector
 
 import (
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -67,10 +68,11 @@ func hoursOf(h *hostChanges) map[string][]int {
 	return out
 }
 
-// TestActivityRecorded: the hours in which an edge was first and last seen
-// are written with it when it is new, and the hour it is last seen in when
-// that moves into another hour: not at every write of an edge that stays
-// active, and not for an edge written for a wire protocol alone.
+// TestActivityRecorded: the hour in which an edge was last seen is written
+// with it when it is new, with the hour it was first seen in if that is
+// the same or the one before, and again when it moves into another hour:
+// not at every write of an edge that stays active, and not for an edge
+// written for a wire protocol alone.
 func TestActivityRecorded(t *testing.T) {
 	first := time.Date(2026, 10, 31, 9, 10, 0, 0, time.UTC)
 	edge := tEdge{role: roleClient, proto: "tcp", local: "10.0.0.11", peer: "10.0.0.10", port: 5432, svc: "app",
@@ -86,14 +88,33 @@ func TestActivityRecorded(t *testing.T) {
 		ch.add(b, at)
 		return ch.take()[b.key]
 	}
-	// New here: the hours of its first and last times, 9 and 11 of the
-	// 31st, with the edge.
-	h := step(first.Add(2 * time.Hour))
-	if got := hoursOf(h); len(got) != 1 || len(got["2026-10"]) != 2 || got["2026-10"][0] != 30*24+9 || got["2026-10"][1] != 30*24+11 {
-		t.Errorf("hours of a new edge = %v, want 9 and 11 of the 31st", got)
+	// New here, first seen in the hour before: the hours of its first and
+	// last times, 9 and 10 of the 31st, with the edge.
+	h := step(first.Add(time.Hour))
+	if got := hoursOf(h); len(got) != 1 || len(got["2026-10"]) != 2 || got["2026-10"][0] != 30*24+9 || got["2026-10"][1] != 30*24+10 {
+		t.Errorf("hours of a new edge = %v, want 9 and 10 of the 31st", got)
 	}
 	if len(h.edges) != 1 {
 		t.Errorf("edges = %v", h.edges)
+	}
+	// New to a connector that just started, and first seen hours or days
+	// before: the hour it is last seen in alone, since the hours in between
+	// were not recorded here, not idle. An earlier time of the same hour
+	// before is recorded.
+	for _, c := range []struct {
+		open time.Duration
+		want []int
+	}{{2 * time.Hour, []int{30*24 + 11}}, {20 * 24 * time.Hour, []int{30*24 + 11}}, {70 * time.Minute, []int{30*24 + 10, 30*24 + 11}},
+		{5 * time.Minute, []int{30*24 + 11}}} {
+		fresh := newChanges(15*time.Minute, false)
+		last := time.Date(2026, 10, 31, 11, 10, 0, 0, time.UTC)
+		old := edge
+		old.first, old.last = last.Add(-c.open), last
+		b := testBatch(t, tAgent{host: "app-01", time: last.Add(15 * time.Second), edges: []tEdge{old}})
+		fresh.add(b, last.Add(15*time.Second))
+		if got := hoursOf(fresh.take()[b.key])["2026-10"]; !slices.Equal(got, c.want) {
+			t.Errorf("hours of an edge first seen %v before a connector started = %v, want %v", c.open, got, c.want)
+		}
 	}
 	// Reported again unchanged: nothing.
 	if h := step(edge.last); len(h.edges) != 0 || len(h.activity) != 0 {
@@ -117,9 +138,10 @@ func TestActivityRecorded(t *testing.T) {
 
 // TestActivityPending: the months of activity of an edge count in the rows
 // pending, are kept when failed writes are put back, with the hours added
-// meanwhile, and the hours the agent still tells are written again once the
-// connector forgets the edge: when the changes of its host are dropped, or
-// when the agent has not reported it for the TTL.
+// meanwhile, and the hour the edge was last seen in is written again once
+// the connector forgets the edge: when the changes of its host are dropped,
+// or when the agent has not reported it for the TTL. Not the hour it was
+// first seen in, three hours before: the hours in between are not known.
 func TestActivityPending(t *testing.T) {
 	seen := time.Date(2026, 10, 31, 23, 30, 0, 0, time.UTC)
 	edge := tEdge{role: roleClient, proto: "tcp", local: "10.0.0.11", peer: "10.0.0.10", port: 5432, svc: "app",
@@ -155,12 +177,13 @@ func TestActivityPending(t *testing.T) {
 		t.Errorf("%d months written again", n)
 	}
 	ch.forget(b.key, now.Add(time.Minute))
-	if n := months(now.Add(2 * time.Minute)); n != 2 {
-		t.Errorf("%d months written after the changes of the host were dropped, want 2", n)
+	if n := months(now.Add(2 * time.Minute)); n != 1 {
+		t.Errorf("%d months written after the changes of the host were dropped, want 1", n)
 	}
 	ch.expire(now.Add(30 * time.Minute))
-	if n := months(now.Add(30 * time.Minute)); n != 2 {
-		t.Errorf("%d months written after the TTL, want 2", n)
+	ch.add(later, now.Add(30*time.Minute))
+	if got := hoursOf(ch.take()[b.key]); len(got) != 1 || !slices.Equal(got["2026-11"], []int{2}) {
+		t.Errorf("hours written after the TTL = %v, want 2 of the 1st", got)
 	}
 }
 

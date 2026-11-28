@@ -7,10 +7,13 @@
 -- The hours of a month in which an edge was active: bit i of hours, from
 -- the left, is the hour that starts i hours after month, the start of a
 -- month in UTC. The connector sets the hour of every time at which an
--- agent reported the edge active, by the clock of the agent like
--- first_seen and last_seen; a bit that is not set tells nothing of an hour
--- in which the host was not observed, or which precedes the first bit of
--- the edge (an edge written before this table). A month has up to 744
+-- agent reported the edge last active, by the clock of the agent like
+-- last_seen, and the hour of first_seen only when it is that hour or the
+-- one before: the hours since an edge was first seen are not known to a
+-- connector that meets it later, as one that just started. A bit that is
+-- not set tells nothing of an hour in which the host was not observed, or
+-- which precedes the first bit of the edge (an edge written before this
+-- table, or by a connector that started after it). A month has up to 744
 -- hours; the bits past its end stay 0. The rows go with their edge, and
 -- the months before the retention are pruned on their own.
 CREATE TABLE shawk.edge_activity (

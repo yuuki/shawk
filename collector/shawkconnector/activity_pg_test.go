@@ -231,3 +231,61 @@ FROM shawk_v1.impact('db-01', $1, $2)`, start, now)
 		t.Errorf("hours of the job = %v, want 4 on each side", got)
 	}
 }
+
+// TestPGCadenceAfterAnUpgrade: a connection that has been open for 20 days
+// when the connectors start to record hours has no hour of the day it was
+// opened, which an upgraded connector would otherwise set from the time
+// the edge was first seen: its hours start with the upgrade, so it is
+// unknown for a day and continuous after, not two runs 20 days apart.
+func TestPGCadenceAfterAnUpgrade(t *testing.T) {
+	c, sink, conn := pgConnector(t)
+	ctx := context.Background()
+	upgrade := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	opened := upgrade.Add(-20 * 24 * time.Hour)
+	now := opened
+	c.now = func() time.Time { return now }
+	step := func() {
+		e := tEdge{proto: "tcp", port: 5432, svc: "app", comm: "puma", unit: "app.service", count: 1, first: opened, last: now}
+		client, server := e, e
+		client.role, client.local, client.peer = "client", "10.0.0.11", "10.0.0.10"
+		server.role, server.local, server.peer = "server", "10.0.0.10", "10.0.0.11"
+		server.svc, server.comm, server.unit = "postgres", "postgres", "postgresql.service"
+		consume(t, c, sink, tAgent{host: "db-01", machineID: "m-db", addrs: []string{"10.0.0.10"}, time: now,
+			segment: opened.Add(-time.Hour), edges: []tEdge{server}})
+		consume(t, c, sink, tAgent{host: "app-01", machineID: "m-app", addrs: []string{"10.0.0.11"}, time: now,
+			segment: opened.Add(-time.Hour), edges: []tEdge{client}})
+		if now.Hour()%6 == 0 && now.Minute() == 0 {
+			c.flush(ctx)
+		}
+	}
+	// Before the upgrade, a connector wrote the edges without their hours.
+	for ; now.Before(upgrade); now = now.Add(15 * time.Minute) {
+		step()
+	}
+	c.flush(ctx)
+	execAll(t, conn, `DELETE FROM shawk.edge_activity`)
+	// The upgraded connector is a new process: it knows no edge.
+	c.changes = newChanges(c.cfg.IdleTTL, c.cfg.JobUsers)
+	for _, w := range []struct {
+		after time.Duration
+		want  string
+	}{
+		{6 * time.Hour, "app both unknown 1"},
+		{2 * 24 * time.Hour, "app both continuous 1"},
+		{30 * 24 * time.Hour, "app both continuous 1"},
+	} {
+		for ; now.Before(upgrade.Add(w.after)); now = now.Add(15 * time.Minute) {
+			step()
+		}
+		c.flush(ctx)
+		got := queryStrings(t, conn, `
+SELECT client_service, observed_by, cadence, runs FROM shawk_v1.impact('db-01', $1::timestamptz - interval '90 days', $1)`, now)
+		if !slices.Equal(got, []string{w.want}) {
+			t.Errorf("%v after the upgrade: dependents of db-01 = %v, want %s", w.after, got, w.want)
+		}
+	}
+	// No hour before the upgrade was written since.
+	if got := queryStrings(t, conn, `SELECT count(*) FROM shawk.edge_activity WHERE month < $1`, upgrade); !slices.Equal(got, []string{"0"}) {
+		t.Errorf("%v months of hours before the upgrade, want none", got)
+	}
+}
