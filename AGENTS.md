@@ -7,6 +7,7 @@
 - Strings from agents go through `cleanString` and the size cuts before PostgreSQL; the agent sends valid UTF-8 only.
 - BPF programs run for every process: trace TCP at state changes and walks, never per message, except the opt-in program of wire protocols (design §3.9), which must return at once for connections that sent; keep the per-datagram UDP programs short.
 - Prometheus outputs carry no addresses (unless `keep_peer_address`); every new label needs a bound on its cardinality.
+- A test runs a command in a network namespace only through `collector/cmd/shawk-policy/netnsguard_test.go`, which refuses the namespace of the test itself: an nftables table loaded there filters the machine that runs the tests.
 
 ## Compatibility contracts
 - PostgreSQL schema `shawk_v1`, public: `collector/shawkconnector/migrations/`; a change is a new migration.
