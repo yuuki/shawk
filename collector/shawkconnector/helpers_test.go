@@ -458,6 +458,47 @@ type fakeStore struct {
 	// hold, when not nil, is called by write before it writes, outside the
 	// lock: it may block, and the error it returns fails the write.
 	hold func(*hostChanges) error
+	// baseline is the baseline written, baselineSyncs how many times it
+	// was, and baselineFails the failures recorded; report is what
+	// baselineReport returns, reportErr its error and reports the periods
+	// it was asked for.
+	baseline      *Baseline
+	baselineSyncs int
+	baselineFails []string
+	report        *baselineReport
+	reportErr     error
+	reports       [][2]time.Time
+}
+
+func (s *fakeStore) syncBaseline(_ context.Context, b *Baseline, _ time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.fail {
+		return errFake
+	}
+	s.baseline = b
+	s.baselineSyncs++
+	return nil
+}
+
+func (s *fakeStore) baselineFailed(_ context.Context, _ time.Time, msg string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.baselineFails = append(s.baselineFails, msg)
+	return nil
+}
+
+func (s *fakeStore) baselineReport(_ context.Context, since, until time.Time, _ int) (*baselineReport, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reports = append(s.reports, [2]time.Time{since, until})
+	if s.reportErr != nil {
+		return nil, s.reportErr
+	}
+	if s.report == nil {
+		return &baselineReport{}, nil
+	}
+	return s.report, nil
 }
 
 func (s *fakeStore) schemaVersion(context.Context) (int, error) {

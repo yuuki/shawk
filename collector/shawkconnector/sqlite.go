@@ -1307,6 +1307,16 @@ func (s *sqliteStore) syncMaintenance(context.Context, []maintenanceWindow) erro
 	return nil
 }
 
+// The baseline needs the dependencies of a period, which SQLite does not
+// keep: baseline_file is refused with it (Config.Validate).
+func (s *sqliteStore) syncBaseline(context.Context, *Baseline, time.Time) error { return nil }
+
+func (s *sqliteStore) baselineFailed(context.Context, time.Time, string) error { return nil }
+
+func (s *sqliteStore) baselineReport(context.Context, time.Time, time.Time, int) (*baselineReport, error) {
+	return &baselineReport{}, nil
+}
+
 func (s *sqliteStore) syncInventory(ctx context.Context, inv *inventory, readAt time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

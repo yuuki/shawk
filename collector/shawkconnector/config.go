@@ -126,6 +126,15 @@ type Config struct {
 	// MaintenanceFile is a file, in YAML or JSON, with the maintenance
 	// windows registered for hosts, read like NodeStatesFile.
 	MaintenanceFile string `mapstructure:"maintenance_file"`
+	// BaselineFile is a file, in YAML or JSON, that lists per service the
+	// dependencies an operator approved (baseline.go), as shawk-policy
+	// baseline writes it. The connector reads it every write interval and
+	// writes it to PostgreSQL; while it cannot be read or is invalid, the
+	// baseline last read stays. With it, the connector tells Prometheus
+	// the dependencies of those services that are not in their baseline
+	// (shawk.baseline.drift.hosts). Unset, the connector leaves the
+	// baseline in PostgreSQL as it is and evaluates nothing.
+	BaselineFile string `mapstructure:"baseline_file"`
 }
 
 // PostgresConfig configures the connection to PostgreSQL.
@@ -227,6 +236,11 @@ func (c *Config) Validate() error {
 		}
 		if c.MaintenanceFile != "" {
 			errs = append(errs, errors.New("maintenance_file is not supported with sqlite"))
+		}
+		if c.BaselineFile != "" {
+			// A baseline is judged against the dependencies of a period,
+			// which the SQLite lightweight mode does not keep.
+			errs = append(errs, errors.New("baseline_file is not supported with sqlite"))
 		}
 	}
 	if c.WriteInterval <= 0 || c.WriteInterval > maxWriteInterval {

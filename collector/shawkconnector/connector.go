@@ -79,6 +79,16 @@ type shawkConnector struct {
 	// unknownNodes are the nodes the inventory did not map, last logged.
 	unknownNodes string
 
+	// Of the baseline_file, used by the loop only: the digest of the
+	// baseline last read, the error last logged and when; the latest
+	// evaluation of the drift, when it was made and tried, and the end of
+	// its period.
+	baselineDigest, baselineErr string
+	lastBaselineLog             time.Time
+	baselineReport              *baselineReport
+	baselineAt, lastBaselineTry time.Time
+	baselineUntil               time.Time
+
 	// Errors of the pipeline after the connector, logged at most once a
 	// minute.
 	downstreamErrs    int
@@ -258,6 +268,7 @@ func (c *shawkConnector) prepare(ctx context.Context) bool {
 	}
 	c.syncInventory(ctx)
 	c.syncNodeStates(ctx)
+	c.syncBaseline(ctx)
 	at := c.now()
 	var former time.Duration
 	if c.cfg.PeerHosts {
@@ -355,8 +366,8 @@ func (c *shawkConnector) flushOnShutdown() {
 
 // tick does the work of a write interval: it writes the pending changes,
 // then prepares the next writes and reloads the names of peers (prepare),
-// prunes and refreshes the history of dependencies when due, and forgets
-// what expired. Writes and the reload of peers have their own deadlines,
+// prunes and refreshes the history of dependencies when due, evaluates the
+// drift from the baseline when due and sends it, and forgets what expired. Writes and the reload of peers have their own deadlines,
 // so that a slow write does not stop the names from being reloaded.
 func (c *shawkConnector) tick(ctx context.Context) {
 	c.writePending(ctx)
@@ -365,6 +376,8 @@ func (c *shawkConnector) tick(ctx context.Context) {
 	cancel()
 	c.pruneIfDue(ctx)
 	c.refreshIfDue(ctx)
+	c.evaluateBaselineIfDue(ctx)
+	c.emitBaseline(ctx)
 	c.expire(c.now())
 }
 

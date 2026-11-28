@@ -55,6 +55,15 @@ type store interface {
 	writeNodeStates(ctx context.Context, at time.Time, nodes []nodeState) error
 	// syncMaintenance replaces the maintenance windows registered.
 	syncMaintenance(ctx context.Context, windows []maintenanceWindow) error
+	// syncBaseline writes the baseline read at readAt, unless PostgreSQL
+	// holds the same contents, and records when it was read.
+	syncBaseline(ctx context.Context, b *Baseline, readAt time.Time) error
+	// baselineFailed records that baseline_file could not be read, or was
+	// invalid, at failedAt; the baseline written before stays.
+	baselineFailed(ctx context.Context, failedAt time.Time, msg string) error
+	// baselineReport evaluates the drift from the baseline over [since,
+	// until], with at most maxDrift dependencies.
+	baselineReport(ctx context.Context, since, until time.Time, maxDrift int) (*baselineReport, error)
 	close()
 }
 
@@ -1007,6 +1016,120 @@ ORDER BY h.host`, func(rows pgx.Rows) error {
 	}
 	inv.digest = inventoryDigest(hosts)
 	return inv, nil
+}
+
+// baselineLock is the key of the advisory lock that serializes the writes
+// of the baseline by several connectors.
+const baselineLock = 0x73686162 // "shab"
+
+// syncBaseline replaces the baseline in one transaction when its contents
+// changed, so that readers see either the baseline of before or the new
+// one, and records when it was read either way, which clears the failure
+// of another connector.
+func (s *pgStore) syncBaseline(ctx context.Context, bl *Baseline, readAt time.Time) error {
+	digest := bl.Digest()
+	return pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.ReadCommitted}, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared($1)`, int64(migrationLock)); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, int64(baselineLock)); err != nil {
+			return err
+		}
+		var stored *string
+		err := tx.QueryRow(ctx, `SELECT digest FROM shawk.baseline_state`).Scan(&stored)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		if stored == nil || *stored != digest {
+			var services, depServices, peers, protos []string
+			var ports []int32
+			for _, sv := range bl.Services {
+				services = append(services, sv.Service)
+				for _, d := range sv.Dependencies {
+					depServices = append(depServices, sv.Service)
+					peers = append(peers, d.Peer)
+					ports = append(ports, int32(d.Port))
+					protos = append(protos, d.Proto)
+				}
+			}
+			b := &pgx.Batch{}
+			b.Queue(`DELETE FROM shawk.baseline_services`)
+			b.Queue(`INSERT INTO shawk.baseline_services (service) SELECT * FROM unnest($1::text[])`, services)
+			b.Queue(`
+INSERT INTO shawk.baseline_dependencies (service, peer, port, proto)
+SELECT * FROM unnest($1::text[], $2::text[], $3::integer[], $4::text[])`, depServices, peers, ports, protos)
+			if err := tx.SendBatch(ctx, b).Close(); err != nil {
+				return err
+			}
+		}
+		_, err = tx.Exec(ctx, `
+INSERT INTO shawk.baseline_state (digest, read_at) VALUES ($1, $2)
+ON CONFLICT (singleton) DO UPDATE SET digest = excluded.digest, read_at = excluded.read_at, failed_at = NULL, error = NULL`,
+			digest, readAt)
+		return err
+	})
+}
+
+func (s *pgStore) baselineFailed(ctx context.Context, failedAt time.Time, msg string) error {
+	_, err := s.pool.Exec(ctx, `
+INSERT INTO shawk.baseline_state (failed_at, error) VALUES ($1, $2)
+ON CONFLICT (singleton) DO UPDATE SET failed_at = excluded.failed_at, error = excluded.error`, failedAt, msg)
+	return err
+}
+
+// baselineReport reads the baseline and what the contract tells of the
+// drift from it over [since, until], in one read-only transaction, so that
+// they are of the same data.
+func (s *pgStore) baselineReport(ctx context.Context, since, until time.Time, maxDrift int) (*baselineReport, error) {
+	r := &baselineReport{}
+	err := pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly}, func(tx pgx.Tx) error {
+		err := tx.QueryRow(ctx, `SELECT read_at IS NOT NULL, failed_at IS NOT NULL FROM shawk.baseline_state`).Scan(&r.read, &r.failed)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		if err != nil || !r.read {
+			// No baseline was read from a valid file yet: nothing is
+			// judged.
+			return err
+		}
+		rows, err := tx.Query(ctx, `
+SELECT s.service, count(d.peer)::integer
+FROM shawk.baseline_services s
+LEFT JOIN shawk.baseline_dependencies d ON d.service = s.service
+GROUP BY s.service ORDER BY s.service COLLATE "C"`)
+		if err != nil {
+			return err
+		}
+		if r.services, err = pgx.CollectRows(rows, func(row pgx.CollectableRow) (baselineCount, error) {
+			var c baselineCount
+			err := row.Scan(&c.service, &c.dependencies)
+			return c, err
+		}); err != nil {
+			return err
+		}
+		var total int
+		rows, err = tx.Query(ctx, `
+SELECT d.service, d.peer, d.port, d.proto, cardinality(d.hosts), count(*) OVER ()::integer
+FROM shawk_v1.baseline_drift($1, $2) d
+ORDER BY d.service COLLATE "C", d.peer COLLATE "C", d.port, d.proto
+LIMIT $3`, since, until, maxDrift)
+		if err != nil {
+			return err
+		}
+		if r.drift, err = pgx.CollectRows(rows, func(row pgx.CollectableRow) (driftRow, error) {
+			var d driftRow
+			err := row.Scan(&d.service, &d.peer, &d.port, &d.proto, &d.hosts, &total)
+			return d, err
+		}); err != nil {
+			return err
+		}
+		r.truncated = max(total-len(r.drift), 0)
+		return tx.QueryRow(ctx, `SELECT count(*)::integer FROM shawk_v1.baseline_new_services($1, $2)`, since, until).Scan(&r.newServices)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return r, nil
 }
 
 // nodeStatesLock is the key of the advisory lock that serializes the writes
