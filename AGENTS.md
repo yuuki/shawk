@@ -10,11 +10,11 @@
 
 ## Compatibility contracts
 - PostgreSQL schema `shawk_v1`, public: `collector/shawkconnector/migrations/`; a change is a new migration.
-- Prometheus names and labels, public: `collector/shawkconnector/names.go`, `aggregate.go`, `packaging/prometheus/shawk-rules.yml`, `packaging/grafana/`.
+- Prometheus names and labels, public: `collector/shawkconnector/names.go`, `aggregate.go`, `baseline.go`, `packaging/prometheus/shawk-rules.yml`, `packaging/grafana/`.
 - Unit and service names (`procinfo.Unit`, `ServiceName`): stored in PostgreSQL and used as `job` in Prometheus.
 - Agent ↔ connector, released together: `internal/otlp/names.go` ↔ `collector/shawkconnector/names.go`, golden `collector/shawkconnector/testdata/agent-request.json`.
 - BPF: structs of `internal/tracer/bpf/shawk.h` ↔ `bpf_bpfel.go` ↔ `collect.go`, `iter.go`, `conntrack.go`; enums mirrored in `types.go`.
-- Agent flags (`internal/cli/cli.go`, `packaging/systemd/agent.env`); connector configuration keys (`config.go`, `packaging/collector/config.yaml`); flags, exit statuses (0 is `SAFE` alone) and JSON of `shawk-impact` (`collector/cmd/shawk-impact`).
+- Agent flags (`internal/cli/cli.go`, `packaging/systemd/agent.env`); connector configuration keys (`config.go`, `packaging/collector/config.yaml`); flags, exit statuses (0 is `SAFE` alone) and JSON of `shawk-impact` (`collector/cmd/shawk-impact`); the same of `shawk-policy` (0 is `COMPLETE` or `CLEAN` alone) and the format of `baseline_file` (`collector/cmd/shawk-policy`, `baseline.go`).
 - The systemd units and their sandbox: `packaging/systemd/`.
 
 ## Before opening a pull request

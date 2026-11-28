@@ -56,8 +56,50 @@
   at a socket nothing serves are no dependency; and whether the agent of
   a session learns translations (`shawk.agent_sessions.translations_traced`).
 
+* `shawk-policy`, in the `shawk-collector` packages and image: rules that
+  allow what a host was seen to do, and a baseline of the dependencies of
+  services, both written for review; it applies nothing (#232).
+  `shawk-policy rules -host NAME` reports the connections of a host over a
+  period (`-lookback`, 90 days) and writes them as a table of nftables
+  (`-format nftables`; `-ingress sources`, `ports` or `none` for what the
+  host accepts) or, for a service unit, as a drop-in of systemd with
+  `IPAddressDeny=` and `IPAddressAllow=` (`-format systemd -unit NAME`),
+  under comments that tell what the rules pin and leave out. A rule
+  denies what was not seen: when the history does not tell every
+  connection of the target (`INCOMPLETE`: a gap of the agent, a period
+  before the retention, dropped flows, UDP not traced, no agent, a name
+  that shawk does not know), the command writes its report and no rule
+  unless `-allow-incomplete`, and exits 4; 0 is `COMPLETE` and nothing
+  else. `RestrictAddressFamilies=` is written as a comment, and
+  iptables and the policies of Kubernetes and Cilium are not written
+  (`docs/design.md` §6.4).
+* A baseline of dependencies, and alerts on what it does not hold (#232).
+  `shawk-policy baseline -service NAME` writes the dependencies of
+  services over a period as a file (`-merge FILE` replaces services in
+  one); the connector reads it with the new `baseline_file`, writes it to
+  PostgreSQL and tells Prometheus, every write interval, the dependencies
+  of those services that it does not hold:
+  `shawk_baseline_drift_hosts{job, service_peer_name, server_port,
+  network_transport}`, one series whatever the number of hosts, without
+  addresses, with `shawk_baseline_dependencies{job}`,
+  `shawk_baseline_drift_truncated`, `shawk_baseline_new_services`,
+  `shawk_baseline_evaluation_timestamp_seconds` and
+  `shawk_baseline_file_failed`. `packaging/prometheus/shawk-rules.yml`
+  has the alerts `ShawkBaselineDrift`, `ShawkBaselineDriftUnresolved`,
+  `ShawkBaselineNotEvaluated`, `ShawkBaselineFileInvalid`,
+  `ShawkBaselineDriftTruncated` and `ShawkNewServiceWithoutBaseline`.
+  `shawk-policy drift` lists the drift with its hosts and addresses, and
+  exits 0 for none, 3 for a drift and 4 when it cannot tell. A service
+  without a baseline is not judged. `baseline_file` is refused with the
+  SQLite lightweight mode.
+* PostgreSQL, migration `0006_policy.sql`: the functions
+  `shawk_v1.policy_flows()`, `policy_verdict()`, `baseline_observed()`,
+  `baseline_verdict()`, `baseline_drift()` and `baseline_new_services()`
+  and the views `shawk_v1.baseline` and `baseline_status`, which
+  `shawk-policy` and the connector read, and the tables of the baseline.
+
 **Upgrading.** Run `shawk-migrate` and `grants.sql` again (migrations 0004
-and 0005), and upgrade every connector: one of an earlier version records
+to 0006), and upgrade every connector: one of an earlier version records
 no hours, and the cadences of its hosts read `unknown`. The hours cost
 about 190 bytes per edge, a side of a dependency, and month in which it
 was active, kept for the retention: the table `shawk.edge_activity` can be

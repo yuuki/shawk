@@ -62,6 +62,7 @@ The design is in [docs/design.md](docs/design.md).
 | Prometheus | how much flows: connections, failures, bytes, RTT, connect time, retransmissions |
 | Grafana | dashboards and alerts |
 | `shawk-impact` | reads PostgreSQL: what removing a host or a service would break, and whether it was watched |
+| `shawk-policy` | reads PostgreSQL: writes, for review, the rules that allow what a host was seen to do, and a baseline of the dependencies of services; the connector alerts on what the baseline does not hold |
 
 ## Requirements
 
@@ -115,9 +116,9 @@ for OBI.
 
 A release ships an OpenTelemetry Collector that includes the connector:
 the deb and rpm packages `shawk-collector` (with `shawk-migrate`,
-`shawk-impact` and the PostgreSQL scripts) and the image
+`shawk-impact`, `shawk-policy` and the PostgreSQL scripts) and the image
 `ghcr.io/yuuki/shawk-collector`. To build it yourself, run `make collector
-shawk-migrate shawk-impact`.
+shawk-migrate shawk-impact shawk-policy`.
 
 [packaging/](packaging/README.md) has the configuration of the collector,
 PostgreSQL, Prometheus and Grafana, and the steps to set them up. The
@@ -219,6 +220,61 @@ the command refuses it. The cadences need the hours of activity that
 connectors record from this version on; before that they are `unknown`.
 The rules, and what the verdict cannot see, are in
 [design §6.3](docs/design.md#63-impact-of-removing-a-host-or-a-service).
+
+The same history tells what a host may be allowed to do. `shawk-policy`
+writes it as rules for a person to review, and applies nothing:
+
+```console
+$ shawk-policy rules -dsn-file /etc/shawk/impact-dsn -host app-01 -format nftables > app-01.nft
+$ shawk-policy rules -dsn-file /etc/shawk/impact-dsn -host app-01 -unit app.service -format systemd
+...
+# Status   COMPLETE: the history tells every TCP and UDP connection of the target in the period
+...
+[Service]
+IPAddressDeny=any
+IPAddressAllow=localhost
+
+# egress 5432/tcp: shop/postgres on db-01, of shop/app, last seen 2026-11-28T06:00:00Z
+IPAddressAllow=10.0.0.10
+```
+
+- A rule denies what was not seen, so the command tells what the history
+  does not hold. When it is `INCOMPLETE` (a gap of the agent, a period
+  before the retention, dropped flows, UDP not traced, no agent, a host
+  or a unit that shawk does not know) it writes its report and no rule,
+  unless `-allow-incomplete`, and its exit status is 4: 0 is `COMPLETE`
+  and nothing else.
+- A rule pins the addresses that the sockets saw. Every file says, above
+  its rules, how many addresses it pins, which peers shawk could not
+  name, what was last seen before the period and so is denied, and that
+  only TCP and UDP are filtered.
+- The formats are a table of nftables for a host (`-ingress ports` opens
+  what it accepts to every source) and a drop-in of systemd for a service
+  unit. `RestrictAddressFamilies=` is a comment, since shawk does not
+  record the families of sockets; iptables and the policies of Kubernetes
+  and Cilium are not written
+  ([design §6.4](docs/design.md#64-least-privilege-rules-and-the-baseline-of-dependencies)).
+
+A baseline locks what a service may depend on. `shawk-policy baseline`
+writes it from a period as a file to review; once approved, the connector
+reads it (`baseline_file`) and tells Prometheus the dependencies of those
+services that the file does not hold:
+
+```console
+$ shawk-policy baseline -dsn-file /etc/shawk/impact-dsn -service shop/app -merge baseline.yaml > new.yaml
+$ diff baseline.yaml new.yaml        # review, then deploy new.yaml as the baseline_file of the connector
+$ shawk-policy drift -dsn-file /etc/shawk/impact-dsn
+Verdict  DRIFT: 1 dependency is not in the baseline of 1 service
+
+Not in the baseline
+SERVICE   PEER         PORT      HOSTS           NAMED BY  FIRST SEEN            LAST SEEN             ADDRESSES
+shop/app  billing/api  8443/tcp  app-01, app-02  edge      2026-11-28T05:40:00Z  2026-11-28T06:00:00Z  10.0.0.40
+```
+
+The alert `ShawkBaselineDrift` fires once per service, server, port and
+transport, whatever the number of hosts, and carries no address. A service
+without a baseline is not judged, and `shawk-policy drift` exits 3 for a
+drift, 0 for none and 4 when it cannot tell.
 
 In SQL:
 

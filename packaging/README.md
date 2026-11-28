@@ -305,8 +305,60 @@ The embedded SQLite database is internal to one collector process (protected
 by an exclusive lock file) and keeps peer-resolution state only (up to 30
 days). Long-term history, change alerts, `unobserved()` coverage gaps,
 multi-hop walks, the impact of removing a host (`shawk-impact`, which
-refuses this mode, and the dashboard shawk / Impact), `job_users`,
+refuses this mode, and the dashboard shawk / Impact), rules and the
+baseline of dependencies (`shawk-policy`, `baseline_file`), `job_users`,
 `node_states_file` and `maintenance_file` require PostgreSQL mode.
+
+## Rules and a baseline of dependencies
+
+`shawk-policy`, in the `shawk-collector` packages and the image, writes
+least-privilege rules and a baseline of dependencies for review, from
+PostgreSQL ([design §6.4](../docs/design.md#64-least-privilege-rules-and-the-baseline-of-dependencies)).
+It applies nothing, and reads `shawk_v1` only: give it the connection
+string of `shawk-impact`, a role with the privileges of `shawk_grafana`.
+
+```sh
+shawk-policy rules -dsn-file /etc/shawk/impact-dsn -host app-01                      # the report: what rules would hold
+shawk-policy rules -dsn-file /etc/shawk/impact-dsn -host app-01 -format nftables > app-01.nft
+shawk-policy rules -dsn-file /etc/shawk/impact-dsn -host app-01 -unit app.service -format systemd
+```
+
+- Read the top of the file first: the status, what the rules pin, and
+  what they leave out. Its exit status is 0 for `COMPLETE` and nothing
+  else, and 4 for `INCOMPLETE`, when no rule is written unless
+  `-allow-incomplete`.
+- Check and try before relying on a file: `nft -c -f app-01.nft`, then
+  load it on one host and watch the counter of the last rule of each
+  chain (`nft list table inet shawk_policy`), which counts what the rules
+  refuse; `systemd-analyze verify app.service` for a drop-in. The table
+  is one of its own (`nft delete table inet shawk_policy` removes it).
+- Write the rules again when peers change: they pin addresses.
+
+To alert on a service that does something its baseline does not hold:
+
+1. Write a baseline from a period, and review it:
+
+   ```sh
+   shawk-policy baseline -dsn-file /etc/shawk/impact-dsn -service shop/app -service shop/worker > baseline.yaml
+   ```
+
+2. Give it to every connector (`baseline_file: /etc/shawk/baseline.yaml`
+   in `collector/config.yaml`), readable by `shawk-collector`. The
+   connector reads it every write interval; a file that is invalid keeps
+   the baseline read before, and `ShawkBaselineFileInvalid` alerts.
+3. Load `prometheus/shawk-rules.yml`: `ShawkBaselineDrift` fires for a
+   dependency that the baseline does not hold, once per service, server,
+   port and transport.
+4. When it fires, `shawk-policy drift -service NAME` lists the hosts and
+   the addresses. To approve the dependency, add its line to the file, or
+   write the service again and review the difference:
+
+   ```sh
+   shawk-policy baseline -dsn-file /etc/shawk/impact-dsn -service shop/app -merge baseline.yaml > new.yaml
+   ```
+
+A service that is not in the file is not judged. The baseline needs
+PostgreSQL: `baseline_file` is refused with the SQLite lightweight mode.
 
 ## Upgrading
 
@@ -330,6 +382,12 @@ that reaches before it is `INCONCLUSIVE` right after the upgrade too. In
 a database whose edges are all recent, that start is recent as well and
 does not move back: periods that reach before it stay `INCONCLUSIVE`
 until they no longer do.
+
+Migration 0006 adds the tables of the baseline and the functions that
+`shawk-policy` and the connector read (`policy_flows()`,
+`baseline_drift()` and the others). It changes no table that holds
+history. A connector of an earlier version ignores them; one with
+`baseline_file` needs the migration, and waits for it like any other.
 
 ## HPC clusters
 

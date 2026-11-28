@@ -1922,6 +1922,9 @@ port_agnostic_services(service)  -- written by the connector (§5.3)
 dynamic_ports(name, proto, addr, port_from, port_to)  -- written by the connector (§5.3); 0.0.0.0/0 and ::/0 for every host
 node_states(hostname, first_seen, last_seen, state, reason)  -- periods of states of Slurm (§5.7)
 maintenance_windows(hostname, starts_at, ends_at, reason, registered_at)  -- registered windows (§5.7)
+baseline_services(service)  -- the services with a baseline, written by the connector from its baseline_file (§5.9)
+baseline_dependencies(service, peer, port, proto)  -- the dependencies approved for them; port 0: every port
+baseline_state(digest, read_at, failed_at, error)  -- when the baseline was read, and the latest failure since
 ```
 
 With `job_users`, the user (`process.user.id`) of a process of a Slurm job
@@ -1977,6 +1980,13 @@ names in PostgreSQL and Prometheus match.
 | `impact_verdict(target_host, since, until, target_service, target_port, target_proto, min_coverage, tolerance)` | whether the target can be removed (§6.3), one row: `verdict` is `UNSAFE` (it has dependents), `INCONCLUSIVE` (none was seen, but the history does not tell so for `min_coverage` of the period, a part from 0 to 1, 1 by default) or `SAFE`; `reasons` tell why (`active_dependents`; `unknown_host`, `no_agent`, `not_observed`, `before_retention`, `dropped_flows`, `netns_limited`, `udp_not_traced`, `unix_not_traced`, `masquerade_not_traced`, `unknown_service`, `unknown_port`) and `caveats` the same shortfalls where they did not decide the verdict; `direct` counts the dependents, those of depth 1 of `impact()`; `coverage` is the part of the period, from 0 to 1 and cut rather than rounded, for which the history tells all that the target covers; `unobserved`, `gaps` and `partly_observed` as in `coverage()`. It fails for a period that is empty, a `min_coverage` that is not above 0 and up to 1, a `tolerance` that is not from 0 to 1 hour, a `target_proto` other than `tcp`, `udp` and `unix`, `unix` without a service or with a port, and a `target_port` that is no port |
 | `coverage(since, until, hosts, tolerance)` | how much of a period the history tells what each host of `hosts` (every host that reported since `since` if NULL) was used for, by name: `host`, `agent` (false for a name no agent reported under), `observed` (from 0 to 1, cut), `unobserved` and its `gaps`, of which `before_retention` precedes the retention of the connector, `partly_observed` and `dropped_flows` (`partly_observed()`), and the time observed without UDP (`udp_untraced`), without Unix sockets or by an agent that does not tell (`unix_untraced`), or in one network namespace only (`netns_limited`). Unlike `unobserved_by_name()`, a session ends earlier by the time the clock of its host is behind, and nothing is observed before the retention (§6.3) |
 | `coverage_gaps(since, until, hosts, tolerance)` | the gaps of `coverage()`, which the verdict counts: `host`, `gap_start`, `gap_end` and `cause`, `retention` for the time before the retention of the connector and `agent` for the time in which no agent of the name observed. A name that no agent reported in the period has one gap, the whole period |
+| `policy_flows(target_host, since, until, target_unit)` | what a host connected to and accepted connections from over TCP and UDP, which least-privilege rules allow (§6.4): one row per `direction` (`egress`, `ingress`), local `service` and `unit`, `proto`, `peer_addr` (as the sockets of the host saw it; a network for folded peers) and `port`, with the ports to allow (`port_from`, `port_to`: the port, the range of `dynamic_ports` that holds it, or 1 to 65535 for a server of `port_agnostic_services`), the name of the peer (`peer`, as in `baseline_observed()`) and its host if its agent saw the connection (`peer_host`), `translated` for a backend that the host itself translates a connection of its own to, `kernel_chosen` for a server on a port the kernel chose, and `first_seen`, `last_seen`. `in_period` is false for a flow last seen before the period, which is listed and not allowed. `target_unit` (NULL by default) narrows the flows to the processes of a unit, with those of the sockets without a known owner of the host |
+| `policy_verdict(target_host, since, until, target_unit, min_coverage, tolerance)` | whether the history tells every flow of `policy_flows()` (§6.4), one row: `status` is `COMPLETE` or `INCOMPLETE`; `reasons` tell why it is incomplete (`unknown_host`, `no_agent`, `unknown_unit`, `not_observed`, `before_retention`, `dropped_flows`, `netns_limited`, `udp_not_traced`) and `caveats` the shortfalls that `min_coverage` (1 by default) accepted; `coverage`, `unobserved`, `gaps` and `partly_observed` as in `impact_verdict()`; `network_namespaces` counts those of the sockets of the flows, `unix_sockets` tells whether the target used Unix sockets, and `translations_traced` whether the agents of the host learned its translations all along. It fails for a period that is empty, a `min_coverage` that is not above 0 and up to 1, a `tolerance` that is not from 0 to 1 hour, and an empty host or unit |
+| `baseline_observed(since, until, services)` | the dependencies of services in a period as a baseline lists them (§6.4), of the services of `services` (every service if NULL): `service` (the client, a process on a host with an agent), `peer` (the server: its service, as an agent saw it or as its listener names it, else the name of its address as `peer_class`), `port` (0 under the rules of ports, §5.3), `proto` (`tcp` or `udp`: no Unix sockets), `first_seen`, `last_seen`, `hosts` (those of the clients), `addrs` (up to 50 of the addresses they connected to) and `named_by` (`edge`, `endpoint` or `address`) |
+| `baseline_verdict(services, since, until, min_coverage, tolerance)` | whether the history tells every dependency of each service of `services`, one row per service: `status` (`COMPLETE`, or `INCOMPLETE` when a host that ran the service was observed for less than `min_coverage` of the period, or no process had the service: `unknown_service`), `reasons` and `caveats` as in `policy_verdict()`, `hosts` (how many ran it), `coverage` (that of the least observed) and `short_hosts` (up to 20 of those below `min_coverage`) |
+| `baseline`, `baseline_status` | the baseline that the connector read from its `baseline_file` (§5.9): one row per `service` and approved dependency (`peer`, `port`, where 0 stands for every port, and `proto`; NULL for a service approved to have none); and when it was last read from a valid file (`read_at`), the latest failure since (`failed_at`, `error`) and how many `services` and `dependencies` it holds, no row before a connector read one |
+| `baseline_drift(since, until, services)` | the dependencies of `baseline_observed()` of the services that have a baseline (those of `services` if not NULL) that it does not hold (§6.4), with the same columns. A service without a baseline has no row |
+| `baseline_new_services(since, until)` | the services without a baseline that were first seen in the period and opened connections (`service`, `first_seen`, `hosts`), which no baseline judges; not the processes of Slurm jobs, nor the sockets without a known owner |
 
 The connector role writes `shawk` and reads `shawk_v1`; Grafana reads
 `shawk_v1` only (`packaging/postgres`). Neither may create objects in the
@@ -2350,6 +2360,281 @@ The verdict is of what shawk observes (§10): a host used over RDMA, one
 that only forwards packets, or one used less often than the period, is not
 seen to be used.
 
+### 6.4 Least-privilege rules and the baseline of dependencies
+
+The history tells what every process connected to, so it can spell the
+rules that allow just that, and tell when a service does something else.
+Two things are made from it, both for a person to review: the rules of a
+host or of a systemd unit (`shawk-policy rules`), and a baseline of the
+dependencies of services, against which the connector reports a drift
+(`shawk-policy baseline`, `baseline_file`, §5.9). `policy_flows()`,
+`policy_verdict()`, `baseline_observed()`, `baseline_verdict()`,
+`baseline_drift()` and `baseline_new_services()` are in the contract, in
+SQL, as the impact is (§6.3): Grafana, psql, the connector and the command
+give the same answer, and the command only writes it as rules.
+
+One rule decides the cases below: **a rule denies what was not seen, so
+what was not watched must be told before a rule is written.** The impact
+answers `SAFE` only when the history can tell that nothing used a target;
+a rule that denies is the same claim, enforced by a firewall.
+
+**shawk writes, a person applies.** `shawk-policy` reads the contract as a
+role that reads `shawk_v1` only and writes to its standard output. It has
+no option to load a ruleset, to install a drop-in or to write the
+database, and the baseline reaches the connector as a file that an
+operator deploys. A deny rule made from an incomplete history is an
+outage, and the review is what stands between the two; a file also
+carries what its reviewer must know as comments, wherever it goes.
+
+**The flows.** `policy_flows()` gives what a host connected to (egress)
+and accepted connections from (ingress) over TCP and UDP, for the whole
+host or for the processes of a unit:
+
+- **They are the edges of the host, not the dependencies matched from
+  them.** A firewall of the host sees what its sockets see: the virtual
+  address of a load balancer, not its backends; the address of a relay
+  that replaced that of the client, not the client. `dependencies` names
+  the real client of such a connection (§5.4), which the server never
+  sees: rules made from it would deny the relay. The dependencies only
+  name the peer of each flow, for the reviewer.
+- **A connection that the host itself translates allows its backend
+  too.** When the kernel of the host rewrites the destination of a
+  connection of one of its own processes (kube-proxy for a Service, a
+  published port reached from the host), the packets leave for the
+  backend: what filters after the translation, the hook `output` of
+  nftables at the priority of filters and the cgroup programs of systemd,
+  sees the backend, and the answers come back from the virtual address.
+  The flows have both, the backend marked `translated`, from the
+  translations that the agent learned in the network namespace of the
+  socket (§3.7). A connection of a pod is translated in another namespace,
+  after what filters the pod: it has the virtual address alone. Where the
+  agent did not learn translations, the verdict tells
+  (`translations_traced`): nothing then tells whether the host translates.
+- **Folded peers are a whole network.** The agent keeps no address of the
+  peers it folds (§3.6): their flow has the network `0.0.0.0/0` or `::/0`,
+  and its rule allows every address of the family on the port. Leaving
+  them out would deny them; the rule says that it is wide, and that
+  `-fold-external none` or `-internal-peers` keeps the addresses.
+- **A socket without a known owner counts for every unit** of its host
+  (`~unknown`, §4.1), as it counts for every service in the impact: it may
+  be the unit's, and a rule that leaves it out would deny it.
+- **Ports follow the rules of ports** (§5.3): a flow in a range of
+  `dynamic_ports` allows the range, and one to a server of
+  `port_agnostic_services` every port of its address, since the server
+  listens on another one at every run. A server that listened on a port
+  the kernel chose, which no rule of ports covers, is marked: a rule
+  pinned to that port breaks at the next run.
+- **What was last seen before the period is listed, not allowed.** A
+  period cannot tell what it does not hold, a job of every quarter or a
+  server used only when another fails; but the flows that the history
+  holds from before it are evidence at hand of exactly that, and the
+  report lists them so that a reviewer extends the period or accepts the
+  loss.
+- **Connections within the host** (loopback) are in no rule: both formats
+  leave loopback open.
+
+**What a rule pins, and what that costs.** Neither nftables nor
+`IPAddressAllow=` matches the name of a service, and shawk keeps no DNS
+name, so a rule pins the addresses that the sockets saw. A peer that gets
+another address is then denied until the rules are written again: a lease
+of DHCP that changes, a group that scales out, a replica that this client
+never used, a failover. The command does not hide it: every report counts
+the addresses pinned, the sources pinned, the peers it could not name and
+the ports that will change, and names the peer above each rule so that a
+reviewer can widen a rule to the range he knows.
+
+- **Not widened automatically.** A rule could allow every endpoint of the
+  service it names, or the whole range of `peer_cidrs` an address is in.
+  Both allow what was never observed, and how wide is right depends on
+  what the reviewer knows of the network (a range of pods and a `/8` are
+  both ranges of `peer_cidrs`): the choice stays his, with the names to
+  make it.
+- **Sources are pinned by default, and can be opened.** The rules of the
+  connections a host accepts are where addresses change most: clients, and
+  administrators. `-ingress sources` (the default) is the least privilege
+  the history supports, `-ingress ports` opens the ports that were seen to
+  every source, and `-ingress none` writes no rule for what the host
+  accepts.
+
+**The formats.**
+
+- **nftables** (`-format nftables`), for a whole host: a table of its
+  own, `inet shawk_policy`, with the chains `output` and, unless
+  `-ingress none`, `input`. Each accepts what belongs to an established
+  connection, loopback and **every protocol but TCP and UDP**; then the
+  flows; then refuses the rest (`reject` for what the host opens, so that
+  a client fails at once rather than at its time limit; `drop` for what
+  it accepts), with a counter. shawk does not observe ICMP, neighbour
+  discovery, VRRP or IPsec: a ruleset that dropped them would deny what
+  nothing looked at. A table of its own replaces no other rule, and a
+  packet passes only if every table accepts it. There is no chain
+  `forward`: the connections of containers that a host forwards do not
+  pass `input` and `output`, and the report tells when the sockets of
+  the flows are in several network namespaces. Rules of a host cannot
+  tell its units apart, so the format takes no unit.
+- **systemd** (`-format systemd`), for a service unit: a drop-in with
+  `IPAddressDeny=any`, `IPAddressAllow=localhost` and an
+  `IPAddressAllow=` per address. The setting has one list for both
+  directions and no ports, so an address of a client and that of a server
+  are allowed alike, for every port. Only a unit named `*.service` has a
+  unit file to drop it in: the unit of a container, a session or a job is
+  refused.
+- **`RestrictAddressFamilies=` is written as a comment**, not as a
+  setting. shawk records the addresses of connections, not the families
+  of sockets: an `AF_INET6` socket carries IPv4 peers, as the listeners
+  of most servers do, and `AF_NETLINK`, `AF_PACKET` and datagram
+  `AF_UNIX` sockets are not observed at all. A list made from what was
+  seen (IPv4 peers only, so `AF_INET`) could keep a unit from starting.
+  The comment tells what was seen and gives a list to start from.
+- **iptables is not written.** On the primary target (RHEL 9) it is a
+  front end of nftables and deprecated; it needs a file per family and is
+  loaded over the tables of the host unless told otherwise. One format
+  that the kernel is seen to load as meant (below) is worth more than
+  two.
+- **Kubernetes `NetworkPolicy` and Cilium policies are not written.**
+  They select pods by labels, which shawk does not keep (the unit of a
+  pod is its namespace, workload and container, §4.1), and their peers
+  must be labels too: the addresses of pods, which is all the history
+  has, are what such a policy must not pin. No validator of either is at
+  hand to check a manifest against either. They would need the labels of
+  pods in the history first.
+- **The files are checked against what reads them.** The tests load the
+  tables into the kernel of a network namespace of their own with `nft`
+  and compare what the kernel then lists with the flows, address by
+  address, and give the drop-ins to `systemd-analyze verify`; both over
+  flows whose names are what agents may send (a name with a line break
+  and a rule after it, one that ends with a backslash). Names are written
+  in comments only, quoted unless plain; every other character of a file
+  is an address, a number or a word of the command.
+
+**Completeness.** `policy_verdict()` tells whether the history holds
+every flow of the target over the period:
+
+| status | when |
+|---|---|
+| `INCOMPLETE` | the target is not known (no agent ever reported under the name of the host: `unknown_host`, or `no_agent` for a host of the inventory; no process of the host had the unit: `unknown_unit`), or the history covers less than `min_coverage` of the period |
+| `COMPLETE` | the history tells every connection of the target over TCP and UDP for `min_coverage` of the period |
+
+- **The coverage is that of the impact** (§6.3) for what rules cover: an
+  agent of the host observed (`not_observed`), within the retention
+  (`before_retention`), without dropped flows (`dropped_flows`), in every
+  network namespace (`netns_limited`) and with UDP (`udp_not_traced`: a
+  resolver is a dependency over UDP). `min_coverage` is 1 by default, and
+  a caller who accepts a gap says so and gets `COMPLETE` with the gap as a
+  caveat, as for `SAFE`.
+- **No rules from an incomplete history, unless asked.** `shawk-policy
+  rules` then writes the report, with what was not seen, and no rule;
+  `-allow-incomplete` writes them, with `INCOMPLETE` as their first line
+  and the shortfalls below it. The exit status is 4 either way, and 0 for
+  `COMPLETE` alone, so that no script takes rules of a partial history
+  for rules of a whole one. Writing them with a warning by default would
+  leave the decision to whoever reads the warning last; refusing them
+  always would leave an operator who knows why his agent restarted
+  without rules at all. `-min-coverage` accepts a known amount of gaps
+  and changes the status; `-allow-incomplete` accepts whatever is missing
+  and does not.
+- **A name that nothing knows is never complete**, whatever is accepted:
+  a host or a unit mistyped has no flow, and its rules would deny
+  everything.
+- **What completeness cannot tell** is said under every report: only TCP
+  and UDP are observed, and a connection that was not made in the period
+  is denied.
+
+**The baseline** is per service, by its name in PostgreSQL and in the
+`job` label, not per host: the hosts of a service share it, so a host
+that joins a service is judged by what the service may do, and adding
+replicas alerts nothing. An entry is a server by its name, a port and a
+transport.
+
+- **A file is the source of truth.** A baseline is approved where an
+  operator approves everything else, in a file under review and version
+  control, and the connector reads it like the inventory (§5.9);
+  PostgreSQL holds a copy to evaluate. `shawk-policy baseline` writes the
+  file from a period, with the evidence of every entry as comments (how
+  many hosts, when it was last seen, where its name comes from), and
+  `-merge FILE` writes a file again with some services replaced, so that a
+  change is a difference to review. A table that the command writes would
+  give a tool that reads a credential to write, and leave no trail of who
+  approved what. Learning the baseline as time goes, as
+  `dependency_changes` tells what is new, would make a compromise that
+  lasts part of the baseline: a lock is explicit.
+- **Names are those of the dependencies between services, with one
+  addition.** A server that no agent saw the side of is named after the
+  service that listens at its address (`service_endpoints`, the last
+  known endpoints, as the connector names peers, §5.2), or at a backend
+  of the translation of the configuration whose virtual address it is,
+  before it is named after its address (`peer_class`). Otherwise a server
+  whose agent stops would turn every dependency on it into one on
+  `~unresolved`, on every client at once, and the baseline would hold
+  both names or alert on each stop. `named_by` tells which evidence named
+  a server: `edge`, `endpoint` or `address`.
+- **A port of 0 stands for every port**, and a dependency is in the
+  baseline by the port of the dependency between services or by the port
+  of the server itself (§5.3). A rule of ports added or removed after a
+  baseline was approved thus makes no drift of what it holds.
+- **Unix sockets are not part of a baseline**: they have neither a port
+  nor a network, every process tries the socket of nscd (§8), and agents
+  that start to trace them would make every such dependency a drift at
+  once.
+- **A service must have run to be written.** `baseline_verdict()` is the
+  verdict of the rules over every host that ran the service, and a
+  service that no process had (`unknown_service`) is never written, even
+  when asked: a name mistyped would approve nothing, and deny everything.
+  A host that ran the service for a part of the period counts over the
+  whole period: what it did before its agent first reported is not known.
+
+**The drift** is what the services of the baseline did that it does not
+hold (`baseline_drift()`).
+
+- **New means not in the baseline**, not "not seen for some time": the
+  answer does not depend on how long a dependency was idle, and the same
+  period gives the same drift. A dependency is told while it was active
+  in the period, an hour for the connector (§5.9).
+- **The ports of clients are not recorded** (§3.1), and a server that
+  takes another port at every run is one dependency under the rules of
+  ports.
+- **A service that is itself new is not judged**, and neither is any
+  service without a baseline: there is nothing to compare it with. It is
+  not silent either: `shawk_baseline_dependencies{job}` tells the
+  services that are judged, and `baseline_new_services()` the services
+  without a baseline that were first seen in the period and opened
+  connections, which the connector counts
+  (`shawk_baseline_new_services`). The count matters because a new
+  executable is a service of its own unless it names itself (§4.1):
+  `curl` run in the unit of an application is the service `curl`, which
+  the baseline of the application does not judge. It is an `info` alert,
+  not a drift: administrators run new tools every day.
+- **A peer that shawk cannot name is a drift of its own kind.**
+  `~unresolved` is a private address without a known service: a host
+  without an agent, or a server of the baseline at an address that shawk
+  does not know of. It is told with its name, and the alert on it is a
+  warning that waits (§8), apart from the alert on servers that shawk
+  names.
+- **No drift is an answer only where someone looked**: `shawk-policy
+  drift` is `INCONCLUSIVE` when no connector read a baseline, when a
+  service asked for has none, or when a host of a service was not
+  observed for the whole period, and the connector tells when it last
+  evaluated (§5.9).
+
+**Cost.** Each function reads the dependencies of the period once
+(`dependencies_between()`), like the impact, and the last known endpoints
+once. On the synthetic fleet of §6.3 (2000 hosts, 1.1 million edges,
+500000 dependencies in 90 days), on a machine at a load average of 3:
+`policy_flows()` takes 5 seconds for any host, also one with 4449 clients;
+`baseline_observed()` 5 seconds for a service of every host and 8 for
+every service; `baseline_drift()` 1.2 seconds over an hour, of which the
+endpoints are most; `shawk-policy rules` and `baseline` 5 to 8 seconds
+and `drift` 1.4.
+
+- **Names are made for the rows that are read**: those of the host, or
+  of the services asked for. A name costs calls of `peer_class()`, a few
+  seconds over the dependencies of months.
+- **The joins of the flows hash**, as those of `shawk.dependents()`: the
+  edges of a host are joined with rows of a function, of which the
+  planner knows nothing, and with nested loops the flows of the host with
+  4449 clients took 22 seconds. The JIT compiler is off in these
+  functions: it took 2 seconds to compile what then ran for one.
+
 ## 7. Counting each dependency once
 
 When both ends run an agent, a dependency appears on the client side
@@ -2526,6 +2811,62 @@ line, and a failure 1.
 - **It needs PostgreSQL** (§5.8): a connection string that names a file
   of SQLite, or a database without `shawk_v1.impact_verdict()`, is an
   error that says so.
+
+`shawk-policy` writes what §6.4 describes, as text or JSON, with three
+commands. It shares the flags of `shawk-impact` for the database and the
+period (`-dsn`, `-dsn-file`, `-timeout`, `-lookback`, `-until`,
+`-min-coverage`), reads in one read-only transaction as any role that
+reads `shawk_v1`, and needs PostgreSQL the same way. Its exit status is 0
+for `COMPLETE`, or for no drift, and for nothing else; 3 for a drift; 4
+for `INCOMPLETE`, or for a drift that cannot be told; 2 for its help and
+an invalid command line; 1 for a failure.
+
+- **`shawk-policy rules -host NAME [-unit NAME]`** writes the report of
+  the flows of a host over a period (90 days by default), and with
+  `-format nftables` or `-format systemd` the rules, under the status and
+  the findings as comments. From an incomplete history it writes the
+  report alone, unless `-allow-incomplete`. It refuses an empty `-unit`,
+  which would widen the target to the host; `-format systemd` without a
+  service unit; `-format nftables` with a unit; and `-ingress` with
+  systemd, whose setting has one list for both directions.
+- **`shawk-policy baseline -service NAME ... | -all`** writes a baseline
+  file of the services over a period, with their status and the evidence
+  of each dependency as comments, and `-merge FILE` writes a file again
+  with those services replaced. A service that is incomplete keeps the
+  whole file from being written unless `-allow-incomplete`; one that no
+  process had is never written, nor taken out of the file it is merged
+  with.
+- **`shawk-policy drift [-service NAME ...]`** tells the drift over a
+  period that ends 5 minutes ago (an hour by default), with the hosts and
+  the addresses, which Prometheus does not have, the line to add to the
+  baseline to approve a dependency, and the new services without a
+  baseline. Its verdict is `CLEAN`, `DRIFT` or `INCONCLUSIVE`.
+- **Names are quoted wherever they are not plain.** A name of a host, a
+  unit, a service or a peer is what an agent sent: in a report it could
+  redraw the terminal, and in a file of rules start a line of its own.
+  Outside the characters that such names usually have, a name is written
+  quoted, on one line.
+
+The alerts of the baseline are rules of Prometheus
+(`packaging/prometheus/shawk-rules.yml`), over what the connector sends
+(§5.9):
+
+| alert | severity | when |
+|---|---|---|
+| `ShawkBaselineDrift` | critical | a service of the baseline connects to a server that shawk names (a service, a range of `peer_cidrs`, `~external`) on a port that the baseline does not hold |
+| `ShawkBaselineDriftUnresolved` | warning, after 15 minutes | the same on `~unresolved`: a private address that shawk cannot name |
+| `ShawkBaselineNotEvaluated` | warning | no connector evaluated the drift for 30 minutes, for a day after the last one stopped |
+| `ShawkBaselineFileInvalid` | warning, after 10 minutes | the latest read of a `baseline_file` failed: the baseline is the one read before |
+| `ShawkBaselineDriftTruncated` | warning | more dependencies drift than the connector sends series for |
+| `ShawkNewServiceWithoutBaseline` | info | services without a baseline appeared and opened connections |
+
+One series, and so one alert, is a service, a peer, a port and a
+transport, whatever the number of hosts: a release that opens a new
+connection on every host of a service alerts once, and a release that
+opens three alerts three times. A peer that is renamed alerts once per
+service that uses it; group the alerts by `service_peer_name` in
+Alertmanager where that matters. An alert resolves when the dependency
+was not used for an hour, or when the baseline holds it.
 
 ## 9. OBI
 
@@ -2845,6 +3186,62 @@ bound above holds. A store whose receiver takes less needs a smaller
   - Planned stops count as gaps. The walk follows the dependents of
     dependents by service and host, not by request: a dependent of depth
     2 uses a service that uses the target, which need not be on its path.
+- **Rules and baselines** (§6.4) are made from what was observed in the
+  period asked for, in PostgreSQL only (§5.8).
+  - *What a rule denies.* Everything over TCP and UDP that was not seen
+    in the period: a job that runs less often, a server that is used only
+    when another fails, a client that was not there yet. The flows that
+    the history holds from before the period are listed; what happened
+    before the retention, or never yet, is not. Review the rules, and try
+    them where a refusal can be watched (the counter of the last rule of a
+    chain) before relying on them.
+  - *Addresses.* A rule pins the addresses that the sockets saw. A peer
+    that changes its address is denied until the rules are written again,
+    and an address that passes to another machine is allowed as the one
+    that had it. Public addresses that an agent folds (the default) are
+    not kept: their rule allows every address on the port, and a drop-in
+    of systemd with such a peer restricts nothing of that family.
+  - *What rules cover.* TCP and UDP of the host itself. The rules of
+    nftables accept every other protocol and do not filter what a host
+    forwards for its containers; a drop-in of systemd has no ports, and
+    allows an address in both directions. `RestrictAddressFamilies=`,
+    policies of Kubernetes and of Cilium, and iptables are not written.
+  - *Translations.* The backends of the connections that a host
+    translates itself are allowed from the translations its agent learned
+    (§3.7), with their limits: none where the agent traces no
+    translation, which the report tells, and none for a datapath without
+    netfilter conntrack. Such a host needs its rules tried before they
+    are enforced.
+  - *Names.* A baseline is per service name. A process that names itself
+    anew, or a new executable in the unit of a service, is another
+    service, which the baseline of the first does not judge:
+    `shawk_baseline_new_services` counts those that appear, and nothing
+    more is told of them. A service that is renamed has no baseline until
+    its file is, and alerts nothing meanwhile
+    (`absent(shawk_baseline_dependencies{job="..."})` alerts on it). A
+    peer that is renamed is a drift for each service that uses it.
+  - *What a baseline tells apart.* The name of a server, its port and the
+    transport: a server of the same name at another address is no drift,
+    `~external` does not tell one public address from another, and
+    `~unresolved` one private address without a known service from
+    another. Name the ranges that matter in `peer_cidrs`, and keep their
+    addresses with `-internal-peers`. Dependencies over Unix sockets are
+    not judged.
+  - *Names of servers whose agent is stopped* are those of their last
+    known listeners, which hold for hosts that reported in the last 30
+    days and not for a virtual address of a translation that an agent
+    learned: a dependency on such a server may then be told as a drift on
+    `~unresolved`, a warning.
+  - *Hosts that come and go.* The history of a service is complete only
+    when every host that ran it was observed for the whole period: a host
+    that joined the service within it makes it `INCOMPLETE`, since what it
+    did before its agent reported is not known. A fleet whose hosts live
+    for days has no complete period longer than they do; `-min-coverage`
+    or `-allow-incomplete` is then a standing choice.
+  - *Timing.* The drift is evaluated every 5 minutes, up to 5 minutes
+    ago: a dependency is alerted 5 to 10 minutes after it was first used.
+    Edges written more than an hour late, by an agent whose clock is
+    behind, are judged only by `shawk-policy drift` over a longer period.
 - **Clocks**: first and last seen times come from each host's clock, capped
   at 2 minutes ahead of the connector (§5.1); so does the segment start,
   capped at the request that carries it, which `clock_skew` converts;
