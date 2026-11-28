@@ -44,12 +44,19 @@ type BaselineService struct {
 
 // BaselineDependency is an approved dependency: the server by its name (a
 // service, a range of peer_cidrs, ~unresolved or ~external), its port, 0
-// for every port, and the transport, tcp or udp.
+// for every port, and the transport, tcp or udp. KernelChosen, with port
+// 0, approves the ports that the kernel chose for a server of the name,
+// and no other (`port: kernel-chosen` in a file).
 type BaselineDependency struct {
-	Peer  string
-	Port  int
-	Proto string
+	Peer         string
+	Port         int
+	Proto        string
+	KernelChosen bool
 }
+
+// baselineKernelChosen is the port of a dependency of a baseline file on
+// the ports that the kernel chose for the server.
+const baselineKernelChosen = "kernel-chosen"
 
 // Bounds of a baseline: far above the services of a fleet and their
 // dependencies, and what the connector writes to PostgreSQL in one
@@ -66,9 +73,16 @@ const (
 //	    dependencies:
 //	      - {peer: shop/postgres, port: 5432, proto: tcp}
 //	      - {peer: ~external, port: 443, proto: tcp}
+//	      - {peer: rpcd, port: kernel-chosen, proto: tcp}
 //	  - service: batch/report
 //	    dependencies: []          # approved to have none
-//	end: {services: 2, dependencies: 2}
+//	end: {services: 2, dependencies: 3}
+//
+// A port is a number, 0 for every port, or `kernel-chosen` for the ports
+// that the kernel chose for a server of the name: a server that listens on
+// such a port has another one at its next run, and a number would be a
+// drift then, while 0 would approve every port of every server of the
+// name, which may be the name of an executable that many servers share.
 //
 // `end` is the last key of the file, so that a file that was cut short,
 // which is still YAML up to many of its bytes, is not taken for the
@@ -295,8 +309,10 @@ func baselineDependency(n *yaml.Node) (BaselineDependency, error) {
 	if fields["port"] == nil {
 		return d, errors.New("no port: write 0 for every port")
 	}
-	if d.Port, err = baselineNumber(fields["port"], 65535); err != nil {
-		return d, fmt.Errorf("port: %w", err)
+	if p := fields["port"]; p.Kind == yaml.ScalarNode && p.ShortTag() == "!!str" && p.Anchor == "" && p.Value == baselineKernelChosen {
+		d.KernelChosen = true
+	} else if d.Port, err = baselineNumber(p, 65535); err != nil {
+		return d, fmt.Errorf("port: %w (a number, or %s)", err, baselineKernelChosen)
 	}
 	if fields["proto"] == nil {
 		return d, errors.New("no proto: tcp or udp")
@@ -314,6 +330,9 @@ func (d BaselineDependency) check() error {
 	}
 	if d.Port < 0 || d.Port > 65535 {
 		return fmt.Errorf("port %d is not from 0 to 65535", d.Port)
+	}
+	if d.KernelChosen && d.Port != 0 {
+		return fmt.Errorf("port %d with %s", d.Port, baselineKernelChosen)
 	}
 	if d.Proto != "tcp" && d.Proto != "udp" {
 		return fmt.Errorf("proto %q is not tcp or udp", cutLabel(d.Proto, 64))
@@ -360,7 +379,16 @@ func compareDependencies(x, y BaselineDependency) int {
 	if x.Port != y.Port {
 		return x.Port - y.Port
 	}
-	return strings.Compare(x.Proto, y.Proto)
+	if c := strings.Compare(x.Proto, y.Proto); c != 0 {
+		return c
+	}
+	switch {
+	case x.KernelChosen == y.KernelChosen:
+		return 0
+	case y.KernelChosen:
+		return -1
+	}
+	return 1
 }
 
 // Digest identifies the contents of a normalized baseline, so that the
@@ -370,6 +398,10 @@ func (b *Baseline) Digest() string {
 	for _, s := range b.Services {
 		fmt.Fprintf(h, "%q\n", s.Service)
 		for _, d := range s.Dependencies {
+			if d.KernelChosen {
+				fmt.Fprintf(h, " %q %s %s\n", d.Peer, baselineKernelChosen, d.Proto)
+				continue
+			}
 			fmt.Fprintf(h, " %q %d %s\n", d.Peer, d.Port, d.Proto)
 		}
 	}
@@ -424,7 +456,11 @@ func (b *Baseline) MarshalNotes(note func(service string, d BaselineDependency) 
 				return nil, fmt.Errorf("service %q: %w", s.Service, err)
 			}
 			total++
-			fmt.Fprintf(&buf, "      - {peer: %s, port: %d, proto: %s}", yamlName(d.Peer), d.Port, d.Proto)
+			port := strconv.Itoa(d.Port)
+			if d.KernelChosen {
+				port = baselineKernelChosen
+			}
+			fmt.Fprintf(&buf, "      - {peer: %s, port: %s, proto: %s}", yamlName(d.Peer), port, d.Proto)
 			if note != nil {
 				if n := yamlComment(note(s.Service, d)); n != "" {
 					buf.WriteString("  # " + n)
@@ -544,8 +580,8 @@ func (c *shawkConnector) syncBaseline(ctx context.Context) {
 	b, err := c.readBaseline(at)
 	if err != nil {
 		// The error may quote the file, so what is recorded is made
-		// acceptable to PostgreSQL (see cleanString) and cut.
-		msg := cleanString(cutLabel(err.Error(), maxStringBytes))
+		// acceptable to PostgreSQL (see pgClean) and cut.
+		msg := pgClean(cutLabel(err.Error(), maxStringBytes))
 		if msg != c.baselineErr || at.Sub(c.lastBaselineLog) >= foldWarnInterval {
 			c.log.Error("reading baseline_file; the baseline read before stays", zap.String("file", c.cfg.BaselineFile), zap.Error(err))
 			c.baselineErr, c.lastBaselineLog = msg, at
@@ -563,7 +599,12 @@ func (c *shawkConnector) syncBaseline(ctx context.Context) {
 	}
 	c.baselineErr, c.baselineFailed = "", false
 	if err := c.store.syncBaseline(ctx, b, at); err != nil {
-		c.log.Warn("writing the baseline to "+c.storeName(), zap.Error(err))
+		// The file is valid and PostgreSQL does not hold it: what is
+		// judged is the baseline of before, or nothing at all. It is told
+		// as a file that failed is, since the baseline does not follow its
+		// file either way.
+		c.log.Warn("writing the baseline to "+c.storeName()+"; the baseline written before stays", zap.Error(err))
+		c.baselineFailed = true
 	}
 }
 
@@ -582,9 +623,6 @@ const (
 	// maxBaselineLookback bounds the period after evaluations failed for
 	// long, as while PostgreSQL was down.
 	maxBaselineLookback = 24 * time.Hour
-	// baselineRetry is how soon an evaluation that failed is tried again,
-	// rather than at the next refreshInterval.
-	baselineRetry = time.Minute
 	// maxDriftSeries bounds the series of the drift, and
 	// maxDriftSeriesPerService those of one service: the dependencies
 	// beyond them are counted (shawk.baseline.drift.truncated), not sent.
@@ -628,10 +666,13 @@ type baselineReport struct {
 	// failed tells that the latest read of a baseline_file failed.
 	failed bool
 	// services are the services of the baseline, each with how many
-	// dependencies it has, how many hosts run it (a process of it was
-	// seen there within baseline_host_memory) and how many of those were
-	// not observed for the whole period: what such a host did is not
-	// known, and a service without a host is not judged at all.
+	// dependencies it has, on how many hosts it is judged and how many of
+	// those were not observed for the whole period: what such a host did
+	// is not known. The hosts are those that run the service (a process
+	// of it was seen there within baseline_host_memory) or, when none
+	// does, those that ran it before and were observed: the service does
+	// not run, and nothing of it was missed. A service without a host is
+	// not judged at all.
 	services []baselineCount
 	// drift are the dependencies that are not in the baseline of their
 	// service: at most maxDriftSeriesPerService per service, those on a
@@ -661,20 +702,33 @@ type driftRow struct {
 	hosts         int
 }
 
+// BaselineHostsSince is since when a process of a service must have been
+// seen on a host for the host to run the service in the period [since,
+// until] of a drift: `memory` before the end of the period, and never
+// later than the start of the period, since a host that ran the service
+// in the period runs it. The connector (baseline_host_memory) and
+// shawk-policy drift (-hosts-lookback) share the rule, and the contract
+// holds it too (shawk_v1.baseline_verdict): a period is longer than the
+// memory after evaluations paused, or when the memory is an hour.
+func BaselineHostsSince(since, until time.Time, memory time.Duration) time.Time {
+	if at := until.Add(-memory); at.Before(since) {
+		return at
+	}
+	return since
+}
+
 // evaluateBaselineIfDue evaluates the drift from the baseline every
 // refreshInterval, with baseline_file, and keeps the result for
-// emitBaseline. An evaluation that failed is tried again after
-// baselineRetry; the result of the last one that succeeded stays, with
-// the time it is of.
+// emitBaseline. An evaluation that failed is tried again at the next
+// refreshInterval, not sooner: one that fails at its time limit of a
+// minute, as against a PostgreSQL that is too slow, would otherwise
+// follow the last at once, and the connector would do nothing else. The
+// result of the last one that succeeded stays, with the time it is of.
 func (c *shawkConnector) evaluateBaselineIfDue(ctx context.Context) {
 	if c.cfg.BaselineFile == "" || c.cfg.useSQLite() {
 		return
 	}
-	wait := refreshInterval
-	if c.baselineEvalFailed {
-		wait = baselineRetry
-	}
-	if !c.lastBaselineTry.IsZero() && c.now().Sub(c.lastBaselineTry) < wait {
+	if !c.lastBaselineTry.IsZero() && c.now().Sub(c.lastBaselineTry) < refreshInterval {
 		return
 	}
 	c.mu.Lock()
@@ -697,7 +751,8 @@ func (c *shawkConnector) evaluateBaselineIfDue(ctx context.Context) {
 	}
 	ectx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
-	r, err := c.store.baselineReport(ectx, since, until, until.Add(-c.cfg.baselineHostMemory()), maxDriftSeries, maxDriftSeriesPerService)
+	r, err := c.store.baselineReport(ectx, since, until, BaselineHostsSince(since, until, c.cfg.baselineHostMemory()),
+		maxDriftSeries, maxDriftSeriesPerService)
 	if err != nil {
 		c.log.Error("evaluating the drift from the baseline; the result of the last evaluation stays, and "+
 			metricBaselineEvalFailed+" tells that it is old", zap.Error(err))
@@ -743,7 +798,7 @@ type baselineState struct {
 	attempted time.Time
 	failed    bool
 	// fileFailed tells that this connector could not read its
-	// baseline_file at its last try.
+	// baseline_file at its last try, or could not write it to PostgreSQL.
 	fileFailed bool
 }
 
@@ -810,8 +865,12 @@ func appendBaselineMetrics(out pmetric.Metrics, st baselineState, now time.Time)
 	}
 	services := map[string]*service{}
 	var names []string
+	// The names are those of PostgreSQL and of the file: whatever they
+	// hold, a label has no control character, which would add lines to
+	// the text of an alert.
+	label := func(s string) string { return cutLabel(cleanString(s), maxPeerName) }
 	for _, s := range r.services {
-		name := cutLabel(s.service, maxPeerName)
+		name := label(s.service)
 		if services[name] == nil {
 			services[name] = &service{drift: map[key]int{}, hosts: s.hosts}
 			names = append(names, name)
@@ -826,8 +885,8 @@ func appendBaselineMetrics(out pmetric.Metrics, st baselineState, now time.Time)
 	for _, d := range r.drift {
 		// The contract gives the drift of the services of the baseline
 		// only; that of another service has no resource to be sent on.
-		if s := services[cutLabel(d.service, maxPeerName)]; s != nil {
-			k := key{cutLabel(d.peer, maxPeerName), d.port, d.proto}
+		if s := services[label(d.service)]; s != nil {
+			k := key{label(d.peer), d.port, d.proto}
 			s.drift[k] = max(s.drift[k], d.hosts)
 		}
 	}
@@ -847,7 +906,8 @@ func appendBaselineMetrics(out pmetric.Metrics, st baselineState, now time.Time)
 			keys = append(keys, k)
 		}
 		slices.SortFunc(keys, func(x, y key) int {
-			return compareDependencies(BaselineDependency{x.peer, x.port, x.proto}, BaselineDependency{y.peer, y.port, y.proto})
+			return compareDependencies(BaselineDependency{Peer: x.peer, Port: x.port, Proto: x.proto},
+				BaselineDependency{Peer: y.peer, Port: y.port, Proto: y.proto})
 		})
 		dps := gauge(rm, metricBaselineDriftHosts, "{host}")
 		for _, k := range keys {

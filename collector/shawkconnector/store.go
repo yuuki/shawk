@@ -1043,6 +1043,7 @@ func (s *pgStore) syncBaseline(ctx context.Context, bl *Baseline, readAt time.Ti
 		if stored == nil || *stored != digest {
 			var services, depServices, peers, protos []string
 			var ports []int32
+			var chosen []bool
 			for _, sv := range bl.Services {
 				services = append(services, sv.Service)
 				for _, d := range sv.Dependencies {
@@ -1050,14 +1051,15 @@ func (s *pgStore) syncBaseline(ctx context.Context, bl *Baseline, readAt time.Ti
 					peers = append(peers, d.Peer)
 					ports = append(ports, int32(d.Port))
 					protos = append(protos, d.Proto)
+					chosen = append(chosen, d.KernelChosen)
 				}
 			}
 			b := &pgx.Batch{}
 			b.Queue(`DELETE FROM shawk.baseline_services`)
 			b.Queue(`INSERT INTO shawk.baseline_services (service) SELECT * FROM unnest($1::text[])`, services)
 			b.Queue(`
-INSERT INTO shawk.baseline_dependencies (service, peer, port, proto)
-SELECT * FROM unnest($1::text[], $2::text[], $3::integer[], $4::text[])`, depServices, peers, ports, protos)
+INSERT INTO shawk.baseline_dependencies (service, peer, port, proto, kernel_chosen)
+SELECT * FROM unnest($1::text[], $2::text[], $3::integer[], $4::text[], $5::boolean[])`, depServices, peers, ports, protos, chosen)
 			if err := tx.SendBatch(ctx, b).Close(); err != nil {
 				return err
 			}
@@ -1102,7 +1104,7 @@ func (s *pgStore) baselineReport(ctx context.Context, since, until, hostsSince t
 		}
 		rows, err := tx.Query(ctx, `
 SELECT s.service, (SELECT count(*)::integer FROM shawk.baseline_dependencies d WHERE d.service = s.service),
-       v.hosts, v.unobserved_hosts
+       CASE WHEN v.hosts > 0 THEN v.hosts ELSE v.idle_hosts END, v.unobserved_hosts
 FROM shawk.baseline_services s
 JOIN shawk_v1.baseline_verdict(ARRAY(SELECT b.service FROM shawk.baseline_services b), $1, $2, 1, interval '3 minutes', $3) v
   ON v.service = s.service

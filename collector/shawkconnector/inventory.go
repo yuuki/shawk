@@ -331,7 +331,7 @@ func (c *shawkConnector) writeInventory(ctx context.Context, inv *inventory, rea
 // lasts. The error may quote the file, so what is recorded is made
 // acceptable to PostgreSQL (see cleanString) and cut to maxStringBytes.
 func (c *shawkConnector) inventoryUnreadable(ctx context.Context, err error, at time.Time) {
-	msg := cleanString(cutLabel(err.Error(), maxStringBytes))
+	msg := pgClean(cutLabel(err.Error(), maxStringBytes))
 	if msg != c.inventoryErr || at.Sub(c.lastInventoryLog) >= foldWarnInterval {
 		c.log.Error("reading inventory_file; the inventory read before stays", zap.String("file", c.cfg.InventoryFile),
 			zap.Error(err))

@@ -404,12 +404,15 @@ func TestPGBaseline(t *testing.T) {
 #
 # A peer is a service by its name, as its agent or its listener tells it, a range of peer_cidrs,
 # ~unresolved (a private address that shawk cannot name) or ~external (a public address, or peers
-# whose addresses the agent folded). Port 0 stands for every port. A dependency that was not used
+# whose addresses the agent folded). Port 0 stands for every port, and kernel-chosen for the ports
+# that the kernel chose for a server of the name, which change at each of its runs: for those and
+# for no port that a server was given. A dependency that was not used
 # in the period is not listed: one used less often than the period, or only when another server
 # fails. Dependencies over Unix sockets are not part of a baseline. A process of another name in
-# a unit of a service, which has no baseline of its own, is judged as the service: what it
-# connected to is listed with it. The last line of the file tells that it is whole: keep it last,
-# and its counts right (or write ` + "`end: {}`" + `).
+# a unit of a service, which has no baseline of its own, is judged by the services of the unit:
+# what it connected to is listed with the first of them. Units that unrelated processes share (the
+# jobs of Slurm, login sessions) judge nothing. The last line of the file tells that it is whole:
+# keep it last, and its counts right (or write ` + "`end: {}`" + `).
 
 services:
   - service: nginx
@@ -432,7 +435,7 @@ end: {services: 1, dependencies: 1}
 	code, out, _ = f.run("baseline", "-service", "shop/app", "-service", "nginx", "-allow-incomplete")
 	b, err := shawkconnector.ParseBaseline([]byte(out))
 	if code != exitIncomplete || err != nil || !strings.HasPrefix(out, "# INCOMPLETE: written with -allow-incomplete") || len(b.Services) != 2 ||
-		fmt.Sprint(b.Services[1]) != "{shop/app [{shop/postgres 5432 tcp} {~external 443 tcp} {~unresolved 53 udp}]}" {
+		fmt.Sprint(b.Services[1]) != "{shop/app [{shop/postgres 5432 tcp false} {~external 443 tcp false} {~unresolved 53 udp false}]}" {
 		t.Errorf("baseline of shop/app with -allow-incomplete: exit status %d, %v, %+v\n%s", code, err, b, out)
 	}
 	code, out, _ = f.run("baseline", "-service", "shop/app", "-min-coverage", "0.999")
@@ -491,13 +494,13 @@ end: {services: 3, dependencies: 2}
 	code, out, _ = f.run("baseline", "-service", "nginx", "-merge", file)
 	b, err = shawkconnector.ParseBaseline([]byte(out))
 	if code != exitComplete || err != nil || len(b.Services) != 3 || fmt.Sprint(b.Services) !=
-		"[{batch/report []} {ngimx [{kept 1 udp}]} {nginx [{shop/app 8080 tcp}]}]" ||
+		"[{batch/report []} {ngimx [{kept 1 udp false}]} {nginx [{shop/app 8080 tcp false}]}]" ||
 		!strings.Contains(out, "# Merged   with "+file+", of which 2 other services are kept as they are\n") {
 		t.Errorf("merged baseline: exit status %d, %v, %+v\n%s", code, err, b, out)
 	}
 	code, out, _ = f.run("baseline", "-service", "nginx", "-service", "ngimx", "-merge", file, "-allow-incomplete")
 	if b, err = shawkconnector.ParseBaseline([]byte(out)); code != exitIncomplete || err != nil || fmt.Sprint(b.Services) !=
-		"[{batch/report []} {ngimx [{kept 1 udp}]} {nginx [{shop/app 8080 tcp}]}]" {
+		"[{batch/report []} {ngimx [{kept 1 udp false}]} {nginx [{shop/app 8080 tcp false}]}]" {
 		t.Errorf("merged baseline with a service that is not known: exit status %d, %v, %+v", code, err, b)
 	}
 
@@ -576,14 +579,15 @@ stopped and whose listener is not known, or one without an agent: see the addres
 New services without a baseline, which nothing judges
 SERVICE  FIRST SEEN  HOSTS
 curl     TIME        app-01
-A new executable, or a process that names itself anew, is a service of its own. In a unit that
-runs a service of the baseline it is judged as that service; anywhere else nothing judges it.
+A new executable, or a process that names itself anew, is a service of its own. In a unit of a
+workload that runs services of the baseline it is judged by them; anywhere else nothing judges it.
 
 Only TCP and UDP are judged, by the name of the server and its port: a server of the same name
 at another address is no drift, and ~external does not tell one public address from another.
-A process is judged by the baseline of the name it declares, or, without one, of a service in its
-unit. A socket without a known owner (~unknown), and a process that takes the name of another
-service of the baseline, are not told apart from what that baseline approves.
+A process is judged by the baseline of the name it declares, or, without one, by the services of
+the baseline in its unit, unless the unit is one that unrelated processes share. A socket without
+a known owner (~unknown), and a process that takes the name of another service of the baseline,
+are not told apart from what that baseline approves.
 `
 	if code != exitDrift || errOut != "" || stable(out) != stable(want) {
 		t.Errorf("a drift: exit status %d, stderr %q\n%s\nwant:\n%s", code, errOut, stable(out), stable(want))
@@ -609,7 +613,8 @@ service of the baseline, are not told apart from what that baseline approves.
 	}
 	code, out, _ = f.run("drift", "-until", f.end.Add(-9*day).Format(time.RFC3339), "-lookback", "2d", "-service", "shop/app")
 	if code != exitInconclusive || !strings.Contains(out, "         - hosts that run a service were not observed for the whole period, "+
-		"so what the service did there is not known: shop/app (1 of its 3 hosts: gap-01)\n") {
+		"so what the service did there is not known: shop/app (1 of its 3 hosts: gap-01 for 1h). A host counts as observed "+
+		"for 3m after a report of its agent: a longer stretch without one, as a restart of the host, is not observed\n") {
 		t.Errorf("drift over the gap of gap-01: exit status %d\n%s", code, out)
 	}
 
@@ -662,8 +667,9 @@ func TestPGDriftNotObserved(t *testing.T) {
 		"  - service: batch/report\n    dependencies: []\n")
 	// batch/report runs nowhere that shawk knows.
 	code, out, _ := f.run("drift")
-	if code != exitInconclusive || !strings.Contains(stable(out), "  - no process was seen since TIME (-hosts-lookback) of batch/report: "+
-		"no host is known to run it, so nothing was there to see what it did. Check its name, or take it out of the baseline\n") {
+	if code != exitInconclusive || !strings.Contains(stable(out), "  - no host is known to run batch/report: no process of it was seen since "+
+		"TIME (-hosts-lookback), and no host that ran it before was observed, so nothing was there to see what it did. "+
+		"Check its name, or take it out of the baseline\n") {
 		t.Errorf("drift with a service that runs nowhere: exit status %d\n%s", code, out)
 	}
 	if code, out, _ = f.run("drift", "-service", "nginx"); code != exitComplete {
@@ -677,12 +683,12 @@ func TestPGDriftNotObserved(t *testing.T) {
 	code, out, _ = f.run("drift", "-service", "nginx")
 	if code != exitInconclusive || !strings.Contains(out, "Verdict  INCONCLUSIVE: no drift was seen, but nothing tells that there was none\n"+
 		"         - hosts that run a service were not observed for the whole period, so what the service did there is not known: "+
-		"nginx (1 of its 1 host: web-01)\n") {
+		"nginx (1 of its 1 host: web-01 for 1h). A host counts as observed for 3m after a report of its agent") {
 		t.Errorf("drift of a service whose host is silent: exit status %d\n%s", code, out)
 	}
 	// Past -hosts-lookback the host is forgotten: no host runs the service.
 	code, out, _ = f.run("drift", "-service", "nginx", "-hosts-lookback", "2h")
-	if code != exitInconclusive || !strings.Contains(out, "no host is known to run it") {
+	if code != exitInconclusive || !strings.Contains(out, "no host is known to run nginx") {
 		t.Errorf("drift with -hosts-lookback 2h: exit status %d\n%s", code, out)
 	}
 	var r driftReport
@@ -739,14 +745,17 @@ func TestPGBaselineNotes(t *testing.T) {
 	code, out, errOut := f.run("baseline", "-all", "-min-coverage", "0.999")
 	b, err := shawkconnector.ParseBaseline([]byte(out))
 	if code != exitComplete || err != nil || errOut != "" || len(b.Services) != 2 ||
-		!strings.Contains(out, "      - {peer: rpcd, port: 0, proto: tcp}  # every port: the kernel chose the port of the server (40123 when seen)\n") ||
+		!strings.Contains(out, "      - {peer: rpcd, port: kernel-chosen, proto: tcp}  # the ports that the kernel chose for a server named rpcd "+
+			"(40123 when seen), on any host, and no other port\n") ||
 		!strings.Contains(out, "# A process without a service name opened connections in the period (its telemetry has no\n") {
 		t.Errorf("baseline of every service: exit status %d, %v, stderr %q\n%s", code, err, errOut, out)
 	}
 	// The drift tells the port that the kernel chose once, whatever it is.
 	f.approve("services:\n  - service: nginx\n    dependencies:\n      - {peer: shop/app, port: 8080, proto: tcp}\n")
 	if code, out, _ = f.run("drift"); code != exitDrift ||
-		!strings.Contains(stable(out), "nginx  rpcd  0/tcp  web-01  edge  TIME  TIME  10.0.0.10  every port: the kernel chose the port of the server (40123 when seen)\n") {
+		!strings.Contains(stable(out), "nginx  rpcd  kernel-chosen/tcp  web-01  edge  TIME  TIME  10.0.0.10  the ports that the kernel chose for "+
+			"a server named rpcd (40123 when seen), on any host, and no other port\n") ||
+		!strings.Contains(out, "  - {peer: rpcd, port: kernel-chosen, proto: tcp}    under service nginx\n") {
 		t.Errorf("drift on a port that the kernel chose: exit status %d\n%s", code, out)
 	}
 }
@@ -846,5 +855,156 @@ alpha  ~unresolved  80/tcp  -dash-01, Zeta-01, alpha-01  address  TIME  TIME  10
 	}
 	if len(r.Rules) != 2 || !slices.Equal(r.Rules[0].Services, []string{"Zeta", "alpha", "~tilde"}) {
 		t.Errorf("the rules of alpha-01: %+v", r.Rules)
+	}
+}
+
+// TestPGBaselineAllThenDrift: what `baseline -all` writes, once approved,
+// is no reason for `drift` to say that it cannot tell: a tool that ran
+// once in the period, and does not run now on a host that is observed,
+// did nothing. The drift is INCONCLUSIVE only when the hosts that ran it
+// are not observed.
+func TestPGBaselineAllThenDrift(t *testing.T) {
+	f := newFleet(t)
+	// curl ran once on app-01, 8 days ago, and a monthly job on db-01.
+	f.exec(`INSERT INTO shawk.processes (host_id, unit, comm, exe, service_name, first_seen, last_seen)
+	        VALUES ('app-01', 'app.service', 'curl', '', 'curl', %[1]s, %[2]s), ('db-01', 'cron.service', 'report', '', 'batch/monthly', %[1]s, %[2]s)`,
+		f.at(9*day), f.at(8*day))
+	f.edge("app-01", "curl", "client", "tcp", "10.0.0.11", "198.51.100.7", 443, 9*day, 8*day)
+	f.edge("db-01", "batch/monthly", "client", "tcp", "10.0.0.10", "10.0.0.77", 25, 9*day, 8*day)
+	code, file, _ := f.run("baseline", "-all", "-lookback", "30d", "-min-coverage", "0.9")
+	_, yaml, _ := strings.Cut(file, "\n\nservices:\n")
+	if code != exitComplete || !strings.Contains(yaml, "  - service: curl\n") || !strings.Contains(yaml, "  - service: batch/monthly\n") {
+		t.Fatalf("baseline -all: exit status %d\n%s", code, file)
+	}
+	f.approve("services:\n" + strings.TrimSuffix(yaml[:strings.Index(yaml, "end: ")], "\n"))
+	code, out, _ := f.run("drift")
+	if code != exitComplete || !strings.Contains(out, "Verdict  CLEAN: 4 services did nothing") ||
+		!strings.Contains(out, "         2 services of the baseline run nowhere now (batch/monthly, curl): no process of them was\n") {
+		t.Errorf("drift after approving what baseline -all wrote: exit status %d\n%s", code, out)
+	}
+	var r driftReport
+	_, out, _ = f.run("drift", "-json")
+	if err := json.Unmarshal([]byte(out), &r); err != nil || r.Verdict != verdictClean || !slices.Equal(r.NotRunning, []string{"batch/monthly", "curl"}) {
+		t.Errorf("as JSON: %v, %+v", err, r)
+	}
+	// The host that ran curl stops reporting: nothing tells what curl, and
+	// shop/app, did there.
+	f.exec(`UPDATE shawk.agent_sessions SET last_heartbeat = %s WHERE host_id = 'app-01'`, f.at(3*time.Hour))
+	if code, out, _ = f.run("drift", "-service", "curl"); code != exitInconclusive || !strings.Contains(out, "no host is known to run curl") {
+		t.Errorf("drift of curl with its host silent: exit status %d\n%s", code, out)
+	}
+}
+
+// TestPGDriftUnits: which unit judges a process without a baseline. A unit
+// that unrelated processes share judges nothing, and lists what is next
+// to a baseline; a unit of a workload with several services of the
+// baseline tells a process once; a container under the unit is judged as
+// the unit; and a service that has a baseline, deployed or in the file to
+// merge with, is not mixed into the baseline of another.
+func TestPGDriftUnits(t *testing.T) {
+	f := newFleet(t)
+	m := 20 * time.Minute
+	for _, p := range [][3]string{
+		{"web-01", "slurm/batch", "python3"}, {"web-01", "slurm/batch", "a.out"},
+		{"web-01", "user-1000.slice/session.scope", "python3"}, {"web-01", "user-1000.slice/session.scope", "rsync"},
+		{"app-01", "app.service", "envoy"}, {"app-01", "app.service", "curl"}, {"app-01", "app.service/podman-0123456789ab", "wget"},
+	} {
+		f.exec(`INSERT INTO shawk.processes (host_id, unit, comm, exe, service_name, first_seen, last_seen)
+		        VALUES ('%s', '%s', 'c', '', '%s', %s, %s)`, p[0], p[1], p[2], f.at(30*day), f.at(0))
+	}
+	edge := func(host, unit, service, local, remote string, port int) {
+		f.exec(`INSERT INTO shawk.edges (host_id, process_id, role, proto, local_addr, remote_addr, port, netns, first_seen, last_seen)
+		        SELECT '%[1]s', id, 'client', 'tcp', '%[4]s', '%[5]s', %[6]d, 1, %[7]s, %[7]s FROM shawk.processes
+		        WHERE host_id = '%[1]s' AND unit = '%[2]s' AND service_name = '%[3]s'`, host, unit, service, local, remote, port, f.at(m))
+	}
+	edge("web-01", "slurm/batch", "a.out", "10.0.0.12", "10.0.5.5", 27000)
+	edge("web-01", "user-1000.slice/session.scope", "rsync", "10.0.0.12", "10.0.6.6", 873)
+	edge("app-01", "app.service", "envoy", "10.0.0.11", "10.0.0.70", 9901)
+	edge("app-01", "app.service", "curl", "10.0.0.11", "203.0.113.66", 4444)
+	edge("app-01", "app.service/podman-0123456789ab", "wget", "10.0.0.11", "203.0.113.67", 80)
+	deployed := "services:\n  - service: shop/app\n    dependencies:\n      - {peer: shop/postgres, port: 5432, proto: tcp}\n" +
+		"      - {peer: ~unresolved, port: 53, proto: udp}\n      - {peer: ~external, port: 443, proto: tcp}\n" +
+		"  - service: envoy\n    dependencies:\n      - {peer: ~unresolved, port: 9901, proto: tcp}\n" +
+		"  - {service: python3, dependencies: []}\n"
+	f.approve(deployed)
+	code, out, _ := f.run("drift")
+	want := `SERVICE  PEER  PORT  HOSTS  NAMED BY  FIRST SEEN  LAST SEEN  ADDRESSES  NOTES
+envoy  ~external  80/tcp  app-01  address  TIME  TIME  203.0.113.67  by wget in its unit
+envoy  ~external  4444/tcp  app-01  address  TIME  TIME  203.0.113.66  by curl in its unit
+`
+	_, list, _ := strings.Cut(stable(out), "\nNot in the baseline\n")
+	list, _, _ = strings.Cut(list, "To approve one")
+	if code != exitDrift || list != want {
+		t.Errorf("drift: exit status %d; listed as\n%s\nwant\n%s\n%s", code, list, want, out)
+	}
+	wantNext := `UNIT  PROCESS  PEER  PORTS  HOSTS  LAST SEEN  SERVICES OF THE BASELINE IN THE UNIT
+slurm/batch  a.out  ~unresolved  27000/tcp  web-01  TIME  python3
+user-1000.slice/session.scope  rsync  ~unresolved  873/tcp  web-01  TIME  python3
+`
+	_, next, _ := strings.Cut(stable(out), "\nNext to the baseline, in units that unrelated processes share: not judged, and no drift\n")
+	next, _, _ = strings.Cut(next, "The jobs of Slurm")
+	if next != wantNext {
+		t.Errorf("next to the baseline:\n%s\nwant\n%s", next, wantNext)
+	}
+	// Asked for a service of the unit, the process is told under it.
+	if code, out, _ = f.run("drift", "-service", "shop/app"); code != exitDrift ||
+		!strings.Contains(stable(out), "shop/app  ~external  4444/tcp  app-01  address  TIME  TIME  203.0.113.66  by curl in its unit\n") {
+		t.Errorf("drift of shop/app: exit status %d\n%s", code, out)
+	}
+	// Written again without -merge, the baseline of shop/app holds what the
+	// processes without a baseline did in its unit, and not the
+	// dependencies of envoy, which the deployed baseline has as its own.
+	_, out, _ = f.run("baseline", "-service", "shop/app", "-lookback", "1h")
+	_, yaml, _ := strings.Cut(out, "\n\nservices:\n")
+	wantFile := `  - service: shop/app
+    dependencies:
+      - {peer: shop/postgres, port: 5432, proto: tcp}
+      - {peer: ~external, port: 80, proto: tcp}  # by wget in its unit
+      - {peer: ~external, port: 4444, proto: tcp}  # by curl in its unit
+      - {peer: ~unresolved, port: 53, proto: udp}
+end: {services: 1, dependencies: 4}
+`
+	if yaml != wantFile {
+		t.Errorf("the baseline of shop/app, written again:\n%s\nwant\n%s", yaml, wantFile)
+	}
+	// The same from the file to merge with, where PostgreSQL holds no
+	// baseline yet: its services have a baseline of their own.
+	f.exec(`DELETE FROM shawk.baseline_services; DELETE FROM shawk.baseline_state`)
+	file := filepath.Join(t.TempDir(), "baseline.yaml")
+	if err := os.WriteFile(file, []byte(deployed+"end: {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, out, _ = f.run("baseline", "-service", "shop/app", "-lookback", "1h", "-merge", file)
+	if b, err := shawkconnector.ParseBaseline([]byte(out)); err != nil || len(b.Services) != 3 ||
+		slices.ContainsFunc(b.Services[2].Dependencies, func(d shawkconnector.BaselineDependency) bool { return d.Port == 9901 }) ||
+		fmt.Sprint(b.Services[0]) != "{envoy [{~unresolved 9901 tcp false}]}" {
+		t.Errorf("the baseline of shop/app merged with the file: %v, %+v\n%s", err, b, out)
+	}
+	// Without either, the other names of the unit are those of processes
+	// without a baseline, and are listed with the service.
+	_, out, _ = f.run("baseline", "-service", "shop/app", "-lookback", "1h")
+	if !strings.Contains(out, "      - {peer: ~unresolved, port: 9901, proto: tcp}  # by envoy in its unit\n") {
+		t.Errorf("the baseline of shop/app without a baseline of envoy anywhere:\n%s", out)
+	}
+}
+
+// TestPGDriftReplacedHost: a host that was installed again reports under a
+// new machine id: the machine of before is gone, not unobserved.
+func TestPGDriftReplacedHost(t *testing.T) {
+	f := newFleet(t)
+	f.approve("services:\n  - service: nginx\n    dependencies:\n      - {peer: shop/app, port: 8080, proto: tcp}\n")
+	f.exec(`UPDATE shawk.agent_sessions SET last_heartbeat = %[1]s WHERE host_id = 'web-01';
+	        UPDATE shawk.processes SET last_seen = %[1]s WHERE host_id = 'web-01';
+	        UPDATE shawk.edges SET last_seen = %[1]s WHERE host_id = 'web-01'`, f.at(2*day))
+	if code, out, _ := f.run("drift"); code != exitInconclusive || !strings.Contains(out, "nginx (1 of its 1 host: web-01 for 1h)") {
+		t.Errorf("drift with the host of nginx silent for 2 days: exit status %d\n%s", code, out)
+	}
+	f.exec(`INSERT INTO shawk.hosts VALUES ('web-01-new', 'm-new', 'web-01', 'k', 'v', %[1]s, %[2]s);
+	        INSERT INTO shawk.agent_sessions (host_id, started_at, last_heartbeat, udp_traced, unix_traced, netns_scope, translations_traced)
+	        VALUES ('web-01-new', %[1]s, %[2]s, true, true, 'all', true);
+	        INSERT INTO shawk.processes (host_id, unit, comm, exe, service_name, first_seen, last_seen)
+	        VALUES ('web-01-new', 'nginx.service', 'c', '', 'nginx', %[1]s, %[2]s)`, f.at(2*day-20*time.Minute), f.at(0))
+	if code, out, _ := f.run("drift"); code != exitComplete || !strings.Contains(out, "Verdict  CLEAN: 1 service did nothing") {
+		t.Errorf("drift after the host was installed again: exit status %d\n%s", code, out)
 	}
 }

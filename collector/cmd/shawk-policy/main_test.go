@@ -64,7 +64,6 @@ func TestUsage(t *testing.T) {
 		{[]string{"rules", "-host", "h", "-enforce"}, "-enforce is for -format nftables or systemd"},
 		{[]string{"rules", "-host", "h", "-format", "json", "-enforce"}, "-enforce is for -format nftables or systemd"},
 		{[]string{"rules", "-host", "h", "-format", "nftables", "-allow-incomplete"}, "-allow-incomplete is for -enforce"},
-		{[]string{"drift", "-hosts-lookback", "30m"}, "-hosts-lookback must not be shorter than -lookback"},
 		{[]string{"drift", "-hosts-lookback", "soon"}, "-hosts-lookback"},
 		{[]string{"rules", "-host", "h", "-limit", "-1"}, "-limit must not be negative"},
 		{[]string{"rules", "-host", "h", "-lookback", "3m"}, "-lookback must be from 1h"},

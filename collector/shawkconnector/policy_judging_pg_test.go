@@ -325,10 +325,95 @@ func TestPGBaselineHosts(t *testing.T) {
 	if got := verdict(week); !slices.Equal(got, []string{"INCOMPLETE [not_observed] 2 1 [app-01]"}) {
 		t.Errorf("a host whose clock is behind: %v", got)
 	}
-	// hosts_since is not after the start of the period.
-	if _, err := f.conn.Exec(context.Background(), `SELECT * FROM shawk_v1.baseline_verdict(ARRAY['shop/app'], $1, $2, 1, '3 minutes', $2)`,
-		f.T.Add(-time.Hour), f.T); err == nil {
-		t.Errorf("hosts_since after the start of the period is accepted")
+	// A hosts_since that is after the start of the period is taken as
+	// the start: a host that ran the service in the period runs it. The
+	// connector asks so when its memory of hosts is shorter than the
+	// period that it evaluates.
+	// The process of app-01 was last seen 3 hours ago: only app-02 ran the
+	// service in the period.
+	for _, at := range []string{f.ago(0), f.ago(30 * time.Minute), f.ago(time.Hour), "NULL"} {
+		if got := verdict(at); !slices.Equal(got, []string{"COMPLETE [] 1 0 []"}) {
+			t.Errorf("hosts since %s: %v", at, got)
+		}
+	}
+}
+
+// TestPGBaselineIdle: a service of the baseline that runs nowhere is told
+// apart by the hosts that ran it before. When one of them is observed,
+// the service does not run and nothing of it was missed; when none is,
+// or no process of it was ever seen, nothing tells.
+func TestPGBaselineIdle(t *testing.T) {
+	f := newPolicyFixture(t)
+	f.host("app-01", "10.0.0.11")
+	f.host("app-02", "10.0.0.21")
+	f.proc("app-01", "app.service", "curl")
+	f.proc("app-02", "cron.service", "batch/monthly")
+	f.exec(`UPDATE shawk.processes SET last_seen = %s`, f.ago(8*days))
+	const columns = `service, status, reasons, caveats, hosts, idle_hosts, coverage::text`
+	verdict := func() []string {
+		t.Helper()
+		return f.query(time.Hour, `SELECT `+columns+` FROM shawk_v1.baseline_verdict(ARRAY['curl', 'batch/monthly', 'ngimx'], $1, $2, 1,
+			'3 minutes', `+f.ago(7*days)+`)`)
+	}
+	want := []string{
+		"batch/monthly COMPLETE [] [not_running] 0 1 1.000000",
+		"curl COMPLETE [] [not_running] 0 1 1.000000",
+		"ngimx INCOMPLETE [unknown_service] [] 0 0 0.000000",
+	}
+	if got := verdict(); !slices.Equal(got, want) {
+		t.Errorf("services that do not run:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+	// The host that ran curl is silent: nothing tells what curl did.
+	f.exec(`UPDATE shawk.agent_sessions SET last_heartbeat = %s WHERE host_id = 'app-01'`, f.ago(3*time.Hour))
+	want[1] = "curl INCOMPLETE [unknown_service] [] 0 0 0.000000"
+	if got := verdict(); !slices.Equal(got, want) {
+		t.Errorf("with the host of curl silent:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+	// The dependencies of a period are those of the hosts that ran the
+	// service in it: without hosts_since, a service that did not run is
+	// not known.
+	if got := f.query(time.Hour, `SELECT status, reasons FROM shawk_v1.baseline_verdict(ARRAY['batch/monthly'], $1, $2)`); !slices.Equal(got, []string{"INCOMPLETE [unknown_service]"}) {
+		t.Errorf("without hosts_since: %v", got)
+	}
+}
+
+// TestPGBaselineReplaced: a machine whose last report is before the first
+// report of another machine of its host name was replaced by it, as a
+// host that was installed again: it is gone, not unobserved.
+func TestPGBaselineReplaced(t *testing.T) {
+	f := newPolicyFixture(t)
+	f.host("app-01", "10.0.0.11")
+	f.exec(`INSERT INTO shawk.hosts VALUES ('old', 'm-old', 'app-02', 'k', 'v', %[1]s, %[2]s), ('new', 'm-new', 'app-02', 'k', 'v', %[3]s, %[4]s)`,
+		f.ago(100*days), f.ago(2*days), f.ago(2*days-20*time.Minute), f.ago(0))
+	f.session("old", 100*days, 2*days, "true", "'all'")
+	f.session("new", 2*days-20*time.Minute, 0, "true", "'all'")
+	for _, h := range []string{"app-01", "old", "new"} {
+		f.proc(h, "app.service", "shop/app")
+	}
+	f.exec(`UPDATE shawk.processes SET last_seen = %s WHERE host_id = 'old'`, f.ago(2*days))
+	week := f.ago(7 * days)
+	verdict := func() []string {
+		t.Helper()
+		return f.query(time.Hour, `SELECT `+hostsColumns+` FROM shawk_v1.baseline_verdict(ARRAY['shop/app'], $1, $2, 1, '3 minutes', `+week+`)`)
+	}
+	if got := verdict(); !slices.Equal(got, []string{"COMPLETE [] 2 0 []"}) {
+		t.Errorf("a host installed again 2 days ago: %v", got)
+	}
+	// Two machines that report at the same time are two: the one that is
+	// silent is not covered by the other.
+	f.exec(`UPDATE shawk.agent_sessions SET started_at = %s WHERE host_id = 'new'`, f.ago(50*days))
+	if got := verdict(); !slices.Equal(got, []string{"INCOMPLETE [not_observed] 2 1 [app-02]"}) {
+		t.Errorf("two machines of one name at the same time, one silent: %v", got)
+	}
+	// A host that was removed, with no machine after it, is not observed
+	// for as long as it counts.
+	f.exec(`DELETE FROM shawk.processes WHERE host_id = 'new'; DELETE FROM shawk.agent_sessions WHERE host_id = 'new'`)
+	if got := verdict(); !slices.Equal(got, []string{"INCOMPLETE [not_observed] 2 1 [app-02]"}) {
+		t.Errorf("a host removed 2 days ago: %v", got)
+	}
+	// How long each host that is listed was not observed: here the hour.
+	if got := f.query(time.Hour, `SELECT short_hosts, short_seconds FROM shawk_v1.baseline_verdict(ARRAY['shop/app'], $1, $2, 1, '3 minutes', `+week+`)`); !slices.Equal(got, []string{"[app-02] [3600]"}) {
+		t.Errorf("the time that the host was not observed: %v", got)
 	}
 }
 
@@ -425,12 +510,13 @@ func TestPGBaselineUnit(t *testing.T) {
 	if got := drift(", ARRAY['curl']"); len(got) != 0 {
 		t.Errorf("drift of curl, which has no baseline: %v", got)
 	}
-	// With a baseline of its own, curl is judged by it, wherever it runs,
-	// and the process without one in the unit by both services of it.
+	// With a baseline of its own, curl is judged by it, wherever it runs.
+	// The process without one in the unit is judged by the two services of
+	// the unit together, and told once, under the first of them.
 	f.approve("services:\n  - service: shop/app\n    dependencies:\n      - {peer: shop/postgres, port: 5432, proto: tcp}\n" +
 		"  - service: curl\n    dependencies: []\n")
 	want = []string{"curl shop/postgres 5432 tcp [app-01] []", "curl ~external 443 tcp [web-01] []",
-		"curl ~external 4444 tcp [app-01] [~unknown]", "shop/app ~external 4444 tcp [app-01] [~unknown]"}
+		"curl ~external 4444 tcp [app-01] [~unknown]"}
 	if got := drift(""); !slices.Equal(got, want) {
 		t.Errorf("drift with a baseline of curl:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
 	}
@@ -681,5 +767,159 @@ func TestPGPolicyOrder(t *testing.T) {
 	f.session("alpha-id", 100*days, 30*time.Minute, "true", "'all'")
 	if got := f.inOrder(time.Hour, `SELECT machine FROM shawk_v1.policy_gaps('twin', $1, $2)`); !slices.Equal(got, []string{"Bravo-id", "alpha-id"}) {
 		t.Errorf("the gaps, in their order: %v", got)
+	}
+}
+
+// TestPGBaselineSharedUnits: a unit that unrelated processes share by its
+// kind (the Slurm jobs of every user, login sessions) judges nothing: a
+// baseline of one of its processes is not a baseline of the others. What
+// is next to a baseline there is listed, once per unit, process and peer,
+// and is no drift. In a unit of a workload, several services of the
+// baseline judge a process together, and tell it once.
+func TestPGBaselineSharedUnits(t *testing.T) {
+	f := newPolicyFixture(t)
+	f.host("web-01", "10.0.0.12")
+	f.host("web-02", "10.0.0.13")
+	m := 20 * time.Minute
+	// python3 has a baseline, and ran in a Slurm job and in a login session
+	// of web-01; a.out of another user and rsync of an administrator run
+	// there now. python3 runs nowhere on web-02, where the same units hold
+	// other processes.
+	for _, p := range [][3]string{
+		{"web-01", "slurm/batch", "python3"}, {"web-01", "slurm/batch", "a.out"},
+		{"web-01", "user-1000.slice/session.scope", "python3"}, {"web-01", "user-1000.slice/session.scope", "rsync"},
+		{"web-01", "run.scope", "python3"}, {"web-01", "run.scope", "tool"},
+		{"web-02", "slurm/batch", "b.out"},
+	} {
+		f.proc(p[0], p[1], p[2])
+	}
+	f.edgeOf("web-01", "slurm/batch", "a.out", "client", "tcp", "10.0.0.12", "10.0.5.5", 27000, m, m)
+	f.edgeOf("web-01", "slurm/batch", "a.out", "client", "tcp", "10.0.0.12", "10.0.5.5", 27001, m, m)
+	f.edgeOf("web-01", "user-1000.slice/session.scope", "rsync", "client", "tcp", "10.0.0.12", "10.0.6.6", 873, m, m)
+	f.edgeOf("web-01", "run.scope", "tool", "client", "udp", "10.0.0.12", "203.0.113.9", 53, m, m)
+	f.edgeOf("web-02", "slurm/batch", "b.out", "client", "tcp", "10.0.0.13", "10.0.5.5", 27000, m, m)
+	f.approve("services:\n  - service: python3\n    dependencies:\n      - {peer: ~unresolved, port: 8000, proto: tcp}\n")
+	if got := f.inOrder(time.Hour, `SELECT service, peer, port FROM shawk_v1.baseline_drift($1, $2)`); len(got) != 0 {
+		t.Errorf("drift in units that unrelated processes share: %v", got)
+	}
+	want := []string{
+		"run.scope tool ~external udp [53] [web-01] [python3] 3",
+		"slurm/batch a.out ~unresolved tcp [27000 27001] [web-01] [python3] 3",
+		"user-1000.slice/session.scope rsync ~unresolved tcp [873] [web-01] [python3] 3",
+	}
+	const columns = `unit, process, peer, proto, ports, hosts, services, total`
+	if got := f.inOrder(time.Hour, `SELECT `+columns+` FROM shawk_v1.baseline_unjudged($1, $2, `+f.ago(7*days)+`)`); !slices.Equal(got, want) {
+		t.Errorf("next to a baseline in shared units:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+	// The list is bounded, and counts what it leaves out.
+	if got := f.inOrder(time.Hour, `SELECT unit, total FROM shawk_v1.baseline_unjudged($1, $2, `+f.ago(7*days)+`, 1)`); !slices.Equal(got, []string{"run.scope 3"}) {
+		t.Errorf("the first of the list: %v", got)
+	}
+	for unit, want := range map[string]string{"": "true", "slurm/batch": "true", "slurm/step": "true", "session.scope": "true",
+		"user-1000.slice/session.scope": "true", "run.scope": "true", "run.service": "true", "user@1000.service": "true",
+		"user@1000.service/foo.service": "false", "user@1000.service/podman-0123456789ab": "false", "app.service": "false",
+		"run-backup.service": "false", "cron.service": "false", "docker/shop/app": "false", "k8s/default/web/app": "false",
+		"app.service/podman-0123456789ab": "false", "xsession.scope": "false"} {
+		if got := queryStrings(t, f.conn, `SELECT shawk.shared_unit($1)`, unit); !slices.Equal(got, []string{want}) {
+			t.Errorf("shared_unit(%q) = %v, want %s", unit, got, want)
+		}
+	}
+}
+
+// TestPGBaselineUnitOfSeveral: in a unit of a workload that runs several
+// services of the baseline, a process without a baseline is judged by
+// them together and told once, not once per service; a unit of the same
+// name on a host where none of them runs judges nothing; and a process
+// in a container under the unit is judged as the unit is.
+func TestPGBaselineUnitOfSeveral(t *testing.T) {
+	f := newPolicyFixture(t)
+	f.host("app-01", "10.0.0.11")
+	f.host("app-02", "10.0.0.21")
+	m := 20 * time.Minute
+	for _, p := range [][3]string{
+		{"app-01", "app.service", "shop/app"}, {"app-01", "app.service", "envoy"}, {"app-01", "app.service", "agent"},
+		{"app-01", "app.service", "curl"}, {"app-01", "app.service/podman-0123456789ab", "wget"},
+		{"app-01", "app.service2", "nc"},
+		// app.service of app-02 runs none of the services of the baseline.
+		{"app-02", "app.service", "curl"},
+	} {
+		f.proc(p[0], p[1], p[2])
+	}
+	f.edge("app-01", "curl", "client", "tcp", "10.0.0.11", "203.0.113.66", 4444, m, m)
+	f.edge("app-01", "curl", "client", "tcp", "10.0.0.11", "10.0.0.70", 9901, m, m)
+	f.edge("app-01", "curl", "client", "tcp", "10.0.0.11", "10.0.0.10", 5432, m, m)
+	f.edge("app-01", "wget", "client", "tcp", "10.0.0.11", "203.0.113.67", 80, m, m)
+	f.edge("app-01", "nc", "client", "tcp", "10.0.0.11", "203.0.113.68", 1, m, m)
+	f.edge("app-02", "curl", "client", "tcp", "10.0.0.21", "203.0.113.66", 4444, m, m)
+	f.approve("services:\n  - service: shop/app\n    dependencies:\n      - {peer: ~unresolved, port: 5432, proto: tcp}\n" +
+		"  - service: envoy\n    dependencies:\n      - {peer: ~unresolved, port: 9901, proto: tcp}\n" +
+		"  - {service: agent, dependencies: []}\n")
+	// What one of the services of the unit approves is no drift of the
+	// process; the rest is told once, under the first of them.
+	want := []string{"agent ~external 80 [app-01] [wget]", "agent ~external 4444 [app-01] [curl]"}
+	if got := f.inOrder(time.Hour, `SELECT service, peer, port, hosts, processes FROM shawk_v1.baseline_drift($1, $2)`); !slices.Equal(got, want) {
+		t.Errorf("drift:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+	// Asked for a service of the unit, it is told under that service.
+	want = []string{"shop/app ~external 80 [app-01] [wget]", "shop/app ~external 4444 [app-01] [curl]"}
+	if got := f.inOrder(time.Hour, `SELECT service, peer, port, hosts, processes FROM shawk_v1.baseline_drift($1, $2, ARRAY['shop/app', 'nope'])`); !slices.Equal(got, want) {
+		t.Errorf("drift of shop/app:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+	// The baseline of one of them, written again, holds what the processes
+	// without a baseline did, and not what the other services of the unit
+	// have of their own.
+	want = []string{"shop/app ~external 80 [wget]", "shop/app ~external 4444 [curl]", "shop/app ~unresolved 5432 [curl]",
+		"shop/app ~unresolved 9901 [curl]"}
+	if got := f.inOrder(time.Hour, `SELECT service, peer, port, processes FROM shawk_v1.baseline_observed($1, $2, ARRAY['shop/app'],
+		ARRAY['shop/app', 'envoy', 'agent'])`); !slices.Equal(got, want) {
+		t.Errorf("observed of shop/app:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+// TestPGBaselineKernelChosenScope: a dependency on a port that the kernel
+// chose approves the ports that the kernel chose for a server of the
+// name, and no other: another server of the same name on a port of its
+// own is a drift. Names are those of executables by default, and many
+// servers share them.
+func TestPGBaselineKernelChosenScope(t *testing.T) {
+	f := newPolicyFixture(t)
+	f.host("app-01", "10.0.0.11")
+	f.host("db-01", "10.0.0.10")
+	f.host("web-01", "10.0.0.12")
+	f.proc("app-01", "app.service", "shop/app")
+	f.proc("db-01", "mgmt.service", "java")
+	f.proc("web-01", "search.service", "java")
+	f.pair("app-01", "shop/app", "10.0.0.11", "db-01", "java", "10.0.0.10", 40123, 20*days, 0)
+	f.listener("db-01", "java", "0.0.0.0", 40123, f.ago(0))
+	const columns = `peer, port, proto, kernel_chosen, ports`
+	if got := f.inOrder(30*days, `SELECT `+columns+` FROM shawk_v1.baseline_observed($1, $2)`); !slices.Equal(got, []string{"java 0 tcp true [40123]"}) {
+		t.Fatalf("observed = %v", got)
+	}
+	f.approve("services:\n  - service: shop/app\n    dependencies:\n      - {peer: java, port: kernel-chosen, proto: tcp}\n")
+	if got := queryStrings(t, f.conn, `SELECT peer, port, proto, kernel_chosen FROM shawk_v1.baseline WHERE peer IS NOT NULL`); !slices.Equal(got, []string{"java 0 tcp true"}) {
+		t.Errorf("the baseline in PostgreSQL: %v", got)
+	}
+	// The server runs again, on another port that the kernel chose: no
+	// drift. A server of the same name on a fixed port, which the service
+	// never used: a drift.
+	f.pair("app-01", "shop/app", "10.0.0.11", "db-01", "java", "10.0.0.10", 40999, 30*time.Minute, 0)
+	f.listener("db-01", "java", "0.0.0.0", 40999, f.ago(0))
+	if got := f.inOrder(time.Hour, `SELECT `+columns+` FROM shawk_v1.baseline_drift($1, $2)`); len(got) != 0 {
+		t.Errorf("drift after the server ran again: %v", got)
+	}
+	f.pair("app-01", "shop/app", "10.0.0.11", "web-01", "java", "10.0.0.12", 9200, 20*time.Minute, 0)
+	if got := f.inOrder(time.Hour, `SELECT `+columns+` FROM shawk_v1.baseline_drift($1, $2)`); !slices.Equal(got, []string{"java 9200 tcp false [9200]"}) {
+		t.Errorf("drift on a fixed port of another server of the name: %v", got)
+	}
+	// Port 0 written by hand is every port of every server of the name.
+	f.approve("services:\n  - service: shop/app\n    dependencies:\n      - {peer: java, port: 0, proto: tcp}\n")
+	if got := f.inOrder(time.Hour, `SELECT `+columns+` FROM shawk_v1.baseline_drift($1, $2)`); len(got) != 0 {
+		t.Errorf("drift with every port approved: %v", got)
+	}
+	// A server under a rule of ports is every port by that rule, whoever
+	// chose its port: its row is not one of the kernel.
+	f.exec(`INSERT INTO shawk.port_agnostic_services VALUES ('java')`)
+	if got := f.inOrder(30*days, `SELECT `+columns+` FROM shawk_v1.baseline_observed($1, $2)`); !slices.Equal(got, []string{"java 0 tcp false [9200 40123 40999]"}) {
+		t.Errorf("observed under a rule of ports = %v", got)
 	}
 }

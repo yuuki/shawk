@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/yuuki/shawk/collector/shawkconnector"
 )
 
 const driftUsage = `shawk-policy drift tells the dependencies of the services of the baseline that the
@@ -25,12 +27,16 @@ nothing that it does not hold, and the history tells so; DRIFT when one did; and
 INCONCLUSIVE when no drift was seen but nothing tells that there was none: no
 connector read a baseline, or it holds no service, a service asked for has none,
 a host that runs a service was not observed for the whole period, or no host is
-known to run a service. A host runs a service when a process of the service was
-seen on it within -hosts-lookback: a host whose agent went silent counts as not
-observed until then, rather than as a host without the service.
+known to run a service or to have run it. A host runs a service when a process of
+the service was seen on it within -hosts-lookback: a host whose agent went silent
+counts as not observed until then, rather than as a host without the service. A
+service that runs nowhere, on hosts that ran it before and are observed, did
+nothing: that is CLEAN, with a note.
 
-A process of another name in a unit of a service, which has no baseline of its
-own, is judged as the service.
+A process of another name in a unit of a workload, which has no baseline of its
+own, is judged by the services of the baseline that run in the unit. A unit that
+unrelated processes share (the jobs of Slurm, login sessions, transient units)
+judges nothing: what is next to a baseline there is listed, and is no drift.
 
 The period ends 5 minutes ago by default, when both sides of a new connection are
 written: before that, a server may still be named ~unresolved.
@@ -81,8 +87,6 @@ func parseDrift(args []string, stderr io.Writer) (*driftConfig, error) {
 		return nil, fmt.Errorf("%w: -hosts-lookback: %w", errUsage, err)
 	}
 	switch {
-	case c.hostsLookback < c.lookback:
-		err = errors.New("-hosts-lookback must not be shorter than -lookback: a host that ran a service in the period runs it")
 	case slices.Contains(c.services, ""):
 		// As of a script whose variable is empty, which would widen the
 		// question to every service without a word.
@@ -132,6 +136,15 @@ type driftReport struct {
 	// for the whole period, with the first of those hosts, and those that
 	// no host is known to run (reason unknown_service).
 	NotObserved []baselineService `json:"not_observed"`
+	// NotRunning are the services judged that run nowhere, on hosts that
+	// ran them before and were observed: they did nothing, and nothing of
+	// them was missed.
+	NotRunning []string `json:"not_running"`
+	// Unjudged are the dependencies of processes without a baseline in
+	// units that unrelated processes share and in which services of the
+	// baseline run: no drift, and listed, at most 100 of UnjudgedTotal.
+	Unjudged      []unjudged `json:"unjudged"`
+	UnjudgedTotal int64      `json:"unjudged_total"`
 	// NewServices are the services without a baseline first seen in the
 	// period: no baseline judges them. They are listed when no service is
 	// asked for.
@@ -146,6 +159,22 @@ type baselineState struct {
 	Services     int64      `json:"services"`
 	Dependencies int64      `json:"dependencies"`
 }
+
+// unjudged is a row of shawk_v1.baseline_unjudged.
+type unjudged struct {
+	Unit      string    `json:"unit"`
+	Process   string    `json:"process"`
+	Peer      string    `json:"peer"`
+	Proto     string    `json:"proto"`
+	Ports     []int32   `json:"ports"`
+	Hosts     []string  `json:"hosts"`
+	Services  []string  `json:"services"`
+	FirstSeen time.Time `json:"first_seen"`
+	LastSeen  time.Time `json:"last_seen"`
+}
+
+// maxUnjudged is how many rows of what is next to a baseline are read.
+const maxUnjudged = 100
 
 // newService is a row of shawk_v1.baseline_new_services.
 type newService struct {
@@ -189,13 +218,11 @@ func runDrift(ctx context.Context, args []string, stdout, stderr io.Writer) (int
 // anything.
 func readDrift(ctx context.Context, tx pgx.Tx, c *driftConfig, since, until time.Time) (*driftReport, error) {
 	r := &driftReport{Since: since, Until: until, Reasons: []string{}, Caveats: []string{}, Asked: []string{}, Unlocked: []string{},
-		Drift: []dependency{}, NotObserved: []baselineService{}, NewServices: []newService{}}
-	// A period longer than -hosts-lookback, as one that -until moved,
+		Drift: []dependency{}, NotObserved: []baselineService{}, NewServices: []newService{}, NotRunning: []string{},
+		Unjudged: []unjudged{}}
+	// The rule of the connector: a period longer than -hosts-lookback
 	// starts no later than the hosts are counted from.
-	r.HostsSince = until.Add(-c.hostsLookback)
-	if r.HostsSince.After(since) {
-		r.HostsSince = since
-	}
+	r.HostsSince = shawkconnector.BaselineHostsSince(since, until, c.hostsLookback)
 	var st baselineState
 	switch err := tx.QueryRow(ctx, `SELECT read_at, failed_at, error, services, dependencies FROM shawk_v1.baseline_status`).
 		Scan(&st.ReadAt, &st.FailedAt, &st.Error, &st.Services, &st.Dependencies); {
@@ -265,21 +292,30 @@ func readDrift(ctx context.Context, tx pgx.Tx, c *driftConfig, since, until time
 	})
 	if len(judged) > 0 {
 		rows, err = tx.Query(ctx, `
-SELECT service, status, reasons, caveats, hosts, coverage::float8, coverage::text, short_hosts, unobserved_hosts
-FROM shawk_v1.baseline_verdict($1, $2, $3, 1, interval '3 minutes', $4)
-WHERE status <> 'COMPLETE'`, judged, since, until, r.HostsSince)
+SELECT service, status, reasons, caveats, hosts, coverage::float8, coverage::text, short_hosts, unobserved_hosts, short_seconds,
+       idle_hosts
+FROM shawk_v1.baseline_verdict($1, $2, $3, 1, make_interval(secs => $5), $4)
+WHERE status <> 'COMPLETE' OR 'not_running' = ANY (caveats)`, judged, since, until, r.HostsSince, tolerance.Seconds())
 		if err != nil {
 			return nil, fmt.Errorf("the observation of the services: %w", err)
 		}
-		if r.NotObserved, err = pgx.CollectRows(rows, func(row pgx.CollectableRow) (baselineService, error) {
+		verdicts, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (baselineService, error) {
 			s := baselineService{Dependencies: []dependency{}}
 			err := row.Scan(&s.Service, &s.Status, &s.Reasons, &s.Caveats, &s.Hosts, &s.Coverage, &s.coverage, &s.ShortHosts,
-				&s.UnobservedHosts)
+				&s.UnobservedHosts, &s.ShortSeconds, &s.IdleHosts)
 			return s, err
-		}); err != nil {
+		})
+		if err != nil {
 			return nil, fmt.Errorf("the observation of the services: %w", err)
 		}
-		slices.SortFunc(r.NotObserved, func(a, b baselineService) int { return strings.Compare(a.Service, b.Service) })
+		slices.SortFunc(verdicts, func(a, b baselineService) int { return strings.Compare(a.Service, b.Service) })
+		for _, s := range verdicts {
+			if s.Status == statusComplete {
+				r.NotRunning = append(r.NotRunning, s.Service)
+			} else {
+				r.NotObserved = append(r.NotObserved, s)
+			}
+		}
 		if slices.ContainsFunc(r.NotObserved, func(s baselineService) bool { return s.known() }) {
 			shortfalls = append(shortfalls, "not_observed")
 		}
@@ -302,6 +338,21 @@ WHERE status <> 'COMPLETE'`, judged, since, until, r.HostsSince)
 			return nil, fmt.Errorf("the new services: %w", err)
 		}
 		slices.SortFunc(r.NewServices, func(a, b newService) int { return strings.Compare(a.Service, b.Service) })
+		rows, err = tx.Query(ctx, `
+SELECT unit, process, peer, proto, ports, hosts, services, first_seen, last_seen, total
+FROM shawk_v1.baseline_unjudged($1, $2, $3, $4)`, since, until, r.HostsSince, maxUnjudged)
+		if err != nil {
+			return nil, fmt.Errorf("what is next to the baseline: %w", err)
+		}
+		if r.Unjudged, err = pgx.CollectRows(rows, func(row pgx.CollectableRow) (unjudged, error) {
+			var u unjudged
+			err := row.Scan(&u.Unit, &u.Process, &u.Peer, &u.Proto, &u.Ports, &u.Hosts, &u.Services, &u.FirstSeen, &u.LastSeen,
+				&r.UnjudgedTotal)
+			u.FirstSeen, u.LastSeen = u.FirstSeen.UTC(), u.LastSeen.UTC()
+			return u, err
+		}); err != nil {
+			return nil, fmt.Errorf("what is next to the baseline: %w", err)
+		}
 	}
 
 	switch {
@@ -342,12 +393,27 @@ func (r *driftReport) describeDriftShortfall(code string) string {
 			if !s.known() {
 				continue
 			}
+			// Each host with how long it was not observed: a restart of 6
+			// minutes is told as one, not as a host that is gone.
+			var hosts []string
+			for i, h := range s.ShortHosts {
+				if i == 3 {
+					hosts = append(hosts, fmt.Sprintf("and %d more", len(s.ShortHosts)-3))
+					break
+				}
+				host := commentName(h)
+				if i < len(s.ShortSeconds) {
+					host += " for " + seconds(float64(s.ShortSeconds[i]))
+				}
+				hosts = append(hosts, host)
+			}
 			part := fmt.Sprintf("%s (%d of its %s: %s)", commentName(s.Service), s.UnobservedHosts, plural(s.Hosts, "host"),
-				describeStrings(s.ShortHosts, 3))
+				strings.Join(hosts, ", "))
 			parts = append(parts, part)
 		}
 		return "hosts that run a service were not observed for the whole period, so what the service did there is not " +
-			"known: " + strings.Join(parts, "; ")
+			"known: " + strings.Join(parts, "; ") + ". A host counts as observed for " + seconds(tolerance.Seconds()) +
+			" after a report of its agent: a longer stretch without one, as a restart of the host, is not observed"
 	case "no_host":
 		var names []string
 		for _, s := range r.NotObserved {
@@ -355,9 +421,9 @@ func (r *driftReport) describeDriftShortfall(code string) string {
 				names = append(names, s.Service)
 			}
 		}
-		return "no process was seen since " + formatTime(r.HostsSince) + " (-hosts-lookback) of " + describeStrings(names, 5) +
-			": no host is known to run it, so nothing was there to see what it did. Check its name, or take it out of " +
-			"the baseline"
+		return "no host is known to run " + describeStrings(names, 5) + ": no process of it was seen since " +
+			formatTime(r.HostsSince) + " (-hosts-lookback), and no host that ran it before was observed, so nothing was " +
+			"there to see what it did. Check its name, or take it out of the baseline"
 	}
 	return commentName(code)
 }
@@ -379,6 +445,16 @@ func (r *driftReport) text(limit int) string {
 		fmt.Fprintf(&b, "Verdict  CLEAN: %s did nothing over TCP or UDP that the baseline does not hold, and every host\n"+
 			"         that runs them was observed for the whole period\n",
 			plural(len(r.Asked), "service", "services"))
+		if n := len(r.NotRunning); n > 0 {
+			rest := "no process of it was seen since %s, and the hosts that ran it before were observed, so it did nothing"
+			if n > 1 {
+				rest = "no process of them was seen since %s, and the hosts that ran them before were observed, so they did nothing"
+			}
+			for _, l := range wrap(fmt.Sprintf("%s nowhere now (%s): "+rest, plural(n, "service of the baseline runs",
+				"services of the baseline run"), describeStrings(r.NotRunning, 5), formatTime(r.HostsSince)), 88) {
+				b.WriteString("         " + l + "\n")
+			}
+		}
 	default:
 		fmt.Fprintf(&b, "Verdict  %s: no drift was seen, but nothing tells that there was none\n", commentName(r.Verdict))
 	}
@@ -400,7 +476,7 @@ func (r *driftReport) text(limit int) string {
 		tb := newTable()
 		tb.row("SERVICE", "PEER", "PORT", "HOSTS", "NAMED BY", "FIRST SEEN", "LAST SEEN", "ADDRESSES", "NOTES")
 		for _, d := range shown {
-			tb.row(commentName(d.Service), commentName(d.Peer), strconv.Itoa(d.Port)+"/"+commentName(d.Proto),
+			tb.row(commentName(d.Service), commentName(d.Peer), d.port()+"/"+commentName(d.Proto),
 				describeStrings(d.Hosts, 3), commentName(d.NamedBy), formatTime(d.FirstSeen), formatTime(d.LastSeen),
 				describeStrings(d.Addresses, 3), d.note())
 		}
@@ -410,13 +486,14 @@ func (r *driftReport) text(limit int) string {
 		}
 		b.WriteString("To approve one, add it to the baseline file of the connector, as\n")
 		d := shown[0]
-		fmt.Fprintf(&b, "  - {peer: %s, port: %d, proto: %s}    under service %s\n", commentName(d.Peer), d.Port, commentName(d.Proto),
+		fmt.Fprintf(&b, "  - {peer: %s, port: %s, proto: %s}    under service %s\n", commentName(d.Peer), d.port(), commentName(d.Proto),
 			commentName(d.Service))
 		b.WriteString("with the counts of the last line of the file (end:), or write the service again:\n" +
 			"shawk-policy baseline -service NAME -merge FILE.\n")
 		if slices.ContainsFunc(shown, func(d dependency) bool { return len(d.Processes) > 0 }) {
 			b.WriteString("by NAME in its unit: a process of another name, without a baseline of its own, in a unit that\n" +
-				"runs the service. It is judged as the service: a name is what a process declares.\n")
+				"runs the service. The services of the baseline of the unit judge it together, and it is told\n" +
+				"under the first of them: a name is what a process declares.\n")
 		}
 		if slices.ContainsFunc(shown, func(d dependency) bool { return d.Peer == "~unresolved" }) {
 			b.WriteString("~unresolved: a private address that shawk cannot name. It may be a server whose agent is\n" +
@@ -438,14 +515,38 @@ func (r *driftReport) text(limit int) string {
 		if n := len(r.NewServices) - len(shown); n > 0 {
 			fmt.Fprintf(&b, "and %s (-limit 0 shows all)\n", plural(n, "more service"))
 		}
-		b.WriteString("A new executable, or a process that names itself anew, is a service of its own. In a unit that\n" +
-			"runs a service of the baseline it is judged as that service; anywhere else nothing judges it.\n")
+		b.WriteString("A new executable, or a process that names itself anew, is a service of its own. In a unit of a\n" +
+			"workload that runs services of the baseline it is judged by them; anywhere else nothing judges it.\n")
+	}
+	if len(r.Unjudged) > 0 {
+		shown := r.Unjudged
+		if limit > 0 && len(shown) > limit {
+			shown = shown[:limit]
+		}
+		b.WriteString("\nNext to the baseline, in units that unrelated processes share: not judged, and no drift\n")
+		tb := newTable()
+		tb.row("UNIT", "PROCESS", "PEER", "PORTS", "HOSTS", "LAST SEEN", "SERVICES OF THE BASELINE IN THE UNIT")
+		for _, u := range shown {
+			ports := make([]string, len(u.Ports))
+			for i, p := range u.Ports {
+				ports[i] = strconv.Itoa(int(p))
+			}
+			tb.row(commentName(u.Unit), commentName(u.Process), commentName(u.Peer), strings.Join(ports, ",")+"/"+commentName(u.Proto),
+				describeStrings(u.Hosts, 3), formatTime(u.LastSeen), describeStrings(u.Services, 3))
+		}
+		tb.writeTo(&b)
+		if n := int(r.UnjudgedTotal) - len(shown); n > 0 {
+			fmt.Fprintf(&b, "and %s (shawk_v1.baseline_unjudged lists them)\n", plural(n, "more row"))
+		}
+		b.WriteString("The jobs of Slurm, login sessions and transient units hold the processes of many users: a baseline\n" +
+			"of one of them says nothing of the others. To judge one of these processes, give its name a baseline.\n")
 	}
 	b.WriteString("\nOnly TCP and UDP are judged, by the name of the server and its port: a server of the same name\n" +
 		"at another address is no drift, and ~external does not tell one public address from another.\n" +
-		"A process is judged by the baseline of the name it declares, or, without one, of a service in its\n" +
-		"unit. A socket without a known owner (~unknown), and a process that takes the name of another\n" +
-		"service of the baseline, are not told apart from what that baseline approves.\n")
+		"A process is judged by the baseline of the name it declares, or, without one, by the services of\n" +
+		"the baseline in its unit, unless the unit is one that unrelated processes share. A socket without\n" +
+		"a known owner (~unknown), and a process that takes the name of another service of the baseline,\n" +
+		"are not told apart from what that baseline approves.\n")
 	return b.String()
 }
 

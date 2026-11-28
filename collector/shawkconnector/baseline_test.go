@@ -40,7 +40,7 @@ func TestParseBaseline(t *testing.T) {
 	want := &Baseline{Services: []BaselineService{
 		{Service: "batch/report", Dependencies: []BaselineDependency{}},
 		{Service: "shop/app", Dependencies: []BaselineDependency{
-			{"resolver", 53, "udp"}, {"shop/postgres", 5432, "tcp"}, {"~external", 443, "tcp"}}},
+			{"resolver", 53, "udp", false}, {"shop/postgres", 5432, "tcp", false}, {"~external", 443, "tcp", false}}},
 	}}
 	if !reflect.DeepEqual(b, want) {
 		t.Errorf("baseline = %+v, want %+v", b, want)
@@ -61,6 +61,23 @@ func TestParseBaseline(t *testing.T) {
 		if e, err := ParseBaseline([]byte(file)); err != nil || len(e.Services) != 0 {
 			t.Errorf("%q = %+v, %v", file, e, err)
 		}
+	}
+	// A dependency on the ports that the kernel chose for a server is not
+	// one on every port of it.
+	k, err := ParseBaseline([]byte("services:\n  - service: a\n    dependencies:\n      - {peer: rpcd, port: kernel-chosen, proto: tcp}\n" +
+		"      - {peer: rpcd, port: 0, proto: udp}\nend: {services: 1, dependencies: 2}\n"))
+	if err != nil || !reflect.DeepEqual(k.Services[0].Dependencies, []BaselineDependency{{"rpcd", 0, "tcp", true}, {"rpcd", 0, "udp", false}}) {
+		t.Errorf("a port that the kernel chose: %+v, %v", k, err)
+	}
+	every, _ := ParseBaseline([]byte("services:\n  - service: a\n    dependencies:\n      - {peer: rpcd, port: 0, proto: tcp}\n" +
+		"      - {peer: rpcd, port: 0, proto: udp}\nend: {}\n"))
+	if every == nil || every.Digest() == k.Digest() {
+		t.Errorf("the ports that the kernel chose and every port are one baseline: %+v", every)
+	}
+	if out, err := k.Marshal(); err != nil || !strings.Contains(string(out), "      - {peer: rpcd, port: kernel-chosen, proto: tcp}\n") {
+		t.Errorf("written as %s, %v", out, err)
+	} else if back, err := ParseBaseline(out); err != nil || !reflect.DeepEqual(back, k) {
+		t.Errorf("read back as %+v, %v", back, err)
 	}
 	// A name that YAML would read as something else is a name when quoted.
 	q, err := ParseBaseline([]byte("services:\n  - service: \"123\"\n    dependencies: [{peer: 'true', port: 0, proto: udp}]\nend: {}\n"))
@@ -116,17 +133,23 @@ func TestParseBaselineInvalid(t *testing.T) {
 		"alias":           {"services:\n  - &a {service: x, dependencies: []}\n  - *a\nend: {}\n", "anchors and aliases"},
 		"anchor":          {"services:\n  - service: &n x\n    dependencies: []\nend: {}\n", "anchors and aliases"},
 		// The last line, which tells that the file is whole.
-		"no end":             {"services: []\n", "does not end with `end:`"},
-		"end first":          {"end: {}\nservices: []\n", "does not end with `end:`"},
-		"end null":           {"services: []\nend:\n", "not a mapping"},
-		"end count":          {"services:\n  - {service: a, dependencies: []}\nend: {services: 2}\n", "has 1 services, and its last line tells 2"},
-		"end dependencies":   {one("{peer: b, port: 1, proto: tcp}") + "", "x"},
-		"end fewer":          {"services:\n  - service: a\n    dependencies: [{peer: b, port: 1, proto: tcp}]\nend: {services: 1, dependencies: 2}\n", "has 1 dependencies, and its last line tells 2"},
-		"end unknown":        {"services: []\nend: {service: 0}\n", `unknown field "service"`},
-		"end not a number":   {"services: []\nend: {services: none}\n", "not a decimal number"},
-		"end octal":          {"services: []\nend: {services: 00}\n", "not a decimal number"},
-		"dependency a list":  {one("[b, 1, tcp]"), "not a mapping"},
-		"services a mapping": {"services: {a: b}\nend: {}\n", "not a list"},
+		"no end":           {"services: []\n", "does not end with `end:`"},
+		"end first":        {"end: {}\nservices: []\n", "does not end with `end:`"},
+		"end null":         {"services: []\nend:\n", "not a mapping"},
+		"end count":        {"services:\n  - {service: a, dependencies: []}\nend: {services: 2}\n", "has 1 services, and its last line tells 2"},
+		"end dependencies": {one("{peer: b, port: 1, proto: tcp}") + "", "x"},
+		"end fewer":        {"services:\n  - service: a\n    dependencies: [{peer: b, port: 1, proto: tcp}]\nend: {services: 1, dependencies: 2}\n", "has 1 dependencies, and its last line tells 2"},
+		"end unknown":      {"services: []\nend: {service: 0}\n", `unknown field "service"`},
+		"end not a number": {"services: []\nend: {services: none}\n", "not a decimal number"},
+		"end octal":        {"services: []\nend: {services: 00}\n", "not a decimal number"},
+		// A file with more items than its last line counts, as one that
+		// lines were added to without it.
+		"end more services":     {"services:\n  - {service: a, dependencies: []}\n  - {service: b, dependencies: []}\nend: {services: 1}\n", "has 2 services, and its last line tells 1"},
+		"end more dependencies": {"services:\n  - service: a\n    dependencies: [{peer: b, port: 1, proto: tcp}, {peer: c, port: 1, proto: tcp}]\nend: {dependencies: 1}\n", "has 2 dependencies, and its last line tells 1"},
+		"port word":             {one("{peer: b, port: kernel, proto: tcp}"), "not a decimal number"},
+		"port word quoted int":  {one("{peer: b, port: \"kernel-chosen \", proto: tcp}"), "not a decimal number"},
+		"dependency a list":     {one("[b, 1, tcp]"), "not a mapping"},
+		"services a mapping":    {"services: {a: b}\nend: {}\n", "not a list"},
 	} {
 		if name == "end dependencies" {
 			continue
@@ -153,16 +176,16 @@ func TestParseBaselineInvalid(t *testing.T) {
 func TestBaselineMarshal(t *testing.T) {
 	b := &Baseline{Services: []BaselineService{
 		{Service: "shop/app", Dependencies: []BaselineDependency{
-			{"~external", 443, "tcp"}, {"shop/postgres", 5432, "tcp"}, {"null", 0, "udp"}, {"a: b", 1, "tcp"}, {"#x", 2, "tcp"},
-			{"user@1000.service", 22, "tcp"}, {"~kernel:nfs", 2049, "tcp"}}},
-		{Service: "~", Dependencies: []BaselineDependency{{"123", 80, "tcp"}, {" lead", 80, "tcp"}, {"'q\"", 80, "tcp"}}},
+			{"~external", 443, "tcp", false}, {"shop/postgres", 5432, "tcp", false}, {"null", 0, "udp", false}, {"a: b", 1, "tcp", false}, {"#x", 2, "tcp", false},
+			{"user@1000.service", 22, "tcp", false}, {"~kernel:nfs", 2049, "tcp", false}}},
+		{Service: "~", Dependencies: []BaselineDependency{{"123", 80, "tcp", false}, {" lead", 80, "tcp", false}, {"'q\"", 80, "tcp", false}}},
 		{Service: "batch/report"},
 	}}
 	b.Normalize()
 	// Whatever an agent names a service, a baseline holds it: a line
 	// break, a tab, a character that ends a line for some readers.
 	odd := &Baseline{Services: []BaselineService{{Service: "a\nb", Dependencies: []BaselineDependency{
-		{"tab\there", 1, "tcp"}, {"\u2028", 2, "tcp"}, {"\x1b[2J", 3, "udp"}, {strings.Repeat("n", maxStringBytes), 4, "tcp"}}}}}
+		{"tab\there", 1, "tcp", false}, {"\u2028", 2, "tcp", false}, {"\x1b[2J", 3, "udp", false}, {strings.Repeat("n", maxStringBytes), 4, "tcp", false}}}}}
 	odd.Normalize()
 	if text, err := odd.Marshal(); err != nil {
 		t.Errorf("Marshal of odd names: %v", err)
@@ -206,10 +229,10 @@ end: {services: 3, dependencies: 10}
 	for _, bad := range []*Baseline{
 		{Services: []BaselineService{{Service: ""}}},
 		{Services: []BaselineService{{Service: "a"}, {Service: "a"}}},
-		{Services: []BaselineService{{Service: "a", Dependencies: []BaselineDependency{{"b", 70000, "tcp"}}}}},
-		{Services: []BaselineService{{Service: "a", Dependencies: []BaselineDependency{{"b\x00", 1, "tcp"}}}}},
+		{Services: []BaselineService{{Service: "a", Dependencies: []BaselineDependency{{"b", 70000, "tcp", false}}}}},
+		{Services: []BaselineService{{Service: "a", Dependencies: []BaselineDependency{{"b\x00", 1, "tcp", false}}}}},
 		{Services: []BaselineService{{Service: "a\xff"}}},
-		{Services: []BaselineService{{Service: "a", Dependencies: []BaselineDependency{{"b", 1, "sctp"}}}}},
+		{Services: []BaselineService{{Service: "a", Dependencies: []BaselineDependency{{"b", 1, "sctp", false}}}}},
 	} {
 		if out, err := bad.Marshal(); err == nil {
 			t.Errorf("Marshal(%+v) = %q, want an error", bad, out)
@@ -235,7 +258,7 @@ func TestBaselineMarshalShowsWhatItHolds(t *testing.T) {
 	}
 	b := &Baseline{}
 	for i, name := range hidden {
-		b.Services = append(b.Services, BaselineService{Service: name, Dependencies: []BaselineDependency{{name, i, "tcp"}}})
+		b.Services = append(b.Services, BaselineService{Service: name, Dependencies: []BaselineDependency{{name, i, "tcp", false}}})
 	}
 	b.Normalize()
 	out, err := b.MarshalNotes(func(string, BaselineDependency) string { return "note\u202e with\na break\x1b" })
@@ -257,7 +280,7 @@ func TestBaselineMarshalShowsWhatItHolds(t *testing.T) {
 		t.Errorf("read back as %+v, %v", back, err)
 	}
 	// A name of letters of any script is itself.
-	plain := &Baseline{Services: []BaselineService{{Service: "決済/api", Dependencies: []BaselineDependency{{"données", 1, "tcp"}}}}}
+	plain := &Baseline{Services: []BaselineService{{Service: "決済/api", Dependencies: []BaselineDependency{{"données", 1, "tcp", false}}}}}
 	if out, err := plain.Marshal(); err != nil || !strings.Contains(string(out), `"決済/api"`) || !strings.Contains(string(out), `"données"`) {
 		t.Errorf("names of other scripts: %s, %v", out, err)
 	}
@@ -269,9 +292,9 @@ func TestBaselineMarshalShowsWhatItHolds(t *testing.T) {
 func TestBaselineCutShort(t *testing.T) {
 	b := &Baseline{Services: []BaselineService{
 		{Service: "batch/report"},
-		{Service: "shop/app", Dependencies: []BaselineDependency{{"~unresolved", 53, "udp"}, {"shop/postgres", 5432, "tcp"}, {"~external", 443, "tcp"}}},
-		{Service: "shop/web", Dependencies: []BaselineDependency{{"shop/app", 8080, "tcp"}}},
-		{Service: "we ird", Dependencies: []BaselineDependency{{"a\nb", 1, "tcp"}}},
+		{Service: "shop/app", Dependencies: []BaselineDependency{{"~unresolved", 53, "udp", false}, {"shop/postgres", 5432, "tcp", false}, {"~external", 443, "tcp", false}}},
+		{Service: "shop/web", Dependencies: []BaselineDependency{{"shop/app", 8080, "tcp", false}}},
+		{Service: "we ird", Dependencies: []BaselineDependency{{"a\nb", 1, "tcp", false}}},
 	}}
 	b.Normalize()
 	whole, err := b.MarshalNotes(func(_ string, d BaselineDependency) string {
@@ -595,12 +618,16 @@ func TestBaselineMetricsWhileFailing(t *testing.T) {
 				t.Errorf("after failures, no %q in %q", want, got)
 			}
 		}
-		// A failed evaluation is tried again a minute later, not five.
-		*now = now.Add(baselineRetry)
-		c.tick(context.Background())
+		// A failed evaluation is tried again at the next interval, and
+		// not sooner: one that fails at its time limit of a minute would
+		// otherwise follow the last one at once.
+		for range 4 {
+			*now = now.Add(time.Minute)
+			c.tick(context.Background())
+		}
 		out()
-		if len(st.reports) != tries+2 {
-			t.Errorf("%d evaluations where 2 were due", len(st.reports)-tries)
+		if len(st.reports) != tries+1 {
+			t.Errorf("%d evaluations in the 4 minutes after one that failed, want none", len(st.reports)-tries-1)
 		}
 	}
 	// The evaluation that succeeds again covers the time of the failures,
@@ -621,10 +648,71 @@ func TestBaselineMetricsWhileFailing(t *testing.T) {
 	*now = now.Add(20 * time.Minute)
 	c.tick(context.Background())
 	st.reportErr = nil
+	*now = now.Add(5 * time.Minute)
+	c.tick(context.Background())
+	if last = st.reports[len(st.reports)-1]; last[1].Sub(last[0]) != baselineWindow+30*time.Minute {
+		t.Errorf("after 30 minutes of failures, evaluated over %s", last[1].Sub(last[0]))
+	}
+	// A host runs a service for the memory of the configuration, and for
+	// the whole period when that is longer: the hosts are never counted
+	// from after its start.
+	if !st.hostsSince.Equal(last[1].Add(-7 * 24 * time.Hour)) {
+		t.Errorf("hosts since %s, want a week before %s", st.hostsSince, last[1])
+	}
+}
+
+// TestBaselineHostsSince: the hosts of a service are counted from the
+// memory before the end of the period, and from no later than its start.
+// A period is longer than a memory of an hour from the second evaluation
+// on, and longer than any memory after evaluations paused for as long.
+func TestBaselineHostsSince(t *testing.T) {
+	until := t0
+	for _, c := range []struct{ period, memory, want time.Duration }{
+		{time.Hour, 7 * 24 * time.Hour, 7 * 24 * time.Hour},
+		{time.Hour, time.Hour, time.Hour},
+		{65 * time.Minute, time.Hour, 65 * time.Minute},
+		{24 * time.Hour, 2 * time.Hour, 24 * time.Hour},
+		{24 * time.Hour, 7 * 24 * time.Hour, 7 * 24 * time.Hour},
+	} {
+		if got := BaselineHostsSince(until.Add(-c.period), until, c.memory); !got.Equal(until.Add(-c.want)) {
+			t.Errorf("a period of %s with a memory of %s: hosts since %s before its end, want %s", c.period, c.memory, until.Sub(got), c.want)
+		}
+	}
+	// The connector with the smallest memory that the configuration
+	// accepts: every evaluation asks for hosts from the start of its
+	// period at the latest, also after a pause.
+	c, st, _, now, _ := baselineConnector(t, testBaseline)
+	c.cfg.BaselineHostMemory = time.Hour
+	st.report = &baselineReport{read: true}
+	for i, step := range []time.Duration{time.Minute, 5 * time.Minute, 5 * time.Minute, 3 * time.Hour, 5 * time.Minute} {
+		*now = now.Add(step)
+		c.tick(context.Background())
+		last := st.reports[len(st.reports)-1]
+		if len(st.reports) != i+1 || st.hostsSince.After(last[0]) || last[1].Sub(st.hostsSince) < time.Hour {
+			t.Errorf("evaluation %d over %s to %s counts the hosts since %s", i+1, last[0], last[1], st.hostsSince)
+		}
+	}
+}
+
+// TestBaselineWriteFails: a file that is valid and that PostgreSQL does not
+// take is told as a file that failed: the baseline does not follow it.
+func TestBaselineWriteFails(t *testing.T) {
+	c, st, out, now, _ := baselineConnector(t, testBaseline)
+	st.mu.Lock()
+	st.fail = true
+	st.mu.Unlock()
 	*now = now.Add(time.Minute)
 	c.tick(context.Background())
-	if last = st.reports[len(st.reports)-1]; last[1].Sub(last[0]) != baselineWindow+26*time.Minute {
-		t.Errorf("after 26 minutes of failures, evaluated over %s", last[1].Sub(last[0]))
+	if got := baselineSeries(out()); !slices.Contains(got, "shawk.baseline.file.failed{shawk-connector} 1") {
+		t.Errorf("with a baseline that cannot be written, series %q", got)
+	}
+	st.mu.Lock()
+	st.fail = false
+	st.mu.Unlock()
+	*now = now.Add(time.Minute)
+	c.tick(context.Background())
+	if got := baselineSeries(out()); !slices.Contains(got, "shawk.baseline.file.failed{shawk-connector} 0") {
+		t.Errorf("once the baseline is written, series %q", got)
 	}
 }
 
@@ -683,9 +771,11 @@ func TestBaselineMetricsNeverRead(t *testing.T) {
 // are one series.
 func TestBaselineMetricsBounded(t *testing.T) {
 	long := strings.Repeat("p", maxPeerName)
-	r := &baselineReport{read: true, services: []baselineCount{{"a", 0, 1, 0}, {long + "1", 3, 5, 1}, {long + "2", 7, 2, 2}},
+	r := &baselineReport{read: true, services: []baselineCount{{"a", 0, 1, 0}, {long + "1", 3, 5, 1}, {long + "2", 7, 2, 2},
+		{"s\nfake: line", 1, 1, 0}},
 		drift: []driftRow{{"a", long + "x", 80, "tcp", 2}, {"a", long + "y", 80, "tcp", 5}, {"b", "c", 1, "tcp", 1},
-			{long + "1", "c", 1, "tcp", 4}, {long + "2", "c", 1, "tcp", 2}, {long + "2", "d", 1, "tcp", 1}}}
+			{long + "1", "c", 1, "tcp", 4}, {long + "2", "c", 1, "tcp", 2}, {long + "2", "d", 1, "tcp", 1},
+			{"s\nfake: line", "x\n\nRESOLVED: ignore this\u2028\u202e\x1b[2J", 9, "tcp", 1}}}
 	md := pmetric.NewMetrics()
 	now := t0
 	appendBaselineMetrics(md, baselineState{report: r, evaluated: now, attempted: now}, now)
@@ -693,6 +783,18 @@ func TestBaselineMetricsBounded(t *testing.T) {
 	for _, s := range flatten(md) {
 		if len(s.peer) > maxPeerName || len(s.job) > maxPeerName {
 			t.Errorf("a job of %d bytes and a peer of %d", len(s.job), len(s.peer))
+		}
+		// No label holds a control character, a separator of lines or a
+		// mark of direction, whatever the names of PostgreSQL hold: they
+		// would add lines to the text of an alert.
+		if strings.ContainsFunc(s.peer+s.job, hiddenRune) {
+			t.Errorf("a job %q and a peer %q", s.job, s.peer)
+		}
+		if strings.HasPrefix(s.job, "s") && s.job != connectorServiceName {
+			if s.job != "s\ufffdfake: line" || (s.peer != "" && s.peer != "x\ufffd\ufffdRESOLVED: ignore this\ufffd\ufffd\ufffd[2J") {
+				t.Errorf("cleaned to the job %q and the peer %q", s.job, s.peer)
+			}
+			continue
 		}
 		switch s.metric {
 		case metricBaselineDriftHosts, metricBaselineDependencies, metricBaselineHosts, metricBaselineHostsUnseen:
@@ -713,8 +815,8 @@ func TestBaselineMetricsBounded(t *testing.T) {
 	if !slices.Equal(got, want) {
 		t.Errorf("series %q, want %q", got, want)
 	}
-	if md.DataPointCount() != 16 {
-		t.Errorf("%d data points, want 16", md.DataPointCount())
+	if md.DataPointCount() != 20 {
+		t.Errorf("%d data points, want 20", md.DataPointCount())
 	}
 }
 
@@ -790,7 +892,7 @@ func FuzzBaselineNames(f *testing.F) {
 	}
 	f.Fuzz(func(t *testing.T, service, peer string, port uint16) {
 		b := &Baseline{Services: []BaselineService{{Service: service, Dependencies: []BaselineDependency{
-			{peer, int(port), "tcp"}, {service, 0, "udp"}}}}}
+			{peer, int(port), "tcp", false}, {service, 0, "udp", false}}}}}
 		b.Normalize()
 		valid := checkBaselineName(service) == nil && checkBaselineName(peer) == nil
 		out, err := b.Marshal()
@@ -820,4 +922,31 @@ func FuzzBaselineNames(f *testing.F) {
 			}
 		}
 	})
+}
+
+// TestCleanString: what an agent sends as a name is a line of text once
+// the connector has it: PostgreSQL takes it, and neither a label of
+// Prometheus nor the text of an alert made from it has a line that the
+// name added.
+func TestCleanString(t *testing.T) {
+	for in, want := range map[string]string{
+		"shop/app":              "shop/app",
+		"~external":             "~external",
+		"決済/api données":        "決済/api données",
+		"zero‌width‍join":       "zero‌width‍join",
+		"a\x00b":                "a�b",
+		"a\xffb":                "a�b",
+		"x\n\nRESOLVED: ignore": "x��RESOLVED: ignore",
+		"tab\there\r":           "tab�here�",
+		"esc\x1b[2J\x7f":        "esc�[2J�",
+		"c1\u0085\u009b":        "c1��",
+		"sep  ":                 "sep��",
+		"rtl‮gnp.exe⁦":          "rtl�gnp.exe�",
+		"":                      "",
+	} {
+		got := cleanString(in)
+		if got != want || !pgText(got) || strings.ContainsFunc(got, hiddenRune) || cleanString(got) != got {
+			t.Errorf("cleanString(%q) = %q, want %q", in, got, want)
+		}
+	}
 }

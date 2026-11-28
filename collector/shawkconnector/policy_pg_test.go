@@ -900,10 +900,33 @@ UPDATE shawk.processes SET last_seen = now() - interval '3 hours' WHERE host_id 
 		r.services[0] != (baselineCount{"shop/app", 1, 1, 0}) {
 		t.Errorf("report with a host forgotten = %+v, %v", r, err)
 	}
+	// A service that runs nowhere is judged on the hosts that ran it
+	// before and are observed: nothing of it was missed there. When none
+	// of them is observed, it has no host.
 	execAll(t, conn, `UPDATE shawk.processes SET last_seen = now() - interval '30 days'`)
 	if r, err = c.store.baselineReport(ctx, now.Add(-time.Hour), now, week, 10, 10); err != nil ||
+		r.services[0] != (baselineCount{"shop/app", 1, 1, 0}) {
+		t.Errorf("report of a service that does not run = %+v, %v", r, err)
+	}
+	execAll(t, conn, `UPDATE shawk.agent_sessions SET last_heartbeat = now() - interval '3 hours'`)
+	if r, err = c.store.baselineReport(ctx, now.Add(-time.Hour), now, week, 10, 10); err != nil ||
 		r.services[0] != (baselineCount{"shop/app", 1, 0, 0}) {
-		t.Errorf("report of a service that no host runs = %+v, %v", r, err)
+		t.Errorf("report of a service that no observed host ran = %+v, %v", r, err)
+	}
+	// The connector with the smallest memory of hosts that it accepts
+	// evaluates again and again, also after a pause: the period is then
+	// longer than the memory.
+	execAll(t, conn, `UPDATE shawk.agent_sessions SET last_heartbeat = now(); UPDATE shawk.processes SET last_seen = now()`)
+	c.cfg.BaselineHostMemory = time.Hour
+	at := now
+	c.now = func() time.Time { return at }
+	for i, step := range []time.Duration{0, 5 * time.Minute, 5 * time.Minute, 3 * time.Hour, 5 * time.Minute, 5 * time.Minute} {
+		at = at.Add(step)
+		c.lastBaselineTry = time.Time{}
+		c.evaluateBaselineIfDue(ctx)
+		if c.baselineEvalFailed || !c.baselineAt.Equal(at) {
+			t.Errorf("evaluation %d with a memory of an hour failed: %t", i+1, c.baselineEvalFailed)
+		}
 	}
 }
 

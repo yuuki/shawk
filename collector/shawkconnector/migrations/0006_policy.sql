@@ -27,14 +27,19 @@ CREATE TABLE shawk.baseline_services (
 -- The dependencies approved for a service: the server by its name as
 -- baseline_observed() names it (a service, a range of peer_cidrs,
 -- ~unresolved or ~external), its port (0: every port) and the transport.
+-- kernel_chosen narrows port 0 to the ports that the kernel chose for a
+-- server of the name (`port: kernel-chosen` in the file): a server that
+-- listens on such a port has another one at its next run, and approving
+-- every port of every server of its name for it would approve too much.
 -- Dependencies over Unix sockets, which have neither a port nor a network,
 -- are not part of a baseline.
 CREATE TABLE shawk.baseline_dependencies (
-  service text NOT NULL REFERENCES shawk.baseline_services ON DELETE CASCADE,
-  peer    text NOT NULL CHECK (peer <> ''),
-  port    integer NOT NULL CHECK (port BETWEEN 0 AND 65535),
-  proto   text NOT NULL CHECK (proto IN ('tcp', 'udp')),
-  PRIMARY KEY (service, peer, port, proto)
+  service       text NOT NULL REFERENCES shawk.baseline_services ON DELETE CASCADE,
+  peer          text NOT NULL CHECK (peer <> ''),
+  port          integer NOT NULL CHECK (port BETWEEN 0 AND 65535),
+  proto         text NOT NULL CHECK (proto IN ('tcp', 'udp')),
+  kernel_chosen boolean NOT NULL DEFAULT false CHECK (NOT kernel_chosen OR port = 0),
+  PRIMARY KEY (service, peer, port, proto, kernel_chosen)
 );
 
 -- When the baseline was read, as shawk.inventory_state: read_at is the
@@ -48,6 +53,23 @@ CREATE TABLE shawk.baseline_state (
   failed_at timestamptz,                   -- NULL unless the latest read failed
   error     text
 );
+
+-- Units ----------------------------------------------------------------------
+
+-- Whether a unit is one that unrelated processes share, by its kind: the
+-- unit says nothing of what runs in it, so a baseline of one of its
+-- processes does not judge the others (§6.4). These are the names that
+-- the agent gives to what is not a workload of its own (§4.1): no unit;
+-- the steps of the Slurm jobs of every user (slurm/batch, slurm/step,
+-- ...); login sessions (session.scope, user-1000.slice/session.scope);
+-- transient units of systemd-run (run.scope, run.service); and the
+-- manager of a user (user@1000.service), but not the units that the user
+-- named under it.
+CREATE FUNCTION shawk.shared_unit(unit text) RETURNS boolean
+LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
+  SELECT unit = '' OR unit LIKE 'slurm/%' OR unit ~ '(^|/)session\.scope$' OR unit ~ '^run\.(scope|service)$'
+      OR unit ~ '^user@[0-9]+\.service$'
+$$;
 
 -- Names ----------------------------------------------------------------------
 
@@ -78,15 +100,31 @@ CREATE TABLE shawk.baseline_state (
 -- judged_service is the service whose baseline judges the dependency
 -- (§6.4). Without `judged` it is the service of the client. With `judged`,
 -- the services that have a baseline, the rows are those of the processes
--- that a baseline judges, one row per service that judges them: a process
--- whose service is in `judged` is judged as that service; any other
--- process is judged as each service of `judged` that runs in its unit on
--- its host, which is a unit in which a process of the service was seen
--- since members_since (15 minutes before the period if NULL). A name is
--- what a process declares (§4.1), and the unit is what it cannot leave: a
--- process that an approved service starts, or that takes another name
--- within its unit, is not out of every baseline for it. The sockets
--- without a known owner, which have no unit, are judged by no baseline.
+-- that a baseline judges, one row per dependency:
+--
+--   - a process whose service is in `judged` is judged as that service
+--     (judges holds it alone);
+--   - any other process is judged by its unit: by the services of
+--     `judged` that run in its unit on its host, or in a unit above it
+--     (a container that a service runs in a cgroup of its own, as for the
+--     rules), where a process of the service was seen since members_since
+--     (at the latest 15 minutes before the period, which is also what
+--     NULL means). judges holds those services, in the order of their
+--     bytes: the dependency is in the baseline when one of them approves
+--     it, and judged_service, under which it is told once, is the first
+--     of them (the first that is in of_services, if given).
+--
+-- A name is what a process declares (§4.1), and the unit is what it
+-- cannot leave: a process that an approved service starts, or that takes
+-- another name within its unit, is not out of every baseline for it. But
+-- a unit that unrelated processes share by its kind (shawk.shared_unit:
+-- the Slurm jobs of every user, login sessions, transient units, no unit
+-- at all) says nothing of what runs in it, and judges nothing: a process
+-- there is judged by the baseline of its own name, or by none. With
+-- `shared`, the rows are those that this leaves out instead: the
+-- dependencies of the processes without a baseline of their own in such a
+-- unit in which services of `judged` run, with those services in judges
+-- and no judged_service (baseline_unjudged).
 --
 -- The names are made for the rows that the caller reads only: those of a
 -- host on either side (of_host), of clients with an agent (clients_only)
@@ -105,14 +143,15 @@ CREATE TABLE shawk.baseline_state (
 -- 2 seconds to compile what then runs for one.
 CREATE FUNCTION shawk.named_dependencies(since timestamptz, until timestamptz, of_host text DEFAULT NULL,
                                          clients_only boolean DEFAULT false, of_services text[] DEFAULT NULL,
-                                         judged text[] DEFAULT NULL, members_since timestamptz DEFAULT NULL)
+                                         judged text[] DEFAULT NULL, members_since timestamptz DEFAULT NULL,
+                                         shared boolean DEFAULT false)
 RETURNS TABLE (
   client_host text, client_service text, client_unit text, client_addr inet,
   server_host text, server_service text, server_unit text, server_addr inet,
   port integer, proto text, first_seen timestamptz, last_seen timestamptz, observed_by text,
   virtual_addr inet, virtual_port integer,
   client_name text, server_name text, named_by text, dependency_port integer,
-  kernel_chosen boolean, judged_service text)
+  kernel_chosen boolean, judged_service text, judges text[])
 LANGUAGE sql STABLE ROWS 100000 SET search_path = pg_catalog, pg_temp SET enable_nestloop = off SET jit = off AS $$
 WITH
 -- The services of of_services and of judged, as rows: a hash finds a
@@ -124,7 +163,8 @@ js AS MATERIALIZED (
   SELECT DISTINCT s.service FROM unnest(named_dependencies.judged) AS s(service) WHERE s.service IS NOT NULL
 ),
 d0 AS MATERIALIZED (
-  SELECT x.client_host, x.client_service, x.client_unit, x.client_addr,
+  SELECT row_number() OVER () AS id,
+         x.client_host, x.client_service, x.client_unit, x.client_addr,
          x.server_host, x.server_service, x.server_unit, x.server_addr,
          x.port, x.proto, x.first_seen, x.last_seen, x.observed_by, x.virtual_addr, x.virtual_port
   FROM shawk.dependencies_in(named_dependencies.since, named_dependencies.until) x
@@ -135,31 +175,58 @@ d0 AS MATERIALIZED (
     AND (named_dependencies.judged IS NOT NULL OR named_dependencies.of_services IS NULL
          OR x.client_service IN (SELECT os.service FROM os))
 ),
--- The units in which a service of judged runs, by host.
+-- The units in which a service of judged runs, by host: not those that
+-- unrelated processes share by their kind, or those alone with `shared`.
 um AS MATERIALIZED (
   SELECT DISTINCT h.hostname AS host, p.unit, p.service_name AS service
   FROM shawk.processes p
   JOIN shawk.hosts h ON h.id = p.host_id
   WHERE named_dependencies.judged IS NOT NULL
     AND p.service_name IN (SELECT js.service FROM js)
+    AND shawk.shared_unit(p.unit) = named_dependencies.shared
     AND p.unit <> ''
-    AND p.last_seen >= coalesce(named_dependencies.members_since, named_dependencies.since - interval '15 minutes')
+    AND p.last_seen >= least(coalesce(named_dependencies.members_since, named_dependencies.since - interval '15 minutes'),
+                             named_dependencies.since - interval '15 minutes')
     AND p.first_seen <= named_dependencies.until
 ),
+-- The dependencies of the processes whose own service is not in judged,
+-- each with the services of judged that run in its unit, or in a unit
+-- above it, on its host.
+mate AS MATERIALIZED (
+  SELECT x.id, array_agg(DISTINCT um.service COLLATE "C" ORDER BY um.service COLLATE "C") AS judges
+  FROM d0 x
+  CROSS JOIN LATERAL (
+    SELECT array_to_string(p.parts[1:i], '/') AS unit
+    FROM (SELECT string_to_array(x.client_unit, '/') AS parts) p
+    CROSS JOIN LATERAL generate_series(1, cardinality(p.parts)) AS i
+  ) above
+  JOIN um ON um.host = x.client_host AND um.unit = above.unit
+  WHERE named_dependencies.judged IS NOT NULL
+    AND x.client_service NOT IN (SELECT js.service FROM js)
+    AND x.client_host IN (SELECT um.host FROM um)
+    AND shawk.shared_unit(x.client_unit) = named_dependencies.shared
+  GROUP BY x.id
+),
 d AS MATERIALIZED (
-  SELECT row_number() OVER () AS id, j.*
+  SELECT j.*
   FROM (
-    SELECT x.*, x.client_service AS judged_service
+    SELECT x.*, x.client_service AS judged_service, ARRAY[x.client_service] AS judges
     FROM d0 x
-    WHERE named_dependencies.judged IS NULL OR x.client_service IN (SELECT js.service FROM js)
+    WHERE NOT named_dependencies.shared
+      AND (named_dependencies.judged IS NULL
+           OR (x.client_service IN (SELECT js.service FROM js)
+               AND (named_dependencies.of_services IS NULL OR x.client_service IN (SELECT os.service FROM os))))
     UNION ALL
-    SELECT x.*, um.service
+    SELECT x.*,
+           CASE WHEN NOT named_dependencies.shared THEN
+             (SELECT u.service FROM unnest(m.judges) WITH ORDINALITY AS u(service, n)
+              WHERE named_dependencies.of_services IS NULL OR u.service = ANY (named_dependencies.of_services)
+              ORDER BY u.n LIMIT 1) END,
+           m.judges
     FROM d0 x
-    JOIN um ON um.host = x.client_host AND um.unit = x.client_unit
-    WHERE x.client_service NOT IN (SELECT js.service FROM js)
+    JOIN mate m ON m.id = x.id
+    WHERE named_dependencies.of_services IS NULL OR m.judges && named_dependencies.of_services
   ) j
-  WHERE named_dependencies.judged IS NULL OR named_dependencies.of_services IS NULL
-     OR j.judged_service IN (SELECT os.service FROM os)
 ),
 -- The rows whose server no agent saw, of clients with an agent.
 u AS MATERIALIZED (
@@ -223,7 +290,7 @@ SELECT d.client_host, d.client_service, d.client_unit, d.client_addr,
                          WHERE r.proto = d.proto AND d.port BETWEEN r.port_from AND r.port_to AND d.server_addr <<= r.addr)
             THEN 0 ELSE d.port END,
        kc.hostname IS NOT NULL,
-       d.judged_service
+       d.judged_service, d.judges
 FROM d
 LEFT JOIN pick p ON p.id = d.id
 LEFT JOIN kc ON kc.hostname = d.server_host AND kc.proto = d.proto AND kc.port = d.port
@@ -790,17 +857,20 @@ $$;
 --
 -- service is the service that a baseline judges the dependency as
 -- (named_dependencies, judged_service): the service of the client, or,
--- with `judged`, the services that a baseline is to hold, a service of
--- `judged` that runs in the unit of a client whose own service is not in
--- `judged`. processes lists up to 20 such other services of the clients of
--- a row. Without `judged`, the services of `services` are, so that the
--- baseline of a service lists what its drift is judged on; with neither,
--- every service is its own.
+-- with `judged`, the services that a baseline is to hold, the first
+-- service of `judged` that runs in the unit of a client whose own service
+-- is not in `judged`. processes lists up to 20 such other services of the
+-- clients of a row. Without `judged`, the services of `services` are, so
+-- that the baseline of a service lists what its drift is judged on; with
+-- neither, every service is its own.
 --
--- A server that listened on a port the kernel chose has port 0, every
--- port, with kernel_chosen: its port is another one at its next run, and a
--- baseline that pinned it would tell a drift then. ports are up to 20 of
--- the ports of the servers of a row, as their sockets had them.
+-- A server that listened on a port the kernel chose, which no rule of
+-- ports covers, has port 0 with kernel_chosen: its port is another one at
+-- its next run, and a baseline that pinned it would tell a drift then.
+-- The row stands for the ports that the kernel chose for a server of the
+-- name, and for no other port (shawk.baseline_dependencies.kernel_chosen).
+-- ports are up to 20 of the ports of the servers of a row, as their
+-- sockets had them.
 --
 -- hosts are the hosts of the clients, addrs up to 50 of the addresses they
 -- connected to (a network for folded peers), and named_by the best
@@ -812,21 +882,24 @@ RETURNS TABLE (service text, peer text, port integer, proto text,
                first_seen timestamptz, last_seen timestamptz, hosts text[], addrs inet[], named_by text,
                kernel_chosen boolean, ports integer[], processes text[])
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
-  SELECT d.judged_service, d.server_name, CASE WHEN d.kernel_chosen THEN 0 ELSE d.dependency_port END, d.proto,
+  SELECT d.judged_service, d.server_name, CASE WHEN k.chosen THEN 0 ELSE d.dependency_port END, d.proto,
          min(d.first_seen), max(d.last_seen),
          array_agg(DISTINCT d.client_host COLLATE "C" ORDER BY d.client_host COLLATE "C"),
          (array_agg(DISTINCT coalesce(d.virtual_addr, d.server_addr) ORDER BY coalesce(d.virtual_addr, d.server_addr)))[1:50],
          CASE WHEN bool_or(d.named_by = 'edge') THEN 'edge' WHEN bool_or(d.named_by = 'endpoint') THEN 'endpoint'
               ELSE 'address' END,
-         bool_or(d.kernel_chosen),
+         k.chosen,
          (array_agg(DISTINCT coalesce(d.virtual_port, d.port) ORDER BY coalesce(d.virtual_port, d.port)))[1:20],
          coalesce((array_agg(DISTINCT d.client_service COLLATE "C" ORDER BY d.client_service COLLATE "C")
                    FILTER (WHERE d.client_service <> d.judged_service))[1:20], '{}')
   FROM shawk.named_dependencies(baseline_observed.since, baseline_observed.until, NULL, true, baseline_observed.services,
                                 coalesce(baseline_observed.judged, baseline_observed.services)) d
+  -- A port that a rule of ports covers is every port by that rule,
+  -- whoever chose it.
+  CROSS JOIN LATERAL (SELECT d.kernel_chosen AND d.dependency_port <> 0 AS chosen) k
   WHERE baseline_observed.since < baseline_observed.until
-  GROUP BY 1, 2, 3, 4
-  ORDER BY d.judged_service COLLATE "C", d.server_name COLLATE "C", 3, d.proto COLLATE "C"
+  GROUP BY 1, 2, 3, 4, k.chosen
+  ORDER BY d.judged_service COLLATE "C", d.server_name COLLATE "C", 3, d.proto COLLATE "C", k.chosen
 $$;
 
 -- Whether the history tells every dependency of each service of
@@ -836,10 +909,10 @@ $$;
 --   COMPLETE    every such machine was observed for min_coverage of the
 --               period;
 --   INCOMPLETE  one was not (short_hosts lists up to 20 of their hosts,
---               the least observed first, and unobserved_hosts counts
---               them), or no machine runs the service
---               (unknown_service): nothing is known to tell that it did
---               nothing.
+--               the least observed first, short_seconds how long each
+--               was not observed, and unobserved_hosts counts them), or
+--               no machine is known for the service (unknown_service):
+--               nothing is known to tell that it did nothing.
 --
 -- A machine runs the service when a process of it was last seen there
 -- since hosts_since, and by the end of the period. hosts_since is NULL
@@ -848,7 +921,21 @@ $$;
 -- drift: the question is then what the service did in the period, on the
 -- machines that have it, and a machine whose agent went silent before the
 -- period, with all its processes, must count as not observed rather than
--- be forgotten with them.
+-- be forgotten with them. A hosts_since that is later than 15 minutes
+-- before the period is taken as that: a machine that ran the service in
+-- the period runs it, whatever the caller remembers.
+--
+-- With hosts_since, a service that no machine runs is told apart by the
+-- machines that ran it before: when one of them was observed for
+-- min_coverage of the period, the service does not run, and nothing of it
+-- was missed: COMPLETE, with the caveat not_running, and idle_hosts
+-- counts those machines. When none was, or no process of the service was
+-- ever seen, it is unknown_service.
+--
+-- A machine whose last report is before the first report of another
+-- machine of the same host name was replaced by it (a host that was
+-- installed again has a new machine id): it is gone, not unobserved, and
+-- is left out.
 --
 -- coverage is that of the least observed machine. One that ran the
 -- service for a part of the period counts over the whole period: what it
@@ -858,23 +945,45 @@ CREATE FUNCTION shawk_v1.baseline_verdict(services text[], since timestamptz, un
                                           min_coverage numeric DEFAULT 1, tolerance interval DEFAULT '3 minutes',
                                           hosts_since timestamptz DEFAULT NULL)
 RETURNS TABLE (service text, status text, reasons text[], caveats text[],
-               hosts integer, coverage numeric, short_hosts text[], unobserved_hosts integer)
+               hosts integer, coverage numeric, short_hosts text[], unobserved_hosts integer,
+               short_seconds integer[], idle_hosts integer)
 LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+  -- Since when a process of a service was seen on the machines that run it.
+  ran_since timestamptz := least(coalesce(hosts_since, since - interval '15 minutes'), since - interval '15 minutes');
 BEGIN
   PERFORM shawk.check_period(since, until, min_coverage, tolerance);
-  IF hosts_since > since THEN
-    RAISE EXCEPTION 'hosts_since is after the start of the period: %', hosts_since USING ERRCODE = 'invalid_parameter_value';
-  END IF;
   RETURN QUERY
   WITH asked AS (
     SELECT DISTINCT u.service FROM unnest(services) AS u(service) WHERE u.service IS NOT NULL
   ),
-  sh AS MATERIALIZED (
-    SELECT DISTINCT p.service_name AS service, h.hostname AS host, h.id AS host_id
+  -- The machines that had a process of a service, with when it was last
+  -- seen there.
+  had AS MATERIALIZED (
+    SELECT p.service_name AS service, h.hostname AS host, h.id AS host_id, max(p.last_seen) AS last_seen
     FROM shawk.processes p
     JOIN shawk.hosts h ON h.id = p.host_id
-    WHERE p.service_name IN (SELECT a.service FROM asked a)
-      AND p.last_seen >= coalesce(hosts_since, since - interval '15 minutes') AND p.first_seen <= until
+    WHERE p.service_name IN (SELECT a.service FROM asked a) AND p.first_seen <= until
+      AND (hosts_since IS NOT NULL OR p.last_seen >= ran_since)
+    GROUP BY p.service_name, h.hostname, h.id
+  ),
+  -- The first and the last report of every machine of the names of
+  -- those machines: one that reported last before another of its name
+  -- reported first was replaced.
+  span AS MATERIALIZED (
+    SELECT h.hostname AS host, h.id AS host_id, min(a.started_at) AS first_report, max(a.last_heartbeat) AS last_report
+    FROM shawk.hosts h
+    JOIN shawk.agent_sessions a ON a.host_id = h.id
+    WHERE h.hostname IN (SELECT had.host FROM had)
+    GROUP BY h.hostname, h.id
+  ),
+  sh AS MATERIALIZED (
+    SELECT had.service, had.host, had.host_id, had.last_seen >= ran_since AS runs
+    FROM had
+    WHERE NOT EXISTS (
+      SELECT FROM span mine
+      JOIN span other ON other.host = mine.host AND other.host_id <> mine.host_id AND other.first_report > mine.last_report
+      WHERE mine.host_id = had.host_id)
   ),
   ob AS MATERIALIZED (
     SELECT * FROM shawk.machine_shortfalls(since, until, ARRAY(SELECT DISTINCT sh.host_id FROM sh), tolerance)
@@ -882,19 +991,40 @@ BEGIN
   -- The hosts of each service by name, each with the coverage of the
   -- least observed of its machines that run the service.
   byhost AS (
-    SELECT sh.service, sh.host, min(ob.covered) AS covered
+    SELECT sh.service, sh.host, min(ob.covered) AS covered, max(ob.unobserved) AS unobserved
     FROM sh
     JOIN ob ON ob.host_id = sh.host_id
+    WHERE sh.runs
     GROUP BY sh.service, sh.host
+  ),
+  short AS (
+    SELECT b.service, b.host, b.unobserved, row_number() OVER (PARTITION BY b.service ORDER BY b.covered, b.host COLLATE "C") AS n
+    FROM byhost b
+    WHERE b.covered < min_coverage
   ),
   per AS (
     SELECT b.service,
            count(*)::integer AS hosts,
            min(b.covered) AS covered,
-           (array_agg(b.host ORDER BY b.covered, b.host COLLATE "C") FILTER (WHERE b.covered < min_coverage))[1:20] AS short_hosts,
            (count(*) FILTER (WHERE b.covered < min_coverage))::integer AS unobserved_hosts
     FROM byhost b
     GROUP BY b.service
+  ),
+  listed AS (
+    SELECT s.service, array_agg(s.host ORDER BY s.n) AS short_hosts,
+           array_agg(extract(epoch FROM s.unobserved)::integer ORDER BY s.n) AS short_seconds
+    FROM short s
+    WHERE s.n <= 20
+    GROUP BY s.service
+  ),
+  -- The machines that ran a service before, and were observed for the
+  -- period: the service does not run there, and nothing of it was missed.
+  idle AS (
+    SELECT sh.service, count(DISTINCT sh.host)::integer AS hosts
+    FROM sh
+    JOIN ob ON ob.host_id = sh.host_id
+    WHERE NOT sh.runs AND ob.covered >= min_coverage
+    GROUP BY sh.service
   ),
   -- The shortfalls of the machines of each service, and whether one of
   -- the machines that has it is below min_coverage.
@@ -907,23 +1037,31 @@ BEGIN
       FROM sh
       JOIN ob ON ob.host_id = sh.host_id
       CROSS JOIN LATERAL unnest(ob.shortfalls) AS c(code)
+      WHERE sh.runs
       GROUP BY sh.service, c.code
     ) x
     GROUP BY x.service
   )
   SELECT a.service,
-         CASE WHEN per.service IS NULL OR per.covered < min_coverage THEN 'INCOMPLETE' ELSE 'COMPLETE' END,
-         CASE WHEN per.service IS NULL THEN ARRAY['unknown_service']
+         CASE WHEN per.service IS NULL AND idle.hosts > 0 THEN 'COMPLETE'
+              WHEN per.service IS NULL OR per.covered < min_coverage THEN 'INCOMPLETE' ELSE 'COMPLETE' END,
+         CASE WHEN per.service IS NULL AND idle.hosts > 0 THEN '{}'::text[]
+              WHEN per.service IS NULL THEN ARRAY['unknown_service']
               WHEN per.covered < min_coverage THEN coalesce(codes.short_codes, '{}') ELSE '{}'::text[] END,
-         CASE WHEN per.service IS NULL THEN '{}'::text[]
+         CASE WHEN per.service IS NULL AND idle.hosts > 0 THEN ARRAY['not_running']
+              WHEN per.service IS NULL THEN '{}'::text[]
               WHEN per.covered < min_coverage THEN coalesce(codes.other_codes, '{}')
               ELSE coalesce(codes.short_codes, '{}') || coalesce(codes.other_codes, '{}') END,
          coalesce(per.hosts, 0),
-         trunc(coalesce(per.covered, 0), 6),
-         coalesce(per.short_hosts, '{}'::text[]),
-         coalesce(per.unobserved_hosts, 0)
+         trunc(coalesce(per.covered, CASE WHEN idle.hosts > 0 THEN 1 ELSE 0 END), 6),
+         coalesce(listed.short_hosts, '{}'::text[]),
+         coalesce(per.unobserved_hosts, 0),
+         coalesce(listed.short_seconds, '{}'::integer[]),
+         coalesce(idle.hosts, 0)
   FROM asked a
   LEFT JOIN per ON per.service = a.service
+  LEFT JOIN listed ON listed.service = a.service
+  LEFT JOIN idle ON idle.service = a.service
   LEFT JOIN codes ON codes.service = a.service
   ORDER BY a.service COLLATE "C";
 END
@@ -931,9 +1069,11 @@ $$;
 
 -- The baseline that the connector read: one row per service and approved
 -- dependency, and one row without a dependency (peer, port and proto
--- NULL) for a service approved to have none.
+-- NULL) for a service approved to have none. kernel_chosen tells a
+-- dependency on the ports that the kernel chose for a server of the name,
+-- and no other: its port is 0, which then does not stand for every port.
 CREATE VIEW shawk_v1.baseline AS
-SELECT s.service, d.peer, d.port, d.proto
+SELECT s.service, d.peer, d.port, d.proto, d.kernel_chosen
 FROM shawk.baseline_services s
 LEFT JOIN shawk.baseline_dependencies d ON d.service = s.service;
 
@@ -950,50 +1090,57 @@ FROM shawk.baseline_state st;
 -- The drift: the dependencies of baseline_observed() in [since, until]
 -- of the services that have a baseline (of those of `services` if not
 -- NULL) that are not in it. A service without a baseline is not judged
--- and has no row, unless its process is in the unit of a service that has
--- one, on its host: it is then judged as that service
--- (named_dependencies, judged_service; members_since tells since when a
--- process of the service must have been seen in the unit, 15 minutes
--- before the period if NULL), and processes lists it.
+-- and has no row, unless its process is in a unit that runs services that
+-- have one, on its host, and that unrelated processes do not share by its
+-- kind: it is then judged by those services together
+-- (named_dependencies: a dependency that one of them approves is no
+-- drift, and one that none approves is told once, under the first of
+-- them; members_since tells since when a process of a service must have
+-- been seen in the unit), and processes lists it.
 -- baseline_new_services() lists the services that are new.
 --
--- A dependency is in the baseline of its service when the baseline has
--- its server and transport with its port, or with port 0, which stands
--- for every port: the port of the dependency between services, or the
--- port of the server itself, so that a rule of ports added or removed
--- after the baseline was approved does not make a drift of what it holds.
+-- A dependency is in the baseline of a service when the baseline has its
+-- server and transport with its port, or with port 0, which stands for
+-- every port: the port of the dependency between services, or the port
+-- of the server itself, so that a rule of ports added or removed after
+-- the baseline was approved does not make a drift of what it holds. A
+-- dependency on a port that the kernel chose is also in a baseline that
+-- has its server and transport with kernel_chosen, which approves the
+-- ports that the kernel chose and no other.
 CREATE FUNCTION shawk_v1.baseline_drift(since timestamptz, until timestamptz, services text[] DEFAULT NULL,
                                         members_since timestamptz DEFAULT NULL)
 RETURNS TABLE (service text, peer text, port integer, proto text,
                first_seen timestamptz, last_seen timestamptz, hosts text[], addrs inet[], named_by text,
                kernel_chosen boolean, ports integer[], processes text[])
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
-  SELECT d.judged_service, d.server_name, CASE WHEN d.kernel_chosen THEN 0 ELSE d.dependency_port END, d.proto,
+  SELECT d.judged_service, d.server_name, CASE WHEN k.chosen THEN 0 ELSE d.dependency_port END, d.proto,
          min(d.first_seen), max(d.last_seen),
          array_agg(DISTINCT d.client_host COLLATE "C" ORDER BY d.client_host COLLATE "C"),
          (array_agg(DISTINCT coalesce(d.virtual_addr, d.server_addr) ORDER BY coalesce(d.virtual_addr, d.server_addr)))[1:50],
          CASE WHEN bool_or(d.named_by = 'edge') THEN 'edge' WHEN bool_or(d.named_by = 'endpoint') THEN 'endpoint'
               ELSE 'address' END,
-         bool_or(d.kernel_chosen),
+         k.chosen,
          (array_agg(DISTINCT coalesce(d.virtual_port, d.port) ORDER BY coalesce(d.virtual_port, d.port)))[1:20],
          coalesce((array_agg(DISTINCT d.client_service COLLATE "C" ORDER BY d.client_service COLLATE "C")
                    FILTER (WHERE d.client_service <> d.judged_service))[1:20], '{}')
   FROM shawk.named_dependencies(baseline_drift.since, baseline_drift.until, NULL, true, baseline_drift.services,
                                 ARRAY(SELECT s.service FROM shawk.baseline_services s), baseline_drift.members_since) d
+  CROSS JOIN LATERAL (SELECT d.kernel_chosen AND d.dependency_port <> 0 AS chosen) k
   WHERE baseline_drift.since < baseline_drift.until
     AND NOT EXISTS (
       SELECT FROM shawk.baseline_dependencies b
-      WHERE b.service = d.judged_service AND b.peer = d.server_name AND b.proto = d.proto
-        AND b.port IN (0, d.port, d.dependency_port))
-  GROUP BY 1, 2, 3, 4
-  ORDER BY d.judged_service COLLATE "C", d.server_name COLLATE "C", 3, d.proto COLLATE "C"
+      WHERE b.service = ANY (d.judges) AND b.peer = d.server_name AND b.proto = d.proto
+        AND ((NOT b.kernel_chosen AND b.port IN (0, d.port, d.dependency_port)) OR (b.kernel_chosen AND d.kernel_chosen)))
+  GROUP BY 1, 2, 3, 4, k.chosen
+  ORDER BY d.judged_service COLLATE "C", d.server_name COLLATE "C", 3, d.proto COLLATE "C", k.chosen
 $$;
 
 -- The services without a baseline that were first seen in [since, until]
 -- and opened connections: a new executable, or a process that names
--- itself anew, is a service of its own (§4.1). One in the unit of a
--- service that has a baseline is judged as that service
--- (baseline_drift); another is judged by no baseline, and is told here
+-- itself anew, is a service of its own (§4.1). One in a unit that runs
+-- services that have a baseline is judged by them (baseline_drift),
+-- unless the unit is one that unrelated processes share
+-- (shawk.shared_unit); another is judged by no baseline, and is told here
 -- once, when it appears. first_seen is the earliest time a process of
 -- the service was seen on any host, within the retention, and hosts its
 -- hosts. The processes of Slurm jobs, which their users name, and the
@@ -1010,4 +1157,41 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
      AND NOT EXISTS (SELECT FROM shawk.baseline_services s WHERE s.service = p.service_name)
      AND bool_or(EXISTS (SELECT FROM shawk.edges e WHERE e.process_id = p.id AND e.role = 'client'))
   ORDER BY p.service_name COLLATE "C"
+$$;
+
+-- What no baseline judges although it is next to one: the dependencies in
+-- [since, until] of the processes without a baseline of their own in a
+-- unit that unrelated processes share by its kind (shawk.shared_unit: the
+-- Slurm jobs of every user, login sessions, transient units) and in which
+-- services of the baseline run on the same host (a process of one was
+-- seen there since members_since). Such a unit says nothing of what runs
+-- in it, so these are no drift of those services; they are listed, so
+-- that what is next to a baseline and out of it is not silent. One row
+-- per unit, process and server, at most max_rows of them in the order of
+-- the bytes of their names; total counts them all. services are the
+-- services of the baseline of the unit, ports up to 20 of the ports, and
+-- hosts the hosts of the processes.
+CREATE FUNCTION shawk_v1.baseline_unjudged(since timestamptz, until timestamptz, members_since timestamptz DEFAULT NULL,
+                                           max_rows integer DEFAULT 100)
+RETURNS TABLE (unit text, process text, peer text, proto text, ports integer[], hosts text[], services text[],
+               first_seen timestamptz, last_seen timestamptz, total bigint)
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+  SELECT g.*, count(*) OVER ()
+  FROM (
+    SELECT d.client_unit, d.client_service, d.server_name, d.proto,
+           (array_agg(DISTINCT coalesce(d.virtual_port, d.port) ORDER BY coalesce(d.virtual_port, d.port)))[1:20],
+           array_agg(DISTINCT d.client_host COLLATE "C" ORDER BY d.client_host COLLATE "C"),
+           ARRAY(SELECT DISTINCT j.service COLLATE "C"
+                 FROM jsonb_array_elements(jsonb_agg(to_jsonb(d.judges))) AS a(services),
+                      jsonb_array_elements_text(a.services) AS j(service)
+                 ORDER BY 1),
+           min(d.first_seen), max(d.last_seen)
+    FROM shawk.named_dependencies(baseline_unjudged.since, baseline_unjudged.until, NULL, true, NULL,
+                                  ARRAY(SELECT s.service FROM shawk.baseline_services s), baseline_unjudged.members_since,
+                                  true) d
+    WHERE baseline_unjudged.since < baseline_unjudged.until
+    GROUP BY d.client_unit, d.client_service, d.server_name, d.proto
+  ) g
+  ORDER BY g.client_unit COLLATE "C", g.client_service COLLATE "C", g.server_name COLLATE "C", g.proto COLLATE "C"
+  LIMIT greatest(baseline_unjudged.max_rows, 0)
 $$;

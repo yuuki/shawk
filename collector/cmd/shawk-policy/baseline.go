@@ -124,8 +124,12 @@ type baselineService struct {
 	Coverage   float64  `json:"coverage"`
 	ShortHosts []string `json:"short_hosts"`
 	// UnobservedHosts counts the hosts that were not observed enough, of
-	// which ShortHosts lists the first.
+	// which ShortHosts lists the first, and ShortSeconds how long each of
+	// those was not observed. IdleHosts counts, for a service that runs
+	// nowhere, the hosts that ran it before and were observed.
 	UnobservedHosts int          `json:"unobserved_hosts"`
+	ShortSeconds    []int32      `json:"short_seconds"`
+	IdleHosts       int          `json:"idle_hosts"`
 	Dependencies    []dependency `json:"dependencies"`
 
 	coverage string
@@ -149,9 +153,11 @@ type dependency struct {
 	Addresses []string `json:"addresses"`
 	NamedBy   string   `json:"named_by"`
 	// KernelChosen tells that the server listened on a port that the
-	// kernel chose, another one at its next run: Port is then 0, every
-	// port, rather than a port that a baseline would pin for nothing.
-	// Ports are the first of the ports that the sockets saw.
+	// kernel chose, another one at its next run: Port is then 0, and the
+	// dependency is on the ports that the kernel chose for a server of
+	// the name, and on no other (`port: kernel-chosen` in the file),
+	// rather than on a port that a baseline would pin for nothing. Ports
+	// are the first of the ports that the sockets saw.
 	KernelChosen bool  `json:"kernel_chosen"`
 	Ports        []int `json:"ports"`
 	// Processes are the other services of the clients: processes in a
@@ -190,6 +196,15 @@ func sortDependencies(deps []dependency) {
 	})
 }
 
+// port is the port of a dependency as a file writes it: a number, or the
+// word for the ports that the kernel chose.
+func (d *dependency) port() string {
+	if d.KernelChosen && d.Port == 0 {
+		return "kernel-chosen"
+	}
+	return strconv.Itoa(d.Port)
+}
+
 // note tells what is particular to a dependency, for the line of the file
 // and the tables: its port when the kernel chose it, and the processes of
 // another name that made it.
@@ -200,7 +215,8 @@ func (d *dependency) note() string {
 		for i, p := range d.Ports {
 			ports[i] = strconv.Itoa(p)
 		}
-		notes = append(notes, "every port: the kernel chose the port of the server ("+strings.Join(ports, ", ")+" when seen)")
+		notes = append(notes, "the ports that the kernel chose for a server named "+commentName(d.Peer)+" ("+strings.Join(ports, ", ")+
+			" when seen), on any host, and no other port")
 	}
 	if len(d.Processes) > 0 {
 		notes = append(notes, "by "+describeStrings(d.Processes, 3)+" in its unit")
@@ -263,9 +279,13 @@ func readBaseline(ctx context.Context, tx pgx.Tx, c *baselineConfig, since, unti
 	if r.MinCoverage, err = strconv.ParseFloat(c.minCoverage, 64); err != nil {
 		return nil, err
 	}
-	// The services that the file will hold: a process of another name in
-	// a unit of one of them is judged as it, by the drift and here alike.
-	// With -all every service that was seen is in the file.
+	// The services that have a baseline once the file is deployed: those
+	// asked for, those of the file to merge with, and those of the
+	// baseline that the connector read, which the file is to replace or to
+	// be merged with. A process of another name in a unit of one of them
+	// is judged by the unit, by the drift and here alike; a service that
+	// has a baseline of its own is not mixed into that of another. With
+	// -all every service that was seen is in the file.
 	var asked, judged []string
 	if !c.all {
 		asked = c.services
@@ -275,6 +295,15 @@ func readBaseline(ctx context.Context, tx pgx.Tx, c *baselineConfig, since, unti
 				judged = append(judged, s.Service)
 			}
 		}
+		rows, err := tx.Query(ctx, `SELECT DISTINCT service FROM shawk_v1.baseline`)
+		if err != nil {
+			return nil, fmt.Errorf("the baseline: %w", err)
+		}
+		deployed, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		if err != nil {
+			return nil, fmt.Errorf("the baseline: %w", err)
+		}
+		judged = append(judged, deployed...)
 	}
 	rows, err := tx.Query(ctx, `SELECT `+dependencyColumns+` FROM shawk_v1.baseline_observed($1, $2, $3, $4)`, since, until, asked, judged)
 	if err != nil {
@@ -304,7 +333,8 @@ func readBaseline(ctx context.Context, tx pgx.Tx, c *baselineConfig, since, unti
 		slices.Sort(asked)
 	}
 	rows, err = tx.Query(ctx, `
-SELECT service, status, reasons, caveats, hosts, coverage::float8, coverage::text, short_hosts, unobserved_hosts
+SELECT service, status, reasons, caveats, hosts, coverage::float8, coverage::text, short_hosts, unobserved_hosts, short_seconds,
+       idle_hosts
 FROM shawk_v1.baseline_verdict($1, $2, $3, $4::numeric)`, asked, since, until, c.minCoverage)
 	if err != nil {
 		return nil, fmt.Errorf("the verdicts: %w", err)
@@ -312,7 +342,7 @@ FROM shawk_v1.baseline_verdict($1, $2, $3, $4::numeric)`, asked, since, until, c
 	if r.Services, err = pgx.CollectRows(rows, func(row pgx.CollectableRow) (baselineService, error) {
 		s := baselineService{Dependencies: []dependency{}}
 		err := row.Scan(&s.Service, &s.Status, &s.Reasons, &s.Caveats, &s.Hosts, &s.Coverage, &s.coverage, &s.ShortHosts,
-			&s.UnobservedHosts)
+			&s.UnobservedHosts, &s.ShortSeconds, &s.IdleHosts)
 		s.Dependencies = append(s.Dependencies, byService[s.Service]...)
 		return s, err
 	}); err != nil {
@@ -349,10 +379,10 @@ func (r *baselineReport) finish(other *shawkconnector.Baseline, allowIncomplete 
 		asked[s.Service] = true
 		bs := shawkconnector.BaselineService{Service: s.Service, Dependencies: []shawkconnector.BaselineDependency{}}
 		for _, d := range s.Dependencies {
-			bd := shawkconnector.BaselineDependency{Peer: d.Peer, Port: d.Port, Proto: d.Proto}
+			bd := shawkconnector.BaselineDependency{Peer: d.Peer, Port: d.Port, Proto: d.Proto, KernelChosen: d.KernelChosen && d.Port == 0}
 			bs.Dependencies = append(bs.Dependencies, bd)
 			if n := d.note(); n != "" {
-				notes[fmt.Sprintf("%q %q %d %s", s.Service, bd.Peer, bd.Port, bd.Proto)] = n
+				notes[fmt.Sprintf("%q %q %d %s %t", s.Service, bd.Peer, bd.Port, bd.Proto, bd.KernelChosen)] = n
 			}
 		}
 		out.Services = append(out.Services, bs)
@@ -375,7 +405,7 @@ func (r *baselineReport) finish(other *shawkconnector.Baseline, allowIncomplete 
 	}
 	out.Normalize()
 	file, err := out.MarshalNotes(func(service string, d shawkconnector.BaselineDependency) string {
-		return notes[fmt.Sprintf("%q %q %d %s", service, d.Peer, d.Port, d.Proto)]
+		return notes[fmt.Sprintf("%q %q %d %s %t", service, d.Peer, d.Port, d.Proto, d.KernelChosen)]
 	})
 	if err != nil {
 		// A name that a baseline cannot hold, as one with control
@@ -439,7 +469,7 @@ func (r *baselineReport) lines() []string {
 		tb := newTable()
 		tb.row("  PEER", "PORT", "HOSTS", "NAMED BY", "LAST SEEN", "ADDRESSES", "NOTES")
 		for _, d := range s.Dependencies {
-			tb.row("  "+commentName(d.Peer), strconv.Itoa(d.Port)+"/"+commentName(d.Proto), strconv.Itoa(len(d.Hosts)),
+			tb.row("  "+commentName(d.Peer), d.port()+"/"+commentName(d.Proto), strconv.Itoa(len(d.Hosts)),
 				commentName(d.NamedBy), formatTime(d.LastSeen), describeStrings(d.Addresses, 3), d.note())
 		}
 		lines = append(lines, tb.lines()...)
@@ -452,12 +482,15 @@ func (r *baselineReport) lines() []string {
 	lines = append(lines, "",
 		"A peer is a service by its name, as its agent or its listener tells it, a range of peer_cidrs,",
 		"~unresolved (a private address that shawk cannot name) or ~external (a public address, or peers",
-		"whose addresses the agent folded). Port 0 stands for every port. A dependency that was not used",
+		"whose addresses the agent folded). Port 0 stands for every port, and kernel-chosen for the ports",
+		"that the kernel chose for a server of the name, which change at each of its runs: for those and",
+		"for no port that a server was given. A dependency that was not used",
 		"in the period is not listed: one used less often than the period, or only when another server",
 		"fails. Dependencies over Unix sockets are not part of a baseline. A process of another name in",
-		"a unit of a service, which has no baseline of its own, is judged as the service: what it",
-		"connected to is listed with it. The last line of the file tells that it is whole: keep it last,",
-		"and its counts right (or write `end: {}`).")
+		"a unit of a service, which has no baseline of its own, is judged by the services of the unit:",
+		"what it connected to is listed with the first of them. Units that unrelated processes share (the",
+		"jobs of Slurm, login sessions) judge nothing. The last line of the file tells that it is whole:",
+		"keep it last, and its counts right (or write `end: {}`).")
 	return lines
 }
 
