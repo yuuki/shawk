@@ -116,6 +116,14 @@ connectors:
     # section 5.7).
     # node_states_file: /etc/shawk/node-states.json
     # maintenance_file: /etc/shawk/maintenance.yaml
+    # The baseline of dependencies: per service, the dependencies that an
+    # operator approved, as `shawk-policy baseline` writes them for review.
+    # The connector reads the file every write_interval and tells
+    # Prometheus the dependencies of those services that the file does not
+    # hold (shawk_baseline_drift_hosts; alert ShawkBaselineDrift), without
+    # addresses or hosts. A service that is not in the file is not judged
+    # (docs/design.md, sections 5.9 and 6.4).
+    # baseline_file: /etc/shawk/baseline.yaml
     # Servers that listen on a port chosen anew at every run, such as srun
     # and salloc of Slurm without SrunPortRange: their dependencies are
     # aggregated without the port (server_port 0 in Prometheus, port 0 in

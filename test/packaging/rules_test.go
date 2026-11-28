@@ -465,6 +465,80 @@ eval instant at 23m ` + a("ShawkAgentDown") + `
 	}
 }
 
+// TestBaselineAlerts evaluates the alerts of the baseline of dependencies
+// over what two connectors send: a release that opens a connection on
+// every host of a service is one alert, a server that shawk cannot name a
+// warning of its own, and no evaluation is alerted rather than taken for
+// no drift.
+func TestBaselineAlerts(t *testing.T) {
+	_, alerts := loadRules(t)
+	a := func(name string) string {
+		e, ok := alerts[name]
+		if !ok {
+			t.Fatalf("no alert %s", name)
+		}
+		return inline(e, nil)
+	}
+	// The connectors evaluate until 40m, when they stop for good; the
+	// second reads a file that an edit broke from 20m to 25m. From 10m,
+	// 120 hosts of shop/app connect to billing/api, 3 to an address that
+	// shawk cannot name, and curl appears.
+	script := `
+load 1m
+  shawk_baseline_evaluation_timestamp_seconds{job="shawk-connector"} 0+60x40
+  shawk_baseline_file_failed{job="shawk-connector"} 0x19 1x5 0x15
+  shawk_baseline_drift_truncated{job="shawk-connector"} 0x29 12x10
+  shawk_baseline_new_services{job="shawk-connector"} 0x9 1x30
+  shawk_baseline_dependencies{job="shop/app"} 3x40
+  shawk_baseline_drift_hosts{job="shop/app", service_peer_name="billing/api", server_port="8443", network_transport="tcp"} _x10 100x4 120x25
+  shawk_baseline_drift_hosts{job="shop/app", service_peer_name="~unresolved", server_port="22", network_transport="tcp"} _x10 3x30
+
+eval instant at 5m ` + a("ShawkBaselineDrift") + `
+
+eval instant at 12m ` + a("ShawkBaselineDrift") + `
+  {job="shop/app", service_peer_name="billing/api", server_port="8443", network_transport="tcp"} 100
+
+eval instant at 20m ` + a("ShawkBaselineDrift") + `
+  {job="shop/app", service_peer_name="billing/api", server_port="8443", network_transport="tcp"} 120
+
+eval instant at 20m ` + a("ShawkBaselineDriftUnresolved") + `
+  {job="shop/app", service_peer_name="~unresolved", server_port="22", network_transport="tcp"} 3
+
+eval instant at 12m ` + a("ShawkNewServiceWithoutBaseline") + `
+  {} 1
+
+eval instant at 5m ` + a("ShawkNewServiceWithoutBaseline") + `
+
+eval instant at 22m ` + a("ShawkBaselineFileInvalid") + `
+  {} 1
+
+eval instant at 30m ` + a("ShawkBaselineFileInvalid") + `
+
+eval instant at 35m ` + a("ShawkBaselineDriftTruncated") + `
+  {} 12
+
+eval instant at 20m ` + a("ShawkBaselineDriftTruncated") + `
+
+# The period evaluated ends within the last minutes while the connectors
+# evaluate, and the alert fires once it is half an hour old, also after the
+# series of the connectors are gone.
+eval instant at 40m ` + a("ShawkBaselineNotEvaluated") + `
+
+eval instant at 71m ` + a("ShawkBaselineNotEvaluated") + `
+  {} 1860
+
+eval instant at 600m ` + a("ShawkBaselineNotEvaluated") + `
+  {} 33600
+
+# A day later nothing tells that a baseline was ever evaluated.
+eval instant at 1500m ` + a("ShawkBaselineNotEvaluated") + `
+
+# Once the drift is no longer told, the alert resolves by itself.
+eval instant at 50m ` + a("ShawkBaselineDrift") + `
+`
+	promqltest.RunTest(t, script, promqltest.NewTestEngine(t, false, 0, promqltest.DefaultMaxSamplesPerQuery))
+}
+
 // TestSYNRetransmitRatio evaluates the panel of SYN retransmissions per
 // attempt of the dependency details dashboard. Its denominator is the union
 // of the handshakes and the failures by reason, which the agents that send

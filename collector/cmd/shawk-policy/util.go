@@ -7,7 +7,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode"
 )
 
 // maxLookback bounds the period: the retention of the connector is 3 years
@@ -81,26 +80,6 @@ func isSQLite(dsn string) bool {
 	return err == nil && !info.IsDir()
 }
 
-// printable returns a name with what is not printable escaped. The names
-// of hosts and services are what agents send, which may hold control
-// characters: written as they are, they could redraw the terminal, or
-// start a line of their own in a file of rules.
-func printable(s string) string {
-	if strings.IndexFunc(s, func(r rune) bool { return !unicode.IsPrint(r) }) < 0 {
-		return s
-	}
-	var b strings.Builder
-	for _, r := range s {
-		if unicode.IsPrint(r) {
-			b.WriteRune(r)
-			continue
-		}
-		q := strconv.QuoteRune(r)
-		b.WriteString(q[1 : len(q)-1])
-	}
-	return b.String()
-}
-
 // plainName tells whether a name is made of the characters that the names
 // of services, units and hosts usually have, none of which means anything
 // to the files that the command writes.
@@ -119,11 +98,13 @@ func plainName(s string) bool {
 	return true
 }
 
-// commentName returns a name as it is written in a comment of a file of
-// rules: as it is when it is plain, quoted otherwise, on one line and with
-// what is not printable escaped. A name that agents chose can thus neither
-// end the comment and start a rule, nor end the line with a backslash,
-// which continues it in the files of systemd and nftables.
+// commentName returns a name as it is written in a report or in a comment
+// of a file of rules: as it is when it is plain, quoted otherwise, on one
+// line and with what is not printable escaped. The names of hosts, units
+// and services are what agents send, which may hold anything: a name can
+// thus neither redraw a terminal, nor end a comment and start a rule, nor
+// end a line with a backslash, which continues it in the files of systemd
+// and nftables.
 func commentName(s string) string {
 	if plainName(s) {
 		return s

@@ -41,6 +41,12 @@ func TestPrometheusNames(t *testing.T) {
 		{"shawk.agent.container_reads.dropped", "{read}", otlptranslator.MetricTypeMonotonicCounter, "shawk_agent_container_reads_dropped_total"},
 		{"shawk.agent.export.failures", "{request}", otlptranslator.MetricTypeMonotonicCounter, "shawk_agent_export_failures_total"},
 		{"shawk.agent.rdma.io", "By", otlptranslator.MetricTypeMonotonicCounter, "shawk_agent_rdma_io_bytes_total"},
+		{"shawk.baseline.drift.hosts", "{host}", otlptranslator.MetricTypeGauge, "shawk_baseline_drift_hosts"},
+		{"shawk.baseline.dependencies", "{dependency}", otlptranslator.MetricTypeGauge, "shawk_baseline_dependencies"},
+		{"shawk.baseline.drift.truncated", "{dependency}", otlptranslator.MetricTypeGauge, "shawk_baseline_drift_truncated"},
+		{"shawk.baseline.new_services", "{service}", otlptranslator.MetricTypeGauge, "shawk_baseline_new_services"},
+		{"shawk.baseline.evaluation.timestamp", "s", otlptranslator.MetricTypeGauge, "shawk_baseline_evaluation_timestamp_seconds"},
+		{"shawk.baseline.file.failed", "", otlptranslator.MetricTypeGauge, "shawk_baseline_file_failed"},
 	} {
 		got, err := namer.Build(otlptranslator.Metric{Name: tc.name, Unit: tc.unit, Type: tc.typ})
 		if err != nil || got != tc.want {

@@ -424,3 +424,91 @@ groups:
         annotations:
           summary: "{{ $labels.src }} fails to connect to {{ $labels.dst }}:{{ $labels.server_port }}"
           description: "{{ $value | humanizePercentage }} of the connections of {{ $labels.src }} to {{ $labels.dst }} on port {{ $labels.server_port }} fail."
+
+  # The baseline of dependencies (docs/design.md §5.9 and §6.4): a connector
+  # with baseline_file tells, every write interval, the dependencies of the
+  # services of the baseline that it does not hold, over the last hour up
+  # to 5 minutes ago. shawk_baseline_drift_hosts has one series per service
+  # (job), server (service_peer_name), port and transport, whatever the
+  # number of hosts, which is its value: a release that opens a new
+  # connection on every host of a service is one alert, not one per host.
+  # The series carry no address and no host; shawk-policy drift lists them.
+  #
+  # The alerts take the maximum over what several connectors send, which
+  # read the same PostgreSQL. A service without a baseline has no series
+  # and is not judged: shawk_baseline_dependencies{job} tells the services
+  # that have one, so that `absent(shawk_baseline_dependencies{job="..."})`
+  # alerts when a service that must have one has none, as after it was
+  # renamed.
+  - name: shawk-baseline
+    rules:
+      # A dependency that the baseline does not hold, on a server that shawk
+      # names: a service, a range of peer_cidrs, or ~external.
+      - alert: ShawkBaselineDrift
+        expr: |
+          max by (job, service_peer_name, server_port, network_transport) (
+            shawk_baseline_drift_hosts{service_peer_name!="~unresolved"}
+          ) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.job }} connects to {{ $labels.service_peer_name }}:{{ $labels.server_port }}/{{ $labels.network_transport }}, which its baseline does not hold"
+          description: "{{ $value }} hosts of {{ $labels.job }} opened connections to {{ $labels.service_peer_name }} on port {{ $labels.server_port }} ({{ $labels.network_transport }}) within the last hour, and the approved baseline of the service has no such dependency. `shawk-policy drift -service {{ $labels.job }}` lists the hosts and the addresses; approve the dependency in the baseline file of the connector if it is meant."
+
+      # The same on a private address that shawk cannot name: a host
+      # without an agent, or a server whose agent is stopped and whose
+      # listener is not known. It may be a server of the baseline at an
+      # address that shawk does not know of, so it is a warning, and waits.
+      - alert: ShawkBaselineDriftUnresolved
+        expr: |
+          max by (job, service_peer_name, server_port, network_transport) (
+            shawk_baseline_drift_hosts{service_peer_name="~unresolved"}
+          ) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.job }} connects to an address that shawk cannot name, on port {{ $labels.server_port }}/{{ $labels.network_transport }}, which its baseline does not hold"
+          description: "{{ $value }} hosts of {{ $labels.job }} opened connections to private addresses without a known service on port {{ $labels.server_port }} ({{ $labels.network_transport }}). `shawk-policy drift -service {{ $labels.job }}` lists the addresses: name their range in peer_cidrs, run an agent there, or approve ~unresolved on the port."
+
+      # No drift is an answer only while the drift is evaluated: the
+      # connectors send when the period that they last evaluated ended. It
+      # is kept for a day after the last connector stopped sending it.
+      - alert: ShawkBaselineNotEvaluated
+        expr: time() - max(last_over_time(shawk_baseline_evaluation_timestamp_seconds[1d])) > 1800
+        labels:
+          severity: warning
+        annotations:
+          summary: "the drift from the baseline of dependencies is not evaluated"
+          description: "No connector evaluated the drift from the baseline for {{ $value | humanizeDuration }}: PostgreSQL cannot be read, or the connectors with baseline_file are stopped. A dependency that the baseline does not hold is not alerted meanwhile."
+
+      - alert: ShawkBaselineFileInvalid
+        expr: max(shawk_baseline_file_failed) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "the baseline file of a connector cannot be read"
+          description: "The latest read of a baseline_file failed (shawk_v1.baseline_status tells why): the baseline read before stays, so a change that was approved in the file does not hold yet."
+
+      # More dependencies drift than the connector sends series for (1000):
+      # the others are in no series, and alert nothing.
+      - alert: ShawkBaselineDriftTruncated
+        expr: max(shawk_baseline_drift_truncated) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} dependencies that drift from the baseline are not told"
+          description: "More dependencies are missing from their baseline than the connector sends series for; `shawk-policy drift` lists them all. A baseline taken before the agents traced UDP, or a peer that was renamed, makes many at once."
+
+      # A service without a baseline that appeared within the last hour. A
+      # new executable is a service of its own (docs/design.md §4.1), which
+      # the baseline of the unit it runs in does not judge: an administrator
+      # who runs a tool, or a process that should not be there.
+      - alert: ShawkNewServiceWithoutBaseline
+        expr: max(shawk_baseline_new_services) > 0
+        labels:
+          severity: info
+        annotations:
+          summary: "{{ $value }} new services opened connections, and no baseline judges them"
+          description: "Services that were first seen within the last hour opened connections and have no baseline. `shawk-policy drift` lists them with their hosts."

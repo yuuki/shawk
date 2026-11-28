@@ -225,7 +225,7 @@ func (c *common) query(ctx context.Context, delay time.Duration, read func(ctx c
 		dsn = os.Getenv("SHAWK_POSTGRES_DSN")
 	}
 	if c.dsnFile != "" {
-		b, err := os.ReadFile(c.dsnFile) //nolint:gosec // G703: the file that the command line names, read as its user
+		b, err := os.ReadFile(c.dsnFile)
 		if err != nil {
 			return err
 		}

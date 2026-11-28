@@ -158,6 +158,10 @@ shawk-migrate: ## build the command that applies the PostgreSQL schema
 shawk-impact: ## build the command that tells what removing a host or a service would break, from PostgreSQL
 	cd collector && CGO_ENABLED=0 $(GO) build -trimpath -o ../shawk-impact ./cmd/shawk-impact
 
+.PHONY: shawk-policy
+shawk-policy: ## build the command that writes least-privilege rules and a baseline of dependencies for review, from PostgreSQL
+	cd collector && CGO_ENABLED=0 $(GO) build -trimpath -o ../shawk-policy ./cmd/shawk-policy
+
 .PHONY: test-root
 test-root: ## tests that load the BPF programs into the running kernel
 	$(GO) test -c -o tracer.test ./internal/tracer/
@@ -226,5 +230,5 @@ compat: rocky9.btf rocky9-nf_conntrack.btf ## check the BPF programs against the
 # pg-down and slurm-down remove it.
 .PHONY: clean
 clean:
-	rm -rf shawk shawk-migrate shawk-impact tracer.test bench.txt rocky9.btf rocky9-nf_conntrack.btf collector/_build \
+	rm -rf shawk shawk-migrate shawk-impact shawk-policy tracer.test bench.txt rocky9.btf rocky9-nf_conntrack.btf collector/_build \
 		$(filter-out build/harness,$(wildcard build/*))

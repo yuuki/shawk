@@ -62,7 +62,7 @@ func TestParseBaselineInvalid(t *testing.T) {
 		"only a comment":    {"# none\n", "no services"},
 		"no list":           {"services:\n", "no services"},
 		"unknown field":     {"services: []\nservice: x\n", "field service not found"},
-		"misspelt field":    {"services:\n  - service: a\n    dependancies: []\n", "field dependancies not found"},
+		"misspelt field":    {"services:\n  - service: a\n    depends: []\n", "field depends not found"},
 		"no dependencies":   {"services:\n  - service: a\n", "no dependencies"},
 		"null dependencies": {"services:\n  - service: a\n    dependencies:\n", "no dependencies"},
 		"no service":        {"services:\n  - dependencies: []\n", "service: empty"},
