@@ -10,5 +10,7 @@
 /collector/_build/
 /shawk-migrate
 /shawk-impact
+/collector/shawk-migrate
+/collector/shawk-impact
 /collector/_release-builder-config.yaml
 /bench.txt
