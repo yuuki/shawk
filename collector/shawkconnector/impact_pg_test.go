@@ -690,6 +690,10 @@ func TestPGImpactVerdict(t *testing.T) {
 	f.watched("idle-01", "10.0.1.1")
 	f.edge("idle-01", "cron", "client", "127.0.0.1", "127.0.0.1", 22, impactSince, impactUntil)
 	f.edge("idle-01", "sshd", "server", "127.0.0.1", "127.0.0.1", 22, impactSince, impactUntil)
+	// A client that binds an address of the host and connects to loopback
+	// is matched with its server within the host: one of its own too.
+	f.edge("idle-01", "cron", "client", "10.0.1.1", "127.0.0.1", 25, impactSince, impactUntil)
+	f.edge("idle-01", "postfix", "server", "127.0.0.1", "10.0.1.1", 25, impactSince, impactUntil)
 	if got, want := f.verdict(`'idle-01', %s, %s`), "SAFE {} {} 0 1.000000"; got != want {
 		t.Errorf("idle-01: %s, want %s", got, want)
 	}
