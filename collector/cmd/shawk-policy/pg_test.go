@@ -967,6 +967,15 @@ end: {services: 1, dependencies: 4}
 	if yaml != wantFile {
 		t.Errorf("the baseline of shop/app, written again:\n%s\nwant\n%s", yaml, wantFile)
 	}
+	// A service that PostgreSQL holds no baseline of judges the processes
+	// of its unit as soon as it is asked for, beside the services that
+	// PostgreSQL holds: its first baseline has what they did.
+	f.approve("services:\n  - service: envoy\n    dependencies:\n      - {peer: ~unresolved, port: 9901, proto: tcp}\n" +
+		"  - {service: python3, dependencies: []}\n")
+	_, out, _ = f.run("baseline", "-service", "shop/app", "-lookback", "1h")
+	if _, yaml, _ = strings.Cut(out, "\n\nservices:\n"); yaml != wantFile {
+		t.Errorf("the first baseline of shop/app, beside that of envoy:\n%s\nwant\n%s", yaml, wantFile)
+	}
 	// The same from the file to merge with, where PostgreSQL holds no
 	// baseline yet: its services have a baseline of their own.
 	f.exec(`DELETE FROM shawk.baseline_services; DELETE FROM shawk.baseline_state`)

@@ -640,6 +640,23 @@ func TestPGBaselineReportShares(t *testing.T) {
 	if !slices.Equal(rows, []string{"shop/app ~external 4444"}) || named != 1 || unresolved != 1003 {
 		t.Errorf("with a bound of 1: %v, %d and %d cut", rows, named, unresolved)
 	}
+	// Within the share of a service, the rows on a named peer come before
+	// those on ~unresolved whatever the name is: one that is no ASCII
+	// follows "~unresolved" in the order of bytes, and would lose its
+	// place to the ports that nobody can name.
+	f.host("db-01", "10.0.0.31")
+	f.proc("db-01", "db.service", "\u00fcbersee/db")
+	f.pair("app-01", "shop/app", "10.0.0.11", "db-01", "\u00fcbersee/db", "10.0.0.31", 5432, m, m)
+	rows, named, unresolved = report(maxDriftSeries, 2)
+	var app []string
+	for _, row := range rows {
+		if strings.HasPrefix(row, "shop/app ") {
+			app = append(app, row)
+		}
+	}
+	if want := []string{"shop/app ~external 4444", "shop/app \u00fcbersee/db 5432"}; !slices.Equal(app, want) || named != 0 || unresolved != 999+2 {
+		t.Errorf("with a share of 2 rows a service: %v of shop/app, %d and %d cut, want %v", app, named, unresolved, want)
+	}
 }
 
 // inOrder returns the rows of a query over the period of `lookback` before
@@ -835,6 +852,7 @@ func TestPGBaselineUnitOfSeveral(t *testing.T) {
 	f := newPolicyFixture(t)
 	f.host("app-01", "10.0.0.11")
 	f.host("app-02", "10.0.0.21")
+	f.host("app-03", "10.0.0.31")
 	m := 20 * time.Minute
 	for _, p := range [][3]string{
 		{"app-01", "app.service", "shop/app"}, {"app-01", "app.service", "envoy"}, {"app-01", "app.service", "agent"},
@@ -842,6 +860,10 @@ func TestPGBaselineUnitOfSeveral(t *testing.T) {
 		{"app-01", "app.service2", "nc"},
 		// app.service of app-02 runs none of the services of the baseline.
 		{"app-02", "app.service", "curl"},
+		// app.service of app-03 runs another service, with a baseline that
+		// holds what curl does on app-01: a unit is of its host, and the
+		// services of a unit of the same name elsewhere judge nothing here.
+		{"app-03", "app.service", "other/app"},
 	} {
 		f.proc(p[0], p[1], p[2])
 	}
@@ -853,7 +875,8 @@ func TestPGBaselineUnitOfSeveral(t *testing.T) {
 	f.edge("app-02", "curl", "client", "tcp", "10.0.0.21", "203.0.113.66", 4444, m, m)
 	f.approve("services:\n  - service: shop/app\n    dependencies:\n      - {peer: ~unresolved, port: 5432, proto: tcp}\n" +
 		"  - service: envoy\n    dependencies:\n      - {peer: ~unresolved, port: 9901, proto: tcp}\n" +
-		"  - {service: agent, dependencies: []}\n")
+		"  - {service: agent, dependencies: []}\n" +
+		"  - service: other/app\n    dependencies:\n      - {peer: ~external, port: 4444, proto: tcp}\n")
 	// What one of the services of the unit approves is no drift of the
 	// process; the rest is told once, under the first of them.
 	want := []string{"agent ~external 80 [app-01] [wget]", "agent ~external 4444 [app-01] [curl]"}
