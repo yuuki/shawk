@@ -432,13 +432,13 @@ func (f impactFixture) both(clientHost, clientSvc, clientAddr, serverHost, serve
 
 // impact returns the dependents of a target over the period of the tests:
 // "depth client_host client_service client_addr -> server_host
-// server_service port observed_by cadence".
+// server_service port observed_by cadence", sorted by bytes.
 func (f impactFixture) impact(target string) []string {
 	f.t.Helper()
 	rows, err := f.conn.Query(context.Background(), fmt.Sprintf(`
 SELECT depth || ' ' || coalesce(client_host, '-') || ' ' || client_service || ' ' || coalesce(host(client_addr), '-')
        || ' -> ' || server_host || ' ' || coalesce(server_service, '-') || ' ' || port || ' ' || observed_by || ' ' || coalesce(cadence, '-')
-FROM shawk_v1.impact(%s) ORDER BY 1`, fmt.Sprintf(target, ts(impactSince), ts(impactUntil))))
+FROM shawk_v1.impact(%s)`, fmt.Sprintf(target, ts(impactSince), ts(impactUntil))))
 	if err != nil {
 		f.t.Fatal(err)
 	}
@@ -446,6 +446,10 @@ FROM shawk_v1.impact(%s) ORDER BY 1`, fmt.Sprintf(target, ts(impactSince), ts(im
 	if err != nil {
 		f.t.Fatal(err)
 	}
+	// Sorted here, not by the database, whose order depends on its
+	// collation: C for test/harness/postgres.sh, en_US.utf8 for the postgres
+	// image of CI, which sorts "- ~external" after "app-01".
+	slices.Sort(out)
 	return out
 }
 
