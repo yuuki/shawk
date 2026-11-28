@@ -224,8 +224,9 @@ func nftFrame(chain string, enforce bool) (before, after []string) {
 	}, common...)
 	return append(before, "ct direction == reply; accept"), []string{
 		fmt.Sprintf("ct label in %d; counter %s; accept", label, counter),
-		fmt.Sprintf("ct state in new; tcp flags & fin syn rst ack != syn; counter %s; %s; accept", counter, log),
-		fmt.Sprintf("set ct label %d; counter %s; %s", label, counter, log),
+		log,
+		fmt.Sprintf("ct state in new; tcp flags & fin syn rst ack != syn; counter %s; accept", counter),
+		fmt.Sprintf("set ct label %d; counter %s", label, counter),
 	}
 }
 

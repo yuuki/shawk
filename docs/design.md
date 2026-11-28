@@ -2717,6 +2717,13 @@ reviewer can widen a rule to the range he knows.
     uncounted, the others are counted. The log has the first packet of a
     labelled connection only, and every packet of one that cannot have a
     label, within the same limit;
+  - the log is a rule of its own, in both forms, with its limit and
+    nothing else. What follows a limit in a rule is not done once the
+    limit is passed, so a verdict, a counter or a label beside it would
+    depend on how many lines were logged in that second: with the log in
+    the rule that accepts a connection taken up after its start, the
+    twenty-first such connection of a second went on to the next rule and
+    got the label of what no rule lists;
   - the lines of the flows are the same in both forms, in the same order,
     and every rule of the frame of the audit form accepts or goes on: it
     rejects nothing. It counts what the form that rejects would refuse

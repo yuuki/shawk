@@ -392,16 +392,16 @@ var (
 		"\t\tcounter name \"egress_unlisted\" reject with icmpx admin-prohibited":                  true,
 		"\t\tcounter name \"ingress_unlisted\" drop":                                               true,
 		// What the audit form has in their place, and around the flows.
-		"\t\tct state new,related ct label set 125":                                  true,
-		"\t\tct state established,related ct label 125 ct label & 126 != 126 accept": true,
-		"\t\tct state established,related ct label 125 ct label & 127 != 127 accept": true,
-		"\t\tct direction reply accept":                                              true,
-		"\t\tct label 126 counter name \"egress_unlisted\" accept":                   true,
-		"\t\tct label 127 counter name \"ingress_unlisted\" accept":                  true,
-		"\t\tct state new tcp flags & (fin | syn | rst | ack) != syn counter name \"egress_unlisted\" limit rate 10/second burst 20 packets log prefix \"shawk-policy unlisted egress: \" accept":   true,
-		"\t\tct state new tcp flags & (fin | syn | rst | ack) != syn counter name \"ingress_unlisted\" limit rate 10/second burst 20 packets log prefix \"shawk-policy unlisted ingress: \" accept": true,
-		"\t\tct label set 126 counter name \"egress_unlisted\" limit rate 10/second burst 20 packets log prefix \"shawk-policy unlisted egress: \"":                                                 true,
-		"\t\tct label set 127 counter name \"ingress_unlisted\" limit rate 10/second burst 20 packets log prefix \"shawk-policy unlisted ingress: \"":                                               true,
+		"\t\tct state new,related ct label set 125":                                                            true,
+		"\t\tct state established,related ct label 125 ct label & 126 != 126 accept":                           true,
+		"\t\tct state established,related ct label 125 ct label & 127 != 127 accept":                           true,
+		"\t\tct direction reply accept":                                                                        true,
+		"\t\tct label 126 counter name \"egress_unlisted\" accept":                                             true,
+		"\t\tct label 127 counter name \"ingress_unlisted\" accept":                                            true,
+		"\t\tct state new tcp flags & (fin | syn | rst | ack) != syn counter name \"egress_unlisted\" accept":  true,
+		"\t\tct state new tcp flags & (fin | syn | rst | ack) != syn counter name \"ingress_unlisted\" accept": true,
+		"\t\tct label set 126 counter name \"egress_unlisted\"":                                                true,
+		"\t\tct label set 127 counter name \"ingress_unlisted\"":                                               true,
 	}
 	// A set of more addresses than fit a line is written over several,
 	// which nftJoin puts back on one.
@@ -610,8 +610,7 @@ func TestWriteNftables(t *testing.T) {
 		t.Errorf("the form that rejects allows\n%s\nand the audit form\n%s", strings.Join(rejecting, "\n"), strings.Join(audit, "\n"))
 	}
 	for form, ends := range map[string][2]string{
-		modeAudit: {"\t\tct label set 126 counter name \"egress_unlisted\" limit rate 10/second burst 20 packets log prefix \"shawk-policy unlisted egress: \"\n\t}\n",
-			"\t\tct label set 127 counter name \"ingress_unlisted\" limit rate 10/second burst 20 packets log prefix \"shawk-policy unlisted ingress: \"\n\t}\n"},
+		modeAudit: {"\t\tct label set 126 counter name \"egress_unlisted\"\n\t}\n", "\t\tct label set 127 counter name \"ingress_unlisted\"\n\t}\n"},
 		modeEnforce: {"\t\tcounter name \"egress_unlisted\" reject with icmpx admin-prohibited\n\t}\n",
 			"\t\tcounter name \"ingress_unlisted\" drop\n\t}\n"},
 	} {
@@ -663,19 +662,39 @@ func TestWriteNftables(t *testing.T) {
 			"ct state new,related ct label set 125", "ct state established,related ct label 125 ct label & 126 != 126 accept",
 			`oifname "lo" accept`, "meta l4proto != { tcp, udp } accept", "ct direction reply accept",
 			`ct label 126 counter name "egress_unlisted" accept`,
-			`ct state new tcp flags & (fin | syn | rst | ack) != syn counter name "egress_unlisted" limit rate 10/second burst 20 packets log prefix "shawk-policy unlisted egress: " accept`,
-			`ct label set 126 counter name "egress_unlisted" limit rate 10/second burst 20 packets log prefix "shawk-policy unlisted egress: "`,
+			`limit rate 10/second burst 20 packets log prefix "shawk-policy unlisted egress: "`,
+			`ct state new tcp flags & (fin | syn | rst | ack) != syn counter name "egress_unlisted" accept`,
+			`ct label set 126 counter name "egress_unlisted"`,
 			"type filter hook input priority filter; policy accept;",
 			"ct state new,related ct label set 125", "ct state established,related ct label 125 ct label & 127 != 127 accept",
 			`iifname "lo" accept`, "meta l4proto != { tcp, udp } accept", "ct direction reply accept",
 			`ct label 127 counter name "ingress_unlisted" accept`,
-			`ct state new tcp flags & (fin | syn | rst | ack) != syn counter name "ingress_unlisted" limit rate 10/second burst 20 packets log prefix "shawk-policy unlisted ingress: " accept`,
-			`ct label set 127 counter name "ingress_unlisted" limit rate 10/second burst 20 packets log prefix "shawk-policy unlisted ingress: "`,
+			`limit rate 10/second burst 20 packets log prefix "shawk-policy unlisted ingress: "`,
+			`ct state new tcp flags & (fin | syn | rst | ack) != syn counter name "ingress_unlisted" accept`,
+			`ct label set 127 counter name "ingress_unlisted"`,
 		},
 	}
 	for form, want := range wantFrames {
 		if !slices.Equal(frames[form], want) {
 			t.Errorf("the frame of the %s form:\n%s\nwant:\n%s", form, strings.Join(frames[form], "\n"), strings.Join(want, "\n"))
+		}
+	}
+	// A limit is in a rule with the log alone, in both forms: what follows
+	// a limit in a rule is not done once the limit is passed, so a verdict,
+	// a counter or a label beside it would depend on how much was logged.
+	for _, form := range []string{modeAudit, modeEnforce} {
+		limits := 0
+		for _, line := range frames[form] {
+			if !strings.Contains(line, "limit ") {
+				continue
+			}
+			limits++
+			if !regexp.MustCompile(`^limit rate 10/second burst 20 packets log prefix "shawk-policy unlisted (egress|ingress): "$`).MatchString(line) {
+				t.Errorf("the %s form has a limit in a rule that does more than log: %q", form, line)
+			}
+		}
+		if limits != 2 {
+			t.Errorf("the %s form has %d rules with a limit, want one per chain", form, limits)
 		}
 	}
 	// The audit form tells what its counters count and what they cannot

@@ -166,10 +166,12 @@ table inet shawk_policy {
 		# What no rule lists: counted, and logged at its first packet; not rejected (audit form).
 		# The later packets of a connection that has the label:
 		ct label 126 counter name "egress_unlisted" accept
+		# The log, with a limit that decides nothing else.
+		limit rate 10/second burst 20 packets log prefix "shawk-policy unlisted egress: "
 		# A TCP connection that the tracking takes up after its start: counted once, not labelled.
-		ct state new tcp flags & (fin | syn | rst | ack) != syn counter name "egress_unlisted" limit rate 10/second burst 20 packets log prefix "shawk-policy unlisted egress: " accept
+		ct state new tcp flags & (fin | syn | rst | ack) != syn counter name "egress_unlisted" accept
 		# The first packet of a connection, and every packet of one that cannot have a label.
-		ct label set 126 counter name "egress_unlisted" limit rate 10/second burst 20 packets log prefix "shawk-policy unlisted egress: "
+		ct label set 126 counter name "egress_unlisted"
 	}
 
 	chain input {
@@ -202,9 +204,11 @@ table inet shawk_policy {
 		# What no rule lists: counted, and logged at its first packet; not rejected (audit form).
 		# The later packets of a connection that has the label:
 		ct label 127 counter name "ingress_unlisted" accept
+		# The log, with a limit that decides nothing else.
+		limit rate 10/second burst 20 packets log prefix "shawk-policy unlisted ingress: "
 		# A TCP connection that the tracking takes up after its start: counted once, not labelled.
-		ct state new tcp flags & (fin | syn | rst | ack) != syn counter name "ingress_unlisted" limit rate 10/second burst 20 packets log prefix "shawk-policy unlisted ingress: " accept
+		ct state new tcp flags & (fin | syn | rst | ack) != syn counter name "ingress_unlisted" accept
 		# The first packet of a connection, and every packet of one that cannot have a label.
-		ct label set 127 counter name "ingress_unlisted" limit rate 10/second burst 20 packets log prefix "shawk-policy unlisted ingress: "
+		ct label set 127 counter name "ingress_unlisted"
 	}
 }

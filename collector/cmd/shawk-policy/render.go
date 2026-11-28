@@ -672,15 +672,21 @@ func writeNftables(b *strings.Builder, r *rulesReport) {
 			}
 		}
 		b.WriteString("\n")
+		// The log has a rule of its own in both forms. A statement after a
+		// limit is not reached once the limit is passed: a verdict or a
+		// label in the same rule would then depend on how much was logged
+		// in that second.
 		log := fmt.Sprintf("%s log prefix \"shawk-policy unlisted %s: \"", nftLogLimit, direction)
 		if audit {
 			comment(b, "\t\t", "What no rule lists: counted, and logged at its first packet; not rejected (audit form).",
 				"The later packets of a connection that has the label:")
 			fmt.Fprintf(b, "\t\tct label %d counter name \"%s\" accept\n", label, counter)
+			comment(b, "\t\t", "The log, with a limit that decides nothing else.")
+			fmt.Fprintf(b, "\t\t%s\n", log)
 			comment(b, "\t\t", "A TCP connection that the tracking takes up after its start: counted once, not labelled.")
-			fmt.Fprintf(b, "\t\tct state new tcp flags & (fin | syn | rst | ack) != syn counter name \"%s\" %s accept\n", counter, log)
+			fmt.Fprintf(b, "\t\tct state new tcp flags & (fin | syn | rst | ack) != syn counter name \"%s\" accept\n", counter)
 			comment(b, "\t\t", "The first packet of a connection, and every packet of one that cannot have a label.")
-			fmt.Fprintf(b, "\t\tct label set %d counter name \"%s\" %s\n", label, counter, log)
+			fmt.Fprintf(b, "\t\tct label set %d counter name \"%s\"\n", label, counter)
 		} else {
 			comment(b, "\t\t", "What no rule lists: logged, counted and refused.")
 			fmt.Fprintf(b, "\t\t%s\n", log)

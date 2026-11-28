@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -47,11 +48,15 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-// netHelper runs a helper: `serve udp:ADDR tcp:ADDR ...` answers every
-// message on the addresses until it is killed, and `flow udp|tcp LOCAL
-// REMOTE` opens one connection from LOCAL to REMOTE, then sends a message
-// and waits for its answer once per line of its input, and writes `ok` or
-// `fail` with the reason.
+// netHelper runs a helper. `serve udp:ADDR tcp:ADDR ...` answers every
+// message on the addresses until it is killed, and at every line of its
+// input sends a message of its own on each TCP connection it accepted,
+// then writes how many. `flow udp|tcp LOCAL REMOTE` opens one connection
+// from LOCAL to REMOTE, then sends a message and waits for its answer once
+// per line of its input, and writes `ok` or `fail` with the reason.
+// `flows ADDR REMOTE N` opens N TCP connections from ADDR and, per line of
+// its input, sends a message on each and waits for the answer (`q`) or
+// only waits for a message (`r`), and writes on how many it came.
 func netHelper(args []string) int {
 	out := bufio.NewWriter(os.Stdout)
 	say := func(format string, a ...any) {
@@ -59,7 +64,49 @@ func netHelper(args []string) int {
 		out.Flush()
 	}
 	switch args[0] {
+	case "flows":
+		n, err := strconv.Atoi(args[3])
+		if err != nil {
+			say("fail %v", err)
+			return 1
+		}
+		conns := make([]net.Conn, 0, n)
+		for range n {
+			local, err := net.ResolveTCPAddr("tcp4", args[1]+":0")
+			if err != nil {
+				say("fail %v", err)
+				return 1
+			}
+			d := net.Dialer{LocalAddr: local, Timeout: 2 * time.Second}
+			c, err := d.Dial("tcp4", args[2])
+			if err != nil {
+				say("fail %v", err)
+				return 1
+			}
+			conns = append(conns, c)
+		}
+		say("ready")
+		in := bufio.NewScanner(os.Stdin)
+		buf := make([]byte, 64)
+		for in.Scan() {
+			came := 0
+			if in.Text() == "q" {
+				for _, c := range conns {
+					_, _ = c.Write([]byte("q"))
+				}
+			}
+			for _, c := range conns {
+				_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+				if _, err := c.Read(buf); err == nil {
+					came++
+				}
+			}
+			say("%d", came)
+		}
+		return 0
 	case "serve":
+		var accepted []net.Conn
+		var mu sync.Mutex
 		for _, a := range args[1:] {
 			proto, addr, _ := strings.Cut(a, ":")
 			if proto == "udp" {
@@ -89,6 +136,9 @@ func netHelper(args []string) int {
 					if err != nil {
 						return
 					}
+					mu.Lock()
+					accepted = append(accepted, c)
+					mu.Unlock()
 					go func() {
 						buf := make([]byte, 64)
 						for {
@@ -102,6 +152,18 @@ func netHelper(args []string) int {
 			}()
 		}
 		say("ready")
+		in := bufio.NewScanner(os.Stdin)
+		for in.Scan() {
+			mu.Lock()
+			sent := 0
+			for _, c := range accepted {
+				if _, err := c.Write([]byte("p")); err == nil {
+					sent++
+				}
+			}
+			mu.Unlock()
+			say("%d", sent)
+		}
 		select {}
 	case "flow":
 		var local net.Addr
@@ -255,11 +317,42 @@ func (f *netFlow) end() {
 }
 
 // serve answers messages on addresses of a namespace.
-func (lab *netLab) serve(ns *heldNetns, addrs ...string) {
+func (lab *netLab) serve(ns *heldNetns, addrs ...string) *netFlow {
 	lab.t.Helper()
-	if f := lab.helper(ns, "serve "+strings.Join(addrs, " ")); !f.opened {
+	f := lab.helper(ns, "serve "+strings.Join(addrs, " "))
+	if !f.opened {
 		lab.t.Fatalf("the helper cannot serve %v: %s", addrs, f.out.Text())
 	}
+	return f
+}
+
+// flows opens n TCP connections from an address of a namespace.
+func (lab *netLab) flows(ns *heldNetns, local, remote string, n int) *netFlow {
+	lab.t.Helper()
+	f := lab.helper(ns, fmt.Sprintf("flows %s %s %d", local, remote, n))
+	if !f.opened {
+		lab.t.Fatalf("the helper cannot open %d connections from %s to %s: %s", n, local, remote, f.out.Text())
+	}
+	return f
+}
+
+// ask writes a line to a helper that answers with a number, and returns
+// the number: the connections that a server sent a message on (any line),
+// or those of `flows` on which the answer to a message (`q`) or a message
+// (`r`) came.
+func (f *netFlow) ask(line string) int {
+	f.t.Helper()
+	if _, err := io.WriteString(f.in, line+"\n"); err != nil {
+		f.t.Fatalf("%s: %v", f.name, err)
+	}
+	if !f.out.Scan() {
+		f.t.Fatalf("%s: the helper ended", f.name)
+	}
+	n, err := strconv.Atoi(f.out.Text())
+	if err != nil {
+		f.t.Fatalf("%s: %q", f.name, f.out.Text())
+	}
+	return n
 }
 
 // flow opens a connection from an address of a namespace.
@@ -487,6 +580,51 @@ func TestAuditFormOfOpenConnections(t *testing.T) {
 	}
 	if f := lab.flow(lab.h, "tcp", "10.0.0.11:0", "10.0.0.10:5432"); f.exchange(1) != 1 {
 		t.Error("the form that rejects refused a connection that a rule lists")
+	}
+}
+
+// TestAuditFormTakesUpManyConnections: on a host that tracked no connection
+// before, the audit form starts the tracking, which takes the open
+// connections up from their next packet. Where the side that answers sends
+// that packet, no rule lists it: such a connection is counted once, and
+// not again, however many are taken up in the same second. The log has a
+// limit of 20 lines at once, and what a rule does after its limit is not
+// done beyond it: with the log in the rule that accepts, the connections
+// beyond the limit went on to the next rule, got the label of what no rule
+// lists, and were counted at every packet for as long as they lived.
+func TestAuditFormTakesUpManyConnections(t *testing.T) {
+	lab := newNetLab(t)
+	const n = 60
+	lab.serve(lab.p, "tcp:10.0.0.10:5432")
+	server := lab.serve(lab.h, "tcp:10.0.0.11:8080")
+	// Connections that the rules list, both ways, open before any table.
+	opened := lab.flows(lab.h, "10.0.0.11", "10.0.0.10:5432", n)
+	accepted := lab.flows(lab.p, "10.0.0.12", "10.0.0.11:8080", n)
+	if a, b := opened.ask("q"), accepted.ask("q"); a != n || b != n {
+		t.Fatalf("before the table, %d and %d of %d connections each way answered", a, b, n)
+	}
+	lab.load(render(testReport(t, target{Host: "app-01"}, formatNftables, ingressSources, labFlows()...)))
+	// The host, which accepted them, sends first on its 60 connections:
+	// each is taken up from that packet, which no rule lists.
+	if sent, came := server.ask("push"), accepted.ask("r"); sent != n || came != n {
+		t.Fatalf("the host sent on %d of its %d connections, and %d messages came", sent, n, came)
+	}
+	if egress, ingress := lab.counters(); egress != n || ingress != 0 {
+		t.Errorf("%d connections taken up from the side that answers: %d egress and %d ingress packets counted, want one each", n, egress, ingress)
+	}
+	// From then on they are connections that began under the table: three
+	// more messages each from the host, and a message with its answer each
+	// way, count nothing.
+	for range 3 {
+		if sent, came := server.ask("push"), accepted.ask("r"); sent != n || came != n {
+			t.Fatalf("the host sent on %d of its %d connections, and %d messages came", sent, n, came)
+		}
+	}
+	if a, b := opened.ask("q"), accepted.ask("q"); a != n || b != n {
+		t.Fatalf("under the audit form, %d and %d of %d connections each way answered", a, b, n)
+	}
+	if egress, ingress := lab.counters(); egress != 0 || ingress != 0 {
+		t.Errorf("after the counters were cleared, %d egress and %d ingress packets of listed connections counted", egress, ingress)
 	}
 }
 
