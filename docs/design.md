@@ -3055,8 +3055,14 @@ transport.
   findings are still one per process, peer and port, and the way out is
   the baseline of the tools by their own names (`-all`). And a process
   that wants to stay unseen under a baseline can start in a shared unit
-  (`systemd-run`, a session): it is then judged by no baseline, as any
-  name without one, and shows in the list and in the new services only.
+  (`systemd-run --scope`, a session): it is then judged by no baseline,
+  as any name without one. It is in the list only where a service of the
+  baseline runs in that same shared unit on its host, and among the new
+  services only when its name was never seen before on any host. A tool
+  of a common name (`curl`) that leaves the unit of its service for a
+  transient scope therefore shows nowhere: the drift is `CLEAN`, the
+  list is empty and no new service is counted. Giving such names a
+  baseline of their own (`-all`) is what judges them wherever they run.
 - **What this does not detect**, said under every drift: a process that
   takes the name of *another* service of the baseline is judged by that
   baseline, and may use what it approves; a process in a unit that runs
@@ -3163,7 +3169,17 @@ hold (`baseline_drift()`).
     machine id under the same host name, whose first report is after the
     last report of the old one, replaces it: the old machine counts for
     nothing from then on. Two machines that report under one name at the
-    same time are still two (`several_machines`, above).
+    same time are still two (`several_machines`, above). The rule reads
+    the name and the order of the reports, and nothing else, so it is
+    wrong both ways. *It forgets a host that is only silent*: when the
+    agent of a host stops and another machine then reports under its
+    name (a second machine that was given the name, a clone), the silent
+    host counts as replaced, and the answer for its services goes from
+    `INCONCLUSIVE` to `CLEAN` although it may run on. *It does not see
+    every replacement*: a host that is installed again under another
+    name, or whose new machine reported before the old one stopped (ten
+    minutes of both are enough), is not replaced by this rule; the old
+    machine stays not observed for the memory, a week by default.
   - *A short gap is shown as what it is.* A host that restarted counts as
     observed for the 3 minutes of the tolerance, and for a longer gap the
     reports give its length beside its name (`web-01 for 6m`), so that a
@@ -3891,7 +3907,11 @@ bound above holds. A store whose receiver takes less needs a smaller
     alert. The kinds are a list (`shawk.shared_unit()`): a unit of
     another kind that many users share, as `cron.service`, is judged as
     one workload. A process that starts itself in a shared unit is
-    judged by no baseline, as any name without one.
+    judged by no baseline, as any name without one, and shows nowhere
+    unless a service of the baseline runs in that unit (the list) or its
+    name is new to the fleet (the new services): a `curl` that moves to a
+    transient scope leaves the drift `CLEAN`. Names that have a baseline
+    of their own are judged wherever they run.
   - *A port that the kernel chose* approves the ports that the kernel
     chose for every server of the name, not for the one server that was
     seen: the name, the port and the transport are all that a baseline
@@ -3935,7 +3955,11 @@ bound above holds. A store whose receiver takes less needs a smaller
     one of them is silent, until another host runs it or it is taken out
     of the baseline. A host that was installed
     again under its name is told apart: its first machine is gone once
-    the new one reports. A restart of an agent, or a reboot, that takes
+    the new one reports. The same makes a host whose agent is only
+    silent count as gone when another machine reports under its name
+    afterwards; and a reinstall under another name, or one whose
+    machines both reported for a while, is not told apart and waits for
+    the memory. A restart of an agent, or a reboot, that takes
     more than the 3 minutes of the tolerance makes the drift of its
     services `INCONCLUSIVE` for the hour that holds it; the report gives
     the length of the gap, so that it reads as a reboot.

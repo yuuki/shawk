@@ -140,13 +140,17 @@
   `baseline_status`, which `shawk-policy` and the connector read, and the
   tables of the baseline, and `baseline_unjudged()`. What they return is
   ordered by the bytes of names, whatever the collation of the database.
-  A database that a build from before this release migrated must be
-  created again: the texts of `0005_impact.sql` and `0006_policy.sql`
-  changed until the release, a migration is applied once by its number,
-  and `shawk-migrate` calls such a database up to date while the commands
-  fail on it. Drop the database, or its schemas `shawk` and `shawk_v1`,
-  and migrate again; a database that only released versions migrated
-  (up to `0004`) upgrades as usual.
+  Migrations `0005_impact.sql` and `0006_policy.sql` are released
+  together: their texts changed until the release, and 0006 comes with
+  the last text of 0005. A database that a build from before this
+  release migrated must be created again: a migration is applied once by
+  its number, so `shawk-migrate` calls such a database up to date and
+  leaves it as it is. With an earlier 0006, `shawk-policy` fails on it;
+  with an earlier 0005 alone, the commands run with the earlier
+  `coverage_gaps()`, `dependents()` and `impact()`, whose order follows
+  the collation of the database. Drop the database, or its schemas
+  `shawk` and `shawk_v1`, and migrate again; a database that only
+  released versions migrated (up to `0004`) upgrades as usual.
 
 **Upgrading.** Run `shawk-migrate` and `grants.sql` again (migrations 0004
 to 0006), and upgrade every connector: one of an earlier version records

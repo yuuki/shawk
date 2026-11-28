@@ -451,7 +451,11 @@ To alert on a service that does something its baseline does not hold:
    hosts come and go (1 hour at least; a memory shorter than the period
    that is evaluated counts as that period). A host that is installed
    again under its name replaces its first machine as soon as it
-   reports.
+   reports. This reads the host name and the order of the reports only:
+   another machine that reports under the name of a host whose agent is
+   merely stopped makes that host count as gone, and a reinstall under
+   another name, or with both machines reporting for a while, is not
+   seen as one and alerts until the memory ends.
    `prometheus/tests` holds unit tests of these alerts
    (`promtool test rules baseline.test.yml`).
 4. When it fires, `shawk-policy drift -service NAME` lists the hosts and
@@ -464,7 +468,12 @@ To alert on a service that does something its baseline does not hold:
    a baseline of `python3` would otherwise judge every program of every
    user beside it. `drift` lists what such processes did next to a
    service of the baseline, under the drift, and no alert fires for it:
-   give the tools that matter a baseline of their own name. To approve a
+   give the tools that matter a baseline of their own name. A process
+   that leaves the unit of its service for such a unit
+   (`systemd-run --scope`) is judged by no baseline, and shows in the
+   list only where a service of the baseline runs in that same unit, and
+   among the new services only if its name is new to the fleet: a `curl`
+   that does so shows nowhere unless `curl` has a baseline. To approve a
    dependency, add its line to the file, or write the service again and
    review the difference. Write it with `-merge` and the file of the
    connector: a file written for some services without it is a part of
@@ -506,12 +515,16 @@ Migration 0006 adds the tables of the baseline and the functions that
 `baseline_drift()` and the others). It changes no table that holds
 history. A connector of an earlier version ignores them; one with
 `baseline_file` needs the migration, and waits for it like any other.
-A database that a build from before the release of 0005 and 0006
-migrated (a build of a development branch) must be created again: their
-texts changed until the release, and a migration is applied once, by its
-number, so `shawk-migrate` calls such a database up to date while
-`shawk-policy` and `shawk-impact` fail on it. Drop it, or its schemas
-`shawk` and `shawk_v1`, and migrate again.
+Migrations 0005 and 0006 are released together: 0006 comes with the
+last text of 0005, which changed until then. A database that a build
+from before that release migrated (a build of a development branch)
+must be created again: a migration is applied once, by its number, so
+`shawk-migrate` calls such a database up to date and leaves it as it is.
+With an earlier 0006, `shawk-policy` fails on it. With an earlier 0005
+alone, the commands run with the earlier `coverage_gaps()`,
+`dependents()` and `impact()`, whose order follows the collation of the
+database. Drop such a database, or its schemas `shawk` and `shawk_v1`,
+and migrate again.
 
 ## HPC clusters
 
