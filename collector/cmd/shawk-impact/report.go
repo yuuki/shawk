@@ -309,7 +309,10 @@ FROM shawk_v1.impact($1, $2, $3, $4, $5, $6, $7, $8)`, t[0], period[0], period[1
 	if len(hosts) == 0 {
 		return r, nil
 	}
-	rows, err = tx.Query(ctx, `SELECT `+coverageColumns+` FROM shawk_v1.coverage($1, $2, $3) ORDER BY host`, period[0], period[1], hosts)
+	// By bytes, as the dependents are (shawk_v1.impact): the collation of
+	// the database does not change the report.
+	rows, err = tx.Query(ctx, `SELECT `+coverageColumns+` FROM shawk_v1.coverage($1, $2, $3) ORDER BY host COLLATE "C"`,
+		period[0], period[1], hosts)
 	if err != nil {
 		return r, fmt.Errorf("the coverage of the clients: %w", err)
 	}
