@@ -374,10 +374,22 @@ shawk-policy rules -dsn-file /etc/shawk/impact-dsn -host app-01 -unit app.servic
   compare `ss -s` with the limit and raise it first. And the form that
   rejects, loaded without the audit form on such a host, stops the open
   connections whose peer sends next. The audit form uses the connection
-  labels 125 to 127 and compares the connections that were open before
-  it with the rules at every packet of their opening side: it costs
-  processor time on a host with much traffic on old connections, for as
-  long as it is loaded.
+  labels 125 to 127. It compares a connection that no rule lists, and
+  one that was open before it, with every rule at every packet of its
+  opening side: with 400 rules, a sender on such a connection had a
+  tenth of its rate left on an idle machine and a sixth on a loaded one,
+  and with a few rules nothing was measured. A host with much traffic
+  that no rule lists (a tunnel of the kernel) is slowed like this for as
+  long as the audit form is loaded.
+- Look for another table that takes traffic out of the connection
+  tracking (`nft list ruleset | grep notrack`; a DNS cache on the node
+  does it for port 53). The form that rejects refuses the answers of such
+  traffic although a rule lists the connection; the audit form counts
+  them.
+- A connection keeps its label when the table is loaded again. If you
+  take a rule out of the file by hand and load it again, a connection
+  that the rule listed when it began is not counted: it is compared with
+  the rules when it is opened again.
 - A rule of UDP has a second rule for the other way, between the same
   port on both sides of the same peer (`udp sport P udp dport P`), for
   sockets that send and receive first on one port (gossip, NTP between

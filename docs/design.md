@@ -2696,7 +2696,14 @@ reviewer can widen a rule to the range he knows.
   - *protocols other than TCP and UDP*, which the table accepts;
   - *destinations that the host rewrites*, where an agent did not learn
     them (above);
-  - *what the host forwards*.
+  - *what the host forwards*;
+  - *traffic that another table takes out of the connection tracking*
+    (`notrack`, as a DNS cache on the node does for port 53). Its answers
+    belong to no tracked connection, so the rule for what is established
+    does not accept them, and no rule of flows lists a packet from the
+    port of a server: the form that rejects refuses the answers of a
+    connection that it lists. The audit form counts them, and the file
+    tells how to look for such a table.
 - **The audit form shows a connection for as long as it lives.** A
   counter that counted the first packet of what no rule lists would give
   a false answer for exactly the traffic that matters: a connection that
@@ -2741,9 +2748,31 @@ reviewer can widen a rule to the range he knows.
   a kernel without connection labels, and that it must not be loaded
   where another tool uses the same ones. The kernel gives the storage of
   labels to the connections that begin while a rule uses labels, which
-  is why one that was open before cannot have one. *What it costs*: such
-  a connection is compared with the rules at every packet of its opening
-  side until it ends; one that begins under the table, once.
+  is why one that was open before cannot have one.
+
+  *What it costs*, which the file says with the numbers. A connection
+  that begins under the table and that a rule lists is compared with the
+  rules once. A connection that no rule lists, and one that was open
+  before the table, is compared with every rule of its chain at every
+  packet of its opening side, for as long as it lives. The cost grows
+  with the number of rules. With 402 rules in the chain `output` and one
+  sender of UDP in a network namespace (the listed flow at the last
+  rule; another table tracking connections in every case):
+
+  | packets a second | idle machine, 4 CPUs | loaded machine (the third review) |
+  |---|---|---|
+  | no table | 600,000 to 650,000 | 450,000 |
+  | audit form, listed, began under the table | 580,000 | 430,000 |
+  | audit form, not listed | 54,000 | 69,000 |
+  | audit form, open before the table | 56,000 to 60,000 | 69,000 |
+  | form that rejects | 450,000 to 500,000 | 440,000 to 560,000 |
+
+  With the two rules of a small host no difference was measured. A host
+  with much traffic that no rule lists, which is what a tunnel of the
+  kernel is, or with busy connections that were open before the table,
+  therefore has a tenth to a sixth of its rate left on those while the
+  audit form is loaded, where the chain has hundreds of rules. The audit
+  form has four more rules in a chain than the form that rejects.
 
   *What it cannot show*, which the file says: a connection whose opening
   side sends nothing during the watch; and, on a host where the table
@@ -2758,7 +2787,15 @@ reviewer can widen a rule to the range he knows.
   cannot be told from a new one: it is followed from the side that sent
   next, and one that a rule lists the other way keeps counting until it
   pauses. Both limits are of hosts that tracked no connection before;
-  where the host did, every connection that sends is compared.
+  where the host did, every connection that sends is compared. The third
+  is of every host: a label stays with its connection when the table is
+  loaded again, also after `nft delete table`. A connection that a rule
+  listed when it began keeps the label of one that began under the
+  table, and is not compared again when that rule is taken out of the
+  file by hand and the file loaded: its counters stay at 0, and the form
+  that rejects lets it go on until it is opened again. (The other way
+  round is compared: a connection that no rule listed and that a rule
+  lists now stops counting.)
 - **From the audit form to rules that reject.** The files tell the
   procedure, which also keeps open connections alive. On a host where
   nothing used the connection tracking, the tracking does not know the
@@ -3803,7 +3840,15 @@ bound above holds. A store whose receiver takes less needs a smaller
     and starts the connection tracking where nothing used it, whose table
     has a limit (`nf_conntrack_max`): a full table drops new connections.
     That last case is read from the documentation of the kernel, not
-    run.
+    run. A connection that a rule listed when it began is not compared
+    again after the rule was taken out and the table loaded again. With
+    hundreds of rules, traffic that no rule lists and traffic of
+    connections that were open before the table has a tenth to a sixth
+    of its rate left while the audit form is loaded (§6.4).
+  - *Traffic outside the connection tracking.* Where another table takes
+    traffic out of the tracking (`notrack`), the form that rejects
+    refuses the answers of connections that it lists; the audit form
+    counts them.
   - *UDP both ways.* The other way of a UDP flow is allowed between the
     port of the flow on both sides only. A peer that starts from another
     port later than the tracking remembers the exchange (a server that

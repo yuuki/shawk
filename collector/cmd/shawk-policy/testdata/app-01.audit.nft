@@ -51,6 +51,10 @@
 #     -ingress none there
 #   - what the host forwards for containers or virtual machines: it does not pass the hooks input
 #     and output, and no chain forward is written
+#   - traffic that another table takes out of the connection tracking (notrack, as a DNS cache on
+#     the node does for port 53): its answers are of no tracked connection, so the rejecting form
+#     refuses them although a rule lists the connection, and the audit form counts them. Look for
+#     it: nft list ruleset | grep notrack
 #   - destinations that the host rewrites (DNAT, as kube-proxy does): the agents of this host
 #     learned them in the period, and the rules list the backends they saw
 #
@@ -110,11 +114,21 @@
 #     it). An exchange of UDP that was going on then is followed from the side that sent
 #     next: one that a rule lists the other way keeps counting until it pauses for longer
 #     than net.netfilter.nf_conntrack_udp_timeout_stream.
+#   - A connection that a rule listed when it began, after that rule was taken out and
+#     the table loaded again (also after nft delete table): the connection keeps the
+#     label of one that began under the table, and is not compared again. It is compared
+#     when it is opened again.
 #
 # What this audit form costs
-#   The connections that were open before a table with its labels was loaded are compared
-#   with the rules at every packet of their opening side, until they end; those that
-#   begin under it, at their first packet (and at every packet if no rule lists them).
+#   A connection that no rule lists, and one that was open before a table with these
+#   labels was loaded, is compared with every rule of its chain at every packet of its
+#   opening side, for as long as it lives; one that begins under the table and that a
+#   rule lists, once. In tests with 400 rules in the chain, a single sender of UDP on such
+#   a connection had a tenth of its rate left on an idle machine (55,000 of 600,000
+#   packets a second) and a sixth on a loaded one (69,000 of 450,000); with a few rules
+#   nothing was measured. A host with much traffic of this kind, as that of a tunnel of
+#   the kernel which no rule lists, is slowed like this for as long as the audit form is
+#   loaded. The form has four more rules in a chain than the rejecting form.
 #   It uses the connection labels 125, 126 and 127: nft refuses the file as a whole on a
 #   kernel without connection labels, and it must not be loaded where another tool uses
 #   the same labels (conntrack -L -o labels shows them).

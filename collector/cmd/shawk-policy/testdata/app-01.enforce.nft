@@ -51,6 +51,10 @@
 #     -ingress none there
 #   - what the host forwards for containers or virtual machines: it does not pass the hooks input
 #     and output, and no chain forward is written
+#   - traffic that another table takes out of the connection tracking (notrack, as a DNS cache on
+#     the node does for port 53): its answers are of no tracked connection, so the rejecting form
+#     refuses them although a rule lists the connection, and the audit form counts them. Look for
+#     it: nft list ruleset | grep notrack
 #   - destinations that the host rewrites (DNAT, as kube-proxy does): the agents of this host
 #     learned them in the period, and the rules list the backends they saw
 #

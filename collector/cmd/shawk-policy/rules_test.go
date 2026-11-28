@@ -674,6 +674,10 @@ func TestWriteNftables(t *testing.T) {
 			`ct label set 127 counter name "ingress_unlisted"`,
 		},
 	}
+	// The audit form says how many more rules it has in a chain.
+	if d := (len(wantFrames[modeAudit]) - len(wantFrames[modeEnforce])) / 2; d != 4 {
+		t.Errorf("the audit form has %d more rules in a chain than the form that rejects, and its header says four", d)
+	}
 	for form, want := range wantFrames {
 		if !slices.Equal(frames[form], want) {
 			t.Errorf("the frame of the %s form:\n%s\nwant:\n%s", form, strings.Join(frames[form], "\n"), strings.Join(want, "\n"))
@@ -703,8 +707,11 @@ func TestWriteNftables(t *testing.T) {
 	for form, wants := range map[string][]string{
 		modeAudit: {"# How to go from this file to rules that reject\n", "#      stays open keeps counting after the counters are cleared",
 			"# What the counters of this audit form cannot show\n", "#   - A connection whose opening side sends nothing while you watch",
-			"# What this audit form costs\n", "net.netfilter.nf_conntrack_max"},
-		modeEnforce: {"# Before loading this file\n", "is established when it is loaded, listed or not", "net.netfilter.nf_conntrack_max"},
+			"#   - A connection that a rule listed when it began, after that rule was taken out and\n",
+			"# What this audit form costs\n", "had a tenth of its rate left on an idle machine", "four more rules in a chain than the rejecting form",
+			"net.netfilter.nf_conntrack_max", "nft list ruleset | grep notrack"},
+		modeEnforce: {"# Before loading this file\n", "is established when it is loaded, listed or not", "net.netfilter.nf_conntrack_max",
+			"nft list ruleset | grep notrack"},
 	} {
 		r.Mode = form
 		text := render(r)
