@@ -181,30 +181,42 @@ Dependents
 DEPTH  CLIENT            SERVER           PORT      SEEN BY  CADENCE     LAST SEEN             NEXT ACTIVITY
 1      app-01 shop/app   db-01 postgres   5432/tcp  both     continuous  2026-10-30T00:00:00Z  now
 1      batch-01 billing  db-01 postgres   5432/tcp  both     monthly     2026-10-01T03:00:00Z  about 2026-10-31T01:00:00Z
-2      web-01 nginx      app-01 shop/app  8080/tcp  both     continuous  2026-10-30T00:00:00Z  now
+2      web-01 nginx      app-01 shop/app  8080/tcp  both     -           2026-10-30T00:00:00Z  -
+The cadence is read to depth 1 (-cadence-depth).
 
 Observation of the hosts that tell
-HOST   ROLE    OBSERVED  NOT OBSERVED  GAPS  PARTLY OBSERVED  NO UDP  NO UNIX  ONE NETNS
-db-01  target  100%      0s            0     0s               0s      0s       0s
+HOST   ROLE    COVERAGE  NOT OBSERVED  GAPS  PARTLY OBSERVED  NO UDP  NO UNIX  ONE NETNS
+db-01  target  1         0s            0     0s               0s      0s       0s
 and 3 clients observed all along
+The coverage is from 0 to 1. A gap of 3m or less is not counted: an agent that
+restarts within it is not seen to.
 
-Only TCP, UDP and Unix stream sockets are observed: a host used over RDMA, or less
-often than the period, looks unused (docs/design.md, sections 6.3 and 10).
+Only TCP, UDP and Unix stream sockets are observed: a host used over RDMA, one that
+only forwards packets, or one used less often than the period, looks unused
+(docs/design.md, sections 6.3 and 10).
 ```
 
 - `UNSAFE`: something used the target in the period. The cadence of each
   dependent tells when it would break: at once, or at the next run of a
-  batch (an estimate from the hours in which it was active).
-- `SAFE`: nothing used it, and its agent watched it over the whole period.
-- `INCONCLUSIVE`: nothing was seen to use it, but it was not watched all
-  along (a gap, dropped flows, UDP not traced, no agent at all), or the
-  host has no such service or port, so the absence of dependents proves
-  nothing. `-min-coverage 99.9` accepts gaps.
+  batch (an estimate from the hours in which it was active). The clients
+  whose connections the host relays in its kernel (a load balancer, a NAT
+  gateway) are dependents too, listed with the server `~relay`.
+- `SAFE`: nothing used it, and the history tells so for the whole period:
+  its agent watched it, and the period is within the retention.
+- `INCONCLUSIVE`: nothing was seen to use it, but the history cannot tell
+  that nothing did (a gap of the agent, a period longer than the
+  retention, dropped flows, UDP not traced, no agent at all), or the host
+  has no such service or port, so the absence of dependents proves
+  nothing. `-min-coverage 0.999` accepts gaps, as a part of the period
+  from 0 to 1.
 
-The exit status is 0, 3 or 4 for the three verdicts, and `-json` writes
-the report for a script. The cadences need the hours of activity that
+The exit status is 0 for `SAFE` and for nothing else, 3 for `UNSAFE` and 4
+for `INCONCLUSIVE`, and `-json` writes the report for a script. It needs
+PostgreSQL: the SQLite lightweight mode keeps no history to tell from, and
+the command refuses it. The cadences need the hours of activity that
 connectors record from this version on; before that they are `unknown`.
-The rules are in [design §6.3](docs/design.md#63-impact-of-removing-a-host-or-a-service).
+The rules, and what the verdict cannot see, are in
+[design §6.3](docs/design.md#63-impact-of-removing-a-host-or-a-service).
 
 In SQL:
 

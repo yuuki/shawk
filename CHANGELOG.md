@@ -6,36 +6,56 @@
   removing a host, or a service or a port of it, would break (#231). From
   PostgreSQL, over a period (`-lookback`, 90 days), it lists the
   dependents of the target, its clients and the clients of its dependents
-  up to `-depth`, with how often each uses it and when it is next expected
-  to, tells how much of the period the target and the hosts that saw the
-  dependents were observed, and gives a verdict, which is also its exit
-  status: `SAFE` (0) when nothing used the target and its agent watched it
-  over the whole period, `UNSAFE` (3) when it has dependents, and
-  `INCONCLUSIVE` (4) when nothing was seen but the target was not watched
-  enough (a gap, dropped flows, UDP not traced, no agent) or is not known
-  (a host, a service or a port that shawk never saw, as one mistyped),
-  since a target that nobody watched may have been used. `-min-coverage` accepts gaps,
-  and `-json` writes the report for a script (`docs/design.md` §6.3).
-* PostgreSQL, migration `0004_impact.sql`: the functions
-  `shawk_v1.impact()`, `impact_verdict()` and `coverage()`, which
-  `shawk-impact` and the new dashboard **shawk / Impact** read.
-  `impact()` gives each dependent a `cadence`: `continuous`, `daily`,
-  `weekly`, `monthly`, `periodic`, `irregular`, `one-off`, `dormant` or
-  `unknown`, with the `period` and the `next_expected` run of a periodic
-  one, an estimate. `coverage()` tells how much of a period hosts were
-  observed, with what their agents did not trace.
+  up to `-depth`, with how often those of depth 1 use it and when they are
+  next expected to (`-cadence-depth` for more), tells how much of the
+  period the history covers for the target and the hosts that saw the
+  dependents, and gives a verdict, which is also its exit status: `SAFE`
+  (0, and 0 is nothing else) when nothing used the target and the history
+  tells so for the whole period, `UNSAFE` (3) when it has dependents, and
+  `INCONCLUSIVE` (4) when nothing was seen but the history cannot tell
+  that nothing used it (a gap of the agent, a period that reaches before
+  the retention, dropped flows, UDP not traced, no agent, a clock behind)
+  or the target is not known (a host, a service or a port that shawk
+  never saw, as one mistyped). `-min-coverage` accepts gaps, as a part of
+  the period from 0 to 1 like in SQL, and `-json` writes the report for a
+  script (`docs/design.md` §6.3). It needs PostgreSQL, and refuses the
+  SQLite lightweight mode, which keeps no history to give a verdict from.
+* The clients whose connections a host relays in its kernel (a load
+  balancer, a NAT gateway, a node that forwards to pods of other nodes)
+  are its dependents, with the server service `~relay`: those of the
+  translations its agent learned, and of a virtual address it holds. A
+  host that only routes or bridges is not seen to be used
+  (`docs/design.md` §10).
+* PostgreSQL, migration `0005_impact.sql`: the functions
+  `shawk_v1.impact()`, `impact_verdict()`, `coverage()` and
+  `coverage_gaps()`, which `shawk-impact` and the new dashboard
+  **shawk / Impact** read. `impact()` gives the dependents of depth 1 (or
+  up to `cadence_depth`) a `cadence`: `continuous`, `daily`, `weekly`,
+  `monthly`, `periodic`, `irregular`, `one-off`, `dormant` or `unknown`,
+  with the `period` and the `next_expected` run of a periodic one, an
+  estimate. `coverage()` tells how much of a period the history covers
+  for hosts, with what their agents did not trace, and `coverage_gaps()`
+  lists the gaps, also before the retention.
 * The connector records the hours in which each dependency was active
-  (migration `0003_edge_activity.sql`: `shawk.edge_activity` and
+  (migration `0004_edge_activity.sql`: `shawk.edge_activity` and
   `shawk.unix_edge_activity`, a row per edge and month with a bit per
   hour), from which the cadences are read. An edge keeps only when it was
   first and last seen, so the hours start with this version: the cadence
-  of what was last active before is `unknown`.
+  of what was last active before is `unknown`. The same migration records
+  the cutoff of the retention (`shawk.retention`, written by
+  `shawk.prune()`), before which nothing counts as observed for the
+  impact, and whether a connection of a client edge of a Unix socket was
+  ever established (`shawk.unix_edges.established`), so that failed
+  attempts at a socket nothing serves are no dependency.
 
-**Upgrading.** Run `shawk-migrate` and `grants.sql` again (migrations 0003
-and 0004), and upgrade every connector: one of an earlier version records
+**Upgrading.** Run `shawk-migrate` and `grants.sql` again (migrations 0004
+and 0005), and upgrade every connector: one of an earlier version records
 no hours, and the cadences of its hosts read `unknown`. The hours cost
 about 190 bytes per edge, a side of a dependency, and month in which it
-was active, kept for the retention.
+was active, kept for the retention: the table `shawk.edge_activity` can be
+larger than `shawk.edges` itself (401 MB against 364 MB for 1.1 million
+edges active in two months on average), so plan for the database to about
+double where the edges are most of it.
 
 ## [v0.11.0](https://github.com/yuuki/shawk/compare/v0.10.1...v0.11.0) (2026-11-26)
 

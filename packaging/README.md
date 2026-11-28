@@ -204,24 +204,40 @@ shawk-impact -dsn-file /etc/shawk/impact-dsn -host db-01 -json | jq .verdict
 
 - It reads `shawk_v1` and writes nothing: give it the connection string
   of a role with the privileges of `shawk_grafana`, in a file only its
-  users read, not that of `shawk_connector`.
-- Its exit status is the verdict: 0 `SAFE`, 3 `UNSAFE`, 4 `INCONCLUSIVE`
-  (1 for a failure, 2 for an invalid command line), so a runbook or a
-  pipeline can refuse to go on unless it is 0.
-- `SAFE` takes an agent on the host that observed over the whole period:
-  a host without an agent, or a name that no agent reported under, is
-  `INCONCLUSIVE` at best, and so is a service that the host does not run
-  or a port that nothing listens on, as a name mistyped would be. A period longer than the history of the agent
-  is not watched in full either. `-min-coverage 99.9` accepts gaps, which
-  the report then lists.
-- The period (`-lookback`, 90 days) must be longer than the rarest job
-  that matters: a job of every quarter is not a dependent over 90 days in
-  which it did not run.
+  users read, not that of `shawk_connector`. It needs PostgreSQL: against
+  the SQLite lightweight mode it fails, since that mode keeps no history
+  to tell from.
+- Its exit status is the verdict: 0 `SAFE` and nothing else, 3 `UNSAFE`,
+  4 `INCONCLUSIVE`; 1 for a failure, also when the verdict was printed
+  and the list of the dependents then failed, and 2 for an invalid
+  command line or `-h`. A runbook or a pipeline can refuse to go on
+  unless it is 0.
+- `SAFE` takes a history that tells that nothing used the target over the
+  whole period. It is `INCONCLUSIVE` at best for a host without an agent
+  or a name that no agent reported under; for a service that the host
+  does not run or a port that no socket of it listens on, as a name
+  mistyped would be; for a period that reaches before the first agent, or
+  before the `retention` of the connector, whose dependencies are
+  deleted; and for a host whose clock is behind, for that long before
+  now. `-min-coverage 0.999` accepts gaps, which the report then lists:
+  a part of the period from 0 to 1, as in the functions and the
+  dashboard; a percentage is refused.
+- A host that relays connections in its kernel (a load balancer, a NAT
+  gateway, a node that forwards to the pods of other nodes) has the
+  clients of the translations its agent learned, and of the virtual
+  addresses it holds, as dependents, with the server `~relay`. They count
+  for each service of the host as well, since nothing tells which one
+  keeps the translations; name a port to narrow the question. A host that
+  only routes or bridges (a router, a hypervisor) is not seen to be used.
+- The period (`-lookback`, 90 days, an hour at least) must be longer than
+  the rarest job that matters: a job of every quarter is not a dependent
+  over 90 days in which it did not run.
 - The cadence of a dependent (`continuous`, `daily`, `weekly`, `monthly`,
   ...) is read from the hours in which it was active, which connectors
   record from this version on: it is `unknown` for what was last active
   before the connectors were upgraded, and until a dependency has a day,
-  or three runs, of hours.
+  or three runs, of hours. It is read for the dependents of depth 1
+  (`-cadence-depth`), and `-` for the others.
 
 The dashboard **shawk / Impact** shows the same for a whole host over the
 time range, and the functions take the place of both in SQL:
@@ -230,11 +246,14 @@ time range, and the functions take the place of both in SQL:
 SELECT * FROM shawk_v1.impact_verdict('db-01', now() - interval '90 days', now(), target_service => 'postgres');
 SELECT * FROM shawk_v1.impact('db-01', now() - interval '90 days', now(), target_service => 'postgres');
 SELECT * FROM shawk_v1.coverage(now() - interval '90 days', now(), ARRAY['db-01', 'app-01']);
+SELECT * FROM shawk_v1.coverage_gaps(now() - interval '90 days', now(), ARRAY['db-01']);
 ```
 
 A period of months over a large fleet may take longer than the 30
 seconds `setup.sql` gives the statements of `shawk_grafana`: the panels
-then fail, and `shawk-impact` sets its own limit (`-timeout`).
+then fail, and `shawk-impact` sets its own limit (`-timeout`). On a fleet
+of 2000 hosts with 500000 dependencies in 90 days, the verdict takes
+about 5 seconds (design §6.3).
 
 ## SQLite lightweight mode (without PostgreSQL)
 
@@ -260,8 +279,9 @@ sudo systemctl restart shawk-collector
 The embedded SQLite database is internal to one collector process (protected
 by an exclusive lock file) and keeps peer-resolution state only (up to 30
 days). Long-term history, change alerts, `unobserved()` coverage gaps,
-multi-hop walks, `job_users`, `node_states_file` and `maintenance_file`
-require PostgreSQL mode.
+multi-hop walks, the impact of removing a host (`shawk-impact`, which
+refuses this mode, and the dashboard shawk / Impact), `job_users`,
+`node_states_file` and `maintenance_file` require PostgreSQL mode.
 
 ## Upgrading
 
@@ -270,11 +290,16 @@ until the schema is at least its own version, and warns when the schema is
 newer. Run `shawk-migrate` and `grants.sql` before or while upgrading the
 collectors, and upgrade all of them, along with the agents.
 
-Migration 0003 adds the hours in which each dependency was active
-(`shawk.edge_activity`), which the connectors record from then on: about
-190 bytes per edge, a side of a dependency, and month in which it was
-active, for the retention. A connector of an earlier version writes none, so upgrade all
-the connectors before reading cadences (`shawk-impact`).
+Migration 0004 adds the hours in which each dependency was active
+(`shawk.edge_activity`), which the connectors record from then on, and
+migration 0005 the functions of the impact. The hours take about 190
+bytes per edge, a side of a dependency, and month in which it was active,
+for the retention: with edges active in two months of three on average,
+the table is larger than `shawk.edges` itself (401 MB against 364 MB for
+1.1 million edges). A connector of an earlier version writes none, so
+upgrade all the connectors before reading cadences (`shawk-impact`). The
+connectors also record the cutoff of their retention from then on: a
+period that reaches before it is `INCONCLUSIVE`.
 
 ## HPC clusters
 
