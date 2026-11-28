@@ -9,7 +9,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"text/tabwriter"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -349,15 +348,13 @@ func (r *baselineReport) lines() []string {
 			lines = append(lines, "  no connection of TCP or UDP was seen: the baseline approves none")
 			continue
 		}
-		var b strings.Builder
-		tw := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(tw, "  PEER\tPORT\tHOSTS\tNAMED BY\tLAST SEEN\tADDRESSES")
+		tb := newTable()
+		tb.row("  PEER", "PORT", "HOSTS", "NAMED BY", "LAST SEEN", "ADDRESSES")
 		for _, d := range s.Dependencies {
-			fmt.Fprintf(tw, "  %s\t%d/%s\t%d\t%s\t%s\t%s\n", commentName(d.Peer), d.Port, commentName(d.Proto), len(d.Hosts),
+			tb.row("  "+commentName(d.Peer), strconv.Itoa(d.Port)+"/"+commentName(d.Proto), strconv.Itoa(len(d.Hosts)),
 				commentName(d.NamedBy), formatTime(d.LastSeen), describeStrings(d.Addresses, 3))
 		}
-		tw.Flush()
-		lines = append(lines, strings.Split(strings.TrimRight(b.String(), "\n"), "\n")...)
+		lines = append(lines, tb.lines()...)
 	}
 	lines = append(lines, "",
 		"A peer is a service by its name, as its agent or its listener tells it, a range of peer_cidrs,",

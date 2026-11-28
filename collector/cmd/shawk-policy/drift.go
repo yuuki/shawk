@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"strconv"
 	"strings"
-	"text/tabwriter"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -344,14 +344,14 @@ func (r *driftReport) text(limit int) string {
 			shown = shown[:limit]
 		}
 		b.WriteString("\nNot in the baseline\n")
-		tw := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(tw, "SERVICE\tPEER\tPORT\tHOSTS\tNAMED BY\tFIRST SEEN\tLAST SEEN\tADDRESSES")
+		tb := newTable()
+		tb.row("SERVICE", "PEER", "PORT", "HOSTS", "NAMED BY", "FIRST SEEN", "LAST SEEN", "ADDRESSES")
 		for _, d := range shown {
-			fmt.Fprintf(tw, "%s\t%s\t%d/%s\t%s\t%s\t%s\t%s\t%s\n", commentName(d.Service), commentName(d.Peer), d.Port, commentName(d.Proto),
+			tb.row(commentName(d.Service), commentName(d.Peer), strconv.Itoa(d.Port)+"/"+commentName(d.Proto),
 				describeStrings(d.Hosts, 3), commentName(d.NamedBy), formatTime(d.FirstSeen), formatTime(d.LastSeen),
 				describeStrings(d.Addresses, 3))
 		}
-		tw.Flush()
+		tb.writeTo(&b)
 		if n := len(r.Drift) - len(shown); n > 0 {
 			fmt.Fprintf(&b, "and %s (-limit 0 shows all)\n", plural(n, "more dependency", "more dependencies"))
 		}
@@ -371,12 +371,12 @@ func (r *driftReport) text(limit int) string {
 			shown = shown[:limit]
 		}
 		b.WriteString("\nNew services without a baseline, which nothing judges\n")
-		tw := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(tw, "SERVICE\tFIRST SEEN\tHOSTS")
+		tb := newTable()
+		tb.row("SERVICE", "FIRST SEEN", "HOSTS")
 		for _, n := range shown {
-			fmt.Fprintf(tw, "%s\t%s\t%s\n", commentName(n.Service), formatTime(n.FirstSeen), describeStrings(n.Hosts, 3))
+			tb.row(commentName(n.Service), formatTime(n.FirstSeen), describeStrings(n.Hosts, 3))
 		}
-		tw.Flush()
+		tb.writeTo(&b)
 		if n := len(r.NewServices) - len(shown); n > 0 {
 			fmt.Fprintf(&b, "and %s (-limit 0 shows all)\n", plural(n, "more service"))
 		}

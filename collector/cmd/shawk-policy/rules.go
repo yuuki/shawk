@@ -480,7 +480,7 @@ func (f *flow) check() error {
 		return fmt.Errorf("a flow of an unknown direction %q", f.direction)
 	case f.proto != "tcp" && f.proto != "udp":
 		return fmt.Errorf("a flow of an unknown transport %q", f.proto)
-	case !f.addr.IsValid() || f.addr.Addr().Zone() != "":
+	case !f.addr.IsValid():
 		return errors.New("a flow without a valid address")
 	case f.portFrom < 0 || f.portTo > 65535 || f.portFrom > f.portTo || f.port < 0 || f.port > 65535:
 		return fmt.Errorf("a flow with the ports %d to %d", f.portFrom, f.portTo)

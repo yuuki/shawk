@@ -5,9 +5,45 @@ import (
 	"fmt"
 	"io"
 	"net/netip"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 )
+
+// table writes rows in columns, as text/tabwriter does, without the
+// spaces it leaves at the end of a line whose last cell is empty.
+type table struct {
+	buf strings.Builder
+	tw  *tabwriter.Writer
+}
+
+func newTable() *table {
+	t := &table{}
+	t.tw = tabwriter.NewWriter(&t.buf, 0, 0, 2, ' ', 0)
+	return t
+}
+
+// row adds a row of cells.
+func (t *table) row(cells ...string) {
+	fmt.Fprintln(t.tw, strings.Join(cells, "\t"))
+}
+
+// lines returns the rows, aligned.
+func (t *table) lines() []string {
+	t.tw.Flush()
+	lines := strings.Split(strings.TrimRight(t.buf.String(), "\n"), "\n")
+	for i, l := range lines {
+		lines[i] = strings.TrimRight(l, " ")
+	}
+	return lines
+}
+
+// writeTo writes the rows, aligned.
+func (t *table) writeTo(b *strings.Builder) {
+	for _, l := range t.lines() {
+		b.WriteString(l + "\n")
+	}
+}
 
 // writeJSON writes a report as one JSON document.
 func writeJSON(w io.Writer, v any) error {
@@ -165,18 +201,18 @@ func writeRulesReport(b *strings.Builder, r *rulesReport, limit int) {
 			shown = shown[:limit]
 		}
 		b.WriteString("\nRules\n")
-		tw := tabwriter.NewWriter(b, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(tw, "DIRECTION\tPORTS\tPEER\tADDRESSES\tSERVICES\tLAST SEEN\tNOTES")
+		tb := newTable()
+		tb.row("DIRECTION", "PORTS", "PEER", "ADDRESSES", "SERVICES", "LAST SEEN", "NOTES")
 		for i := range shown {
 			ru := &shown[i]
 			peer := commentName(ru.Peer)
 			if len(ru.PeerHosts) > 0 {
 				peer += " (" + commentNames(ru.PeerHosts) + ")"
 			}
-			fmt.Fprintf(tw, "%s\t%s/%s\t%s\t%s\t%s\t%s\t%s\n", ru.Direction, ru.ports(), ru.Proto, peer,
-				describeAddresses(ru.Addresses, 3), commentNames(ru.Services), formatTime(ru.LastSeen), describeNotes(ru))
+			tb.row(ru.Direction, ru.ports()+"/"+ru.Proto, peer, describeAddresses(ru.Addresses, 3), commentNames(ru.Services),
+				formatTime(ru.LastSeen), describeNotes(ru))
 		}
-		tw.Flush()
+		tb.writeTo(b)
 		if n := len(r.Rules) - len(shown); n > 0 {
 			fmt.Fprintf(b, "and %s (-limit 0 shows all)\n", plural(n, "more rule"))
 		}
@@ -189,13 +225,13 @@ func writeRulesReport(b *strings.Builder, r *rulesReport, limit int) {
 			shown = shown[:limit]
 		}
 		b.WriteString("\nSeen before the period, and in no rule\n")
-		tw := tabwriter.NewWriter(b, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(tw, "DIRECTION\tPORT\tPEER\tADDRESS\tSERVICE\tLAST SEEN")
+		tb := newTable()
+		tb.row("DIRECTION", "PORT", "PEER", "ADDRESS", "SERVICE", "LAST SEEN")
 		for _, p := range shown {
-			fmt.Fprintf(tw, "%s\t%d/%s\t%s\t%s\t%s\t%s\n", p.Direction, p.Port, p.Proto, commentName(p.Peer), address(p.Address),
-				commentName(p.Service), formatTime(p.LastSeen))
+			tb.row(p.Direction, strconv.Itoa(p.Port)+"/"+p.Proto, commentName(p.Peer), address(p.Address), commentName(p.Service),
+				formatTime(p.LastSeen))
 		}
-		tw.Flush()
+		tb.writeTo(b)
 		if n := len(r.Before) - len(shown); n > 0 {
 			fmt.Fprintf(b, "and %s (-limit 0 shows all)\n", plural(n, "more flow"))
 		}
@@ -204,12 +240,13 @@ func writeRulesReport(b *strings.Builder, r *rulesReport, limit int) {
 }
 
 // comment writes lines as the comments of a file of rules, indented. A
-// line stays a comment whatever it holds: a line break in it is a space,
-// and it does not end with a backslash, which would continue it with the
-// next line in the files of systemd and nftables.
+// line stays a comment whatever it holds: a line break in it, or a NUL,
+// which ends a line for systemd, is a space, and it does not end with a
+// backslash, which would continue it with the next line in the files of
+// systemd and nftables.
 func comment(b *strings.Builder, indent string, lines ...string) {
 	for _, l := range lines {
-		l = strings.TrimRight(strings.NewReplacer("\n", " ", "\r", " ").Replace(l), " \t")
+		l = strings.TrimRight(strings.NewReplacer("\n", " ", "\r", " ", "\x00", " ").Replace(l), " \t")
 		if l == "" {
 			b.WriteString(indent + "#\n")
 			continue
