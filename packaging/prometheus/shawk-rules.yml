@@ -512,11 +512,15 @@ groups:
 
       # A host that runs a service of the baseline was not observed for the
       # whole period that was evaluated: its agent is stopped, it restarted
-      # for longer than 3 minutes, or its clock is behind. What the service
-      # did there is not known, and no drift is no answer for it. A host
-      # runs a service for baseline_host_memory (a week) after a process of
-      # the service was last seen on it: one that was removed counts until
-      # then.
+      # for longer than 3 minutes (a host counts as observed for 3 minutes
+      # after a report of its agent), or its clock is behind. What the
+      # service did there is not known, and no drift is no answer for it. A
+      # host runs a service for baseline_host_memory (a week) after a
+      # process of the service was last seen on it: one that was removed
+      # counts until then, unless the same host name reports again under a
+      # new machine id (a host that was installed again), which replaces
+      # it. A restart of the host is not observed for the hour that holds
+      # it: the alert then lasts that long.
       - alert: ShawkBaselineHostsNotObserved
         expr: max by (job) (shawk_baseline_hosts_unobserved) > 0
         for: 10m
@@ -524,19 +528,23 @@ groups:
           severity: warning
         annotations:
           summary: "{{ $value }} hosts that run {{ $labels.job }} were not observed: its drift from the baseline is not known"
-          description: "{{ $value }} hosts on which a process of {{ $labels.job }} was seen in the last week were not observed by their agent for the whole of the last hour. A dependency that the baseline does not hold is not told for them. `shawk-policy drift -service {{ $labels.job }}` lists the hosts: start their agents, or wait for baseline_host_memory if they were removed."
+          description: "{{ $value }} hosts on which a process of {{ $labels.job }} was seen in the last week were not observed by their agent for the whole of the last hour: an agent that is stopped, a restart of more than 3 minutes within the hour, or a clock that is behind. A dependency that the baseline does not hold is not told for them. `shawk-policy drift -service {{ $labels.job }}` lists the hosts with how long each was not observed: start their agents, or wait for baseline_host_memory if they were removed."
 
-      # No host is known to run a service of the baseline: nothing was
-      # there to see what it did. The service was renamed, or removed, or
-      # its hosts were all silent for longer than baseline_host_memory.
+      # Nothing judges a service of the baseline: no host runs it, and no
+      # host that ran it before is observed, or no process of it was ever
+      # seen. The service was renamed, or its hosts are gone or silent. A
+      # service that simply does not run now, as a monthly job or a tool
+      # that ran once, on hosts that are observed, is judged on those
+      # hosts (shawk_baseline_hosts counts them): it did nothing, and this
+      # alert does not fire.
       - alert: ShawkBaselineServiceWithoutHosts
         expr: max by (job) (shawk_baseline_hosts) == 0
         for: 10m
         labels:
           severity: warning
         annotations:
-          summary: "no host is known to run {{ $labels.job }}, which has a baseline: nothing judges it"
-          description: "No process of {{ $labels.job }} was seen on any host in the last week (baseline_host_memory). Its baseline judges nothing: check the name of the service, start the agents of its hosts, or take it out of the baseline file."
+          summary: "no observed host is known to run or to have run {{ $labels.job }}, which has a baseline: nothing judges it"
+          description: "No process of {{ $labels.job }} was seen on any host in the last week (baseline_host_memory), and no host that ran it before is observed. Its baseline judges nothing: check the name of the service, start the agents of its hosts, or take it out of the baseline file."
 
       - alert: ShawkBaselineFileInvalid
         expr: max(shawk_baseline_file_failed) > 0
@@ -544,8 +552,8 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "the baseline file of a connector cannot be read"
-          description: "The latest read of a baseline_file failed (shawk_v1.baseline_status tells why): the baseline read before stays, so a change that was approved in the file does not hold yet."
+          summary: "the baseline of PostgreSQL does not follow the baseline file of a connector"
+          description: "The latest read of a baseline_file failed (shawk_v1.baseline_status tells why), or the file is valid and could not be written to PostgreSQL (the log of the connector tells why): the baseline written before stays, so a change that was approved in the file does not hold yet, and nothing is judged if none was written."
 
       # More dependencies drift than the connector sends series for (20 per
       # service, 1000 in all): the others are in no series, and alert

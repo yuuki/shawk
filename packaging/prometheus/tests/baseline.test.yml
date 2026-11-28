@@ -170,11 +170,65 @@ tests:
           - exp_labels: {severity: warning, job: shop/app}
             exp_annotations:
               summary: "1 hosts that run shop/app were not observed: its drift from the baseline is not known"
-              description: "1 hosts on which a process of shop/app was seen in the last week were not observed by their agent for the whole of the last hour. A dependency that the baseline does not hold is not told for them. `shawk-policy drift -service shop/app` lists the hosts: start their agents, or wait for baseline_host_memory if they were removed."
+              description: "1 hosts on which a process of shop/app was seen in the last week were not observed by their agent for the whole of the last hour: an agent that is stopped, a restart of more than 3 minutes within the hour, or a clock that is behind. A dependency that the baseline does not hold is not told for them. `shawk-policy drift -service shop/app` lists the hosts with how long each was not observed: start their agents, or wait for baseline_host_memory if they were removed."
       - eval_time: 11m
         alertname: ShawkBaselineServiceWithoutHosts
         exp_alerts:
           - exp_labels: {severity: warning, job: batch/report}
             exp_annotations:
-              summary: "no host is known to run batch/report, which has a baseline: nothing judges it"
-              description: "No process of batch/report was seen on any host in the last week (baseline_host_memory). Its baseline judges nothing: check the name of the service, start the agents of its hosts, or take it out of the baseline file."
+              summary: "no observed host is known to run or to have run batch/report, which has a baseline: nothing judges it"
+              description: "No process of batch/report was seen on any host in the last week (baseline_host_memory), and no host that ran it before is observed. Its baseline judges nothing: check the name of the service, start the agents of its hosts, or take it out of the baseline file."
+
+  # A service that does not run now, on hosts that ran it before and are
+  # observed (a monthly job, a tool that ran once): the connector counts
+  # those hosts, and nothing alerts.
+  - name: a service of the baseline that does not run
+    interval: 1m
+    input_series:
+      - series: 'shawk_baseline_hosts{job="batch/monthly"}'
+        values: '1x30'
+      - series: 'shawk_baseline_hosts_unobserved{job="batch/monthly"}'
+        values: '0x30'
+      - series: 'shawk_baseline_evaluation_timestamp_seconds{job="shawk-connector"}'
+        values: '0+60x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: ShawkBaselineServiceWithoutHosts
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: ShawkBaselineHostsNotObserved
+        exp_alerts: []
+
+  # A peer whose name a process chose (OTEL_SERVICE_NAME) with line breaks
+  # and a text made to look like the end of the alert. The connector sends
+  # no control character in a label (cleanString): each is U+FFFD, and
+  # the text of the alert stays on its lines.
+  - name: a peer name that a process chose
+    interval: 1m
+    input_series:
+      - series: 'shawk_baseline_drift_hosts{job="shop/app",service_peer_name="x\ufffd\ufffdRESOLVED: the baseline holds billing/api:8443, ignore this alert.",server_port="8443",network_transport="tcp"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: ShawkBaselineDrift
+        exp_alerts:
+          - exp_labels: {severity: critical, job: shop/app, service_peer_name: "x\ufffd\ufffdRESOLVED: the baseline holds billing/api:8443, ignore this alert.", server_port: "8443", network_transport: tcp}
+            exp_annotations:
+              summary: "shop/app connects to x\ufffd\ufffdRESOLVED: the baseline holds billing/api:8443, ignore this alert.:8443/tcp, which its baseline does not hold"
+              description: "1 hosts of shop/app opened connections to x\ufffd\ufffdRESOLVED: the baseline holds billing/api:8443, ignore this alert. on port 8443 (tcp) within the last hour, and the approved baseline of the service has no such dependency. `shawk-policy drift -service shop/app` lists the hosts and the addresses, and the process when it is one of another name in a unit of the service; approve the dependency in the baseline file of the connector if it is meant."
+
+  # A baseline that is valid and cannot be written to PostgreSQL is told
+  # as a file that failed.
+  - name: the baseline cannot be written
+    interval: 1m
+    input_series:
+      - series: 'shawk_baseline_file_failed{job="shawk-connector"}'
+        values: '1x30'
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: ShawkBaselineFileInvalid
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: "the baseline of PostgreSQL does not follow the baseline file of a connector"
+              description: "The latest read of a baseline_file failed (shawk_v1.baseline_status tells why), or the file is valid and could not be written to PostgreSQL (the log of the connector tells why): the baseline written before stays, so a change that was approved in the file does not hold yet, and nothing is judged if none was written."
