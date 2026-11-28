@@ -2018,7 +2018,15 @@ limits (§10). From them:
   that address (`masquerade_not_traced`). A server in the namespace of
   its client is reached by nothing that the host masqueraded, since what
   is delivered locally is not translated on its way out: a host that
-  talks to itself over its own address stays its own.
+  talks to itself over its own address stays its own. This is the case
+  of a Kubernetes node whose kubelet probes its pods, and of a Docker
+  host at its defaults, whose `docker-proxy` connects to the containers
+  over the bridge: with an agent that folds, such a host has a coverage
+  of 0 for as long as those edges last, which no `min_coverage` accepts.
+  Once its agent runs with `-fold-external none`, the time before still
+  counts: the host is `INCONCLUSIVE` until the period asked for starts
+  after the change (10 days after it, a period of 90 days has a coverage
+  of 0.11, and one of 9 days is `SAFE`).
 - **A dependent with an agent is followed**: the clients of its service on
   its host are the dependents of the next depth, up to `max_depth`. Each
   dependent is reported once, at the depth it is first reached, with the
@@ -2151,7 +2159,11 @@ A dependent of the last four has a `period`, the median interval, and
     starts before the upgrade `INCONCLUSIVE` for as long as the period,
     with the history at hand. A prune that its bound of rows cut short
     leaves older edges, so the start may be earlier than that cutoff
-    until the next prune records its own;
+    until the next prune records its own. Where every edge left is
+    recent, as in a small database whose dependencies are all in use, the
+    start is recent too, and it never moves back, whatever the retention
+    of later prunes: every host is then `INCONCLUSIVE` for periods that
+    reach before it, until they no longer do;
   - without dropped flows (`dropped_flows`, `partly_observed()`), in every
     network namespace (`netns_limited`), with UDP unless the target is of
     another transport (`udp_not_traced`), and with Unix sockets when the
@@ -2679,12 +2691,16 @@ bound above holds. A store whose receiver takes less needs a smaller
   - *Masquerade.* The clients from outside that a host masqueraded to a
     pod or a container of its own are told by the translations its agent
     learned, and the verdict is not `SAFE` where the agent traces none or
-    folds external peers (§6.3). Translations are also missing for
-    connections confirmed before the agent started, when the table of the
-    agent overflowed (`shawk.agent.translations.dropped`), and with a
-    datapath without netfilter conntrack (§3.7): such a client then shows
-    only as the address of the host, which a client on the host may
-    explain. Nor are protocols other than TCP, UDP and
+    folds external peers (§6.3). With an agent that traces translations
+    and folds nothing, a history without a translation still reads as
+    no masqueraded client, and the verdict may be `SAFE`, where the
+    translation is missing for another reason: a connection confirmed
+    before the agent started, a table of translations of the agent that
+    overflowed, or a datapath without netfilter conntrack (§3.7). Such a
+    client shows only as the address of the host, which a client on the
+    host may explain. The overflow is counted in Prometheus
+    (`shawk.agent.translations.dropped`, to be watched) and not kept in
+    PostgreSQL, so the verdict cannot know of it. Nor are protocols other than TCP, UDP and
     Unix stream sockets seen (RDMA, SCTP, ICMP, VRRP), nor what a service
     needs to run at all without a connection: a container runtime, a
     supervisor.

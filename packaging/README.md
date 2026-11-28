@@ -239,8 +239,18 @@ shawk-impact -dsn-file /etc/shawk/impact-dsn -host db-01 -json | jq .verdict
   tell them apart, and such clients are dependents; an agent that folds
   external peers (`-fold-external in`, the default) or traces no
   translation does not learn them, and the verdict on the host is then
-  `INCONCLUSIVE` (`masquerade_not_traced`) rather than `SAFE`. Run the
-  agents of such hosts with `-fold-external none` to decide it.
+  `INCONCLUSIVE` (`masquerade_not_traced`) rather than `SAFE`. The same
+  holds for a Docker host at its defaults, whose `docker-proxy` connects
+  to the containers over the bridge. The coverage of such a host is 0
+  while those connections last, which no `-min-coverage` accepts. Run
+  the agents of such hosts with `-fold-external none` to decide it, and
+  allow for the time before the change: the verdict stays `INCONCLUSIVE`
+  until the period asked for starts after it, so ask with a `-lookback`
+  no longer than the time since (9 days, 10 days after the change), or
+  wait for the lookback to pass. Translations are also missing for
+  connections older than the agent and when its table of translations
+  overflowed (`shawk_agent_translations_dropped_total` in Prometheus,
+  which PostgreSQL does not hold): watch that counter on such hosts.
 - The period (`-lookback`, 90 days, an hour at least) must be longer than
   the rarest job that matters: a job of every quarter is not a dependent
   over 90 days in which it did not run.
@@ -316,7 +326,10 @@ upgrade all the connectors before reading cadences (`shawk-impact`). The
 connectors also record the cutoff of their retention from then on: a
 period that reaches before it is `INCONCLUSIVE`. The migration starts
 that record from the oldest edge the database still holds, so a period
-that reaches before it is `INCONCLUSIVE` right after the upgrade too.
+that reaches before it is `INCONCLUSIVE` right after the upgrade too. In
+a database whose edges are all recent, that start is recent as well and
+does not move back: periods that reach before it stay `INCONCLUSIVE`
+until they no longer do.
 
 ## HPC clusters
 
