@@ -2613,10 +2613,10 @@ hold (`baseline_drift()`).
   warning that waits (§8), apart from the alert on servers that shawk
   names.
 - **No drift is an answer only where someone looked**: `shawk-policy
-  drift` is `INCONCLUSIVE` when no connector read a baseline, when a
-  service asked for has none, or when a host of a service was not
-  observed for the whole period, and the connector tells when it last
-  evaluated (§5.9).
+  drift` is `INCONCLUSIVE` when no connector read a baseline or the
+  baseline holds no service, when a service asked for has none, or when
+  a host of a service was not observed for the whole period, and the
+  connector tells when it last evaluated (§5.9).
 
 **Cost.** Each function reads the dependencies of the period once
 (`dependencies_between()`), like the impact, and the last known endpoints
@@ -2634,8 +2634,10 @@ and `drift` 1.4.
 - **The joins of the flows hash**, as those of `shawk.dependents()`: the
   edges of a host are joined with rows of a function, of which the
   planner knows nothing, and with nested loops the flows of the host with
-  4449 clients took 22 seconds. The JIT compiler is off in these
-  functions: it took 2 seconds to compile what then ran for one.
+  4449 clients took 22 seconds. The edges and the translations of the
+  host are read through their indexes all the same, by its host ids as
+  values. The JIT compiler is off in these functions: it took 2 seconds
+  to compile what then ran for one.
 
 ## 7. Counting each dependency once
 

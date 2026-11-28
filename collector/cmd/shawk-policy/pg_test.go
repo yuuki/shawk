@@ -397,6 +397,13 @@ services:
 		t.Errorf("baseline of every service: exit status %d, %v, %+v", code, err, b)
 	}
 
+	// Over a period in which nothing connected, -all finds no service: no
+	// file is written, and the status is not that of a complete history.
+	if code, out, _ = f.run("baseline", "-all", "-until", f.end.Add(-200*day).Format(time.RFC3339), "-lookback", "1d"); code != exitIncomplete ||
+		strings.Contains(out, "services:") || !strings.Contains(out, "\nNo baseline is written: none of the services was seen in the period.\n") {
+		t.Errorf("baseline of every service of a period without any: exit status %d\n%s", code, out)
+	}
+
 	// A service that no process had is never written: a name mistyped
 	// would approve nothing, and a file of no service drops every baseline.
 	code, out, _ = f.run("baseline", "-service", "ngimx", "-allow-incomplete")
@@ -556,6 +563,11 @@ at another address is no drift, and ~external does not tell one public address f
 		!strings.Contains(stable(out), "  - the latest read of a baseline_file failed: the baseline is the one read before, at TIME "+
 			`("services[0]: no dependencies")`+"\n") {
 		t.Errorf("drift with a baseline that is stale: exit status %d\n%s", code, out)
+	}
+	// A baseline of no service judges nothing: that is no answer either.
+	f.approve("services: []\n")
+	if code, out, _ = f.run("drift"); code != exitInconclusive || !strings.Contains(out, "         - the baseline holds no service: nothing is judged\n") {
+		t.Errorf("with a baseline of no service: exit status %d\n%s", code, out)
 	}
 	// Approved, the drift is gone.
 	f.approve(`

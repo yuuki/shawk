@@ -4,7 +4,6 @@ import (
 	"cmp"
 	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"net/netip"
@@ -623,5 +622,3 @@ func writeRules(w io.Writer, r *rulesReport, limit int) error {
 	_, err := io.WriteString(w, b.String())
 	return err
 }
-
-var _ flag.Value = (*names)(nil)

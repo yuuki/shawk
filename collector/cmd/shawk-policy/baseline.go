@@ -289,8 +289,9 @@ func (r *baselineReport) finish(other *shawkconnector.Baseline, allowIncomplete 
 	if len(out.Services) == 0 {
 		// None of the services asked for was seen, and there is no file to
 		// keep the others of: a file of no service, taken for the
-		// baseline, would drop every baseline.
-		r.Refused = true
+		// baseline, would drop every baseline. Nothing is written, which
+		// is not the answer of a history that is complete.
+		r.Refused, r.Status = true, statusIncomplete
 		return nil
 	}
 	out.Normalize()

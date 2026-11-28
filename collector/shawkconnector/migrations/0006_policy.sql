@@ -67,10 +67,8 @@ CREATE TABLE shawk.baseline_state (
 -- The names are made for the rows that the caller reads only: those of a
 -- host on either side (of_host), of clients with an agent (clients_only),
 -- of the services of of_services, and of the services that have a
--- baseline (with_baseline). A name costs calls of peer_class and of
--- dependency_port, a few seconds for the hundreds of thousands of
--- dependencies of a period of months, which the rows of one host or one
--- service do not need.
+-- baseline (with_baseline), rather than for the hundreds of thousands of
+-- dependencies of a period of months.
 --
 -- Nested loops are on within the function, whatever its caller sets
 -- (policy_flows turns them off): the dependencies of the period and the
@@ -254,14 +252,19 @@ RETURNS TABLE (
   peer text, peer_host text, translated boolean, kernel_chosen boolean,
   first_seen timestamptz, last_seen timestamptz)
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp SET enable_nestloop = off SET jit = off AS $$
-WITH e AS MATERIALIZED (
+WITH
+-- The host ids of the name, as values: the edges and the translations of
+-- the host are then read through their indexes, whatever joins them.
+t AS MATERIALIZED (
+  SELECT ARRAY(SELECT h.id FROM shawk.hosts h WHERE h.hostname = policy_flows.target_host) AS ids
+),
+e AS MATERIALIZED (
   SELECT e.id, e.host_id, e.process_id, e.role, e.proto, e.local_addr, e.remote_addr, e.port, e.netns,
          e.first_seen, e.last_seen, p.service_name AS service, p.unit,
          e.last_seen >= policy_flows.since AS in_period
-  FROM shawk.hosts h
-  JOIN shawk.edges e ON e.host_id = h.id
+  FROM shawk.edges e
   JOIN shawk.processes p ON p.id = e.process_id
-  WHERE h.hostname = policy_flows.target_host
+  WHERE e.host_id = ANY ((SELECT t.ids FROM t)::text[])
     AND policy_flows.since < policy_flows.until
     AND e.first_seen <= policy_flows.until
     AND (policy_flows.target_unit IS NULL OR p.unit = policy_flows.target_unit OR p.service_name = '~unknown')
@@ -271,6 +274,14 @@ nd AS MATERIALIZED (
   FROM shawk.named_dependencies(policy_flows.since, policy_flows.until, policy_flows.target_host) d
   WHERE EXISTS (SELECT FROM e WHERE e.in_period)
 ),
+-- The ports that the kernel chose for a listener in the period, by host:
+-- few, read through their index.
+kc AS MATERIALIZED (
+  SELECT DISTINCT h.hostname, o.proto, o.port
+  FROM shawk.listener_owners o
+  JOIN shawk.hosts h ON h.id = o.host_id
+  WHERE o.kernel_chosen_seen >= policy_flows.since
+),
 -- The names of the servers of the client edges, the ports of their
 -- dependencies, and whether the kernel chose the port of a server.
 eg AS MATERIALIZED (
@@ -278,15 +289,13 @@ eg AS MATERIALIZED (
          string_agg(DISTINCT d.server_name, ', ') AS peer,
          string_agg(DISTINCT d.server_host, ', ') AS peer_host,
          bool_or(d.dependency_port = 0) AS any_port,
-         bool_or(EXISTS (SELECT FROM shawk.hosts sh
-                         JOIN shawk.listener_owners o ON o.host_id = sh.id
-                         WHERE sh.hostname = d.server_host AND o.proto = d.proto AND o.port = d.port
-                           AND o.kernel_chosen_seen >= policy_flows.since)) AS kernel_chosen
+         bool_or(kc.hostname IS NOT NULL) AS kernel_chosen
   FROM e
   JOIN nd d
     ON  d.client_host = policy_flows.target_host AND d.proto = e.proto AND d.client_addr = e.local_addr
     AND coalesce(d.virtual_addr, d.server_addr) = e.remote_addr AND coalesce(d.virtual_port, d.port) = e.port
     AND d.client_service = e.service AND d.client_unit = e.unit
+  LEFT JOIN kc ON kc.hostname = d.server_host AND kc.proto = d.proto AND kc.port = d.port
   WHERE e.role = 'client' AND e.in_period
   GROUP BY e.id
 ),
@@ -307,11 +316,12 @@ ig AS MATERIALIZED (
 -- network namespace of their socket.
 tr AS (
   SELECT DISTINCT e.id, l.backend_addr, l.backend_port
-  FROM e
-  JOIN shawk.learned_translations l
+  FROM shawk.learned_translations l
+  JOIN e
     ON  l.host_id = e.host_id AND l.proto = e.proto AND l.netns = e.netns AND l.client_addr = e.local_addr
     AND l.virtual_addr = e.remote_addr AND l.virtual_port = e.port
-  WHERE e.role = 'client' AND e.in_period
+  WHERE l.host_id = ANY ((SELECT t.ids FROM t)::text[])
+    AND e.role = 'client' AND e.in_period
     AND l.last_seen >= policy_flows.since - interval '15 minutes'
     AND l.first_seen <= policy_flows.until + interval '15 minutes'
     AND (l.backend_addr <> e.remote_addr OR l.backend_port <> e.port)

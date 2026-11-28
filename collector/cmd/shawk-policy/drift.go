@@ -23,8 +23,8 @@ Usage:
 The verdict is CLEAN when the services of the baseline, or those asked for, did
 nothing that it does not hold, and the history tells so; DRIFT when one did; and
 INCONCLUSIVE when no drift was seen but nothing tells that there was none: no
-connector read a baseline, a service asked for has none, or a host of a service
-was not observed for the whole period.
+connector read a baseline, or it holds no service, a service asked for has none,
+or a host of a service was not observed for the whole period.
 
 The period ends 5 minutes ago by default, when both sides of a new connection are
 written: before that, a server may still be named ~unresolved.
@@ -90,9 +90,9 @@ type driftReport struct {
 
 	Verdict string `json:"verdict"`
 	// Reasons tell why a verdict is INCONCLUSIVE: no_baseline (no
-	// connector read one), unlocked_service (a service asked for has
-	// none) and not_observed (a host of a service was not observed for the
-	// whole period). Caveats tell the same where a drift was seen all the
+	// connector read one), empty_baseline (it holds no service),
+	// unlocked_service (a service asked for has none) and not_observed (a
+	// host of a service was not observed for the whole period). Caveats tell the same where a drift was seen all the
 	// same, and stale_baseline: the latest read of a baseline_file failed,
 	// so the baseline is not that of the file.
 	Reasons []string `json:"reasons"`
@@ -179,10 +179,15 @@ func readDrift(ctx context.Context, tx pgx.Tx, c *driftConfig, since, until time
 		r.Baseline = &st
 	}
 	var shortfalls []string
-	if r.Baseline == nil || r.Baseline.ReadAt == nil {
+	switch {
+	case r.Baseline == nil || r.Baseline.ReadAt == nil:
 		// Nothing is judged without a baseline: no drift is no answer.
 		shortfalls = append(shortfalls, "no_baseline")
-	} else if r.Baseline.FailedAt != nil {
+	case r.Baseline.Services == 0:
+		// Nor with a baseline of no service.
+		shortfalls = append(shortfalls, "empty_baseline")
+	}
+	if r.Baseline != nil && r.Baseline.ReadAt != nil && r.Baseline.FailedAt != nil {
 		r.Caveats = append(r.Caveats, "stale_baseline")
 	}
 
@@ -284,6 +289,8 @@ func (r *driftReport) describeDriftShortfall(code string) string {
 	switch code {
 	case "no_baseline":
 		return "no connector read a baseline (baseline_file): nothing is judged"
+	case "empty_baseline":
+		return "the baseline holds no service: nothing is judged"
 	case "stale_baseline":
 		msg := "the latest read of a baseline_file failed: the baseline is the one read before"
 		if r.Baseline != nil && r.Baseline.FailedAt != nil {
@@ -322,7 +329,7 @@ func (r *driftReport) text(limit int) string {
 	switch r.Verdict {
 	case verdictDrift:
 		fmt.Fprintf(&b, "Verdict  DRIFT: %s not in the baseline of %s\n", plural(len(r.Drift), "dependency is", "dependencies are"),
-			pluralPossessive(countServices(r.Drift)))
+			plural(countServices(r.Drift), "service"))
 	case verdictClean:
 		fmt.Fprintf(&b, "Verdict  CLEAN: %s did nothing over TCP or UDP that the baseline does not hold\n",
 			plural(len(r.Asked), "service", "services"))
@@ -396,6 +403,3 @@ func countServices(deps []dependency) int {
 	}
 	return len(seen)
 }
-
-// pluralPossessive is "1 service" or "n services".
-func pluralPossessive(n int) string { return plural(n, "service") }

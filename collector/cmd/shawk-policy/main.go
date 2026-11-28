@@ -201,6 +201,8 @@ func newFlagSet(name, text string, stderr io.Writer) *flag.FlagSet {
 // names is a flag that may be given several times.
 type names []string
 
+var _ flag.Value = (*names)(nil)
+
 func (n *names) String() string { return strings.Join(*n, ",") }
 
 func (n *names) Set(s string) error {
