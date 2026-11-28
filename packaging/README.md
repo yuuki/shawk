@@ -319,19 +319,44 @@ string of `shawk-impact`, a role with the privileges of `shawk_grafana`.
 
 ```sh
 shawk-policy rules -dsn-file /etc/shawk/impact-dsn -host app-01                      # the report: what rules would hold
-shawk-policy rules -dsn-file /etc/shawk/impact-dsn -host app-01 -format nftables > app-01.nft
-shawk-policy rules -dsn-file /etc/shawk/impact-dsn -host app-01 -unit app.service -format systemd
+shawk-policy rules -dsn-file /etc/shawk/impact-dsn -host app-01 -format nftables > app-01.audit.nft
+shawk-policy rules -dsn-file /etc/shawk/impact-dsn -host app-01 -format nftables -enforce > app-01.nft
+shawk-policy rules -dsn-file /etc/shawk/impact-dsn -host app-01 -unit app.service -format systemd -enforce
 ```
 
-- Read the top of the file first: the status, what the rules pin, and
-  what they leave out. Its exit status is 0 for `COMPLETE` and nothing
-  else, and 4 for `INCOMPLETE`, when no rule is written unless
-  `-allow-incomplete`.
-- Check and try before relying on a file: `nft -c -f app-01.nft`, then
-  load it on one host and watch the counter of the last rule of each
-  chain (`nft list table inet shawk_policy`), which counts what the rules
-  refuse; `systemd-analyze verify app.service` for a drop-in. The table
-  is one of its own (`nft delete table inet shawk_policy` removes it).
+- Read the top of the file first: the status, what the rules pin, what
+  they leave out, and what shawk cannot observe. The exit status is 0 for
+  `COMPLETE` and nothing else, and 4 for `INCOMPLETE`, when no file that
+  blocks is written unless `-allow-incomplete`. The rules of a host whose
+  agent folds peers (`-fold-external in`, the default) are `INCOMPLETE`:
+  such an agent does not learn a destination that the host rewrites to an
+  address outside its internal ranges.
+- Load the audit form before the form that rejects. `-format nftables`
+  writes the audit form, which rejects nothing:
+
+  ```sh
+  nft -c -f app-01.audit.nft && nft -f app-01.audit.nft
+  nft reset counters table inet shawk_policy   # a few minutes later: until then the open connections count
+  nft list counters table inet shawk_policy    # egress_unlisted, ingress_unlisted: what no rule lists
+  journalctl -k -g 'shawk-policy unlisted'     # the same, with addresses and ports (10 lines a second at most)
+  ```
+
+  Leave it for as long as the slowest job of the host takes to come
+  round, and longer than the longest silence of its open connections.
+  Only while the counters stay at 0, load the form that rejects
+  (`nft -f app-01.nft` replaces the table in one transaction). What the
+  counters show and no history of shawk holds: the outer packets of
+  tunnels that the kernel makes (VXLAN, Geneve, WireGuard), the virtual
+  services of a host that balances with IPVS (use `-ingress none`
+  there; `shawk-policy` was not run on such a host), and destinations
+  that the host rewrites. Loaded without the audit form on a host that
+  did not track connections, the form that rejects stops the open
+  connections whose peer sends next.
+- A drop-in of systemd has no audit form: it blocks every address that it
+  does not list, for every IP protocol, as soon as the unit restarts with
+  it. Check it with `systemd-analyze verify app.service`, and the host
+  with the audit form first. The table is one of its own
+  (`nft delete table inet shawk_policy` removes it).
 - Write the rules again when peers change: they pin addresses.
 
 To alert on a service that does something its baseline does not hold:
@@ -342,16 +367,30 @@ To alert on a service that does something its baseline does not hold:
    shawk-policy baseline -dsn-file /etc/shawk/impact-dsn -service shop/app -service shop/worker > baseline.yaml
    ```
 
+   The file ends with `end: {services: N, dependencies: N}`, which tells
+   that it is whole: keep the line last, and its counts right when you
+   edit the file by hand (or write `end: {}`).
 2. Give it to every connector (`baseline_file: /etc/shawk/baseline.yaml`
    in `collector/config.yaml`), readable by `shawk-collector`. The
-   connector reads it every write interval; a file that is invalid keeps
-   the baseline read before, and `ShawkBaselineFileInvalid` alerts.
+   connector reads it every write interval; a file that is invalid, or
+   that was cut short, keeps the baseline read before, and
+   `ShawkBaselineFileInvalid` alerts.
 3. Load `prometheus/shawk-rules.yml`: `ShawkBaselineDrift` fires for a
    dependency that the baseline does not hold, once per service, server,
-   port and transport.
+   port and transport. Three alerts tell where no drift is no answer:
+   `ShawkBaselineNotEvaluated` (critical: no connector evaluates the
+   drift), `ShawkBaselineHostsNotObserved` (a host that runs a service
+   was not observed: its agent is stopped, or its clock is behind) and
+   `ShawkBaselineServiceWithoutHosts` (no host is known to run a service
+   of the file). A host runs a service for `baseline_host_memory` (a
+   week) after a process of it was last seen there, so a host that was
+   removed alerts until then: shorten it where hosts come and go.
+   `prometheus/tests` holds unit tests of these alerts
+   (`promtool test rules baseline.test.yml`).
 4. When it fires, `shawk-policy drift -service NAME` lists the hosts and
-   the addresses. To approve the dependency, add its line to the file, or
-   write the service again and review the difference:
+   the addresses, and the process when it is one of another name in a
+   unit of the service. To approve the dependency, add its line to the
+   file, or write the service again and review the difference:
 
    ```sh
    shawk-policy baseline -dsn-file /etc/shawk/impact-dsn -service shop/app -merge baseline.yaml > new.yaml

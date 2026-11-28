@@ -225,10 +225,14 @@ The same history tells what a host may be allowed to do. `shawk-policy`
 writes it as rules for a person to review, and applies nothing:
 
 ```console
-$ shawk-policy rules -dsn-file /etc/shawk/impact-dsn -host app-01 -format nftables > app-01.nft
-$ shawk-policy rules -dsn-file /etc/shawk/impact-dsn -host app-01 -unit app.service -format systemd
+$ shawk-policy rules -dsn-file /etc/shawk/impact-dsn -host app-01 -format nftables > app-01.audit.nft
+$ nft -f app-01.audit.nft                            # the audit form: it rejects nothing
+$ nft list counters table inet shawk_policy          # what the rules do not list, counted (and logged)
+$ shawk-policy rules -dsn-file /etc/shawk/impact-dsn -host app-01 -format nftables -enforce > app-01.nft
+$ shawk-policy rules -dsn-file /etc/shawk/impact-dsn -host app-01 -unit app.service -format systemd -enforce
 ...
-# Status   COMPLETE: the history tells every TCP and UDP connection of the target in the period
+# Status   COMPLETE: an agent observed the target for the whole period, so the history tells every
+#          TCP and UDP connection that its sockets made in it
 ...
 [Service]
 IPAddressDeny=any
@@ -241,13 +245,27 @@ IPAddressAllow=10.0.0.10
 - A rule denies what was not seen, so the command tells what the history
   does not hold. When it is `INCOMPLETE` (a gap of the agent, a period
   before the retention, dropped flows, UDP not traced, no agent, a host
-  or a unit that shawk does not know) it writes its report and no rule,
-  unless `-allow-incomplete`, and its exit status is 4: 0 is `COMPLETE`
-  and nothing else.
+  or a unit that shawk does not know, two machines under one host name,
+  an agent that did not learn the addresses the host rewrites its
+  connections to, which is so while it folds peers, its default) it
+  writes no file that blocks, unless `-allow-incomplete`, and its exit
+  status is 4: 0 is `COMPLETE` and nothing else.
+- **A file that blocks is asked for.** `-format nftables` writes the
+  audit form: the same rules, and what they do not list is counted and
+  logged instead of rejected. Load it first: some of what a host needs is
+  in no history of shawk (the outer packets of a VXLAN or WireGuard
+  tunnel, the virtual services of IPVS, a destination that the host
+  rewrites), and the audit form shows it before anything breaks. It also
+  lets the connection tracking of the kernel take up the connections that
+  are open, which the form that rejects would otherwise stop. `-enforce`
+  writes the form that rejects; the drop-in of systemd has no audit form,
+  and needs it.
 - A rule pins the addresses that the sockets saw. Every file says, above
   its rules, how many addresses it pins, which peers shawk could not
-  name, what was last seen before the period and so is denied, and that
-  only TCP and UDP are filtered.
+  name, what was last seen before the period and so is denied, and what
+  shawk cannot observe. A table of nftables filters TCP and UDP only; a
+  drop-in of systemd blocks every IP protocol to the addresses it does
+  not list.
 - The formats are a table of nftables for a host (`-ingress ports` opens
   what it accepts to every source) and a drop-in of systemd for a service
   unit. `RestrictAddressFamilies=` is a comment, since shawk does not
@@ -267,14 +285,20 @@ $ shawk-policy drift -dsn-file /etc/shawk/impact-dsn
 Verdict  DRIFT: 1 dependency is not in the baseline of 1 service
 
 Not in the baseline
-SERVICE   PEER         PORT      HOSTS           NAMED BY  FIRST SEEN            LAST SEEN             ADDRESSES
+SERVICE   PEER         PORT      HOSTS           NAMED BY  FIRST SEEN            LAST SEEN             ADDRESSES  NOTES
 shop/app  billing/api  8443/tcp  app-01, app-02  edge      2026-11-28T05:40:00Z  2026-11-28T06:00:00Z  10.0.0.40
 ```
 
 The alert `ShawkBaselineDrift` fires once per service, server, port and
 transport, whatever the number of hosts, and carries no address. A service
-without a baseline is not judged, and `shawk-policy drift` exits 3 for a
-drift, 0 for none and 4 when it cannot tell.
+without a baseline is not judged, except that a process of another name
+in a unit that runs a service of the baseline is judged as that service.
+`shawk-policy drift` exits 3 for a drift, 0 for none and 4 when it cannot
+tell: no drift is an answer only when every host that runs the services
+was observed, so a host whose agent is stopped makes it `INCONCLUSIVE`,
+and `ShawkBaselineHostsNotObserved` and `ShawkBaselineNotEvaluated` alert
+where the drift is not known. A baseline file ends with the line `end:`,
+which tells that it is whole: one that was cut short is refused.
 
 In SQL:
 

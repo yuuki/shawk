@@ -63,40 +63,65 @@
   period (`-lookback`, 90 days) and writes them as a table of nftables
   (`-format nftables`; `-ingress sources`, `ports` or `none` for what the
   host accepts) or, for a service unit, as a drop-in of systemd with
-  `IPAddressDeny=` and `IPAddressAllow=` (`-format systemd -unit NAME`),
-  under comments that tell what the rules pin and leave out. A rule
-  denies what was not seen: when the history does not tell every
-  connection of the target (`INCOMPLETE`: a gap of the agent, a period
-  before the retention, dropped flows, UDP not traced, no agent, a name
-  that shawk does not know), the command writes its report and no rule
-  unless `-allow-incomplete`, and exits 4; 0 is `COMPLETE` and nothing
-  else. `RestrictAddressFamilies=` is written as a comment, and
-  iptables and the policies of Kubernetes and Cilium are not written
+  `IPAddressDeny=` and `IPAddressAllow=` (`-format systemd -unit NAME
+  -enforce`), under comments that tell what the rules pin and leave out,
+  and what shawk cannot observe. The table is an audit form unless
+  `-enforce` asks for the one that rejects: it has the same rules, and
+  counts and logs what they do not list instead of refusing it, so that
+  what no history of shawk holds (the outer packets of tunnels that the
+  kernel makes, the virtual services of IPVS, a destination that the host
+  rewrites) shows before it breaks, and so that the connection tracking
+  takes up the connections that are open. A flow of UDP allows its peer
+  both ways. A rule denies what was not seen: when the history does not
+  tell every connection of the target (`INCOMPLETE`: a gap of the agent,
+  a period before the retention, dropped flows, UDP not traced, no agent,
+  a name that shawk does not know, two machines under one host name, an
+  agent that did not learn the addresses that the host rewrites its
+  connections to, as one that folds peers), the command writes no file
+  that blocks unless `-allow-incomplete`, and exits 4; 0 is `COMPLETE`
+  and nothing else. `RestrictAddressFamilies=` is written as a comment,
+  and iptables and the policies of Kubernetes and Cilium are not written
   (`docs/design.md` §6.4).
 * A baseline of dependencies, and alerts on what it does not hold (#232).
   `shawk-policy baseline -service NAME` writes the dependencies of
   services over a period as a file (`-merge FILE` replaces services in
-  one); the connector reads it with the new `baseline_file`, writes it to
-  PostgreSQL and tells Prometheus, every write interval, the dependencies
-  of those services that it does not hold:
+  one), which ends with a line that tells it is whole (`end:`); the
+  connector reads it with the new `baseline_file`, refuses one that was
+  cut short, writes it to PostgreSQL and tells Prometheus, every write
+  interval, the dependencies of those services that it does not hold:
   `shawk_baseline_drift_hosts{job, service_peer_name, server_port,
   network_transport}`, one series whatever the number of hosts, without
-  addresses, with `shawk_baseline_dependencies{job}`,
-  `shawk_baseline_drift_truncated`, `shawk_baseline_new_services`,
-  `shawk_baseline_evaluation_timestamp_seconds` and
-  `shawk_baseline_file_failed`. `packaging/prometheus/shawk-rules.yml`
-  has the alerts `ShawkBaselineDrift`, `ShawkBaselineDriftUnresolved`,
-  `ShawkBaselineNotEvaluated`, `ShawkBaselineFileInvalid`,
-  `ShawkBaselineDriftTruncated` and `ShawkNewServiceWithoutBaseline`.
-  `shawk-policy drift` lists the drift with its hosts and addresses, and
-  exits 0 for none, 3 for a drift and 4 when it cannot tell. A service
-  without a baseline is not judged. `baseline_file` is refused with the
-  SQLite lightweight mode.
+  addresses, at most 20 per service and 1000 in all, with
+  `shawk_baseline_dependencies{job}`,
+  `shawk_baseline_drift_truncated{shawk_baseline_peer}` and
+  `shawk_baseline_new_services`. No drift is an answer only where the
+  drift is known, and the connector tells where it is not:
+  `shawk_baseline_hosts{job}` and `shawk_baseline_hosts_unobserved{job}`
+  (a host runs a service for the new `baseline_host_memory`, a week,
+  after a process of it was last seen there, so a host whose agent
+  stopped is not observed rather than forgotten),
+  `shawk_baseline_evaluation_timestamp_seconds` (0 before an evaluation
+  succeeded), `shawk_baseline_evaluation_attempt_timestamp_seconds`,
+  `shawk_baseline_evaluation_failed` and `shawk_baseline_file_failed`.
+  A process of another name in a unit that runs a service of the baseline
+  is judged as that service. `packaging/prometheus/shawk-rules.yml` has
+  the alerts `ShawkBaselineDrift`, `ShawkBaselineDriftUnresolved`,
+  `ShawkBaselineNotEvaluated`, `ShawkBaselineHostsNotObserved`,
+  `ShawkBaselineServiceWithoutHosts`, `ShawkBaselineFileInvalid`,
+  `ShawkBaselineDriftTruncated`, `ShawkBaselineDriftUnresolvedTruncated`
+  and `ShawkNewServiceWithoutBaseline`, with unit tests for promtool in
+  `packaging/prometheus/tests`. `shawk-policy drift` lists the drift with
+  its hosts and addresses, and exits 0 for none, 3 for a drift and 4 when
+  it cannot tell, as when a host that runs a service was not observed. A
+  service without a baseline is not judged. `baseline_file` is refused
+  with the SQLite lightweight mode.
 * PostgreSQL, migration `0006_policy.sql`: the functions
-  `shawk_v1.policy_flows()`, `policy_verdict()`, `baseline_observed()`,
-  `baseline_verdict()`, `baseline_drift()` and `baseline_new_services()`
-  and the views `shawk_v1.baseline` and `baseline_status`, which
-  `shawk-policy` and the connector read, and the tables of the baseline.
+  `shawk_v1.policy_flows()`, `policy_verdict()`, `policy_gaps()`,
+  `baseline_observed()`, `baseline_verdict()`, `baseline_drift()` and
+  `baseline_new_services()` and the views `shawk_v1.baseline` and
+  `baseline_status`, which `shawk-policy` and the connector read, and the
+  tables of the baseline. What they return is ordered by the bytes of
+  names, whatever the collation of the database.
 
 **Upgrading.** Run `shawk-migrate` and `grants.sql` again (migrations 0004
 to 0006), and upgrade every connector: one of an earlier version records
