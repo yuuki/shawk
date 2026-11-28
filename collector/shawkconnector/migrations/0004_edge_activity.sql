@@ -39,17 +39,42 @@ CREATE INDEX unix_edge_activity_month ON shawk.unix_edge_activity (month);
 -- edge written by a connector that did not tell.
 ALTER TABLE shawk.unix_edges ADD COLUMN established boolean;
 
+-- Whether the agent of a session learns the translations of addresses that
+-- its host makes (shawk.agent.translations.traced), NULL if the connector
+-- that wrote the session did not tell. With peer_fold, it tells whether
+-- the learned translations name every client that the host masqueraded:
+-- an agent that folds its peers does not learn those of the peers outside
+-- its internal ranges (0005_impact.sql).
+ALTER TABLE shawk.agent_sessions ADD COLUMN translations_traced boolean;
+
 -- How far back the history is whole: the latest cutoff shawk.prune() was
 -- called with. An edge last seen before it is deleted, but the session of
 -- an agent that goes on is kept whole, so that the sessions alone would
 -- tell that a host was observed, and unused, in a time whose dependencies
 -- are gone. What reads the history as evidence that something was not used
 -- (0005_impact.sql) takes the time before the cutoff as not observed. No
--- row until the first prune.
+-- row for a database that never held an edge, until the first prune.
 CREATE TABLE shawk.retention (
   singleton     boolean PRIMARY KEY DEFAULT true CHECK (singleton),
   pruned_before timestamptz NOT NULL
 );
+
+-- What was pruned before this table is not recorded. The history says it
+-- all the same: a prune deletes every edge last seen before its cutoff,
+-- so the oldest time an edge still kept was last seen is no earlier than
+-- the latest cutoff, and before it the history holds no dependency that
+-- ended, whether none did or all were deleted. That time is the cutoff to
+-- start from: without it, a period longer than the retention would look
+-- whole until the next prune, and for good where none follows (a
+-- retention set to 0, connectors stopped). The time of the migration
+-- would be safe too, and would make every period that starts before the
+-- upgrade INCONCLUSIVE for as long as the period, with the history at
+-- hand. A prune that its bound of rows cut short leaves older edges: the
+-- next one records its own cutoff. No row for a database without edges.
+INSERT INTO shawk.retention (pruned_before)
+SELECT x.oldest
+FROM (SELECT least((SELECT min(last_seen) FROM shawk.edges), (SELECT min(last_seen) FROM shawk.unix_edges)) AS oldest) x
+WHERE x.oldest IS NOT NULL;
 
 -- shawk.prune() of 0002_edge_protocols.sql, which also records its cutoff
 -- (shawk.retention), first, so that no reader takes the history for whole

@@ -147,11 +147,13 @@ type sessionRow struct {
 	// of the agent, from the latest request.
 	clockSkew time.Duration
 	udpTraced bool
-	// unixTraced tells whether the agent traces Unix sockets, and
-	// protocolsClassified whether it classifies wire protocols, nil if it
-	// does not tell.
+	// unixTraced tells whether the agent traces Unix sockets,
+	// protocolsClassified whether it classifies wire protocols, and
+	// translationsTraced whether it learns the translations of addresses
+	// of its host, nil if it does not tell.
 	unixTraced          *bool
 	protocolsClassified *bool
+	translationsTraced  *bool
 	netnsScope          string
 	dropped             int64
 	// countersStarted is when the counters of the agent started, by the
@@ -494,8 +496,8 @@ func (c *changes) addSegment(b *hostBatch, h *hostChanges, f sessionFloor, skew 
 		start = f.start
 	}
 	s := sessionRow{lastHeartbeat: now, clockSkew: skew, udpTraced: b.udpTraced, unixTraced: b.unixTraced,
-		protocolsClassified: b.protocolsClassified,
-		netnsScope:          b.netnsScope, dropped: b.dropped, peerFold: b.peerFold, peerInternal: b.peerInternal}
+		protocolsClassified: b.protocolsClassified, translationsTraced: b.translationsTraced,
+		netnsScope: b.netnsScope, dropped: b.dropped, peerFold: b.peerFold, peerInternal: b.peerInternal}
 	s.countersStarted = b.droppedSince
 	if !h.addSession(start, s) {
 		c.droppedSessions++

@@ -465,7 +465,7 @@ func queueSessions(b *pgx.Batch, h *hostChanges) {
 	var starts, beats []time.Time
 	var runs []*time.Time // nil if unknown
 	var udp []bool
-	var unixTraced, classified []*bool // nil if the agent does not tell
+	var unixTraced, classified, translations []*bool // nil if the agent does not tell
 	var scopes, folds []string
 	var internals []*string
 	var dropped []int64
@@ -477,6 +477,7 @@ func queueSessions(b *pgx.Batch, h *hostChanges) {
 		udp = append(udp, s.udpTraced)
 		unixTraced = append(unixTraced, s.unixTraced)
 		classified = append(classified, s.protocolsClassified)
+		translations = append(translations, s.translationsTraced)
 		scopes = append(scopes, s.netnsScope)
 		dropped = append(dropped, s.dropped)
 		skews = append(skews, s.clockSkew.Seconds())
@@ -504,13 +505,17 @@ func queueSessions(b *pgx.Batch, h *hostChanges) {
 	// What the agent traces and folds is kept as of the latest heartbeat.
 	b.Queue(`
 INSERT INTO shawk.agent_sessions AS s (host_id, started_at, last_heartbeat, udp_traced, netns_scope, dropped_flows, clock_skew,
-                                       peer_fold, peer_internal, counters_started, unix_traced, protocols_classified)
+                                       peer_fold, peer_internal, counters_started, unix_traced, protocols_classified,
+                                       translations_traced)
 SELECT $1, u.started, u.beat, u.udp, u.scope, u.dropped, make_interval(secs => u.skew),
-       coalesce(nullif(u.fold, ''), 'none'), string_to_array(u.internal, ',')::cidr[], u.run, u.unix, u.classified
+       coalesce(nullif(u.fold, ''), 'none'), string_to_array(u.internal, ',')::cidr[], u.run, u.unix, u.classified,
+       u.translations
 FROM unnest($2::timestamptz[], $3::timestamptz[], $4::boolean[], $5::text[], $6::bigint[], $7::float8[],
-            $8::text[], $9::text[], $10::timestamptz[], $11::boolean[], $12::boolean[])
-  AS u(started, beat, udp, scope, dropped, skew, fold, internal, run, unix, classified)
+            $8::text[], $9::text[], $10::timestamptz[], $11::boolean[], $12::boolean[], $13::boolean[])
+  AS u(started, beat, udp, scope, dropped, skew, fold, internal, run, unix, classified, translations)
 ON CONFLICT (host_id, started_at) DO UPDATE SET
+  translations_traced = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat THEN excluded.translations_traced
+                        ELSE s.translations_traced END,
   clock_skew       = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat THEN excluded.clock_skew ELSE s.clock_skew END,
   udp_traced       = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat THEN excluded.udp_traced ELSE s.udp_traced END,
   unix_traced      = CASE WHEN excluded.last_heartbeat >= s.last_heartbeat THEN excluded.unix_traced ELSE s.unix_traced END,
@@ -522,7 +527,7 @@ ON CONFLICT (host_id, started_at) DO UPDATE SET
   counters_started = coalesce(s.counters_started, excluded.counters_started),
   dropped_flows    = greatest(s.dropped_flows, excluded.dropped_flows),
   last_heartbeat   = greatest(s.last_heartbeat, excluded.last_heartbeat)`,
-		h.key, starts, beats, udp, scopes, dropped, skews, folds, internals, runs, unixTraced, classified)
+		h.key, starts, beats, udp, scopes, dropped, skews, folds, internals, runs, unixTraced, classified, translations)
 }
 
 // queueListeners writes the listeners of a host: a row per listener with

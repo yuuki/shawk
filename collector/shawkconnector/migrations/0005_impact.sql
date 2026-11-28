@@ -166,7 +166,11 @@ $$;
 -- sockets, or traced one network namespace only. agent tells whether an
 -- agent of the name ever reported, and pruned is the part of the period
 -- before the retention (shawk.retention), which is not observed whatever
--- the sessions say: its dependencies are deleted.
+-- the sessions say: its dependencies are deleted. translations_untold is
+-- the time in which the translations that the agent learned do not name
+-- every client that its host masqueraded: it does not trace them (or the
+-- connector did not tell), or it folds the peers outside its internal
+-- ranges, whose translations it does not learn.
 --
 -- observed is the time for which the history tells what the host was used
 -- for. A session counts from its start, by the clock of the connector
@@ -179,7 +183,8 @@ $$;
 CREATE FUNCTION shawk.observation(since timestamptz, until timestamptz, hosts text[], tolerance interval)
 RETURNS TABLE (host text, agent boolean, observed tstzmultirange, pruned tstzmultirange,
                dropped tstzmultirange, dropped_flows bigint,
-               udp_untraced tstzmultirange, unix_untraced tstzmultirange, netns_limited tstzmultirange)
+               udp_untraced tstzmultirange, unix_untraced tstzmultirange, netns_limited tstzmultirange,
+               translations_untold tstzmultirange)
 LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $$
 WITH ids AS (
   SELECT h.id, h.hostname FROM shawk.hosts h WHERE h.hostname = ANY (observation.hosts)
@@ -187,6 +192,7 @@ WITH ids AS (
 -- Only the sessions that meet the period, as in unobserved_by_name().
 s AS (
   SELECT i.hostname, a.udp_traced, a.unix_traced, a.netns_scope, a.last_heartbeat,
+         a.peer_fold <> 'none' OR a.translations_traced IS NOT TRUE AS translations_untold,
          least(a.started_at + a.clock_skew, a.last_heartbeat - greatest(a.clock_skew, interval '0')) AS started,
          a.last_heartbeat - greatest(a.clock_skew, interval '0') AS ended
   FROM ids i
@@ -201,7 +207,8 @@ ses AS (
          range_agg(tstzrange(s.started, s.ended + observation.tolerance)) AS observed,
          range_agg(tstzrange(s.started, s.last_heartbeat)) FILTER (WHERE NOT s.udp_traced) AS udp_untraced,
          range_agg(tstzrange(s.started, s.last_heartbeat)) FILTER (WHERE s.unix_traced IS NOT TRUE) AS unix_untraced,
-         range_agg(tstzrange(s.started, s.last_heartbeat)) FILTER (WHERE s.netns_scope <> 'all') AS netns_limited
+         range_agg(tstzrange(s.started, s.last_heartbeat)) FILTER (WHERE s.netns_scope <> 'all') AS netns_limited,
+         range_agg(tstzrange(s.started, s.last_heartbeat)) FILTER (WHERE s.translations_untold) AS translations_untold
   FROM s GROUP BY s.hostname
 ),
 par AS (
@@ -223,7 +230,8 @@ SELECT n.host,
        coalesce(par.dropped_flows, 0),
        coalesce(ses.udp_untraced, '{}') * w.period,
        coalesce(ses.unix_untraced, '{}') * w.period,
-       coalesce(ses.netns_limited, '{}') * w.period
+       coalesce(ses.netns_limited, '{}') * w.period,
+       coalesce(ses.translations_untold, '{}') * w.period
 FROM (SELECT DISTINCT u.host FROM unnest(observation.hosts) AS u(host) WHERE u.host IS NOT NULL) n
 CROSS JOIN w
 LEFT JOIN ses ON ses.hostname = n.host
@@ -354,34 +362,74 @@ d AS MATERIALIZED (
   FROM shawk.dependencies_in(dependents.since, dependents.until) x
   WHERE dependents.since < dependents.until
 ),
--- The periods in which the agents of a name reported addresses, and the
--- stretches in which they reported any: when the name was seen. A period
--- starts anew after the alive window (shawk.host_addrs), so that an agent
--- that stops ends the periods of all the addresses of its host.
-hp AS (
+-- The periods in which the agents of a name reported addresses
+-- (shawk.host_addrs: a period starts anew after the alive window, so an
+-- agent that stops ends the periods of all the addresses of its host). Not
+-- the history of the retention, which may be millions of periods where
+-- hosts or pods come and go: those that meet the period asked for, and of
+-- each host the addresses of its last report before the period, which it
+-- may still hold in it. They are found from the last heartbeat of the host
+-- before the period, through the indexes of the sessions and of the
+-- addresses.
+hp AS MATERIALIZED (
   SELECT h.hostname, a.addr, a.first_seen, a.last_seen
   FROM shawk.host_addrs a
   JOIN shawk.hosts h ON h.id = a.host_id
+  WHERE a.last_seen >= dependents.since - shawk.alive_window()
+    AND a.first_seen <= dependents.until + shawk.alive_window()
+  UNION
+  SELECT h.hostname, a.addr, a.first_seen, a.last_seen
+  FROM shawk.hosts h
+  CROSS JOIN LATERAL (
+    SELECT max(s.last_heartbeat) AS at
+    FROM shawk.agent_sessions s
+    WHERE s.host_id = h.id AND s.last_heartbeat < dependents.since - shawk.alive_window()
+  ) b
+  CROSS JOIN LATERAL (
+    SELECT a.addr, a.first_seen, a.last_seen
+    FROM shawk.host_addrs a
+    WHERE a.host_id = h.id
+      AND a.last_seen >= b.at - shawk.alive_window() AND a.last_seen <= b.at + shawk.alive_window()
+    OFFSET 0
+  ) a
 ),
-hs AS (
-  SELECT s.hostname, s.seen, lag(upper(s.seen)) OVER w AS before, lead(lower(s.seen)) OVER w AS after
+-- The stretches in which the agents of a name reported any address, when
+-- the name was seen, numbered in order: a period starts a stretch when it
+-- starts later than the alive window after every period before it ended.
+-- Read in one pass over the periods of a name in the order they start,
+-- not by comparing every period with every stretch.
+hq AS (
+  SELECT y.hostname, y.addr, y.first_seen, y.last_seen,
+         sum(y.starts) OVER (PARTITION BY y.hostname ORDER BY y.first_seen, y.last_seen, y.addr) AS stretch
   FROM (
-    SELECT hp.hostname,
-           unnest(range_agg(tstzrange(hp.first_seen, hp.last_seen + shawk.alive_window(), '[]'))) AS seen
-    FROM hp GROUP BY hp.hostname
-  ) s
-  WINDOW w AS (PARTITION BY s.hostname ORDER BY s.seen)
+    SELECT hp.*,
+           coalesce(hp.first_seen > max(hp.last_seen) OVER (PARTITION BY hp.hostname ORDER BY hp.first_seen, hp.last_seen, hp.addr
+                                                         ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) + shawk.alive_window(),
+                    true)::integer AS starts
+    FROM hp
+  ) y
+),
+-- Each stretch with when it started and ended, when the stretch before it
+-- ended (with the alive window) and when the next one started.
+hs AS (
+  SELECT x.hostname, x.stretch, x.seen_from, x.seen_until,
+         lag(x.seen_until) OVER w + shawk.alive_window() AS before, lead(x.seen_from) OVER w AS after
+  FROM (
+    SELECT hq.hostname, hq.stretch, min(hq.first_seen) AS seen_from, max(hq.last_seen) AS seen_until
+    FROM hq GROUP BY hq.hostname, hq.stretch
+  ) x
+  WINDOW w AS (PARTITION BY x.hostname ORDER BY x.stretch)
 ),
 -- The periods of an address in the order they started, numbered by the
 -- runs of periods of one name, and when a run of another name started
 -- after each run (taken) and ended before it (released).
 ho AS (
-  SELECT y.hostname, y.addr, y.first_seen, y.last_seen,
+  SELECT y.hostname, y.addr, y.first_seen, y.last_seen, y.stretch,
          sum(y.other) OVER (PARTITION BY y.addr ORDER BY y.first_seen, y.hostname) AS run
   FROM (
-    SELECT hp.*,
-           (hp.hostname IS DISTINCT FROM lag(hp.hostname) OVER (PARTITION BY hp.addr ORDER BY hp.first_seen, hp.hostname))::integer AS other
-    FROM hp
+    SELECT hq.*,
+           (hq.hostname IS DISTINCT FROM lag(hq.hostname) OVER (PARTITION BY hq.addr ORDER BY hq.first_seen, hq.hostname))::integer AS other
+    FROM hq
   ) y
 ),
 hr AS (
@@ -399,16 +447,16 @@ hr AS (
 -- to its hosts at all times.
 ha AS MATERIALIZED (
   SELECT ho.addr, ho.hostname,
-         CASE WHEN ho.first_seen <= lower(hs.seen) + shawk.alive_window()
+         CASE WHEN ho.first_seen <= hs.seen_from + shawk.alive_window()
               THEN least(ho.first_seen - shawk.alive_window(),
                          greatest(coalesce(hs.before, '-infinity'), coalesce(hr.released, '-infinity')))
               ELSE ho.first_seen - shawk.alive_window() END AS held_from,
-         CASE WHEN ho.last_seen >= upper(hs.seen) - 2 * shawk.alive_window()
+         CASE WHEN ho.last_seen >= hs.seen_until - shawk.alive_window()
               THEN greatest(ho.last_seen + shawk.alive_window(),
                             least(coalesce(hs.after, 'infinity'), coalesce(hr.taken, 'infinity')))
               ELSE ho.last_seen + shawk.alive_window() END AS held_until
   FROM ho
-  JOIN hs ON hs.hostname = ho.hostname AND hs.seen @> ho.first_seen
+  JOIN hs ON hs.hostname = ho.hostname AND hs.stretch = ho.stretch
   JOIN hr ON hr.addr = ho.addr AND hr.run = ho.run
   UNION ALL
   SELECT i.addr, i.host, '-infinity', 'infinity' FROM shawk.inventory_addrs i
@@ -519,8 +567,13 @@ r AS MATERIALIZED (
 -- process of the target accepted them, and the dependency is that of the
 -- client on the backend, so the target shows nowhere else. Not those of
 -- its own clients (an address it holds, or the address of a client edge
--- of its own), nor those to a backend that it serves itself, whose server
--- edge has them.
+-- of its own), nor those to a backend that it serves itself when the
+-- server edge has the address of the client, and so the client: a
+-- published port. When the target also replaced the address of the client
+-- by one of its own (masquerade, as for a NodePort), the server edge has
+-- the address of the target, which a process of the target may use too (a
+-- kubelet that probes the pod): the edge then looks like the target's own,
+-- and the translation alone tells the client outside it.
 lt AS (
   SELECT l.proto, l.client_addr, l.virtual_addr, l.virtual_port, min(l.first_seen) AS first_seen, max(l.last_seen) AS last_seen
   FROM shawk.learned_translations l
@@ -533,11 +586,13 @@ lt AS (
     AND NOT EXISTS (SELECT FROM shawk.edges e
                     WHERE e.host_id = l.host_id AND e.role = 'client' AND e.proto = l.proto
                       AND e.local_addr = l.client_addr AND e.remote_addr = l.virtual_addr AND e.port = l.virtual_port)
-    AND NOT EXISTS (SELECT FROM shawk.edges e
-                    WHERE e.host_id = l.host_id AND e.role = 'server' AND e.proto = l.proto
-                      AND e.local_addr = l.backend_addr AND e.port = l.backend_port
-                      AND e.last_seen >= dependents.since - interval '15 minutes'
-                      AND e.first_seen <= dependents.until + interval '15 minutes')
+    AND NOT (l.source_addr = l.client_addr
+             AND EXISTS (SELECT FROM shawk.edges e
+                         WHERE e.host_id = l.host_id AND e.role = 'server' AND e.proto = l.proto
+                           AND e.local_addr = l.backend_addr AND e.port = l.backend_port
+                           AND e.remote_addr = l.client_addr
+                           AND e.last_seen >= dependents.since - interval '15 minutes'
+                           AND e.first_seen <= dependents.until + interval '15 minutes'))
   GROUP BY l.proto, l.client_addr, l.virtual_addr, l.virtual_port
 ),
 -- The clients that the target relayed, each once per virtual address and
@@ -545,10 +600,13 @@ lt AS (
 -- client gives it, if any; those that reached a backend through a virtual
 -- address that the target held (a translation of the configuration, or
 -- one that another host learned); and those that the backends of a
--- translation of the configuration saw alone, when the target held its
--- virtual address, since they may have come through it. They are clients
--- of the target on the virtual address and port, of no process of it:
--- ~relay.
+-- translation of the configuration saw, when the target held its virtual
+-- address, since they may have come through it: the clients that a
+-- backend saw alone, and, through a translation with sources, whatever a
+-- backend saw from a source, also when a client with an agent explains
+-- the edge, since the backend cannot tell the clients behind a source
+-- apart. They are clients of the target on the virtual address and port,
+-- of no process of it: ~relay.
 relay AS (
   SELECT -row_number() OVER () AS id, y.*
   FROM (
@@ -587,13 +645,14 @@ relay AS (
       JOIN d ON d.proto = b.proto AND d.server_addr <<= b.addr AND b.port IN (0, d.port)
       WHERE v.side = 'virtual'
         AND (b.port <> 0 OR v.port IN (0, d.port))
-        AND d.client_host IS NULL AND d.server_host <> dependents.target_host
+        AND d.server_host IS NOT NULL
         AND ha.held_until >= greatest(d.first_seen, dependents.since)
         AND ha.held_from <= least(d.last_seen, dependents.until)
-        AND (NOT EXISTS (SELECT FROM shawk.translations x
-                         WHERE x.name = v.name AND x.proto = v.proto AND x.side = 'source')
-             OR EXISTS (SELECT FROM shawk.translations x
-                        WHERE x.name = v.name AND x.proto = v.proto AND x.side = 'source' AND d.client_addr <<= x.addr))
+        AND CASE WHEN EXISTS (SELECT FROM shawk.translations x
+                              WHERE x.name = v.name AND x.proto = v.proto AND x.side = 'source')
+                 THEN EXISTS (SELECT FROM shawk.translations x
+                              WHERE x.name = v.name AND x.proto = v.proto AND x.side = 'source' AND d.client_addr <<= x.addr)
+                 ELSE d.client_host IS NULL AND d.server_host <> dependents.target_host END
     ) x
     LEFT JOIN shawk.inventory_addrs ci ON x.client_host IS NULL AND ci.addr = x.client_addr
     WHERE x.client_host IS DISTINCT FROM dependents.target_host
@@ -908,8 +967,13 @@ $$;
 -- (not_observed otherwise), within the retention (before_retention),
 -- without dropped flows (dropped_flows), in every network namespace
 -- (netns_limited), with UDP unless target_proto is another transport
--- (udp_not_traced), and with Unix sockets when the target is a service
--- without a port (unix_not_traced). A target that no agent reported under
+-- (udp_not_traced), with Unix sockets when the target is a service
+-- without a port (unix_not_traced), and, when the target is a whole host
+-- of which a pod or a container accepted connections from an address of
+-- the host itself, with the translations that tell the clients the host
+-- masqueraded (masquerade_not_traced: the agent does not trace them, or
+-- folds the peers outside its internal ranges, whose translations it does
+-- not learn). A target that no agent reported under
 -- has a coverage of 0: unknown_host, or no_agent for a host of the
 -- inventory, whose clients without an agent nothing would tell.
 -- min_coverage is 1 by default: any gap makes the verdict INCONCLUSIVE.
@@ -944,6 +1008,7 @@ DECLARE
   shortfalls text[];
   inventoried boolean;
   unknown boolean := false;
+  masqueraded tstzmultirange;
 BEGIN
   IF since IS NULL OR until IS NULL OR since >= until THEN
     RAISE EXCEPTION 'the period is empty: % to %', since, until USING ERRCODE = 'invalid_parameter_value';
@@ -1001,6 +1066,38 @@ BEGIN
      AND NOT isempty(o.unix_untraced) THEN
     blind := blind + o.unix_untraced;
     shortfalls := shortfalls || 'unix_not_traced'::text;
+  END IF;
+  -- A socket of the host that accepted connections from an address of the
+  -- host itself, in a network namespace in which no client of the host has
+  -- that address: a pod or a container reached over the bridge. Its clients
+  -- on the host go with the host, but the same edge is that of the clients
+  -- outside it whose address the host replaced by its own (masquerade, as
+  -- for a NodePort), which only the translations that the agent learned
+  -- tell: they are dependents (~relay). While the agent did not learn them
+  -- all, nothing tells that there was none.
+  IF target_service IS NULL AND target_port IS NULL AND NOT isempty(o.translations_untold) THEN
+    SELECT coalesce(range_agg(tstzrange(greatest(s.first_seen, since),
+                                        greatest(least(s.last_seen, until), greatest(s.first_seen, since)), '[]')), '{}')
+    INTO masqueraded
+    FROM shawk.hosts h
+    JOIN shawk.edges s ON s.host_id = h.id AND s.role = 'server'
+    WHERE h.hostname = target_host
+      AND s.last_seen >= since AND s.first_seen <= until
+      AND (target_proto IS NULL OR s.proto = target_proto)
+      AND NOT (s.remote_addr << inet '127.0.0.0/8' OR s.remote_addr = inet '::1')
+      AND EXISTS (SELECT FROM shawk.hosts h2
+                  JOIN shawk.host_addrs a ON a.host_id = h2.id
+                  WHERE h2.hostname = target_host AND a.addr = s.remote_addr
+                    AND a.last_seen >= s.first_seen - shawk.alive_window()
+                    AND a.first_seen <= s.last_seen + shawk.alive_window())
+      AND NOT EXISTS (SELECT FROM shawk.edges c
+                      WHERE c.role = 'client' AND c.proto = s.proto AND c.remote_addr = s.local_addr AND c.port = s.port
+                        AND c.local_addr = s.remote_addr AND c.host_id = s.host_id AND c.netns = s.netns);
+    masqueraded := masqueraded * o.translations_untold;
+    IF NOT isempty(masqueraded) THEN
+      blind := blind + masqueraded;
+      shortfalls := shortfalls || 'masquerade_not_traced'::text;
+    END IF;
   END IF;
 
   -- What the agent of the host does not know of was not seen to be used,

@@ -98,7 +98,10 @@ type tAgent struct {
 	unixTraced *bool
 	// classified is sent as shawk.agent.protocols.classified if not nil.
 	classified *bool
-	netnsScope string
+	// translationsTraced is sent as shawk.agent.translations.traced if not
+	// nil.
+	translationsTraced *bool
+	netnsScope         string
 	// dropped is sent as shawk.agent.flows.dropped, counted since
 	// droppedSince (t0 if zero), when either is set.
 	dropped      int64
@@ -393,6 +396,13 @@ func (ta tAgent) metrics() pmetric.Metrics {
 		dp := metric(metricAgentProtocolsClassified, pmetric.MetricTypeGauge).Gauge().DataPoints().AppendEmpty()
 		dp.SetTimestamp(now)
 		if *ta.classified {
+			dp.SetIntValue(1)
+		}
+	}
+	if ta.translationsTraced != nil {
+		dp := metric(metricAgentTranslationsTraced, pmetric.MetricTypeGauge).Gauge().DataPoints().AppendEmpty()
+		dp.SetTimestamp(now)
+		if *ta.translationsTraced {
 			dp.SetIntValue(1)
 		}
 	}

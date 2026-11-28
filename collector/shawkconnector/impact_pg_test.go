@@ -249,11 +249,12 @@ func (f impactFixture) host(name string, addrs ...string) {
 // session adds a session of the agent of a host from from to to, in which
 // it reported the addresses of the host: as the connector, an address
 // continues its latest period unless that ended longer ago than the alive
-// window. udp, unix and scope are what the agent traced, in SQL.
+// window. udp, unix and scope are what the agent traced, in SQL; it learns
+// translations and folds no peer.
 func (f impactFixture) session(host string, from, to time.Time, udp, unix, scope string) {
 	f.t.Helper()
-	f.exec(`INSERT INTO shawk.agent_sessions (host_id, started_at, last_heartbeat, udp_traced, unix_traced, netns_scope)
-		VALUES ($1, $2, $3, `+udp+`, `+unix+`, `+scope+`)`, host, from, to)
+	f.exec(`INSERT INTO shawk.agent_sessions (host_id, started_at, last_heartbeat, udp_traced, unix_traced, netns_scope, translations_traced)
+		VALUES ($1, $2, $3, `+udp+`, `+unix+`, `+scope+`, true)`, host, from, to)
 	f.exec(`UPDATE shawk.hosts SET first_seen = least(first_seen, $2), last_seen = greatest(last_seen, $3) WHERE id = $1`, host, from, to)
 	for _, addr := range f.addrs[host] {
 		f.held(host, addr, from, to)
@@ -641,12 +642,25 @@ func TestPGImpactPlans(t *testing.T) {
 		`SELECT * FROM shawk_v1.impact_verdict('db-01', `+period+`, 'postgres')`)
 	// The nested loops left are those that have no other plan: the
 	// lookups of one row at a time, which have no condition of their own.
+	// Nor does a join compare ranges, as that of every period of an
+	// address with every stretch of its host did, and the addresses that
+	// hosts held are read for the period asked for, not for the retention:
+	// each scan of them is bound by the time they were last seen.
 	var loops func(node map[string]any, text string)
-	walked := 0
+	walked, addrs := 0, 0
 	loops = func(node map[string]any, text string) {
 		walked++
 		if node["Node Type"] == "Nested Loop" && node["Join Filter"] != nil {
 			t.Errorf("a nested loop with the condition %v in the plan of:\n%.300s", node["Join Filter"], text)
+		}
+		if cond := fmt.Sprint(node["Join Filter"], node["Hash Cond"], node["Merge Cond"]); strings.Contains(cond, "@>") || strings.Contains(cond, "&&") {
+			t.Errorf("a join on ranges, %v, in the plan of:\n%.300s", cond, text)
+		}
+		if node["Relation Name"] == "host_addrs" {
+			addrs++
+			if cond := fmt.Sprint(node["Index Cond"], node["Filter"], node["Recheck Cond"]); !strings.Contains(cond, "last_seen") {
+				t.Errorf("a scan of shawk.host_addrs without a bound on last_seen (%v) in the plan of:\n%.300s", cond, text)
+			}
 		}
 		children, _ := node["Plans"].([]any)
 		for _, c := range children {
@@ -669,8 +683,9 @@ func TestPGImpactPlans(t *testing.T) {
 			loops(p.Plan, p.Text)
 		}
 	}
-	if dependents != 2 || walked < 100 {
-		t.Errorf("%d plans of shawk.dependents with %d nodes among %d plans, want 2 of them", dependents, walked, len(plans))
+	if dependents != 2 || walked < 100 || addrs < 4 {
+		t.Errorf("%d plans of shawk.dependents with %d nodes and %d scans of shawk.host_addrs among %d plans, want 2 of them",
+			dependents, walked, addrs, len(plans))
 	}
 }
 
@@ -991,6 +1006,28 @@ func TestPGImpactSeenByClients(t *testing.T) {
 		"1 app-01 app - -> heir-01 - 222 client one-off",
 	})
 
+	// early-01 came and went for a year, and was last observed two days
+	// before the period, with two addresses: it may still hold them in the
+	// period, not one it reported at an earlier stop, nor one it dropped an
+	// hour before it stopped. Only the last report before the period is
+	// read, not the history of the year.
+	f.host("early-01", "10.0.0.40", "10.0.0.41")
+	for d := 360; d > 2; d -= 3 {
+		f.observed("early-01", impactSince.Add(-time.Duration(d)*24*time.Hour), impactSince.Add(-time.Duration(d-1)*24*time.Hour))
+		f.held("early-01", fmt.Sprintf("10.9.%d.%d", d/100, d%100), impactSince.Add(-time.Duration(d)*24*time.Hour), impactSince.Add(-time.Duration(d-1)*24*time.Hour))
+	}
+	f.held("early-01", "10.0.0.42", impactSince.Add(-3*24*time.Hour), impactSince.Add(-49*time.Hour))
+	for port, addr := range map[int]string{340: "10.0.0.40", 341: "10.0.0.41", 342: "10.0.0.42", 343: "10.9.0.6", 344: "10.9.0.60"} {
+		f.edge("app-01", "app", "client", "10.0.0.11", addr, port, day(30, 0), day(30, 1))
+	}
+	checkRows(t, "dependents of early-01", f.impact(`'early-01', %s, %s`), []string{
+		"1 app-01 app - -> early-01 - 340 client one-off",
+		"1 app-01 app - -> early-01 - 341 client one-off",
+	})
+	if got, want := f.verdict(`'early-01', %s, %s`), "UNSAFE {active_dependents} {not_observed} 1 0.000000"; got != want {
+		t.Errorf("early-01: %s, want %s", got, want)
+	}
+
 	// A host of the inventory without an agent: its clients with an agent
 	// are its dependents, whatever its service, of which nothing is known.
 	f.exec(`INSERT INTO shawk.inventory_hosts (host, agent) VALUES ('sfa-01', false)`)
@@ -1241,44 +1278,157 @@ func TestPGImpactOfAPort(t *testing.T) {
 	}
 }
 
-// TestPGImpactOwnAddress: a connection from an address of the target that
-// no client on the target made is that of a dependent: a host that
-// translates addresses (a published port, a NodePort with masquerade) is
-// the source of the clients outside it.
+// TestPGImpactOwnAddress: a connection from an address of the target is
+// that of a dependent unless a client on the target explains it, and also
+// then when the target replaced the address of a client outside it by its
+// own (a NodePort with masquerade): the translation that its agent learned
+// tells the client, and where the agent learned none, the verdict tells
+// that it cannot know.
 func TestPGImpactOwnAddress(t *testing.T) {
 	_, conn := migratedDB(t)
 	f := newImpactFixture(t, conn)
-	// node-a holds the address of its bridge and of a pod, which serves
-	// connections that the kernel masqueraded: their peer is the bridge.
+	// node-a holds the address of its bridge and of a pod, which serves, in
+	// its own network namespace, connections that the kernel masqueraded:
+	// their peer is the bridge.
 	f.watched("node-a", "10.0.0.10", "10.244.1.1", "10.244.1.7")
 	f.listens("node-a", "web", 8080)
 	f.edge("node-a", "web", "server", "10.244.1.7", "10.244.1.1", 8080, impactSince, impactUntil)
 	f.active("node-a", "web", 8080, impactSince, impactUntil, time.Hour, 1)
-	// kubelet, on the node, probes the pod from the same address: both
-	// sides are seen.
-	f.both("node-a", "kubelet", "10.244.1.1", "node-a", "web", "10.244.1.7", 8081, impactSince, impactUntil)
+	f.exec(`UPDATE shawk.edges SET netns = 4026532001 WHERE role = 'server'`)
+	// No client on the node explains them: a dependent, at the address of
+	// the node. Also when the inventory gives the node that address.
 	masqueraded := []string{"1 - ~unresolved 10.244.1.1 -> node-a web 8080 server continuous"}
 	checkRows(t, "dependents of node-a", f.impact(`'node-a', %s, %s`), masqueraded)
 	if got, want := f.verdict(`'node-a', %s, %s`), "UNSAFE {active_dependents} {} 1 1.000000"; got != want {
 		t.Errorf("node-a: %s, want %s", got, want)
 	}
-	// The same with the translation that its agent learned, whose backend
-	// is the pod, and when the inventory names the address.
-	f.learned("node-a", "203.0.113.50", "10.0.0.10", 30080, "10.244.1.1", "10.244.1.7", 8080, impactSince, impactUntil)
-	checkRows(t, "dependents of node-a, with the translation", f.impact(`'node-a', %s, %s`), masqueraded)
 	f.exec(`INSERT INTO shawk.inventory_hosts (host) VALUES ('node-a')`)
 	f.exec(`INSERT INTO shawk.inventory_addrs VALUES ('10.244.1.1', 'node-a')`)
 	checkRows(t, "dependents of node-a, in the inventory", f.impact(`'node-a', %s, %s`), []string{
 		"1 node-a ~unresolved 10.244.1.1 -> node-a web 8080 server continuous",
 	})
-	if got, want := f.verdict(`'node-a', %s, %s`), "UNSAFE {active_dependents} {} 1 1.000000"; got != want {
-		t.Errorf("node-a, in the inventory: %s, want %s", got, want)
-	}
-	// Without it, only kubelet and the pod itself are left.
-	f.exec(`DELETE FROM shawk.edges WHERE port = 8080`)
-	f.exec(`DELETE FROM shawk.learned_translations`)
+	f.exec(`DELETE FROM shawk.inventory_hosts`)
+
+	// The kubelet of the node probes the pod from the same address, in the
+	// namespace of the host: the one edge of the pod for that peer now has
+	// a client on the node. The agent learns translations and folds no
+	// peer, and learned none: no client outside the node was masqueraded.
+	f.edge("node-a", "kubelet", "client", "10.244.1.1", "10.244.1.7", 8080, impactSince, impactUntil)
+	checkRows(t, "dependents of node-a, probed by its kubelet", f.impact(`'node-a', %s, %s`), nil)
 	if got, want := f.verdict(`'node-a', %s, %s`), "SAFE {} {} 0 1.000000"; got != want {
-		t.Errorf("node-a without the masqueraded connections: %s, want %s", got, want)
+		t.Errorf("node-a, probed by its kubelet: %s, want %s", got, want)
+	}
+	// The pod alone is used by the kubelet.
+	if got, want := f.verdict(`'node-a', %s, %s, 'web'`), "UNSAFE {active_dependents} {} 1 1.000000"; got != want {
+		t.Errorf("web of node-a: %s, want %s", got, want)
+	}
+
+	// The agent learned that a client outside connected to the NodePort,
+	// which the pod saw from the bridge: a dependent, although the edge of
+	// the pod has a client on the node.
+	f.learned("node-a", "203.0.113.50", "10.0.0.10", 30080, "10.244.1.1", "10.244.1.7", 8080, day(10, 0), day(20, 0))
+	outside := []string{"1 - ~external 203.0.113.50 -> node-a ~relay 30080 server unknown"}
+	checkRows(t, "dependents of node-a, with the translation", f.impact(`'node-a', %s, %s`), outside)
+	if got, want := f.verdict(`'node-a', %s, %s`), "UNSAFE {active_dependents} {} 1 1.000000"; got != want {
+		t.Errorf("node-a, with the translation: %s, want %s", got, want)
+	}
+	checkRows(t, "dependents of port 30080 of node-a", f.impact(`'node-a', %s, %s, target_port => 30080`), outside)
+	// A port that the node publishes without replacing the address of the
+	// client: the pod sees the client, whose row it is, once.
+	f.edge("node-a", "web", "server", "10.244.1.7", "198.51.100.7", 8080, day(1, 0), day(2, 0))
+	f.learned("node-a", "198.51.100.7", "10.0.0.10", 30080, "198.51.100.7", "10.244.1.7", 8080, day(1, 0), day(2, 0))
+	checkRows(t, "dependents of node-a, with a client that kept its address", f.impact(`'node-a', %s, %s`), []string{
+		"1 - ~external 198.51.100.7 -> node-a web 8080 server one-off",
+		outside[0],
+	})
+	f.exec(`DELETE FROM shawk.edges WHERE remote_addr = '198.51.100.7'`)
+	f.exec(`DELETE FROM shawk.learned_translations`)
+
+	// An agent that folds the peers outside its internal ranges does not
+	// learn their translations, nor does one that traces none, and a
+	// connector before this one did not tell: the clients outside that the
+	// node masqueraded would show nowhere, so the verdict is not SAFE.
+	for name, set := range map[string]string{
+		"folds external peers":  `peer_fold = 'in'`,
+		"traces no translation": `translations_traced = false`,
+		"does not tell":         `translations_traced = NULL`,
+	} {
+		f.exec(`UPDATE shawk.agent_sessions SET peer_fold = 'none', translations_traced = true`)
+		f.exec(`UPDATE shawk.agent_sessions SET ` + set)
+		if got, want := f.verdict(`'node-a', %s, %s`), "INCONCLUSIVE {masquerade_not_traced} {} 0 0.000000"; got != want {
+			t.Errorf("node-a, of an agent that %s: %s, want %s", name, got, want)
+		}
+		if got, want := f.verdict(`'node-a', %s, %s, target_proto => 'udp'`), "SAFE {} {} 0 1.000000"; got != want {
+			t.Errorf("node-a over UDP, of an agent that %s: %s, want %s", name, got, want)
+		}
+	}
+	// For the time of the edge of the pod only, and only while the agent
+	// did not learn: the pod is gone after day 30, and the agent learns
+	// from day 20.
+	f.exec(`UPDATE shawk.edges SET last_seen = $1`, day(30, 0))
+	f.exec(`DELETE FROM shawk.agent_sessions`)
+	f.session("node-a", impactSince.Add(-time.Hour), day(20, 0), "true", "true", "'all'")
+	f.exec(`UPDATE shawk.agent_sessions SET peer_fold = 'in'`)
+	f.session("node-a", day(20, 0), impactUntil, "true", "true", "'all'")
+	if got, want := f.verdict(`'node-a', %s, %s`), "INCONCLUSIVE {masquerade_not_traced} {} 0 0.777777"; got != want {
+		t.Errorf("node-a, of an agent that folded for 20 days: %s, want %s", got, want)
+	}
+	if got, want := f.verdict(`'node-a', %s, %s, min_coverage => 0.7`), "SAFE {} {masquerade_not_traced} 0 0.777777"; got != want {
+		t.Errorf("node-a, of a caller that accepts it: %s, want %s", got, want)
+	}
+
+	// A server in the namespace of its client is reached by nothing that
+	// the host masqueraded: a host that talks to itself over its own
+	// address is its own, whatever its agent folds.
+	f.exec(`UPDATE shawk.edges SET netns = $1, last_seen = $2`, int64(impactNetns), impactUntil)
+	f.exec(`UPDATE shawk.agent_sessions SET peer_fold = 'all', translations_traced = NULL`)
+	if got, want := f.verdict(`'node-a', %s, %s`), "SAFE {} {} 0 1.000000"; got != want {
+		t.Errorf("node-a, with the pod in the namespace of the host: %s, want %s", got, want)
+	}
+}
+
+// TestPGImpactMasqueradedBehindAProbe: the rows that the connector writes
+// for a node whose pod is probed by its kubelet and used from outside
+// through a NodePort with masquerade, which the pod sees as one peer, the
+// bridge of the node. The client outside is a dependent by the translation
+// that the agent learned; an agent that folds its peers learns none, and
+// the verdict is then not SAFE.
+func TestPGImpactMasqueradedBehindAProbe(t *testing.T) {
+	for _, folds := range []bool{false, true} {
+		c, sink, conn := pgConnector(t)
+		start := impactSince
+		now := start
+		c.now = func() time.Time { return now }
+		traced := true
+		for ; now.Before(start.Add(3 * time.Hour)); now = now.Add(time.Minute) {
+			pod := tEdge{role: "server", proto: "tcp", local: "10.244.1.7", peer: "10.244.1.1", port: 8080, svc: "web", comm: "web",
+				unit: "web.service", netns: "4026532001", count: 1, first: start, last: now}
+			probe := tEdge{role: "client", proto: "tcp", local: "10.244.1.1", peer: "10.244.1.7", port: 8080, svc: "kubelet", comm: "kubelet",
+				unit: "kubelet.service", opened: 1, first: start, last: now}
+			a := tAgent{host: "node-a", machineID: "m-a", addrs: []string{"10.0.0.10", "10.244.1.1", "10.244.1.7"}, time: now, segment: start,
+				unixTraced: &traced, translationsTraced: &traced, edges: []tEdge{pod, probe}}
+			if folds {
+				a.fold = "in"
+			} else {
+				a.translations = []tTranslation{{proto: "tcp", client: "203.0.113.50", virtual: "10.0.0.10", vport: 30080,
+					source: "10.244.1.1", backend: "10.244.1.7", bport: 8080, first: start, last: now}}
+			}
+			consume(t, c, sink, a)
+		}
+		c.flush(context.Background())
+		// One row of the dependencies, of the kubelet and the pod.
+		checkRows(t, "dependencies", queryStrings(t, conn, `SELECT client_host, client_service, server_host, server_service, observed_by
+			FROM shawk_v1.dependencies_between($1, $2)`, start, now), []string{"node-a kubelet node-a web both"})
+		dependents := queryStrings(t, conn, `SELECT host(client_addr), server_host, server_service, port, observed_by
+			FROM shawk_v1.impact('node-a', $1, $2)`, start, now)
+		verdict := queryStrings(t, conn, `SELECT verdict, reasons::text, caveats::text, direct FROM shawk_v1.impact_verdict('node-a', $1, $2)`, start, now)
+		if folds {
+			checkRows(t, "dependents of node-a, of an agent that folds", dependents, nil)
+			checkRows(t, "verdict on node-a, of an agent that folds", verdict, []string{"INCONCLUSIVE {masquerade_not_traced} {} 0"})
+		} else {
+			checkRows(t, "dependents of node-a", dependents, []string{"203.0.113.50 node-a ~relay 30080 server"})
+			checkRows(t, "verdict on node-a", verdict, []string{"UNSAFE {active_dependents} {} 1"})
+		}
 	}
 }
 
@@ -1352,6 +1502,26 @@ func TestPGImpactOfARelay(t *testing.T) {
 	checkRows(t, "dependents of docker-01", f.impact(`'docker-01', %s, %s`), []string{
 		"1 - ~unresolved 10.0.7.7 -> docker-01 web 80 server continuous",
 	})
+
+	// A director whose translation the configuration gives, with its own
+	// address as the source: db-01 sees its clients from that address, and
+	// the health checks of the director from it too, which explain the
+	// edge. The clients behind the source are still there, as far as db-01
+	// can tell.
+	f.watched("fnat-01", "10.0.0.6", "10.0.100.2")
+	f.exec(`INSERT INTO shawk.translations VALUES
+		('fnat', 'virtual', 'tcp', '10.0.100.2', 5432), ('fnat', 'backend', 'tcp', '10.0.1.10', 0), ('fnat', 'source', 'tcp', '10.0.0.6', 0)`)
+	f.both("fnat-01", "keepalived", "10.0.0.6", "db-01", "postgres", "10.0.1.10", 5432, impactSince, impactUntil)
+	checkRows(t, "dependents of fnat-01", f.impact(`'fnat-01', %s, %s`), []string{
+		"1 - ~unresolved 10.0.0.6 -> fnat-01 ~relay 5432 server unknown",
+	})
+	if got, want := f.verdict(`'fnat-01', %s, %s`), "UNSAFE {active_dependents} {} 1 1.000000"; got != want {
+		t.Errorf("fnat-01: %s, want %s", got, want)
+	}
+	// Not without the virtual address, which a standby does not hold.
+	f.watched("fnat-02", "10.0.0.7")
+	f.both("fnat-02", "keepalived", "10.0.0.7", "db-01", "postgres", "10.0.1.10", 5432, impactSince, impactUntil)
+	checkRows(t, "dependents of fnat-02", f.impact(`'fnat-02', %s, %s`), nil)
 }
 
 // TestPGImpactThroughATranslation: the clients of a virtual address are
@@ -1566,6 +1736,88 @@ func TestPGImpactBeforeTheRetention(t *testing.T) {
 	}
 }
 
+// migrateTo applies the migrations up to a version to an empty database,
+// as Migrate does: the schema of a connector before the ones after.
+func migrateTo(t *testing.T, conn *pgx.Conn, version int) {
+	t.Helper()
+	ctx := context.Background()
+	execAll(t, conn, `CREATE SCHEMA IF NOT EXISTS shawk`, `CREATE TABLE IF NOT EXISTS shawk.schema_migrations (
+		version integer PRIMARY KEY, name text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now())`)
+	for _, m := range must(Migrations()) {
+		if m.Version > version {
+			break
+		}
+		if _, err := conn.Exec(ctx, m.SQL); err != nil {
+			t.Fatalf("migration %s: %v", m.Name, err)
+		}
+		if _, err := conn.Exec(ctx, `INSERT INTO shawk.schema_migrations (version, name) VALUES ($1, $2)`, m.Version, m.Name); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// TestPGImpactRetentionAfterAnUpgrade: a database that a connector before
+// this version pruned has no record of the cutoff. The migration starts
+// from the oldest time an edge still kept was last seen, so that a period
+// longer than the retention is not SAFE right after the upgrade, before
+// any prune and without one.
+func TestPGImpactRetentionAfterAnUpgrade(t *testing.T) {
+	_, conn := testDB(t)
+	migrateTo(t, conn, 3)
+	// db-01 was observed all along. billing used its postgres on day 20,
+	// and its own backup reads it over loopback until day 70.
+	for _, q := range []string{
+		`INSERT INTO shawk.hosts VALUES ('db-01', 'm', 'db-01', 'k', 'v', $1, $2), ('batch-01', 'm', 'batch-01', 'k', 'v', $1, $2)`,
+		`INSERT INTO shawk.agent_sessions (host_id, started_at, last_heartbeat, udp_traced, unix_traced, netns_scope)
+		 VALUES ('db-01', $1, $2, true, true, 'all'), ('batch-01', $1, $2, true, true, 'all')`,
+		`INSERT INTO shawk.host_addrs VALUES ('db-01', '10.0.0.10', $1, $2), ('batch-01', '10.0.0.13', $1, $2)`,
+	} {
+		if _, err := conn.Exec(context.Background(), q, impactSince.Add(-100*24*time.Hour), impactUntil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	execAll(t, conn, `INSERT INTO shawk.processes (host_id, unit, comm, service_name, first_seen, last_seen) VALUES
+		('db-01', 'postgres.service', 'postgres', 'postgres', `+ts(impactSince)+`, `+ts(impactUntil)+`),
+		('db-01', 'backup.service', 'backup', 'backup', `+ts(impactSince)+`, `+ts(impactUntil)+`),
+		('batch-01', 'billing.service', 'billing', 'billing', `+ts(impactSince)+`, `+ts(impactUntil)+`)`,
+		`INSERT INTO shawk.edges (host_id, process_id, role, proto, local_addr, remote_addr, port, netns, first_seen, last_seen)
+		 SELECT e.host, p.id, e.role, 'tcp', e.local::inet, e.remote::inet, 5432, 1, `+ts(day(20, 0))+`, e.last::timestamptz
+		 FROM (VALUES ('batch-01', 'billing', 'client', '10.0.0.13', '10.0.0.10', `+ts(day(20, 2))+`),
+		              ('db-01', 'postgres', 'server', '10.0.0.10', '10.0.0.13', `+ts(day(20, 2))+`),
+		              ('db-01', 'backup', 'client', '127.0.0.1', '127.0.0.1', `+ts(day(70, 0))+`),
+		              ('db-01', 'postgres', 'server', '127.0.0.1', '127.0.0.1', `+ts(day(70, 0))+`)) AS e(host, svc, role, local, remote, last)
+		 JOIN shawk.processes p ON p.host_id = e.host AND p.service_name = e.svc`,
+		// The connector of that version keeps 30 days.
+		`SELECT shawk.prune(`+ts(day(60, 0))+`)`)
+	if got := queryStrings(t, conn, `SELECT count(*) FROM shawk.edges`); !slices.Equal(got, []string{"2"}) {
+		t.Fatalf("%v edges left by the prune, want 2", got)
+	}
+	if _, err := Migrate(context.Background(), conn); err != nil {
+		t.Fatal(err)
+	}
+	if got := queryStrings(t, conn, `SELECT to_char(pruned_before AT TIME ZONE 'UTC', 'MM-DD') FROM shawk.retention`); !slices.Equal(got, []string{"10-10"}) {
+		t.Errorf("retention after the migration: %v, want 10-10, the day the oldest edge left was last seen", got)
+	}
+	verdict := func(since time.Time) []string {
+		return queryStrings(t, conn, `SELECT verdict, reasons::text, coverage::text FROM shawk_v1.impact_verdict('db-01', $1, $2)`, since, impactUntil)
+	}
+	checkRows(t, "db-01 over 90 days, right after the upgrade", verdict(impactSince), []string{"INCONCLUSIVE {before_retention} 0.222222"})
+	checkRows(t, "db-01 over the last 20 days", verdict(day(70, 0)), []string{"SAFE {} 1.000000"})
+	// The next prune records its own cutoff, a later one.
+	execAll(t, conn, `SELECT shawk.prune(`+ts(day(75, 0))+`)`)
+	checkRows(t, "db-01 over the last 20 days, after a prune", verdict(day(70, 0)), []string{"INCONCLUSIVE {before_retention} 0.750000"})
+
+	// A database without edges has nothing to start from: no record.
+	_, conn = testDB(t)
+	migrateTo(t, conn, 3)
+	if _, err := Migrate(context.Background(), conn); err != nil {
+		t.Fatal(err)
+	}
+	if got := queryStrings(t, conn, `SELECT count(*) FROM shawk.retention`); !slices.Equal(got, []string{"0"}) {
+		t.Errorf("%v records of the retention of an empty database, want none", got)
+	}
+}
+
 // TestPGImpactClockBehind: the edges keep the times of the agent: with a
 // clock 2 hours behind, the last 2 hours of the history of a host are not
 // written yet, whatever the heartbeat of its session.
@@ -1635,7 +1887,8 @@ func impactDump(t *testing.T, conn *pgx.Conn) []string {
 	var out []string
 	for _, q := range []string{
 		`SELECT 'host', h.hostname, @h.first_seen, @h.last_seen FROM shawk.hosts h`,
-		`SELECT 'session', h.hostname, @s.started_at, @s.last_heartbeat, s.udp_traced, s.unix_traced, s.netns_scope, s.clock_skew::text
+		`SELECT 'session', h.hostname, @s.started_at, @s.last_heartbeat, s.udp_traced, s.unix_traced, s.netns_scope, s.clock_skew::text,
+		        s.translations_traced, s.peer_fold
 		 FROM shawk.agent_sessions s JOIN shawk.hosts h ON h.id = s.host_id`,
 		`SELECT 'addr', h.hostname, host(a.addr), @a.first_seen, @a.last_seen
 		 FROM shawk.host_addrs a JOIN shawk.hosts h ON h.id = a.host_id`,
@@ -1676,6 +1929,7 @@ func TestPGImpactFixtureLikeTheConnector(t *testing.T) {
 	ctx := context.Background()
 	now := start
 	c.now = func() time.Time { return now }
+	traced := true
 	for ; !now.After(end); now = now.Add(time.Minute) {
 		var edges []tEdge
 		if !now.Before(used.from) && !now.After(used.to) {
@@ -1687,7 +1941,7 @@ func TestPGImpactFixtureLikeTheConnector(t *testing.T) {
 				segment = back
 			}
 			db := tAgent{host: "db-01", machineID: "m-db", addrs: []string{"10.0.0.10"}, time: now, segment: segment,
-				unixTraced: new(bool),
+				unixTraced: new(bool), translationsTraced: &traced,
 				listeners: []tListener{{proto: "tcp", addr: "0.0.0.0", port: 5432, svc: "postgres", comm: "postgres",
 					unit: "postgres.service", first: segment, last: now}}}
 			*db.unixTraced = true
@@ -1699,7 +1953,8 @@ func TestPGImpactFixtureLikeTheConnector(t *testing.T) {
 			}
 			consume(t, c, sink, db)
 		}
-		app := tAgent{host: "app-01", machineID: "m-app", addrs: []string{"10.0.0.11"}, time: now, segment: start, unixTraced: new(bool)}
+		app := tAgent{host: "app-01", machineID: "m-app", addrs: []string{"10.0.0.11"}, time: now, segment: start, unixTraced: new(bool),
+			translationsTraced: &traced}
 		*app.unixTraced = true
 		for _, e := range edges {
 			e.role, e.local, e.peer, e.svc, e.comm, e.unit = "client", "10.0.0.11", "10.0.0.10", "app", "app", "app.service"
