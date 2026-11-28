@@ -204,6 +204,9 @@ type rulesReport struct {
 	// sockets.
 	NetworkNamespaces int  `json:"network_namespaces"`
 	UnixSockets       bool `json:"unix_sockets"`
+	// TranslationsTraced tells whether the agents of the host learned the
+	// translations of addresses that the host makes, all along.
+	TranslationsTraced bool `json:"translations_traced"`
 
 	// coverage is Coverage as PostgreSQL writes it, which is cut rather
 	// than rounded: 1 is a target watched all along. minCoverage is
@@ -339,9 +342,9 @@ func readRules(ctx context.Context, tx pgx.Tx, c *rulesConfig, since, until time
 	}
 	var reasons, caveats []string
 	if err := tx.QueryRow(ctx, `
-SELECT status, reasons, caveats, coverage::float8, coverage::text, network_namespaces, unix_sockets
+SELECT status, reasons, caveats, coverage::float8, coverage::text, network_namespaces, unix_sockets, translations_traced
 FROM shawk_v1.policy_verdict($1, $2, $3, $4, $5::numeric)`, c.host, since, until, unit, c.minCoverage).
-		Scan(&r.Status, &reasons, &caveats, &r.Coverage, &r.coverage, &r.NetworkNamespaces, &r.UnixSockets); err != nil {
+		Scan(&r.Status, &reasons, &caveats, &r.Coverage, &r.coverage, &r.NetworkNamespaces, &r.UnixSockets, &r.TranslationsTraced); err != nil {
 		return nil, fmt.Errorf("the verdict: %w", err)
 	}
 	r.Reasons, r.Caveats = append(r.Reasons, reasons...), append(r.Caveats, caveats...)
@@ -576,6 +579,11 @@ func (r *rulesReport) findings() []finding {
 	n = count(func(ru *rule) bool { return ru.Translated })
 	add("translated_backends", n, "%s the backends that the host itself translates its connections to (DNAT in "+
 		"its kernel, as kube-proxy does): they change when the translation does", plural(n, "rule allows", "rules allow"))
+	if !r.TranslationsTraced && r.Observation != nil && r.Observation.Agent {
+		add("translations_not_traced", 1, "the agent of the host did not learn the translations of addresses that the host "+
+			"makes, for all or a part of the period: if the host translates its own connections (kube-proxy, a published port "+
+			"of Docker), the rules lack the backends, and what filters after the translation denies them")
+	}
 	n = count(func(ru *rule) bool { return ru.Unattributed })
 	add("unattributed_sockets", n, "%s from sockets of the host whose owner is not known (~unknown): they may "+
 		"be of the unit, so they are allowed", plural(n, "rule comes", "rules come"))

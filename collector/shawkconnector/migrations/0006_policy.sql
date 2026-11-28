@@ -349,12 +349,17 @@ $$;
 -- flows in the period: more than one tells a host of containers, whose
 -- forwarded connections rules of the host itself do not see. unix_sockets
 -- tells whether the target used or served Unix sockets in the period.
+-- translations_traced tells whether the agents of the host learned the
+-- translations of addresses that the host makes all along
+-- (shawk.agent_sessions.translations_traced): where they did not, the
+-- flows lack the backends of the connections that the host translates
+-- itself (policy_flows, translated), and nothing tells whether it does.
 CREATE FUNCTION shawk_v1.policy_verdict(target_host text, since timestamptz, until timestamptz,
                                         target_unit text DEFAULT NULL, min_coverage numeric DEFAULT 1,
                                         tolerance interval DEFAULT '3 minutes')
 RETURNS TABLE (status text, reasons text[], caveats text[], coverage numeric,
                unobserved interval, gaps integer, partly_observed interval,
-               network_namespaces integer, unix_sockets boolean)
+               network_namespaces integer, unix_sockets boolean, translations_traced boolean)
 LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
 DECLARE
   o record;
@@ -404,6 +409,11 @@ BEGIN
       JOIN shawk.processes p ON p.id = l.process_id
       WHERE h.hostname = target_host AND l.last_seen >= since AND l.first_seen <= until
         AND (target_unit IS NULL OR p.unit = target_unit));
+  translations_traced := NOT EXISTS (
+      SELECT FROM shawk.hosts h
+      JOIN shawk.agent_sessions a ON a.host_id = h.id
+      WHERE h.hostname = target_host AND a.last_heartbeat > since AND a.started_at < until
+        AND a.translations_traced IS NOT TRUE);
   IF NOT o.agent OR unknown OR o.covered < min_coverage THEN
     status := 'INCOMPLETE';
     reasons := shortfalls;

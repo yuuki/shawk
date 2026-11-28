@@ -34,7 +34,7 @@ func testReport(t testing.TB, tg target, format, ingressMode string, flows ...fl
 	r := &rulesReport{Target: tg, Since: testUntil.Add(-90 * 24 * time.Hour), Until: testUntil, Status: statusComplete,
 		Coverage: 1, MinCoverage: 1, coverage: "1.000000", minCoverage: "1.000000000000", Format: format,
 		Reasons: []string{}, Caveats: []string{}, Gaps: []gap{}, Rules: []rule{}, Findings: []finding{}, Before: []pastFlow{},
-		Observation: &observation{Host: tg.Host, Agent: true, Observed: 1}, NetworkNamespaces: 1}
+		Observation: &observation{Host: tg.Host, Agent: true, Observed: 1}, NetworkNamespaces: 1, TranslationsTraced: true}
 	if format != formatSystemd {
 		r.Ingress = ingressMode
 	}
@@ -137,10 +137,10 @@ func TestBuildRules(t *testing.T) {
 	if n := slices.IndexFunc(r.Findings, func(f finding) bool { return f.Code == "unattributed_sockets" }); n < 0 {
 		t.Errorf("no finding for the sockets without an owner: %+v", r.Findings)
 	}
-	// A host of containers.
+	// A host of containers, whose agent did not learn its translations.
 	r = testReport(t, target{Host: "app-01"}, formatNftables, ingressSources)
-	r.NetworkNamespaces = 3
-	if f := r.findings(); len(f) != 1 || f[0].Code != "other_network_namespaces" {
+	r.NetworkNamespaces, r.TranslationsTraced = 3, false
+	if f := r.findings(); len(f) != 2 || f[0].Code != "translations_not_traced" || f[1].Code != "other_network_namespaces" {
 		t.Errorf("findings of a host of containers: %+v", f)
 	}
 }

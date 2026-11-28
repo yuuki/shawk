@@ -105,8 +105,8 @@ func newFleet(t *testing.T) *pgFleet {
 		f.exec(`INSERT INTO shawk.hosts VALUES ('%[1]s', 'm-%[1]s', '%[1]s', 'k', 'v', %[2]s, %[3]s)`, host, f.at(100*day), f.at(0))
 		f.exec(`INSERT INTO shawk.host_addrs VALUES ('%s', '%s', %s, %s)`, host, addr, f.at(100*day), f.at(0))
 		if host != "gap-01" {
-			f.exec(`INSERT INTO shawk.agent_sessions (host_id, started_at, last_heartbeat, udp_traced, unix_traced, netns_scope)
-			        VALUES ('%s', %s, %s, true, true, 'all')`, host, f.at(100*day), f.at(0))
+			f.exec(`INSERT INTO shawk.agent_sessions (host_id, started_at, last_heartbeat, udp_traced, unix_traced, netns_scope, translations_traced)
+			        VALUES ('%s', %s, %s, true, true, 'all', true)`, host, f.at(100*day), f.at(0))
 		}
 	}
 	f.exec(`INSERT INTO shawk.agent_sessions (host_id, started_at, last_heartbeat, udp_traced, unix_traced, netns_scope) VALUES
@@ -241,8 +241,15 @@ shawk applied nothing. -format nftables or -format systemd writes the rules, for
 	}
 	if code != exitComplete || r.Status != statusComplete || r.Coverage != 1 || len(r.Rules) != 5 || len(r.Before) != 1 || r.Refused ||
 		r.Observation == nil || !r.Observation.Agent || !r.Until.Equal(f.end) || !r.Since.Equal(f.end.Add(-90*day)) ||
-		r.Rules[1].Peer != "shop/postgres" || !slices.Equal(r.Rules[1].PeerHosts, []string{"db-01"}) || r.NetworkNamespaces != 1 {
+		r.Rules[1].Peer != "shop/postgres" || !slices.Equal(r.Rules[1].PeerHosts, []string{"db-01"}) || r.NetworkNamespaces != 1 ||
+		!r.TranslationsTraced {
 		t.Errorf("exit status %d, report = %+v", code, r)
+	}
+	// A host whose agent did not learn its translations: the rules may lack
+	// the backends of what it translates itself, which the report tells.
+	code, out, _ = f.run("rules", "-host", "gap-01", "-min-coverage", "0.9")
+	if code != exitComplete || !strings.Contains(out, "  - the agent of the host did not learn the translations of addresses that the host makes") {
+		t.Errorf("rules of a host whose agent traced no translations: exit status %d\n%s", code, out)
 	}
 }
 

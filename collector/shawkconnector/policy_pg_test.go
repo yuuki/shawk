@@ -262,9 +262,13 @@ func TestPGPolicyFlowsTranslated(t *testing.T) {
 		t.Errorf("flows of node-01:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
 	}
 	// The sockets of the flows are in two network namespaces: a host of
-	// containers.
-	if got := f.query(30*days, `SELECT status, network_namespaces FROM shawk_v1.policy_verdict('node-01', $1, $2)`); !slices.Equal(got, []string{"COMPLETE 2"}) {
+	// containers. Its agent did not tell whether it learns translations.
+	if got := f.query(30*days, `SELECT status, network_namespaces, translations_traced FROM shawk_v1.policy_verdict('node-01', $1, $2)`); !slices.Equal(got, []string{"COMPLETE 2 false"}) {
 		t.Errorf("verdict of node-01: %v", got)
+	}
+	f.exec(`UPDATE shawk.agent_sessions SET translations_traced = true`)
+	if got := f.query(30*days, `SELECT translations_traced FROM shawk_v1.policy_verdict('node-01', $1, $2)`); !slices.Equal(got, []string{"true"}) {
+		t.Errorf("translations_traced of node-01 with an agent that learns them: %v", got)
 	}
 	if got := f.query(30*days, `SELECT status, network_namespaces FROM shawk_v1.policy_verdict('node-01', $1, $2, 'kubelet.service')`); !slices.Equal(got, []string{"COMPLETE 1"}) {
 		t.Errorf("verdict of kubelet.service: %v", got)
