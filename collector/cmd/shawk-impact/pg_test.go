@@ -352,3 +352,34 @@ func TestPGNeedsTheSchema(t *testing.T) {
 		}
 	}
 }
+
+// TestPGReportCutShort: when the list of the dependents fails after the
+// verdict was read, as when it runs out of time, the verdict is written
+// all the same, with what is missing, and the command fails: a verdict
+// that was reached is not lost, and a report cut short is not taken for a
+// whole one.
+func TestPGReportCutShort(t *testing.T) {
+	dsn, conn := testDB(t)
+	ctx := context.Background()
+	for _, q := range []string{fleet, reader,
+		// The role may read the verdict, not the dependents.
+		`REVOKE EXECUTE ON FUNCTION shawk_v1.impact(text, timestamptz, timestamptz, text, integer, text, integer, integer) FROM PUBLIC`} {
+		if _, err := conn.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() { conn.Exec(ctx, "DROP OWNED BY shawk_impact_reader") })
+	code, out := impact(t, dsn, "-host", "db-01")
+	if code != exitError || !strings.Contains(out, "Verdict  UNSAFE: active dependents\n") ||
+		!strings.Contains(out, "\nThe rest of the report is missing: the dependents: ") || strings.Contains(out, "\nDependents\n") {
+		t.Errorf("db-01 without the dependents: exit status %d, want %d\n%s", code, exitError, out)
+	}
+	code, out = impact(t, dsn, "-host", "idle-01", "-json")
+	var r report
+	if err := json.Unmarshal([]byte(out), &r); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if code != exitError || r.Verdict != verdictSafe || !strings.HasPrefix(r.Incomplete, "the dependents: ") || len(r.Observers) != 1 {
+		t.Errorf("idle-01 without the dependents: exit status %d, want %d; report %+v", code, exitError, r)
+	}
+}
