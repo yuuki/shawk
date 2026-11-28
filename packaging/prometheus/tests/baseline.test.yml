@@ -32,7 +32,7 @@ tests:
           - exp_labels: {severity: critical, job: shop/app, service_peer_name: billing/api, server_port: "8443", network_transport: tcp}
             exp_annotations:
               summary: "shop/app connects to billing/api:8443/tcp, which its baseline does not hold"
-              description: "1 hosts of shop/app opened connections to billing/api on port 8443 (tcp) within the last hour, and the approved baseline of the service has no such dependency. `shawk-policy drift -service shop/app` lists the hosts and the addresses, and the process when it is one of another name in a unit of the service; approve the dependency in the baseline file of the connector if it is meant."
+              description: "1 hosts of shop/app opened connections to billing/api on port 8443 (tcp) within the last hour, and the approved baseline of the service has no such dependency. `shawk-policy drift -service shop/app` lists the hosts and the addresses, the ports that were seen, and the process when it is one of another name in a unit of the service; approve the dependency in the baseline file of the connector if it is meant."
       # The last evaluation that succeeded was at 600 s: the other alert
       # is pending from minute 26 and fires from minute 31.
       - eval_time: 30m
@@ -54,14 +54,14 @@ tests:
           - exp_labels: {severity: critical, job: shop/app, service_peer_name: billing/api, server_port: "8443", network_transport: tcp}
             exp_annotations:
               summary: "shop/app connects to billing/api:8443/tcp, which its baseline does not hold"
-              description: "1 hosts of shop/app opened connections to billing/api on port 8443 (tcp) within the last hour, and the approved baseline of the service has no such dependency. `shawk-policy drift -service shop/app` lists the hosts and the addresses, and the process when it is one of another name in a unit of the service; approve the dependency in the baseline file of the connector if it is meant."
+              description: "1 hosts of shop/app opened connections to billing/api on port 8443 (tcp) within the last hour, and the approved baseline of the service has no such dependency. `shawk-policy drift -service shop/app` lists the hosts and the addresses, the ports that were seen, and the process when it is one of another name in a unit of the service; approve the dependency in the baseline file of the connector if it is meant."
       - eval_time: 68m
         alertname: ShawkBaselineDrift
         exp_alerts:
           - exp_labels: {severity: critical, job: shop/app, service_peer_name: billing/api, server_port: "8443", network_transport: tcp}
             exp_annotations:
               summary: "shop/app connects to billing/api:8443/tcp, which its baseline does not hold"
-              description: "1 hosts of shop/app opened connections to billing/api on port 8443 (tcp) within the last hour, and the approved baseline of the service has no such dependency. `shawk-policy drift -service shop/app` lists the hosts and the addresses, and the process when it is one of another name in a unit of the service; approve the dependency in the baseline file of the connector if it is meant."
+              description: "1 hosts of shop/app opened connections to billing/api on port 8443 (tcp) within the last hour, and the approved baseline of the service has no such dependency. `shawk-policy drift -service shop/app` lists the hosts and the addresses, the ports that were seen, and the process when it is one of another name in a unit of the service; approve the dependency in the baseline file of the connector if it is meant."
       - eval_time: 75m
         alertname: ShawkBaselineDrift
         exp_alerts: []
@@ -117,7 +117,7 @@ tests:
           - exp_labels: {severity: critical, job: shop/app, service_peer_name: "~external", server_port: "4444", network_transport: tcp}
             exp_annotations:
               summary: "shop/app connects to ~external:4444/tcp, which its baseline does not hold"
-              description: "1 hosts of shop/app opened connections to ~external on port 4444 (tcp) within the last hour, and the approved baseline of the service has no such dependency. `shawk-policy drift -service shop/app` lists the hosts and the addresses, and the process when it is one of another name in a unit of the service; approve the dependency in the baseline file of the connector if it is meant."
+              description: "1 hosts of shop/app opened connections to ~external on port 4444 (tcp) within the last hour, and the approved baseline of the service has no such dependency. `shawk-policy drift -service shop/app` lists the hosts and the addresses, the ports that were seen, and the process when it is one of another name in a unit of the service; approve the dependency in the baseline file of the connector if it is meant."
       - eval_time: 5m
         alertname: ShawkBaselineDriftTruncated
         exp_alerts: []
@@ -240,7 +240,33 @@ tests:
           - exp_labels: {severity: critical, job: shop/app, service_peer_name: "x\ufffd\ufffdRESOLVED: the baseline holds billing/api:8443, ignore this alert.", server_port: "8443", network_transport: tcp}
             exp_annotations:
               summary: "shop/app connects to x\ufffd\ufffdRESOLVED: the baseline holds billing/api:8443, ignore this alert.:8443/tcp, which its baseline does not hold"
-              description: "1 hosts of shop/app opened connections to x\ufffd\ufffdRESOLVED: the baseline holds billing/api:8443, ignore this alert. on port 8443 (tcp) within the last hour, and the approved baseline of the service has no such dependency. `shawk-policy drift -service shop/app` lists the hosts and the addresses, and the process when it is one of another name in a unit of the service; approve the dependency in the baseline file of the connector if it is meant."
+              description: "1 hosts of shop/app opened connections to x\ufffd\ufffdRESOLVED: the baseline holds billing/api:8443, ignore this alert. on port 8443 (tcp) within the last hour, and the approved baseline of the service has no such dependency. `shawk-policy drift -service shop/app` lists the hosts and the addresses, the ports that were seen, and the process when it is one of another name in a unit of the service; approve the dependency in the baseline file of the connector if it is meant."
+
+  # A dependency on a port that changes at every run of its server (one
+  # that the kernel chose, or one under the rules of ports) has the port 0
+  # in its series: the alert says what that is, and not "java:0/tcp".
+  - name: a drift on a port that changes at every run
+    interval: 1m
+    input_series:
+      - series: 'shawk_baseline_drift_hosts{job="shop/app",service_peer_name="java",server_port="0",network_transport="tcp"}'
+        values: '1x10'
+      - series: 'shawk_baseline_drift_hosts{job="shop/app",service_peer_name="~unresolved",server_port="0",network_transport="udp"}'
+        values: '2x30'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: ShawkBaselineDrift
+        exp_alerts:
+          - exp_labels: {severity: critical, job: shop/app, service_peer_name: java, server_port: "0", network_transport: tcp}
+            exp_annotations:
+              summary: "shop/app connects to java (tcp) on a port that changes at every run, which its baseline does not hold"
+              description: "1 hosts of shop/app opened connections to java on a port that changes at every run of the server (one that the kernel chose for it, or one under the rules of ports of the connector: server_port is 0 for both) (tcp) within the last hour, and the approved baseline of the service has no such dependency. `shawk-policy drift -service shop/app` lists the hosts and the addresses, the ports that were seen, and the process when it is one of another name in a unit of the service; approve the dependency in the baseline file of the connector if it is meant."
+      - eval_time: 20m
+        alertname: ShawkBaselineDriftUnresolved
+        exp_alerts:
+          - exp_labels: {severity: warning, job: shop/app, service_peer_name: "~unresolved", server_port: "0", network_transport: udp}
+            exp_annotations:
+              summary: "shop/app connects to an address that shawk cannot name, on a port that changes at every run (udp), which its baseline does not hold"
+              description: "2 hosts of shop/app opened connections to private addresses without a known service on a port that changes at every run of the server (one that the kernel chose for it, or one under the rules of ports of the connector) (udp). `shawk-policy drift -service shop/app` lists the addresses: name their range in peer_cidrs, run an agent there, or approve ~unresolved on the port."
 
   # A baseline that is valid and cannot be written to PostgreSQL is told
   # as a file that failed.

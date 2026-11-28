@@ -2935,7 +2935,17 @@ transport.
   the file says what it approves. What it still approves beyond what was
   seen is a port of the kernel of *another* server of the same name: the
   history holds no fact that tells the two apart but the address, which
-  a baseline does not pin (below). A rule of ports for the server
+  a baseline does not pin (below). And a port counts as chosen by the
+  kernel by the name of the host and its number alone, when a listener
+  of that host had it so within the period: not by the process that
+  listened, its address or its network namespace. A process on the host
+  of a server that listens for a moment on a port that the kernel chose
+  for it, with the number of a fixed port of that server (a network
+  namespace has a range of ports of its own, which its owner sets),
+  makes a connection to the fixed port pass as one to a port of the
+  kernel. The connector sends such a dependency with `server_port` 0, as
+  one under the rules of ports, and the alerts say "a port that changes
+  at every run" for it. A rule of ports for the server
   (`port_agnostic_services`, `dynamic_ports`) approves every port of it
   on purpose, as port 0.
 - **A baseline judges the unit that runs its service.** The name of a
@@ -3840,7 +3850,11 @@ bound above holds. A store whose receiver takes less needs a smaller
   - *A port that the kernel chose* approves the ports that the kernel
     chose for every server of the name, not for the one server that was
     seen: the name, the port and the transport are all that a baseline
-    tells apart. A service that is
+    tells apart. Whether the kernel chose a port is known by the host and
+    the number of the port, within the period: a process on the host of
+    the server that has the kernel choose the number of a fixed port,
+    in a network namespace of its own, makes a connection to that fixed
+    port pass. A service that is
     renamed, by a release or by
     an agent that names services otherwise (`-service-name-fallback`), is
     such a new service: it is counted once, when it appears, and nothing

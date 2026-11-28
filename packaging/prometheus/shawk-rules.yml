@@ -449,6 +449,12 @@ groups:
   # ShawkNewServiceWithoutBaseline tells once, when it appears.
   - name: shawk-baseline
     rules:
+      # server_port is 0 for a dependency on a port that changes at every
+      # run of its server: one that the kernel chose for it, which the file
+      # of the baseline writes `port: kernel-chosen`, and one under the
+      # rules of ports of the connector. The text of the alerts says so in
+      # the place of "port 0".
+      #
       # A dependency that the baseline does not hold, on a server that shawk
       # names: a service, a range of peer_cidrs, or ~external.
       #
@@ -467,8 +473,8 @@ groups:
         labels:
           severity: critical
         annotations:
-          summary: "{{ $labels.job }} connects to {{ $labels.service_peer_name }}:{{ $labels.server_port }}/{{ $labels.network_transport }}, which its baseline does not hold"
-          description: "{{ $value }} hosts of {{ $labels.job }} opened connections to {{ $labels.service_peer_name }} on port {{ $labels.server_port }} ({{ $labels.network_transport }}) within the last hour, and the approved baseline of the service has no such dependency. `shawk-policy drift -service {{ $labels.job }}` lists the hosts and the addresses, and the process when it is one of another name in a unit of the service; approve the dependency in the baseline file of the connector if it is meant."
+          summary: "{{ $labels.job }} connects to {{ $labels.service_peer_name }}{{ if eq $labels.server_port \"0\" }} ({{ $labels.network_transport }}) on a port that changes at every run{{ else }}:{{ $labels.server_port }}/{{ $labels.network_transport }}{{ end }}, which its baseline does not hold"
+          description: "{{ $value }} hosts of {{ $labels.job }} opened connections to {{ $labels.service_peer_name }} on {{ if eq $labels.server_port \"0\" }}a port that changes at every run of the server (one that the kernel chose for it, or one under the rules of ports of the connector: server_port is 0 for both){{ else }}port {{ $labels.server_port }}{{ end }} ({{ $labels.network_transport }}) within the last hour, and the approved baseline of the service has no such dependency. `shawk-policy drift -service {{ $labels.job }}` lists the hosts and the addresses, the ports that were seen, and the process when it is one of another name in a unit of the service; approve the dependency in the baseline file of the connector if it is meant."
 
       # The same on a private address that shawk cannot name: a host
       # without an agent, or a server whose agent is stopped and whose
@@ -483,8 +489,8 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "{{ $labels.job }} connects to an address that shawk cannot name, on port {{ $labels.server_port }}/{{ $labels.network_transport }}, which its baseline does not hold"
-          description: "{{ $value }} hosts of {{ $labels.job }} opened connections to private addresses without a known service on port {{ $labels.server_port }} ({{ $labels.network_transport }}). `shawk-policy drift -service {{ $labels.job }}` lists the addresses: name their range in peer_cidrs, run an agent there, or approve ~unresolved on the port."
+          summary: "{{ $labels.job }} connects to an address that shawk cannot name, on {{ if eq $labels.server_port \"0\" }}a port that changes at every run ({{ $labels.network_transport }}){{ else }}port {{ $labels.server_port }}/{{ $labels.network_transport }}{{ end }}, which its baseline does not hold"
+          description: "{{ $value }} hosts of {{ $labels.job }} opened connections to private addresses without a known service on {{ if eq $labels.server_port \"0\" }}a port that changes at every run of the server (one that the kernel chose for it, or one under the rules of ports of the connector){{ else }}port {{ $labels.server_port }}{{ end }} ({{ $labels.network_transport }}). `shawk-policy drift -service {{ $labels.job }}` lists the addresses: name their range in peer_cidrs, run an agent there, or approve ~unresolved on the port."
 
       # No drift is an answer only while the drift is evaluated. A connector
       # with baseline_file sends when its last evaluation succeeded, from

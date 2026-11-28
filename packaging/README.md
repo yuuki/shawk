@@ -406,7 +406,12 @@ To alert on a service that does something its baseline does not hold:
    `port: kernel-chosen`: it approves the ports that the kernel chooses
    for servers of that name, so a restart on another such port is no
    drift, and a server of the same name on a fixed port is one. Port 0
-   approves every port. With `-all`, every name that was seen in the
+   approves every port. Whether the kernel chose a port is known by the
+   host of the server and the number of the port: a process on that host
+   that has the kernel choose the number of a fixed port of the server
+   makes a connection to the fixed port pass. In Prometheus such a
+   dependency has `server_port="0"`, and the alert says "a port that
+   changes at every run". With `-all`, every name that was seen in the
    period has a baseline, also a tool that ran once: `drift` stays
    `CLEAN` for a service that runs nowhere while the hosts that ran it
    are observed.
