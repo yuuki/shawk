@@ -807,9 +807,13 @@ func TestPGBaselineSharedUnits(t *testing.T) {
 		{"web-01", "user-1000.slice/session.scope", "python3"}, {"web-01", "user-1000.slice/session.scope", "rsync"},
 		{"web-01", "run.scope", "python3"}, {"web-01", "run.scope", "tool"},
 		{"web-02", "slurm/batch", "b.out"},
+		// Without a unit, two processes share nothing: what one of them
+		// does is not next to the other.
+		{"web-01", "", "python3"}, {"web-01", "", "stray"},
 	} {
 		f.proc(p[0], p[1], p[2])
 	}
+	f.edgeOf("web-01", "", "stray", "client", "tcp", "10.0.0.12", "10.0.7.7", 9, m, m)
 	f.edgeOf("web-01", "slurm/batch", "a.out", "client", "tcp", "10.0.0.12", "10.0.5.5", 27000, m, m)
 	f.edgeOf("web-01", "slurm/batch", "a.out", "client", "tcp", "10.0.0.12", "10.0.5.5", 27001, m, m)
 	f.edgeOf("web-01", "user-1000.slice/session.scope", "rsync", "client", "tcp", "10.0.0.12", "10.0.6.6", 873, m, m)

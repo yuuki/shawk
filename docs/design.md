@@ -2977,7 +2977,9 @@ transport.
   service of the baseline, is not lost: `shawk_v1.baseline_unjudged()`
   lists it, at most one row per unit, process, peer and transport and 100
   rows, and `shawk-policy drift` shows it under the drift as "next to the
-  baseline, not judged", without changing the verdict. The connector
+  baseline, not judged", without changing the verdict. Processes without
+  a unit are not in the list: no unit is no place that two processes
+  share, and on a host without systemd it would be every process. The connector
   sends no series for it: a series per tool of a user is the storm again,
   whatever its severity, and a new name still counts once in
   `shawk_baseline_new_services`. *The limits of the rule*: it is a list,
