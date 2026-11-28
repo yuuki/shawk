@@ -422,9 +422,13 @@ To alert on a service that does something its baseline does not hold:
    `ShawkBaselineNotEvaluated` (critical: no connector evaluates the
    drift), `ShawkBaselineHostsNotObserved` (a host that runs a service
    was not observed: its agent is stopped, or its clock is behind) and
-   `ShawkBaselineServiceWithoutHosts` (a service of the file runs
-   nowhere and no host that ran it is observed; a service that does not
-   run now on observed hosts does not fire). A host runs a service for
+   `ShawkBaselineServiceWithoutHosts` (no process of a service of the
+   file was ever seen: check its name). A service that no host runs now
+   is judged on the hosts that ran it last: where they are observed it
+   did nothing and nothing fires, and where one of them is silent it may
+   run there still, and `ShawkBaselineHostsNotObserved` fires until the
+   host reports again, another host runs the service, or the service is
+   taken out of the file. A host runs a service for
    `baseline_host_memory` (a week) after a process of it was last seen
    there, so a host that was removed alerts until then: shorten it where
    hosts come and go (1 hour at least; a memory shorter than the period

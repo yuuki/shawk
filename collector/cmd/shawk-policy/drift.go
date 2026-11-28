@@ -111,9 +111,11 @@ type driftReport struct {
 	// Reasons tell why a verdict is INCONCLUSIVE: no_baseline (no
 	// connector read one), empty_baseline (it holds no service),
 	// unlocked_service (a service asked for has none), not_observed (a
-	// host that runs a service was not observed for the whole period) and
-	// no_host (no host is known to run a service: no process of it was
-	// seen since HostsSince). Caveats tell the same where a drift was seen
+	// host that runs a service was not observed for the whole period),
+	// last_hosts_not_observed (no process of a service was seen since
+	// HostsSince, and a host that ran it last was not observed: it may run
+	// there) and no_host (no process of a service was ever seen on a host
+	// that is known). Caveats tell the same where a drift was seen
 	// all the same, and stale_baseline: the latest read of a
 	// baseline_file failed, so the baseline is not that of the file.
 	Reasons []string `json:"reasons"`
@@ -316,8 +318,11 @@ WHERE status <> 'COMPLETE' OR 'not_running' = ANY (caveats)`, judged, since, unt
 				r.NotObserved = append(r.NotObserved, s)
 			}
 		}
-		if slices.ContainsFunc(r.NotObserved, func(s baselineService) bool { return s.known() }) {
+		if slices.ContainsFunc(r.NotObserved, func(s baselineService) bool { return s.known() && !s.lastHosts() }) {
 			shortfalls = append(shortfalls, "not_observed")
+		}
+		if slices.ContainsFunc(r.NotObserved, func(s baselineService) bool { return s.lastHosts() }) {
+			shortfalls = append(shortfalls, "last_hosts_not_observed")
 		}
 		if slices.ContainsFunc(r.NotObserved, func(s baselineService) bool { return !s.known() }) {
 			shortfalls = append(shortfalls, "no_host")
@@ -387,10 +392,11 @@ func (r *driftReport) describeDriftShortfall(code string) string {
 		return msg
 	case "unlocked_service":
 		return "no baseline for " + commentNames(r.Unlocked) + ": not judged"
-	case "not_observed":
+	case "not_observed", "last_hosts_not_observed":
+		last := code == "last_hosts_not_observed"
 		var parts []string
 		for _, s := range r.NotObserved {
-			if !s.known() {
+			if !s.known() || s.lastHosts() != last {
 				continue
 			}
 			// Each host with how long it was not observed: a restart of 6
@@ -407,13 +413,26 @@ func (r *driftReport) describeDriftShortfall(code string) string {
 				}
 				hosts = append(hosts, host)
 			}
-			part := fmt.Sprintf("%s (%d of its %s: %s)", commentName(s.Service), s.UnobservedHosts, plural(s.Hosts, "host"),
-				strings.Join(hosts, ", "))
+			of := plural(s.Hosts, "host")
+			if last {
+				of = plural(s.IdleHosts, "host") + " that ran it last"
+			}
+			part := fmt.Sprintf("%s (%d of its %s: %s)", commentName(s.Service), s.UnobservedHosts, of, strings.Join(hosts, ", "))
 			parts = append(parts, part)
 		}
-		return "hosts that run a service were not observed for the whole period, so what the service did there is not " +
-			"known: " + strings.Join(parts, "; ") + ". A host counts as observed for " + seconds(tolerance.Seconds()) +
+		observed := ". A host counts as observed for " + seconds(tolerance.Seconds()) +
 			" after a report of its agent: a longer stretch without one, as a restart of the host, is not observed"
+		if last {
+			// The service was seen on no host since the memory began, and a
+			// host that ran it last is silent: it may run there, and an
+			// earlier run on a host that is observed tells nothing of it.
+			return "no process of a service was seen since " + formatTime(r.HostsSince) + " (-hosts-lookback), and a host " +
+				"that ran it last was not observed for the whole period: the service may run there still, so what it " +
+				"did is not known: " + strings.Join(parts, "; ") + observed + ". If the host is gone for good, take the " +
+				"service out of the baseline, or wait until another host runs it"
+		}
+		return "hosts that run a service were not observed for the whole period, so what the service did there is not " +
+			"known: " + strings.Join(parts, "; ") + observed
 	case "no_host":
 		var names []string
 		for _, s := range r.NotObserved {
@@ -421,9 +440,8 @@ func (r *driftReport) describeDriftShortfall(code string) string {
 				names = append(names, s.Service)
 			}
 		}
-		return "no host is known to run " + describeStrings(names, 5) + ": no process of it was seen since " +
-			formatTime(r.HostsSince) + " (-hosts-lookback), and no host that ran it before was observed, so nothing was " +
-			"there to see what it did. Check its name, or take it out of the baseline"
+		return "no host is known to run " + describeStrings(names, 5) + ": no process of it was ever seen on a host " +
+			"that is still known, so nothing was there to see what it did. Check its name, or take it out of the baseline"
 	}
 	return commentName(code)
 }
@@ -446,9 +464,9 @@ func (r *driftReport) text(limit int) string {
 			"         that runs them was observed for the whole period\n",
 			plural(len(r.Asked), "service", "services"))
 		if n := len(r.NotRunning); n > 0 {
-			rest := "no process of it was seen since %s, and the hosts that ran it before were observed, so it did nothing"
+			rest := "no process of it was seen since %s, and the hosts that ran it last were observed, so it did nothing"
 			if n > 1 {
-				rest = "no process of them was seen since %s, and the hosts that ran them before were observed, so they did nothing"
+				rest = "no process of them was seen since %s, and the hosts that ran them last were observed, so they did nothing"
 			}
 			for _, l := range wrap(fmt.Sprintf("%s nowhere now (%s): "+rest, plural(n, "service of the baseline runs",
 				"services of the baseline run"), describeStrings(r.NotRunning, 5), formatTime(r.HostsSince)), 88) {

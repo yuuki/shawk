@@ -118,8 +118,10 @@
   on a port that the kernel chose is written `port: kernel-chosen` in
   the file, which approves such ports of servers of that name and no
   fixed port. A service of the baseline that runs nowhere is judged on
-  the hosts that ran it and are observed, so that `baseline -all`
-  followed by `drift` is `CLEAN`; a host that was installed again under
+  the hosts that ran it last: where they are observed it did nothing, so
+  that `baseline -all` followed by `drift` is `CLEAN`, and where one of
+  them is silent it may run there still (`INCONCLUSIVE`,
+  `ShawkBaselineHostsNotObserved`); a host that was installed again under
   its name replaces its first machine. `packaging/prometheus/shawk-rules.yml` has
   the alerts `ShawkBaselineDrift`, `ShawkBaselineDriftUnresolved`,
   `ShawkBaselineNotEvaluated`, `ShawkBaselineHostsNotObserved`,

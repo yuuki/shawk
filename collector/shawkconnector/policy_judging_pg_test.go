@@ -313,8 +313,9 @@ func TestPGBaselineHosts(t *testing.T) {
 	if got := verdict(week); !slices.Equal(got, []string{"INCOMPLETE [not_observed] 2 2 [app-01 app-02]"}) {
 		t.Errorf("every host silent: %v", got)
 	}
-	// No host is known to run the service.
-	if got := verdict(f.ago(2 * time.Hour)); !slices.Equal(got, []string{"INCOMPLETE [unknown_service] 0 0 []"}) {
+	// Past the memory no host runs the service, and the hosts that ran it
+	// last are silent: it may run there still.
+	if got := verdict(f.ago(2 * time.Hour)); !slices.Equal(got, []string{"INCOMPLETE [last_hosts_not_observed] 0 2 [app-01 app-02]"}) {
 		t.Errorf("no host since 2 hours ago: %v", got)
 	}
 	// A host whose clock is 2 hours behind reports now, and what it does
@@ -363,9 +364,10 @@ func TestPGBaselineIdle(t *testing.T) {
 	if got := verdict(); !slices.Equal(got, want) {
 		t.Errorf("services that do not run:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
 	}
-	// The host that ran curl is silent: nothing tells what curl did.
+	// The host that ran curl is silent: curl may run there, and nothing
+	// tells what it did.
 	f.exec(`UPDATE shawk.agent_sessions SET last_heartbeat = %s WHERE host_id = 'app-01'`, f.ago(3*time.Hour))
-	want[1] = "curl INCOMPLETE [unknown_service] [] 0 0 0.000000"
+	want[1] = "curl INCOMPLETE [last_hosts_not_observed] [] 0 1 0.000000"
 	if got := verdict(); !slices.Equal(got, want) {
 		t.Errorf("with the host of curl silent:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
 	}
@@ -374,6 +376,58 @@ func TestPGBaselineIdle(t *testing.T) {
 	// not known.
 	if got := f.query(time.Hour, `SELECT status, reasons FROM shawk_v1.baseline_verdict(ARRAY['batch/monthly'], $1, $2)`); !slices.Equal(got, []string{"INCOMPLETE [unknown_service]"}) {
 		t.Errorf("without hosts_since: %v", got)
+	}
+}
+
+// TestPGBaselineLastHosts: a service that no host runs is idle only when
+// the hosts that ran it last are observed. One that runs on a host whose
+// agent went silent longer ago than the memory of hosts has no process
+// within the memory either: an earlier run on a host that is observed
+// tells nothing of where it ran since, and the answer is not that it did
+// nothing.
+func TestPGBaselineLastHosts(t *testing.T) {
+	f := newPolicyFixture(t)
+	f.host("web-01", "10.0.0.12")
+	f.host("web-02", "10.0.0.13")
+	// The agent of job-01 stopped 8 days ago, with the service running.
+	f.hostObserved("job-01", "10.0.0.31", 100*days, 8*days)
+	f.proc("job-01", "report.service", "batch/report")
+	f.exec(`UPDATE shawk.processes SET last_seen = %s WHERE host_id = 'job-01'`, f.ago(8*days))
+	const columns = `status, reasons, caveats, hosts, idle_hosts, unobserved_hosts, short_hosts, short_seconds`
+	verdict := func(service string) []string {
+		t.Helper()
+		return f.query(time.Hour, `SELECT `+columns+` FROM shawk_v1.baseline_verdict(ARRAY['`+service+`'], $1, $2, 1, '3 minutes', `+f.ago(7*days)+`)`)
+	}
+	silent := []string{"INCOMPLETE [last_hosts_not_observed] [] 0 1 1 [job-01] [3600]"}
+	if got := verdict("batch/report"); !slices.Equal(got, silent) {
+		t.Errorf("a service whose only host is silent for longer than the memory: %v, want %v", got, silent)
+	}
+	// 200 days ago the service was tried for a day on web-01, which is
+	// observed: it changes nothing.
+	f.exec(`INSERT INTO shawk.processes (host_id, unit, comm, exe, service_name, first_seen, last_seen)
+	        VALUES ('web-01', 'report.service', 'c', '', 'batch/report', %s, %s)`, f.ago(200*days), f.ago(199*days))
+	if got := verdict("batch/report"); !slices.Equal(got, silent) {
+		t.Errorf("with an earlier run on a host that is observed: %v, want %v", got, silent)
+	}
+	// A host that ran it within the length of the memory before it was
+	// last seen anywhere ran it last too: both count, and one is observed.
+	f.exec(`INSERT INTO shawk.processes (host_id, unit, comm, exe, service_name, first_seen, last_seen)
+	        VALUES ('web-02', 'report.service', 'c', '', 'batch/report', %s, %s)`, f.ago(30*days), f.ago(12*days))
+	if got, want := verdict("batch/report"), []string{"INCOMPLETE [last_hosts_not_observed] [] 0 2 1 [job-01] [3600]"}; !slices.Equal(got, want) {
+		t.Errorf("with a second host that ran it last: %v, want %v", got, want)
+	}
+	// Once the host that ran it last is observed again, without the
+	// service, the service is idle.
+	f.session("job-01", 2*time.Hour, 0, "true", "'all'")
+	if got, want := verdict("batch/report"), []string{"COMPLETE [] [not_running] 0 2 0 [] []"}; !slices.Equal(got, want) {
+		t.Errorf("with the hosts that ran it last observed: %v, want %v", got, want)
+	}
+	// The case that must stay idle: a tool that ran once, on a host that
+	// is observed.
+	f.exec(`INSERT INTO shawk.processes (host_id, unit, comm, exe, service_name, first_seen, last_seen)
+	        VALUES ('web-01', 'app.service', 'c', '', 'curl', %s, %s)`, f.ago(8*days+time.Hour), f.ago(8*days))
+	if got, want := verdict("curl"), []string{"COMPLETE [] [not_running] 0 1 0 [] []"}; !slices.Equal(got, want) {
+		t.Errorf("a tool that ran once on a host that is observed: %v, want %v", got, want)
 	}
 }
 

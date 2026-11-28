@@ -667,9 +667,8 @@ func TestPGDriftNotObserved(t *testing.T) {
 		"  - service: batch/report\n    dependencies: []\n")
 	// batch/report runs nowhere that shawk knows.
 	code, out, _ := f.run("drift")
-	if code != exitInconclusive || !strings.Contains(stable(out), "  - no host is known to run batch/report: no process of it was seen since "+
-		"TIME (-hosts-lookback), and no host that ran it before was observed, so nothing was there to see what it did. "+
-		"Check its name, or take it out of the baseline\n") {
+	if code != exitInconclusive || !strings.Contains(stable(out), "  - no host is known to run batch/report: no process of it was ever seen "+
+		"on a host that is still known, so nothing was there to see what it did. Check its name, or take it out of the baseline\n") {
 		t.Errorf("drift with a service that runs nowhere: exit status %d\n%s", code, out)
 	}
 	if code, out, _ = f.run("drift", "-service", "nginx"); code != exitComplete {
@@ -686,9 +685,12 @@ func TestPGDriftNotObserved(t *testing.T) {
 		"nginx (1 of its 1 host: web-01 for 1h). A host counts as observed for 3m after a report of its agent") {
 		t.Errorf("drift of a service whose host is silent: exit status %d\n%s", code, out)
 	}
-	// Past -hosts-lookback the host is forgotten: no host runs the service.
+	// Past -hosts-lookback no host runs the service, and the host that ran
+	// it last is the silent one: it may run there still.
 	code, out, _ = f.run("drift", "-service", "nginx", "-hosts-lookback", "2h")
-	if code != exitInconclusive || !strings.Contains(out, "no host is known to run nginx") {
+	if code != exitInconclusive || !strings.Contains(stable(out), "  - no process of a service was seen since TIME (-hosts-lookback), and a host "+
+		"that ran it last was not observed for the whole period: the service may run there still, so what it did is not known: "+
+		"nginx (1 of its 1 host that ran it last: web-01 for 1h). A host counts as observed for 3m after a report of its agent") {
 		t.Errorf("drift with -hosts-lookback 2h: exit status %d\n%s", code, out)
 	}
 	var r driftReport
@@ -890,8 +892,44 @@ func TestPGBaselineAllThenDrift(t *testing.T) {
 	// The host that ran curl stops reporting: nothing tells what curl, and
 	// shop/app, did there.
 	f.exec(`UPDATE shawk.agent_sessions SET last_heartbeat = %s WHERE host_id = 'app-01'`, f.at(3*time.Hour))
-	if code, out, _ = f.run("drift", "-service", "curl"); code != exitInconclusive || !strings.Contains(out, "no host is known to run curl") {
+	if code, out, _ = f.run("drift", "-service", "curl"); code != exitInconclusive ||
+		!strings.Contains(out, "curl (1 of its 1 host that ran it last: app-01 for 1h)") {
 		t.Errorf("drift of curl with its host silent: exit status %d\n%s", code, out)
+	}
+}
+
+// TestPGDriftLastHostSilent: a service of the baseline that runs on a host
+// whose agent has been silent for longer than -hosts-lookback has no
+// process within it. It is not a service that does nothing: an earlier
+// run on a host that is observed does not make the verdict CLEAN.
+func TestPGDriftLastHostSilent(t *testing.T) {
+	f := newFleet(t)
+	f.exec(`INSERT INTO shawk.hosts VALUES ('job-01', 'm-job-01', 'job-01', 'k', 'v', %[1]s, %[2]s);
+	        INSERT INTO shawk.agent_sessions (host_id, started_at, last_heartbeat, udp_traced, unix_traced, netns_scope, translations_traced)
+	        VALUES ('job-01', %[1]s, %[2]s, true, true, 'all', true);
+	        INSERT INTO shawk.processes (host_id, unit, comm, exe, service_name, first_seen, last_seen)
+	        VALUES ('job-01', 'report.service', 'report', '', 'batch/report', %[1]s, %[2]s),
+	               ('web-01', 'report.service', 'report', '', 'batch/report', %[3]s, %[4]s)`,
+		f.at(100*day), f.at(8*day), f.at(200*day), f.at(199*day))
+	f.approve("services:\n  - service: batch/report\n    dependencies:\n      - {peer: shop/postgres, port: 5432, proto: tcp}\n")
+	code, out, _ := f.run("drift")
+	if code != exitInconclusive || !strings.Contains(out, "Verdict  INCONCLUSIVE: no drift was seen, but nothing tells that there was none\n") ||
+		!strings.Contains(out, "batch/report (1 of its 1 host that ran it last: job-01 for 1h)") || strings.Contains(out, "so it did nothing") {
+		t.Errorf("drift of a service whose last host is silent: exit status %d\n%s", code, out)
+	}
+	var r driftReport
+	_, out, _ = f.run("drift", "-json")
+	if err := json.Unmarshal([]byte(out), &r); err != nil || r.Verdict != verdictInconclusive || len(r.NotRunning) != 0 ||
+		!slices.Equal(r.Reasons, []string{"last_hosts_not_observed"}) || len(r.NotObserved) != 1 || r.NotObserved[0].IdleHosts != 1 ||
+		r.NotObserved[0].UnobservedHosts != 1 || !slices.Equal(r.NotObserved[0].ShortHosts, []string{"job-01"}) {
+		t.Errorf("as JSON: %v, %+v", err, r)
+	}
+	// The agent of the host reports again, and the service is not there:
+	// it runs nowhere, and did nothing.
+	f.exec(`INSERT INTO shawk.agent_sessions (host_id, started_at, last_heartbeat, udp_traced, unix_traced, netns_scope, translations_traced)
+	        VALUES ('job-01', %s, %s, true, true, 'all', true)`, f.at(3*time.Hour), f.at(0))
+	if code, out, _ = f.run("drift"); code != exitComplete || !strings.Contains(out, "1 service of the baseline runs nowhere now (batch/report)") {
+		t.Errorf("drift once the last host is observed again: exit status %d\n%s", code, out)
 	}
 }
 

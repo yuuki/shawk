@@ -520,31 +520,33 @@ groups:
       # counts until then, unless the same host name reports again under a
       # new machine id (a host that was installed again), which replaces
       # it. A restart of the host is not observed for the hour that holds
-      # it: the alert then lasts that long.
+      # it: the alert then lasts that long. A service that no host runs is
+      # judged on the hosts that ran it last: one of them that is silent
+      # may run it still, and counts here for as long as it is silent.
       - alert: ShawkBaselineHostsNotObserved
         expr: max by (job) (shawk_baseline_hosts_unobserved) > 0
         for: 10m
         labels:
           severity: warning
         annotations:
-          summary: "{{ $value }} hosts that run {{ $labels.job }} were not observed: its drift from the baseline is not known"
-          description: "{{ $value }} hosts on which a process of {{ $labels.job }} was seen in the last week were not observed by their agent for the whole of the last hour: an agent that is stopped, a restart of more than 3 minutes within the hour, or a clock that is behind. A dependency that the baseline does not hold is not told for them. `shawk-policy drift -service {{ $labels.job }}` lists the hosts with how long each was not observed: start their agents, or wait for baseline_host_memory if they were removed."
+          summary: "{{ $value }} hosts that run {{ $labels.job }}, or ran it last, were not observed: its drift from the baseline is not known"
+          description: "{{ $value }} hosts on which a process of {{ $labels.job }} was seen in the last week, or which ran it last if no host runs it now, were not observed by their agent for the whole of the last hour: an agent that is stopped, a restart of more than 3 minutes within the hour, or a clock that is behind. A dependency that the baseline does not hold is not told for them. `shawk-policy drift -service {{ $labels.job }}` lists the hosts with how long each was not observed: start their agents, or wait for baseline_host_memory if they were removed. A service that runs on no host and whose last host is gone for good stays here until it is taken out of the baseline file."
 
-      # Nothing judges a service of the baseline: no host runs it, and no
-      # host that ran it before is observed, or no process of it was ever
-      # seen. The service was renamed, or its hosts are gone or silent. A
-      # service that simply does not run now, as a monthly job or a tool
-      # that ran once, on hosts that are observed, is judged on those
-      # hosts (shawk_baseline_hosts counts them): it did nothing, and this
-      # alert does not fire.
+      # Nothing judges a service of the baseline: no process of it was ever
+      # seen on a host that is still known. The service was renamed, or
+      # its name is mistyped. A service that simply does not run now, as a
+      # monthly job or a tool that ran once, is judged on the hosts that
+      # ran it last (shawk_baseline_hosts counts them): where they are
+      # observed it did nothing and no alert fires, and where one is not,
+      # ShawkBaselineHostsNotObserved does.
       - alert: ShawkBaselineServiceWithoutHosts
         expr: max by (job) (shawk_baseline_hosts) == 0
         for: 10m
         labels:
           severity: warning
         annotations:
-          summary: "no observed host is known to run or to have run {{ $labels.job }}, which has a baseline: nothing judges it"
-          description: "No process of {{ $labels.job }} was seen on any host in the last week (baseline_host_memory), and no host that ran it before is observed. Its baseline judges nothing: check the name of the service, start the agents of its hosts, or take it out of the baseline file."
+          summary: "no host is known to run or to have run {{ $labels.job }}, which has a baseline: nothing judges it"
+          description: "No process of {{ $labels.job }} was ever seen on a host that is still known. Its baseline judges nothing: check the name of the service, or take it out of the baseline file."
 
       - alert: ShawkBaselineFileInvalid
         expr: max(shawk_baseline_file_failed) > 0

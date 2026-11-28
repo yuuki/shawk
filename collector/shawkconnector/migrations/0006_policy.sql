@@ -912,7 +912,9 @@ $$;
 --               the least observed first, short_seconds how long each
 --               was not observed, and unobserved_hosts counts them), or
 --               no machine is known for the service (unknown_service):
---               nothing is known to tell that it did nothing.
+--               nothing is known to tell that it did nothing; or no
+--               machine runs it and one that ran it last was not observed
+--               (last_hosts_not_observed, below).
 --
 -- A machine runs the service when a process of it was last seen there
 -- since hosts_since, and by the end of the period. hosts_since is NULL
@@ -926,11 +928,19 @@ $$;
 -- the period runs it, whatever the caller remembers.
 --
 -- With hosts_since, a service that no machine runs is told apart by the
--- machines that ran it before: when one of them was observed for
--- min_coverage of the period, the service does not run, and nothing of it
--- was missed: COMPLETE, with the caveat not_running, and idle_hosts
--- counts those machines. When none was, or no process of the service was
--- ever seen, it is unknown_service.
+-- machines that ran it last: those on which a process of it was seen
+-- within the length of the memory (until - hosts_since) before it was last
+-- seen anywhere. They are where it may still run, if anywhere: a machine
+-- whose agent went silent keeps the service it had for ever, as far as
+-- the history tells. idle_hosts counts their hosts.
+--   When each of them was observed for min_coverage of the period, the
+--   service does not run, and nothing of it was missed: COMPLETE, with
+--   the caveat not_running.
+--   When one of them was not, the service may run there, unseen:
+--   INCOMPLETE, last_hosts_not_observed, with those hosts in short_hosts
+--   and unobserved_hosts. An earlier run on a machine that is observed
+--   says nothing of where the service ran since.
+--   When no process of the service was ever seen, it is unknown_service.
 --
 -- A machine whose last report is before the first report of another
 -- machine of the same host name was replaced by it (a host that was
@@ -978,7 +988,7 @@ BEGIN
     GROUP BY h.hostname, h.id
   ),
   sh AS MATERIALIZED (
-    SELECT had.service, had.host, had.host_id, had.last_seen >= ran_since AS runs
+    SELECT had.service, had.host, had.host_id, had.last_seen, had.last_seen >= ran_since AS runs
     FROM had
     WHERE NOT EXISTS (
       SELECT FROM span mine
@@ -988,14 +998,27 @@ BEGIN
   ob AS MATERIALIZED (
     SELECT * FROM shawk.machine_shortfalls(since, until, ARRAY(SELECT DISTINCT sh.host_id FROM sh), tolerance)
   ),
+  -- The machines that ran last a service that none runs.
+  last AS (
+    SELECT sh.service, sh.host, sh.host_id
+    FROM sh
+    JOIN (SELECT x.service, max(x.last_seen) AS at, bool_or(x.runs) AS runs FROM sh x GROUP BY x.service) t ON t.service = sh.service
+    WHERE NOT t.runs AND sh.last_seen >= t.at - (until - ran_since)
+  ),
   -- The hosts of each service by name, each with the coverage of the
-  -- least observed of its machines that run the service.
+  -- least observed of its machines that run the service, or that ran it
+  -- last when none runs it.
   byhost AS (
-    SELECT sh.service, sh.host, min(ob.covered) AS covered, max(ob.unobserved) AS unobserved
+    SELECT sh.service, sh.host, true AS runs, min(ob.covered) AS covered, max(ob.unobserved) AS unobserved
     FROM sh
     JOIN ob ON ob.host_id = sh.host_id
     WHERE sh.runs
     GROUP BY sh.service, sh.host
+    UNION ALL
+    SELECT l.service, l.host, false, min(ob.covered), max(ob.unobserved)
+    FROM last l
+    JOIN ob ON ob.host_id = l.host_id
+    GROUP BY l.service, l.host
   ),
   short AS (
     SELECT b.service, b.host, b.unobserved, row_number() OVER (PARTITION BY b.service ORDER BY b.covered, b.host COLLATE "C") AS n
@@ -1004,6 +1027,7 @@ BEGIN
   ),
   per AS (
     SELECT b.service,
+           bool_or(b.runs) AS runs,
            count(*)::integer AS hosts,
            min(b.covered) AS covered,
            (count(*) FILTER (WHERE b.covered < min_coverage))::integer AS unobserved_hosts
@@ -1016,15 +1040,6 @@ BEGIN
     FROM short s
     WHERE s.n <= 20
     GROUP BY s.service
-  ),
-  -- The machines that ran a service before, and were observed for the
-  -- period: the service does not run there, and nothing of it was missed.
-  idle AS (
-    SELECT sh.service, count(DISTINCT sh.host)::integer AS hosts
-    FROM sh
-    JOIN ob ON ob.host_id = sh.host_id
-    WHERE NOT sh.runs AND ob.covered >= min_coverage
-    GROUP BY sh.service
   ),
   -- The shortfalls of the machines of each service, and whether one of
   -- the machines that has it is below min_coverage.
@@ -1043,25 +1058,25 @@ BEGIN
     GROUP BY x.service
   )
   SELECT a.service,
-         CASE WHEN per.service IS NULL AND idle.hosts > 0 THEN 'COMPLETE'
-              WHEN per.service IS NULL OR per.covered < min_coverage THEN 'INCOMPLETE' ELSE 'COMPLETE' END,
-         CASE WHEN per.service IS NULL AND idle.hosts > 0 THEN '{}'::text[]
-              WHEN per.service IS NULL THEN ARRAY['unknown_service']
-              WHEN per.covered < min_coverage THEN coalesce(codes.short_codes, '{}') ELSE '{}'::text[] END,
-         CASE WHEN per.service IS NULL AND idle.hosts > 0 THEN ARRAY['not_running']
-              WHEN per.service IS NULL THEN '{}'::text[]
+         CASE WHEN per.service IS NULL OR per.covered < min_coverage THEN 'INCOMPLETE' ELSE 'COMPLETE' END,
+         CASE WHEN per.service IS NULL THEN ARRAY['unknown_service']
+              WHEN per.covered >= min_coverage THEN '{}'::text[]
+              WHEN per.runs THEN coalesce(codes.short_codes, '{}')
+              ELSE ARRAY['last_hosts_not_observed'] END,
+         CASE WHEN per.service IS NULL THEN '{}'::text[]
+              WHEN NOT per.runs AND per.covered >= min_coverage THEN ARRAY['not_running']
+              WHEN NOT per.runs THEN '{}'::text[]
               WHEN per.covered < min_coverage THEN coalesce(codes.other_codes, '{}')
               ELSE coalesce(codes.short_codes, '{}') || coalesce(codes.other_codes, '{}') END,
-         coalesce(per.hosts, 0),
-         trunc(coalesce(per.covered, CASE WHEN idle.hosts > 0 THEN 1 ELSE 0 END), 6),
+         CASE WHEN per.runs THEN per.hosts ELSE 0 END,
+         trunc(coalesce(per.covered, 0), 6),
          coalesce(listed.short_hosts, '{}'::text[]),
          coalesce(per.unobserved_hosts, 0),
          coalesce(listed.short_seconds, '{}'::integer[]),
-         coalesce(idle.hosts, 0)
+         CASE WHEN per.runs THEN 0 ELSE coalesce(per.hosts, 0) END
   FROM asked a
   LEFT JOIN per ON per.service = a.service
   LEFT JOIN listed ON listed.service = a.service
-  LEFT JOIN idle ON idle.service = a.service
   LEFT JOIN codes ON codes.service = a.service
   ORDER BY a.service COLLATE "C";
 END

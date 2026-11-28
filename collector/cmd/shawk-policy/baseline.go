@@ -126,7 +126,8 @@ type baselineService struct {
 	// UnobservedHosts counts the hosts that were not observed enough, of
 	// which ShortHosts lists the first, and ShortSeconds how long each of
 	// those was not observed. IdleHosts counts, for a service that runs
-	// nowhere, the hosts that ran it before and were observed.
+	// nowhere, the hosts that ran it last: UnobservedHosts and ShortHosts
+	// are then of those.
 	UnobservedHosts int          `json:"unobserved_hosts"`
 	ShortSeconds    []int32      `json:"short_seconds"`
 	IdleHosts       int          `json:"idle_hosts"`
@@ -137,6 +138,12 @@ type baselineService struct {
 
 // known tells whether a process had the service in the period.
 func (s *baselineService) known() bool { return !slices.Contains(s.Reasons, "unknown_service") }
+
+// lastHosts tells that the service runs on no host that is observed, and
+// that a host that ran it last is not observed: it may run there.
+func (s *baselineService) lastHosts() bool {
+	return slices.Contains(s.Reasons, "last_hosts_not_observed")
+}
 
 // dependency is a row of shawk_v1.baseline_observed or baseline_drift.
 type dependency struct {

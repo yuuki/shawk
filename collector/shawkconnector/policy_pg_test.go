@@ -900,17 +900,23 @@ UPDATE shawk.processes SET last_seen = now() - interval '3 hours' WHERE host_id 
 		r.services[0] != (baselineCount{"shop/app", 1, 1, 0}) {
 		t.Errorf("report with a host forgotten = %+v, %v", r, err)
 	}
-	// A service that runs nowhere is judged on the hosts that ran it
-	// before and are observed: nothing of it was missed there. When none
-	// of them is observed, it has no host.
+	// A service that runs nowhere is judged on the hosts that ran it last.
+	// One of them is silent: the service may run there, and the host
+	// counts as not observed.
 	execAll(t, conn, `UPDATE shawk.processes SET last_seen = now() - interval '30 days'`)
 	if r, err = c.store.baselineReport(ctx, now.Add(-time.Hour), now, week, 10, 10); err != nil ||
-		r.services[0] != (baselineCount{"shop/app", 1, 1, 0}) {
+		r.services[0] != (baselineCount{"shop/app", 1, 2, 1}) {
+		t.Errorf("report of a service that does not run, with a host that ran it last silent = %+v, %v", r, err)
+	}
+	// Both are observed: nothing of the service was missed.
+	execAll(t, conn, `UPDATE shawk.agent_sessions SET last_heartbeat = now()`)
+	if r, err = c.store.baselineReport(ctx, now.Add(-time.Hour), now, week, 10, 10); err != nil ||
+		r.services[0] != (baselineCount{"shop/app", 1, 2, 0}) {
 		t.Errorf("report of a service that does not run = %+v, %v", r, err)
 	}
 	execAll(t, conn, `UPDATE shawk.agent_sessions SET last_heartbeat = now() - interval '3 hours'`)
 	if r, err = c.store.baselineReport(ctx, now.Add(-time.Hour), now, week, 10, 10); err != nil ||
-		r.services[0] != (baselineCount{"shop/app", 1, 0, 0}) {
+		r.services[0] != (baselineCount{"shop/app", 1, 2, 2}) {
 		t.Errorf("report of a service that no observed host ran = %+v, %v", r, err)
 	}
 	// The connector with the smallest memory of hosts that it accepts

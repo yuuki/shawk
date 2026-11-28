@@ -307,8 +307,10 @@ the baseline, without an alert. `shawk-policy drift` exits 3 for a drift,
 every host that runs the services was observed, so a host whose agent is
 stopped makes it `INCONCLUSIVE`, and `ShawkBaselineHostsNotObserved` and
 `ShawkBaselineNotEvaluated` alert where the drift is not known. A service
-that runs nowhere at the moment, on hosts that are observed, is no such
-case: `baseline -all` followed by `drift` is `CLEAN`. A baseline file
+that runs nowhere at the moment is judged on the hosts that ran it last:
+where they are observed it did nothing (`baseline -all` followed by
+`drift` is `CLEAN`), and where one of them is silent it may run there
+still, and the verdict is `INCONCLUSIVE`. A baseline file
 ends with the line `end:`, which tells that it is whole: one that was cut
 short is refused. A server on a port that the kernel chose is written
 `port: kernel-chosen`, which approves such ports of servers of that name

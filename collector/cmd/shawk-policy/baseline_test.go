@@ -160,10 +160,11 @@ func FuzzDriftText(f *testing.F) {
 		d.Processes, d.KernelChosen, d.Port, d.Ports = []string{peer, service}, true, 0, []int{443}
 		at := testUntil
 		r := &driftReport{Since: testUntil.Add(-time.Hour), Until: testUntil, Verdict: verdictDrift, Reasons: []string{peer},
-			Caveats:  []string{"stale_baseline", "unlocked_service", "not_observed", "no_host", service},
+			Caveats:  []string{"stale_baseline", "unlocked_service", "not_observed", "last_hosts_not_observed", "no_host", service},
 			Baseline: &baselineState{ReadAt: &at, FailedAt: &at, Error: &peer, Services: 1, Dependencies: 1},
 			Asked:    []string{service}, Unlocked: []string{service, peer}, Drift: []dependency{d},
-			NotObserved: []baselineService{{Service: service, ShortHosts: []string{peer}}, {Service: peer, Reasons: []string{"unknown_service"}}},
+			NotObserved: []baselineService{{Service: service, ShortHosts: []string{peer}}, {Service: peer, Reasons: []string{"unknown_service"}},
+				{Service: peer, Reasons: []string{"last_hosts_not_observed"}, ShortHosts: []string{service}, IdleHosts: 1, UnobservedHosts: 1}},
 			NewServices: []newService{{Service: peer, FirstSeen: at, Hosts: []string{service}}},
 			// What does not run, and what is next to the baseline in a unit
 			// that unrelated processes share: names of agents too.

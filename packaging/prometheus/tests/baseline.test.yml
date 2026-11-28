@@ -169,15 +169,15 @@ tests:
         exp_alerts:
           - exp_labels: {severity: warning, job: shop/app}
             exp_annotations:
-              summary: "1 hosts that run shop/app were not observed: its drift from the baseline is not known"
-              description: "1 hosts on which a process of shop/app was seen in the last week were not observed by their agent for the whole of the last hour: an agent that is stopped, a restart of more than 3 minutes within the hour, or a clock that is behind. A dependency that the baseline does not hold is not told for them. `shawk-policy drift -service shop/app` lists the hosts with how long each was not observed: start their agents, or wait for baseline_host_memory if they were removed."
+              summary: "1 hosts that run shop/app, or ran it last, were not observed: its drift from the baseline is not known"
+              description: "1 hosts on which a process of shop/app was seen in the last week, or which ran it last if no host runs it now, were not observed by their agent for the whole of the last hour: an agent that is stopped, a restart of more than 3 minutes within the hour, or a clock that is behind. A dependency that the baseline does not hold is not told for them. `shawk-policy drift -service shop/app` lists the hosts with how long each was not observed: start their agents, or wait for baseline_host_memory if they were removed. A service that runs on no host and whose last host is gone for good stays here until it is taken out of the baseline file."
       - eval_time: 11m
         alertname: ShawkBaselineServiceWithoutHosts
         exp_alerts:
           - exp_labels: {severity: warning, job: batch/report}
             exp_annotations:
-              summary: "no observed host is known to run or to have run batch/report, which has a baseline: nothing judges it"
-              description: "No process of batch/report was seen on any host in the last week (baseline_host_memory), and no host that ran it before is observed. Its baseline judges nothing: check the name of the service, start the agents of its hosts, or take it out of the baseline file."
+              summary: "no host is known to run or to have run batch/report, which has a baseline: nothing judges it"
+              description: "No process of batch/report was ever seen on a host that is still known. Its baseline judges nothing: check the name of the service, or take it out of the baseline file."
 
   # A service that does not run now, on hosts that ran it before and are
   # observed (a monthly job, a tool that ran once): the connector counts
@@ -198,6 +198,31 @@ tests:
       - eval_time: 25m
         alertname: ShawkBaselineHostsNotObserved
         exp_alerts: []
+
+  # A service that no host runs within the memory of hosts, and whose last
+  # host is silent: it may run there still. An earlier run on a host that
+  # is observed changes nothing: the connector counts the hosts that ran
+  # it last, and the one that is not observed alerts.
+  - name: a service of the baseline whose last host is silent
+    interval: 1m
+    input_series:
+      - series: 'shawk_baseline_hosts{job="batch/nightly"}'
+        values: '1x30'
+      - series: 'shawk_baseline_hosts_unobserved{job="batch/nightly"}'
+        values: '1x30'
+      - series: 'shawk_baseline_evaluation_timestamp_seconds{job="shawk-connector"}'
+        values: '0+60x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: ShawkBaselineServiceWithoutHosts
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: ShawkBaselineHostsNotObserved
+        exp_alerts:
+          - exp_labels: {severity: warning, job: batch/nightly}
+            exp_annotations:
+              summary: "1 hosts that run batch/nightly, or ran it last, were not observed: its drift from the baseline is not known"
+              description: "1 hosts on which a process of batch/nightly was seen in the last week, or which ran it last if no host runs it now, were not observed by their agent for the whole of the last hour: an agent that is stopped, a restart of more than 3 minutes within the hour, or a clock that is behind. A dependency that the baseline does not hold is not told for them. `shawk-policy drift -service batch/nightly` lists the hosts with how long each was not observed: start their agents, or wait for baseline_host_memory if they were removed. A service that runs on no host and whose last host is gone for good stays here until it is taken out of the baseline file."
 
   # A peer whose name a process chose (OTEL_SERVICE_NAME) with line breaks
   # and a text made to look like the end of the alert. The connector sends
