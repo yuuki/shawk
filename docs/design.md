@@ -1815,9 +1815,10 @@ services:
   that PostgreSQL may hold (valid UTF-8 without NUL, of 4096 bytes at
   most, §5.5), so that whatever an agent names a service, a baseline can
   approve a dependency on it; a port is 0 to 65535, where 0 stands for
-  every port; the transport is `tcp` or `udp`. A service listed twice is refused, a dependency listed twice is
-  one. The failure is logged and recorded with its time, for every
-  connector (`shawk_v1.baseline_status`) and for Prometheus
+  every port; the transport is `tcp` or `udp`. A service listed twice is
+  refused, a dependency listed twice is one. The failure is logged and
+  recorded with its time, for every connector
+  (`shawk_v1.baseline_status`) and for Prometheus
   (`shawk.baseline.file.failed`): a baseline that no longer follows its
   file must not go unnoticed.
 - **Evaluation.** Every 5 minutes the connector reads
@@ -1869,13 +1870,17 @@ The last four are of the connector, under `job="shawk-connector"`.
   of services and peers are cut to 511 bytes, as `service.peer.name` is,
   and two that are the same once cut are one series.
 - **Unknown is not zero.** While evaluations fail, the last result is
-  sent for 15 minutes, then only the time of the evaluation: a drift that
-  is no longer known is not told, and neither is its absence, and
-  `ShawkBaselineNotEvaluated` alerts on the time (§8). Before a baseline
-  was read from a valid file nothing is judged and only
-  `shawk_baseline_file_failed` is sent.
+  sent for 15 minutes, then only the time of the evaluation and whether
+  the file failed: a drift that is no longer known is not told, and
+  neither is its absence, and `ShawkBaselineNotEvaluated` alerts on the
+  time (§8). Before a baseline was read from a valid file nothing is
+  judged and only `shawk_baseline_file_failed` is sent.
 - **Several connectors** with `baseline_file` evaluate the same
-  PostgreSQL and send the same series; the alerts take their maximum.
+  PostgreSQL and send series with the same labels, which Prometheus
+  keeps as one: the points of each follow those of the others within
+  the out-of-order window (§5.3). The evaluation is part of the work of
+  a write interval, like the refresh of `known_dependencies`: while it
+  runs, at most a minute, the connector writes nothing.
 - **Not with SQLite** (§5.8), which keeps no dependencies of a period:
   `baseline_file` is refused by configuration validation.
 
