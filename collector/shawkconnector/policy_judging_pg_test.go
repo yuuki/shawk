@@ -2,6 +2,7 @@ package shawkconnector
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -555,51 +556,130 @@ func TestPGBaselineReportShares(t *testing.T) {
 	}
 }
 
+// inOrder returns the rows of a query over the period of `lookback` before
+// T as strings, in the order of the query: queryStrings sorts them, and
+// cannot tell the order that a function returns them in.
+func (f policyFixture) inOrder(lookback time.Duration, sql string) []string {
+	f.t.Helper()
+	rows, err := f.conn.Query(context.Background(), sql, f.T.Add(-lookback), f.T)
+	if err != nil {
+		f.t.Fatalf("%s: %v", sql, err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		vals, err := rows.Values()
+		if err != nil {
+			f.t.Fatal(err)
+		}
+		parts := make([]string, len(vals))
+		for i, v := range vals {
+			parts[i] = fmt.Sprint(v)
+		}
+		out = append(out, strings.Join(parts, " "))
+	}
+	if err := rows.Err(); err != nil {
+		f.t.Fatalf("%s: %v", sql, err)
+	}
+	return out
+}
+
 // TestPGPolicyOrder: the order of what the contract returns is that of
 // the bytes of the names, whatever the collation of the database: with
 // en_US.UTF-8, the default of the PostgreSQL image, a capital sorts after
 // the small letters and marks such as ~ and - are skipped at first, so
 // that a list ordered by the database would differ from one database to
 // another with the same contents, and with it the files of shawk-policy
-// and what the connector keeps under its bounds.
+// and what the connector keeps under its bounds. The names of this test
+// are in another order in the two collations: by bytes -dash, Bravo,
+// alpha, ~tilde; in en_US.UTF-8 alpha, Bravo, -dash, ~tilde.
 func TestPGPolicyOrder(t *testing.T) {
 	f := newPolicyFixture(t)
-	for _, h := range []string{"Zeta-01", "alpha-01", "-dash-01", "~tilde-01"} {
+	names := []string{"-dash", "Bravo", "alpha", "~tilde"}
+	f.host("srv-01", "10.0.0.9")
+	for i, n := range names {
+		h := n + "-01"
 		f.host(h, "")
-		f.proc(h, "app.service", "svc")
-		f.proc(h, "Zeta.service", "Zeta")
-		f.proc(h, "alpha.service", "alpha")
-		f.edge(h, "svc", "client", "tcp", "10.0.0.1", "10.0.0.9", 80, 20*time.Minute, 0)
-		f.edge(h, "Zeta", "client", "tcp", "10.0.0.1", "10.0.0.9", 80, 20*time.Minute, 0)
-		f.edge(h, "alpha", "client", "tcp", "10.0.0.1", "203.0.113.9", 80, 20*time.Minute, 0)
+		for _, svc := range names {
+			f.proc(h, svc+".service", svc)
+			f.edge(h, svc, "client", "tcp", "10.0.0.1", "10.0.0.9", 80, 20*time.Minute, 0)
+		}
+		// The servers of srv-01, on a port each, named as the clients are.
+		f.proc("srv-01", n+".service", "srv/"+n)
+		f.pair(h, "alpha", "10.0.0.1", "srv-01", "srv/"+n, "10.0.0.9", 9000+i, 20*time.Minute, 0)
 	}
-	hosts := "[-dash-01 Zeta-01 alpha-01 ~tilde-01]"
-	want := []string{"Zeta ~unresolved " + hosts, "alpha ~external " + hosts, "svc ~unresolved " + hosts}
-	if got := f.query(time.Hour, `SELECT service, peer, hosts FROM shawk_v1.baseline_observed($1, $2)`); !slices.Equal(got, want) {
-		t.Errorf("observed:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	hosts := "[-dash-01 Bravo-01 alpha-01 ~tilde-01]"
+	// alpha depends on four servers: its rows are by the bytes of the peer.
+	want := []string{
+		"-dash ~unresolved " + hosts, "Bravo ~unresolved " + hosts,
+		"alpha srv/-dash [-dash-01]", "alpha srv/Bravo [Bravo-01]", "alpha srv/alpha [alpha-01]", "alpha srv/~tilde [~tilde-01]",
+		"alpha ~unresolved " + hosts, "~tilde ~unresolved " + hosts,
 	}
-	f.approve("services:\n  - {service: Zeta, dependencies: []}\n  - {service: alpha, dependencies: []}\n  - {service: svc, dependencies: []}\n")
-	if got := f.query(time.Hour, `SELECT service, peer, hosts FROM shawk_v1.baseline_drift($1, $2)`); !slices.Equal(got, want) {
-		t.Errorf("drift:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	if got := f.inOrder(time.Hour, `SELECT service, peer, hosts FROM shawk_v1.baseline_observed($1, $2)`); !slices.Equal(got, want) {
+		t.Errorf("observed, in its order:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
 	}
-	// The hosts that were not observed, of which the first are listed.
-	f.exec(`UPDATE shawk.agent_sessions SET last_heartbeat = %s`, f.ago(3*time.Hour))
-	want = []string{"Zeta " + hosts, "alpha " + hosts, "svc " + hosts}
-	if got := f.query(time.Hour, `SELECT service, short_hosts FROM shawk_v1.baseline_verdict(ARRAY['svc', 'alpha', 'Zeta'], $1, $2)`); !slices.Equal(got, want) {
-		t.Errorf("verdicts:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	f.approve("services:\n  - {service: \"-dash\", dependencies: []}\n  - {service: Bravo, dependencies: []}\n" +
+		"  - {service: alpha, dependencies: []}\n  - {service: ~tilde, dependencies: []}\n")
+	if got := f.inOrder(time.Hour, `SELECT service, peer, hosts FROM shawk_v1.baseline_drift($1, $2)`); !slices.Equal(got, want) {
+		t.Errorf("drift, in its order:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
 	}
-	if got := f.query(time.Hour, `SELECT (short_hosts)[1:2] FROM shawk_v1.baseline_verdict(ARRAY['svc'], $1, $2)`); !slices.Equal(got, []string{"[-dash-01 Zeta-01]"}) {
+	// What the connector keeps of the drift of a service under its share
+	// is the same in every database: the first two peers by bytes.
+	st, err := newPGStore(context.Background(), f.conn.Config().ConnString())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+	r, err := st.baselineReport(context.Background(), f.T.Add(-time.Hour), f.T, f.T.Add(-7*days), 100, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var kept []string
+	for _, d := range r.drift {
+		kept = append(kept, d.service+" "+d.peer)
+	}
+	wantKept := []string{"-dash ~unresolved", "Bravo ~unresolved", "alpha srv/-dash", "alpha srv/Bravo", "~tilde ~unresolved"}
+	slices.Sort(kept)
+	if !slices.Equal(kept, wantKept) || r.truncatedNamed != 2 || r.truncatedUnresolved != 1 {
+		t.Errorf("the connector keeps %v, and cuts %d and %d; want %v", kept, r.truncatedNamed, r.truncatedUnresolved, wantKept)
+	}
+	var services []string
+	for _, c := range r.services {
+		services = append(services, c.service)
+	}
+	if !slices.Equal(services, names) {
+		t.Errorf("the services of the report, in its order: %v, want %v", services, names)
+	}
+	// The flows of a host: by service, then by peer.
+	want = []string{"-dash ~unresolved", "Bravo ~unresolved", "alpha ~unresolved", "~tilde ~unresolved", "alpha srv/alpha"}
+	if got := f.inOrder(time.Hour, `SELECT service, peer FROM shawk_v1.policy_flows('alpha-01', $1, $2)`); !slices.Equal(got, want) {
+		t.Errorf("flows, in their order: %v, want %v", got, want)
+	}
+	// The hosts that were not observed, of which the first are listed, and
+	// the services of a verdict.
+	f.exec(`UPDATE shawk.agent_sessions SET last_heartbeat = %s WHERE host_id <> 'srv-01'`, f.ago(3*time.Hour))
+	want = nil
+	for _, n := range names {
+		want = append(want, n+" "+hosts)
+	}
+	if got := f.inOrder(time.Hour, `SELECT service, short_hosts FROM shawk_v1.baseline_verdict(ARRAY['alpha', '~tilde', 'Bravo', '-dash'], $1, $2)`); !slices.Equal(got, want) {
+		t.Errorf("verdicts, in their order:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+	if got := f.inOrder(time.Hour, `SELECT (short_hosts)[1:2] FROM shawk_v1.baseline_verdict(ARRAY['alpha'], $1, $2)`); !slices.Equal(got, []string{"[-dash-01 Bravo-01]"}) {
 		t.Errorf("the first two hosts that were not observed: %v", got)
 	}
-	// The flows of a host, and the new services.
-	want = []string{"Zeta", "alpha", "svc"}
-	if got := f.query(time.Hour, `SELECT service FROM shawk_v1.policy_flows('alpha-01', $1, $2)`); !slices.Equal(got, want) {
-		t.Errorf("flows: %v, want %v", got, want)
-	}
+	// The new services.
 	f.approve("services: []\n")
-	f.exec(`UPDATE shawk.processes SET first_seen = %s`, f.ago(30*time.Minute))
-	want = []string{"Zeta " + hosts, "alpha " + hosts, "svc " + hosts}
-	if got := f.query(time.Hour, `SELECT service, hosts FROM shawk_v1.baseline_new_services($1, $2)`); !slices.Equal(got, want) {
-		t.Errorf("new services:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	f.exec(`UPDATE shawk.processes SET first_seen = %s WHERE host_id <> 'srv-01'`, f.ago(30*time.Minute))
+	if got := f.inOrder(time.Hour, `SELECT service, hosts FROM shawk_v1.baseline_new_services($1, $2)`); !slices.Equal(got, want) {
+		t.Errorf("new services, in their order:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+	// The gaps of two machines of one name, by the ids of the machines.
+	f.exec(`INSERT INTO shawk.hosts VALUES ('Bravo-id', 'm1', 'twin', 'k', 'v', %[1]s, %[2]s), ('alpha-id', 'm2', 'twin', 'k', 'v', %[1]s, %[2]s)`,
+		f.ago(100*days), f.ago(0))
+	f.session("Bravo-id", 100*days, 30*time.Minute, "true", "'all'")
+	f.session("alpha-id", 100*days, 30*time.Minute, "true", "'all'")
+	if got := f.inOrder(time.Hour, `SELECT machine FROM shawk_v1.policy_gaps('twin', $1, $2)`); !slices.Equal(got, []string{"Bravo-id", "alpha-id"}) {
+		t.Errorf("the gaps, in their order: %v", got)
 	}
 }
