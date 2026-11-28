@@ -2142,12 +2142,14 @@ the hosts they find through their indexes; the addresses that hosts held
 are read whole, as `dependencies_between()` reads them for the shared
 ones. On a synthetic fleet of 2000 hosts with 1.1 million edges, of which
 500000 dependencies are in a period of 90 days, `dependencies_between()`
-takes 3.0 seconds, the verdict 5.1, and `impact()` 5.6 at depth 1 (179
-dependents with their cadences), 5.9 at depth 2 (7263 rows) and 7.6 at
-depth 3 (126260 rows): less than three times the dependencies of the
-period, at any depth. The cadence costs 0.3 to 0.9 milliseconds per
-dependent, for 1 to 150 runs, which is 100 seconds for the rows of depth
-3 above, and why it is read for depth 1 unless asked.
+takes 3.0 seconds, the verdict 4.3, and `impact()` 4.4 at depth 1 (179
+dependents with their cadences), 5.0 at depth 2 (7263 rows) and 6.2 at
+depth 3 (126260 rows): about twice the dependencies of the period, at any
+depth. The cadence costs 0.3 to 0.9 milliseconds per dependent, for 1 to
+150 runs: 4 more seconds for a hub with 3559 dependents, and 100 for the
+rows of depth 3 above, which is why it is read for depth 1 unless asked.
+`shawk-impact` at its defaults takes 12 seconds there, and 16 for the
+hub (the best of several runs on a shared machine).
 
 - **The joins hash.** `shawk.dependents()` joins the dependencies of the
   period with each other, and they are the rows of a function, of which
