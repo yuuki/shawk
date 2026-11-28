@@ -2963,6 +2963,15 @@ transport.
     has a baseline anywhere of those keeps its dependencies to itself:
     writing one service again does not mix in those of its neighbours.
     With `-all` every name that was seen has a baseline of its own.
+  - *A file of some services is a part of a baseline.* Written without
+    `-merge` while the connector holds a baseline of other services, the
+    file leaves to those services what they do, also in a unit of a
+    service of the file. Deployed alone it takes their baseline away, and
+    what they do becomes a drift of the services of the file at once
+    ("by envoy in its unit"). The file says so first (`NOT A WHOLE
+    BASELINE`, with the names of the services it was written against;
+    `outside_services` in JSON), and tells to merge it into the file of
+    the connector.
 - **A unit that unrelated processes share judges nothing.** The reasoning
   above holds where a unit is one workload. It does not where the unit is
   only where the system puts processes that have nothing to do with each
@@ -3359,7 +3368,9 @@ an invalid command line; 1 for a failure.
   approves, and a process of another name in the unit. A service that
   has a baseline of its own, in the file to merge with or in PostgreSQL,
   keeps its dependencies: they are not mixed into the service that is
-  written.
+  written. A file that lacks services of the baseline that PostgreSQL
+  holds says first that it is a part of that baseline, to be merged into
+  it and not deployed alone.
 - **`shawk-policy drift [-service NAME ...]`** tells the drift over a
   period that ends 5 minutes ago (an hour by default), with the hosts and
   the addresses, which Prometheus does not have, the process when it is

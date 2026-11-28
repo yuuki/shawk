@@ -106,6 +106,13 @@ type baselineReport struct {
 	// connections in the period (-all): a baseline cannot name it, so it
 	// is in no file, and nothing judges it.
 	Unnamed bool `json:"unnamed_service"`
+	// Outside are the services of the baseline that the connector holds
+	// which are not in the file: it was written as a part of that
+	// baseline, and is not one to deploy alone.
+	Outside []string `json:"outside_services"`
+
+	// deployed are the services of the baseline that the connector holds.
+	deployed []string
 
 	minCoverage string
 }
@@ -306,11 +313,10 @@ func readBaseline(ctx context.Context, tx pgx.Tx, c *baselineConfig, since, unti
 		if err != nil {
 			return nil, fmt.Errorf("the baseline: %w", err)
 		}
-		deployed, err := pgx.CollectRows(rows, pgx.RowTo[string])
-		if err != nil {
+		if r.deployed, err = pgx.CollectRows(rows, pgx.RowTo[string]); err != nil {
 			return nil, fmt.Errorf("the baseline: %w", err)
 		}
-		judged = append(judged, deployed...)
+		judged = append(judged, r.deployed...)
 	}
 	rows, err := tx.Query(ctx, `SELECT `+dependencyColumns+` FROM shawk_v1.baseline_observed($1, $2, $3, $4)`, since, until, asked, judged)
 	if err != nil {
@@ -402,6 +408,20 @@ func (r *baselineReport) finish(other *shawkconnector.Baseline, allowIncomplete 
 			}
 		}
 	}
+	// The services that have a baseline in PostgreSQL and none in the
+	// file. The file leaves their dependencies to them, also what they do
+	// in a unit of a service that it holds: without them it is not the
+	// baseline that it was written for.
+	inFile := map[string]bool{}
+	for _, s := range out.Services {
+		inFile[s.Service] = true
+	}
+	for _, s := range r.deployed {
+		if !inFile[s] {
+			r.Outside = append(r.Outside, s)
+		}
+	}
+	slices.Sort(r.Outside)
 	if len(out.Services) == 0 {
 		// None of the services asked for was seen, and there is no file to
 		// keep the others of: a file of no service, taken for the
@@ -537,6 +557,16 @@ func (r *baselineReport) text() string {
 	}
 	comment(&b, "", "Baseline of dependencies, written by shawk-policy for review. The connector reads it once",
 		"it is approved (baseline_file) and tells the dependencies of these services that are not here.", "")
+	if n := len(r.Outside); n > 0 {
+		// A part of a baseline, and no baseline: said first.
+		lines := []string{"NOT A WHOLE BASELINE: written against the baseline that the connector holds, which has"}
+		lines = append(lines, wrap(fmt.Sprintf("%s that %s not in this file (%s). What a service of this file and one of those do in the "+
+			"same unit was left to the baseline of the other. Deployed alone, this file takes their baseline away, and what "+
+			"they do becomes a drift of the services here (\"by NAME in its unit\"). Merge it into the baseline file of the "+
+			"connector: the same command with -merge FILE writes that file with these services replaced.",
+			plural(n, "service"), map[bool]string{true: "is", false: "are"}[n == 1], describeStrings(r.Outside, 5)), 92)...)
+		comment(&b, "", append(lines, "")...)
+	}
 	comment(&b, "", r.lines()...)
 	b.WriteString("\n" + r.File)
 	return b.String()

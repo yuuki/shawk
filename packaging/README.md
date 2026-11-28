@@ -449,7 +449,10 @@ To alert on a service that does something its baseline does not hold:
    service of the baseline, under the drift, and no alert fires for it:
    give the tools that matter a baseline of their own name. To approve a
    dependency, add its line to the file, or write the service again and
-   review the difference:
+   review the difference. Write it with `-merge` and the file of the
+   connector: a file written for some services without it is a part of
+   the baseline (it says `NOT A WHOLE BASELINE` at its top), and deployed
+   alone it takes the baseline of the other services away:
 
    ```sh
    shawk-policy baseline -dsn-file /etc/shawk/impact-dsn -service shop/app -merge baseline.yaml > new.yaml

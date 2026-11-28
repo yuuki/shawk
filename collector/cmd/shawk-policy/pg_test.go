@@ -1005,6 +1005,29 @@ end: {services: 1, dependencies: 4}
 	if yaml != wantFile {
 		t.Errorf("the baseline of shop/app, written again:\n%s\nwant\n%s", yaml, wantFile)
 	}
+	// Such a file is a part of the baseline that the connector holds, and
+	// says so before anything else: deployed alone it would take the
+	// baseline of envoy away, and what envoy does would be a drift of
+	// shop/app.
+	if !strings.Contains(out, "# NOT A WHOLE BASELINE: written against the baseline that the connector holds, which has\n"+
+		"# 2 services that are not in this file (envoy, python3). What a service of this file and one\n") ||
+		!strings.Contains(out, "-merge FILE writes that file with these services replaced.\n") {
+		t.Errorf("the file of one service, written beside a baseline of three, does not tell that it is a part:\n%s", out)
+	}
+	var part baselineReport
+	_, js, _ := f.run("baseline", "-service", "shop/app", "-lookback", "1h", "-json")
+	if err := json.Unmarshal([]byte(js), &part); err != nil || !slices.Equal(part.Outside, []string{"envoy", "python3"}) {
+		t.Errorf("as JSON: %v, outside %v", err, part.Outside)
+	}
+	// Merged into the file of that baseline, it is whole, and says nothing
+	// of the kind.
+	whole := filepath.Join(t.TempDir(), "deployed.yaml")
+	if err := os.WriteFile(whole, []byte(deployed+"end: {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, out, _ = f.run("baseline", "-service", "shop/app", "-lookback", "1h", "-merge", whole); strings.Contains(out, "NOT A WHOLE BASELINE") {
+		t.Errorf("the file merged with the whole baseline tells that it is a part:\n%s", out)
+	}
 	// A service that PostgreSQL holds no baseline of judges the processes
 	// of its unit as soon as it is asked for, beside the services that
 	// PostgreSQL holds: its first baseline has what they did.
