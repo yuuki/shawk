@@ -674,6 +674,42 @@ type series struct {
 	buckets []uint64
 }
 
+// sentStrings returns every string that metrics hold as an attribute of a
+// resource or of a point, as it is: what the connector sends, and not
+// what getString would make of it.
+func sentStrings(md pmetric.Metrics) []string {
+	var out []string
+	add := func(m pcommon.Map) {
+		m.Range(func(_ string, v pcommon.Value) bool {
+			if v.Type() == pcommon.ValueTypeStr {
+				out = append(out, v.Str())
+			}
+			return true
+		})
+	}
+	rms := md.ResourceMetrics()
+	for i := range rms.Len() {
+		add(rms.At(i).Resource().Attributes())
+		sms := rms.At(i).ScopeMetrics()
+		for j := range sms.Len() {
+			ms := sms.At(j).Metrics()
+			for k := range ms.Len() {
+				switch m := ms.At(k); m.Type() {
+				case pmetric.MetricTypeSum:
+					for l := range m.Sum().DataPoints().Len() {
+						add(m.Sum().DataPoints().At(l).Attributes())
+					}
+				case pmetric.MetricTypeGauge:
+					for l := range m.Gauge().DataPoints().Len() {
+						add(m.Gauge().DataPoints().At(l).Attributes())
+					}
+				}
+			}
+		}
+	}
+	return out
+}
+
 func flatten(md pmetric.Metrics) []series {
 	var out []series
 	rms := md.ResourceMetrics()

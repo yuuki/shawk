@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"go.opentelemetry.io/collector/pdata/pmetric"
 )
@@ -779,6 +780,20 @@ func TestBaselineMetricsBounded(t *testing.T) {
 	md := pmetric.NewMetrics()
 	now := t0
 	appendBaselineMetrics(md, baselineState{report: r, evaluated: now, attempted: now}, now)
+	// What leaves the connector, as it is: flatten reads the attributes
+	// through getString, which cleans them itself and would hide a label
+	// that was sent as PostgreSQL held it.
+	raw := sentStrings(md)
+	for _, v := range raw {
+		if strings.ContainsFunc(v, hiddenRune) || !utf8.ValidString(v) {
+			t.Errorf("the connector sends the attribute %q", v)
+		}
+	}
+	for _, want := range []string{"s\ufffdfake: line", "x\ufffd\ufffdRESOLVED: ignore this\ufffd\ufffd\ufffd[2J"} {
+		if !slices.Contains(raw, want) {
+			t.Errorf("the connector does not send %q among %q", want, raw)
+		}
+	}
 	var got []string
 	for _, s := range flatten(md) {
 		if len(s.peer) > maxPeerName || len(s.job) > maxPeerName {

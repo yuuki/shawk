@@ -486,6 +486,21 @@ func TestPGBaselineHostsMargin(t *testing.T) {
 	if got := f.query(time.Hour, `SELECT hosts FROM shawk_v1.baseline_verdict(ARRAY['shop/app'], $1, $2)`); !slices.Equal(got, []string{"2"}) {
 		t.Errorf("hosts of the period = %v, want 2", got)
 	}
+	// A caller that remembers hosts from a moment within the period, as a
+	// connector whose memory is shorter than its period, is given the
+	// hosts of the period all the same: a process that was last seen in
+	// the period, before that moment, is one of a host that runs the
+	// service, not of one that ran it once.
+	f.exec(`UPDATE shawk.processes SET last_seen = %s WHERE host_id = 'app-02'`, f.ago(40*time.Minute))
+	if got, want := f.query(time.Hour, `SELECT status, caveats, hosts, idle_hosts FROM shawk_v1.baseline_verdict(ARRAY['shop/app'], $1, $2, 1,
+		'3 minutes', `+f.ago(10*time.Minute)+`)`), []string{"COMPLETE [] 2 0"}; !slices.Equal(got, want) {
+		t.Errorf("with hosts_since within the period: %v, want %v", got, want)
+	}
+	f.exec(`UPDATE shawk.processes SET last_seen = %s WHERE host_id = 'app-01'`, f.ago(30*time.Minute))
+	if got, want := f.query(time.Hour, `SELECT status, caveats, hosts, idle_hosts FROM shawk_v1.baseline_verdict(ARRAY['shop/app'], $1, $2, 1,
+		'3 minutes', `+f.ago(10*time.Minute)+`)`), []string{"COMPLETE [] 2 0"}; !slices.Equal(got, want) {
+		t.Errorf("with hosts_since after every process of the period: %v, want %v", got, want)
+	}
 }
 
 // TestPGBaselineMachines: the hosts that run a service are machines: of
@@ -864,9 +879,18 @@ func TestPGBaselineSharedUnits(t *testing.T) {
 		// Without a unit, two processes share nothing: what one of them
 		// does is not next to the other.
 		{"web-01", "", "python3"}, {"web-01", "", "stray"},
+		// The unit of the process itself decides. A session below the
+		// unit of a workload is a place that unrelated processes share:
+		// the services of the workload do not judge what is in it. A unit
+		// of a user below his manager is a workload of its own: it is not
+		// next to what runs in the manager.
+		{"web-01", "job.service", "python3"}, {"web-01", "job.service/session.scope", "inner"},
+		{"web-01", "user@1000.service", "python3"}, {"web-01", "user@1000.service/foo.service", "utool"},
 	} {
 		f.proc(p[0], p[1], p[2])
 	}
+	f.edgeOf("web-01", "job.service/session.scope", "inner", "client", "tcp", "10.0.0.12", "10.0.8.8", 22, m, m)
+	f.edgeOf("web-01", "user@1000.service/foo.service", "utool", "client", "tcp", "10.0.0.12", "10.0.8.9", 23, m, m)
 	f.edgeOf("web-01", "", "stray", "client", "tcp", "10.0.0.12", "10.0.7.7", 9, m, m)
 	f.edgeOf("web-01", "slurm/batch", "a.out", "client", "tcp", "10.0.0.12", "10.0.5.5", 27000, m, m)
 	f.edgeOf("web-01", "slurm/batch", "a.out", "client", "tcp", "10.0.0.12", "10.0.5.5", 27001, m, m)
@@ -991,6 +1015,13 @@ func TestPGBaselineKernelChosenScope(t *testing.T) {
 	f.pair("app-01", "shop/app", "10.0.0.11", "web-01", "java", "10.0.0.12", 9200, 20*time.Minute, 0)
 	if got := f.inOrder(time.Hour, `SELECT `+columns+` FROM shawk_v1.baseline_drift($1, $2)`); !slices.Equal(got, []string{"java 9200 tcp false [9200]"}) {
 		t.Errorf("drift on a fixed port of another server of the name: %v", got)
+	}
+	// A port is one that the kernel chose for the period in which it chose
+	// it: 9200 was such a port of web-01 three hours ago, for a listener
+	// that is gone, and the server that has it now was given it.
+	f.listener("web-01", "java", "0.0.0.0", 9200, f.ago(3*time.Hour))
+	if got := f.inOrder(time.Hour, `SELECT `+columns+` FROM shawk_v1.baseline_drift($1, $2)`); !slices.Equal(got, []string{"java 9200 tcp false [9200]"}) {
+		t.Errorf("drift on a port that the kernel chose before the period: %v", got)
 	}
 	// Port 0 written by hand is every port of every server of the name.
 	f.approve("services:\n  - service: shop/app\n    dependencies:\n      - {peer: java, port: 0, proto: tcp}\n")
