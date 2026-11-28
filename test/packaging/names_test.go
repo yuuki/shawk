@@ -47,6 +47,10 @@ func TestPrometheusNames(t *testing.T) {
 		{"shawk.baseline.new_services", "{service}", otlptranslator.MetricTypeGauge, "shawk_baseline_new_services"},
 		{"shawk.baseline.evaluation.timestamp", "s", otlptranslator.MetricTypeGauge, "shawk_baseline_evaluation_timestamp_seconds"},
 		{"shawk.baseline.file.failed", "", otlptranslator.MetricTypeGauge, "shawk_baseline_file_failed"},
+		{"shawk.baseline.hosts", "{host}", otlptranslator.MetricTypeGauge, "shawk_baseline_hosts"},
+		{"shawk.baseline.hosts.unobserved", "{host}", otlptranslator.MetricTypeGauge, "shawk_baseline_hosts_unobserved"},
+		{"shawk.baseline.evaluation.attempt.timestamp", "s", otlptranslator.MetricTypeGauge, "shawk_baseline_evaluation_attempt_timestamp_seconds"},
+		{"shawk.baseline.evaluation.failed", "", otlptranslator.MetricTypeGauge, "shawk_baseline_evaluation_failed"},
 	} {
 		got, err := namer.Build(otlptranslator.Metric{Name: tc.name, Unit: tc.unit, Type: tc.typ})
 		if err != nil || got != tc.want {
