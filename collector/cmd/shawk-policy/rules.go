@@ -25,9 +25,12 @@ Usage:
 
   -format report    what the rules would hold, and what the history does not tell (default)
   -format nftables  a table of nftables for the host: its own connections (the hooks
-                    input and output), TCP and UDP; needs no -unit
+                    input and output), TCP and UDP; needs no -unit. Without -enforce it
+                    is the audit form, which rejects nothing: it counts and logs what
+                    the rules do not list. Load it first, and watch it
   -format systemd   a drop-in of the unit with IPAddressDeny= and IPAddressAllow=;
-                    needs -unit, the name of a service unit
+                    needs -unit, the name of a service unit, and -enforce: a drop-in
+                    has no audit form, and blocks as soon as the unit restarts with it
   -format json      the report, with the rules as data
 
 A rule pins the addresses that the sockets of the host saw: shawk keeps no name
@@ -35,8 +38,10 @@ that a firewall could match. A peer that changes its address is denied until the
 rules are written again; the report tells what is pinned and what that costs.
 
 When the history does not tell every connection of the target for the whole period
-(INCOMPLETE), rules would deny what was not seen: the report is written without
-them, unless -allow-incomplete asks for them, and the exit status is 4 either way.
+(INCOMPLETE), rules would deny what was not seen: a file that blocks (-enforce) is
+not written, unless -allow-incomplete asks for it, and the exit status is 4 either
+way. The audit form is written all the same, marked INCOMPLETE: it blocks nothing,
+and shows what the history lacks.
 
 Exit status: 0 COMPLETE, and nothing else; 4 INCOMPLETE; 1 when the command fails;
 2 when the command line is invalid, or asks for this help.
@@ -71,7 +76,9 @@ type rulesConfig struct {
 	host, unit      string
 	format, ingress string
 	allowIncomplete bool
-	limit           int
+	// enforce asks for a file that blocks what no rule lists.
+	enforce bool
+	limit   int
 }
 
 // serviceUnit is the name of a service unit of systemd, which a drop-in
@@ -87,7 +94,8 @@ func parseRules(args []string, stderr io.Writer) (*rulesConfig, error) {
 	fs.StringVar(&c.unit, "unit", "", "unit of the host to write rules for alone, as in PostgreSQL (shawk.unit: nginx.service); without it, the whole host")
 	fs.StringVar(&c.format, "format", formatReport, "report, nftables, systemd or json")
 	fs.StringVar(&c.ingress, "ingress", ingressSources, "with nftables, what is allowed of the connections the host accepts: sources (from the addresses that were seen), ports (from every address, on the ports that were seen) or none (they are not filtered)")
-	fs.BoolVar(&c.allowIncomplete, "allow-incomplete", false, "write the rules also when the history is INCOMPLETE: they deny what was not seen, and say so")
+	fs.BoolVar(&c.enforce, "enforce", false, "write a file that blocks what no rule lists: the rejecting form of the table of nftables, or the drop-in of systemd. Without it, -format nftables writes the audit form, which counts and logs instead")
+	fs.BoolVar(&c.allowIncomplete, "allow-incomplete", false, "with -enforce, write the rules also when the history is INCOMPLETE: they deny what was not seen, and say so")
 	fs.IntVar(&c.limit, "limit", 50, "rules to list in the report; 0 for all")
 	// An hour is the least that tells anything of what a host connects to.
 	if err := c.parse(fs, args, time.Hour); err != nil {
@@ -116,6 +124,14 @@ func parseRules(args []string, stderr io.Writer) (*rulesConfig, error) {
 	case c.format == formatNftables && c.unit != "":
 		err = errors.New("-format nftables writes the rules of a whole host: it takes no -unit " +
 			"(rules of the host cannot tell the processes of a unit apart)")
+	case c.format == formatSystemd && !c.enforce:
+		err = errors.New("-format systemd needs -enforce: a drop-in of systemd has no audit form, and blocks every address " +
+			"that it does not list as soon as the unit restarts with it. Load the audit form of the host first " +
+			"(-format nftables), and watch what it counts")
+	case c.enforce && c.format != formatNftables && c.format != formatSystemd:
+		err = errors.New("-enforce is for -format nftables or systemd")
+	case c.allowIncomplete && !c.enforce:
+		err = errors.New("-allow-incomplete is for -enforce: the report and the audit form are written from an incomplete history as they are")
 	case c.limit < 0:
 		err = errors.New("-limit must not be negative")
 	}
@@ -148,8 +164,12 @@ func runRules(ctx context.Context, args []string, stdout, stderr io.Writer) (int
 		// A verdict of a schema newer than this command: not COMPLETE.
 		return exitError, fmt.Errorf("unknown status %q", r.Status)
 	}
-	if r.Refused {
-		fmt.Fprintln(stderr, "shawk-policy: the history is INCOMPLETE: no rules are written (-allow-incomplete writes them all the same)")
+	switch {
+	case r.Refused && r.unknownTarget():
+		fmt.Fprintln(stderr, "shawk-policy: the target is not known: no rules are written")
+	case r.Refused:
+		fmt.Fprintln(stderr, "shawk-policy: the history is INCOMPLETE: no file that blocks is written "+
+			"(-allow-incomplete writes it all the same; without -enforce, -format nftables writes the audit form, which blocks nothing)")
 	}
 	return exitIncomplete, nil
 }
@@ -181,10 +201,13 @@ type rulesReport struct {
 	Observation *observation `json:"observation"`
 	Gaps        []gap        `json:"gaps"`
 
-	// Format and Ingress are what was asked for, and Refused tells that
-	// the rules are not written because the history is incomplete.
+	// Format and Ingress are what was asked for. Mode tells what a file of
+	// rules does with what no rule lists: audit (it counts and logs it) or
+	// enforce (it blocks it). Refused tells that a file that blocks is not
+	// written because the history is incomplete.
 	Format  string `json:"format"`
 	Ingress string `json:"ingress,omitempty"`
+	Mode    string `json:"mode,omitempty"`
 	Refused bool   `json:"refused"`
 
 	// Rules are what the target may connect to and accept, each with the
@@ -203,8 +226,9 @@ type rulesReport struct {
 	// sockets.
 	NetworkNamespaces int  `json:"network_namespaces"`
 	UnixSockets       bool `json:"unix_sockets"`
-	// TranslationsTraced tells whether the agents of the host learned the
-	// translations of addresses that the host makes, all along.
+	// TranslationsTraced tells whether the agents of the host learned
+	// every translation of addresses that the host makes, all along; the
+	// status is INCOMPLETE where they did not (translations_not_learned).
 	TranslationsTraced bool `json:"translations_traced"`
 
 	// coverage is Coverage as PostgreSQL writes it, which is cut rather
@@ -213,27 +237,43 @@ type rulesReport struct {
 	coverage, minCoverage string
 }
 
-// observation is a row of shawk_v1.coverage.
+// observation is how the machines of the host name were observed in the
+// period, from the row of shawk_v1.policy_verdict: each time is the
+// longest among them.
 type observation struct {
-	Host                   string  `json:"host"`
-	Agent                  bool    `json:"agent"`
-	Observed               float64 `json:"observed"`
+	Host string `json:"host"`
+	// Machines counts the machines that reported under the name in the
+	// period: more than one is INCOMPLETE (several_machines).
+	Machines               int     `json:"machines"`
 	UnobservedSeconds      float64 `json:"unobserved_seconds"`
 	Gaps                   int     `json:"gaps"`
 	PartlyObservedSeconds  float64 `json:"partly_observed_seconds"`
-	DroppedFlows           int64   `json:"dropped_flows"`
 	UDPUntracedSeconds     float64 `json:"udp_untraced_seconds"`
 	NetnsLimitedSeconds    float64 `json:"netns_limited_seconds"`
 	BeforeRetentionSeconds float64 `json:"before_retention_seconds"`
+	// ToleratedSeconds is the time that counts as observed although no
+	// agent reported in it, in ToleratedGaps stretches of at most
+	// ToleranceSeconds each: the restart of an agent, or its latest report
+	// that is not written yet.
+	ToleratedSeconds float64 `json:"tolerated_seconds"`
+	ToleratedGaps    int     `json:"tolerated_gaps"`
+	ToleranceSeconds float64 `json:"tolerance_seconds"`
 }
 
-// gap is a period for which the history does not tell what the target
-// did: before the retention of the connector (cause retention), or while
-// no agent observed it (cause agent).
+// tolerance is how long after its last report an agent still counts as
+// observing, the default of the contract (shawk_v1.policy_verdict).
+const tolerance = 3 * time.Minute
+
+// gap is a period for which the history does not tell what a machine of
+// the target did: before the retention of the connector (cause
+// retention), or while no agent observed it (cause agent). Machine is the
+// id of the machine (shawk_v1.agents.host_id), empty for a name without a
+// machine in the period.
 type gap struct {
-	Start time.Time `json:"start"`
-	End   time.Time `json:"end"`
-	Cause string    `json:"cause"`
+	Machine string    `json:"machine,omitempty"`
+	Start   time.Time `json:"start"`
+	End     time.Time `json:"end"`
+	Cause   string    `json:"cause"`
 }
 
 // maxGaps is how many gaps a report lists.
@@ -294,7 +334,21 @@ type rule struct {
 	Translated   bool `json:"translated"`
 	KernelChosen bool `json:"kernel_chosen"`
 	Unattributed bool `json:"unattributed"`
+	// SourcePort tells the other way of a UDP rule: the same peer, with
+	// the port as the source port of the packets. A socket of UDP may both
+	// send and receive first on one port (gossip, NTP between peers, IKE),
+	// and the agent records one direction of it: the rule of what was seen
+	// allows the datagrams to the port, and this one those from it, which
+	// the connection tracking of the kernel knows as replies only for a
+	// while after the last datagram the other way.
+	SourcePort bool `json:"source_port,omitempty"`
 }
+
+// Modes of a file of rules.
+const (
+	modeAudit   = "audit"
+	modeEnforce = "enforce"
+)
 
 // ports is the port of a rule, or its range.
 func (r *rule) ports() string {
@@ -302,6 +356,15 @@ func (r *rule) ports() string {
 		return strconv.Itoa(r.PortFrom)
 	}
 	return strconv.Itoa(r.PortFrom) + "-" + strconv.Itoa(r.PortTo)
+}
+
+// portsOf is the ports of a rule with its transport, as a reviewer reads
+// them: "8301/udp", or "from 8301/udp" for the other way of a UDP rule.
+func (r *rule) portsOf() string {
+	if r.SourcePort {
+		return "from " + r.ports() + "/" + r.Proto
+	}
+	return r.ports() + "/" + r.Proto
 }
 
 // pastFlow is a flow last seen before the period.
@@ -340,35 +403,31 @@ func readRules(ctx context.Context, tx pgx.Tx, c *rulesConfig, since, until time
 		unit = &c.unit
 	}
 	var reasons, caveats []string
+	o := observation{Host: c.host, ToleranceSeconds: tolerance.Seconds()}
 	if err := tx.QueryRow(ctx, `
-SELECT status, reasons, caveats, coverage::float8, coverage::text, network_namespaces, unix_sockets, translations_traced
-FROM shawk_v1.policy_verdict($1, $2, $3, $4, $5::numeric)`, c.host, since, until, unit, c.minCoverage).
-		Scan(&r.Status, &reasons, &caveats, &r.Coverage, &r.coverage, &r.NetworkNamespaces, &r.UnixSockets, &r.TranslationsTraced); err != nil {
+SELECT status, reasons, caveats, coverage::float8, coverage::text, network_namespaces, unix_sockets, translations_traced,
+       machines, extract(epoch FROM unobserved)::float8, gaps, extract(epoch FROM partly_observed)::float8,
+       extract(epoch FROM udp_untraced)::float8, extract(epoch FROM netns_limited)::float8,
+       extract(epoch FROM before_retention)::float8, extract(epoch FROM tolerated)::float8, tolerated_gaps
+FROM shawk_v1.policy_verdict($1, $2, $3, $4, $5::numeric, make_interval(secs => $6))`, c.host, since, until, unit, c.minCoverage,
+		tolerance.Seconds()).
+		Scan(&r.Status, &reasons, &caveats, &r.Coverage, &r.coverage, &r.NetworkNamespaces, &r.UnixSockets, &r.TranslationsTraced,
+			&o.Machines, &o.UnobservedSeconds, &o.Gaps, &o.PartlyObservedSeconds, &o.UDPUntracedSeconds, &o.NetnsLimitedSeconds,
+			&o.BeforeRetentionSeconds, &o.ToleratedSeconds, &o.ToleratedGaps); err != nil {
 		return nil, fmt.Errorf("the verdict: %w", err)
 	}
 	r.Reasons, r.Caveats = append(r.Reasons, reasons...), append(r.Caveats, caveats...)
-
-	var o observation
-	err = tx.QueryRow(ctx, `
-SELECT host, agent, observed::float8, extract(epoch FROM unobserved)::float8, gaps,
-       extract(epoch FROM partly_observed)::float8, dropped_flows, extract(epoch FROM udp_untraced)::float8,
-       extract(epoch FROM netns_limited)::float8, extract(epoch FROM before_retention)::float8
-FROM shawk_v1.coverage($1, $2, $3)`, since, until, []string{c.host}).
-		Scan(&o.Host, &o.Agent, &o.Observed, &o.UnobservedSeconds, &o.Gaps, &o.PartlyObservedSeconds, &o.DroppedFlows,
-			&o.UDPUntracedSeconds, &o.NetnsLimitedSeconds, &o.BeforeRetentionSeconds)
-	if err != nil {
-		return nil, fmt.Errorf("the coverage of the host: %w", err)
-	}
 	r.Observation = &o
 	rows, err := tx.Query(ctx, `
-SELECT gap_start, gap_end, cause FROM shawk_v1.coverage_gaps($1, $2, $3) ORDER BY gap_start LIMIT $4`,
-		since, until, []string{c.host}, maxGaps)
+SELECT coalesce(machine, ''), gap_start, gap_end, cause
+FROM shawk_v1.policy_gaps($1, $2, $3, make_interval(secs => $4)) ORDER BY gap_start, machine LIMIT $5`,
+		c.host, since, until, tolerance.Seconds(), maxGaps)
 	if err != nil {
 		return nil, fmt.Errorf("the gaps: %w", err)
 	}
 	gaps, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (gap, error) {
 		var g gap
-		err := row.Scan(&g.Start, &g.End, &g.Cause)
+		err := row.Scan(&g.Machine, &g.Start, &g.End, &g.Cause)
 		g.Start, g.End = g.Start.UTC(), g.End.UTC()
 		return g, err
 	})
@@ -396,10 +455,27 @@ FROM shawk_v1.policy_flows($1, $2, $3, $4)`, c.host, since, until, unit)
 	if err := r.build(flows, c.ingress); err != nil {
 		return nil, err
 	}
+	switch {
+	case c.format == formatSystemd || (c.format == formatNftables && c.enforce):
+		r.Mode = modeEnforce
+	case c.format == formatNftables:
+		r.Mode = modeAudit
+	}
 	// Rules made from a history that does not tell everything deny what
-	// was not seen: they are not written unless asked for.
-	r.Refused = r.Status != statusComplete && !c.allowIncomplete && (c.format == formatNftables || c.format == formatSystemd)
+	// was not seen: a file that blocks is not written unless asked for.
+	// The audit form blocks nothing. No file is written for a target that
+	// nothing knows: its name may be mistyped, and its rules would be
+	// those of no connection at all.
+	r.Refused = r.Mode != "" && (r.unknownTarget() || (r.Status != statusComplete && !c.allowIncomplete && r.Mode == modeEnforce))
 	return r, nil
+}
+
+// unknownTarget tells that nothing is known of the target: no agent
+// reported under the name of the host, or no process of it had the unit.
+func (r *rulesReport) unknownTarget() bool {
+	return slices.ContainsFunc(r.Reasons, func(code string) bool {
+		return code == "unknown_host" || code == "no_agent" || code == "unknown_unit"
+	})
 }
 
 // unknownService is the service of the sockets whose owner the agent does
@@ -452,18 +528,41 @@ func (r *rulesReport) build(flows []flow, ingressMode string) error {
 		ru.Folded = ru.Folded || f.addr.Bits() == 0
 		ru.Translated = ru.Translated || f.translated
 		ru.KernelChosen = ru.KernelChosen || (f.kernelChosen && f.portFrom == f.portTo)
-		ru.Unattributed = ru.Unattributed || (r.Target.Unit != "" && f.service == unknownService && f.unit != r.Target.Unit)
+		// A socket without a known owner has no unit (§4.1): a process
+		// of another unit that names itself ~unknown is not one.
+		ru.Unattributed = ru.Unattributed || (r.Target.Unit != "" && f.service == unknownService && f.unit == "")
 	}
+	// A drop-in of systemd lists addresses, for both directions: the
+	// directions and the ports below are of the rules of the host.
+	host := r.Format != formatSystemd
 	for k, ru := range byKey {
 		ru.Addresses = normalizePrefixes(ru.Addresses)
 		ru.PeerHosts = sortedKeys(hosts[k])
 		ru.Services = sortedKeys(services[k])
-		ru.AnySource = ru.Direction == ingress && ingressMode == ingressPorts && r.Format != formatSystemd
-		r.Rules = append(r.Rules, *ru)
+		ru.AnySource = ru.Direction == ingress && ingressMode == ingressPorts && host
+		// With -ingress none nothing is written for what the host
+		// accepts, and nothing is counted as a rule of it.
+		if !(host && ru.Direction == ingress && ingressMode == ingressNone) {
+			r.Rules = append(r.Rules, *ru)
+		}
+		if host && ru.Proto == "udp" {
+			// The other way of a UDP rule (see rule.SourcePort). That of
+			// what the host accepts is written whatever -ingress is: it is
+			// of what the host sends.
+			other := *ru
+			other.SourcePort = true
+			if ru.Direction == ingress {
+				other.Direction = egress
+				r.Rules = append(r.Rules, other)
+			} else if ingressMode != ingressNone {
+				other.Direction = ingress
+				r.Rules = append(r.Rules, other)
+			}
+		}
 	}
 	slices.SortFunc(r.Rules, func(a, b rule) int {
 		return cmp.Or(cmp.Compare(a.Direction, b.Direction), cmp.Compare(a.Proto, b.Proto), cmp.Compare(a.PortFrom, b.PortFrom),
-			cmp.Compare(a.PortTo, b.PortTo), cmp.Compare(a.Peer, b.Peer))
+			cmp.Compare(a.PortTo, b.PortTo), cmp.Compare(a.Peer, b.Peer), cmpBool(a.SourcePort, b.SourcePort))
 	})
 	slices.SortFunc(r.Before, func(a, b pastFlow) int {
 		return cmp.Or(cmp.Compare(a.Direction, b.Direction), cmp.Compare(a.Proto, b.Proto), cmp.Compare(a.Port, b.Port),
@@ -471,6 +570,17 @@ func (r *rulesReport) build(flows []flow, ingressMode string) error {
 	})
 	r.Findings = r.findings()
 	return nil
+}
+
+// cmpBool orders false before true.
+func cmpBool(a, b bool) int {
+	switch {
+	case a == b:
+		return 0
+	case b:
+		return -1
+	}
+	return 1
 }
 
 // check refuses a flow that the rules cannot be written from: what the
@@ -538,10 +648,12 @@ func (r *rulesReport) findings() []finding {
 			out = append(out, finding{code, n, fmt.Sprintf(format, args...)})
 		}
 	}
+	// The rules of what was seen: the other way of a UDP rule has its
+	// peer, its ports and its marks, and is counted once, as what it is.
 	count := func(match func(*rule) bool) int {
 		n := 0
 		for i := range r.Rules {
-			if match(&r.Rules[i]) {
+			if !r.Rules[i].SourcePort && match(&r.Rules[i]) {
 				n++
 			}
 		}
@@ -549,7 +661,7 @@ func (r *rulesReport) findings() []finding {
 	}
 	pinned := 0
 	for _, ru := range r.Rules {
-		if ru.AnySource {
+		if ru.AnySource || ru.SourcePort {
 			continue
 		}
 		for _, p := range ru.Addresses {
@@ -561,6 +673,18 @@ func (r *rulesReport) findings() []finding {
 	add("pinned_addresses", pinned, "%s pinned as the sockets saw them: a peer that gets another address (DHCP, "+
 		"autoscaling, a replica that was not used, a failover) is denied until the rules are written again",
 		plural(pinned, "address is", "addresses are"))
+	if r.Format == formatSystemd {
+		for _, v4 := range []bool{true, false} {
+			family := "IPv6"
+			if v4 {
+				family = "IPv4"
+			}
+			if r.wholeFamily(v4) {
+				add("family_open", 1, "the drop-in limits nothing for %s: a rule allows every address of the family, "+
+					"and IPAddressAllow= has no ports to narrow it with", family)
+			}
+		}
+	}
 	n := count(func(ru *rule) bool { return ru.Folded })
 	add("folded_peers", n, "%s every address of a family: the agent folded these peers and kept no address "+
 		"(the agent keeps them with -fold-external none, or -internal-peers for the ranges that matter)",
@@ -578,15 +702,19 @@ func (r *rulesReport) findings() []finding {
 	n = count(func(ru *rule) bool { return ru.Translated })
 	add("translated_backends", n, "%s the backends that the host itself translates its connections to (DNAT in "+
 		"its kernel, as kube-proxy does): they change when the translation does", plural(n, "rule allows", "rules allow"))
-	if !r.TranslationsTraced && r.Observation != nil && r.Observation.Agent {
-		add("translations_not_traced", 1, "the agent of the host did not learn the translations of addresses that the host "+
-			"makes, for all or a part of the period: if the host translates its own connections (kube-proxy, a published port "+
-			"of Docker), the rules lack the backends, and what filters after the translation denies them")
-	}
 	n = count(func(ru *rule) bool { return ru.Unattributed })
 	add("unattributed_sockets", n, "%s from sockets of the host whose owner is not known (~unknown): they may "+
 		"be of the unit, so they are allowed", plural(n, "rule comes", "rules come"))
-	n = count(func(ru *rule) bool { return ru.Direction == ingress && !ru.AnySource })
+	n = 0
+	for i := range r.Rules {
+		if r.Rules[i].SourcePort {
+			n++
+		}
+	}
+	add("udp_both_ways", n, "%s the other way of a UDP rule, for the same peer and port (the packets from the port, "+
+		"where the rule of what was seen allows those to it): a socket of UDP may send and receive first on one port, "+
+		"and shawk records one direction of it", plural(n, "rule allows", "rules allow"))
+	n = count(func(ru *rule) bool { return ru.Direction == ingress && !ru.AnySource && !ru.SourcePort })
 	if r.Format != formatSystemd && r.Ingress == ingressSources {
 		add("pinned_sources", n, "%s to the sources that were seen: a client, or an administrator, at "+
 			"another address is refused (-ingress ports opens the ports to every source)",

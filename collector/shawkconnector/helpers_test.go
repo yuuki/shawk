@@ -468,6 +468,8 @@ type fakeStore struct {
 	report        *baselineReport
 	reportErr     error
 	reports       [][2]time.Time
+	// hostsSince is since when the hosts of the last report run a service.
+	hostsSince time.Time
 }
 
 func (s *fakeStore) syncBaseline(_ context.Context, b *Baseline, _ time.Time) error {
@@ -488,10 +490,11 @@ func (s *fakeStore) baselineFailed(_ context.Context, _ time.Time, msg string) e
 	return nil
 }
 
-func (s *fakeStore) baselineReport(_ context.Context, since, until time.Time, _ int) (*baselineReport, error) {
+func (s *fakeStore) baselineReport(_ context.Context, since, until, hostsSince time.Time, _, _ int) (*baselineReport, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.reports = append(s.reports, [2]time.Time{since, until})
+	s.hostsSince = hostsSince
 	if s.reportErr != nil {
 		return nil, s.reportErr
 	}
@@ -661,6 +664,7 @@ type series struct {
 	transport                              string
 	errType                                string
 	peerHost                               string // shawk.peer.host
+	baselinePeer                           string // shawk.baseline.peer
 	localNet, peerNet                      string // shawk.local.network, shawk.peer.network
 	agent                                  bool
 	port                                   int64
@@ -692,7 +696,7 @@ func flatten(md pmetric.Metrics) []series {
 						agent: agent.Bool(), errType: getString(a, attrErrorType), peerHost: getString(a, attrPeerHost),
 						localNet: getString(a, attrLocalNetwork), peerNet: getString(a, attrPeerNetwork),
 						role: getString(a, attrRole), dir: getString(a, attrIODirection), port: port, value: v, count: c,
-						transport: getString(a, attrTransport)})
+						transport: getString(a, attrTransport), baselinePeer: getString(a, attrBaselinePeer)})
 				}
 				switch m.Type() {
 				case pmetric.MetricTypeSum:

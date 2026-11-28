@@ -85,9 +85,18 @@ type shawkConnector struct {
 	// its period.
 	baselineDigest, baselineErr string
 	lastBaselineLog             time.Time
+	// baselineFile is baseline_file as it was last read, and
+	// baselineFailed whether that read failed.
+	baselineFile   baselineFileState
+	baselineFailed bool
+	// baselineReport is the result of the last evaluation of the drift
+	// that succeeded, baselineAt when it ran and baselineUntil the end of
+	// its period; lastBaselineTry is when the last one was tried, and
+	// baselineEvalFailed whether it failed.
 	baselineReport              *baselineReport
 	baselineAt, lastBaselineTry time.Time
 	baselineUntil               time.Time
+	baselineEvalFailed          bool
 
 	// Errors of the pipeline after the connector, logged at most once a
 	// minute.

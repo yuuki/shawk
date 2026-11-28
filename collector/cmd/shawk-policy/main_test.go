@@ -59,6 +59,13 @@ func TestUsage(t *testing.T) {
 		{[]string{"rules", "-host", "h", "-format", "systemd", "-unit", "a.service", "-ingress", "ports"}, "-ingress is for nftables"},
 		{[]string{"rules", "-host", "h", "-format", "nftables", "-unit", "a.service"}, "it takes no -unit"},
 		{[]string{"rules", "-host", "h", "-ingress", "all"}, "-ingress must be sources, ports or none"},
+		// A file that blocks is asked for in so many words.
+		{[]string{"rules", "-host", "h", "-format", "systemd", "-unit", "a.service"}, "-format systemd needs -enforce"},
+		{[]string{"rules", "-host", "h", "-enforce"}, "-enforce is for -format nftables or systemd"},
+		{[]string{"rules", "-host", "h", "-format", "json", "-enforce"}, "-enforce is for -format nftables or systemd"},
+		{[]string{"rules", "-host", "h", "-format", "nftables", "-allow-incomplete"}, "-allow-incomplete is for -enforce"},
+		{[]string{"drift", "-hosts-lookback", "30m"}, "-hosts-lookback must not be shorter than -lookback"},
+		{[]string{"drift", "-hosts-lookback", "soon"}, "-hosts-lookback"},
 		{[]string{"rules", "-host", "h", "-limit", "-1"}, "-limit must not be negative"},
 		{[]string{"rules", "-host", "h", "-lookback", "3m"}, "-lookback must be from 1h"},
 		{[]string{"rules", "-host", "h", "-min-coverage", "99.9"}, "-min-coverage must be a part of the period"},
@@ -80,7 +87,7 @@ func TestUsage(t *testing.T) {
 	}
 	// Units that a drop-in can be written for.
 	for _, unit := range []string{"nginx.service", "app@1.service", "app@.service", `dev-disk\x2dby.service`, "a:b_c-d.service"} {
-		if _, err := parseRules([]string{"-host", "h", "-format", "systemd", "-unit", unit}, new(bytes.Buffer)); err != nil {
+		if _, err := parseRules([]string{"-host", "h", "-format", "systemd", "-enforce", "-unit", unit}, new(bytes.Buffer)); err != nil {
 			t.Errorf("unit %q: %v", unit, err)
 		}
 	}
@@ -115,7 +122,7 @@ func TestNeedsPostgres(t *testing.T) {
 	}
 	// A file to merge with that is invalid fails before the database is asked.
 	bad := filepath.Join(t.TempDir(), "baseline.yaml")
-	if err := os.WriteFile(bad, []byte("services:\n  - service: a\n"), 0o600); err != nil {
+	if err := os.WriteFile(bad, []byte("services:\n  - service: a\nend: {}\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if code, out, errOut := policy("baseline", "-service", "a", "-merge", bad, "-dsn", "postgres://127.0.0.1:1/x"); code != exitError ||

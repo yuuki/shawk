@@ -204,7 +204,16 @@ func describeShortfall(code string, o *observation) string {
 	case "unknown_unit":
 		return "no process of the host had this unit in the period: check the name (shawk.unit, as in PostgreSQL)"
 	case "unknown_service":
-		return "no process had this service in the period: check the name"
+		return "no process of this service was seen on any host: check the name"
+	case "several_machines":
+		return fmt.Sprintf("%d machines reported under this host name in the period (shawk_v1.agents lists them): the rules "+
+			"would be of them all, and the coverage is that of the least observed. Give each machine its own name",
+			o.Machines)
+	case "translations_not_learned":
+		return "an agent of the host did not learn every address that the host rewrites its connections to: it traces no " +
+			"translation, or it folds the peers outside its internal ranges (the default; -fold-external none keeps them). " +
+			"If the host rewrites a destination to an address outside those ranges (a NAT rule, kube-proxy with a public " +
+			"backend), the packets leave for an address that the rules lack, and nothing tells whether it does"
 	case "not_observed":
 		return "not observed by an agent" + during(o.UnobservedSeconds-o.BeforeRetentionSeconds)
 	case "before_retention":

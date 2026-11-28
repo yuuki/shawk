@@ -63,11 +63,23 @@ func (f policyFixture) hostObserved(name, addr string, from, to time.Duration) {
 	}
 }
 
-// session adds a session of the agent of a host.
+// session adds a session of the agent of a host, which keeps every peer
+// and learns the translations of addresses.
 func (f policyFixture) session(host string, from, to time.Duration, udp, netns string) {
 	f.t.Helper()
-	f.exec(`INSERT INTO shawk.agent_sessions (host_id, started_at, last_heartbeat, udp_traced, unix_traced, netns_scope)
-	        VALUES ('%s', %s, %s, %s, true, %s)`, host, f.ago(from), f.ago(to), udp, netns)
+	f.exec(`INSERT INTO shawk.agent_sessions (host_id, started_at, last_heartbeat, udp_traced, unix_traced, netns_scope,
+	                                          translations_traced)
+	        VALUES ('%s', %s, %s, %s, true, %s, true)`, host, f.ago(from), f.ago(to), udp, netns)
+}
+
+// edgeOf adds an edge of the process of a unit and a service on a host,
+// for the hosts that have the service in several units.
+func (f policyFixture) edgeOf(host, unit, service, role, proto, local, remote string, port int, first, last time.Duration) {
+	f.t.Helper()
+	f.exec(`INSERT INTO shawk.edges (host_id, process_id, role, proto, local_addr, remote_addr, port, netns, first_seen, last_seen)
+	        VALUES ('%[1]s', (SELECT id FROM shawk.processes WHERE host_id = '%[1]s' AND unit = '%[2]s' AND service_name = '%[3]s'),
+	                '%[4]s', '%[5]s', '%[6]s', '%[7]s', %[8]d, 1, %[9]s, %[10]s)`,
+		host, unit, service, role, proto, local, remote, port, f.ago(first), f.ago(last))
 }
 
 // proc adds a process of a unit and a service on a host, seen all along.
@@ -134,7 +146,8 @@ func TestPGPolicyFlows(t *testing.T) {
 	f.host("web-01", "10.0.0.12")
 	f.proc("app-01", "app.service", "shop/app")
 	f.proc("app-01", "backup.service", "backup")
-	f.proc("app-01", "~unknown", "~unknown")
+	// A socket without a known owner has no unit (§4.1).
+	f.proc("app-01", "", "~unknown")
 	f.proc("db-01", "postgresql.service", "shop/postgres")
 	f.proc("web-01", "nginx.service", "nginx")
 	f.pair("app-01", "shop/app", "10.0.0.11", "db-01", "shop/postgres", "10.0.0.10", 5432, 80*days, 0)
@@ -262,13 +275,9 @@ func TestPGPolicyFlowsTranslated(t *testing.T) {
 		t.Errorf("flows of node-01:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
 	}
 	// The sockets of the flows are in two network namespaces: a host of
-	// containers. Its agent did not tell whether it learns translations.
-	if got := f.query(30*days, `SELECT status, network_namespaces, translations_traced FROM shawk_v1.policy_verdict('node-01', $1, $2)`); !slices.Equal(got, []string{"COMPLETE 2 false"}) {
+	// containers, whose agent learned the translations.
+	if got := f.query(30*days, `SELECT status, network_namespaces, translations_traced FROM shawk_v1.policy_verdict('node-01', $1, $2)`); !slices.Equal(got, []string{"COMPLETE 2 true"}) {
 		t.Errorf("verdict of node-01: %v", got)
-	}
-	f.exec(`UPDATE shawk.agent_sessions SET translations_traced = true`)
-	if got := f.query(30*days, `SELECT translations_traced FROM shawk_v1.policy_verdict('node-01', $1, $2)`); !slices.Equal(got, []string{"true"}) {
-		t.Errorf("translations_traced of node-01 with an agent that learns them: %v", got)
 	}
 	if got := f.query(30*days, `SELECT status, network_namespaces FROM shawk_v1.policy_verdict('node-01', $1, $2, 'kubelet.service')`); !slices.Equal(got, []string{"COMPLETE 1"}) {
 		t.Errorf("verdict of kubelet.service: %v", got)
@@ -544,7 +553,7 @@ func TestPGBaselineVerdict(t *testing.T) {
 // approve writes a baseline as the connector does.
 func (f policyFixture) approve(yaml string) {
 	f.t.Helper()
-	b, err := ParseBaseline([]byte(yaml))
+	b, err := ParseBaseline([]byte(strings.TrimRight(yaml, "\n") + "\nend: {}\n"))
 	if err != nil {
 		f.t.Fatal(err)
 	}
@@ -816,9 +825,17 @@ FROM shawk.processes WHERE host_id = '%[1]s'`, h))
 		"shawk.baseline.dependencies{batch/report} 0",
 		"shawk.baseline.dependencies{shop/app} 3",
 		"shawk.baseline.drift.hosts{shop/app,~unresolved,8443,tcp} 2",
-		"shawk.baseline.drift.truncated{shawk-connector} 0",
-		"shawk.baseline.evaluation.timestamp{shawk-connector} " + itoa(now.Add(-baselineDelay).Unix()),
+		"shawk.baseline.drift.truncated{named} 0",
+		"shawk.baseline.drift.truncated{unresolved} 0",
+		"shawk.baseline.evaluation.attempt.timestamp{shawk-connector} " + itoa(now.Unix()),
+		"shawk.baseline.evaluation.failed{shawk-connector} 0",
+		"shawk.baseline.evaluation.timestamp{shawk-connector} " + itoa(now.Unix()),
 		"shawk.baseline.file.failed{shawk-connector} 0",
+		// No host runs batch/report: nothing judges it, and that is told.
+		"shawk.baseline.hosts.unobserved{batch/report} 0",
+		"shawk.baseline.hosts.unobserved{shop/app} 0",
+		"shawk.baseline.hosts{batch/report} 0",
+		"shawk.baseline.hosts{shop/app} 2",
 		"shawk.baseline.new_services{shawk-connector} 0",
 	}
 	if got := baselineSeries(out); !slices.Equal(got, wantSeries) {
@@ -827,7 +844,7 @@ FROM shawk.processes WHERE host_id = '%[1]s'`, h))
 
 	// A file that an edit broke keeps the baseline, and the failure is
 	// recorded, for every connector and for Prometheus.
-	if err := os.WriteFile(path, []byte("services:\n  - service: shop/app\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte("services:\n  - service: shop/app\nend: {}\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	c.syncBaseline(ctx)
@@ -835,8 +852,9 @@ FROM shawk.processes WHERE host_id = '%[1]s'`, h))
 		FROM shawk_v1.baseline_status`); !slices.Equal(got, []string{"true true 2 3"}) {
 		t.Errorf("baseline_status after an invalid file = %v", got)
 	}
-	r, err := c.store.baselineReport(ctx, now.Add(-time.Hour), now, 1)
-	if err != nil || !r.read || !r.failed || len(r.drift) != 1 || r.truncated != 0 {
+	week := now.Add(-7 * days)
+	r, err := c.store.baselineReport(ctx, now.Add(-time.Hour), now, week, 1, 1)
+	if err != nil || !r.read || !r.failed || len(r.drift) != 1 || r.truncatedNamed != 0 || r.truncatedUnresolved != 0 {
 		t.Errorf("report = %+v, %v", r, err)
 	}
 	// More drift than the bound: the rest is counted.
@@ -844,18 +862,48 @@ FROM shawk.processes WHERE host_id = '%[1]s'`, h))
 INSERT INTO shawk.edges (host_id, process_id, role, proto, local_addr, remote_addr, port, netns, first_seen, last_seen)
 SELECT 'app-01', id, 'client', 'tcp', '10.0.0.1', '10.0.0.9', p, 1, now() - interval '20 minutes', now() - interval '10 minutes'
 FROM shawk.processes, generate_series(9000, 9004) p WHERE host_id = 'app-01'`)
-	if r, err = c.store.baselineReport(ctx, now.Add(-time.Hour), now, 2); err != nil || len(r.drift) != 2 || r.truncated != 4 ||
-		r.drift[0].port != 8443 || r.drift[1].port != 9000 {
+	if r, err = c.store.baselineReport(ctx, now.Add(-time.Hour), now, week, 2, 10); err != nil || len(r.drift) != 2 ||
+		r.truncatedUnresolved != 4 || r.truncatedNamed != 0 || r.drift[0].port != 8443 || r.drift[1].port != 9000 {
 		t.Errorf("report with a bound of 2 = %+v, %v", r, err)
 	}
+	// And more of a service than its share.
+	if r, err = c.store.baselineReport(ctx, now.Add(-time.Hour), now, week, 100, 3); err != nil || len(r.drift) != 3 ||
+		r.truncatedUnresolved != 3 || r.drift[2].port != 9001 {
+		t.Errorf("report with a share of 3 = %+v, %v", r, err)
+	}
+	// With nothing kept, what is cut is still counted.
+	if r, err = c.store.baselineReport(ctx, now.Add(-time.Hour), now, week, 0, 3); err != nil || len(r.drift) != 0 ||
+		r.truncatedUnresolved != 6 {
+		t.Errorf("report with a bound of 0 = %+v, %v", r, err)
+	}
 	// The file is valid again, and approves what was seen.
-	if err := os.WriteFile(path, []byte("services:\n  - service: shop/app\n    dependencies:\n      - {peer: ~unresolved, port: 0, proto: tcp}\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte("services:\n  - service: shop/app\n    dependencies:\n      - {peer: ~unresolved, port: 0, proto: tcp}\nend: {services: 1, dependencies: 1}\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	c.syncBaseline(ctx)
-	if r, err = c.store.baselineReport(ctx, now.Add(-time.Hour), now, 10); err != nil || r.failed || len(r.drift) != 0 || len(r.services) != 1 ||
-		r.services[0] != (baselineCount{"shop/app", 1}) {
+	if r, err = c.store.baselineReport(ctx, now.Add(-time.Hour), now, week, 10, 10); err != nil || r.failed || len(r.drift) != 0 ||
+		len(r.services) != 1 || r.services[0] != (baselineCount{"shop/app", 1, 2, 0}) {
 		t.Errorf("report after the approval = %+v, %v", r, err)
+	}
+	// The agent of a host of the service goes silent, with its processes:
+	// the host still runs the service, and is not observed.
+	execAll(t, conn, `
+UPDATE shawk.agent_sessions SET last_heartbeat = now() - interval '3 hours' WHERE host_id = 'app-02';
+UPDATE shawk.processes SET last_seen = now() - interval '3 hours' WHERE host_id = 'app-02'`)
+	if r, err = c.store.baselineReport(ctx, now.Add(-time.Hour), now, week, 10, 10); err != nil ||
+		r.services[0] != (baselineCount{"shop/app", 1, 2, 1}) {
+		t.Errorf("report with a silent host = %+v, %v", r, err)
+	}
+	// Past the memory of hosts it is forgotten, and a service that no
+	// host runs has none.
+	if r, err = c.store.baselineReport(ctx, now.Add(-time.Hour), now, now.Add(-2*time.Hour), 10, 10); err != nil ||
+		r.services[0] != (baselineCount{"shop/app", 1, 1, 0}) {
+		t.Errorf("report with a host forgotten = %+v, %v", r, err)
+	}
+	execAll(t, conn, `UPDATE shawk.processes SET last_seen = now() - interval '30 days'`)
+	if r, err = c.store.baselineReport(ctx, now.Add(-time.Hour), now, week, 10, 10); err != nil ||
+		r.services[0] != (baselineCount{"shop/app", 1, 0, 0}) {
+		t.Errorf("report of a service that no host runs = %+v, %v", r, err)
 	}
 }
 

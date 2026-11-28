@@ -44,6 +44,7 @@ services:
     dependencies: []
   - service: gone
     dependencies: [{peer: stays, port: 2, proto: udp}]
+end: {services: 3, dependencies: 2}
 `))
 	if err != nil {
 		t.Fatal(err)
@@ -72,6 +73,7 @@ services:
     dependencies:
       - {peer: shop/postgres, port: 5432, proto: tcp}
       - {peer: ~external, port: 443, proto: tcp}
+end: {services: 4, dependencies: 3}
 `
 	if r.File != want {
 		t.Errorf("file:\n%s\nwant:\n%s", r.File, want)
@@ -79,7 +81,7 @@ services:
 	// The text is the file under what the report tells, as comments.
 	text := r.text()
 	if !strings.HasPrefix(text, "# INCOMPLETE: written with -allow-incomplete") || !strings.HasSuffix(text, "\n\n"+want) ||
-		!strings.Contains(text, "# Service  gone\n# Status   INCOMPLETE: not written\n#          - no process had this service in the period: check the name\n") ||
+		!strings.Contains(text, "# Service  gone\n# Status   INCOMPLETE: not written\n#          - no process of this service was seen on any host: check the name\n") ||
 		!strings.Contains(text, "# Service  idle\n# Status   COMPLETE: 2 hosts that ran it were observed for the whole period (coverage 1; 1 is all of the period)\n"+
 			"#   no connection of TCP or UDP was seen: the baseline approves none\n") {
 		t.Errorf("text:\n%s", text)

@@ -135,6 +135,26 @@ type Config struct {
 	// (shawk.baseline.drift.hosts). Unset, the connector leaves the
 	// baseline in PostgreSQL as it is and evaluates nothing.
 	BaselineFile string `mapstructure:"baseline_file"`
+	// BaselineHostMemory is how long a host counts as one that runs a
+	// service of the baseline after a process of the service was last seen
+	// on it. While it counts, the host must be observed for the drift of
+	// the service to be known: a host whose agent went silent is then told
+	// as not observed (shawk.baseline.hosts.unobserved) rather than left
+	// out, for this long. A fleet whose hosts come and go shortens it; a
+	// host that is removed counts until it is over.
+	BaselineHostMemory time.Duration `mapstructure:"baseline_host_memory"`
+}
+
+// defaultBaselineHostMemory is baseline_host_memory when it is not set: a
+// week, so that a host that is off over a weekend still counts.
+const defaultBaselineHostMemory = 7 * 24 * time.Hour
+
+// baselineHostMemory is BaselineHostMemory, or its default.
+func (c *Config) baselineHostMemory() time.Duration {
+	if c.BaselineHostMemory == 0 {
+		return defaultBaselineHostMemory
+	}
+	return c.BaselineHostMemory
 }
 
 // PostgresConfig configures the connection to PostgreSQL.
@@ -193,15 +213,16 @@ const (
 
 func createDefaultConfig() *Config {
 	return &Config{
-		WriteInterval:    time.Minute,
-		IdleTTL:          15 * time.Minute,
-		MaxPeers:         50,
-		MaxServices:      200,
-		MaxPeerHosts:     500,
-		Retention:        3 * 365 * 24 * time.Hour,
-		MaxHosts:         defaultMaxHosts,
-		MaxSeriesPerHost: defaultMaxSeriesPerHost,
-		MaxPendingRows:   defaultMaxPendingRows,
+		WriteInterval:      time.Minute,
+		IdleTTL:            15 * time.Minute,
+		MaxPeers:           50,
+		MaxServices:        200,
+		MaxPeerHosts:       500,
+		Retention:          3 * 365 * 24 * time.Hour,
+		BaselineHostMemory: defaultBaselineHostMemory,
+		MaxHosts:           defaultMaxHosts,
+		MaxSeriesPerHost:   defaultMaxSeriesPerHost,
+		MaxPendingRows:     defaultMaxPendingRows,
 	}
 }
 
@@ -251,6 +272,11 @@ func (c *Config) Validate() error {
 	if c.IdleTTL < c.WriteInterval || c.IdleTTL < 2*time.Minute {
 		// Inputs must outlive a few intervals of the agents (15s) and delays.
 		errs = append(errs, errors.New("idle_ttl must be at least 2m and not shorter than write_interval"))
+	}
+	if c.BaselineHostMemory != 0 && (c.BaselineHostMemory < time.Hour || c.BaselineHostMemory > 90*24*time.Hour) {
+		// Less than the period of an evaluation would forget a host
+		// before its silence is told once.
+		errs = append(errs, errors.New("baseline_host_memory must be from 1h to 2160h (90 days)"))
 	}
 	if c.Retention < 0 {
 		errs = append(errs, errors.New("retention must not be negative"))

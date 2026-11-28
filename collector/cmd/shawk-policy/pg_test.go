@@ -109,8 +109,8 @@ func newFleet(t *testing.T) *pgFleet {
 			        VALUES ('%s', %s, %s, true, true, 'all', true)`, host, f.at(100*day), f.at(0))
 		}
 	}
-	f.exec(`INSERT INTO shawk.agent_sessions (host_id, started_at, last_heartbeat, udp_traced, unix_traced, netns_scope) VALUES
-	        ('gap-01', %s, %s, true, true, 'all'), ('gap-01', %s, %s, true, true, 'all')`,
+	f.exec(`INSERT INTO shawk.agent_sessions (host_id, started_at, last_heartbeat, udp_traced, unix_traced, netns_scope, translations_traced) VALUES
+	        ('gap-01', %s, %s, true, true, 'all', true), ('gap-01', %s, %s, true, true, 'all', true)`,
 		f.at(100*day), f.at(10*day), f.at(10*day-time.Hour-3*time.Minute), f.at(0))
 	for _, p := range [][3]string{{"app-01", "app.service", "shop/app"}, {"app-02", "app.service", "shop/app"},
 		{"gap-01", "app.service", "shop/app"}, {"db-01", "postgresql.service", "shop/postgres"}, {"web-01", "nginx.service", "nginx"},
@@ -153,7 +153,7 @@ func (f *pgFleet) run(command string, args ...string) (int, string, string) {
 // approve writes a baseline to the database as the connector does.
 func (f *pgFleet) approve(file string) {
 	f.t.Helper()
-	b, err := shawkconnector.ParseBaseline([]byte(file))
+	b, err := shawkconnector.ParseBaseline([]byte(strings.TrimRight(file, "\n") + "\nend: {}\n"))
 	if err != nil {
 		f.t.Fatal(err)
 	}
@@ -188,46 +188,57 @@ func TestPGRules(t *testing.T) {
 	f := newFleet(t)
 	code, out, errOut := f.run("rules", "-host", "app-01")
 	_, rules, _ := strings.Cut(stable(out), "\nRules\n")
-	want := `DIRECTION  PORTS     PEER                   ADDRESSES  SERVICES  LAST SEEN  NOTES
-egress     443/tcp   ~external              0.0.0.0/0  shop/app  TIME       folded peers
-egress     5432/tcp  shop/postgres (db-01)  10.0.0.10  shop/app  TIME
-egress     53/udp    ~unresolved            10.0.0.53  shop/app  TIME
-ingress    22/tcp    ~unresolved            10.0.5.5   sshd      TIME
-ingress    8080/tcp  nginx (web-01)         10.0.0.12  shop/app  TIME
+	want := `DIRECTION  PORTS        PEER                   ADDRESSES  SERVICES  LAST SEEN  NOTES
+egress     443/tcp      ~external              0.0.0.0/0  shop/app  TIME       folded peers
+egress     5432/tcp     shop/postgres (db-01)  10.0.0.10  shop/app  TIME
+egress     53/udp       ~unresolved            10.0.0.53  shop/app  TIME
+ingress    22/tcp       ~unresolved            10.0.5.5   sshd      TIME
+ingress    8080/tcp     nginx (web-01)         10.0.0.12  shop/app  TIME
+ingress    from 53/udp  ~unresolved            10.0.0.53  shop/app  TIME       the other way of a UDP rule
 
 Seen before the period, and in no rule
 DIRECTION  PORT      PEER         ADDRESS   SERVICE   LAST SEEN
 egress     9000/tcp  ~unresolved  10.0.9.9  shop/app  TIME
 
-shawk applied nothing. -format nftables or -format systemd writes the rules, for review.
+shawk applied nothing. -format nftables writes the rules as a table that rejects nothing and counts
+what they do not list (the audit form): load it first. -enforce writes the table that rejects, and
+-format systemd -enforce the drop-in of a unit.
 `
 	if code != exitComplete || errOut != "" || rules != stable(want) ||
 		!strings.Contains(out, "Target   host app-01\n") || !strings.Contains(stable(out), "Period  TIME to TIME (90d)\n") ||
-		!strings.Contains(out, "Status   COMPLETE: the history tells every TCP and UDP connection of the target in the period\n"+
-			"         (coverage 1; 1 is all of the period)\n") {
+		!strings.Contains(out, "Status   COMPLETE: an agent observed the target for the whole period, so the history tells every\n"+
+			"         TCP and UDP connection that its sockets made in it\n         (coverage 1; 1 is all of the period)\n") {
 		t.Errorf("rules of app-01: exit status %d, stderr %q\n%s\nwant the rules:\n%s", code, errOut, out, want)
 	}
 
 	// The table of nftables allows those flows and nothing else.
 	code, out, errOut = f.run("rules", "-host", "app-01", "-format", "nftables")
-	wantRules := []string{"egress tcp 443-443 0.0.0.0/0", "egress tcp 5432-5432 10.0.0.10/32", "egress udp 53-53 10.0.0.53/32",
-		"ingress tcp 22-22 10.0.5.5/32", "ingress tcp 8080-8080 10.0.0.12/32"}
-	if got := parseNftables(t, out); code != exitComplete || errOut != "" || !slices.Equal(got, wantRules) {
+	// It is the audit form unless -enforce asks for the one that rejects.
+	wantRules := []string{"egress tcp to 443-443 0.0.0.0/0", "egress tcp to 5432-5432 10.0.0.10/32", "egress udp to 53-53 10.0.0.53/32",
+		"ingress tcp to 22-22 10.0.5.5/32", "ingress tcp to 8080-8080 10.0.0.12/32", "ingress udp from 53-53 10.0.0.53/32"}
+	if got := parseNftables(t, out); code != exitComplete || errOut != "" || !slices.Equal(got, wantRules) ||
+		!strings.Contains(out, "# AUDIT form: it rejects nothing.") || strings.Contains(out, "reject with") {
 		t.Errorf("nftables of app-01: exit status %d, stderr %q; it allows %v, want %v\n%s", code, errOut, got, wantRules, out)
 	}
+	code, out, errOut = f.run("rules", "-host", "app-01", "-format", "nftables", "-enforce")
+	if got := parseNftables(t, out); code != exitComplete || errOut != "" || !slices.Equal(got, wantRules) ||
+		!strings.Contains(out, "# ENFORCING form: it rejects what no rule lists.") ||
+		!strings.Contains(out, "\t\tcounter name \"egress_unlisted\" reject with icmpx admin-prohibited\n") {
+		t.Errorf("nftables of app-01 with -enforce: exit status %d, stderr %q; it allows %v, want %v\n%s", code, errOut, got, wantRules, out)
+	}
 	code, out, _ = f.run("rules", "-host", "app-01", "-format", "nftables", "-ingress", "ports")
-	wantRules[3], wantRules[4] = "ingress tcp 22-22 any", "ingress tcp 8080-8080 any"
+	wantRules[3], wantRules[4] = "ingress tcp to 22-22 any", "ingress tcp to 8080-8080 any"
 	if got := parseNftables(t, out); code != exitComplete || !slices.Equal(got, wantRules) {
 		t.Errorf("nftables of app-01 with -ingress ports: exit status %d; it allows %v, want %v", code, got, wantRules)
 	}
 	// A longer period holds the job.
 	code, out, _ = f.run("rules", "-host", "app-01", "-format", "nftables", "-ingress", "none", "-lookback", "98d")
-	if got := parseNftables(t, out); code != exitComplete || !slices.Contains(got, "egress tcp 9000-9000 10.0.9.9/32") || len(got) != 4 {
+	if got := parseNftables(t, out); code != exitComplete || !slices.Contains(got, "egress tcp to 9000-9000 10.0.9.9/32") || len(got) != 4 {
 		t.Errorf("nftables of app-01 over 98 days: exit status %d; it allows %v", code, got)
 	}
 
 	// The drop-in of the unit of the application: sshd is another unit.
-	code, out, errOut = f.run("rules", "-host", "app-01", "-unit", "app.service", "-format", "systemd")
+	code, out, errOut = f.run("rules", "-host", "app-01", "-unit", "app.service", "-format", "systemd", "-enforce")
 	wantAllow := []string{"0.0.0.0/0", "10.0.0.10/32", "10.0.0.12/32", "10.0.0.53/32"}
 	if got := parseSystemd(t, out); code != exitComplete || errOut != "" || !slices.Equal(got, wantAllow) ||
 		!strings.Contains(out, "# Target   unit app.service of host app-01\n") {
@@ -239,17 +250,39 @@ shawk applied nothing. -format nftables or -format systemd writes the rules, for
 	if err := json.Unmarshal([]byte(out), &r); err != nil {
 		t.Fatalf("%v\n%s", err, out)
 	}
-	if code != exitComplete || r.Status != statusComplete || r.Coverage != 1 || len(r.Rules) != 5 || len(r.Before) != 1 || r.Refused ||
-		r.Observation == nil || !r.Observation.Agent || !r.Until.Equal(f.end) || !r.Since.Equal(f.end.Add(-90*day)) ||
+	if code != exitComplete || r.Status != statusComplete || r.Coverage != 1 || len(r.Rules) != 6 || len(r.Before) != 1 || r.Refused ||
+		r.Observation == nil || r.Observation.Machines != 1 || !r.Until.Equal(f.end) || !r.Since.Equal(f.end.Add(-90*day)) ||
 		r.Rules[1].Peer != "shop/postgres" || !slices.Equal(r.Rules[1].PeerHosts, []string{"db-01"}) || r.NetworkNamespaces != 1 ||
 		!r.TranslationsTraced {
 		t.Errorf("exit status %d, report = %+v", code, r)
 	}
-	// A host whose agent did not learn its translations: the rules may lack
-	// the backends of what it translates itself, which the report tells.
-	code, out, _ = f.run("rules", "-host", "gap-01", "-min-coverage", "0.9")
-	if code != exitComplete || !strings.Contains(out, "  - the agent of the host did not learn the translations of addresses that the host makes") {
-		t.Errorf("rules of a host whose agent traced no translations: exit status %d\n%s", code, out)
+	// A host whose agent folds its peers, as an agent does by default,
+	// did not learn every address that the host rewrites its connections
+	// to: the rules may lack what the packets leave for, and are not
+	// complete, whatever is accepted of the time that was not observed. The
+	// audit form is written all the same, and says so.
+	f.exec(`UPDATE shawk.agent_sessions SET peer_fold = 'in' WHERE host_id = 'app-02'`)
+	code, out, _ = f.run("rules", "-host", "app-02", "-min-coverage", "0.5")
+	if code != exitIncomplete || !strings.Contains(out, "         - an agent of the host did not learn every address that the host rewrites its connections\n") {
+		t.Errorf("rules of a host whose agent folds its peers: exit status %d\n%s", code, out)
+	}
+	code, out, errOut = f.run("rules", "-host", "app-02", "-format", "nftables")
+	if code != exitIncomplete || errOut != "" || !strings.HasPrefix(out, "#!/usr/sbin/nft -f\n# INCOMPLETE: the history does not tell every connection of the target") ||
+		!strings.Contains(out, "\t\tip daddr 10.0.0.10 tcp dport 5432 accept\n") || strings.Contains(out, "reject with") {
+		t.Errorf("the audit form of that host: exit status %d, stderr %q\n%s", code, errOut, out)
+	}
+	code, out, errOut = f.run("rules", "-host", "app-02", "-format", "nftables", "-enforce")
+	if code != exitIncomplete || strings.Contains(out, "table inet") || !strings.Contains(errOut, "no file that blocks is written") {
+		t.Errorf("the form that rejects of that host: exit status %d, stderr %q\n%s", code, errOut, out)
+	}
+	// Two machines that report under one name: the rules would be of both.
+	f.exec(`INSERT INTO shawk.hosts VALUES ('db-01-twin', 'm-twin', 'db-01', 'k', 'v', %s, %s)`, f.at(100*day), f.at(0))
+	f.exec(`INSERT INTO shawk.agent_sessions (host_id, started_at, last_heartbeat, udp_traced, unix_traced, netns_scope, translations_traced)
+	        VALUES ('db-01-twin', %s, %s, true, true, 'all', true)`, f.at(100*day), f.at(20*day))
+	code, out, _ = f.run("rules", "-host", "db-01")
+	if code != exitIncomplete || !strings.Contains(out, "         - 2 machines reported under this host name in the period") ||
+		!strings.Contains(out, ", machine db-01-twin\n") {
+		t.Errorf("rules of a name of two machines: exit status %d\n%s", code, out)
 	}
 }
 
@@ -257,15 +290,15 @@ shawk applied nothing. -format nftables or -format systemd writes the rules, for
 // rules are written unless they are asked for, and the status is never 0.
 func TestPGRulesIncomplete(t *testing.T) {
 	f := newFleet(t)
-	for _, format := range [][]string{{"-format", "nftables"}, {"-format", "systemd", "-unit", "app.service"}} {
+	for _, format := range [][]string{{"-format", "nftables", "-enforce"}, {"-format", "systemd", "-enforce", "-unit", "app.service"}} {
 		args := append([]string{"-host", "gap-01"}, format...)
 		code, out, errOut := f.run("rules", args...)
-		if code != exitIncomplete || strings.Contains(out, "accept") || strings.Contains(out, "IPAddress") ||
+		if code != exitIncomplete || strings.Contains(out, "accept\n") || strings.Contains(out, "\nIPAddressAllow=") ||
 			!strings.Contains(out, "Status   INCOMPLETE: the history does not tell every connection of the target in the period.\n") ||
 			!strings.Contains(out, "         - not observed by an agent for 1h of the period\n") ||
 			!strings.Contains(stable(out), "\nNot observed\n  TIME to TIME (1h)\n") ||
-			!strings.Contains(out, "\nNo rules are written from an incomplete history.") ||
-			!strings.Contains(errOut, "the history is INCOMPLETE: no rules are written") {
+			!strings.Contains(out, "\nNo file that blocks is written from an incomplete history.") ||
+			!strings.Contains(errOut, "the history is INCOMPLETE: no file that blocks is written") {
 			t.Errorf("%v of gap-01: exit status %d, stderr %q\n%s", format, code, errOut, out)
 		}
 		// Asked for, they are written, marked, and the status stays 4.
@@ -276,10 +309,17 @@ func TestPGRulesIncomplete(t *testing.T) {
 		}
 		// A caller who accepts the gap gets them, with what was accepted.
 		code, out, _ = f.run("rules", append(args, "-min-coverage", "0.999")...)
-		if code != exitComplete || !strings.Contains(out, "#          Accepted with -min-coverage 0.999:\n#          - not observed by an agent for 1h of the period\n") ||
+		if code != exitComplete || !strings.Contains(out, "# Status   COMPLETE by -min-coverage 0.999 only: the history tells the connections of 0.999537 of the period\n") ||
+			!strings.Contains(out, "#          Accepted as not observed:\n#          - not observed by an agent for 1h of the period\n") ||
 			strings.Contains(out, "# INCOMPLETE") {
 			t.Errorf("%v of gap-01 with -min-coverage 0.999: exit status %d\n%s", format, code, out)
 		}
+	}
+	// The audit form blocks nothing: it is written, marked, with status 4.
+	if code, out, errOut := f.run("rules", "-host", "gap-01", "-format", "nftables"); code != exitIncomplete || errOut != "" ||
+		!strings.HasPrefix(out, "#!/usr/sbin/nft -f\n# INCOMPLETE: the history does not tell every connection of the target") ||
+		!strings.Contains(out, "# AUDIT form: it rejects nothing.") || strings.Contains(out, "reject with") {
+		t.Errorf("the audit form of gap-01: exit status %d, stderr %q\n%s", code, errOut, out)
 	}
 	// The report lists what the rules would hold, and is not complete either.
 	if code, out, _ := f.run("rules", "-host", "gap-01"); code != exitIncomplete || !strings.Contains(out, "\nRules\n") {
@@ -296,6 +336,9 @@ func TestPGRulesIncomplete(t *testing.T) {
 		{[]string{"-host", "app-O1"}, "no agent ever reported under this name"},
 		{[]string{"-host", "app-01", "-unit", "ap.service"}, "no process of the host had this unit in the period"},
 		{[]string{"-host", "app-O1", "-min-coverage", "0.000001", "-format", "nftables"}, "no agent ever reported under this name"},
+		{[]string{"-host", "app-O1", "-format", "nftables", "-enforce", "-allow-incomplete"}, "No rules are written: nothing is known of the target"},
+		{[]string{"-host", "app-01", "-unit", "ap.service", "-format", "systemd", "-enforce", "-allow-incomplete"},
+			"No rules are written: nothing is known of the target"},
 	} {
 		if code, out, _ := f.run("rules", c.args...); code != exitIncomplete || !strings.Contains(out, c.want) || strings.Contains(out, "table inet") {
 			t.Errorf("%v: exit status %d\n%s", c.args, code, out)
@@ -317,14 +360,19 @@ func TestPGRulesIncomplete(t *testing.T) {
 func TestPGRulesTools(t *testing.T) {
 	f := newFleet(t)
 	_, table, _ := f.run("rules", "-host", "app-01", "-format", "nftables")
-	_, dropIn, _ := f.run("rules", "-host", "app-01", "-unit", "app.service", "-format", "systemd")
+	_, rejecting, _ := f.run("rules", "-host", "app-01", "-format", "nftables", "-enforce")
+	_, dropIn, _ := f.run("rules", "-host", "app-01", "-unit", "app.service", "-format", "systemd", "-enforce")
 	t.Run("nft", func(t *testing.T) {
 		netns := inNetns(t)
-		got := listedSpans(t, loadNftables(t, netns, table))
-		want := []string{"egress tcp 443-443 0.0.0.0-255.255.255.255", "egress tcp 5432-5432 10.0.0.10-10.0.0.10",
-			"egress udp 53-53 10.0.0.53-10.0.0.53", "ingress tcp 22-22 10.0.5.5-10.0.5.5", "ingress tcp 8080-8080 10.0.0.12-10.0.0.12"}
-		if !slices.Equal(got, want) {
-			t.Errorf("the kernel allows %v, want %v", got, want)
+		// What was seen, and the other way of the flow of UDP: the answers
+		// of the resolver, whenever they come.
+		want := []string{"egress tcp to 443-443 0.0.0.0-255.255.255.255", "egress tcp to 5432-5432 10.0.0.10-10.0.0.10",
+			"egress udp to 53-53 10.0.0.53-10.0.0.53", "ingress tcp to 22-22 10.0.5.5-10.0.5.5",
+			"ingress tcp to 8080-8080 10.0.0.12-10.0.0.12", "ingress udp from 53-53 10.0.0.53-10.0.0.53"}
+		for name, text := range map[string]string{"audit": table, "enforce": rejecting} {
+			if got := listedSpans(t, loadNftables(t, netns, text), name == "enforce"); !slices.Equal(got, want) {
+				t.Errorf("%s: the kernel allows %v, want %v", name, got, want)
+			}
 		}
 	})
 	t.Run("systemd-analyze", func(t *testing.T) {
@@ -351,19 +399,23 @@ func TestPGBaseline(t *testing.T) {
 #
 # Service  nginx
 # Status   COMPLETE: 1 host that ran it was observed for the whole period (coverage 1; 1 is all of the period)
-#   PEER      PORT      HOSTS  NAMED BY  LAST SEEN  ADDRESSES
+#   PEER      PORT      HOSTS  NAMED BY  LAST SEEN  ADDRESSES  NOTES
 #   shop/app  8080/tcp  1      edge      TIME       10.0.0.11
 #
 # A peer is a service by its name, as its agent or its listener tells it, a range of peer_cidrs,
 # ~unresolved (a private address that shawk cannot name) or ~external (a public address, or peers
 # whose addresses the agent folded). Port 0 stands for every port. A dependency that was not used
 # in the period is not listed: one used less often than the period, or only when another server
-# fails. Dependencies over Unix sockets are not part of a baseline.
+# fails. Dependencies over Unix sockets are not part of a baseline. A process of another name in
+# a unit of a service, which has no baseline of its own, is judged as the service: what it
+# connected to is listed with it. The last line of the file tells that it is whole: keep it last,
+# and its counts right (or write ` + "`end: {}`" + `).
 
 services:
   - service: nginx
     dependencies:
       - {peer: shop/app, port: 8080, proto: tcp}
+end: {services: 1, dependencies: 1}
 `
 	if code != exitComplete || errOut != "" || stable(out) != stable(want) {
 		t.Errorf("baseline of nginx: exit status %d, stderr %q\n%s\nwant:\n%s", code, errOut, stable(out), stable(want))
@@ -385,7 +437,9 @@ services:
 	}
 	code, out, _ = f.run("baseline", "-service", "shop/app", "-min-coverage", "0.999")
 	if b, err = shawkconnector.ParseBaseline([]byte(out)); code != exitComplete || err != nil || len(b.Services) != 1 ||
-		!strings.Contains(out, "#          Accepted with -min-coverage 0.999:\n#          - not observed by an agent\n") {
+		!strings.Contains(out, "# Status   COMPLETE by -min-coverage 0.999 only: the least observed of the 3 hosts that ran it was observed\n"+
+			"#          for 0.999537 of the period (1 is all of it). A dependency of the rest is missing here.\n"+
+			"#          Accepted as not observed:\n#          - not observed by an agent\n") {
 		t.Errorf("baseline of shop/app with -min-coverage 0.999: exit status %d, %v\n%s", code, err, out)
 	}
 
@@ -408,7 +462,7 @@ services:
 	// would approve nothing, and a file of no service drops every baseline.
 	code, out, _ = f.run("baseline", "-service", "ngimx", "-allow-incomplete")
 	if code != exitIncomplete || strings.Contains(out, "services:") || !strings.Contains(out, "Service  ngimx\nStatus   INCOMPLETE: not written\n"+
-		"         - no process had this service in the period: check the name\n") ||
+		"         - no process of this service was seen on any host: check the name\n") ||
 		!strings.Contains(out, "\nNo baseline is written: none of the services was seen in the period.\n") {
 		t.Errorf("baseline of a service that is not known: exit status %d\n%s", code, out)
 	}
@@ -430,6 +484,7 @@ services:
   - service: ngimx
     dependencies:
       - {peer: kept, port: 1, proto: udp}
+end: {services: 3, dependencies: 2}
 `), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -482,7 +537,8 @@ services:
 `)
 	code, out, errOut := f.run("drift")
 	if code != exitComplete || errOut != "" || !strings.Contains(stable(out), "Period  TIME to TIME (1h)\nBaseline 2 services with 4 dependencies, read TIME\n\n"+
-		"Verdict  CLEAN: 2 services did nothing over TCP or UDP that the baseline does not hold\n") || strings.Contains(out, "Not in the baseline") {
+		"Verdict  CLEAN: 2 services did nothing over TCP or UDP that the baseline does not hold, and every host\n"+
+		"  that runs them was observed for the whole period\n") || strings.Contains(out, "Not in the baseline") {
 		t.Errorf("without a drift: exit status %d, stderr %q\n%s", code, errOut, out)
 	}
 
@@ -500,22 +556,26 @@ Baseline 2 services with 4 dependencies, read TIME
 Verdict  DRIFT: 1 dependency is not in the baseline of 1 service
 
 Not in the baseline
-SERVICE   PEER         PORT      HOSTS           NAMED BY  FIRST SEEN  LAST SEEN  ADDRESSES
+SERVICE   PEER         PORT      HOSTS           NAMED BY  FIRST SEEN  LAST SEEN  ADDRESSES  NOTES
 shop/app  ~unresolved  8443/tcp  app-01, app-02  address   TIME        TIME       10.0.7.7
 To approve one, add it to the baseline file of the connector, as
   - {peer: ~unresolved, port: 8443, proto: tcp}    under service shop/app
-or write the service again: shawk-policy baseline -service NAME -merge FILE.
+with the counts of the last line of the file (end:), or write the service again:
+shawk-policy baseline -service NAME -merge FILE.
 ~unresolved: a private address that shawk cannot name. It may be a server whose agent is
 stopped and whose listener is not known, or one without an agent: see the addresses.
 
 New services without a baseline, which nothing judges
 SERVICE  FIRST SEEN  HOSTS
 curl     TIME        app-01
-A new executable, or a process that names itself anew, is a service of its own: the baseline
-of the service it runs in does not judge it.
+A new executable, or a process that names itself anew, is a service of its own. In a unit that
+runs a service of the baseline it is judged as that service; anywhere else nothing judges it.
 
 Only TCP and UDP are judged, by the name of the server and its port: a server of the same name
 at another address is no drift, and ~external does not tell one public address from another.
+A process is judged by the baseline of the name it declares, or, without one, of a service in its
+unit. A socket without a known owner (~unknown), and a process that takes the name of another
+service of the baseline, are not told apart from what that baseline approves.
 `
 	if code != exitDrift || errOut != "" || stable(out) != stable(want) {
 		t.Errorf("a drift: exit status %d, stderr %q\n%s\nwant:\n%s", code, errOut, stable(out), stable(want))
@@ -540,8 +600,8 @@ at another address is no drift, and ~external does not tell one public address f
 		t.Errorf("drift before the release: exit status %d\n%s", code, out)
 	}
 	code, out, _ = f.run("drift", "-until", f.end.Add(-9*day).Format(time.RFC3339), "-lookback", "2d", "-service", "shop/app")
-	if code != exitInconclusive || !strings.Contains(out, "         - hosts were not observed for the whole period, so what their services "+
-		"did then is not known: shop/app (gap-01)\n") {
+	if code != exitInconclusive || !strings.Contains(out, "         - hosts that run a service were not observed for the whole period, "+
+		"so what the service did there is not known: shop/app (1 of its 3 hosts: gap-01)\n") {
 		t.Errorf("drift over the gap of gap-01: exit status %d\n%s", code, out)
 	}
 
@@ -584,6 +644,105 @@ services:
 	}
 }
 
+// TestPGDriftNotObserved: no drift is an answer only where every host that
+// runs a service was observed. A host whose agent went silent, with every
+// process it reported, still runs its services: the verdict is
+// INCONCLUSIVE, and so it is for a service that no host is known to run.
+func TestPGDriftNotObserved(t *testing.T) {
+	f := newFleet(t)
+	f.approve("services:\n  - service: nginx\n    dependencies:\n      - {peer: shop/app, port: 8080, proto: tcp}\n" +
+		"  - service: batch/report\n    dependencies: []\n")
+	// batch/report runs nowhere that shawk knows.
+	code, out, _ := f.run("drift")
+	if code != exitInconclusive || !strings.Contains(stable(out), "  - no process was seen since TIME (-hosts-lookback) of batch/report: "+
+		"no host is known to run it, so nothing was there to see what it did. Check its name, or take it out of the baseline\n") {
+		t.Errorf("drift with a service that runs nowhere: exit status %d\n%s", code, out)
+	}
+	if code, out, _ = f.run("drift", "-service", "nginx"); code != exitComplete {
+		t.Errorf("drift of nginx: exit status %d\n%s", code, out)
+	}
+	// The agent of web-01 stopped 3 hours ago: nothing was seen of it in
+	// the last hour, and nothing tells what nginx did there.
+	f.exec(`UPDATE shawk.agent_sessions SET last_heartbeat = %[1]s WHERE host_id = 'web-01';
+	        UPDATE shawk.processes SET last_seen = %[1]s WHERE host_id = 'web-01';
+	        UPDATE shawk.edges SET last_seen = %[1]s WHERE host_id = 'web-01'`, f.at(3*time.Hour))
+	code, out, _ = f.run("drift", "-service", "nginx")
+	if code != exitInconclusive || !strings.Contains(out, "Verdict  INCONCLUSIVE: no drift was seen, but nothing tells that there was none\n"+
+		"         - hosts that run a service were not observed for the whole period, so what the service did there is not known: "+
+		"nginx (1 of its 1 host: web-01)\n") {
+		t.Errorf("drift of a service whose host is silent: exit status %d\n%s", code, out)
+	}
+	// Past -hosts-lookback the host is forgotten: no host runs the service.
+	code, out, _ = f.run("drift", "-service", "nginx", "-hosts-lookback", "2h")
+	if code != exitInconclusive || !strings.Contains(out, "no host is known to run it") {
+		t.Errorf("drift with -hosts-lookback 2h: exit status %d\n%s", code, out)
+	}
+	var r driftReport
+	code, out, _ = f.run("drift", "-json")
+	if err := json.Unmarshal([]byte(out), &r); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if code != exitInconclusive || r.Verdict != verdictInconclusive || !slices.Equal(r.Reasons, []string{"not_observed", "no_host"}) ||
+		len(r.NotObserved) != 2 || r.NotObserved[1].Service != "nginx" || r.NotObserved[1].UnobservedHosts != 1 ||
+		!r.HostsSince.Equal(f.end.Add(-7*day)) {
+		t.Errorf("exit status %d, report = %+v", code, r)
+	}
+}
+
+// TestPGDriftUnit: a process of another name in the unit of a service of
+// the baseline is judged as that service, and the report tells which.
+func TestPGDriftUnit(t *testing.T) {
+	f := newFleet(t)
+	f.approve("services:\n  - service: shop/app\n    dependencies:\n      - {peer: shop/postgres, port: 5432, proto: tcp}\n" +
+		"      - {peer: ~unresolved, port: 53, proto: udp}\n      - {peer: ~external, port: 443, proto: tcp}\n")
+	f.exec(`INSERT INTO shawk.processes (host_id, unit, comm, exe, service_name, first_seen, last_seen) VALUES
+	        ('app-01', 'app.service', 'curl', '', 'curl', %[1]s, %[2]s), ('app-01', 'app.service', 'python3', '', '~unknown', %[1]s, %[2]s)`,
+		f.at(20*time.Minute), f.at(0))
+	f.edge("app-01", "curl", "client", "tcp", "10.0.0.11", "203.0.113.66", 4444, 20*time.Minute, 0)
+	f.edge("app-01", "~unknown", "client", "tcp", "10.0.0.11", "203.0.113.66", 4444, 20*time.Minute, 0)
+	code, out, _ := f.run("drift")
+	if code != exitDrift || !strings.Contains(stable(out), "shop/app  ~external  4444/tcp  app-01  address  TIME  TIME  203.0.113.66  by curl, ~unknown in its unit\n") ||
+		!strings.Contains(out, "by NAME in its unit: a process of another name, without a baseline of its own, in a unit that\n") {
+		t.Errorf("drift of processes in the unit of shop/app: exit status %d\n%s", code, out)
+	}
+	// The baseline of the service, written again, holds what they did.
+	code, out, _ = f.run("baseline", "-service", "shop/app", "-min-coverage", "0.999")
+	if b, err := shawkconnector.ParseBaseline([]byte(out)); code != exitComplete || err != nil ||
+		!slices.Contains(b.Services[0].Dependencies, shawkconnector.BaselineDependency{Peer: "~external", Port: 4444, Proto: "tcp"}) ||
+		!strings.Contains(out, "      - {peer: ~external, port: 4444, proto: tcp}  # by curl, ~unknown in its unit\n") {
+		t.Errorf("baseline of shop/app: exit status %d, %v\n%s", code, err, out)
+	}
+}
+
+// TestPGBaselineNotes: a dependency on a port that the kernel chose is on
+// every port of its server, and says so; a process without a service name
+// is in no baseline, and the file is written all the same.
+func TestPGBaselineNotes(t *testing.T) {
+	f := newFleet(t)
+	f.exec(`INSERT INTO shawk.processes (host_id, unit, comm, exe, service_name, first_seen, last_seen)
+	        VALUES ('db-01', 'rpc.service', 'rpcd', '', 'rpcd', %[1]s, %[2]s), ('web-01', 'x.service', 'x', '', '', %[1]s, %[2]s)`,
+		f.at(100*day), f.at(0))
+	f.exec(`INSERT INTO shawk.listener_owners (host_id, process_id, proto, addr, port, netns, first_seen, last_seen, kernel_chosen_seen)
+	        SELECT 'db-01', id, 'tcp', '0.0.0.0', 40123, 1, %[1]s, %[2]s, %[2]s FROM shawk.processes WHERE service_name = 'rpcd'`,
+		f.at(20*day), f.at(0))
+	f.edge("web-01", "nginx", "client", "tcp", "10.0.0.12", "10.0.0.10", 40123, 20*day, 0)
+	f.edge("db-01", "rpcd", "server", "tcp", "10.0.0.10", "10.0.0.12", 40123, 20*day, 0)
+	f.edge("web-01", "", "client", "tcp", "10.0.0.12", "10.0.0.10", 5432, 20*day, 0)
+	code, out, errOut := f.run("baseline", "-all", "-min-coverage", "0.999")
+	b, err := shawkconnector.ParseBaseline([]byte(out))
+	if code != exitComplete || err != nil || errOut != "" || len(b.Services) != 2 ||
+		!strings.Contains(out, "      - {peer: rpcd, port: 0, proto: tcp}  # every port: the kernel chose the port of the server (40123 when seen)\n") ||
+		!strings.Contains(out, "# A process without a service name opened connections in the period (its telemetry has no\n") {
+		t.Errorf("baseline of every service: exit status %d, %v, stderr %q\n%s", code, err, errOut, out)
+	}
+	// The drift tells the port that the kernel chose once, whatever it is.
+	f.approve("services:\n  - service: nginx\n    dependencies:\n      - {peer: shop/app, port: 8080, proto: tcp}\n")
+	if code, out, _ = f.run("drift"); code != exitDrift ||
+		!strings.Contains(stable(out), "nginx  rpcd  0/tcp  web-01  edge  TIME  TIME  10.0.0.10  every port: the kernel chose the port of the server (40123 when seen)\n") {
+		t.Errorf("drift on a port that the kernel chose: exit status %d\n%s", code, out)
+	}
+}
+
 // TestPGDriftNow: without -until the period of a drift ends 5 minutes ago,
 // by the clock of the database.
 func TestPGDriftNow(t *testing.T) {
@@ -608,7 +767,7 @@ func TestPGNeedsTheSchema(t *testing.T) {
 	ctx := context.Background()
 	for _, drop := range []string{
 		`DROP FUNCTION shawk_v1.policy_verdict(text, timestamptz, timestamptz, text, numeric, interval);
-		 DROP FUNCTION shawk_v1.baseline_observed(timestamptz, timestamptz, text[]);
+		 DROP FUNCTION shawk_v1.baseline_observed(timestamptz, timestamptz, text[], text[]);
 		 DROP VIEW shawk_v1.baseline_status`,
 		`DROP SCHEMA shawk_v1 CASCADE`,
 	} {

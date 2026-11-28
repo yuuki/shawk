@@ -64,40 +64,98 @@ CREATE TABLE shawk.baseline_state (
 -- the server comes from: edge (an agent saw the server side), endpoint, or
 -- address (peer_class).
 --
--- The names are made for the rows that the caller reads only: those of a
--- host on either side (of_host), of clients with an agent (clients_only),
--- of the services of of_services, and of the services that have a
--- baseline (with_baseline), rather than for the hundreds of thousands of
--- dependencies of a period of months.
+-- kernel_chosen tells that the server listened on the port because the
+-- kernel chose it (shawk.listener_owners.kernel_chosen_seen, within the
+-- period): the port is another one at the next run of the server.
 --
--- Nested loops are on within the function, whatever its caller sets
--- (policy_flows turns them off): the dependencies of the period and the
--- endpoints are read through indexes, a host at a time. The JIT compiler
--- is off: the costs of these plans start it, and it takes 2 seconds to
--- compile what then runs for one.
+-- judged_service is the service whose baseline judges the dependency
+-- (§6.4). Without `judged` it is the service of the client. With `judged`,
+-- the services that have a baseline, the rows are those of the processes
+-- that a baseline judges, one row per service that judges them: a process
+-- whose service is in `judged` is judged as that service; any other
+-- process is judged as each service of `judged` that runs in its unit on
+-- its host, which is a unit in which a process of the service was seen
+-- since members_since (15 minutes before the period if NULL). A name is
+-- what a process declares (§4.1), and the unit is what it cannot leave: a
+-- process that an approved service starts, or that takes another name
+-- within its unit, is not out of every baseline for it. The sockets
+-- without a known owner, which have no unit, are judged by no baseline.
+--
+-- The names are made for the rows that the caller reads only: those of a
+-- host on either side (of_host), of clients with an agent (clients_only)
+-- and of the services of of_services (judged_service), rather than for
+-- the hundreds of thousands of dependencies of a period of months.
+--
+-- The dependencies of the period are read by shawk.dependencies_in(), in
+-- which nested loops are on: its edges and endpoints are read through
+-- indexes, a host at a time. Here they are off, as in policy_flows(): the
+-- planner knows nothing of the rows of a function, expects one, and would
+-- join the dependencies with the servers that an endpoint names in a
+-- nested loop, which reads every such server once per dependency, a
+-- quarter of an hour for a fleet of which some agents are stopped. The
+-- joins hash instead, and the time grows with the number of dependencies.
+-- The JIT compiler is off: the costs of these plans start it, and it takes
+-- 2 seconds to compile what then runs for one.
 CREATE FUNCTION shawk.named_dependencies(since timestamptz, until timestamptz, of_host text DEFAULT NULL,
                                          clients_only boolean DEFAULT false, of_services text[] DEFAULT NULL,
-                                         with_baseline boolean DEFAULT false)
+                                         judged text[] DEFAULT NULL, members_since timestamptz DEFAULT NULL)
 RETURNS TABLE (
   client_host text, client_service text, client_unit text, client_addr inet,
   server_host text, server_service text, server_unit text, server_addr inet,
   port integer, proto text, first_seen timestamptz, last_seen timestamptz, observed_by text,
   virtual_addr inet, virtual_port integer,
-  client_name text, server_name text, named_by text, dependency_port integer)
-LANGUAGE sql STABLE ROWS 100000 SET search_path = pg_catalog, pg_temp SET enable_nestloop = on SET jit = off AS $$
-WITH d AS MATERIALIZED (
-  SELECT row_number() OVER () AS id, x.*
-  FROM shawk_v1.dependencies_between(named_dependencies.since, named_dependencies.until) x
+  client_name text, server_name text, named_by text, dependency_port integer,
+  kernel_chosen boolean, judged_service text)
+LANGUAGE sql STABLE ROWS 100000 SET search_path = pg_catalog, pg_temp SET enable_nestloop = off SET jit = off AS $$
+WITH
+-- The services of of_services and of judged, as rows: a hash finds a
+-- service among thousands, where an array is read through for every row.
+os AS MATERIALIZED (
+  SELECT DISTINCT s.service FROM unnest(named_dependencies.of_services) AS s(service) WHERE s.service IS NOT NULL
+),
+js AS MATERIALIZED (
+  SELECT DISTINCT s.service FROM unnest(named_dependencies.judged) AS s(service) WHERE s.service IS NOT NULL
+),
+d0 AS MATERIALIZED (
+  SELECT x.client_host, x.client_service, x.client_unit, x.client_addr,
+         x.server_host, x.server_service, x.server_unit, x.server_addr,
+         x.port, x.proto, x.first_seen, x.last_seen, x.observed_by, x.virtual_addr, x.virtual_port
+  FROM shawk.dependencies_in(named_dependencies.since, named_dependencies.until) x
   WHERE x.proto <> 'unix'
     AND (named_dependencies.of_host IS NULL
          OR x.client_host = named_dependencies.of_host OR x.server_host = named_dependencies.of_host)
     AND (NOT named_dependencies.clients_only OR x.client_host IS NOT NULL)
-    AND (named_dependencies.of_services IS NULL OR x.client_service = ANY (named_dependencies.of_services))
-    AND (NOT named_dependencies.with_baseline
-         OR x.client_service IN (SELECT s.service FROM shawk.baseline_services s))
+    AND (named_dependencies.judged IS NOT NULL OR named_dependencies.of_services IS NULL
+         OR x.client_service IN (SELECT os.service FROM os))
+),
+-- The units in which a service of judged runs, by host.
+um AS MATERIALIZED (
+  SELECT DISTINCT h.hostname AS host, p.unit, p.service_name AS service
+  FROM shawk.processes p
+  JOIN shawk.hosts h ON h.id = p.host_id
+  WHERE named_dependencies.judged IS NOT NULL
+    AND p.service_name IN (SELECT js.service FROM js)
+    AND p.unit <> ''
+    AND p.last_seen >= coalesce(named_dependencies.members_since, named_dependencies.since - interval '15 minutes')
+    AND p.first_seen <= named_dependencies.until
+),
+d AS MATERIALIZED (
+  SELECT row_number() OVER () AS id, j.*
+  FROM (
+    SELECT x.*, x.client_service AS judged_service
+    FROM d0 x
+    WHERE named_dependencies.judged IS NULL OR x.client_service IN (SELECT js.service FROM js)
+    UNION ALL
+    SELECT x.*, um.service
+    FROM d0 x
+    JOIN um ON um.host = x.client_host AND um.unit = x.client_unit
+    WHERE x.client_service NOT IN (SELECT js.service FROM js)
+  ) j
+  WHERE named_dependencies.judged IS NULL OR named_dependencies.of_services IS NULL
+     OR j.judged_service IN (SELECT os.service FROM os)
 ),
 -- The rows whose server no agent saw, of clients with an agent.
-u AS (
+u AS MATERIALIZED (
   SELECT d.id, d.client_host, d.server_addr, d.port, d.proto,
          d.server_addr << inet '127.0.0.0/8' OR d.server_addr = inet '::1'
            OR d.server_addr IN (SELECT s.addr FROM shawk.shared_addrs s) AS host_local
@@ -129,10 +187,18 @@ cand AS (
   FROM vb
   JOIN ep ON ep.proto = vb.proto AND ep.port = vb.port AND ep.addr <<= vb.addr
 ),
-pick AS (
+pick AS MATERIALIZED (
   SELECT DISTINCT ON (c.id) c.id, c.service, c.slurm_job
   FROM cand c
   ORDER BY c.id, c.via, c.own DESC, c.exact DESC, c.last_seen DESC, c.service
+),
+-- The ports that the kernel chose for a listener in the period, by host:
+-- few, read through their index.
+kc AS MATERIALIZED (
+  SELECT DISTINCT h.hostname, o.proto, o.port
+  FROM shawk.listener_owners o
+  JOIN shawk.hosts h ON h.id = o.host_id
+  WHERE o.kernel_chosen_seen >= named_dependencies.since
 )
 SELECT d.client_host, d.client_service, d.client_unit, d.client_addr,
        d.server_host, d.server_service, d.server_unit, d.server_addr,
@@ -148,41 +214,205 @@ SELECT d.client_host, d.client_service, d.client_unit, d.client_addr,
                   AND EXISTS (SELECT FROM shawk.port_agnostic_services a WHERE a.service = 'slurm-job'))
               OR EXISTS (SELECT FROM shawk.dynamic_ports r
                          WHERE r.proto = d.proto AND d.port BETWEEN r.port_from AND r.port_to AND d.server_addr <<= r.addr)
-            THEN 0 ELSE d.port END
+            THEN 0 ELSE d.port END,
+       kc.hostname IS NOT NULL,
+       d.judged_service
 FROM d
 LEFT JOIN pick p ON p.id = d.id
+LEFT JOIN kc ON kc.hostname = d.server_host AND kc.proto = d.proto AND kc.port = d.port
 CROSS JOIN LATERAL (
   SELECT coalesce(d.server_service, p.service, shawk_v1.peer_class(d.server_addr)) AS server_name
 ) n
 $$;
 
--- How each host of hosts was observed in [since, until] for what a policy
--- or a baseline lists, the connections of TCP and UDP of its processes:
+-- Observation ----------------------------------------------------------------
+
+-- How each machine of ids (shawk.hosts.id) was observed in [since, until]
+-- for what a policy or a baseline lists, the connections of TCP and UDP
+-- of its processes. It is shawk.observation() of 0005_impact.sql by
+-- machine rather than by host name: two machines that report under one
+-- name (clones, or nodes all named localhost) are two rows, and the time
+-- that one of them was observed tells nothing of the other.
+--
 -- covered is the part of the period, from 0 to 1, for which the history
 -- tells them all, and shortfalls why it does not, as impact_verdict()
--- names them: unknown_host (no agent ever reported under the name),
--- no_agent (the same for a host of the inventory), not_observed,
--- before_retention, dropped_flows, netns_limited and udp_not_traced.
-CREATE FUNCTION shawk.host_shortfalls(since timestamptz, until timestamptz, hosts text[], tolerance interval)
-RETURNS TABLE (host text, agent boolean, covered numeric, shortfalls text[],
-               unobserved interval, gaps integer, partly_observed interval)
+-- names them: not_observed, before_retention, dropped_flows, netns_limited
+-- and udp_not_traced. missing is the time without an agent, with that
+-- before the retention (pruned), in `gaps` gaps; unobserved,
+-- partly_observed (dropped flows), udp_untraced, netns_limited and
+-- before_retention are how long each lasted.
+--
+-- A session counts as observed for `tolerance` after its last heartbeat,
+-- as in coverage(): the restart of an agent, or its latest report, which
+-- is not written yet. tolerated is that time within the period, in
+-- tolerated_gaps stretches: no agent reported in it, and the verdicts
+-- that count it as observed say so.
+--
+-- translations_untold tells that a session of the machine in the period
+-- did not learn every translation of addresses that the machine makes:
+-- an agent that traces none, or that folds the peers outside its internal
+-- ranges (§3.6, the default), which does not learn a translation to a
+-- backend outside them (§3.7).
+CREATE FUNCTION shawk.machine_shortfalls(since timestamptz, until timestamptz, ids text[], tolerance interval)
+RETURNS TABLE (host_id text, host text, covered numeric, shortfalls text[],
+               unobserved interval, gaps integer, partly_observed interval,
+               udp_untraced interval, netns_limited interval, before_retention interval,
+               tolerated interval, tolerated_gaps integer, translations_untold boolean,
+               missing tstzmultirange, pruned tstzmultirange)
 LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $$
-  SELECT o.host, o.agent,
-         1 - extract(epoch FROM shawk.duration(m.missing + o.dropped + o.netns_limited + o.udp_untraced))
-             / extract(epoch FROM host_shortfalls.until - host_shortfalls.since),
-         array_remove(ARRAY[
-           CASE WHEN NOT o.agent AND EXISTS (SELECT FROM shawk.inventory_hosts i WHERE i.host = o.host) THEN 'no_agent'
-                WHEN NOT o.agent THEN 'unknown_host'
-                WHEN NOT isempty(m.missing - o.pruned) THEN 'not_observed' END,
-           CASE WHEN o.agent AND NOT isempty(o.pruned) THEN 'before_retention' END,
-           CASE WHEN NOT isempty(o.dropped) THEN 'dropped_flows' END,
-           CASE WHEN NOT isempty(o.netns_limited) THEN 'netns_limited' END,
-           CASE WHEN NOT isempty(o.udp_untraced) THEN 'udp_not_traced' END], NULL),
-         shawk.duration(m.missing), (SELECT count(*)::integer FROM unnest(m.missing)), shawk.duration(o.dropped)
-  FROM shawk.observation(host_shortfalls.since, host_shortfalls.until, host_shortfalls.hosts, host_shortfalls.tolerance) o
-  CROSS JOIN LATERAL (
-    SELECT shawk.period(host_shortfalls.since, host_shortfalls.until) - o.observed AS missing
-  ) m
+WITH i AS (
+  SELECT h.id, h.hostname
+  FROM shawk.hosts h
+  WHERE h.id IN (SELECT u.id FROM unnest(machine_shortfalls.ids) AS u(id))
+),
+-- Only the sessions that meet the period, with the times of
+-- shawk.observation(): a session ends earlier by the time the clock of
+-- its host is behind.
+s AS (
+  SELECT a.host_id, a.udp_traced, a.netns_scope, a.last_heartbeat,
+         a.peer_fold <> 'none' OR a.translations_traced IS NOT TRUE AS translations_untold,
+         least(a.started_at + a.clock_skew, a.last_heartbeat - greatest(a.clock_skew, interval '0')) AS started,
+         a.last_heartbeat - greatest(a.clock_skew, interval '0') AS ended
+  FROM i
+  JOIN shawk.agent_sessions a ON a.host_id = i.id
+  WHERE a.last_heartbeat > machine_shortfalls.since - machine_shortfalls.tolerance
+    AND least(a.started_at + a.clock_skew, a.last_heartbeat) < machine_shortfalls.until
+),
+ses AS (
+  SELECT s.host_id,
+         range_agg(tstzrange(s.started, s.ended + machine_shortfalls.tolerance)) AS observed,
+         range_agg(tstzrange(s.started, s.ended)) AS reported,
+         range_agg(tstzrange(s.started, s.last_heartbeat)) FILTER (WHERE NOT s.udp_traced) AS udp_untraced,
+         range_agg(tstzrange(s.started, s.last_heartbeat)) FILTER (WHERE s.netns_scope <> 'all') AS netns_limited,
+         range_agg(tstzrange(s.started, s.last_heartbeat)) FILTER (WHERE s.translations_untold) AS translations_untold
+  FROM s GROUP BY s.host_id
+),
+par AS (
+  SELECT i.id AS host_id, range_agg(tstzrange(p.period_start, p.period_end)) AS dropped
+  FROM i
+  JOIN shawk.partial_observations p ON p.host_id = i.id
+  WHERE p.period_end > machine_shortfalls.since AND p.period_start < machine_shortfalls.until
+  GROUP BY i.id
+),
+w AS (
+  SELECT shawk.period(machine_shortfalls.since, machine_shortfalls.until) AS period,
+         coalesce((SELECT tstzmultirange(tstzrange(NULL, r.pruned_before)) FROM shawk.retention r), '{}') AS pruned
+),
+o AS (
+  SELECT i.id, i.hostname, w.period,
+         coalesce(ses.observed, '{}') * w.period - w.pruned AS observed,
+         coalesce(ses.reported, '{}') * w.period - w.pruned AS reported,
+         w.period * w.pruned AS pruned,
+         coalesce(par.dropped, '{}') * w.period AS dropped,
+         coalesce(ses.udp_untraced, '{}') * w.period AS udp_untraced,
+         coalesce(ses.netns_limited, '{}') * w.period AS netns_limited,
+         coalesce(ses.translations_untold, '{}') * w.period AS translations_untold
+  FROM i
+  CROSS JOIN w
+  LEFT JOIN ses ON ses.host_id = i.id
+  LEFT JOIN par ON par.host_id = i.id
+)
+SELECT o.id, o.hostname,
+       1 - extract(epoch FROM shawk.duration(m.missing + o.dropped + o.netns_limited + o.udp_untraced))
+           / extract(epoch FROM machine_shortfalls.until - machine_shortfalls.since),
+       array_remove(ARRAY[
+         CASE WHEN NOT isempty(m.missing - o.pruned) THEN 'not_observed' END,
+         CASE WHEN NOT isempty(o.pruned) THEN 'before_retention' END,
+         CASE WHEN NOT isempty(o.dropped) THEN 'dropped_flows' END,
+         CASE WHEN NOT isempty(o.netns_limited) THEN 'netns_limited' END,
+         CASE WHEN NOT isempty(o.udp_untraced) THEN 'udp_not_traced' END], NULL),
+       shawk.duration(m.missing), (SELECT count(*)::integer FROM unnest(m.missing)), shawk.duration(o.dropped),
+       shawk.duration(o.udp_untraced), shawk.duration(o.netns_limited), shawk.duration(o.pruned),
+       shawk.duration(o.observed - o.reported), (SELECT count(*)::integer FROM unnest(o.observed - o.reported)),
+       NOT isempty(o.translations_untold),
+       m.missing, o.pruned
+FROM o
+CROSS JOIN LATERAL (SELECT o.period - o.observed AS missing) m
+$$;
+
+-- The machines of each host name of hosts in [since, until]: the ids
+-- under the name that an agent session of the period reported for.
+CREATE FUNCTION shawk.machines_of(since timestamptz, until timestamptz, hosts text[], tolerance interval)
+RETURNS TABLE (host text, host_id text)
+LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $$
+  SELECT h.hostname, h.id
+  FROM shawk.hosts h
+  WHERE h.hostname = ANY (machines_of.hosts)
+    AND EXISTS (
+      SELECT FROM shawk.agent_sessions a
+      WHERE a.host_id = h.id
+        AND a.last_heartbeat > machines_of.since - machines_of.tolerance
+        AND least(a.started_at + a.clock_skew, a.last_heartbeat) < machines_of.until)
+$$;
+
+-- machine_shortfalls() by host name, for what is asked by name (the rules
+-- of a host): machines counts the machines of the name in the period
+-- (machines_of), covered is that of the least observed of them, shortfalls
+-- are those of them all, and unobserved, gaps, partly_observed,
+-- udp_untraced, netns_limited, before_retention, tolerated and
+-- tolerated_gaps are each the largest among them. Further shortfalls:
+-- unknown_host (no agent ever reported under the name), no_agent (the same
+-- for a host of the inventory), not_observed for a name without a machine
+-- in the period, and several_machines when it has more than one: what is
+-- listed for the name is then of several machines at once.
+CREATE FUNCTION shawk.host_shortfalls(since timestamptz, until timestamptz, hosts text[], tolerance interval)
+RETURNS TABLE (host text, agent boolean, machines integer, covered numeric, shortfalls text[],
+               unobserved interval, gaps integer, partly_observed interval,
+               udp_untraced interval, netns_limited interval, before_retention interval,
+               tolerated interval, tolerated_gaps integer, translations_untold boolean)
+LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $$
+WITH n AS (
+  SELECT DISTINCT u.host FROM unnest(host_shortfalls.hosts) AS u(host) WHERE u.host IS NOT NULL
+),
+m AS MATERIALIZED (
+  SELECT x.*
+  FROM shawk.machine_shortfalls(host_shortfalls.since, host_shortfalls.until,
+         ARRAY(SELECT o.host_id
+               FROM shawk.machines_of(host_shortfalls.since, host_shortfalls.until, host_shortfalls.hosts,
+                                      host_shortfalls.tolerance) o),
+         host_shortfalls.tolerance) x
+),
+agg AS (
+  SELECT m.host, count(*)::integer AS machines, min(m.covered) AS covered, bool_or(m.translations_untold) AS untold,
+         max(m.unobserved) AS unobserved, max(m.gaps) AS gaps, max(m.partly_observed) AS partly_observed,
+         max(m.udp_untraced) AS udp_untraced, max(m.netns_limited) AS netns_limited,
+         max(m.before_retention) AS before_retention,
+         max(m.tolerated) AS tolerated, max(m.tolerated_gaps) AS tolerated_gaps
+  FROM m GROUP BY m.host
+),
+codes AS (
+  SELECT m.host, array_agg(DISTINCT c.code) AS codes
+  FROM m CROSS JOIN LATERAL unnest(m.shortfalls) AS c(code)
+  GROUP BY m.host
+),
+w AS (
+  SELECT shawk.period(host_shortfalls.since, host_shortfalls.until) AS period,
+         coalesce((SELECT tstzmultirange(tstzrange(NULL, r.pruned_before)) FROM shawk.retention r), '{}') AS pruned
+)
+SELECT n.host, k.agent, coalesce(agg.machines, 0), coalesce(agg.covered, 0),
+       -- In the order that the commands tell them.
+       ARRAY(SELECT c FROM unnest(ARRAY['unknown_host', 'no_agent', 'several_machines', 'not_observed', 'before_retention',
+                                        'dropped_flows', 'netns_limited', 'udp_not_traced']) AS c
+             WHERE c = ANY (
+               coalesce(codes.codes, '{}')
+               || CASE WHEN k.agent THEN '{}'::text[]
+                       WHEN EXISTS (SELECT FROM shawk.inventory_hosts i WHERE i.host = n.host) THEN ARRAY['no_agent']
+                       ELSE ARRAY['unknown_host'] END
+               || CASE WHEN agg.machines > 1 THEN ARRAY['several_machines'] ELSE '{}' END
+               || CASE WHEN k.agent AND agg.machines IS NULL AND NOT isempty(w.period - w.pruned) THEN ARRAY['not_observed']
+                       ELSE '{}' END
+               || CASE WHEN k.agent AND agg.machines IS NULL AND NOT isempty(w.period * w.pruned)
+                       THEN ARRAY['before_retention'] ELSE '{}' END)),
+       coalesce(agg.unobserved, shawk.duration(w.period)), coalesce(agg.gaps, 1),
+       coalesce(agg.partly_observed, interval '0'),
+       coalesce(agg.udp_untraced, interval '0'), coalesce(agg.netns_limited, interval '0'),
+       coalesce(agg.before_retention, shawk.duration(w.period * w.pruned)),
+       coalesce(agg.tolerated, interval '0'), coalesce(agg.tolerated_gaps, 0), coalesce(agg.untold, false)
+FROM n
+CROSS JOIN w
+CROSS JOIN LATERAL (SELECT EXISTS (SELECT FROM shawk.hosts h WHERE h.hostname = n.host) AS agent) k
+LEFT JOIN agg ON agg.host = n.host
+LEFT JOIN codes ON codes.host = n.host
 $$;
 
 -- The arguments that the verdicts below share, checked as impact_verdict()
@@ -206,9 +436,12 @@ $$;
 
 -- What a host connected to and accepted connections from, over TCP and
 -- UDP: the flows that least-privilege rules of the host allow. target_unit
--- narrows them to the processes of a unit (shawk.unit), with those of the
--- sockets of the host without a known owner (service ~unknown), which may
--- be its own.
+-- narrows them to the processes of a unit (shawk.unit) and of the units
+-- under it (`<unit>/...`: a container that the unit runs in a cgroup of
+-- its own, which a limit of systemd on the unit holds too), with those of
+-- the sockets of the host without a known owner, which may be its own:
+-- the service ~unknown without a unit, not a process of another unit that
+-- gives itself that name.
 --
 -- A row is an address and a port that the sockets of the host saw: of the
 -- server for egress (the host connected), the address of the client and
@@ -267,20 +500,14 @@ e AS MATERIALIZED (
   WHERE e.host_id = ANY ((SELECT t.ids FROM t)::text[])
     AND policy_flows.since < policy_flows.until
     AND e.first_seen <= policy_flows.until
-    AND (policy_flows.target_unit IS NULL OR p.unit = policy_flows.target_unit OR p.service_name = '~unknown')
+    AND (policy_flows.target_unit IS NULL OR p.unit = policy_flows.target_unit
+         OR starts_with(p.unit, policy_flows.target_unit || '/')
+         OR (p.service_name = '~unknown' AND p.unit = ''))
 ),
 nd AS MATERIALIZED (
   SELECT d.*
   FROM shawk.named_dependencies(policy_flows.since, policy_flows.until, policy_flows.target_host) d
   WHERE EXISTS (SELECT FROM e WHERE e.in_period)
-),
--- The ports that the kernel chose for a listener in the period, by host:
--- few, read through their index.
-kc AS MATERIALIZED (
-  SELECT DISTINCT h.hostname, o.proto, o.port
-  FROM shawk.listener_owners o
-  JOIN shawk.hosts h ON h.id = o.host_id
-  WHERE o.kernel_chosen_seen >= policy_flows.since
 ),
 -- The names of the servers of the client edges, the ports of their
 -- dependencies, and whether the kernel chose the port of a server.
@@ -289,13 +516,12 @@ eg AS MATERIALIZED (
          string_agg(DISTINCT d.server_name, ', ') AS peer,
          string_agg(DISTINCT d.server_host, ', ') AS peer_host,
          bool_or(d.dependency_port = 0) AS any_port,
-         bool_or(kc.hostname IS NOT NULL) AS kernel_chosen
+         bool_or(d.kernel_chosen) AS kernel_chosen
   FROM e
   JOIN nd d
     ON  d.client_host = policy_flows.target_host AND d.proto = e.proto AND d.client_addr = e.local_addr
     AND coalesce(d.virtual_addr, d.server_addr) = e.remote_addr AND coalesce(d.virtual_port, d.port) = e.port
     AND d.client_service = e.service AND d.client_unit = e.unit
-  LEFT JOIN kc ON kc.hostname = d.server_host AND kc.proto = d.proto AND kc.port = d.port
   WHERE e.role = 'client' AND e.in_period
   GROUP BY e.id
 ),
@@ -379,43 +605,60 @@ $$;
 -- Whether the history tells every flow of policy_flows() over [since,
 -- until], one row:
 --
---   COMPLETE    an agent of the host observed for min_coverage of the
---               period, all that the flows cover; caveats tell the
---               shortfalls that min_coverage accepted;
+--   COMPLETE    an agent observed the one machine of the host name for
+--               min_coverage of the period, all that the flows cover, and
+--               learned the translations of addresses that the host makes;
+--               caveats tell the shortfalls that min_coverage accepted;
 --   INCOMPLETE  it did not, or the target is not known: no agent ever
 --               reported under the name of the host (unknown_host, or
---               no_agent for a host of the inventory), or no process of
---               the host had the unit in the period (unknown_unit).
---               reasons tell what is missing. Rules made from the flows
---               would deny what was not seen.
+--               no_agent for a host of the inventory), no process of the
+--               host had the unit in the period (unknown_unit), several
+--               machines reported under the name in the period
+--               (several_machines: the flows are of them all, and the
+--               coverage of the least observed), or an agent of the host
+--               did not learn every translation (translations_not_learned:
+--               one that traces none, or that folds the peers outside its
+--               internal ranges, §3.6, which is the default: a connection
+--               that the host rewrites to a backend outside them leaves
+--               the host for an address that the flows lack, and nothing
+--               tells whether the host rewrites any). reasons tell what is
+--               missing. Rules made from the flows would deny what was not
+--               seen. min_coverage accepts time that was not observed, and
+--               none of the other reasons.
 --
 -- coverage is the part of the period, from 0 to 1 and cut rather than
 -- rounded, in which an agent of the host observed (not_observed
 -- otherwise), within the retention (before_retention), without dropped
 -- flows (dropped_flows), in every network namespace (netns_limited) and
--- with UDP (udp_not_traced). unobserved, gaps and partly_observed are
--- those of coverage() for the host.
+-- with UDP (udp_not_traced): that of the least observed machine of the
+-- name. unobserved, gaps, partly_observed, udp_untraced, netns_limited
+-- and before_retention tell how long each lasted, the longest among the
+-- machines of the name (policy_gaps() lists the gaps). machines counts
+-- the machines of the name in the period.
+-- tolerated is the time, in tolerated_gaps stretches, that counts as
+-- observed although no agent reported in it, because it is within
+-- `tolerance` of a report: the restart of an agent, or its latest report
+-- not written yet.
 --
 -- network_namespaces counts the network namespaces of the sockets of the
 -- flows in the period: more than one tells a host of containers, whose
 -- forwarded connections rules of the host itself do not see. unix_sockets
 -- tells whether the target used or served Unix sockets in the period.
--- translations_traced tells whether the agents of the host learned the
--- translations of addresses that the host makes all along
--- (shawk.agent_sessions.translations_traced): where they did not, the
--- flows lack the backends of the connections that the host translates
--- itself (policy_flows, translated), and nothing tells whether it does.
+-- translations_traced is false with translations_not_learned.
 CREATE FUNCTION shawk_v1.policy_verdict(target_host text, since timestamptz, until timestamptz,
                                         target_unit text DEFAULT NULL, min_coverage numeric DEFAULT 1,
                                         tolerance interval DEFAULT '3 minutes')
 RETURNS TABLE (status text, reasons text[], caveats text[], coverage numeric,
                unobserved interval, gaps integer, partly_observed interval,
-               network_namespaces integer, unix_sockets boolean, translations_traced boolean)
+               network_namespaces integer, unix_sockets boolean, translations_traced boolean,
+               machines integer, tolerated interval, tolerated_gaps integer,
+               udp_untraced interval, netns_limited interval, before_retention interval)
 LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
 DECLARE
   o record;
   shortfalls text[];
-  unknown boolean := false;
+  -- The shortfalls that no min_coverage accepts.
+  refused boolean := false;
 BEGIN
   PERFORM shawk.check_period(since, until, min_coverage, tolerance);
   IF target_host IS NULL OR target_host = '' THEN
@@ -427,45 +670,54 @@ BEGIN
 
   SELECT * INTO o FROM shawk.host_shortfalls(since, until, ARRAY[target_host], tolerance);
   shortfalls := o.shortfalls;
+  IF NOT o.agent OR o.machines > 1 THEN
+    refused := true;
+  END IF;
   -- A unit that no process of the host had was not seen to connect, which
   -- tells nothing: its name may be misspelt.
   IF o.agent AND target_unit IS NOT NULL AND NOT EXISTS (
        SELECT FROM shawk.hosts h
        JOIN shawk.processes p ON p.host_id = h.id
-       WHERE h.hostname = target_host AND p.unit = target_unit
+       WHERE h.hostname = target_host AND (p.unit = target_unit OR starts_with(p.unit, target_unit || '/'))
          AND p.last_seen >= since - interval '15 minutes' AND p.first_seen <= until) THEN
-    unknown := true;
+    refused := true;
     shortfalls := shortfalls || 'unknown_unit'::text;
+  END IF;
+  IF o.translations_untold THEN
+    refused := true;
+    shortfalls := shortfalls || 'translations_not_learned'::text;
   END IF;
 
   coverage := trunc(o.covered, 6);
   unobserved := o.unobserved;
   gaps := o.gaps;
   partly_observed := o.partly_observed;
+  machines := o.machines;
+  tolerated := o.tolerated;
+  tolerated_gaps := o.tolerated_gaps;
+  udp_untraced := o.udp_untraced;
+  netns_limited := o.netns_limited;
+  before_retention := o.before_retention;
+  translations_traced := NOT o.translations_untold;
   SELECT count(DISTINCT e.netns)::integer INTO network_namespaces
   FROM shawk.hosts h
   JOIN shawk.edges e ON e.host_id = h.id
   JOIN shawk.processes p ON p.id = e.process_id
   WHERE h.hostname = target_host AND e.last_seen >= since AND e.first_seen <= until
-    AND (target_unit IS NULL OR p.unit = target_unit);
+    AND (target_unit IS NULL OR p.unit = target_unit OR starts_with(p.unit, target_unit || '/'));
   unix_sockets := EXISTS (
       SELECT FROM shawk.hosts h
       JOIN shawk.unix_edges e ON e.host_id = h.id
       JOIN shawk.processes p ON p.id = e.process_id
       WHERE h.hostname = target_host AND e.last_seen >= since AND e.first_seen <= until
-        AND (target_unit IS NULL OR p.unit = target_unit))
+        AND (target_unit IS NULL OR p.unit = target_unit OR starts_with(p.unit, target_unit || '/')))
     OR EXISTS (
       SELECT FROM shawk.hosts h
       JOIN shawk.unix_listeners l ON l.host_id = h.id
       JOIN shawk.processes p ON p.id = l.process_id
       WHERE h.hostname = target_host AND l.last_seen >= since AND l.first_seen <= until
-        AND (target_unit IS NULL OR p.unit = target_unit));
-  translations_traced := NOT EXISTS (
-      SELECT FROM shawk.hosts h
-      JOIN shawk.agent_sessions a ON a.host_id = h.id
-      WHERE h.hostname = target_host AND a.last_heartbeat > since AND a.started_at < until
-        AND a.translations_traced IS NOT TRUE);
-  IF NOT o.agent OR unknown OR o.covered < min_coverage THEN
+        AND (target_unit IS NULL OR p.unit = target_unit OR starts_with(p.unit, target_unit || '/')));
+  IF refused OR o.covered < min_coverage THEN
     status := 'INCOMPLETE';
     reasons := shortfalls;
     caveats := '{}';
@@ -478,82 +730,166 @@ BEGIN
 END
 $$;
 
+-- The gaps of policy_verdict(): the stretches of [since, until] for which
+-- the history does not tell the flows of a machine of the host name, each
+-- with its cause: retention for the time before the retention, agent for
+-- the time in which no agent of the machine observed. machine is the id
+-- of the machine (shawk_v1.agents.host_id), NULL for a name without a
+-- machine in the period, whose gap is the whole period.
+CREATE FUNCTION shawk_v1.policy_gaps(target_host text, since timestamptz, until timestamptz,
+                                     tolerance interval DEFAULT '3 minutes')
+RETURNS TABLE (machine text, gap_start timestamptz, gap_end timestamptz, cause text)
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+WITH m AS MATERIALIZED (
+  SELECT x.host_id, x.missing, x.pruned
+  FROM shawk.machine_shortfalls(policy_gaps.since, policy_gaps.until,
+         ARRAY(SELECT o.host_id
+               FROM shawk.machines_of(policy_gaps.since, policy_gaps.until, ARRAY[policy_gaps.target_host],
+                                      policy_gaps.tolerance) o),
+         policy_gaps.tolerance) x
+  WHERE policy_gaps.since < policy_gaps.until
+),
+w AS (
+  SELECT shawk.period(policy_gaps.since, policy_gaps.until) AS period,
+         coalesce((SELECT tstzmultirange(tstzrange(NULL, r.pruned_before)) FROM shawk.retention r), '{}') AS pruned
+),
+r AS (
+  SELECT m.host_id, m.missing, m.pruned FROM m
+  UNION ALL
+  SELECT NULL, w.period, w.period * w.pruned
+  FROM w
+  WHERE policy_gaps.since < policy_gaps.until AND NOT EXISTS (SELECT FROM m)
+)
+SELECT r.host_id, lower(g.gap), upper(g.gap), g.cause
+FROM r
+CROSS JOIN LATERAL (
+  SELECT x AS gap, 'retention' AS cause FROM unnest(r.pruned) AS x
+  UNION ALL
+  SELECT x, 'agent' FROM unnest(r.missing - r.pruned) AS x
+) g
+ORDER BY r.host_id, lower(g.gap)
+$$;
+
 -- Baselines ------------------------------------------------------------------
 
 -- The dependencies of services in [since, until] as a baseline lists
--- them: one row per client service, server, port and transport, of the
--- services of `services` (every service if NULL). The client is a process
--- on a host with an agent, by its service name; the server is named as
--- shawk.named_dependencies() names it, and the port is that of the
--- dependencies between services, 0 under the rules of ports (§5.3).
--- Dependencies over Unix sockets are left out.
+-- them: one row per service, server, port and transport, of the services
+-- of `services` (every service if NULL). The client is a process on a
+-- host with an agent; the server is named as shawk.named_dependencies()
+-- names it, and the port is that of the dependencies between services, 0
+-- under the rules of ports (§5.3). Dependencies over Unix sockets are left
+-- out.
+--
+-- service is the service that a baseline judges the dependency as
+-- (named_dependencies, judged_service): the service of the client, or,
+-- with `judged`, the services that a baseline is to hold, a service of
+-- `judged` that runs in the unit of a client whose own service is not in
+-- `judged`. processes lists up to 20 such other services of the clients of
+-- a row. Without `judged`, the services of `services` are, so that the
+-- baseline of a service lists what its drift is judged on; with neither,
+-- every service is its own.
+--
+-- A server that listened on a port the kernel chose has port 0, every
+-- port, with kernel_chosen: its port is another one at its next run, and a
+-- baseline that pinned it would tell a drift then. ports are up to 20 of
+-- the ports of the servers of a row, as their sockets had them.
 --
 -- hosts are the hosts of the clients, addrs up to 50 of the addresses they
 -- connected to (a network for folded peers), and named_by the best
 -- evidence of the name of the server among its rows: edge, endpoint or
 -- address.
-CREATE FUNCTION shawk_v1.baseline_observed(since timestamptz, until timestamptz, services text[] DEFAULT NULL)
+CREATE FUNCTION shawk_v1.baseline_observed(since timestamptz, until timestamptz, services text[] DEFAULT NULL,
+                                           judged text[] DEFAULT NULL)
 RETURNS TABLE (service text, peer text, port integer, proto text,
-               first_seen timestamptz, last_seen timestamptz, hosts text[], addrs inet[], named_by text)
+               first_seen timestamptz, last_seen timestamptz, hosts text[], addrs inet[], named_by text,
+               kernel_chosen boolean, ports integer[], processes text[])
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
-  SELECT d.client_service, d.server_name, d.dependency_port, d.proto,
+  SELECT d.judged_service, d.server_name, CASE WHEN d.kernel_chosen THEN 0 ELSE d.dependency_port END, d.proto,
          min(d.first_seen), max(d.last_seen),
          array_agg(DISTINCT d.client_host ORDER BY d.client_host),
          (array_agg(DISTINCT coalesce(d.virtual_addr, d.server_addr) ORDER BY coalesce(d.virtual_addr, d.server_addr)))[1:50],
          CASE WHEN bool_or(d.named_by = 'edge') THEN 'edge' WHEN bool_or(d.named_by = 'endpoint') THEN 'endpoint'
-              ELSE 'address' END
-  FROM shawk.named_dependencies(baseline_observed.since, baseline_observed.until, NULL, true, baseline_observed.services) d
+              ELSE 'address' END,
+         bool_or(d.kernel_chosen),
+         (array_agg(DISTINCT coalesce(d.virtual_port, d.port) ORDER BY coalesce(d.virtual_port, d.port)))[1:20],
+         coalesce((array_agg(DISTINCT d.client_service ORDER BY d.client_service)
+                   FILTER (WHERE d.client_service <> d.judged_service))[1:20], '{}')
+  FROM shawk.named_dependencies(baseline_observed.since, baseline_observed.until, NULL, true, baseline_observed.services,
+                                coalesce(baseline_observed.judged, baseline_observed.services)) d
   WHERE baseline_observed.since < baseline_observed.until
   GROUP BY 1, 2, 3, 4
   ORDER BY 1, 2, 3, 4
 $$;
 
 -- Whether the history tells every dependency of each service of
--- `services` over [since, until], one row per service: the verdict of
--- policy_verdict() over every host that ran a process of the service in
--- the period.
+-- `services` over [since, until], one row per service: the observation
+-- (shawk.machine_shortfalls) of every machine that runs the service.
 --
---   COMPLETE    every such host was observed for min_coverage of the
+--   COMPLETE    every such machine was observed for min_coverage of the
 --               period;
---   INCOMPLETE  one was not (short_hosts lists up to 20 of them, the
---               least observed first), or no process had the service in
---               the period (unknown_service).
+--   INCOMPLETE  one was not (short_hosts lists up to 20 of their hosts,
+--               the least observed first, and unobserved_hosts counts
+--               them), or no machine runs the service
+--               (unknown_service): nothing is known to tell that it did
+--               nothing.
 --
--- coverage is that of the least observed host. A host that ran the
+-- A machine runs the service when a process of it was last seen there
+-- since hosts_since, and by the end of the period. hosts_since is NULL
+-- for the dependencies of a period, which are of the machines that ran
+-- the service within it (from 15 minutes before it). It is earlier for a
+-- drift: the question is then what the service did in the period, on the
+-- machines that have it, and a machine whose agent went silent before the
+-- period, with all its processes, must count as not observed rather than
+-- be forgotten with them.
+--
+-- coverage is that of the least observed machine. One that ran the
 -- service for a part of the period counts over the whole period: what it
--- did before its agent first reported is not known.
+-- did before its agent first reported is not known. hosts counts the
+-- hosts by name.
 CREATE FUNCTION shawk_v1.baseline_verdict(services text[], since timestamptz, until timestamptz,
-                                          min_coverage numeric DEFAULT 1, tolerance interval DEFAULT '3 minutes')
+                                          min_coverage numeric DEFAULT 1, tolerance interval DEFAULT '3 minutes',
+                                          hosts_since timestamptz DEFAULT NULL)
 RETURNS TABLE (service text, status text, reasons text[], caveats text[],
-               hosts integer, coverage numeric, short_hosts text[])
+               hosts integer, coverage numeric, short_hosts text[], unobserved_hosts integer)
 LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
 BEGIN
   PERFORM shawk.check_period(since, until, min_coverage, tolerance);
+  IF hosts_since > since THEN
+    RAISE EXCEPTION 'hosts_since is after the start of the period: %', hosts_since USING ERRCODE = 'invalid_parameter_value';
+  END IF;
   RETURN QUERY
   WITH asked AS (
     SELECT DISTINCT u.service FROM unnest(services) AS u(service) WHERE u.service IS NOT NULL
   ),
   sh AS MATERIALIZED (
-    SELECT DISTINCT p.service_name AS service, h.hostname AS host
+    SELECT DISTINCT p.service_name AS service, h.hostname AS host, h.id AS host_id
     FROM shawk.processes p
     JOIN shawk.hosts h ON h.id = p.host_id
     WHERE p.service_name IN (SELECT a.service FROM asked a)
-      AND p.last_seen >= since - interval '15 minutes' AND p.first_seen <= until
+      AND p.last_seen >= coalesce(hosts_since, since - interval '15 minutes') AND p.first_seen <= until
   ),
   ob AS MATERIALIZED (
-    SELECT * FROM shawk.host_shortfalls(since, until, ARRAY(SELECT DISTINCT sh.host FROM sh), tolerance)
+    SELECT * FROM shawk.machine_shortfalls(since, until, ARRAY(SELECT DISTINCT sh.host_id FROM sh), tolerance)
+  ),
+  -- The hosts of each service by name, each with the coverage of the
+  -- least observed of its machines that run the service.
+  byhost AS (
+    SELECT sh.service, sh.host, min(ob.covered) AS covered
+    FROM sh
+    JOIN ob ON ob.host_id = sh.host_id
+    GROUP BY sh.service, sh.host
   ),
   per AS (
-    SELECT sh.service,
+    SELECT b.service,
            count(*)::integer AS hosts,
-           min(ob.covered) AS covered,
-           (array_agg(sh.host ORDER BY ob.covered, sh.host) FILTER (WHERE ob.covered < min_coverage))[1:20] AS short_hosts
-    FROM sh
-    JOIN ob ON ob.host = sh.host
-    GROUP BY sh.service
+           min(b.covered) AS covered,
+           (array_agg(b.host ORDER BY b.covered, b.host) FILTER (WHERE b.covered < min_coverage))[1:20] AS short_hosts,
+           (count(*) FILTER (WHERE b.covered < min_coverage))::integer AS unobserved_hosts
+    FROM byhost b
+    GROUP BY b.service
   ),
-  -- The shortfalls of the hosts of each service, and whether one of the
-  -- hosts that has it is below min_coverage.
+  -- The shortfalls of the machines of each service, and whether one of
+  -- the machines that has it is below min_coverage.
   codes AS (
     SELECT x.service,
            coalesce(array_agg(x.code ORDER BY x.code) FILTER (WHERE x.short), '{}') AS short_codes,
@@ -561,7 +897,7 @@ BEGIN
     FROM (
       SELECT sh.service, c.code, bool_or(ob.covered < min_coverage) AS short
       FROM sh
-      JOIN ob ON ob.host = sh.host
+      JOIN ob ON ob.host_id = sh.host_id
       CROSS JOIN LATERAL unnest(ob.shortfalls) AS c(code)
       GROUP BY sh.service, c.code
     ) x
@@ -576,7 +912,8 @@ BEGIN
               ELSE coalesce(codes.short_codes, '{}') || coalesce(codes.other_codes, '{}') END,
          coalesce(per.hosts, 0),
          trunc(coalesce(per.covered, 0), 6),
-         coalesce(per.short_hosts, '{}'::text[])
+         coalesce(per.short_hosts, '{}'::text[]),
+         coalesce(per.unobserved_hosts, 0)
   FROM asked a
   LEFT JOIN per ON per.service = a.service
   LEFT JOIN codes ON codes.service = a.service
@@ -605,28 +942,40 @@ FROM shawk.baseline_state st;
 -- The drift: the dependencies of baseline_observed() in [since, until]
 -- of the services that have a baseline (of those of `services` if not
 -- NULL) that are not in it. A service without a baseline is not judged
--- and has no row: baseline_new_services() lists those that are new.
+-- and has no row, unless its process is in the unit of a service that has
+-- one, on its host: it is then judged as that service
+-- (named_dependencies, judged_service; members_since tells since when a
+-- process of the service must have been seen in the unit, 15 minutes
+-- before the period if NULL), and processes lists it.
+-- baseline_new_services() lists the services that are new.
 --
 -- A dependency is in the baseline of its service when the baseline has
 -- its server and transport with its port, or with port 0, which stands
 -- for every port: the port of the dependency between services, or the
 -- port of the server itself, so that a rule of ports added or removed
 -- after the baseline was approved does not make a drift of what it holds.
-CREATE FUNCTION shawk_v1.baseline_drift(since timestamptz, until timestamptz, services text[] DEFAULT NULL)
+CREATE FUNCTION shawk_v1.baseline_drift(since timestamptz, until timestamptz, services text[] DEFAULT NULL,
+                                        members_since timestamptz DEFAULT NULL)
 RETURNS TABLE (service text, peer text, port integer, proto text,
-               first_seen timestamptz, last_seen timestamptz, hosts text[], addrs inet[], named_by text)
+               first_seen timestamptz, last_seen timestamptz, hosts text[], addrs inet[], named_by text,
+               kernel_chosen boolean, ports integer[], processes text[])
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
-  SELECT d.client_service, d.server_name, d.dependency_port, d.proto,
+  SELECT d.judged_service, d.server_name, CASE WHEN d.kernel_chosen THEN 0 ELSE d.dependency_port END, d.proto,
          min(d.first_seen), max(d.last_seen),
          array_agg(DISTINCT d.client_host ORDER BY d.client_host),
          (array_agg(DISTINCT coalesce(d.virtual_addr, d.server_addr) ORDER BY coalesce(d.virtual_addr, d.server_addr)))[1:50],
          CASE WHEN bool_or(d.named_by = 'edge') THEN 'edge' WHEN bool_or(d.named_by = 'endpoint') THEN 'endpoint'
-              ELSE 'address' END
-  FROM shawk.named_dependencies(baseline_drift.since, baseline_drift.until, NULL, true, baseline_drift.services, true) d
+              ELSE 'address' END,
+         bool_or(d.kernel_chosen),
+         (array_agg(DISTINCT coalesce(d.virtual_port, d.port) ORDER BY coalesce(d.virtual_port, d.port)))[1:20],
+         coalesce((array_agg(DISTINCT d.client_service ORDER BY d.client_service)
+                   FILTER (WHERE d.client_service <> d.judged_service))[1:20], '{}')
+  FROM shawk.named_dependencies(baseline_drift.since, baseline_drift.until, NULL, true, baseline_drift.services,
+                                ARRAY(SELECT s.service FROM shawk.baseline_services s), baseline_drift.members_since) d
   WHERE baseline_drift.since < baseline_drift.until
     AND NOT EXISTS (
       SELECT FROM shawk.baseline_dependencies b
-      WHERE b.service = d.client_service AND b.peer = d.server_name AND b.proto = d.proto
+      WHERE b.service = d.judged_service AND b.peer = d.server_name AND b.proto = d.proto
         AND b.port IN (0, d.port, d.dependency_port))
   GROUP BY 1, 2, 3, 4
   ORDER BY 1, 2, 3, 4
@@ -634,11 +983,13 @@ $$;
 
 -- The services without a baseline that were first seen in [since, until]
 -- and opened connections: a new executable, or a process that names
--- itself anew, is a service of its own (§4.1) and is judged by no
--- baseline. first_seen is the earliest time a process of the service was
--- seen on any host, within the retention, and hosts its hosts. The
--- processes of Slurm jobs, which their users name, and the sockets
--- without a known owner are left out.
+-- itself anew, is a service of its own (§4.1). One in the unit of a
+-- service that has a baseline is judged as that service
+-- (baseline_drift); another is judged by no baseline, and is told here
+-- once, when it appears. first_seen is the earliest time a process of
+-- the service was seen on any host, within the retention, and hosts its
+-- hosts. The processes of Slurm jobs, which their users name, and the
+-- sockets without a known owner are left out.
 CREATE FUNCTION shawk_v1.baseline_new_services(since timestamptz, until timestamptz)
 RETURNS TABLE (service text, first_seen timestamptz, hosts text[])
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$

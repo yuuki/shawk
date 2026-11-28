@@ -1,0 +1,547 @@
+package shawkconnector
+
+import (
+	"context"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+)
+
+// The tests in this file run, against PostgreSQL (SHAWK_TEST_POSTGRES_DSN),
+// what decides whether a verdict of 0006_policy.sql may be trusted: which
+// machines and which processes it is about, and what it says where the
+// history cannot tell.
+
+// TestPGPolicyUnits: the flows of a unit are those of its processes, of
+// the units under it, which a limit of systemd on the unit holds too, and
+// of the sockets without a known owner, which have no unit; not those of
+// a process of another unit that names itself ~unknown.
+func TestPGPolicyUnits(t *testing.T) {
+	f := newPolicyFixture(t)
+	f.host("app-01", "10.0.0.11")
+	f.proc("app-01", "app.service", "shop/app")
+	f.proc("app-01", "app.service/podman-0123456789ab", "worker")
+	f.proc("app-01", "app.service2", "other")
+	f.proc("app-01", "", "~unknown")
+	f.proc("app-01", "user-1000.slice/session.scope", "~unknown")
+	f.proc("app-01", "pods.service/docker-0123456789ab", "pod")
+	f.edge("app-01", "shop/app", "client", "tcp", "10.0.0.11", "10.0.0.10", 5432, 20*days, 0)
+	f.edge("app-01", "worker", "client", "tcp", "10.0.0.11", "10.0.0.77", 6379, 20*days, 0)
+	f.edge("app-01", "other", "client", "tcp", "10.0.0.11", "10.0.0.88", 1, 20*days, 0)
+	f.edgeOf("app-01", "", "~unknown", "client", "tcp", "10.0.0.11", "10.0.0.30", 9999, 20*days, 0)
+	f.edgeOf("app-01", "user-1000.slice/session.scope", "~unknown", "client", "tcp", "10.0.0.11", "203.0.113.66", 4444, 20*days, 0)
+	f.edge("app-01", "pod", "client", "tcp", "10.0.0.11", "10.0.0.99", 80, 20*days, 0)
+
+	want := []string{
+		"app.service shop/app 10.0.0.10/32 5432",
+		"app.service/podman-0123456789ab worker 10.0.0.77/32 6379",
+		" ~unknown 10.0.0.30/32 9999",
+	}
+	slices.Sort(want)
+	got := f.query(30*days, `SELECT unit, service, peer_addr::text, port FROM shawk_v1.policy_flows('app-01', $1, $2, 'app.service')`)
+	slices.Sort(got)
+	if !slices.Equal(got, want) {
+		t.Errorf("flows of app.service:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+	// A unit that has processes under it only is known, and its flows are
+	// theirs; one that starts with the same letters is another unit.
+	for target, want := range map[string]string{
+		`'pods.service'`:                    "COMPLETE []",
+		`'app.service/podman-0123456789ab'`: "COMPLETE []",
+		`'app.servic'`:                      "INCOMPLETE [unknown_unit]",
+		`'pods'`:                            "INCOMPLETE [unknown_unit]",
+	} {
+		if got := f.query(30*days, `SELECT status, reasons FROM shawk_v1.policy_verdict('app-01', $1, $2, `+target+`)`); !slices.Equal(got, []string{want}) {
+			t.Errorf("verdict of %s = %v, want %s", target, got, want)
+		}
+	}
+	if got := f.query(30*days, `SELECT service FROM shawk_v1.policy_flows('app-01', $1, $2, 'pods.service') WHERE unit <> ''`); !slices.Equal(got, []string{"pod"}) {
+		t.Errorf("flows of pods.service: %v", got)
+	}
+	// A unit whose processes were last seen long before the period is not
+	// known in it.
+	f.exec(`UPDATE shawk.processes SET last_seen = %s WHERE unit = 'app.service2'`, f.ago(60*days))
+	if got := f.query(30*days, `SELECT status, reasons FROM shawk_v1.policy_verdict('app-01', $1, $2, 'app.service2')`); !slices.Equal(got, []string{"INCOMPLETE [unknown_unit]"}) {
+		t.Errorf("verdict of a unit last seen before the period = %v", got)
+	}
+}
+
+// TestPGPolicySeveralMachines: the history of a host name is that of each
+// machine that reported under it. Two machines of one name are never
+// complete, and the time that one was observed does not cover the other.
+func TestPGPolicySeveralMachines(t *testing.T) {
+	f := newPolicyFixture(t)
+	// The first machine was not observed for 20 of the last 30 days; the
+	// second was observed all along.
+	f.exec(`INSERT INTO shawk.hosts VALUES ('id-1', 'm-1', 'app-01', 'k', 'v', %[1]s, %[2]s), ('id-2', 'm-2', 'app-01', 'k', 'v', %[1]s, %[2]s)`,
+		f.ago(100*days), f.ago(0))
+	f.session("id-1", 100*days, 25*days, "true", "'all'")
+	f.session("id-1", 5*days, 0, "true", "'all'")
+	f.session("id-2", 100*days, 0, "true", "'all'")
+	const columns = `status, reasons, coverage::text, machines, extract(epoch FROM unobserved)::integer`
+	// The gap is 20 days less the 3 minutes after the last report that
+	// count as observed.
+	want := "INCOMPLETE [several_machines not_observed] 0.333402 2 1727820"
+	if got := f.query(30*days, `SELECT `+columns+` FROM shawk_v1.policy_verdict('app-01', $1, $2)`); !slices.Equal(got, []string{want}) {
+		t.Errorf("two machines, one with a gap = %v, want %s", got, want)
+	}
+	// The coverage by name, which takes either machine, would tell 1.
+	if got := f.query(30*days, `SELECT observed::text FROM shawk_v1.coverage($1, $2, ARRAY['app-01'])`); !slices.Equal(got, []string{"1.000000"}) {
+		t.Errorf("coverage by name = %v", got)
+	}
+	// The gap is that of the machine.
+	gap := "id-1 " + ts2(f.T.Add(-25*days+3*time.Minute)) + " " + ts2(f.T.Add(-5*days)) + " agent"
+	if got := f.query(30*days, `SELECT machine, to_char(gap_start AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS'),
+		to_char(gap_end AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS'), cause FROM shawk_v1.policy_gaps('app-01', $1, $2)`); !slices.Equal(got, []string{gap}) {
+		t.Errorf("gaps = %v, want %s", got, gap)
+	}
+	// No min_coverage accepts two machines: the flows are of both.
+	if got := f.query(30*days, `SELECT status FROM shawk_v1.policy_verdict('app-01', $1, $2, NULL, 0.1)`); !slices.Equal(got, []string{"INCOMPLETE"}) {
+		t.Errorf("two machines with min_coverage 0.1 = %v", got)
+	}
+	// Both observed all along: still two machines.
+	f.exec(`DELETE FROM shawk.agent_sessions WHERE host_id = 'id-1'`)
+	f.session("id-1", 100*days, 0, "true", "'all'")
+	want = "INCOMPLETE [several_machines] 1.000000 2 0"
+	if got := f.query(30*days, `SELECT `+columns+` FROM shawk_v1.policy_verdict('app-01', $1, $2)`); !slices.Equal(got, []string{want}) {
+		t.Errorf("two machines observed = %v, want %s", got, want)
+	}
+	// A machine that another replaced before the period is not in it.
+	f.exec(`DELETE FROM shawk.agent_sessions WHERE host_id = 'id-1'`)
+	f.session("id-1", 100*days, 40*days, "true", "'all'")
+	want = "COMPLETE [] 1.000000 1 0"
+	if got := f.query(30*days, `SELECT `+columns+` FROM shawk_v1.policy_verdict('app-01', $1, $2)`); !slices.Equal(got, []string{want}) {
+		t.Errorf("a machine replaced before the period = %v, want %s", got, want)
+	}
+	// A name whose only machine stopped reporting before the period: the
+	// gap is the whole period, of no machine.
+	f.exec(`DELETE FROM shawk.agent_sessions WHERE host_id = 'id-2'`)
+	want = "INCOMPLETE [not_observed] 0.000000 0 2592000"
+	if got := f.query(30*days, `SELECT `+columns+` FROM shawk_v1.policy_verdict('app-01', $1, $2)`); !slices.Equal(got, []string{want}) {
+		t.Errorf("no machine in the period = %v, want %s", got, want)
+	}
+	if got := f.query(30*days, `SELECT machine IS NULL, gap_end - gap_start = interval '30 days', cause
+		FROM shawk_v1.policy_gaps('app-01', $1, $2)`); !slices.Equal(got, []string{"true true agent"}) {
+		t.Errorf("gaps of a name without a machine = %v", got)
+	}
+}
+
+// ts2 formats a time as the gaps are compared.
+func ts2(t time.Time) string { return t.UTC().Format("2006-01-02T15:04:05") }
+
+// TestPGPolicyTranslationsNotLearned: where an agent of the host did not
+// learn every address that the host rewrites its connections to, the
+// flows may lack what the packets leave for, and are not complete.
+func TestPGPolicyTranslationsNotLearned(t *testing.T) {
+	f := newPolicyFixture(t)
+	f.host("app-01", "10.0.0.11")
+	const columns = `status, reasons, coverage::text, translations_traced`
+	verdict := func(args string) []string {
+		t.Helper()
+		return f.query(30*days, `SELECT `+columns+` FROM shawk_v1.policy_verdict('app-01', $1, $2`+args+`)`)
+	}
+	if got := verdict(""); !slices.Equal(got, []string{"COMPLETE [] 1.000000 true"}) {
+		t.Fatalf("an agent that learns the translations: %v", got)
+	}
+	want := []string{"INCOMPLETE [translations_not_learned] 1.000000 false"}
+	// The default of the agent: it folds the clients of its servers, and
+	// learns no translation to a backend outside its internal ranges.
+	for _, set := range []string{`peer_fold = 'in'`, `peer_fold = 'all'`, `peer_fold = 'none', translations_traced = NULL`,
+		`translations_traced = false`} {
+		f.exec(`UPDATE shawk.agent_sessions SET %s`, set)
+		if got := verdict(""); !slices.Equal(got, want) {
+			t.Errorf("with %s: %v, want %v", set, got, want)
+		}
+		// Time that was not observed is what min_coverage accepts; this
+		// is not.
+		if got := verdict(", NULL, 0.01"); !slices.Equal(got, want) {
+			t.Errorf("with %s and min_coverage 0.01: %v, want %v", set, got, want)
+		}
+	}
+	// A session that did not learn them and ended before the period does
+	// not count; one of an hour within it does.
+	f.exec(`DELETE FROM shawk.agent_sessions`)
+	f.exec(`INSERT INTO shawk.agent_sessions (host_id, started_at, last_heartbeat, udp_traced, unix_traced, netns_scope, peer_fold, translations_traced)
+	        VALUES ('app-01', %s, %s, true, true, 'all', 'in', true)`, f.ago(100*days), f.ago(40*days))
+	f.session("app-01", 40*days, 0, "true", "'all'")
+	if got := verdict(""); !slices.Equal(got, []string{"COMPLETE [] 1.000000 true"}) {
+		t.Errorf("folding that ended before the period: %v", got)
+	}
+	f.exec(`UPDATE shawk.agent_sessions SET last_heartbeat = %s WHERE peer_fold = 'in'`, f.ago(30*days-time.Hour))
+	f.exec(`UPDATE shawk.agent_sessions SET started_at = %s WHERE peer_fold = 'none'`, f.ago(30*days-time.Hour))
+	if got := verdict(""); !slices.Equal(got, want) {
+		t.Errorf("folding for the first hour of the period: %v, want %v", got, want)
+	}
+}
+
+// TestPGPolicyTolerated: a stretch without a report that is within the
+// tolerance counts as observed, and is told with the verdict.
+func TestPGPolicyTolerated(t *testing.T) {
+	f := newPolicyFixture(t)
+	const columns = `status, coverage::text, extract(epoch FROM unobserved)::integer, gaps,
+		extract(epoch FROM tolerated)::integer, tolerated_gaps`
+	for name, c := range map[string]struct {
+		gap  time.Duration
+		want string
+	}{
+		"none":  {0, "COMPLETE 1.000000 0 0 0 0"},
+		"short": {170 * time.Second, "COMPLETE 1.000000 0 0 170 1"},
+		"long":  {190 * time.Second, "INCOMPLETE 0.999996 10 1 180 1"},
+	} {
+		f.exec(`INSERT INTO shawk.hosts VALUES ('%[1]s', 'm-%[1]s', '%[1]s', 'k', 'v', %[2]s, %[3]s)`, name, f.ago(100*days), f.ago(0))
+		f.session(name, 100*days, 10*days, "true", "'all'")
+		f.session(name, 10*days-c.gap, 0, "true", "'all'")
+		if got := f.query(30*days, `SELECT `+columns+` FROM shawk_v1.policy_verdict('`+name+`', $1, $2)`); !slices.Equal(got, []string{c.want}) {
+			t.Errorf("a restart of %s = %v, want %s", c.gap, got, c.want)
+		}
+	}
+	// The latest report of an agent is not the end of the period: what
+	// follows it counts for the tolerance, and is told too.
+	f.exec(`UPDATE shawk.agent_sessions SET last_heartbeat = %s WHERE host_id = 'none'`, f.ago(time.Minute))
+	if got := f.query(30*days, `SELECT `+columns+` FROM shawk_v1.policy_verdict('none', $1, $2)`); !slices.Equal(got, []string{"COMPLETE 1.000000 0 0 60 1"}) {
+		t.Errorf("a last report of a minute ago = %v", got)
+	}
+}
+
+// TestPGPolicyFlowsEdges: the edges of the flows at the borders of what
+// policy_flows() takes.
+func TestPGPolicyFlowsEdges(t *testing.T) {
+	f := newPolicyFixture(t)
+	f.host("node-01", "10.0.0.11")
+	f.proc("node-01", "kubelet.service", "kubelet")
+	f.proc("node-01", "web.service", "web")
+	// A translation of the port alone, to the address that the socket
+	// connected to; one that was last seen in the middle of the period;
+	// and one that ended before it.
+	f.edge("node-01", "kubelet", "client", "tcp", "10.0.0.11", "10.0.0.40", 443, 20*days, 0)
+	f.edge("node-01", "kubelet", "client", "tcp", "10.0.0.11", "10.96.0.1", 443, 20*days, 0)
+	f.exec(`INSERT INTO shawk.learned_translations VALUES
+	  ('node-01', 'tcp', 1, '10.0.0.11', '10.0.0.40', 443, '10.0.0.11', '10.0.0.40', 6443, %[1]s, %[2]s),
+	  ('node-01', 'tcp', 1, '10.0.0.11', '10.96.0.1', 443, '10.0.0.11', '10.0.0.41', 6443, %[1]s, %[3]s),
+	  ('node-01', 'tcp', 1, '10.0.0.11', '10.96.0.1', 443, '10.0.0.11', '10.0.0.42', 6443, %[4]s, %[5]s),
+	  ('node-01', 'tcp', 1, '10.0.0.11', '10.0.0.40', 443, '10.0.0.11', '10.0.0.40', 443, %[1]s, %[2]s)`,
+		f.ago(20*days), f.ago(0), f.ago(12*days), f.ago(99*days), f.ago(40*days))
+	want := []string{"10.0.0.40/32 6443", "10.0.0.41/32 6443"}
+	if got := f.query(30*days, `SELECT peer_addr::text, port FROM shawk_v1.policy_flows('node-01', $1, $2) WHERE translated`); !slices.Equal(got, want) {
+		t.Errorf("translated flows = %v, want %v", got, want)
+	}
+	// A flow first seen after the period is not of it.
+	f.edge("node-01", "kubelet", "client", "tcp", "10.0.0.11", "10.0.0.50", 8080, days, 0)
+	if got := queryStrings(t, f.conn, `SELECT count(*) FROM shawk_v1.policy_flows('node-01', $1, $2) WHERE port = 8080`,
+		f.T.Add(-30*days), f.T.Add(-2*days)); !slices.Equal(got, []string{"0"}) {
+		t.Errorf("a flow first seen after the period: %v", got)
+	}
+	if got := f.query(30*days, `SELECT count(*) FROM shawk_v1.policy_flows('node-01', $1, $2) WHERE port = 8080`); !slices.Equal(got, []string{"1"}) {
+		t.Errorf("the same flow in a period that holds it: %v", got)
+	}
+	// A range of dynamic_ports holds an ingress flow by the address of the
+	// host, which is the server, not by that of its client.
+	f.exec(`INSERT INTO shawk.dynamic_ports VALUES ('nodeports', 'tcp', '10.0.0.11/32', 30000, 32767),
+	        ('clients', 'tcp', '192.0.2.0/24', 20000, 29999)`)
+	f.edge("node-01", "web", "server", "tcp", "10.0.0.11", "192.0.2.50", 30080, 20*days, 0)
+	f.edge("node-01", "web", "server", "tcp", "10.0.0.11", "192.0.2.50", 20080, 20*days, 0)
+	want = []string{"20080 20080 20080", "30080 30000 32767"}
+	if got := f.query(30*days, `SELECT port, port_from, port_to FROM shawk_v1.policy_flows('node-01', $1, $2) WHERE direction = 'ingress'`); !slices.Equal(got, want) {
+		t.Errorf("ports of the ingress flows = %v, want %v", got, want)
+	}
+}
+
+// TestPGNamedByEndpointChoice: among the endpoints that could name a
+// server whose agent is stopped, one observed on a socket wins over one
+// inferred from a listener on every address, and the most recent of
+// those.
+func TestPGNamedByEndpointChoice(t *testing.T) {
+	f := newPolicyFixture(t)
+	f.host("app-01", "10.0.0.11")
+	f.hostObserved("srv-01", "10.0.0.30", 100*days, 2*days)
+	f.proc("app-01", "app.service", "shop/app")
+	f.proc("srv-01", "wild.service", "wild")
+	f.proc("srv-01", "exact.service", "exact")
+	f.proc("srv-01", "old.service", "exact-old")
+	f.listener("srv-01", "wild", "0.0.0.0", 7000, "NULL")
+	f.listener("srv-01", "exact", "10.0.0.30", 7000, "NULL")
+	f.edge("srv-01", "exact-old", "server", "tcp", "10.0.0.30", "10.0.0.99", 7000, 20*days, 3*days)
+	f.edge("app-01", "shop/app", "client", "tcp", "10.0.0.11", "10.0.0.30", 7000, 20*days, 0)
+	if got := f.query(time.Hour, `SELECT peer, named_by FROM shawk_v1.baseline_observed($1, $2)`); !slices.Equal(got, []string{"exact endpoint"}) {
+		t.Errorf("the server is named %v, want exact, by its endpoint", got)
+	}
+}
+
+const hostsColumns = `status, reasons, hosts, unobserved_hosts, short_hosts`
+
+// TestPGBaselineHosts: the drift of a service is known only when every
+// host that runs it was observed. A host whose agent went silent, with
+// every process of it, runs the service for as long as the caller says:
+// it is not observed, rather than out of the question.
+func TestPGBaselineHosts(t *testing.T) {
+	f := newPolicyFixture(t)
+	f.host("app-01", "10.0.0.11")
+	f.host("app-02", "10.0.0.21")
+	f.proc("app-01", "app.service", "shop/app")
+	f.proc("app-02", "app.service", "shop/app")
+	verdict := func(hostsSince string) []string {
+		t.Helper()
+		return f.query(time.Hour, `SELECT `+hostsColumns+` FROM shawk_v1.baseline_verdict(ARRAY['shop/app'], $1, $2, 1, '3 minutes', `+hostsSince+`)`)
+	}
+	week := f.ago(7 * days)
+	if got := verdict(week); !slices.Equal(got, []string{"COMPLETE [] 2 0 []"}) {
+		t.Fatalf("every host observed: %v", got)
+	}
+	// The agent of app-02 stopped 3 hours ago: its session, and the
+	// processes it reported, were last seen then.
+	silent := func(host string, ago time.Duration) {
+		f.exec(`UPDATE shawk.agent_sessions SET last_heartbeat = %[2]s WHERE host_id = '%[1]s';
+		        UPDATE shawk.processes SET last_seen = %[2]s WHERE host_id = '%[1]s'`, host, f.ago(ago))
+	}
+	silent("app-02", 3*time.Hour)
+	if got := verdict(week); !slices.Equal(got, []string{"INCOMPLETE [not_observed] 2 1 [app-02]"}) {
+		t.Errorf("a host silent for 3 hours: %v", got)
+	}
+	// The hosts of a period alone, as a baseline is made from, are those
+	// that ran the service within it.
+	if got := verdict("NULL"); !slices.Equal(got, []string{"COMPLETE [] 1 0 []"}) {
+		t.Errorf("without hosts_since: %v", got)
+	}
+	// A host is forgotten when hosts_since is after its last process.
+	if got := verdict(f.ago(2 * time.Hour)); !slices.Equal(got, []string{"COMPLETE [] 1 0 []"}) {
+		t.Errorf("hosts since 2 hours ago: %v", got)
+	}
+	// Every host silent: nothing was there to see a drift.
+	silent("app-01", 3*time.Hour)
+	if got := verdict(week); !slices.Equal(got, []string{"INCOMPLETE [not_observed] 2 2 [app-01 app-02]"}) {
+		t.Errorf("every host silent: %v", got)
+	}
+	// No host is known to run the service.
+	if got := verdict(f.ago(2 * time.Hour)); !slices.Equal(got, []string{"INCOMPLETE [unknown_service] 0 0 []"}) {
+		t.Errorf("no host since 2 hours ago: %v", got)
+	}
+	// A host whose clock is 2 hours behind reports now, and what it does
+	// now is dated 2 hours ago: the last hour is not observed.
+	f.exec(`UPDATE shawk.agent_sessions SET last_heartbeat = %s, clock_skew = interval '2 hours' WHERE host_id = 'app-01'`, f.ago(0))
+	f.exec(`UPDATE shawk.agent_sessions SET last_heartbeat = %s WHERE host_id = 'app-02'`, f.ago(0))
+	f.exec(`UPDATE shawk.processes SET last_seen = %s WHERE host_id = 'app-02'`, f.ago(0))
+	if got := verdict(week); !slices.Equal(got, []string{"INCOMPLETE [not_observed] 2 1 [app-01]"}) {
+		t.Errorf("a host whose clock is behind: %v", got)
+	}
+	// hosts_since is not after the start of the period.
+	if _, err := f.conn.Exec(context.Background(), `SELECT * FROM shawk_v1.baseline_verdict(ARRAY['shop/app'], $1, $2, 1, '3 minutes', $2)`,
+		f.T.Add(-time.Hour), f.T); err == nil {
+		t.Errorf("hosts_since after the start of the period is accepted")
+	}
+}
+
+// TestPGBaselineHostsMargin: a process last seen within 15 minutes before
+// the period is of it, as the dependencies of the period are matched.
+func TestPGBaselineHostsMargin(t *testing.T) {
+	f := newPolicyFixture(t)
+	f.host("app-01", "10.0.0.11")
+	f.host("app-02", "10.0.0.21")
+	f.host("app-03", "10.0.0.31")
+	for _, h := range []string{"app-01", "app-02", "app-03"} {
+		f.proc(h, "app.service", "shop/app")
+	}
+	f.exec(`UPDATE shawk.processes SET last_seen = %s WHERE host_id = 'app-02'`, f.ago(time.Hour+10*time.Minute))
+	f.exec(`UPDATE shawk.processes SET last_seen = %s WHERE host_id = 'app-03'`, f.ago(time.Hour+20*time.Minute))
+	if got := f.query(time.Hour, `SELECT hosts FROM shawk_v1.baseline_verdict(ARRAY['shop/app'], $1, $2)`); !slices.Equal(got, []string{"2"}) {
+		t.Errorf("hosts of the period = %v, want 2", got)
+	}
+}
+
+// TestPGBaselineMachines: the hosts that run a service are machines: of
+// two that report under one name, the one that is silent is not covered
+// by the other.
+func TestPGBaselineMachines(t *testing.T) {
+	f := newPolicyFixture(t)
+	f.exec(`INSERT INTO shawk.hosts VALUES ('id-1', 'm-1', 'app-01', 'k', 'v', %[1]s, %[2]s), ('id-2', 'm-2', 'app-01', 'k', 'v', %[1]s, %[2]s)`,
+		f.ago(100*days), f.ago(0))
+	f.session("id-1", 100*days, 3*time.Hour, "true", "'all'")
+	f.session("id-2", 100*days, 0, "true", "'all'")
+	f.proc("id-1", "app.service", "shop/app")
+	f.proc("id-2", "app.service", "shop/app")
+	want := "INCOMPLETE [not_observed] 1 1 [app-01]"
+	if got := f.query(time.Hour, `SELECT `+hostsColumns+` FROM shawk_v1.baseline_verdict(ARRAY['shop/app'], $1, $2)`); !slices.Equal(got, []string{want}) {
+		t.Errorf("two machines of one name, one silent = %v, want %s", got, want)
+	}
+	// The machine that does not run the service does not count for it.
+	f.exec(`DELETE FROM shawk.processes WHERE host_id = 'id-1'`)
+	if got := f.query(time.Hour, `SELECT `+hostsColumns+` FROM shawk_v1.baseline_verdict(ARRAY['shop/app'], $1, $2)`); !slices.Equal(got, []string{"COMPLETE [] 1 0 []"}) {
+		t.Errorf("the silent machine without the service = %v", got)
+	}
+}
+
+const judgedColumns = `service, peer, port, proto, hosts, processes`
+
+// TestPGBaselineUnit: a process of another name in a unit that runs a
+// service of the baseline is judged as that service, unless its own name
+// has a baseline: a connection out of the unit is not out of every
+// baseline because its process has another executable, or names itself.
+func TestPGBaselineUnit(t *testing.T) {
+	f := newPolicyFixture(t)
+	f.host("app-01", "10.0.0.11")
+	f.host("web-01", "10.0.0.12")
+	f.host("db-01", "10.0.0.10")
+	f.proc("app-01", "app.service", "shop/app")
+	f.proc("db-01", "postgresql.service", "shop/postgres")
+	f.pair("app-01", "shop/app", "10.0.0.11", "db-01", "shop/postgres", "10.0.0.10", 5432, 20*days, 0)
+	f.approve("services:\n  - service: shop/app\n    dependencies:\n      - {peer: shop/postgres, port: 5432, proto: tcp}\n")
+	// In the unit of shop/app: curl, and a process that names itself
+	// ~unknown, connect out 20 minutes ago. An administrator ran curl on
+	// web-01 too, in a login session.
+	f.exec(`INSERT INTO shawk.processes (host_id, unit, comm, exe, service_name, first_seen, last_seen) VALUES
+	  ('app-01', 'app.service', 'curl', '/usr/bin/curl', 'curl', %[1]s, %[1]s),
+	  ('app-01', 'app.service', 'python3', '/usr/bin/python3', '~unknown', %[1]s, %[1]s),
+	  ('web-01', 'user-0.slice/session.scope', 'curl', '/usr/bin/curl', 'curl', %[1]s, %[1]s)`, f.ago(20*time.Minute))
+	m := 20 * time.Minute
+	f.edgeOf("app-01", "app.service", "curl", "client", "tcp", "10.0.0.11", "203.0.113.66", 4444, m, m)
+	f.edgeOf("app-01", "app.service", "~unknown", "client", "tcp", "10.0.0.11", "203.0.113.66", 4444, m, m)
+	f.edgeOf("web-01", "user-0.slice/session.scope", "curl", "client", "tcp", "10.0.0.12", "198.51.100.1", 443, m, m)
+	// One that uses what the service is approved for is no drift.
+	f.edgeOf("app-01", "app.service", "curl", "client", "tcp", "10.0.0.11", "10.0.0.10", 5432, m, m)
+	drift := func(args string) []string {
+		t.Helper()
+		return f.query(time.Hour, `SELECT `+judgedColumns+` FROM shawk_v1.baseline_drift($1, $2`+args+`)`)
+	}
+	want := []string{"shop/app ~external 4444 tcp [app-01] [curl ~unknown]"}
+	if got := drift(""); !slices.Equal(got, want) {
+		t.Errorf("drift:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+	// The baseline of the service lists what its drift is judged on.
+	want = []string{"shop/app shop/postgres 5432 tcp [app-01] [curl]", "shop/app ~external 4444 tcp [app-01] [curl ~unknown]"}
+	if got := f.query(time.Hour, `SELECT `+judgedColumns+` FROM shawk_v1.baseline_observed($1, $2, ARRAY['shop/app'])`); !slices.Equal(got, want) {
+		t.Errorf("observed of shop/app:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+	// Every service on its own, as shawk-policy baseline -all asks.
+	want = []string{"curl shop/postgres 5432 tcp [app-01] []", "curl ~external 443 tcp [web-01] []", "curl ~external 4444 tcp [app-01] []",
+		"shop/app shop/postgres 5432 tcp [app-01] []", "~unknown ~external 4444 tcp [app-01] []"}
+	if got := f.query(time.Hour, `SELECT `+judgedColumns+` FROM shawk_v1.baseline_observed($1, $2)`); !slices.Equal(got, want) {
+		t.Errorf("observed of every service:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+	// The drift of a service asked for holds what is judged as it.
+	if got := drift(", ARRAY['shop/app']"); len(got) != 1 {
+		t.Errorf("drift of shop/app: %v", got)
+	}
+	if got := drift(", ARRAY['curl']"); len(got) != 0 {
+		t.Errorf("drift of curl, which has no baseline: %v", got)
+	}
+	// With a baseline of its own, curl is judged by it, wherever it runs,
+	// and the process without one in the unit by both services of it.
+	f.approve("services:\n  - service: shop/app\n    dependencies:\n      - {peer: shop/postgres, port: 5432, proto: tcp}\n" +
+		"  - service: curl\n    dependencies: []\n")
+	want = []string{"curl shop/postgres 5432 tcp [app-01] []", "curl ~external 443 tcp [web-01] []",
+		"curl ~external 4444 tcp [app-01] [~unknown]", "shop/app ~external 4444 tcp [app-01] [~unknown]"}
+	if got := drift(""); !slices.Equal(got, want) {
+		t.Errorf("drift with a baseline of curl:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+	// A unit runs a service for as long as the caller says: after the
+	// process of the service was last seen, 2 days ago, what stays in its
+	// unit is still judged with members_since, and not without.
+	f.approve("services:\n  - service: shop/app\n    dependencies:\n      - {peer: shop/postgres, port: 5432, proto: tcp}\n")
+	f.exec(`UPDATE shawk.processes SET last_seen = %s WHERE service_name = 'shop/app'`, f.ago(2*days))
+	f.exec(`UPDATE shawk.edges SET last_seen = %s WHERE process_id = (SELECT id FROM shawk.processes WHERE service_name = 'shop/app')`, f.ago(2*days))
+	if got := drift(""); len(got) != 0 {
+		t.Errorf("drift without members_since, of a unit whose service stopped: %v", got)
+	}
+	want = []string{"shop/app ~external 4444 tcp [app-01] [curl ~unknown]"}
+	if got := drift(", NULL, " + f.ago(7*days)); !slices.Equal(got, want) {
+		t.Errorf("drift with members_since:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+// TestPGBaselineKernelChosen: a server on a port that the kernel chose
+// has another one at its next run. A baseline does not pin it: the
+// dependency is on every port of the server, and is marked.
+func TestPGBaselineKernelChosen(t *testing.T) {
+	f := newPolicyFixture(t)
+	f.host("app-01", "10.0.0.11")
+	f.host("db-01", "10.0.0.10")
+	f.proc("app-01", "app.service", "shop/app")
+	f.proc("db-01", "rpc.service", "rpcd")
+	f.proc("db-01", "postgresql.service", "shop/postgres")
+	f.pair("app-01", "shop/app", "10.0.0.11", "db-01", "rpcd", "10.0.0.10", 40123, 20*days, 0)
+	f.pair("app-01", "shop/app", "10.0.0.11", "db-01", "shop/postgres", "10.0.0.10", 5432, 20*days, 0)
+	f.listener("db-01", "rpcd", "0.0.0.0", 40123, f.ago(0))
+	f.listener("db-01", "shop/postgres", "0.0.0.0", 5432, "NULL")
+	const columns = `peer, port, proto, kernel_chosen, ports`
+	want := []string{"rpcd 0 tcp true [40123]", "shop/postgres 5432 tcp false [5432]"}
+	if got := f.query(30*days, `SELECT `+columns+` FROM shawk_v1.baseline_observed($1, $2)`); !slices.Equal(got, want) {
+		t.Errorf("observed = %v, want %v", got, want)
+	}
+	// The rules of the host still pin the port, and mark it.
+	if got := f.query(30*days, `SELECT port_from, port_to, kernel_chosen FROM shawk_v1.policy_flows('app-01', $1, $2) WHERE port = 40123`); !slices.Equal(got, []string{"40123 40123 true"}) {
+		t.Errorf("the flow of the host = %v", got)
+	}
+	// The server runs again, on another port: no drift from the baseline
+	// that holds every port of it.
+	f.approve("services:\n  - service: shop/app\n    dependencies:\n      - {peer: rpcd, port: 0, proto: tcp}\n      - {peer: shop/postgres, port: 5432, proto: tcp}\n")
+	f.pair("app-01", "shop/app", "10.0.0.11", "db-01", "rpcd", "10.0.0.10", 40999, 30*time.Minute, 0)
+	f.listener("db-01", "rpcd", "0.0.0.0", 40999, f.ago(0))
+	if got := f.query(time.Hour, `SELECT `+columns+` FROM shawk_v1.baseline_drift($1, $2)`); len(got) != 0 {
+		t.Errorf("drift after the server ran again: %v", got)
+	}
+	// A baseline written by hand that pins the old port tells a drift,
+	// which is marked: one row, whatever the ports.
+	f.approve("services:\n  - service: shop/app\n    dependencies:\n      - {peer: rpcd, port: 40123, proto: tcp}\n      - {peer: shop/postgres, port: 5432, proto: tcp}\n")
+	if got := f.query(time.Hour, `SELECT `+columns+` FROM shawk_v1.baseline_drift($1, $2)`); !slices.Equal(got, []string{"rpcd 0 tcp true [40999]"}) {
+		t.Errorf("drift from a baseline that pins the port: %v", got)
+	}
+}
+
+// TestPGBaselineReportShares: the series of the drift are bounded per
+// service and in all, so that one service does not use up the share of
+// the others: a service that tries a thousand ports cuts its own rows,
+// and the rows on a named peer come before those on ~unresolved.
+func TestPGBaselineReportShares(t *testing.T) {
+	f := newPolicyFixture(t)
+	f.host("app-01", "10.0.0.11")
+	f.host("app-02", "10.0.0.21")
+	f.proc("app-01", "app.service", "shop/app")
+	f.proc("app-02", "scan.scope", "aaa/first")
+	f.proc("app-02", "web.service", "shop/web")
+	f.approve("services:\n  - {service: aaa/first, dependencies: []}\n  - {service: shop/app, dependencies: []}\n  - {service: shop/web, dependencies: []}\n")
+	m := 20 * time.Minute
+	// aaa/first tries 30 ports of a private address; shop/app connects to
+	// a public address and to two private ones; shop/web to a public one.
+	f.exec(`INSERT INTO shawk.edges (host_id, process_id, role, proto, local_addr, remote_addr, port, netns, first_seen, last_seen)
+	        SELECT 'app-02', (SELECT id FROM shawk.processes WHERE service_name = 'aaa/first'), 'client', 'tcp', '10.0.0.21', '10.0.0.250',
+	               p, 1, %[1]s, %[1]s FROM generate_series(1, 30) p`, f.ago(m))
+	f.edge("app-01", "shop/app", "client", "tcp", "10.0.0.11", "203.0.113.66", 4444, m, m)
+	f.edge("app-01", "shop/app", "client", "tcp", "10.0.0.11", "10.0.0.250", 7, m, m)
+	f.edge("app-01", "shop/app", "client", "tcp", "10.0.0.11", "10.0.0.250", 8, m, m)
+	f.edge("app-02", "shop/web", "client", "tcp", "10.0.0.21", "203.0.113.67", 443, m, m)
+	st, err := newPGStore(context.Background(), f.conn.Config().ConnString())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+	report := func(maxDrift, perService int) (rows []string, named, unresolved int) {
+		t.Helper()
+		r, err := st.baselineReport(context.Background(), f.T.Add(-time.Hour), f.T, f.T.Add(-7*days), maxDrift, perService)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, d := range r.drift {
+			rows = append(rows, d.service+" "+d.peer+" "+itoa(int64(d.port)))
+		}
+		return rows, r.truncatedNamed, r.truncatedUnresolved
+	}
+	// The bounds of the connector: the flood is cut to its share, and the
+	// drift of the others is all there.
+	rows, named, unresolved := report(1000, 20)
+	if len(rows) != 24 || named != 0 || unresolved != 10 || !slices.Contains(rows, "shop/app ~external 4444") ||
+		!slices.Contains(rows, "shop/web ~external 443") || !slices.Contains(rows, "shop/app ~unresolved 8") {
+		t.Errorf("with the shares of the connector: %d rows, %d and %d cut: %v", len(rows), named, unresolved, rows)
+	}
+	// A bound in all that is smaller than the drift: the named peers
+	// first, then the first row of each service before the second of any.
+	rows, named, unresolved = report(4, 20)
+	want := []string{"shop/app ~external 4444", "shop/web ~external 443", "aaa/first ~unresolved 1", "shop/app ~unresolved 7"}
+	if !slices.Equal(rows, want) || named != 0 || unresolved != 30 {
+		t.Errorf("with a bound of 4: %v, %d and %d cut, want %v", rows, named, unresolved, want)
+	}
+	// What is cut of the named peers is counted apart: it is critical.
+	rows, named, unresolved = report(1, 20)
+	if !slices.Equal(rows, []string{"shop/app ~external 4444"}) || named != 1 || unresolved != 32 {
+		t.Errorf("with a bound of 1: %v, %d and %d cut", rows, named, unresolved)
+	}
+}

@@ -63,7 +63,7 @@ type store interface {
 	baselineFailed(ctx context.Context, failedAt time.Time, msg string) error
 	// baselineReport evaluates the drift from the baseline over [since,
 	// until], with at most maxDrift dependencies.
-	baselineReport(ctx context.Context, since, until time.Time, maxDrift int) (*baselineReport, error)
+	baselineReport(ctx context.Context, since, until, hostsSince time.Time, maxDrift, maxDriftPerService int) (*baselineReport, error)
 	close()
 }
 
@@ -1079,8 +1079,16 @@ ON CONFLICT (singleton) DO UPDATE SET failed_at = excluded.failed_at, error = ex
 
 // baselineReport reads the baseline and what the contract tells of the
 // drift from it over [since, until], in one read-only transaction, so that
-// they are of the same data.
-func (s *pgStore) baselineReport(ctx context.Context, since, until time.Time, maxDrift int) (*baselineReport, error) {
+// they are of the same data. hostsSince is since when a process of a
+// service must have been seen on a host for the host to run the service
+// (baseline_verdict, baseline_drift).
+//
+// The drift is cut to maxDriftPerService rows per service and maxDrift in
+// all, so that no service uses up the share of another: within a service,
+// the rows on a named peer come before those on ~unresolved; among the
+// services, the first row of each comes before the second of any, the
+// rows on named peers first. What is cut is counted, by peer.
+func (s *pgStore) baselineReport(ctx context.Context, since, until, hostsSince time.Time, maxDrift, maxDriftPerService int) (*baselineReport, error) {
 	r := &baselineReport{}
 	err := pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly}, func(tx pgx.Tx) error {
 		err := tx.QueryRow(ctx, `SELECT read_at IS NOT NULL, failed_at IS NOT NULL FROM shawk.baseline_state`).Scan(&r.read, &r.failed)
@@ -1093,37 +1101,80 @@ func (s *pgStore) baselineReport(ctx context.Context, since, until time.Time, ma
 			return err
 		}
 		rows, err := tx.Query(ctx, `
-SELECT s.service, count(d.peer)::integer
+SELECT s.service, (SELECT count(*)::integer FROM shawk.baseline_dependencies d WHERE d.service = s.service),
+       v.hosts, v.unobserved_hosts
 FROM shawk.baseline_services s
-LEFT JOIN shawk.baseline_dependencies d ON d.service = s.service
-GROUP BY s.service ORDER BY s.service COLLATE "C"`)
+JOIN shawk_v1.baseline_verdict(ARRAY(SELECT b.service FROM shawk.baseline_services b), $1, $2, 1, interval '3 minutes', $3) v
+  ON v.service = s.service
+ORDER BY s.service COLLATE "C"`, since, until, hostsSince)
 		if err != nil {
 			return err
 		}
 		if r.services, err = pgx.CollectRows(rows, func(row pgx.CollectableRow) (baselineCount, error) {
 			var c baselineCount
-			err := row.Scan(&c.service, &c.dependencies)
+			err := row.Scan(&c.service, &c.dependencies, &c.hosts, &c.unobserved)
 			return c, err
 		}); err != nil {
 			return err
 		}
-		var total int
 		rows, err = tx.Query(ctx, `
-SELECT d.service, d.peer, d.port, d.proto, cardinality(d.hosts), count(*) OVER ()::integer
-FROM shawk_v1.baseline_drift($1, $2) d
-ORDER BY d.service COLLATE "C", d.peer COLLATE "C", d.port, d.proto
-LIMIT $3`, since, until, maxDrift)
+WITH d AS MATERIALIZED (
+  SELECT x.service, x.peer, x.port, x.proto, cardinality(x.hosts) AS hosts, x.peer = '~unresolved' AS unresolved
+  FROM shawk_v1.baseline_drift($1, $2, NULL, $3) x
+),
+-- rank is the place of a row in its service, for the share of the
+-- service; turn its place among the rows of its service on the same kind
+-- of peer, for the order among the services.
+ranked AS (
+  SELECT d.*,
+         row_number() OVER (PARTITION BY d.service ORDER BY d.unresolved, d.peer COLLATE "C", d.port, d.proto) AS rank,
+         row_number() OVER (PARTITION BY d.service, d.unresolved ORDER BY d.peer COLLATE "C", d.port, d.proto) AS turn
+  FROM d
+),
+kept AS (
+  SELECT k.service, k.peer, k.port, k.proto, k.hosts
+  FROM ranked k
+  WHERE k.rank <= $5
+  ORDER BY k.unresolved, k.turn, k.service COLLATE "C"
+  LIMIT $4
+)
+SELECT k.service, k.peer, k.port, k.proto, k.hosts,
+       (SELECT count(*) FILTER (WHERE NOT d.unresolved)::integer FROM d),
+       (SELECT count(*) FILTER (WHERE d.unresolved)::integer FROM d)
+FROM kept k
+UNION ALL
+-- The counts alone, when no row is kept.
+SELECT NULL, NULL, NULL, NULL, NULL,
+       (SELECT count(*) FILTER (WHERE NOT d.unresolved)::integer FROM d),
+       (SELECT count(*) FILTER (WHERE d.unresolved)::integer FROM d)
+WHERE NOT EXISTS (SELECT FROM kept)`, since, until, hostsSince, maxDrift, maxDriftPerService)
 		if err != nil {
 			return err
 		}
-		if r.drift, err = pgx.CollectRows(rows, func(row pgx.CollectableRow) (driftRow, error) {
-			var d driftRow
-			err := row.Scan(&d.service, &d.peer, &d.port, &d.proto, &d.hosts, &total)
-			return d, err
-		}); err != nil {
+		var named, unresolved int
+		drift, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (*driftRow, error) {
+			var service, peer, proto *string
+			var port, hosts *int
+			if err := row.Scan(&service, &peer, &port, &proto, &hosts, &named, &unresolved); err != nil || service == nil {
+				return nil, err
+			}
+			return &driftRow{*service, *peer, *port, *proto, *hosts}, nil
+		})
+		if err != nil {
 			return err
 		}
-		r.truncated = max(total-len(r.drift), 0)
+		for _, d := range drift {
+			if d == nil {
+				continue
+			}
+			r.drift = append(r.drift, *d)
+			if d.peer == "~unresolved" {
+				unresolved--
+			} else {
+				named--
+			}
+		}
+		r.truncatedNamed, r.truncatedUnresolved = max(named, 0), max(unresolved, 0)
 		return tx.QueryRow(ctx, `SELECT count(*)::integer FROM shawk_v1.baseline_new_services($1, $2)`, since, until).Scan(&r.newServices)
 	})
 	if err != nil {

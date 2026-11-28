@@ -1,0 +1,146 @@
+#!/usr/sbin/nft -f
+# Rules of nftables for host app-01, written by shawk-policy for review.
+# AUDIT form: it rejects nothing. What no rule lists is counted and logged, and passes.
+# shawk applied nothing: read this file, then load it yourself.
+#
+# Target   host app-01
+# Period   2026-08-30T00:00:00Z to 2026-11-28T00:00:00Z (90d)
+# Status   COMPLETE: an agent observed the target for the whole period, so the history tells every
+#          TCP and UDP connection that its sockets made in it
+#          (coverage 1; 1 is all of the period)
+#
+# What the rules pin, and what they leave out
+#   - 10 addresses are pinned as the sockets saw them: a peer that gets another address (DHCP,
+#     autoscaling, a replica that was not used, a failover) is denied until the rules are written
+#     again
+#   - 2 rules allow every address of a family: the agent folded these peers and kept no address
+#     (the agent keeps them with -fold-external none, or -internal-peers for the ranges that
+#     matter)
+#   - 3 rules are for peers shawk could not name (~unresolved: no agent there, and no range of
+#     peer_cidrs): check what they are before allowing them
+#   - 1 rule allows a range of ports, by the rules of ports of the connector (dynamic_ports,
+#     port_agnostic_services): the server listens on another port at every run
+#   - 1 rule pins a port that the kernel chose for the server, which no rule of ports covers: the
+#     server listens on another one at its next run, and is denied then
+#     (shawk_v1.kernel_chosen_ports)
+#   - 1 rule allows the backends that the host itself translates its connections to (DNAT in its
+#     kernel, as kube-proxy does): they change when the translation does
+#   - 1 rule allows the other way of a UDP rule, for the same peer and port (the packets from the
+#     port, where the rule of what was seen allows those to it): a socket of UDP may send and
+#     receive first on one port, and shawk records one direction of it
+#   - 3 ingress rules are pinned to the sources that were seen: a client, or an administrator, at
+#     another address is refused (-ingress ports opens the ports to every source)
+#   - 2 flows are within the host (loopback): they are left open, and are in no rule
+#   - 1 flow was last seen before the period, and in no rule: a job that runs less often than the
+#     period would be denied (a longer -lookback includes them)
+#   - a connection that was not made in the period is denied: one made less often than the period,
+#     or only when another server fails
+#
+# What shawk cannot observe: check each before the rules block anything
+#   - protocols other than TCP and UDP (ICMP, VRRP, IPsec, GRE): shawk does not observe them, and
+#     the table accepts them all
+#   - tunnels that the kernel makes (VXLAN, Geneve, WireGuard, IP-in-IP): no socket of a process
+#     sends their outer packets, so no rule lists them. The rejecting form stops them (UDP 4789,
+#     8472, 6081, 51820), and every connection over the tunnel with them, although the rules list
+#     the addresses inside it
+#   - a host that balances connections for others in its kernel (IPVS: an LVS director, kube-proxy
+#     in IPVS mode): a virtual service has no socket, so no ingress rule lists it, and the chain
+#     input runs before IPVS takes its packets. shawk-policy was not run on such a host: use
+#     -ingress none there
+#   - what the host forwards for containers or virtual machines: it does not pass the hooks input
+#     and output, and no chain forward is written
+#   - destinations that the host rewrites (DNAT, as kube-proxy does): the agents of this host
+#     learned them in the period, and the rules list the backends they saw
+#
+# It filters the connections of the host itself (the hooks input and output), not what
+# the host forwards. It is a table of its own: the other tables of the host still apply,
+# and a packet passes only if every table accepts it.
+#
+# To check it without loading it:  nft -c -f FILE
+# To load it:                      nft -f FILE
+# To read what no rule lists:      nft list counters table inet shawk_policy
+#                                  and the kernel log, lines with "shawk-policy unlisted"
+# To remove it:                    nft delete table inet shawk_policy
+#
+# How to go from this file to rules that reject
+#   1. Load this audit form. Nothing is rejected. If the host did not track connections
+#      before, loading it starts the tracking: the connections that are open are taken up
+#      as their next packets pass (net.netfilter.nf_conntrack_tcp_loose = 1, the default).
+#   2. A few minutes later, clear the counters: nft reset counters table inet shawk_policy
+#      Until then they also count the connections that were open before the table.
+#   3. Leave it for as long as the slowest job of the host takes to come round, and longer
+#      than the longest silence of its open connections (TCP keepalive: 2 hours by default).
+#      The counters count the packets that no rule lists, of each such connection until its
+#      peer answers: a kernel tunnel, a rewritten destination, a job the period did not see.
+#   4. Only while the counters stay at 0: write the rejecting form (the same command with
+#      -enforce) and load it. It replaces this table in one transaction, and the
+#      connections that the tracking knows by then stay established.
+#   Loading the rejecting form on a host that did not track connections, without this
+#   audit first, stops the open connections whose peer sends next: the tracking does not
+#   know them, and takes their next packet for a new connection that no rule lists.
+
+table inet shawk_policy
+delete table inet shawk_policy
+
+table inet shawk_policy {
+	counter egress_unlisted { }
+	counter ingress_unlisted { }
+
+	chain output {
+		type filter hook output priority filter; policy accept;
+
+		ct state established,related accept
+		oifname "lo" accept
+		# shawk observes TCP and UDP only: nothing else is filtered.
+		meta l4proto != { tcp, udp } accept
+
+		# egress 1-65535/tcp: srun, of shop/app, last seen 2026-11-28T00:00:00Z
+		ip daddr 10.0.0.60 tcp dport 1-65535 accept
+
+		# egress 443/tcp: ~external, of shop/app, last seen 2026-11-28T00:00:00Z [folded peers]
+		meta nfproto ipv4 tcp dport 443 accept
+		meta nfproto ipv6 tcp dport 443 accept
+
+		# egress 5432/tcp: shop/postgres on db-01, db-02, of shop/app, last seen 2026-11-28T00:00:00Z
+		ip daddr { 10.0.0.10, 10.0.0.20 } tcp dport 5432 accept
+
+		# egress 6443/tcp: ~unresolved, of kubelet, last seen 2026-11-28T00:00:00Z [translated by the host]
+		ip daddr 10.0.0.40 tcp dport 6443 accept
+
+		# egress 8443/tcp: partner, of shop/app, last seen 2026-11-28T00:00:00Z
+		ip6 daddr 2001:db8::7 tcp dport 8443 accept
+
+		# egress 45678/tcp: x, of shop/app, last seen 2026-11-28T00:00:00Z [port chosen by the kernel]
+		ip daddr 10.0.0.61 tcp dport 45678 accept
+
+		# egress 53/udp: ~unresolved, of shop/app, last seen 2026-11-28T00:00:00Z
+		ip daddr 10.0.0.53 udp dport 53 accept
+
+		# What no rule lists: counted and logged, not rejected (audit form).
+		counter name "egress_unlisted" limit rate 10/second burst 20 packets log prefix "shawk-policy unlisted egress: "
+	}
+
+	chain input {
+		type filter hook input priority filter; policy accept;
+
+		ct state established,related accept
+		iifname "lo" accept
+		# shawk observes TCP and UDP only: nothing else is filtered.
+		meta l4proto != { tcp, udp } accept
+
+		# ingress 22/tcp: ~unresolved, of sshd, last seen 2026-11-28T00:00:00Z
+		ip saddr { 10.0.5.5, 10.0.5.6 } tcp dport 22 accept
+
+		# ingress 8080/tcp: nginx on web-01, of shop/app, last seen 2026-11-28T00:00:00Z
+		ip saddr 10.0.0.12 tcp dport 8080 accept
+
+		# ingress 8080/tcp: ~external, of shop/app, last seen 2026-11-28T00:00:00Z [folded peers]
+		meta nfproto ipv4 tcp dport 8080 accept
+
+		# ingress from 53/udp: ~unresolved, of shop/app, last seen 2026-11-28T00:00:00Z [the other way of a UDP rule]
+		ip saddr 10.0.0.53 udp sport 53 accept
+
+		# What no rule lists: counted and logged, not rejected (audit form).
+		counter name "ingress_unlisted" limit rate 10/second burst 20 packets log prefix "shawk-policy unlisted ingress: "
+	}
+}

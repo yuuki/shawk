@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
@@ -34,7 +36,13 @@ func testReport(t testing.TB, tg target, format, ingressMode string, flows ...fl
 	r := &rulesReport{Target: tg, Since: testUntil.Add(-90 * 24 * time.Hour), Until: testUntil, Status: statusComplete,
 		Coverage: 1, MinCoverage: 1, coverage: "1.000000", minCoverage: "1.000000000000", Format: format,
 		Reasons: []string{}, Caveats: []string{}, Gaps: []gap{}, Rules: []rule{}, Findings: []finding{}, Before: []pastFlow{},
-		Observation: &observation{Host: tg.Host, Agent: true, Observed: 1}, NetworkNamespaces: 1, TranslationsTraced: true}
+		Observation: &observation{Host: tg.Host, Machines: 1, ToleranceSeconds: 180}, NetworkNamespaces: 1, TranslationsTraced: true}
+	switch format {
+	case formatNftables:
+		r.Mode = modeAudit
+	case formatSystemd:
+		r.Mode = modeEnforce
+	}
 	if format != formatSystemd {
 		r.Ingress = ingressMode
 	}
@@ -83,7 +91,7 @@ func TestBuildRules(t *testing.T) {
 	r := testReport(t, target{Host: "app-01"}, formatNftables, ingressSources, appFlows()...)
 	var got []string
 	for _, ru := range r.Rules {
-		got = append(got, fmt.Sprintf("%s %s/%s %s %v %v %v [%s]", ru.Direction, ru.ports(), ru.Proto, ru.Peer, ru.PeerHosts,
+		got = append(got, fmt.Sprintf("%s %s %s %v %v %v [%s]", ru.Direction, ru.portsOf(), ru.Peer, ru.PeerHosts,
 			ru.Addresses, ru.Services, describeNotes(&ru)))
 	}
 	want := []string{
@@ -97,6 +105,9 @@ func TestBuildRules(t *testing.T) {
 		"ingress 22/tcp ~unresolved [] [10.0.5.5/32 10.0.5.6/32] [sshd] []",
 		"ingress 8080/tcp nginx [web-01] [10.0.0.12/32] [shop/app] []",
 		"ingress 8080/tcp ~external [] [0.0.0.0/0] [shop/app] [folded peers]",
+		// The other way of the flow of UDP: what the resolver sends from
+		// its port, whenever it does.
+		"ingress from 53/udp ~unresolved [] [10.0.0.53/32] [shop/app] [the other way of a UDP rule]",
 	}
 	if !slices.Equal(got, want) {
 		t.Errorf("rules:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
@@ -113,7 +124,7 @@ func TestBuildRules(t *testing.T) {
 		codes = append(codes, f.Code+" "+strconv.Itoa(f.Count))
 	}
 	wantCodes := []string{"pinned_addresses 10", "folded_peers 2", "unresolved_peers 3", "port_ranges 1", "kernel_chosen_ports 1",
-		"translated_backends 1", "pinned_sources 3", "loopback_flows 2", "seen_before_period 1"}
+		"translated_backends 1", "udp_both_ways 1", "pinned_sources 3", "loopback_flows 2", "seen_before_period 1"}
 	if !slices.Equal(codes, wantCodes) {
 		t.Errorf("findings %v, want %v", codes, wantCodes)
 	}
@@ -127,21 +138,77 @@ func TestBuildRules(t *testing.T) {
 	if f := r.Findings[0]; f.Code != "pinned_addresses" || f.Count != 7 {
 		t.Errorf("with -ingress ports: %+v", f)
 	}
+	// A socket without a known owner has no unit; a process that names
+	// itself ~unknown in a unit is a process of that unit.
 	unknown := testFlow(egress, unknownService, "tcp", "10.0.0.30/32", 9999, "~unresolved")
-	unknown.unit = unknownService
-	r = testReport(t, target{Host: "app-01", Unit: "shop/app.service"}, formatSystemd, ingressSources, append(appFlows(), unknown)...)
+	unknown.unit = ""
+	named := testFlow(egress, unknownService, "tcp", "10.0.0.31/32", 9998, "~unresolved")
+	named.unit = "shop/app.service"
+	r = testReport(t, target{Host: "app-01", Unit: "shop/app.service"}, formatSystemd, ingressSources, append(appFlows(), unknown, named)...)
 	if n := slices.IndexFunc(r.Rules, func(ru rule) bool { return ru.PortFrom == 9999 }); n < 0 || !r.Rules[n].Unattributed ||
 		slices.ContainsFunc(r.Rules, func(ru rule) bool { return ru.PortFrom != 9999 && ru.Unattributed }) {
 		t.Errorf("the rule of the socket without an owner: %+v", r.Rules)
 	}
-	if n := slices.IndexFunc(r.Findings, func(f finding) bool { return f.Code == "unattributed_sockets" }); n < 0 {
+	if n := slices.IndexFunc(r.Findings, func(f finding) bool { return f.Code == "unattributed_sockets" }); n < 0 || r.Findings[n].Count != 1 {
 		t.Errorf("no finding for the sockets without an owner: %+v", r.Findings)
 	}
-	// A host of containers, whose agent did not learn its translations.
+	// A drop-in has no direction and no port: no rule of the other way,
+	// and what allows a whole family is told as what limits nothing.
+	if slices.ContainsFunc(r.Rules, func(ru rule) bool { return ru.SourcePort }) {
+		t.Errorf("a drop-in with rules of the other way of UDP: %+v", r.Rules)
+	}
+	codes = nil
+	for _, f := range r.Findings {
+		if f.Code == "family_open" {
+			codes = append(codes, f.Text[:38])
+		}
+	}
+	if !slices.Equal(codes, []string{"the drop-in limits nothing for IPv4: a", "the drop-in limits nothing for IPv6: a"}) {
+		t.Errorf("findings of the families that are open: %q", codes)
+	}
+	// A host of containers.
 	r = testReport(t, target{Host: "app-01"}, formatNftables, ingressSources)
-	r.NetworkNamespaces, r.TranslationsTraced = 3, false
-	if f := r.findings(); len(f) != 2 || f[0].Code != "translations_not_traced" || f[1].Code != "other_network_namespaces" {
+	r.NetworkNamespaces = 3
+	if f := r.findings(); len(f) != 1 || f[0].Code != "other_network_namespaces" {
 		t.Errorf("findings of a host of containers: %+v", f)
+	}
+}
+
+// TestBuildRulesBothWays: a flow of UDP allows its peer the other way too,
+// by the same port as the source of the packets: a socket of UDP may send
+// and receive first on one port, and one direction of it is recorded.
+func TestBuildRulesBothWays(t *testing.T) {
+	gossip := testFlow(ingress, "consul", "udp", "10.0.0.200/32", 8301, "~unresolved")
+	dns := testFlow(egress, "shop/app", "udp", "10.0.0.53/32", 53, "~unresolved")
+	web := testFlow(ingress, "shop/app", "tcp", "10.0.0.12/32", 8080, "nginx")
+	list := func(mode string) []string {
+		var out []string
+		r := testReport(t, target{Host: "app-01"}, formatNftables, mode, gossip, dns, web)
+		for _, ru := range r.Rules {
+			out = append(out, fmt.Sprintf("%s %s any=%t", ru.Direction, ru.portsOf(), ru.AnySource))
+		}
+		for _, f := range r.Findings {
+			if f.Code == "udp_both_ways" || f.Code == "pinned_sources" || f.Code == "pinned_addresses" {
+				out = append(out, f.Code+" "+strconv.Itoa(f.Count))
+			}
+		}
+		return out
+	}
+	for mode, want := range map[string][]string{
+		ingressSources: {"egress 53/udp any=false", "egress from 8301/udp any=false", "ingress 8080/tcp any=false",
+			"ingress from 53/udp any=false", "ingress 8301/udp any=false", "pinned_addresses 3", "udp_both_ways 2", "pinned_sources 2"},
+		// With -ingress ports what the host accepts pins no source, and
+		// neither does what it sends from that port.
+		ingressPorts: {"egress 53/udp any=false", "egress from 8301/udp any=true", "ingress 8080/tcp any=true",
+			"ingress from 53/udp any=false", "ingress 8301/udp any=true", "pinned_addresses 1", "udp_both_ways 2"},
+		// With -ingress none nothing is written of what the host accepts,
+		// and nothing of it is counted; what it sends from the port of its
+		// server is still of what it sends.
+		ingressNone: {"egress 53/udp any=false", "egress from 8301/udp any=false", "pinned_addresses 1", "udp_both_ways 1"},
+	} {
+		if got := list(mode); !slices.Equal(got, want) {
+			t.Errorf("-ingress %s: %q, want %q", mode, got, want)
+		}
 	}
 }
 
@@ -242,6 +309,8 @@ type allowed struct {
 	from, to         int
 	prefix           netip.Prefix
 	anyAddr          bool
+	// source tells that the ports are those that the packets come from.
+	source bool
 }
 
 func (a allowed) String() string {
@@ -249,7 +318,7 @@ func (a allowed) String() string {
 	if a.anyAddr {
 		addr = "any"
 	}
-	return fmt.Sprintf("%s %s %d-%d %s", a.direction, a.proto, a.from, a.to, addr)
+	return fmt.Sprintf("%s %s %s %d-%d %s", a.direction, a.proto, map[bool]string{false: "to", true: "from"}[a.source], a.from, a.to, addr)
 }
 
 // expected returns what the rules of a report allow, as nftables is asked
@@ -261,11 +330,11 @@ func expected(r *rulesReport) []string {
 			continue
 		}
 		if ru.AnySource {
-			out = append(out, allowed{ru.Direction, ru.Proto, ru.PortFrom, ru.PortTo, netip.Prefix{}, true}.String())
+			out = append(out, allowed{ru.Direction, ru.Proto, ru.PortFrom, ru.PortTo, netip.Prefix{}, true, ru.SourcePort}.String())
 			continue
 		}
 		for _, p := range ru.Addresses {
-			out = append(out, allowed{ru.Direction, ru.Proto, ru.PortFrom, ru.PortTo, p, false}.String())
+			out = append(out, allowed{ru.Direction, ru.Proto, ru.PortFrom, ru.PortTo, p, false, ru.SourcePort}.String())
 		}
 	}
 	slices.Sort(out)
@@ -284,13 +353,20 @@ var (
 		"\t\ttype filter hook input priority filter; policy accept;":  true,
 		"\t\tct state established,related accept":                     true,
 		"\t\toifname \"lo\" accept":                                   true, "\t\tiifname \"lo\" accept": true,
-		"\t\tmeta l4proto != { tcp, udp } accept":        true,
-		"\t\tcounter reject with icmpx admin-prohibited": true, "\t\tcounter drop": true,
+		"\t\tmeta l4proto != { tcp, udp } accept": true,
+		"\tcounter egress_unlisted { }":           true, "\tcounter ingress_unlisted { }": true,
+		// The end of a chain of the audit form, and of the form that rejects.
+		"\t\tcounter name \"egress_unlisted\" limit rate 10/second burst 20 packets log prefix \"shawk-policy unlisted egress: \"":   true,
+		"\t\tcounter name \"ingress_unlisted\" limit rate 10/second burst 20 packets log prefix \"shawk-policy unlisted ingress: \"": true,
+		"\t\tlimit rate 10/second burst 20 packets log prefix \"shawk-policy unlisted egress: \"":                                    true,
+		"\t\tlimit rate 10/second burst 20 packets log prefix \"shawk-policy unlisted ingress: \"":                                   true,
+		"\t\tcounter name \"egress_unlisted\" reject with icmpx admin-prohibited":                                                    true,
+		"\t\tcounter name \"ingress_unlisted\" drop":                                                                                 true,
 	}
 	// A set of more addresses than fit a line is written over several,
 	// which nftJoin puts back on one.
 	nftSetLines = regexp.MustCompile(`(?m) \{\n((?:\t\t\t[0-9a-f.:/]+(?:, [0-9a-f.:/]+)*,?\n)+)\t\t\} `)
-	nftRule     = regexp.MustCompile(`^\t\t(?:(ip6?) ([sd]addr) (\{ [0-9a-f.:/, ]+ \}|[0-9a-f.:/]+) |meta nfproto (ipv[46]) )?(tcp|udp) dport (\d+)(?:-(\d+))? accept$`)
+	nftRule     = regexp.MustCompile(`^\t\t(?:(ip6?) ([sd]addr) (\{ [0-9a-f.:/, ]+ \}|[0-9a-f.:/]+) |meta nfproto (ipv[46]) )?(tcp|udp) ([sd])port (\d+)(?:-(\d+))? accept$`)
 )
 
 // parseNftables reads a table that writeNftables wrote and returns what it
@@ -332,12 +408,12 @@ func parseNftables(t testing.TB, text string) []string {
 		if (m[2] == "daddr") != (chain == egress) && m[2] != "" {
 			t.Fatalf("line %d matches %s in the chain of %s", i+1, m[2], chain)
 		}
-		from, _ := strconv.Atoi(m[6])
+		from, _ := strconv.Atoi(m[7])
 		to := from
-		if m[7] != "" {
-			to, _ = strconv.Atoi(m[7])
+		if m[8] != "" {
+			to, _ = strconv.Atoi(m[8])
 		}
-		a := allowed{direction: chain, proto: m[5], from: from, to: to}
+		a := allowed{direction: chain, proto: m[5], from: from, to: to, source: m[6] == "s"}
 		switch {
 		case m[4] == "ipv4":
 			a.prefix = netip.MustParsePrefix("0.0.0.0/0")
@@ -440,109 +516,7 @@ func render(r *rulesReport) string {
 func TestWriteNftables(t *testing.T) {
 	r := testReport(t, target{Host: "app-01"}, formatNftables, ingressSources, appFlows()...)
 	got := render(r)
-	want := `#!/usr/sbin/nft -f
-# Rules of nftables for host app-01, written by shawk-policy for review.
-# shawk applied nothing: read this file, then load it yourself.
-#
-# Target   host app-01
-# Period   2026-08-30T00:00:00Z to 2026-11-28T00:00:00Z (90d)
-# Status   COMPLETE: the history tells every TCP and UDP connection of the target in the period
-#          (coverage 1; 1 is all of the period)
-#
-# What the rules pin, and what they leave out
-#   - 10 addresses are pinned as the sockets saw them: a peer that gets another address (DHCP,
-#     autoscaling, a replica that was not used, a failover) is denied until the rules are written
-#     again
-#   - 2 rules allow every address of a family: the agent folded these peers and kept no address
-#     (the agent keeps them with -fold-external none, or -internal-peers for the ranges that
-#     matter)
-#   - 3 rules are for peers shawk could not name (~unresolved: no agent there, and no range of
-#     peer_cidrs): check what they are before allowing them
-#   - 1 rule allows a range of ports, by the rules of ports of the connector (dynamic_ports,
-#     port_agnostic_services): the server listens on another port at every run
-#   - 1 rule pins a port that the kernel chose for the server, which no rule of ports covers: the
-#     server listens on another one at its next run, and is denied then
-#     (shawk_v1.kernel_chosen_ports)
-#   - 1 rule allows the backends that the host itself translates its connections to (DNAT in its
-#     kernel, as kube-proxy does): they change when the translation does
-#   - 3 ingress rules are pinned to the sources that were seen: a client, or an administrator, at
-#     another address is refused (-ingress ports opens the ports to every source)
-#   - 2 flows are within the host (loopback): they are left open, and are in no rule
-#   - 1 flow was last seen before the period, and in no rule: a job that runs less often than the
-#     period would be denied (a longer -lookback includes them)
-#   - only TCP and UDP are observed: the rules filter nothing else, and what uses another protocol
-#     (ICMP, VRRP, IPsec) is not known to shawk
-#   - a connection that was not made in the period is denied: one made less often than the period, or
-#     only when another server fails
-#
-# To check it without loading it:  nft -c -f FILE
-# To load it:                      nft -f FILE
-# To remove it:                    nft delete table inet shawk_policy
-# It is a table of its own: the other tables of the host still apply, and a packet
-# passes only if every table accepts it. It filters the connections of the host itself
-# (the hooks input and output), not what the host forwards.
-
-table inet shawk_policy
-delete table inet shawk_policy
-
-table inet shawk_policy {
-	chain output {
-		type filter hook output priority filter; policy accept;
-
-		ct state established,related accept
-		oifname "lo" accept
-		# shawk observes TCP and UDP only: nothing else is filtered.
-		meta l4proto != { tcp, udp } accept
-
-		# egress 1-65535/tcp: srun, of shop/app, last seen 2026-11-28T00:00:00Z
-		ip daddr 10.0.0.60 tcp dport 1-65535 accept
-
-		# egress 443/tcp: ~external, of shop/app, last seen 2026-11-28T00:00:00Z [folded peers]
-		meta nfproto ipv4 tcp dport 443 accept
-		meta nfproto ipv6 tcp dport 443 accept
-
-		# egress 5432/tcp: shop/postgres on db-01, db-02, of shop/app, last seen 2026-11-28T00:00:00Z
-		ip daddr { 10.0.0.10, 10.0.0.20 } tcp dport 5432 accept
-
-		# egress 6443/tcp: ~unresolved, of kubelet, last seen 2026-11-28T00:00:00Z [translated by the host]
-		ip daddr 10.0.0.40 tcp dport 6443 accept
-
-		# egress 8443/tcp: partner, of shop/app, last seen 2026-11-28T00:00:00Z
-		ip6 daddr 2001:db8::7 tcp dport 8443 accept
-
-		# egress 45678/tcp: x, of shop/app, last seen 2026-11-28T00:00:00Z [port chosen by the kernel]
-		ip daddr 10.0.0.61 tcp dport 45678 accept
-
-		# egress 53/udp: ~unresolved, of shop/app, last seen 2026-11-28T00:00:00Z
-		ip daddr 10.0.0.53 udp dport 53 accept
-
-		counter reject with icmpx admin-prohibited
-	}
-
-	chain input {
-		type filter hook input priority filter; policy accept;
-
-		ct state established,related accept
-		iifname "lo" accept
-		# shawk observes TCP and UDP only: nothing else is filtered.
-		meta l4proto != { tcp, udp } accept
-
-		# ingress 22/tcp: ~unresolved, of sshd, last seen 2026-11-28T00:00:00Z
-		ip saddr { 10.0.5.5, 10.0.5.6 } tcp dport 22 accept
-
-		# ingress 8080/tcp: nginx on web-01, of shop/app, last seen 2026-11-28T00:00:00Z
-		ip saddr 10.0.0.12 tcp dport 8080 accept
-
-		# ingress 8080/tcp: ~external, of shop/app, last seen 2026-11-28T00:00:00Z [folded peers]
-		meta nfproto ipv4 tcp dport 8080 accept
-
-		counter drop
-	}
-}
-`
-	if got != want {
-		t.Errorf("nftables:\n%s\nwant:\n%s", got, want)
-	}
+	golden(t, "app-01.audit.nft", got)
 	if got, want := parseNftables(t, got), expected(r); !slices.Equal(got, want) {
 		t.Errorf("the table allows\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
 	}
@@ -557,15 +531,69 @@ table inet shawk_policy {
 			t.Errorf("with -ingress ports, no %q in\n%s", want, got)
 		}
 	}
-	if strings.Contains(got, "saddr") {
+	// The peer of what the host sends over UDP stays pinned the other way:
+	// it is of what the host opens.
+	if regexp.MustCompile(`saddr .* dport`).MatchString(got) || !strings.Contains(got, "\t\tip saddr 10.0.0.53 udp sport 53 accept\n") {
 		t.Errorf("with -ingress ports, a source is pinned:\n%s", got)
 	}
 	if got, want := parseNftables(t, got), expected(r); !slices.Equal(got, want) {
 		t.Errorf("with -ingress ports the table allows\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
 	}
+	// With -ingress none the file tells that it filters what the host
+	// opens only, and counts no rule of what it accepts.
 	r = testReport(t, target{Host: "app-01"}, formatNftables, ingressNone, appFlows()...)
-	if got = render(r); strings.Contains(got, "chain input") || strings.Contains(got, "ingress") {
+	if got = render(r); strings.Contains(got, "\tchain input {") || strings.Contains(got, "ingress rule") ||
+		strings.Contains(got, "ingress_unlisted") || strings.Contains(got, "connections of the host itself (the hooks input and output)") ||
+		!strings.Contains(got, "# It filters the connections that the host opens (the hook output) only: with -ingress none\n") ||
+		!strings.Contains(got, "#   - 7 addresses are pinned") {
 		t.Errorf("with -ingress none:\n%s", got)
+	}
+	if got, want := parseNftables(t, got), expected(r); !slices.Equal(got, want) {
+		t.Errorf("with -ingress none the table allows\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+
+	// The form that rejects: the same rules, and what no rule lists is
+	// refused.
+	r = testReport(t, target{Host: "app-01"}, formatNftables, ingressSources, appFlows()...)
+	audit := parseNftables(t, render(r))
+	r.Mode = modeEnforce
+	got = render(r)
+	golden(t, "app-01.enforce.nft", got)
+	if rejecting := parseNftables(t, got); !slices.Equal(rejecting, audit) {
+		t.Errorf("the form that rejects allows\n%s\nand the audit form\n%s", strings.Join(rejecting, "\n"), strings.Join(audit, "\n"))
+	}
+	for form, ends := range map[string][2]string{
+		modeAudit: {"\t\tcounter name \"egress_unlisted\" limit rate 10/second burst 20 packets log prefix \"shawk-policy unlisted egress: \"\n\t}\n",
+			"\t\tcounter name \"ingress_unlisted\" limit rate 10/second burst 20 packets log prefix \"shawk-policy unlisted ingress: \"\n\t}\n"},
+		modeEnforce: {"\t\tcounter name \"egress_unlisted\" reject with icmpx admin-prohibited\n\t}\n",
+			"\t\tcounter name \"ingress_unlisted\" drop\n\t}\n"},
+	} {
+		r.Mode = form
+		text := render(r)
+		// The audit form refuses nothing, anywhere in the file.
+		refuses := regexp.MustCompile(`(?m)^[^#\n]*\b(reject|drop)\b`).MatchString(text)
+		if !strings.Contains(text, ends[0]) || !strings.Contains(text, ends[1]) || refuses != (form == modeEnforce) {
+			t.Errorf("the %s form ends its chains otherwise, or refuses: %t\n%s", form, refuses, text)
+		}
+	}
+}
+
+// golden compares a text with a file of testdata, which
+// SHAWK_UPDATE_GOLDEN=1 writes again.
+func golden(t *testing.T, name, got string) {
+	t.Helper()
+	path := filepath.Join("testdata", name)
+	if os.Getenv("SHAWK_UPDATE_GOLDEN") != "" {
+		if err := os.WriteFile(path, []byte(got), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != string(want) {
+		t.Errorf("%s:\n%s\nwant:\n%s", name, got, want)
 	}
 }
 
@@ -582,7 +610,8 @@ func TestWriteSystemd(t *testing.T) {
 #                 systemctl daemon-reload, and restart the unit
 # To check it:    systemd-analyze verify app.service
 # IPAddressAllow= has no ports and one list for both directions: an address is allowed
-# for every port, to connect to and to be accepted from.
+# for every port and every IP protocol, to connect to and to be accepted from. The list
+# holds for the unit and for the control groups under it (a container that it runs).
 
 [Service]
 IPAddressDeny=any
@@ -625,8 +654,24 @@ IPAddressAllow=10.0.0.12
 		t.Errorf("the drop-in:\n%s\nwant:\n%s", rules, want)
 	}
 	if !strings.HasPrefix(got, "# Drop-in of systemd for unit app.service of host app-01, written by shawk-policy for review.\n"+
+		"# It blocks, as soon as the unit restarts with it, every address that it does not list, for\n"+
+		"# every IP protocol. It has no audit form: check the host with the audit form of\n"+
+		"# `shawk-policy rules -format nftables` first.\n"+
 		"# shawk applied nothing: read this file, then install it yourself.\n#\n# Target   unit app.service of host app-01\n") {
 		t.Errorf("the top of the drop-in:\n%s", got)
+	}
+	// What the drop-in tells is what IPAddressDeny=any does: every IP
+	// protocol, and not the sockets that systemd passes.
+	for _, want := range []string{
+		"#   - protocols other than TCP and UDP: IPAddressDeny=any blocks every IP protocol of the unit,\n",
+		"#   - sockets that systemd passes to the unit (socket activation): the list is not applied to\n",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("no %q in the drop-in:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "filter nothing else") || strings.Contains(got, "only TCP and UDP are") {
+		t.Errorf("the drop-in tells that it filters TCP and UDP alone:\n%s", got)
 	}
 	if got, want := parseSystemd(t, got), expectedSystemd(r); !slices.Equal(got, want) {
 		t.Errorf("the drop-in allows %v, want %v", got, want)
@@ -642,19 +687,21 @@ IPAddressAllow=10.0.0.12
 // incomplete makes a report that of a host not observed for an hour.
 func incomplete(r *rulesReport) {
 	r.Status, r.Reasons, r.Coverage, r.coverage = statusIncomplete, []string{"not_observed", "udp_not_traced"}, 0.999537, "0.999537"
-	r.Observation = &observation{Host: r.Target.Host, Agent: true, UnobservedSeconds: 3600, Gaps: 12, UDPUntracedSeconds: 86400}
-	r.Gaps = []gap{{testUntil.Add(-10 * 24 * time.Hour), testUntil.Add(-10*24*time.Hour + time.Hour), "agent"},
-		{r.Since, r.Since.Add(time.Hour), "retention"}}
+	r.Observation = &observation{Host: r.Target.Host, Machines: 1, UnobservedSeconds: 3600, Gaps: 12, UDPUntracedSeconds: 86400}
+	r.Gaps = []gap{{"", testUntil.Add(-10 * 24 * time.Hour), testUntil.Add(-10*24*time.Hour + time.Hour), "agent"},
+		{"", r.Since, r.Since.Add(time.Hour), "retention"}}
 }
 
-// TestIncomplete: rules are not written from a history that does not tell
-// everything, unless asked for, and then say so first.
+// TestIncomplete: a file that blocks is not written from a history that
+// does not tell everything, unless asked for, and then says so first. The
+// audit form, which blocks nothing, is written, and says so too.
 func TestIncomplete(t *testing.T) {
 	status := `Status   INCOMPLETE: the history does not tell every connection of the target in the period.
          Rules made from it deny what was not seen.
          (coverage 0.999537, of the 1 that -min-coverage asks for)
          - not observed by an agent for 1h of the period
-         - the agent did not trace UDP for 1d of the period: connections over UDP, as to a resolver, are missing
+         - the agent did not trace UDP for 1d of the period: connections over UDP, as to a
+           resolver, are missing
 
 Not observed
   2026-11-18T00:00:00Z to 2026-11-18T01:00:00Z (1h)
@@ -667,12 +714,14 @@ Not observed
 			tg.Unit = "app.service"
 		}
 		r := testReport(t, tg, format, ingressSources, appFlows()...)
+		r.Mode = modeEnforce
 		incomplete(r)
 		r.Refused = true
 		got := render(r)
-		if !strings.Contains(got, status) || !strings.HasSuffix(got, "\nNo rules are written from an incomplete history. "+
-			"-allow-incomplete writes them all the same,\nmarked as incomplete; -format report lists what they would hold.\n") ||
-			strings.Contains(got, "accept") || strings.Contains(got, "IPAddress") {
+		if !strings.Contains(got, status) || !strings.HasSuffix(got, "\nNo file that blocks is written from an incomplete history. "+
+			"-allow-incomplete writes it all the same,\nmarked as incomplete; -format report lists what it would hold, and "+
+			"-format nftables without -enforce\nwrites the audit form, which blocks nothing.\n") ||
+			strings.Contains(got, "accept\n") || strings.Contains(got, "\nIPAddressAllow=") {
 			t.Errorf("%s, refused:\n%s", format, got)
 		}
 		r.Refused = false
@@ -688,14 +737,49 @@ Not observed
 			t.Errorf("%s, with -allow-incomplete:\n%s", format, got)
 		}
 	}
-	// A caller who accepts the gaps gets the rules, with what was accepted.
+	// The audit form of an incomplete history: written, marked, and
+	// without a rule that refuses.
 	r := testReport(t, target{Host: "app-01"}, formatNftables, ingressSources, appFlows()...)
 	incomplete(r)
+	got := render(r)
+	if !strings.HasPrefix(got, "#!/usr/sbin/nft -f\n# INCOMPLETE: the history does not tell every connection of the target, and these rules\n"+
+		"# lack what was not seen. This audit form blocks nothing; it shows what they lack.\n# Read the status below.\n#\n") ||
+		!strings.Contains(got, "# AUDIT form: it rejects nothing.") || strings.Contains(got, "reject with") || strings.Contains(got, "\" drop") {
+		t.Errorf("the audit form of an incomplete history:\n%s", got)
+	}
+	// A caller who accepts the gaps gets the rules, with what was
+	// accepted: the status does not say that the history tells everything.
 	r.Status, r.Caveats, r.Reasons, r.minCoverage = statusComplete, r.Reasons, []string{}, "0.999000000000"
-	if got := render(r); !strings.Contains(got, "# Status   COMPLETE: the history tells every TCP and UDP connection of the target in the period\n"+
-		"#          (coverage 0.999537; 1 is all of the period)\n#          Accepted with -min-coverage 0.999:\n"+
-		"#          - not observed by an agent for 1h of the period\n") || strings.HasPrefix(got, "#!/usr/sbin/nft -f\n# INCOMPLETE") {
+	got = render(r)
+	if !strings.Contains(got, "# Status   COMPLETE by -min-coverage 0.999 only: the history tells the connections of 0.999537 of the period\n"+
+		"#          (1 is all of it). What the target did in the rest is not known, and the rules deny it.\n"+
+		"#          Accepted as not observed:\n"+
+		"#          - not observed by an agent for 1h of the period\n") || strings.HasPrefix(got, "#!/usr/sbin/nft -f\n# INCOMPLETE") ||
+		strings.Contains(got, "tells every") {
 		t.Errorf("with -min-coverage 0.999:\n%s", got)
+	}
+	// What an agent did not report, within the tolerance, is told with a
+	// status of COMPLETE; several machines of one name, and the addresses
+	// that an agent did not learn, with one of INCOMPLETE.
+	r = testReport(t, target{Host: "app-01"}, formatReport, ingressSources, appFlows()...)
+	r.Observation.ToleratedGaps, r.Observation.ToleratedSeconds = 2, 290
+	if got := render(r); !strings.Contains(got, "         2 stretches without a report of the agent, of 3m or less each (4m50s in all), count as\n"+
+		"         observed: the restart of an agent, or its latest report, which is not written yet\n") {
+		t.Errorf("stretches within the tolerance:\n%s", got)
+	}
+	r.Status, r.Reasons, r.TranslationsTraced = statusIncomplete, []string{"several_machines", "translations_not_learned"}, false
+	r.Observation.Machines = 2
+	r.Gaps = []gap{{"id-1", testUntil.Add(-10 * 24 * time.Hour), testUntil.Add(-10*24*time.Hour + time.Hour), "agent"}}
+	got = render(r)
+	for _, want := range []string{
+		"         - 2 machines reported under this host name in the period (shawk_v1.agents lists them): the\n",
+		"         - an agent of the host did not learn every address that the host rewrites its connections\n",
+		"  2026-11-18T00:00:00Z to 2026-11-18T01:00:00Z (1h), machine id-1\n",
+		"  - destinations that the host rewrites (DNAT, as kube-proxy does): an agent of this host did",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("no %q in\n%s", want, got)
+		}
 	}
 }
 
@@ -711,13 +795,15 @@ func TestWriteReport(t *testing.T) {
 egress     1-65535/tcp  srun                          10.0.0.60             shop/app  2026-11-28T00:00:00Z
 egress     443/tcp      ~external                     0.0.0.0/0, ::/0       shop/app  2026-11-28T00:00:00Z  folded peers
 egress     5432/tcp     shop/postgres (db-01, db-02)  10.0.0.10, 10.0.0.20  shop/app  2026-11-28T00:00:00Z
-and 7 more rules (-limit 0 shows all)
+and 8 more rules (-limit 0 shows all)
 
 Seen before the period, and in no rule
 DIRECTION  PORT      PEER         ADDRESS   SERVICE   LAST SEEN
 egress     9000/tcp  ~unresolved  10.0.9.9  shop/app  2026-08-25T00:00:00Z
 
-shawk applied nothing. -format nftables or -format systemd writes the rules, for review.
+shawk applied nothing. -format nftables writes the rules as a table that rejects nothing and counts
+what they do not list (the audit form): load it first. -enforce writes the table that rejects, and
+-format systemd -enforce the drop-in of a unit.
 `
 	if got != want {
 		t.Errorf("the report:\n%s\nwant:\n%s", got, want)
@@ -748,8 +834,8 @@ shawk applied nothing. -format nftables or -format systemd writes the rules, for
 	if err := json.Unmarshal([]byte(render(r)), &doc); err != nil {
 		t.Fatal(err)
 	}
-	if doc.Target.Host != "app-01" || doc.Status != statusComplete || doc.Coverage != 1 || doc.Refused || len(doc.Rules) != 10 ||
-		len(doc.Findings) != 9 || doc.Loopback != 2 || len(doc.Before) != 1 || doc.Before[0].Address != "10.0.9.9/32" {
+	if doc.Target.Host != "app-01" || doc.Status != statusComplete || doc.Coverage != 1 || doc.Refused || len(doc.Rules) != 11 ||
+		len(doc.Findings) != 10 || doc.Loopback != 2 || len(doc.Before) != 1 || doc.Before[0].Address != "10.0.9.9/32" {
 		t.Errorf("JSON = %+v", doc)
 	}
 	if ru := doc.Rules[2]; ru.Direction != egress || ru.Proto != "tcp" || ru.Peer != "shop/postgres" || ru.PortFrom != 5432 || ru.PortTo != 5432 ||
@@ -879,19 +965,38 @@ func checkRuleFiles(t testing.TB, data []byte) {
 			if !fl.inPeriod || fl.addr.Addr().IsLoopback() {
 				continue
 			}
-			if !slices.ContainsFunc(r.Rules, func(ru rule) bool {
-				return ru.Direction == fl.direction && ru.Proto == fl.proto && ru.PortFrom == fl.portFrom && ru.PortTo == fl.portTo &&
-					ru.Peer == fl.peer && slices.ContainsFunc(ru.Addresses, func(p netip.Prefix) bool {
-					return p.Bits() <= fl.addr.Bits() && p.Contains(fl.addr.Addr())
-				})
-			}) {
-				t.Fatalf("no rule allows the flow %+v", fl)
+			// The rule of what was seen and, for UDP, the one of the other
+			// way, by the port that the packets come from.
+			ways := []bool{false}
+			if fl.proto == "udp" {
+				ways = append(ways, true)
+			}
+			for _, other := range ways {
+				direction := fl.direction
+				if other {
+					direction = map[string]string{egress: ingress, ingress: egress}[direction]
+				}
+				if !slices.ContainsFunc(r.Rules, func(ru rule) bool {
+					return ru.Direction == direction && ru.SourcePort == other && ru.Proto == fl.proto && ru.PortFrom == fl.portFrom &&
+						ru.PortTo == fl.portTo && ru.Peer == fl.peer && slices.ContainsFunc(ru.Addresses, func(p netip.Prefix) bool {
+						return p.Bits() <= fl.addr.Bits() && p.Contains(fl.addr.Addr())
+					})
+				}) {
+					t.Fatalf("no rule allows the flow %+v (the other way: %t)", fl, other)
+				}
 			}
 		}
 		for _, ru := range r.Rules {
+			direction := ru.Direction
+			if ru.SourcePort {
+				if ru.Proto != "udp" {
+					t.Fatalf("the rule %+v is the other way of a flow that is not of UDP", ru)
+				}
+				direction = map[string]string{egress: ingress, ingress: egress}[direction]
+			}
 			for _, p := range ru.Addresses {
 				if !slices.ContainsFunc(flows, func(fl flow) bool {
-					return fl.inPeriod && fl.addr.Masked() == p && fl.direction == ru.Direction && fl.proto == ru.Proto &&
+					return fl.inPeriod && fl.addr.Masked() == p && fl.direction == direction && fl.proto == ru.Proto &&
 						fl.portFrom == ru.PortFrom && fl.portTo == ru.PortTo && fl.peer == ru.Peer
 				}) {
 					t.Fatalf("the rule %+v allows %s, which no flow has", ru, p)

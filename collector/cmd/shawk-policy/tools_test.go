@@ -94,7 +94,8 @@ func wantSpans(r *rulesReport) []string {
 		if ru.Direction == ingress && r.Ingress == ingressNone {
 			continue
 		}
-		k := fmt.Sprintf("%s %s %d-%d", ru.Direction, ru.Proto, ru.PortFrom, ru.PortTo)
+		k := fmt.Sprintf("%s %s %s %d-%d", ru.Direction, ru.Proto, map[bool]string{false: "to", true: "from"}[ru.SourcePort],
+			ru.PortFrom, ru.PortTo)
 		if ru.AnySource {
 			by[k] = append(by[k], allV4, allV6)
 			continue
@@ -146,8 +147,9 @@ func nftAddrs(t *testing.T, v any) []span {
 
 // listedSpans reads what the table that nft lists as JSON allows: the
 // rules of its chains output and input but those of their frame, which it
-// checks are there.
-func listedSpans(t *testing.T, doc []byte) []string {
+// checks are there, and end as the form of the table does: enforce tells
+// the form that rejects, rather than the audit form.
+func listedSpans(t *testing.T, doc []byte, enforce bool) []string {
 	t.Helper()
 	var listing struct {
 		Nftables []map[string]json.RawMessage
@@ -191,7 +193,7 @@ func listedSpans(t *testing.T, doc []byte) []string {
 			continue
 		}
 		var spans []span
-		proto, ports := "", ""
+		proto, ports, side := "", "", ""
 		framed := ""
 		for _, e := range ru.Expr[:len(ru.Expr)-1] {
 			m, ok := e["match"].(map[string]any)
@@ -212,7 +214,8 @@ func listedSpans(t *testing.T, doc []byte) []string {
 				p := left["payload"].(map[string]any)
 				field := p["field"].(string)
 				switch {
-				case field == "dport":
+				case field == "dport" || field == "sport":
+					side = map[string]string{"dport": "to", "sport": "from"}[field]
 					proto = p["protocol"].(string)
 					switch r := m["right"].(type) {
 					case float64:
@@ -245,20 +248,36 @@ func listedSpans(t *testing.T, doc []byte) []string {
 		if spans == nil {
 			spans = []span{allV4, allV6}
 		}
-		k := fmt.Sprintf("%s %s %s", direction, proto, ports)
+		k := fmt.Sprintf("%s %s %s %s", direction, proto, side, ports)
 		by[k] = append(by[k], spans...)
 		frame[ru.Chain] = append(frame[ru.Chain], "flow")
 	}
 	// What a chain accepts whatever the flows, before them, and what it
 	// does with the rest, after them.
+	// The audit form counts and logs the rest, and lets it pass; the form
+	// that rejects logs it, then counts and refuses it.
 	for name, got := range frame {
+		end := []string{"log"}
+		if enforce {
+			end = append(end, map[string]string{"output": "reject", "input": "drop"}[name])
+		}
 		want := []string{"established", "loopback lo", "other protocols !="}
-		for range len(got) - 4 {
+		for range len(got) - 3 - len(end) {
 			want = append(want, "flow")
 		}
-		want = append(want, map[string]string{"output": "reject", "input": "drop"}[name])
+		want = append(want, end...)
 		if !slices.Equal(got, want) {
 			t.Fatalf("the chain %s holds %v, want %v", name, got, want)
+		}
+	}
+	// A counter per chain, by name, that the last rule of the chain counts
+	// in.
+	for name, counter := range map[string]string{"output": nftEgressCounter, "input": nftIngressCounter} {
+		_, chain := frame[name]
+		declared := strings.Contains(string(doc), `"counter": {"family": "inet", "name": "`+counter+`"`)
+		used := strings.Contains(string(doc), `{"counter": "`+counter+`"}`)
+		if declared != chain || used != chain {
+			t.Fatalf("the counter %s is declared: %t, used: %t, with a chain %s: %t\n%s", counter, declared, used, name, chain, doc)
 		}
 	}
 	if _, ok := frame["output"]; !ok {
@@ -357,9 +376,14 @@ func TestNftablesLoads(t *testing.T) {
 	}
 	reports = append(reports, randomReports(t, formatNftables, 40)...)
 	for i, r := range reports {
+		// Both forms of each table: the audit form, and the one that
+		// rejects.
+		if i%2 == 1 {
+			r.Mode = modeEnforce
+		}
 		text := render(r)
 		listed := loadNftables(t, netns, text)
-		if got, want := listedSpans(t, listed), wantSpans(r); !slices.Equal(got, want) {
+		if got, want := listedSpans(t, listed, r.Mode == modeEnforce), wantSpans(r); !slices.Equal(got, want) {
 			t.Errorf("report %d: the kernel allows\n%s\nwant\n%s\n%s", i, strings.Join(got, "\n"), strings.Join(want, "\n"), text)
 		}
 		// One table, with one chain per direction that is written.
