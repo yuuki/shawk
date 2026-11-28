@@ -524,6 +524,14 @@ func TestPGDrift(t *testing.T) {
 		"         - no connector read a baseline (baseline_file): nothing is judged\n") {
 		t.Errorf("without a baseline: exit status %d\n%s", code, out)
 	}
+	// Nor did one that only ever failed to read its file: the state of the
+	// baseline is there, and no baseline.
+	f.exec(`INSERT INTO shawk.baseline_state (failed_at, error) VALUES (%s, 'no services')`, f.at(0))
+	code, out, _ = f.run("drift")
+	if code != exitInconclusive || !strings.Contains(out, "         - no connector read a baseline (baseline_file): nothing is judged\n") ||
+		strings.Contains(out, "Baseline ") {
+		t.Errorf("with a baseline that was never read: exit status %d\n%s", code, out)
+	}
 	f.approve(`
 services:
   - service: shop/app

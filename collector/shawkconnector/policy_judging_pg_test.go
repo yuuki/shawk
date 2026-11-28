@@ -500,11 +500,12 @@ func TestPGBaselineReportShares(t *testing.T) {
 	f.proc("app-02", "web.service", "shop/web")
 	f.approve("services:\n  - {service: aaa/first, dependencies: []}\n  - {service: shop/app, dependencies: []}\n  - {service: shop/web, dependencies: []}\n")
 	m := 20 * time.Minute
-	// aaa/first tries 30 ports of a private address; shop/app connects to
-	// a public address and to two private ones; shop/web to a public one.
+	// aaa/first tries 1001 ports of a private address, one more than the
+	// series of the connector; shop/app connects to a public address and
+	// to two private ones; shop/web to a public one.
 	f.exec(`INSERT INTO shawk.edges (host_id, process_id, role, proto, local_addr, remote_addr, port, netns, first_seen, last_seen)
 	        SELECT 'app-02', (SELECT id FROM shawk.processes WHERE service_name = 'aaa/first'), 'client', 'tcp', '10.0.0.21', '10.0.0.250',
-	               p, 1, %[1]s, %[1]s FROM generate_series(1, 30) p`, f.ago(m))
+	               p, 1, %[1]s, %[1]s FROM generate_series(1, 1001) p`, f.ago(m))
 	f.edge("app-01", "shop/app", "client", "tcp", "10.0.0.11", "203.0.113.66", 4444, m, m)
 	f.edge("app-01", "shop/app", "client", "tcp", "10.0.0.11", "10.0.0.250", 7, m, m)
 	f.edge("app-01", "shop/app", "client", "tcp", "10.0.0.11", "10.0.0.250", 8, m, m)
@@ -514,6 +515,14 @@ func TestPGBaselineReportShares(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.close()
+	// A baseline that only ever failed to be read is none: nothing is
+	// judged, and the failure is told.
+	f.exec(`UPDATE shawk.baseline_state SET read_at = NULL, digest = NULL, failed_at = %s, error = 'no services'`, f.ago(0))
+	if r, err := st.baselineReport(context.Background(), f.T.Add(-time.Hour), f.T, f.T.Add(-7*days), 10, 10); err != nil || r.read ||
+		!r.failed || len(r.drift) != 0 || len(r.services) != 0 {
+		t.Errorf("report of a baseline that was never read = %+v, %v", r, err)
+	}
+	f.exec(`UPDATE shawk.baseline_state SET read_at = %s, digest = 'x', failed_at = NULL, error = NULL`, f.ago(0))
 	report := func(maxDrift, perService int) (rows []string, named, unresolved int) {
 		t.Helper()
 		r, err := st.baselineReport(context.Background(), f.T.Add(-time.Hour), f.T, f.T.Add(-7*days), maxDrift, perService)
@@ -527,8 +536,8 @@ func TestPGBaselineReportShares(t *testing.T) {
 	}
 	// The bounds of the connector: the flood is cut to its share, and the
 	// drift of the others is all there.
-	rows, named, unresolved := report(1000, 20)
-	if len(rows) != 24 || named != 0 || unresolved != 10 || !slices.Contains(rows, "shop/app ~external 4444") ||
+	rows, named, unresolved := report(maxDriftSeries, maxDriftSeriesPerService)
+	if len(rows) != 24 || named != 0 || unresolved != 981 || !slices.Contains(rows, "shop/app ~external 4444") ||
 		!slices.Contains(rows, "shop/web ~external 443") || !slices.Contains(rows, "shop/app ~unresolved 8") {
 		t.Errorf("with the shares of the connector: %d rows, %d and %d cut: %v", len(rows), named, unresolved, rows)
 	}
@@ -536,12 +545,12 @@ func TestPGBaselineReportShares(t *testing.T) {
 	// first, then the first row of each service before the second of any.
 	rows, named, unresolved = report(4, 20)
 	want := []string{"shop/app ~external 4444", "shop/web ~external 443", "aaa/first ~unresolved 1", "shop/app ~unresolved 7"}
-	if !slices.Equal(rows, want) || named != 0 || unresolved != 30 {
+	if !slices.Equal(rows, want) || named != 0 || unresolved != 1001 {
 		t.Errorf("with a bound of 4: %v, %d and %d cut, want %v", rows, named, unresolved, want)
 	}
 	// What is cut of the named peers is counted apart: it is critical.
 	rows, named, unresolved = report(1, 20)
-	if !slices.Equal(rows, []string{"shop/app ~external 4444"}) || named != 1 || unresolved != 32 {
+	if !slices.Equal(rows, []string{"shop/app ~external 4444"}) || named != 1 || unresolved != 1003 {
 		t.Errorf("with a bound of 1: %v, %d and %d cut", rows, named, unresolved)
 	}
 }
