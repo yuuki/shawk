@@ -2,22 +2,28 @@
 // connector. Run it as a role that owns the schemas shawk and shawk_v1
 // before starting the collector, or set postgres.migrate in the connector.
 //
-// A connection string may hold a password: the command never prints it,
-// in its usage, its usage errors or its other errors.
+// A connection string may hold a password: the command prints no text that
+// holds a value of the command line or of the environment, in its usage,
+// its usage errors or its other errors.
 package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
+	"net"
 	"os"
-	"sort"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/yuuki/shawk/collector/shawkconnector"
 )
@@ -59,71 +65,82 @@ func run(name string, args []string, getenv func(string) string, stdout, stderr 
 // invalid command line, to stderr.
 func parse(name string, args []string, getenv func(string) string, stderr io.Writer) (*config, error) {
 	var c config
-	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	flags := flag.NewFlagSet(name, flag.ContinueOnError)
 	// The default of -dsn is not $SHAWK_POSTGRES_DSN, which the usage
 	// would print with its password.
-	fs.StringVar(&c.dsn, "dsn", "", "PostgreSQL connection string (default $"+envDSN+")")
-	fs.StringVar(&c.dsnFile, "dsn-file", "", "file that holds the connection string")
-	fs.BoolVar(&c.list, "list", false, "print the bundled migrations and exit")
-	fs.StringVar(&c.print, "print", "", "print the SQL of a bundled migration, e.g. 0001_schema.sql, and exit")
-	fs.DurationVar(&c.timeout, "timeout", time.Minute, "timeout")
+	flags.StringVar(&c.dsn, "dsn", "", "PostgreSQL connection string (default $"+envDSN+")")
+	flags.StringVar(&c.dsnFile, "dsn-file", "", "file that holds the connection string")
+	flags.BoolVar(&c.list, "list", false, "print the bundled migrations and exit")
+	flags.StringVar(&c.print, "print", "", "print the SQL of a bundled migration, e.g. 0001_schema.sql, and exit")
+	flags.DurationVar(&c.timeout, "timeout", time.Minute, "timeout")
 	// The flag package would print its errors with the arguments, which
-	// may hold a connection string: print them here without it.
-	fs.SetOutput(io.Discard)
-	fs.Usage = func() {}
-	err := fs.Parse(args)
-	fs.SetOutput(stderr)
+	// may hold a connection string: the command prints its own.
+	flags.SetOutput(io.Discard)
+	flags.Usage = func() {}
+	err := flags.Parse(args)
+	flags.SetOutput(stderr)
 	if err != nil {
 		if !errors.Is(err, flag.ErrHelp) {
-			fmt.Fprintln(stderr, hideArgs(err.Error(), args))
+			fmt.Fprintln(stderr, usageError(flags, err))
 		}
 		fmt.Fprintf(stderr, "Usage of %s:\n", name)
-		fs.PrintDefaults()
+		flags.PrintDefaults()
 		return nil, err
 	}
 	given := false
-	fs.Visit(func(f *flag.Flag) { given = given || f.Name == "dsn" })
+	flags.Visit(func(f *flag.Flag) { given = given || f.Name == "dsn" })
 	if !given {
 		c.dsn = getenv(envDSN)
 	}
 	return &c, nil
 }
 
-// hidden replaces the arguments that hideArgs takes out of a message.
-const hidden = "(an argument, not shown)"
-
-// hideArgs returns msg without the arguments, and the values of
-// -flag=value arguments, that it quotes, unless they are made only of
-// letters, digits and the characters -_.+ as names of flags, durations
-// and files of migrations are: a connection string never is.
-func hideArgs(msg string, args []string) string {
-	var parts []string
-	for _, a := range args {
-		parts = append(parts, a, strings.TrimLeft(a, "-"))
-		if _, v, ok := strings.Cut(a, "="); ok {
-			parts = append(parts, v)
+// usageError returns the message of an error of flags.Parse. The message is
+// made of constants and of the name of a flag that flags defines, never of
+// text from the error, which quotes the arguments: an argument may be a
+// connection string, which escaping or quoting does not hide.
+func usageError(flags *flag.FlagSet, err error) string {
+	msg := err.Error()
+	// The formats of the flag package, in flag.go of Go 1.27; an error of
+	// another form gives the general message.
+	switch {
+	case strings.HasPrefix(msg, "bad flag syntax: "):
+		return "bad flag syntax (the argument is not shown)"
+	case strings.HasPrefix(msg, "flag provided but not defined: "):
+		return "flag provided but not defined (the argument is not shown)"
+	case strings.HasPrefix(msg, "flag needs an argument: -"):
+		if n := flagName(flags, strings.TrimPrefix(msg, "flag needs an argument: -"), ""); n != "" {
+			return "flag needs an argument: -" + n
+		}
+	case strings.HasPrefix(msg, "invalid boolean flag "):
+		if n := flagName(flags, strings.TrimPrefix(msg, "invalid boolean flag "), ": "); n != "" {
+			return "invalid value for flag -" + n + " (the value is not shown)"
+		}
+	case strings.HasPrefix(msg, "invalid value "), strings.HasPrefix(msg, "invalid boolean value "):
+		// invalid value %q for flag -%s: %v
+		// invalid boolean value %q for -%s: %v
+		rest := strings.TrimPrefix(strings.TrimPrefix(msg, "invalid value "), "invalid boolean value ")
+		if q, qerr := strconv.QuotedPrefix(rest); qerr == nil {
+			rest = strings.TrimPrefix(rest[len(q):], " for ")
+			rest = strings.TrimPrefix(rest, "flag ")
+			if n := flagName(flags, strings.TrimPrefix(rest, "-"), ": "); n != "" {
+				return "invalid value for flag -" + n + " (the value is not shown)"
+			}
 		}
 	}
-	// The longest first, so that an argument goes as a whole.
-	sort.Slice(parts, func(i, j int) bool { return len(parts[i]) > len(parts[j]) })
-	for _, p := range parts {
-		if p != "" && !plain(p) {
-			msg = strings.ReplaceAll(msg, p, hidden)
-		}
-	}
-	return msg
+	return "invalid command line (the arguments are not shown)"
 }
 
-// plain tells whether s is made only of letters, digits and -_.+.
-func plain(s string) bool {
-	for _, r := range s {
-		ok := r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' ||
-			r == '-' || r == '_' || r == '.' || r == '+'
-		if !ok {
-			return false
+// flagName returns the name of the flag of flags that s holds, followed by
+// end (or alone if end is empty), or "" if none does.
+func flagName(flags *flag.FlagSet, s, end string) string {
+	name := ""
+	flags.VisitAll(func(f *flag.Flag) {
+		if end == "" && s == f.Name || end != "" && strings.HasPrefix(s, f.Name+end) {
+			name = f.Name
 		}
-	}
-	return true
+	})
+	return name
 }
 
 func migrate(c *config, stdout io.Writer) error {
@@ -144,13 +161,20 @@ func migrate(c *config, stdout io.Writer) error {
 				return nil
 			}
 		}
-		return fmt.Errorf("no migration %s", c.print)
+		// Not the name, which may be anything given on the command line.
+		return errors.New("no bundled migration of the name of -print; -list prints them")
 	}
 	dsn := c.dsn
 	if c.dsnFile != "" {
 		b, err := os.ReadFile(c.dsnFile) //nolint:gosec // G703: the file that the command line names, read as its user
 		if err != nil {
-			return err
+			// Not the path, which may be a connection string given by
+			// mistake.
+			var pe *fs.PathError
+			if errors.As(err, &pe) {
+				return fmt.Errorf("reading -dsn-file: %w", pe.Err)
+			}
+			return errors.New("reading -dsn-file failed")
 		}
 		dsn = strings.TrimSpace(string(b))
 	}
@@ -167,9 +191,13 @@ func migrate(c *config, stdout io.Writer) error {
 	defer cancel()
 	conn, err := pgx.ConnectConfig(ctx, cfg)
 	if err != nil {
-		return err
+		return connectError(err)
 	}
 	defer conn.Close(ctx)
+	// The errors of the migrations are those of the server and of the
+	// connector. They may name the role and the database, which are then
+	// those of an existing database that accepted the connection, never a
+	// password, which the server does not quote.
 	applied, err := shawkconnector.Migrate(ctx, conn)
 	for _, name := range applied {
 		fmt.Fprintln(stdout, "applied", name)
@@ -181,4 +209,42 @@ func migrate(c *config, stdout io.Writer) error {
 		fmt.Fprintln(stdout, "the schema is up to date: version", shawkconnector.SchemaVersion())
 	}
 	return nil
+}
+
+// connectError returns the message of a failed connection. The error of
+// pgconn quotes the user, the database and the hosts of the connection
+// string, and the server quotes the user and the database: a malformed
+// connection string can put its password there (postgres://u:12/pw@h/d
+// is the host u, port 12 and database pw@h/d). The message is made of
+// constants, and of the code of an error of the server.
+func connectError(err error) error {
+	const prefix = "cannot connect to PostgreSQL (the connection string is not shown): "
+	var pgErr *pgconn.PgError
+	var dnsErr *net.DNSError
+	switch {
+	case errors.As(err, &pgErr):
+		code := pgErr.Code
+		if len(code) != 5 || strings.Trim(code, "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ") != "" {
+			code = "?????"
+		}
+		switch code {
+		case "28P01", "28000":
+			return errors.New(prefix + "authentication failed (SQLSTATE " + code + ")")
+		case "3D000":
+			return errors.New(prefix + "the database does not exist (SQLSTATE " + code + ")")
+		default:
+			return errors.New(prefix + "the server refused the connection (SQLSTATE " + code + ")")
+		}
+	case errors.Is(err, context.DeadlineExceeded):
+		return errors.New(prefix + "timed out (-timeout)")
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return errors.New(prefix + "connection refused")
+	case errors.As(err, &dnsErr):
+		return errors.New(prefix + "the host is not found")
+	}
+	var tlsErr *tls.CertificateVerificationError
+	if errors.As(err, &tlsErr) {
+		return errors.New(prefix + "the certificate of the server is not verified")
+	}
+	return errors.New(prefix + "the connection failed")
 }

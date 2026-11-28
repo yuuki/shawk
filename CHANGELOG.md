@@ -4,13 +4,18 @@
 
 * `shawk-migrate -h` printed the value of `$SHAWK_POSTGRES_DSN` as the
   default of `-dsn`, with its password, as did the usage that follows an
-  invalid flag. The usage now names the variable only. Usage errors no
-  longer quote an argument that could be a connection string, and a
-  connection string that cannot be parsed gives `invalid PostgreSQL
-  connection string`, as the connector does: the error of pgx quoted it
-  and did not hide every form of its password (`password = x`, a
-  password with `@`). The flags, the variable and the exit statuses are
-  unchanged (`docs/design.md` §6).
+  invalid flag. Its other errors could print the password too: usage
+  errors quoted the arguments, `-print` and `-dsn-file` errors quoted
+  their value, the parse error of pgx quoted the connection string
+  without hiding every form of its password (`password = x`, a password
+  with `@`), and a failed connection quoted the database, where a
+  malformed URL can put the password. The usage now names the variable
+  only, and these errors print no value of the command line or the
+  environment: a usage error names the flag at most
+  (`invalid value for flag -timeout (the value is not shown)`), and a
+  failed connection gives its cause and the SQLSTATE of the server. The
+  flags, the variable and the exit statuses are unchanged
+  (`docs/design.md` §6).
 
 ## [v0.11.0](https://github.com/yuuki/shawk/compare/v0.10.1...v0.11.0) (2026-11-26)
 
