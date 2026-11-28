@@ -6,8 +6,9 @@
 #
 # KERNEL is one of
 #   rocky9   Rocky Linux 9.6 (5.14.0-570), the primary target
-#   5.14     upstream 5.14.21: the old layout of sock_cgroup_data, and a TCP
-#            iterator that does not lock sockets
+#   5.14     upstream 5.14.21: the old layout of sock_cgroup_data, a TCP
+#            iterator that does not lock sockets, and a false positive of
+#            RCU Tasks Trace that does not fail the run (test/vm/init)
 #   5.15     upstream 5.15.224, a long-term release: a TCP iterator that does
 #            not lock sockets
 # or the path of a kernel image. The upstream kernels are the builds of
@@ -24,15 +25,19 @@
 # The tests run with SHAWK_TEST_STRICT=1, so that a skip fails, unless the
 # environment sets it. Kernels without BPF trampolines (aarch64 before 6.0,
 # including Rocky Linux 9.6) run with SHAWK_TEST_NO_TRAMPOLINES=1: Unix
-# sockets must be reported as not traced, and UDP must be traced with
-# kprobes. SHAWK_TEST_NO_UDP=1 declares a kernel with neither trampolines
-# nor kprobes, where UDP tracing must be reported unavailable. The initramfs holds the modules of
-# the NFS client for Rocky Linux 9 (from kernel-modules-core), which init
+# sockets and UDP must be traced with kprobes. SHAWK_TEST_NO_UDP=1 declares
+# a kernel with neither trampolines nor kprobes, where both must be reported
+# unavailable. The initramfs holds the NFS modules for Rocky Linux 9, which init
 # loads; the other kernels run with SHAWK_TEST_NO_NFS=1. It also holds the
 # modules of conntrack and nf_tables with NAT, from kernel-modules-core or
 # the modules package of the mainline build, for the tests of translations;
-# a kernel given by its path runs with SHAWK_TEST_NO_CONNTRACK=1. Further arguments of the test binaries can be given in
+# a kernel given by its path runs with SHAWK_TEST_NO_CONNTRACK=1. The
+# initramfs has no module of VXLAN, so every kernel runs with
+# SHAWK_TEST_NO_VXLAN=1. Further arguments of the test binaries can be given in
 # VM_TEST_ARGS, e.g. VM_TEST_ARGS='-test.run=TestUDP'.
+# VM_RCU_EXPEDITED=1 asks the test kernel to expedite RCU grace periods:
+# the map flips and probe teardown still wait for readers, with less delay
+# at the cost of extra CPU work. The default (0) uses the kernel's policy.
 #
 # Requires go, qemu-system-x86_64 or qemu-system-aarch64, cpio, gzip, curl,
 # sha256sum, timeout, rpm2cpio and xz (rocky9), and dpkg-deb (5.14, 5.15).
@@ -47,6 +52,11 @@ ARCH="${2:-$(uname -m)}"
 ARCH="${ARCH/arm64/aarch64}"
 ARCH="${ARCH/amd64/x86_64}"
 TIMEOUT="${VM_TIMEOUT:-1800}"
+rcu_expedited="${VM_RCU_EXPEDITED:-0}"
+case "$rcu_expedited" in
+0|1) ;;
+*) echo "VM_RCU_EXPEDITED must be 0 or 1" >&2; exit 2 ;;
+esac
 
 case "$ARCH" in
 x86_64) goarch=amd64 qemu=qemu-system-x86_64 console=ttyS0 ;;
@@ -104,8 +114,7 @@ rocky9/x86_64)
 	nfmodules=$modules ;;
 rocky9/aarch64)
 	# arm64 has BPF trampolines since Linux 6.0, and RHEL 9.6 did not
-	# backport them: fentry programs load but do not attach, and UDP is
-	# traced with kprobes.
+	# backport them: the UDP and Unix socket tests require kprobes.
 	: "${no_trampolines:=1}"
 	pkg=$(fetch $rocky/aarch64/os/Packages/k/kernel-core-5.14.0-570.58.1.el9_6.aarch64.rpm \
 		f0eb542737285c1a7fd386a2cbb5f464228b847762d585d8bd47aa013512d7dd)
@@ -215,21 +224,25 @@ EOF
 
 # Unknown parameters of the kernel command line are passed to init as
 # environment variables.
-cmdline="console=$console panic=-1 quiet SHAWK_TEST_STRICT=${SHAWK_TEST_STRICT:-1} SHAWK_TEST_NO_UDP=${no_udp:-0} SHAWK_TEST_NO_TRAMPOLINES=${no_trampolines:-0} SHAWK_TEST_NO_NFS=${SHAWK_TEST_NO_NFS:-$no_nfs} SHAWK_TEST_NO_CONNTRACK=${SHAWK_TEST_NO_CONNTRACK:-$no_conntrack}"
+cmdline="console=$console panic=-1 quiet SHAWK_TEST_STRICT=${SHAWK_TEST_STRICT:-1} SHAWK_TEST_NO_UDP=${no_udp:-0} SHAWK_TEST_NO_TRAMPOLINES=${no_trampolines:-0} SHAWK_TEST_NO_NFS=${SHAWK_TEST_NO_NFS:-$no_nfs} SHAWK_TEST_NO_CONNTRACK=${SHAWK_TEST_NO_CONNTRACK:-$no_conntrack} SHAWK_TEST_NO_VXLAN=${SHAWK_TEST_NO_VXLAN:-1}"
+if [[ "$rcu_expedited" == 1 ]]; then
+	cmdline+=" rcupdate.rcu_expedited=1"
+fi
 opts=(-m 2G -smp 2 -nographic -no-reboot -kernel "$image" -initrd "$WORK/initramfs.gz" -append "$cmdline")
 host="$(uname -m)"
 host="${host/arm64/aarch64}"
+accel=tcg
+cpu=max
 if [[ "$host" == "$ARCH" && -r /dev/kvm && -w /dev/kvm ]]; then
-	opts+=(-accel kvm -cpu host)
+	accel=kvm cpu=host
 elif [[ "$host" == "$ARCH" && "$(uname -s)" == Darwin ]]; then
-	opts+=(-accel hvf -cpu host)
-else
-	opts+=(-accel tcg -cpu max)
+	accel=hvf cpu=host
 fi
+opts+=(-accel "$accel" -cpu "$cpu")
 [[ "$ARCH" == aarch64 ]] && opts+=(-machine virt)
 [[ "$ARCH" == x86_64 ]] && opts+=(-machine q35)
 
-echo "booting $(basename "$image") ($ARCH) with ${opts[*]: -4}" >&2
+echo "booting $(basename "$image") ($ARCH) with $accel, CPU $cpu, expedited RCU $rcu_expedited" >&2
 log="$WORK/console.log"
 status=0
 timeout "$TIMEOUT" "$qemu" "${opts[@]}" </dev/null 2>&1 | tee "$log" || status=$?

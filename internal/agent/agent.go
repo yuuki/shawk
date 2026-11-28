@@ -161,50 +161,12 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 
 	cgroups := procinfo.NewResolver()
-	// The addresses of the host are internal from the first flow on, also
-	// for the connections the tracer adopts.
-	local, err := hostAddrs()
+	tr, err := startTracer(cfg, cgroups)
 	if err != nil {
-		cfg.Logger.Warn("listing the addresses of the host, whose peers are not folded", "error", err)
-	}
-	tr, err := tracer.New(tracer.Options{
-		NetNS:             cfg.NetNS,
-		MaxFlows:          cfg.MaxFlows,
-		OnCgroup:          cgroups.Learn,
-		TraceSelf:         cfg.traceSelf,
-		Fold:              cfg.Fold,
-		InternalPeers:     cfg.InternalPeers,
-		LocalAddrs:        local,
-		LearnTranslations: cfg.LearnTranslations,
-		ClassifyProtocols: cfg.ClassifyProtocols,
-		Logger:            cfg.Logger,
-	})
-	if err != nil {
-		return fmt.Errorf("starting tracer: %w", err)
+		return err
 	}
 	defer tr.Close()
-	if cfg.BPFStats {
-		if err := tr.EnableStats(); err != nil {
-			cfg.Logger.Warn("enabling BPF run time statistics", "error", err)
-		}
-	}
-	if tr.SelfPID() != uint32(os.Getpid()) {
-		cfg.Logger.Warn("the agent runs in a PID namespace; owners of sockets of processes outside it are not resolved, run it in the host PID namespace",
-			"pid", os.Getpid(), "host_pid", tr.SelfPID())
-	}
-	if !tr.UDPEnabled() {
-		cfg.Logger.Warn("UDP is not traced; see the error above (UDP tracing needs BPF trampolines, fentry, or else kprobes)")
-	}
-	if !tr.UnixEnabled() {
-		cfg.Logger.Warn("Unix sockets are not traced; see the error above (their tracing needs BPF trampolines, fexit)")
-	}
-	if cfg.ClassifyProtocols && !tr.ProtocolsEnabled() {
-		cfg.Logger.Warn("wire protocols are not classified; see the error above (their classification needs BPF trampolines, fentry)")
-	}
-	if cfg.NetNS != 0 && cfg.NetNS == procinfo.NetNSOf(1) {
-		cfg.Logger.Warn("only the initial network namespace is traced: connections of containers in other namespaces are not, " +
-			"and those that leave with the addresses of the host look traced to their peers; use -netns all on hosts with containers")
-	}
+	warnUntraced(cfg, tr)
 
 	hostname, _ := os.Hostname()
 	machineID := procinfo.MachineID()
@@ -231,19 +193,78 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 
 	go a.rdma.run(ctx, cfg.Interval)
+	a.loop(ctx)
+	return nil
+}
 
-	ticker := time.NewTicker(cfg.Interval)
+// startTracer starts the tracer of an agent, which reports the cgroups
+// created on the host to cgroups.
+func startTracer(cfg Config, cgroups *procinfo.Resolver) (*tracer.Tracer, error) {
+	// The addresses of the host are internal from the first flow on, also
+	// for the connections the tracer adopts.
+	local, err := hostAddrs()
+	if err != nil {
+		cfg.Logger.Warn("listing the addresses of the host, whose peers are not folded", "error", err)
+	}
+	tr, err := tracer.New(tracer.Options{
+		NetNS:             cfg.NetNS,
+		MaxFlows:          cfg.MaxFlows,
+		OnCgroup:          cgroups.Learn,
+		TraceSelf:         cfg.traceSelf,
+		Fold:              cfg.Fold,
+		InternalPeers:     cfg.InternalPeers,
+		LocalAddrs:        local,
+		LearnTranslations: cfg.LearnTranslations,
+		ClassifyProtocols: cfg.ClassifyProtocols,
+		Logger:            cfg.Logger,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("starting tracer: %w", err)
+	}
+	if cfg.BPFStats {
+		if err := tr.EnableStats(); err != nil {
+			cfg.Logger.Warn("enabling BPF run time statistics", "error", err)
+		}
+	}
+	return tr, nil
+}
+
+// warnUntraced logs what the tracer of an agent does not trace, or does not
+// resolve, on this host.
+func warnUntraced(cfg Config, tr *tracer.Tracer) {
+	if tr.SelfPID() != uint32(os.Getpid()) {
+		cfg.Logger.Warn("the agent runs in a PID namespace; owners of sockets of processes outside it are not resolved, run it in the host PID namespace",
+			"pid", os.Getpid(), "host_pid", tr.SelfPID())
+	}
+	if !tr.UDPEnabled() {
+		cfg.Logger.Warn("UDP is not traced; see the error above (UDP tracing needs BPF trampolines, fentry, or else kprobes)")
+	}
+	if !tr.UnixEnabled() {
+		cfg.Logger.Warn("Unix sockets are not traced; see the error above (trampolines and fallback kprobes could not be attached)")
+	}
+	if cfg.ClassifyProtocols && !tr.ProtocolsEnabled() {
+		cfg.Logger.Warn("wire protocols are not classified; see the error above (their classification needs BPF trampolines, fentry)")
+	}
+	if cfg.NetNS != 0 && cfg.NetNS == procinfo.NetNSOf(1) {
+		cfg.Logger.Warn("only the initial network namespace is traced: connections of containers in other namespaces are not, " +
+			"and those that leave with the addresses of the host look traced to their peers; use -netns all on hosts with containers")
+	}
+}
+
+// loop collects and sends an interval at every tick until ctx is canceled,
+// and then the last partial interval.
+func (a *Agent) loop(ctx context.Context) {
+	ticker := time.NewTicker(a.cfg.Interval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			// Send the last partial interval.
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			if err := a.tick(shutdownCtx); err != nil {
 				a.log.Error("sending the last interval", "error", err)
 			}
-			return nil
+			return
 		case <-ticker.C:
 			if err := a.tick(ctx); err != nil {
 				a.log.Error("collecting and sending flows", "error", err)

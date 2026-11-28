@@ -134,7 +134,11 @@ processors:
     check_interval: 1s
     limit_percentage: 80
     spike_limit_percentage: 20
-  batch: {}
+  # At most 8192 points (or spans) a batch: the outputs of a host arrive
+  # whole, so a batch would otherwise be as large as the largest host makes
+  # it, and one larger than the queue of otlp_http/prometheus is refused.
+  batch:
+    send_batch_max_size: 8192
 
 exporters:
   # Prometheus started with --web.enable-otlp-receiver and the web
@@ -146,11 +150,70 @@ exporters:
   # requires client certificates instead takes tls.cert_file and
   # tls.key_file here.
   otlp_http/prometheus:
-    endpoint: https://prometheus.example:9090/api/v1/otlp
-    tls:
+    endpoint: &prometheus https://prometheus.example:9090/api/v1/otlp
+    tls: &prometheus_tls
       ca_file: /etc/shawk/tls/prometheus-ca.crt
-    headers:
+    headers: &prometheus_headers
       Authorization: ${env:SHAWK_PROMETHEUS_AUTHORIZATION}
+    # The queue counts points, about 600 bytes of memory each
+    # (docs/design.md, section 5.3): 409600 take under 250 MiB and last 4
+    # minutes for a fleet whose outputs are 100 000 points a minute; size it
+    # to the fleet and the memory of the collector. Not batches: a batch
+    # holds what arrives in 200 ms, often a few hundred points, and the
+    # default of 1000 batches bounds no number of points. While Prometheus
+    # is down the queue fills, and a full memory would make memory_limiter
+    # refuse the requests of agents, for PostgreSQL too. Keep the queue
+    # enabled, and not blocking: the retries of a batch would otherwise
+    # block the connector, and with it the requests of agents. Points
+    # beyond the queue are dropped, which leaves gaps in the series.
+    sending_queue:
+      sizer: items
+      queue_size: 409600
+  # The metrics of OBI, to the same Prometheus. They are not batched, so a
+  # request is as large as an export of OBI: the queue counts their encoded
+  # bytes (64 MiB, up to about 3.5 times as much in memory), apart from the
+  # queue of the connector, which they would otherwise fill.
+  otlp_http/obi:
+    endpoint: *prometheus
+    tls: *prometheus_tls
+    headers: *prometheus_headers
+    sending_queue:
+      sizer: bytes
+      queue_size: 67108864
+  # Or Prometheus remote write, to VictoriaMetrics or another store that
+  # takes it (docs/design.md, section 5.3): replace otlp_http/prometheus
+  # with it in metrics/shawk-out, and otlp_http/obi with another instance
+  # in metrics/obi, so that the requests of OBI do not fill the queue of
+  # the connector. Its names (the default translation)
+  # and labels (host_id and host_name, no scope) are those of the OTLP
+  # receiver of Prometheus with packaging/prometheus/prometheus.yml. The
+  # store must be protected as Prometheus is: whoever can write to it can
+  # silence the alerts on agents.
+  # prometheus_remote_write/victoriametrics:
+  #   http:
+  #     endpoint: https://victoriametrics.example:8428/api/v1/write
+  #     tls:
+  #       ca_file: /etc/shawk/tls/victoriametrics-ca.crt
+  #     headers:
+  #       Authorization: ${env:SHAWK_PROMETHEUS_AUTHORIZATION}
+  #   translation_strategy: UnderscoreEscapingWithSuffixes
+  #   resource_constant_labels:
+  #     included: [host.id, host.name]
+  #   # Without it every series would have otel_scope_name.
+  #   disable_scope_info: true
+  #   # Batches of the batch processor, not points: this queue counts
+  #   # nothing else. A batch holds what arrives in 200 ms, at most 8192
+  #   # points and 4.5 MiB, so 50 take at most 225 MiB but last 10 seconds
+  #   # for a fleet whose outputs are 100 000 points a minute; size the
+  #   # queue to the fleet and the memory of the collector. While the store
+  #   # is down the queue fills: the default of 10000 would take the memory
+  #   # of the collector, and memory_limiter would then refuse the requests
+  #   # of agents, for PostgreSQL too. Keep the queue enabled: without it,
+  #   # the retries of a batch would block the connector, and with it the
+  #   # requests of agents. Batches beyond the queue are dropped, which
+  #   # leaves gaps in the series.
+  #   remote_write_queue:
+  #     queue_size: 50
   # Tempo or another trace store, over TLS with the client certificate of
   # the collector, which the store should require: in Tempo,
   # tls.client_ca_file of the otlp receiver of the distributor.
@@ -160,6 +223,37 @@ exporters:
       ca_file: /etc/shawk/tls/tempo-ca.crt
       cert_file: /etc/shawk/tls/collector-client.crt
       key_file: /etc/shawk/tls/collector-client.key
+    # The queue counts the encoded bytes of the batches of OBI's spans
+    # (docs/design.md, section 9): 64 MiB, about 200 MiB in memory (up to
+    # 3.5 times as much), hold about 270 000 spans of 250 encoded bytes, as
+    # those of HTTP and SQL requests, which last 2.7 minutes for a fleet
+    # whose OBI sends 100 000 spans a minute; size it to the fleet and the
+    # memory of the collector. Not spans: their attributes (paths, URLs, SQL
+    # queries) come from the applications, so that a span takes from 235
+    # bytes to several KB of memory. Not batches: a batch holds what arrives
+    # in 200 ms, up to 8192 spans, so that the default of 1000 batches holds
+    # 200 seconds of spans whatever their rate, about 5.7 GiB once batches
+    # are full. While the store is down the queue fills, and a full memory
+    # would make memory_limiter refuse the requests of agents, for
+    # PostgreSQL too. Keep the queue enabled, and not blocking: the retries
+    # of a batch would otherwise block the batch processor, and with it the
+    # requests of OBI. Spans beyond the queue are dropped.
+    #
+    # Requests of at most 3 MiB of encoded spans: a gRPC receiver refuses a
+    # message larger than 4 MiB by default (the OTLP receiver without
+    # max_recv_msg_size_mib), after decompression, and the exporter does not
+    # retry it, so that a batch of 8192 spans of more than 512 bytes each
+    # would be lost whole. The batcher of the queue, with min_size 0, merges
+    # nothing and splits batches by their encoded bytes; a span larger than
+    # max_size alone is dropped and logged ("Failed to split request").
+    # Lower max_size for a store that takes less.
+    sending_queue:
+      sizer: bytes
+      queue_size: 67108864
+      batch:
+        sizer: bytes
+        min_size: 0
+        max_size: 3145728
 
 service:
   pipelines:
@@ -181,7 +275,7 @@ service:
     metrics/obi:
       receivers: [otlp]
       processors: [memory_limiter]
-      exporters: [otlp_http/prometheus]
+      exporters: [otlp_http/obi]
     traces/obi:
       receivers: [otlp]
       processors: [memory_limiter, batch]

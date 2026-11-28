@@ -2,7 +2,6 @@ package agent
 
 import (
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/yuuki/shawk/internal/otlp"
@@ -19,12 +18,11 @@ type identities struct {
 	// The latest identity of each unit and comm, for flows whose process
 	// exited before it could be read, such as short-lived batch jobs.
 	latest map[identityKey]latestIdentity
-	// Readers of /proc; replaced in tests.
-	exe  func(pid uint32) string
-	comm func(pid uint32) string
+	// Readers of /proc; replaced in tests. open opens the directory of a
+	// process, through which its executable, command name and cgroup are
+	// read.
+	open func(pid uint32) (procDir, bool)
 	env  func(pid uint32) (map[string]string, bool)
-	// cgroup reads the path of the cgroup of a process.
-	cgroup func(pid uint32) string
 	// users reads the user id of a process and the cgroup it is in, which
 	// the processes of Slurm jobs carry; nil reads none.
 	users func(pid uint32) (uid uint32, cgroupID uint64, ok bool)
@@ -44,6 +42,26 @@ const (
 	procReadBudget = time.Second
 	procReaders    = 8
 )
+
+// procDir is the directory of a process in /proc, opened once
+// (procinfo.Proc): what is read through it is of that process, and the reads
+// fail once it has exited, rather than read a process that took its PID.
+type procDir interface {
+	Exe() string
+	Comm() (string, bool)
+	Cgroup() (string, bool)
+	Close() error
+}
+
+// openProc opens the directory of a process in /proc, or returns false if
+// the process is gone.
+func openProc(pid uint32) (procDir, bool) {
+	p, err := procinfo.OpenProc(pid)
+	if err != nil {
+		return nil, false
+	}
+	return p, true
+}
 
 type procRead struct {
 	exe  string
@@ -93,10 +111,8 @@ func newIdentities(fb procinfo.Fallback, ttl time.Duration, users func(uint32) (
 		ttl:      ttl,
 		users:    users,
 		latest:   map[identityKey]latestIdentity{},
-		exe:      procinfo.Exe,
-		comm:     procinfo.Comm,
+		open:     openProc,
 		env:      procinfo.OTelEnv,
-		cgroup:   procinfo.CgroupOf,
 		stuck:    procinfo.StuckEnvironReads,
 		budget:   procReadBudget,
 	}
@@ -118,8 +134,33 @@ type procRequest struct {
 // export. Processes not read in time are marked incomplete. The
 // environment of a process is read if one of its requests uses it.
 func (r *identities) prefetch(reqs []procRequest) {
-	var todo []uint32
-	env := map[uint32]bool{}
+	todo, env := r.unread(reqs)
+	if len(todo) == 0 {
+		return
+	}
+	results, stop := r.startReaders(todo, env)
+	defer stop()
+	deadline := time.NewTimer(r.budget)
+	defer deadline.Stop()
+	for range todo {
+		select {
+		case res := <-results:
+			r.byPID[res.pid] = res.p
+		case <-deadline.C:
+			for _, pid := range todo {
+				if _, ok := r.byPID[pid]; !ok {
+					r.byPID[pid] = procRead{}
+				}
+			}
+			return
+		}
+	}
+}
+
+// unread returns the processes of the requests that the interval has not
+// read, each once, and whether a request of each uses its environment.
+func (r *identities) unread(reqs []procRequest) (todo []uint32, env map[uint32]bool) {
+	env = map[uint32]bool{}
 	for _, q := range reqs {
 		if _, ok := r.byPID[q.pid]; ok || q.pid == 0 {
 			continue
@@ -130,25 +171,30 @@ func (r *identities) prefetch(reqs []procRequest) {
 			todo = append(todo, q.pid)
 		}
 	}
-	if len(todo) == 0 {
-		return
-	}
-	type result struct {
-		pid uint32
-		p   procRead
-	}
+	return todo, env
+}
+
+// pidRead is what a reader read of a process.
+type pidRead struct {
+	pid uint32
+	p   procRead
+}
+
+// startReaders starts the readers of /proc, at most procReaders, which read
+// the processes of todo, with the environment of those env tells, and send
+// what they read. stop keeps them from starting to read the processes left;
+// a read that hangs goes on.
+func (r *identities) startReaders(todo []uint32, env map[uint32]bool) (results <-chan pidRead, stop func()) {
 	// Buffered, so that readers still running after the budget never block.
-	results := make(chan result, len(todo))
+	out := make(chan pidRead, len(todo))
 	jobs := make(chan uint32)
-	stop := make(chan struct{})
-	var once sync.Once
-	defer once.Do(func() { close(stop) })
+	stopped := make(chan struct{})
 	go func() {
 		defer close(jobs)
 		for _, pid := range todo {
 			select {
 			case jobs <- pid:
-			case <-stop:
+			case <-stopped:
 				return
 			}
 		}
@@ -156,26 +202,11 @@ func (r *identities) prefetch(reqs []procRequest) {
 	for range min(procReaders, len(todo)) {
 		go func() {
 			for pid := range jobs {
-				results <- result{pid, r.readNow(pid, env[pid])}
+				out <- pidRead{pid, r.readNow(pid, env[pid])}
 			}
 		}()
 	}
-	deadline := time.NewTimer(r.budget)
-	defer deadline.Stop()
-	for range todo {
-		select {
-		case res := <-results:
-			r.byPID[res.pid] = res.p
-		case <-deadline.C:
-			once.Do(func() { close(stop) })
-			for _, pid := range todo {
-				if _, ok := r.byPID[pid]; !ok {
-					r.byPID[pid] = procRead{}
-				}
-			}
-			return
-		}
-	}
+	return out, func() { close(stopped) }
 }
 
 // read returns the reads of a process, reading /proc if the interval has
@@ -193,34 +224,52 @@ func (r *identities) read(pid uint32, env bool) procRead {
 }
 
 // readNow reads the executable, the command name, the cgroup and, if env is
-// true, the environment of a process. The environment of a process in the
-// cgroup of a Slurm job is not read, whatever the cgroup of its flow: it
-// names nothing, and its read could hang on a parallel file system and hold
-// a slot of the reads of the other processes. A process whose cgroup
-// changed while its environment was read, as when its PID was reused, is
-// incomplete.
+// true, the environment of a process. The first three are read through one
+// open /proc/PID, so that they are of one process; a process that exited
+// before all were read is taken as one that exited before it was read. The
+// environment of a process in the cgroup of a Slurm job is not read,
+// whatever the cgroup of its flow: it names nothing, and its read could hang
+// on a parallel file system and hold a slot of the reads of the other
+// processes. The environment is read by its path, so a process that exited,
+// executed another executable or changed its cgroup while it was read, as
+// when its PID was reused, is incomplete.
 //
 // If users are read, so are the user id of the process and its cgroup,
 // whether or not the environment is: a process that pam_slurm_adopt moved
 // into a job is asked for with its environment for the sockets it opened
 // before, and carries its user on the flows of the cgroup it is in now.
 func (r *identities) readNow(pid uint32, env bool) procRead {
-	p := procRead{exe: r.exe(pid), complete: true}
-	if p.exe != "" {
-		p.comm = r.comm(pid)
-		p.cgroup = r.cgroup(pid)
-		p.job = procinfo.SlurmJob(procinfo.Unit(p.cgroup))
-		if env && !p.job {
-			p.env, p.complete = r.env(pid)
-			if p.complete && r.cgroup(pid) != p.cgroup {
+	p := procRead{complete: true}
+	d, ok := r.open(pid)
+	if !ok {
+		return p
+	}
+	defer d.Close()
+	exe := d.Exe()
+	if exe == "" {
+		return p
+	}
+	comm, okComm := d.Comm()
+	cgroup, okCgroup := d.Cgroup()
+	if !okComm || !okCgroup {
+		// The process exited after its executable was read: the executable
+		// cannot be checked against the flow.
+		return p
+	}
+	p.exe, p.comm, p.cgroup = exe, comm, cgroup
+	p.job = procinfo.SlurmJob(procinfo.Unit(p.cgroup))
+	if env && !p.job {
+		p.env, p.complete = r.env(pid)
+		if p.complete {
+			if cg, ok := d.Cgroup(); !ok || cg != p.cgroup || d.Exe() != p.exe {
 				p.env, p.complete = nil, false
 			}
-		} else {
-			p.noEnv = true
 		}
-		if r.users != nil {
-			p.uid, p.uidCgroup, p.hasUID = r.users(pid)
-		}
+	} else {
+		p.noEnv = true
+	}
+	if r.users != nil {
+		p.uid, p.uidCgroup, p.hasUID = r.users(pid)
 	}
 	return p
 }
@@ -244,8 +293,8 @@ type flowCgroup struct {
 // path is not known is learned from its process when the process is still
 // in it (Agent.process); otherwise a process now in a job is not taken for
 // the process of the flow, nor is its latest identity, since the unit of
-// the flow is not known. A process whose cgroup cannot be read is taken as
-// it is.
+// the flow is not known. A process whose cgroup is not in the hierarchy of
+// the agent (cgroup v1, another cgroup namespace) is taken as it is.
 //
 // With users, a process of a Slurm job carries its user id as read in this
 // interval, if it was read in the cgroup of the flow: the user id and the
@@ -259,7 +308,10 @@ func (r *identities) resolve(pid uint32, comm string, cg flowCgroup, unit string
 	keep := true
 	p := r.read(pid, !job)
 	switch {
-	case p.comm == "" || p.comm == comm:
+	case p.exe == "" || p.comm == comm:
+		// Nothing was read of the process, or it has the command name of
+		// the flow: an executable is used only with the command name read
+		// with it.
 	case systemdChild(comm, p.comm):
 		// The child that systemd forked for a service, which connected the
 		// standard output of the service to journald, executed it: the

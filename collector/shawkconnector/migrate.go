@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -47,8 +48,17 @@ func Migrations() ([]Migration, error) {
 }
 
 // migrationLock is the key of the advisory lock that serializes migrations
-// run by several connectors.
+// run by several connectors. The transactions that write take it shared
+// before any other lock, so that they wait for a migration in progress
+// rather than take the locks of tables in another order and deadlock with
+// it.
 const migrationLock = 0x73686177 // "shaw"
+
+// unlockTimeout bounds the release of the lock of migrations, which is sent
+// even once the context of Migrate is done: a connection that stopped
+// answering would otherwise hold Migrate until the kernel gives it up, many
+// minutes later. A variable for tests.
+var unlockTimeout = 5 * time.Second
 
 // Migrate applies the migrations that the database lacks, each in its own
 // transaction, and returns the names of those applied.
@@ -61,8 +71,13 @@ func Migrate(ctx context.Context, conn *pgx.Conn) ([]string, error) {
 		return nil, err
 	}
 	// The lock is of the session: an unlock fails only with the connection,
-	// whose end releases it.
-	defer conn.Exec(context.WithoutCancel(ctx), `SELECT pg_advisory_unlock($1)`, migrationLock) //nolint:errcheck // see above
+	// whose end releases it. pgx closes the connection of a query that
+	// outlives its context, so an unlock that times out does too.
+	defer func() {
+		uctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), unlockTimeout)
+		defer cancel()
+		conn.Exec(uctx, `SELECT pg_advisory_unlock($1)`, migrationLock) //nolint:errcheck // see above
+	}()
 	if _, err := conn.Exec(ctx, `
 CREATE SCHEMA IF NOT EXISTS shawk;
 CREATE TABLE IF NOT EXISTS shawk.schema_migrations (

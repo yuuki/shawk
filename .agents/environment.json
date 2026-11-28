@@ -1,0 +1,3 @@
+{
+  "install": "sed -i '/case \\$- in/,/esac/d' ~/.bashrc 2>/dev/null || true; if ! command -v clang >/dev/null || ! command -v llvm-strip >/dev/null || ! command -v rpm2cpio >/dev/null || ! command -v cpio >/dev/null; then sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends clang llvm rpm2cpio cpio; fi; for m in . collector test/packaging test/hookcost; do (cd \"$m\" && go mod download); done"
+}

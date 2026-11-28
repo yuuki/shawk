@@ -57,6 +57,25 @@ the architecture of the host, and emulates it otherwise (slow). Without
 `rpm2cpio` or `dpkg-deb`, as on macOS, `bsdtar` extracts the kernel packages.
 On macOS, Homebrew has `qemu`, `xz` and `coreutils` (`timeout`).
 
+The init of the VM ([`test/vm/init`](../vm/init)) fails the run when the
+kernel was tainted while the tests ran, e.g. by a warning, and prints the
+kernel log. A warning of the kernel itself that the tests set off is
+listed in `knownWarnings` with the one kernel release that has it, and
+does not fail the run on that kernel: the init prints it, provided the
+tests added `TAINT_WARN` alone and every warning or bug they logged is
+known. The only one is on upstream 5.14.21: RCU Tasks Trace warns in
+`trc_read_check_handler` (`kernel/rcu/tasks.h:889`, `:897` or `:906`) when
+the IPI that checks a task runs after the grace period dropped its count,
+a false positive that BPF trampolines set off at random, fixed in 5.16
+(cbe0d8d91415) and in 5.15.y since 5.15.130. The same warning fails the run
+on any other kernel.
+
+CI sets `VM_RCU_EXPEDITED=1` to shorten the RCU grace periods that map
+flips and probe teardown wait for. This keeps the wait for readers and
+spends more CPU to reduce latency, especially under emulation; it does
+not reduce the test cases or the 1024-port iterator regression test.
+Local runs default to the kernel's normal policy (`VM_RCU_EXPEDITED=0`).
+
 ## Slurm cluster
 
 ```bash
@@ -126,9 +145,10 @@ the pinned release of Lima if `limactl` is missing, and needs QEMU and
 | `SHAWK_TEST_POSTGRES_DSN` | the `TestPG*` tests of `collector/shawkconnector` (`make test`, `make pg-test`); skipped without it | `postgres.sh env`, `run` |
 | `SHAWK_E2E_POSTGRES_DSN` | `test/e2e/run.sh` (`make e2e`), which drops and recreates its schemas | `postgres.sh env`, `run` (database `shawke2e`) |
 | `SHAWK_TEST_STRICT` | the BPF tests (`make test-root`, `vm-test`, `e2e`): a skip fails | `test/vm/run.sh` (1 unless set) |
-| `SHAWK_TEST_NO_TRAMPOLINES`, `SHAWK_TEST_NO_UDP`, `SHAWK_TEST_NO_NFS`, `SHAWK_TEST_NO_CONNTRACK` | the BPF tests: what the kernel lacks | `test/vm/run.sh` from the kernel |
+| `SHAWK_TEST_NO_TRAMPOLINES`, `SHAWK_TEST_NO_UDP`, `SHAWK_TEST_NO_NFS`, `SHAWK_TEST_NO_CONNTRACK`, `SHAWK_TEST_NO_VXLAN` | the BPF tests: what the kernel lacks | `test/vm/run.sh` from the kernel |
 | `SHAWK_TARGET_BTF`, `SHAWK_TARGET_MODULE_BTF`, `SHAWK_FRESH_OBJECT` | `TestKernelCompatibility` and the check of the committed object | `make compat`, `make check-object` |
 | `VM_TEST_ARGS`, `VM_TIMEOUT` | `test/vm/run.sh`: arguments of the test binaries, a deadline | the user |
+| `VM_RCU_EXPEDITED` | `test/vm/run.sh`: expedite RCU grace periods (0 or 1) | 0 locally, 1 in CI |
 | `SLURM_*`, `SHAWK_VM_*` | `slurm.sh up` (above) | the user |
 | `SHAWK_CACHE_DIR`, `SHAWK_HARNESS_ID` | all of `test/harness`: the cache, the name of the workspace (8 hex digits of its path) | the user |
 

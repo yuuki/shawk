@@ -2,7 +2,7 @@
 -- An edge keeps when it was first and last seen only, so that a job that
 -- runs once a month and a connection that never closes look the same
 -- between those times. These tables keep the history in between, by hour:
--- the cadence of a dependency is read from them (0004_impact.sql).
+-- the cadence of a dependency is read from them (0005_impact.sql).
 
 -- The hours of a month in which an edge was active: bit i of hours, from
 -- the left, is the hour that starts i hours after month, the start of a
@@ -41,7 +41,7 @@ ALTER TABLE shawk.unix_edges ADD COLUMN established boolean;
 -- an agent that goes on is kept whole, so that the sessions alone would
 -- tell that a host was observed, and unused, in a time whose dependencies
 -- are gone. What reads the history as evidence that something was not used
--- (0004_impact.sql) takes the time before the cutoff as not observed. No
+-- (0005_impact.sql) takes the time before the cutoff as not observed. No
 -- row until the first prune.
 CREATE TABLE shawk.retention (
   singleton     boolean PRIMARY KEY DEFAULT true CHECK (singleton),

@@ -104,8 +104,12 @@ jobs:
       - uses: actions/setup-go@v7.0.0
         with:
           go-version-file: go.mod
+      # The mirrors of the runners are slow at times: the install has a time
+      # limit and retries of its own, each from another mirror, so that a
+      # slow mirror does not take the time of the tests.
       - name: Install tools
-        run: sudo apt-get update && sudo apt-get install -y clang llvm rpm2cpio cpio
+        timeout-minutes: 10
+        run: scripts/apt-install.sh clang llvm rpm2cpio cpio
       - name: Vet
         run: make vet
       - name: Unit tests with the race detector (agent, connector with PostgreSQL, packaging examples)
@@ -148,7 +152,7 @@ jobs:
   # Linux 9 and upstream releases older than the runner's, on x86_64 (with
   # KVM) and on aarch64 (emulated).
   kernels:
-    name: kernel ${{ matrix.kernel }} ${{ matrix.arch }}
+    name: kernel ${{ matrix.kernel }} ${{ matrix.arch }}${{ matrix.shard && format(' ({0})', matrix.shard) || '' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
@@ -159,7 +163,25 @@ jobs:
           - { kernel: rocky9, arch: aarch64, qemu: qemu-system-arm }
           - { kernel: "5.14", arch: x86_64, qemu: qemu-system-x86 }
           - { kernel: "5.15", arch: x86_64, qemu: qemu-system-x86 }
-          - { kernel: "5.15", arch: aarch64, qemu: qemu-system-arm }
+          # This emulated guest takes about 20 minutes. Split its tests by
+          # name across separate VMs, without running BPF tests concurrently
+          # in one kernel. The three patterns cover every Test, Example and
+          # Fuzz name, including new tests; the other guests still run all.
+          - kernel: "5.15"
+            arch: aarch64
+            qemu: qemu-system-arm
+            shard: A-S
+            test-args: '-test.run=^Test[A-S]'
+          - kernel: "5.15"
+            arch: aarch64
+            qemu: qemu-system-arm
+            shard: T
+            test-args: '-test.run=^TestT'
+          - kernel: "5.15"
+            arch: aarch64
+            qemu: qemu-system-arm
+            shard: remaining
+            test-args: '-test.run=^(Test([^A-T]|$)|Example|Fuzz)'
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -167,8 +189,11 @@ jobs:
       - uses: actions/setup-go@v7.0.0
         with:
           go-version-file: go.mod
+      # As in the job test; the tests of an emulated aarch64 kernel alone
+      # take up to half of the time of the job.
       - name: Install QEMU
-        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.qemu }} rpm2cpio cpio
+        timeout-minutes: 10
+        run: scripts/apt-install.sh ${{ matrix.qemu }} rpm2cpio cpio
       # The runners have KVM, which only its group may open.
       - name: Enable KVM
         run: |
@@ -184,6 +209,9 @@ jobs:
           # The script checks the SHA-256 of what an older cache holds.
           restore-keys: kernel-${{ matrix.kernel }}-${{ matrix.arch }}-
       - name: Tests in the virtual machine
+        env:
+          VM_TEST_ARGS: ${{ matrix.test-args }}
+          VM_RCU_EXPEDITED: "1"
         run: test/vm/run.sh ${{ matrix.kernel }} ${{ matrix.arch }}
 
   # The same tests on an arm64 host, with its own kernel and JIT.

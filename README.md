@@ -66,11 +66,11 @@ The design is in [docs/design.md](docs/design.md).
 ## Requirements
 
 - Linux with BTF (`/sys/kernel/btf/vmlinux`): RHEL / Rocky Linux 9, or
-  upstream 5.14 or later. Unix sockets need BPF trampolines (fentry,
-  fexit), which arm64 has only since 6.0 (Rocky Linux 9.8); without them
-  they are not traced, and UDP is traced with kprobes, at about twice the
-  cost per datagram. Wire protocols (`-classify-protocols`) need them too;
-  without them they are not classified. The tested kernels
+  upstream 5.14 or later. UDP and Unix stream sockets use BPF trampolines
+  when available and fall back to kprobes, including on arm64 before 6.0
+  and Rocky Linux 9.6 on arm64. For UDP the fallback roughly doubles the
+  cost per datagram on arm64. Wire protocol classification (`-classify-protocols`) requires
+  trampolines. The tested kernels
   are listed in
   [design §3.5](docs/design.md#35-kernel-requirements-and-features-used).
   The agent runs as root with the capabilities that
@@ -104,9 +104,12 @@ connections should be traced after it, e.g. slurmd
 
 `shawk agent -h` lists the flags. Most deployments set only
 `-otlp-endpoint` and the TLS files (`-otlp-ca-file`, `-otlp-cert-file`,
-`-otlp-key-file`). Services that share an executable on a host (`ruby`,
-`python`, `java`) should set `OTEL_SERVICE_NAME`, e.g. with `Environment=`
-in a systemd drop-in, as for OBI.
+`-otlp-key-file`); behind a front collector that checks tokens rather
+than client certificates, `-otlp-bearer-token-file` replaces the
+certificate ([packaging/](packaging/README.md#agent)). Services that
+share an executable on a host (`ruby`, `python`, `java`) should set
+`OTEL_SERVICE_NAME`, e.g. with `Environment=` in a systemd drop-in, as
+for OBI.
 
 ### Collector
 
@@ -117,9 +120,11 @@ the deb and rpm packages `shawk-collector` (with `shawk-migrate`,
 shawk-migrate shawk-impact`.
 
 [packaging/](packaging/README.md) has the configuration of the collector,
-PostgreSQL, Prometheus and Grafana, and the steps to set them up. A
-database created by v0.8.0 must be created again; see the
-[CHANGELOG](CHANGELOG.md).
+PostgreSQL, Prometheus and Grafana, and the steps to set them up. The
+collector also has the Prometheus remote write exporter, for
+VictoriaMetrics or another store that takes Prometheus remote write
+([packaging/](packaging/README.md#prometheus)). A database created
+by v0.8.0 must be created again; see the [CHANGELOG](CHANGELOG.md).
 
 Connections through a load balancer, a virtual address or a proxy without
 an agent end at its address unless the translation is known: agents learn

@@ -113,8 +113,28 @@ bench: ## benchmarks, written to bench.txt for benchstat (BENCH_COUNT runs of ea
 	done; cat bench.txt
 
 .PHONY: vuln
-vuln: ## known vulnerabilities that the code of every module reaches (govulncheck)
+vuln: vuln-modules vuln-collector ## known vulnerabilities that the code of every module and the collector of the releases reach (govulncheck)
+
+.PHONY: vuln-modules
+vuln-modules: ## known vulnerabilities that the code of every module reaches (govulncheck)
 	@set -e; for m in $(MODULES); do echo "== govulncheck $$m"; (cd $$m && $(GO_RUN_TOOL) golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...); done
+
+# The collector of the releases links the components of
+# collector/builder-config.yaml, which no module of MODULES requires: it is
+# scanned in the sources that ocb generates, built as .goreleaser.yml builds
+# it (linux, CGO_ENABLED=0, each of RELEASE_GOARCHES). govulncheck reports
+# what the files of that build call, which differ with cgo (net, os/user)
+# and the architecture (x/sys/unix, assembly). -exec gives that build to
+# govulncheck only, so that go run still builds govulncheck for this system;
+# every architecture is scanned, also when another one failed.
+RELEASE_GOARCHES := amd64 arm64
+
+.PHONY: vuln-collector
+vuln-collector: collector-sources ## known vulnerabilities that the collector of the releases reaches (govulncheck of collector/_build, per architecture)
+	@rc=0; for a in $(RELEASE_GOARCHES); do \
+		echo "== govulncheck collector/_build linux/$$a"; \
+		(cd collector/_build && $(GO_RUN_TOOL) -exec "env GOOS=linux GOARCH=$$a CGO_ENABLED=0" golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...) || rc=1; \
+	done; exit $$rc
 
 .PHONY: complexity
 complexity: ## rank the most complex functions with cccc (https://github.com/moznion/cccc); settings in cccc.toml
@@ -122,9 +142,12 @@ complexity: ## rank the most complex functions with cccc (https://github.com/moz
 
 OCB_VERSION ?= v0.165.0
 
-.PHONY: collector
-collector: ## build the collector with the shawk connector and VERSION (collector/_build/shawk-collector)
+.PHONY: collector-sources
+collector-sources: ## generate the sources of the collector with the shawk connector and VERSION in collector/_build (ocb), as the releases do
 	OCB_VERSION=$(OCB_VERSION) sh scripts/generate-collector.sh $(VERSION)
+
+.PHONY: collector
+collector: collector-sources ## build the collector with the shawk connector and VERSION (collector/_build/shawk-collector)
 	cd collector/_build && CGO_ENABLED=0 $(GO) build -trimpath -ldflags "-s -w" -o shawk-collector .
 
 .PHONY: shawk-migrate

@@ -3,12 +3,14 @@ package tracer
 import (
 	"cmp"
 	"errors"
+	"io"
 	"net/netip"
 	"slices"
 	"strings"
 	"time"
 
 	"github.com/cilium/ebpf"
+	"golang.org/x/sys/unix"
 )
 
 type sockAddrKey struct {
@@ -34,22 +36,33 @@ type unixListenerKey struct {
 	path  string
 }
 
+// beforeSocketWalk, if set, runs before the iterators of a walk of the
+// sockets are opened, once listen_ports is cleared; set in tests.
+var beforeSocketWalk func()
+
 // scanSockets walks TCP and UDP sockets and returns the listeners and the
 // inodes of their sockets, where known. The Comm of a listener that the
 // kernel may hold is KernelComm, until its owner is resolved.
 //
 // The iterators are opened in every network namespace, since an iterator
-// only walks the namespace it was opened in.
+// only walks the namespace it was opened in. The walk rebuilds listen_ports
+// from empty: only the walks read it, and iter/tcp finds the listeners of a
+// namespace before its connections. The UDP programs read udp_listen_ports
+// at any time, so it keeps its ports during the walk: a socket that sends
+// first on the port of a server while the port is missing would be a client
+// for good (#238). Afterwards, the ports that the walk did not find are
+// deleted, except in the namespaces that it could not open, and those that
+// udp_direction() learned meanwhile are kept.
 func (t *Tracer) scanSockets() ([]Listener, []uint64, error) {
-	for _, m := range []*ebpf.Map{t.listenPorts, t.udpListenPorts} {
-		if err := clearMap(m); err != nil {
-			return nil, nil, err
-		}
-	}
-	readers, err := t.openAllNetNS()
-	defer closeAll(readers)
+	before, err := listenKeys(t.udpListenPorts)
 	if err != nil {
 		return nil, nil, err
+	}
+	if err := clearMap(t.listenPorts); err != nil {
+		return nil, nil, err
+	}
+	if beforeSocketWalk != nil {
+		beforeSocketWalk()
 	}
 
 	var (
@@ -58,44 +71,72 @@ func (t *Tracer) scanSockets() ([]Listener, []uint64, error) {
 	)
 	// The sockets of a SO_REUSEPORT group share an address and a port.
 	seen := map[sockAddrKey]int{}
-	for _, rd := range readers {
+	udpPorts := make(map[bpfShawkListenKey]bool, len(before))
+	skipped, err := t.walkAllNetNS(func(rd io.Reader) error {
 		recs, err := readRecords(rd)
 		if err != nil {
-			return nil, nil, err
+			return err
 		}
 		for i := range recs {
-			if recs[i].Type != recListener {
+			r := &recs[i]
+			if r.Type != recListener {
 				continue
 			}
-			if recs[i].Ino != 0 {
-				inos = append(inos, recs[i].Ino)
+			if r.Ino != 0 {
+				inos = append(inos, r.Ino)
 			}
-			l := Listener{
-				Proto:        Proto(recs[i].Proto),
-				Addr:         addrFrom16(recs[i].Addr),
-				Port:         recs[i].Port,
-				NetNS:        recs[i].Netns,
-				KernelChosen: recs[i].KernelChosen != 0,
+			if Proto(r.Proto) == ProtoUDP {
+				udpPorts[bpfShawkListenKey{Netns: r.Netns, Port: r.Port}] = true
 			}
-			if commString(recs[i].Comm) == KernelComm {
-				l.Comm = KernelComm
-			}
-			k := listenerKey(&l)
-			if j, ok := seen[k]; ok {
-				if l.Comm != "" {
-					listeners[j].Comm = l.Comm
-				}
-				listeners[j].KernelChosen = listeners[j].KernelChosen || l.KernelChosen
-				continue
-			}
-			seen[k] = len(listeners)
-			listeners = append(listeners, l)
+			listeners = addListener(listeners, seen, listenerOf(r))
 		}
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := syncUDPListenPorts(t.udpListenPorts, before, udpPorts, skipped); err != nil {
+		return nil, nil, err
 	}
 	return listeners, inos, nil
 }
 
-func clearMap(m *ebpf.Map) error {
+// addListener adds a listener to those of a walk of the sockets, of which
+// seen holds the indexes: the sockets that share its address and its port
+// are one listener.
+func addListener(listeners []Listener, seen map[sockAddrKey]int, l Listener) []Listener {
+	k := listenerKey(&l)
+	j, ok := seen[k]
+	if !ok {
+		seen[k] = len(listeners)
+		return append(listeners, l)
+	}
+	if l.Comm != "" {
+		listeners[j].Comm = l.Comm
+	}
+	listeners[j].KernelChosen = listeners[j].KernelChosen || l.KernelChosen
+	return listeners
+}
+
+// listenerOf converts the record of a listening socket that a walk of the
+// sockets found. Its Comm is KernelComm if the kernel may hold the socket,
+// and empty otherwise.
+func listenerOf(r *bpfShawkIterRec) Listener {
+	l := Listener{
+		Proto:        Proto(r.Proto),
+		Addr:         addrFrom16(r.Addr),
+		Port:         r.Port,
+		NetNS:        r.Netns,
+		KernelChosen: r.KernelChosen != 0,
+	}
+	if commString(r.Comm) == KernelComm {
+		l.Comm = KernelComm
+	}
+	return l
+}
+
+// listenKeys returns the ports that a map of listening ports holds.
+func listenKeys(m *ebpf.Map) ([]bpfShawkListenKey, error) {
 	var (
 		key  bpfShawkListenKey
 		val  uint8
@@ -105,11 +146,52 @@ func clearMap(m *ebpf.Map) error {
 	for it.Next(&key, &val) {
 		keys = append(keys, key)
 	}
-	if err := it.Err(); err != nil {
+	return keys, it.Err()
+}
+
+func clearMap(m *ebpf.Map) error {
+	keys, err := listenKeys(m)
+	if err != nil {
 		return err
 	}
 	for i := range keys {
 		if err := m.Delete(&keys[i]); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			return err
+		}
+	}
+	return nil
+}
+
+// syncUDPListenPorts updates udp_listen_ports after a walk of the sockets.
+// It deletes the ports that the map held before the walk and that the walk
+// did not find, unless the walk skipped their namespace, and adds those that
+// the walk found and that the map did not hold before: the walk may have
+// found no room for them while the deleted ones took it. A port that
+// udp_direction() learned during the walk is in neither, and stays. The
+// ports of a namespace that is gone are deleted by the next walk, which
+// does not list it.
+func syncUDPListenPorts(m *ebpf.Map, before []bpfShawkListenKey, found map[bpfShawkListenKey]bool, skipped map[uint32]bool) error {
+	held := make(map[bpfShawkListenKey]bool, len(before))
+	for i := range before {
+		k := &before[i]
+		held[*k] = true
+		if found[*k] || skipped[k.Netns] {
+			continue
+		}
+		if err := m.Delete(k); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			return err
+		}
+	}
+	for k := range found {
+		if held[k] {
+			continue
+		}
+		err := m.Update(&k, uint8(1), ebpf.UpdateNoExist)
+		if errors.Is(err, unix.E2BIG) {
+			// The map is full, and the walk counted the ports left out.
+			return nil
+		}
+		if err != nil && !errors.Is(err, ebpf.ErrKeyExist) {
 			return err
 		}
 	}
@@ -251,15 +333,13 @@ func (t *Tracer) unixListeners() []Listener {
 }
 
 // hasUnixListener reports whether the last owner scan found a listener of
-// the name path in any network namespace: a client may reach a path
-// through a mount from another namespace than that of its server.
-func (t *Tracer) hasUnixListener(path string) bool {
-	for k := range t.unixOwners {
-		if k.path == path {
-			return true
-		}
-	}
-	return false
+// the name of k in the network namespace of k. A listener of the name in
+// another namespace does not count: an abstract name is reached in the
+// namespace of its client only, and while a client may reach a path through
+// a mount from another namespace, the connector names the listener of the
+// namespace of the client first, which may have started since the scan.
+func (t *Tracer) hasUnixListener(k unixListenerKey) bool {
+	return len(t.unixOwners[k]) > 0
 }
 
 func (t *Tracer) hasOwner(k sockAddrKey) bool {

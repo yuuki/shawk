@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"slices"
 	"strings"
@@ -135,11 +136,66 @@ func TestPackagedCollectorConfig(t *testing.T) {
 			t.Errorf("%s: %s is not in collector.env", name, m[1])
 		}
 	}
+	toPrometheus := func(exporters []string) []string {
+		var out []string
+		for _, name := range exporters {
+			e, _ := doc.Exporters[name].(map[string]any)
+			if endpoint, _ := e["endpoint"].(string); strings.HasSuffix(endpoint, "/api/v1/otlp") {
+				out = append(out, name)
+			}
+		}
+		return out
+	}
+	// The queues of the exporters stay enabled and do not block, so that the
+	// retries of a batch do not block the connector or the requests of OBI,
+	// and are bounded, so that they do not fill the memory of the collector
+	// while Prometheus or the trace store is down: in points for the
+	// connector, since a batch holds what arrived within its timeout; in
+	// bytes for OBI's metrics, which are not batched and have a queue of
+	// their own, and for OBI's spans, as large as their attributes
+	// (docs/design.md, sections 5.3 and 9). The queue of OBI's spans splits
+	// batches into requests below the 4 MiB of a gRPC receiver, without
+	// merging them; the other queues do not batch.
+	batch, _ := doc.Processors["batch"].(map[string]any)
+	if batch["send_batch_max_size"] != 8192 {
+		t.Errorf("batch: send_batch_max_size = %v", batch["send_batch_max_size"])
+	}
+	queues := map[string]map[string]any{
+		"metrics/shawk-out": {"sizer": "items", "queue_size": 409600},
+		"metrics/obi":       {"sizer": "bytes", "queue_size": 67108864},
+		"traces/obi": {"sizer": "bytes", "queue_size": 67108864,
+			"batch": map[string]any{"sizer": "bytes", "min_size": 0, "max_size": 3145728}},
+	}
+	sends, shared := map[string]bool{}, map[string]string{}
 	for name, p := range doc.Service.Pipelines {
+		// An exporter has one instance, and one queue, per signal.
+		signal, _, _ := strings.Cut(name, "/")
+		for _, e := range p.Exporters {
+			if doc.Exporters[e] == nil {
+				continue // the connector, or undefined (below)
+			}
+			if other, ok := shared[signal+" "+e]; ok {
+				t.Errorf("%s: in %s and %s, whose requests share its queue", e, other, name)
+			}
+			shared[signal+" "+e] = name
+			want, ok := queues[name]
+			if !ok {
+				t.Errorf("%s: exports through %s, whose queue is not checked", name, e)
+				continue
+			}
+			sends[name] = true
+			ex, _ := doc.Exporters[e].(map[string]any)
+			q, _ := ex["sending_queue"].(map[string]any)
+			if q["enabled"] == false || q["block_on_overflow"] == true || q["wait_for_result"] == true ||
+				q["sizer"] != want["sizer"] || q["queue_size"] != want["queue_size"] ||
+				!reflect.DeepEqual(q["batch"], want["batch"]) {
+				t.Errorf("%s: sending_queue of %s = %v, want %v, enabled and not blocking", name, e, q, want)
+			}
+		}
 		// Points of other sources carry the clocks of their hosts; batched,
 		// one host with a wrong clock makes Prometheus drop the others.
 		if slicesContains(p.Receivers, "otlp") && slicesContains(p.Processors, "batch") &&
-			slicesContains(p.Exporters, "otlp_http/prometheus") {
+			len(toPrometheus(p.Exporters)) > 0 {
 			t.Errorf("%s: batches points of several hosts for Prometheus", name)
 		}
 		for _, r := range p.Receivers {
@@ -160,6 +216,80 @@ func TestPackagedCollectorConfig(t *testing.T) {
 				t.Errorf("%s: undefined exporter %s", name, e)
 			}
 		}
+	}
+	for name := range queues {
+		if !sends[name] {
+			t.Errorf("%s exports through no exporter", name)
+		}
+	}
+	for _, name := range []string{"metrics/shawk-out", "metrics/obi"} {
+		if len(toPrometheus(doc.Service.Pipelines[name].Exporters)) == 0 {
+			t.Errorf("%s sends nothing to Prometheus", name)
+		}
+	}
+}
+
+func TestPackagedSQLiteCollectorConfig(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join(packaging, "collector/config-sqlite.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Receivers  map[string]any `yaml:"receivers"`
+		Processors map[string]any `yaml:"processors"`
+		Exporters  map[string]any `yaml:"exporters"`
+		Connectors map[string]any `yaml:"connectors"`
+		Service    struct {
+			Pipelines map[string]struct {
+				Receivers  []string `yaml:"receivers"`
+				Processors []string `yaml:"processors"`
+				Exporters  []string `yaml:"exporters"`
+			} `yaml:"pipelines"`
+		} `yaml:"service"`
+	}
+	if err := yaml.Unmarshal(b, &doc); err != nil {
+		t.Fatal(err)
+	}
+	raw, ok := doc.Connectors["shawk"].(map[string]any)
+	if !ok {
+		t.Fatal("no shawk connector")
+	}
+	cfg := createDefaultConfig()
+	if err := confmap.NewFromStringMap(raw).Unmarshal(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Error(err)
+	}
+	if cfg.SQLite.Path != "/var/lib/shawk-collector/shawk.db" || cfg.SQLite.BusyTimeout != 5*time.Second ||
+		cfg.Postgres.DSN != "" || cfg.Postgres.DSNFile != "" || cfg.HostIdentity != hostIdentityCertificate {
+		t.Errorf("config = %+v", cfg)
+	}
+	// Verify TLS + client cert on otlp/shawk (gRPC only) and bounded exporter queue.
+	protocols, _ := doc.Receivers["otlp/shawk"].(map[string]any)["protocols"].(map[string]any)
+	if protocols["http"] != nil {
+		t.Error("otlp/shawk: HTTP carries no client certificate to the connector")
+	}
+	grpcProto, _ := protocols["grpc"].(map[string]any)
+	tls, _ := grpcProto["tls"].(map[string]any)
+	if tls["client_ca_file"] == nil || tls["cert_file"] == nil || tls["key_file"] == nil {
+		t.Errorf("otlp/shawk grpc: no TLS with client certificates: %v", grpcProto)
+	}
+	if grpcProto["max_recv_msg_size_mib"] != 16 {
+		t.Errorf("otlp/shawk: max_recv_msg_size_mib = %v", grpcProto["max_recv_msg_size_mib"])
+	}
+	ex, _ := doc.Exporters["otlp_http/prometheus"].(map[string]any)
+	q, _ := ex["sending_queue"].(map[string]any)
+	if q["sizer"] != "items" || q["queue_size"] != 409600 {
+		t.Errorf("otlp_http/prometheus sending_queue = %v", q)
+	}
+	for name, p := range doc.Service.Pipelines {
+		if slicesContains(p.Processors, "batch") && slicesContains(p.Exporters, "shawk") {
+			t.Errorf("%s: batch processor before connector merges agent requests", name)
+		}
+	}
+	if _, err := os.ReadFile(filepath.Join(packaging, "systemd/shawk-collector-sqlite.conf")); err != nil {
+		t.Errorf("missing sqlite drop-in: %v", err)
 	}
 }
 
@@ -611,6 +741,73 @@ func TestPGDetailsFilterPeerCIDRs(t *testing.T) {
 	}
 }
 
+// TestPGDetailsFilterPrometheusNames: the dependency details panel selects
+// the dependencies by the names their sides have in Prometheus, which its
+// variables offer: slurm-job for the processes of Slurm jobs, which
+// PostgreSQL keeps under their own names, and ~other, which folds services
+// beyond max_services and peers beyond max_peers, with an agent or not. A
+// variable without values, as over a time range that Prometheus no longer
+// holds, selects every name rather than failing the query.
+func TestPGDetailsFilterPrometheusNames(t *testing.T) {
+	_, conn := migratedDB(t)
+	f := fixture{t, conn}
+	f.host("db-01", "postgres")
+	f.host("web-01", "web")
+	f.host("node-01")
+	f.host("node-02", "slurmstepd")
+	execAll(t, conn, `INSERT INTO shawk.processes (host_id, unit, comm, exe, service_name, first_seen, last_seen)
+		VALUES ('node-01', 'slurm/batch', 'a.out', '', 'a.out', now()-interval '30 days', now())`)
+	// A job connects to postgres, and slurmstepd to the job.
+	f.conn2("node-01", "a.out", "10.0.0.21", "db-01", "postgres", "10.0.0.10", 5432, "now()-interval '1 hour'", "now()")
+	f.conn2("node-02", "slurmstepd", "10.0.0.22", "node-01", "a.out", "10.0.0.21", 40000, "now()-interval '1 hour'", "now()")
+	f.conn2("web-01", "web", "10.0.0.11", "db-01", "postgres", "10.0.0.10", 5432, "now()-interval '1 hour'", "now()")
+	q := packagedSQL(t)["shawk-dependency.json/shawk / Dependency details/Dependencies in PostgreSQL/A#0"]
+	if q == "" {
+		t.Fatal("no query")
+	}
+	now := time.Now()
+	// run returns the client and server services of the rows the panel
+	// shows with the values src and dst of its variables.
+	run := func(src, dst []string) ([]string, error) {
+		sql := expandMacros(expandVars(q, map[string][]string{"src": src, "dst": dst}), now.Add(-6*time.Hour), now)
+		rows, err := conn.Query(context.Background(), "SELECT client_service, server_service FROM ("+sql+") d ORDER BY 1, 2")
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		var out []string
+		for rows.Next() {
+			vals, err := rows.Values()
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, fmt.Sprintf("%v %v", vals[0], vals[1]))
+		}
+		return out, rows.Err()
+	}
+	all := []string{"a.out postgres", "slurmstepd a.out", "web postgres"}
+	for _, c := range []struct {
+		src, dst, want []string
+	}{
+		{[]string{"slurm-job"}, []string{"postgres"}, []string{"a.out postgres"}},
+		{[]string{"slurmstepd"}, []string{"slurm-job"}, []string{"slurmstepd a.out"}},
+		// The job is slurm-job in Prometheus, not a.out.
+		{[]string{"a.out", "web"}, []string{"postgres"}, []string{"web postgres"}},
+		{[]string{"~other"}, []string{"postgres"}, []string{"a.out postgres", "web postgres"}},
+		{[]string{"slurmstepd", "web"}, []string{"~other"}, []string{"slurmstepd a.out", "web postgres"}},
+		{nil, []string{"postgres"}, []string{"a.out postgres", "web postgres"}},
+		{nil, nil, all},
+		{[]string{"postgres", "slurm-job", "slurmstepd", "web"}, []string{"postgres", "slurm-job"}, all},
+		// Quoted, a value a link sets stays a value.
+		{[]string{`web'] OR true OR '~other' = ANY (ARRAY['`}, nil, nil},
+	} {
+		got, err := run(c.src, c.dst)
+		if err != nil || !slices.Equal(got, c.want) {
+			t.Errorf("src %q, dst %q: %q, %v; want %q", c.src, c.dst, got, err, c.want)
+		}
+	}
+}
+
 // TestPGSilentAlertReinstall: the silent agent alert does not name a host
 // that was reinstalled under a new host id and is alive, nor fire together
 // with the Prometheus alert in the first 24 hours.
@@ -640,6 +837,42 @@ func TestPGSilentAlertReinstall(t *testing.T) {
 	rows.Close()
 	if !slices.Equal(got, []string{"[web-2 dead]"}) {
 		t.Errorf("silent agents = %v", got)
+	}
+}
+
+// TestPGClockSkewAlertSharedName: the clock skew alert has one series per
+// host name, labelled with the name only, also when two live host ids have
+// it, as a node that booted with a new machine id within the alive window;
+// its value is the largest skew.
+func TestPGClockSkewAlertSharedName(t *testing.T) {
+	_, conn := migratedDB(t)
+	execAll(t, conn,
+		`INSERT INTO shawk.hosts VALUES
+		   ('old','m1','node-1','k','v',now()-interval '30 days',now()-interval '3 minutes'),
+		   ('new','m2','node-1','k','v',now()-interval '2 minutes',now()),
+		   ('synced','m3','node-2','k','v',now()-interval '30 days',now()),
+		   ('silent','m4','node-3','k','v',now()-interval '30 days',now()-interval '1 hour')`,
+		`INSERT INTO shawk.agent_sessions (host_id, started_at, last_heartbeat, udp_traced, netns_scope, clock_skew) VALUES
+		   ('old', now()-interval '30 days', now()-interval '3 minutes', true, 'all', interval '120 seconds'),
+		   ('new', now()-interval '2 minutes', now(), true, 'all', interval '-90 seconds'),
+		   ('synced', now()-interval '30 days', now(), true, 'all', interval '1 second'),
+		   ('silent', now()-interval '30 days', now()-interval '1 hour', true, 'all', interval '300 seconds')`)
+	q := packagedSQL(t)["shawk-rules.yaml/shawk-agents/shawk agent clock skew/A/A#0"]
+	if q == "" {
+		t.Fatal("no query")
+	}
+	rows, err := conn.Query(context.Background(), q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for rows.Next() {
+		vals, _ := rows.Values()
+		got = append(got, fmt.Sprint(vals[1:]))
+	}
+	rows.Close()
+	if !slices.Equal(got, []string{"[node-1 120]"}) {
+		t.Errorf("skewed clocks = %v", got)
 	}
 }
 

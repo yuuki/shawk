@@ -3,7 +3,9 @@ package tracer
 import (
 	"bufio"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"net/netip"
 	"os"
@@ -17,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cilium/ebpf"
 	"golang.org/x/sys/unix"
 )
 
@@ -538,4 +541,196 @@ func TestCgroupBurst(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestSyncUDPListenPorts checks the update of udp_listen_ports after a walk
+// of the sockets (#238): the ports that the walk did not find are deleted,
+// except in the namespaces it could not open; those that udp_direction()
+// learned during the walk stay; and those that found no room during the
+// walk are added once the others are deleted. A full map is no error.
+func TestSyncUDPListenPorts(t *testing.T) {
+	requireRoot(t)
+	spec, err := loadBpf()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ms := spec.Maps[bpfMapUdpListenPorts].Copy()
+	ms.MaxEntries = 4
+	m, err := ebpf.NewMap(ms)
+	if err != nil {
+		skipUnavailable(t, "creating %s: %v", bpfMapUdpListenPorts, err)
+	}
+	defer m.Close()
+	// Ports of namespace 1, and of namespace 2 with an offset of 10000.
+	key := func(p uint16) bpfShawkListenKey {
+		if p >= 10000 {
+			return bpfShawkListenKey{Netns: 2, Port: p - 10000}
+		}
+		return bpfShawkListenKey{Netns: 1, Port: p}
+	}
+	put := func(ports ...uint16) {
+		t.Helper()
+		for _, p := range ports {
+			k := key(p)
+			if err := m.Put(&k, uint8(1)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	keys := func(ports ...uint16) map[bpfShawkListenKey]bool {
+		out := map[bpfShawkListenKey]bool{}
+		for _, p := range ports {
+			out[key(p)] = true
+		}
+		return out
+	}
+	held := func() []bpfShawkListenKey {
+		t.Helper()
+		ks, err := listenKeys(m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ks
+	}
+	check := func(want ...uint16) {
+		t.Helper()
+		got := map[bpfShawkListenKey]bool{}
+		for _, k := range held() {
+			got[k] = true
+		}
+		if !maps.Equal(got, keys(want...)) {
+			t.Errorf("ports = %v, want those of %v", got, want)
+		}
+	}
+
+	// The server of 53 closed before the walk, and 9999 during it. The walk
+	// cannot open namespace 2, whose server 10053 stays. During the walk,
+	// udp_direction() learns 6000, which fills the map, and the walk finds
+	// 443 and the new server 5000, which does not fit.
+	put(443, 53, 10053)
+	before := append(held(), key(9999))
+	put(6000)
+	if err := syncUDPListenPorts(m, before, keys(443, 5000), map[uint32]bool{2: true}); err != nil {
+		t.Fatal(err)
+	}
+	check(443, 6000, 5000, 10053)
+
+	// More servers than the map holds.
+	if err := syncUDPListenPorts(m, held(), keys(443, 6000, 5000, 7000), map[uint32]bool{2: true}); err != nil {
+		t.Fatalf("with a full map: %v", err)
+	}
+	check(443, 6000, 5000, 10053)
+
+	// Namespace 2 is gone, and no longer listed.
+	if err := syncUDPListenPorts(m, held(), keys(443, 6000, 5000, 7000), nil); err != nil {
+		t.Fatal(err)
+	}
+	check(443, 6000, 5000, 7000)
+}
+
+// TestUDPListenPortsKeptAcrossCollect checks that a walk of the sockets keeps
+// the ports of the UDP servers while it runs (#238): a per-client connected
+// socket of a server, like those of QUIC, that sends first during the walk is
+// a server for good, not a client of the port of its client. A port whose
+// server closed is deleted once the walk is over.
+func TestUDPListenPortsKeptAcrossCollect(t *testing.T) {
+	skipIfNoNetwork(t, "udp4")
+	tr := newTestTracer(t)
+	requireUDP(t, tr)
+
+	reuse := setsockoptControl(unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+	l := listenUDPFixedPort(t, "udp4", "127.0.0.1")
+	srvAddr := l.LocalAddr().String()
+	l.Close()
+	srv, err := (&net.ListenConfig{Control: reuse}).ListenPacket(t.Context(), "udp4", srvAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	closed := listenUDPFixedPort(t, "udp4", "127.0.0.1")
+	defer closed.Close()
+	srvKey := bpfShawkListenKey{Netns: tr.netns, Port: uint16(srv.LocalAddr().(*net.UDPAddr).Port)}
+	closedKey := bpfShawkListenKey{Netns: tr.netns, Port: uint16(closed.LocalAddr().(*net.UDPAddr).Port)}
+	if _, err := tr.Collect(); err != nil {
+		t.Fatal(err)
+	}
+	var v uint8
+	for _, k := range []bpfShawkListenKey{srvKey, closedKey} {
+		if err := tr.udpListenPorts.Lookup(&k, &v); err != nil {
+			t.Fatalf("port %d is not a UDP server port after the first walk: %v", k.Port, err)
+		}
+	}
+	closed.Close()
+
+	cli, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+	cliPort := uint16(cli.LocalAddr().(*net.UDPAddr).Port)
+	var (
+		conn    net.Conn
+		hookErr error
+	)
+	buf := make([]byte, 32)
+	t.Cleanup(func() { beforeSocketWalk = nil })
+	beforeSocketWalk = func() {
+		if err := tr.udpListenPorts.Lookup(&srvKey, &v); err != nil {
+			hookErr = fmt.Errorf("the server port is missing during the walk: %w", err)
+			return
+		}
+		conn, hookErr = (&net.Dialer{LocalAddr: srv.LocalAddr(), Control: reuse}).DialContext(t.Context(), "udp4", cli.LocalAddr().String())
+		if hookErr != nil {
+			return
+		}
+		if _, hookErr = conn.Write(buf); hookErr != nil {
+			return
+		}
+		cli.SetReadDeadline(time.Now().Add(time.Second))
+		_, _, hookErr = cli.ReadFrom(buf)
+	}
+	snap, err := tr.Collect()
+	beforeSocketWalk = nil
+	if conn != nil {
+		defer conn.Close()
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hookErr != nil {
+		t.Fatal(hookErr)
+	}
+	if err := tr.udpListenPorts.Lookup(&srvKey, &v); err != nil {
+		t.Errorf("the server port is missing after the walk: %v", err)
+	}
+	if err := tr.udpListenPorts.Lookup(&closedKey, &v); !errors.Is(err, ebpf.ErrKeyNotExist) {
+		t.Errorf("the port of the closed server after the walk: %v, want ErrKeyNotExist", err)
+	}
+	lo := netip.MustParseAddr("127.0.0.1")
+	check := func(what string, snap *Snapshot) {
+		t.Helper()
+		if f := findFlow(snap.Flows, DirIn, ProtoUDP, srvKey.Port, lo); f == nil || f.MsgsSent != 1 {
+			t.Errorf("%s: server flow = %+v in %+v", what, f, snap.Flows)
+		}
+		// The client socket receives first, which makes its own port that
+		// of an incoming flow; the server socket must not be a client of it.
+		if f := findFlow(snap.Flows, DirOut, ProtoUDP, cliPort, lo); f != nil {
+			t.Errorf("%s: the server socket is a client of the port of its client: %+v", what, f)
+		}
+	}
+	check("datagram sent during the walk", snap)
+
+	// The socket keeps its direction.
+	if _, err := conn.Write(buf); err != nil {
+		t.Fatal(err)
+	}
+	cli.SetReadDeadline(time.Now().Add(time.Second))
+	if _, _, err := cli.ReadFrom(buf); err != nil {
+		t.Fatal(err)
+	}
+	snap, err = tr.Collect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	check("next datagram", snap)
 }
