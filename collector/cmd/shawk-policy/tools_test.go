@@ -94,7 +94,7 @@ func wantSpans(r *rulesReport) []string {
 		if ru.Direction == ingress && r.Ingress == ingressNone {
 			continue
 		}
-		k := fmt.Sprintf("%s %s %s %d-%d", ru.Direction, ru.Proto, map[bool]string{false: "to", true: "from"}[ru.SourcePort],
+		k := fmt.Sprintf("%s %s %s %d-%d", ru.Direction, ru.Proto, map[bool]string{false: "to", true: "between"}[ru.SamePort],
 			ru.PortFrom, ru.PortTo)
 		if ru.AnySource {
 			by[k] = append(by[k], allV4, allV6)
@@ -215,16 +215,28 @@ func listedSpans(t *testing.T, doc []byte, enforce bool) []string {
 				field := p["field"].(string)
 				switch {
 				case field == "dport" || field == "sport":
-					side = map[string]string{"dport": "to", "sport": "from"}[field]
 					proto = p["protocol"].(string)
+					var of string
 					switch r := m["right"].(type) {
 					case float64:
-						ports = fmt.Sprintf("%d-%d", int(r), int(r))
+						of = fmt.Sprintf("%d-%d", int(r), int(r))
 					case map[string]any:
 						rg := r["range"].([]any)
-						ports = fmt.Sprintf("%d-%d", int(rg[0].(float64)), int(rg[1].(float64)))
+						of = fmt.Sprintf("%d-%d", int(rg[0].(float64)), int(rg[1].(float64)))
 					default:
 						t.Fatalf("nft lists the ports %v", m["right"])
+					}
+					// The source port is matched by the other way of a
+					// UDP rule only, before the same port as the
+					// destination.
+					switch {
+					case field == "sport" && side == "" && proto == "udp":
+						side, ports = "between", of
+					case field == "dport" && side == "":
+						side, ports = "to", of
+					case field == "dport" && side == "between" && ports == of && proto == "udp":
+					default:
+						t.Fatalf("nft lists a match of the ports %v in the rule %v", p, ru.Expr)
 					}
 				case (field == "daddr") == (direction == egress) && (field == "daddr" || field == "saddr"):
 					spans = nftAddrs(t, m["right"])

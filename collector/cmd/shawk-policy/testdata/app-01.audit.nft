@@ -25,9 +25,11 @@
 #     (shawk_v1.kernel_chosen_ports)
 #   - 1 rule allows the backends that the host itself translates its connections to (DNAT in its
 #     kernel, as kube-proxy does): they change when the translation does
-#   - 1 rule allows the other way of a UDP rule, for the same peer and port (the packets from the
-#     port, where the rule of what was seen allows those to it): a socket of UDP may send and
-#     receive first on one port, and shawk records one direction of it
+#   - 1 rule allows the other way of a UDP rule of one port: the same peer, between that port on
+#     both sides. A socket of UDP may send and receive first on one port, and shawk records one
+#     direction of it. No other port is opened: a peer that sends first from another port, later
+#     than the connection tracking remembers the exchange (30 seconds to a few minutes), is not
+#     listed
 #   - 3 ingress rules are pinned to the sources that were seen: a client, or an administrator, at
 #     another address is refused (-ingress ports opens the ports to every source)
 #   - 2 flows are within the host (loopback): they are left open, and are in no rule
@@ -137,8 +139,8 @@ table inet shawk_policy {
 		# ingress 8080/tcp: ~external, of shop/app, last seen 2026-11-28T00:00:00Z [folded peers]
 		meta nfproto ipv4 tcp dport 8080 accept
 
-		# ingress from 53/udp: ~unresolved, of shop/app, last seen 2026-11-28T00:00:00Z [the other way of a UDP rule]
-		ip saddr 10.0.0.53 udp sport 53 accept
+		# ingress 53/udp from 53: ~unresolved, of shop/app, last seen 2026-11-28T00:00:00Z [the other way of a UDP rule]
+		ip saddr 10.0.0.53 udp sport 53 udp dport 53 accept
 
 		# What no rule lists: counted and logged, not rejected (audit form).
 		counter name "ingress_unlisted" limit rate 10/second burst 20 packets log prefix "shawk-policy unlisted ingress: "

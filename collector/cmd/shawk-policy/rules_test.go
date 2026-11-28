@@ -107,7 +107,7 @@ func TestBuildRules(t *testing.T) {
 		"ingress 8080/tcp ~external [] [0.0.0.0/0] [shop/app] [folded peers]",
 		// The other way of the flow of UDP: what the resolver sends from
 		// its port, whenever it does.
-		"ingress from 53/udp ~unresolved [] [10.0.0.53/32] [shop/app] [the other way of a UDP rule]",
+		"ingress 53/udp from 53 ~unresolved [] [10.0.0.53/32] [shop/app] [the other way of a UDP rule]",
 	}
 	if !slices.Equal(got, want) {
 		t.Errorf("rules:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
@@ -154,7 +154,7 @@ func TestBuildRules(t *testing.T) {
 	}
 	// A drop-in has no direction and no port: no rule of the other way,
 	// and what allows a whole family is told as what limits nothing.
-	if slices.ContainsFunc(r.Rules, func(ru rule) bool { return ru.SourcePort }) {
+	if slices.ContainsFunc(r.Rules, func(ru rule) bool { return ru.SamePort }) {
 		t.Errorf("a drop-in with rules of the other way of UDP: %+v", r.Rules)
 	}
 	codes = nil
@@ -174,16 +174,23 @@ func TestBuildRules(t *testing.T) {
 	}
 }
 
-// TestBuildRulesBothWays: a flow of UDP allows its peer the other way too,
-// by the same port as the source of the packets: a socket of UDP may send
-// and receive first on one port, and one direction of it is recorded.
+// TestBuildRulesBothWays: a flow of UDP on one port allows its peer the
+// other way too, between that port on both sides and no other: a socket of
+// UDP may send and receive first on one port, and one direction of it is
+// recorded.
 func TestBuildRulesBothWays(t *testing.T) {
 	gossip := testFlow(ingress, "consul", "udp", "10.0.0.200/32", 8301, "~unresolved")
 	dns := testFlow(egress, "shop/app", "udp", "10.0.0.53/32", 53, "~unresolved")
 	web := testFlow(ingress, "shop/app", "tcp", "10.0.0.12/32", 8080, "nginx")
-	list := func(mode string) []string {
+	// No exchange keeps a port that changes on both sides: a range of
+	// ports, and a port that the kernel chose for the server.
+	ranged := testFlow(egress, "shop/app", "udp", "10.0.0.61/32", 30100, "nodeport")
+	ranged.portFrom, ranged.portTo = 30000, 32767
+	chosen := testFlow(ingress, "shop/app", "udp", "10.0.0.62/32", 41234, "~unresolved")
+	chosen.kernelChosen = true
+	list := func(mode string, flows ...flow) []string {
 		var out []string
-		r := testReport(t, target{Host: "app-01"}, formatNftables, mode, gossip, dns, web)
+		r := testReport(t, target{Host: "app-01"}, formatNftables, mode, flows...)
 		for _, ru := range r.Rules {
 			out = append(out, fmt.Sprintf("%s %s any=%t", ru.Direction, ru.portsOf(), ru.AnySource))
 		}
@@ -195,19 +202,42 @@ func TestBuildRulesBothWays(t *testing.T) {
 		return out
 	}
 	for mode, want := range map[string][]string{
-		ingressSources: {"egress 53/udp any=false", "egress from 8301/udp any=false", "ingress 8080/tcp any=false",
-			"ingress from 53/udp any=false", "ingress 8301/udp any=false", "pinned_addresses 3", "udp_both_ways 2", "pinned_sources 2"},
-		// With -ingress ports what the host accepts pins no source, and
-		// neither does what it sends from that port.
-		ingressPorts: {"egress 53/udp any=false", "egress from 8301/udp any=true", "ingress 8080/tcp any=true",
-			"ingress from 53/udp any=false", "ingress 8301/udp any=true", "pinned_addresses 1", "udp_both_ways 2"},
+		ingressSources: {"egress 53/udp any=false", "egress 8301/udp from 8301 any=false", "ingress 8080/tcp any=false",
+			"ingress 53/udp from 53 any=false", "ingress 8301/udp any=false", "pinned_addresses 3", "udp_both_ways 2", "pinned_sources 2"},
+		// With -ingress ports what the host accepts pins no source; what
+		// it sends from that port stays pinned to the peers that were
+		// seen, as everything that it sends is.
+		ingressPorts: {"egress 53/udp any=false", "egress 8301/udp from 8301 any=false", "ingress 8080/tcp any=true",
+			"ingress 53/udp from 53 any=false", "ingress 8301/udp any=true", "pinned_addresses 1", "udp_both_ways 2"},
 		// With -ingress none nothing is written of what the host accepts,
 		// and nothing of it is counted; what it sends from the port of its
 		// server is still of what it sends.
-		ingressNone: {"egress 53/udp any=false", "egress from 8301/udp any=false", "pinned_addresses 1", "udp_both_ways 1"},
+		ingressNone: {"egress 53/udp any=false", "egress 8301/udp from 8301 any=false", "pinned_addresses 1", "udp_both_ways 1"},
 	} {
-		if got := list(mode); !slices.Equal(got, want) {
+		if got := list(mode, gossip, dns, web); !slices.Equal(got, want) {
 			t.Errorf("-ingress %s: %q, want %q", mode, got, want)
+		}
+	}
+	if got, want := list(ingressSources, ranged, chosen), []string{"egress 30000-32767/udp any=false", "ingress 41234/udp any=false",
+		"pinned_addresses 2", "pinned_sources 1"}; !slices.Equal(got, want) {
+		t.Errorf("a range of ports and a port that the kernel chose: %q, want %q", got, want)
+	}
+	// The table names the port on both sides, with the address of the
+	// peer: the source port alone would open every port of the host to
+	// whoever sends from it, and every port of the peer to the host.
+	for _, mode := range []string{ingressSources, ingressPorts} {
+		text := render(testReport(t, target{Host: "app-01"}, formatNftables, mode, gossip, dns, web))
+		for _, want := range []string{"\t\tip saddr 10.0.0.53 udp sport 53 udp dport 53 accept\n",
+			"\t\tip daddr 10.0.0.200 udp sport 8301 udp dport 8301 accept\n"} {
+			if !strings.Contains(text, want) {
+				t.Errorf("-ingress %s: no %q in\n%s", mode, want, text)
+			}
+		}
+		for _, line := range strings.Split(text, "\n") {
+			if !strings.HasPrefix(strings.TrimSpace(line), "#") && strings.Contains(line, "sport") &&
+				!regexp.MustCompile(`^\t\tip [sd]addr [0-9.]+ udp sport (\d+) udp dport (\d+) accept$`).MatchString(line) {
+				t.Errorf("-ingress %s: a rule by the source port that does not name the peer and both ports: %q", mode, line)
+			}
 		}
 	}
 }
@@ -309,8 +339,9 @@ type allowed struct {
 	from, to         int
 	prefix           netip.Prefix
 	anyAddr          bool
-	// source tells that the ports are those that the packets come from.
-	source bool
+	// same tells that the packets come from the port too: the other way of
+	// a UDP rule.
+	same bool
 }
 
 func (a allowed) String() string {
@@ -318,7 +349,7 @@ func (a allowed) String() string {
 	if a.anyAddr {
 		addr = "any"
 	}
-	return fmt.Sprintf("%s %s %s %d-%d %s", a.direction, a.proto, map[bool]string{false: "to", true: "from"}[a.source], a.from, a.to, addr)
+	return fmt.Sprintf("%s %s %s %d-%d %s", a.direction, a.proto, map[bool]string{false: "to", true: "between"}[a.same], a.from, a.to, addr)
 }
 
 // expected returns what the rules of a report allow, as nftables is asked
@@ -330,11 +361,11 @@ func expected(r *rulesReport) []string {
 			continue
 		}
 		if ru.AnySource {
-			out = append(out, allowed{ru.Direction, ru.Proto, ru.PortFrom, ru.PortTo, netip.Prefix{}, true, ru.SourcePort}.String())
+			out = append(out, allowed{ru.Direction, ru.Proto, ru.PortFrom, ru.PortTo, netip.Prefix{}, true, ru.SamePort}.String())
 			continue
 		}
 		for _, p := range ru.Addresses {
-			out = append(out, allowed{ru.Direction, ru.Proto, ru.PortFrom, ru.PortTo, p, false, ru.SourcePort}.String())
+			out = append(out, allowed{ru.Direction, ru.Proto, ru.PortFrom, ru.PortTo, p, false, ru.SamePort}.String())
 		}
 	}
 	slices.Sort(out)
@@ -366,7 +397,7 @@ var (
 	// A set of more addresses than fit a line is written over several,
 	// which nftJoin puts back on one.
 	nftSetLines = regexp.MustCompile(`(?m) \{\n((?:\t\t\t[0-9a-f.:/]+(?:, [0-9a-f.:/]+)*,?\n)+)\t\t\} `)
-	nftRule     = regexp.MustCompile(`^\t\t(?:(ip6?) ([sd]addr) (\{ [0-9a-f.:/, ]+ \}|[0-9a-f.:/]+) |meta nfproto (ipv[46]) )?(tcp|udp) ([sd])port (\d+)(?:-(\d+))? accept$`)
+	nftRule     = regexp.MustCompile(`^\t\t(?:(ip6?) ([sd]addr) (\{ [0-9a-f.:/, ]+ \}|[0-9a-f.:/]+) |meta nfproto (ipv[46]) )?(tcp|udp) (?:sport (\d+) udp )?dport (\d+)(?:-(\d+))? accept$`)
 )
 
 // parseNftables reads a table that writeNftables wrote and returns what it
@@ -413,7 +444,13 @@ func parseNftables(t testing.TB, text string) []string {
 		if m[8] != "" {
 			to, _ = strconv.Atoi(m[8])
 		}
-		a := allowed{direction: chain, proto: m[5], from: from, to: to, source: m[6] == "s"}
+		// A rule by the source port is the other way of a UDP rule: of
+		// UDP, with the address of its peer, and the same port on both
+		// sides.
+		if m[6] != "" && (m[5] != "udp" || m[6] != m[7] || m[8] != "" || (m[1] == "" && m[4] == "")) {
+			t.Fatalf("line %d matches a source port otherwise than with the same port of UDP on both sides: %q", i+1, line)
+		}
+		a := allowed{direction: chain, proto: m[5], from: from, to: to, same: m[6] != ""}
 		switch {
 		case m[4] == "ipv4":
 			a.prefix = netip.MustParsePrefix("0.0.0.0/0")
@@ -532,8 +569,9 @@ func TestWriteNftables(t *testing.T) {
 		}
 	}
 	// The peer of what the host sends over UDP stays pinned the other way:
-	// it is of what the host opens.
-	if regexp.MustCompile(`saddr .* dport`).MatchString(got) || !strings.Contains(got, "\t\tip saddr 10.0.0.53 udp sport 53 accept\n") {
+	// it is of what the host opens. No other source is pinned.
+	if regexp.MustCompile(`saddr [^\n]* (tcp|udp) dport`).MatchString(strings.ReplaceAll(got, "ip saddr 10.0.0.53 udp sport 53 udp dport 53 accept", "")) ||
+		!strings.Contains(got, "\t\tip saddr 10.0.0.53 udp sport 53 udp dport 53 accept\n") {
 		t.Errorf("with -ingress ports, a source is pinned:\n%s", got)
 	}
 	if got, want := parseNftables(t, got), expected(r); !slices.Equal(got, want) {
@@ -965,32 +1003,37 @@ func checkRuleFiles(t testing.TB, data []byte) {
 			if !fl.inPeriod || fl.addr.Addr().IsLoopback() {
 				continue
 			}
-			// The rule of what was seen and, for UDP, the one of the other
-			// way, by the port that the packets come from.
-			ways := []bool{false}
-			if fl.proto == "udp" {
-				ways = append(ways, true)
-			}
-			for _, other := range ways {
+			// The rule of what was seen and, for UDP on one port that the
+			// kernel did not choose, the one of the other way.
+			find := func(other bool) *rule {
 				direction := fl.direction
 				if other {
 					direction = map[string]string{egress: ingress, ingress: egress}[direction]
 				}
-				if !slices.ContainsFunc(r.Rules, func(ru rule) bool {
-					return ru.Direction == direction && ru.SourcePort == other && ru.Proto == fl.proto && ru.PortFrom == fl.portFrom &&
+				n := slices.IndexFunc(r.Rules, func(ru rule) bool {
+					return ru.Direction == direction && ru.SamePort == other && ru.Proto == fl.proto && ru.PortFrom == fl.portFrom &&
 						ru.PortTo == fl.portTo && ru.Peer == fl.peer && slices.ContainsFunc(ru.Addresses, func(p netip.Prefix) bool {
 						return p.Bits() <= fl.addr.Bits() && p.Contains(fl.addr.Addr())
 					})
-				}) {
-					t.Fatalf("no rule allows the flow %+v (the other way: %t)", fl, other)
+				})
+				if n < 0 {
+					return nil
 				}
+				return &r.Rules[n]
+			}
+			seen := find(false)
+			if seen == nil {
+				t.Fatalf("no rule allows the flow %+v", fl)
+			}
+			if want := fl.proto == "udp" && seen.PortFrom == seen.PortTo && !seen.KernelChosen; (find(true) != nil) != want {
+				t.Fatalf("the flow %+v has a rule of the other way: %t, want %t", fl, !want, want)
 			}
 		}
 		for _, ru := range r.Rules {
 			direction := ru.Direction
-			if ru.SourcePort {
-				if ru.Proto != "udp" {
-					t.Fatalf("the rule %+v is the other way of a flow that is not of UDP", ru)
+			if ru.SamePort {
+				if ru.Proto != "udp" || ru.PortFrom != ru.PortTo || ru.KernelChosen || ru.AnySource {
+					t.Fatalf("the rule %+v is the other way of a flow that has none", ru)
 				}
 				direction = map[string]string{egress: ingress, ingress: egress}[direction]
 			}

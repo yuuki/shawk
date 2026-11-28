@@ -257,7 +257,7 @@ func describeNotes(ru *rule) string {
 	if ru.Unattributed {
 		notes = append(notes, "socket without a known owner")
 	}
-	if ru.SourcePort {
+	if ru.SamePort {
 		notes = append(notes, "the other way of a UDP rule")
 	}
 	return strings.Join(notes, "; ")
@@ -453,12 +453,12 @@ func nftMatch(ps []netip.Prefix, v4 bool, side string) string {
 const nftPerLine = 4
 
 // nftRules returns the lines of a rule: one per family of its addresses.
+// The other way of a UDP rule names its port on both sides.
 func nftRules(ru *rule) []string {
-	port := "dport"
-	if ru.SourcePort {
-		port = "sport"
+	ports := fmt.Sprintf("%s dport %s accept", ru.Proto, ru.ports())
+	if ru.SamePort {
+		ports = fmt.Sprintf("%s sport %s %s", ru.Proto, ru.ports(), ports)
 	}
-	ports := fmt.Sprintf("%s %s %s accept", ru.Proto, port, ru.ports())
 	if ru.AnySource {
 		return []string{ports}
 	}

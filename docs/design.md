@@ -2562,10 +2562,22 @@ host or for the processes of a unit:
   or as opened. The connection tracking of the kernel knows the other
   direction as a reply only for a while after the last datagram, so a
   datagram that the other side starts would be refused. The rules of a
-  host therefore allow, beside the datagrams to the port, those of the
-  same peer from the port, the other way (`udp sport`), with the same
-  addresses, and say so. The drop-in of systemd lists addresses for both
-  directions and needs nothing more.
+  host therefore allow, beside the datagrams to the port, those that the
+  same peer exchanges the other way **between that port on both sides**
+  (`udp sport P udp dport P`), with the addresses that were seen, and say
+  so. The rule names both ports because the history holds one: the source
+  port alone would open every port of the host to whoever sends from that
+  port (a rule `ip saddr <resolver> udp sport 53 accept` lets the
+  resolver, or a datagram that forges its address, reach every UDP server
+  of the host; with a folded peer, every address), and every port of the
+  peer to the socket of the host. What it leaves out is a peer that
+  starts from another port later than the tracking remembers the exchange
+  (30 seconds, or 120 once both sides sent, by default): the audit form
+  counts it. There is no such rule for a range of ports or for a port
+  that the kernel chose, which no exchange keeps on both sides, and the
+  rule stays pinned to the addresses with `-ingress ports` too. The
+  drop-in of systemd lists addresses for both directions and needs
+  nothing more.
 - **Ports follow the rules of ports** (§5.3): a flow in a range of
   `dynamic_ports` allows the range, and one to a server of
   `port_agnostic_services` every port of its address, since the server

@@ -188,13 +188,13 @@ func TestPGRules(t *testing.T) {
 	f := newFleet(t)
 	code, out, errOut := f.run("rules", "-host", "app-01")
 	_, rules, _ := strings.Cut(stable(out), "\nRules\n")
-	want := `DIRECTION  PORTS        PEER                   ADDRESSES  SERVICES  LAST SEEN  NOTES
-egress     443/tcp      ~external              0.0.0.0/0  shop/app  TIME       folded peers
-egress     5432/tcp     shop/postgres (db-01)  10.0.0.10  shop/app  TIME
-egress     53/udp       ~unresolved            10.0.0.53  shop/app  TIME
-ingress    22/tcp       ~unresolved            10.0.5.5   sshd      TIME
-ingress    8080/tcp     nginx (web-01)         10.0.0.12  shop/app  TIME
-ingress    from 53/udp  ~unresolved            10.0.0.53  shop/app  TIME       the other way of a UDP rule
+	want := `DIRECTION  PORTS           PEER                   ADDRESSES  SERVICES  LAST SEEN  NOTES
+egress     443/tcp         ~external              0.0.0.0/0  shop/app  TIME       folded peers
+egress     5432/tcp        shop/postgres (db-01)  10.0.0.10  shop/app  TIME
+egress     53/udp          ~unresolved            10.0.0.53  shop/app  TIME
+ingress    22/tcp          ~unresolved            10.0.5.5   sshd      TIME
+ingress    8080/tcp        nginx (web-01)         10.0.0.12  shop/app  TIME
+ingress    53/udp from 53  ~unresolved            10.0.0.53  shop/app  TIME       the other way of a UDP rule
 
 Seen before the period, and in no rule
 DIRECTION  PORT      PEER         ADDRESS   SERVICE   LAST SEEN
@@ -215,7 +215,7 @@ what they do not list (the audit form): load it first. -enforce writes the table
 	code, out, errOut = f.run("rules", "-host", "app-01", "-format", "nftables")
 	// It is the audit form unless -enforce asks for the one that rejects.
 	wantRules := []string{"egress tcp to 443-443 0.0.0.0/0", "egress tcp to 5432-5432 10.0.0.10/32", "egress udp to 53-53 10.0.0.53/32",
-		"ingress tcp to 22-22 10.0.5.5/32", "ingress tcp to 8080-8080 10.0.0.12/32", "ingress udp from 53-53 10.0.0.53/32"}
+		"ingress tcp to 22-22 10.0.5.5/32", "ingress tcp to 8080-8080 10.0.0.12/32", "ingress udp between 53-53 10.0.0.53/32"}
 	if got := parseNftables(t, out); code != exitComplete || errOut != "" || !slices.Equal(got, wantRules) ||
 		!strings.Contains(out, "# AUDIT form: it rejects nothing.") || strings.Contains(out, "reject with") {
 		t.Errorf("nftables of app-01: exit status %d, stderr %q; it allows %v, want %v\n%s", code, errOut, got, wantRules, out)
@@ -368,7 +368,7 @@ func TestPGRulesTools(t *testing.T) {
 		// of the resolver, whenever they come.
 		want := []string{"egress tcp to 443-443 0.0.0.0-255.255.255.255", "egress tcp to 5432-5432 10.0.0.10-10.0.0.10",
 			"egress udp to 53-53 10.0.0.53-10.0.0.53", "ingress tcp to 22-22 10.0.5.5-10.0.5.5",
-			"ingress tcp to 8080-8080 10.0.0.12-10.0.0.12", "ingress udp from 53-53 10.0.0.53-10.0.0.53"}
+			"ingress tcp to 8080-8080 10.0.0.12-10.0.0.12", "ingress udp between 53-53 10.0.0.53-10.0.0.53"}
 		for name, text := range map[string]string{"audit": table, "enforce": rejecting} {
 			if got := listedSpans(t, loadNftables(t, netns, text), name == "enforce"); !slices.Equal(got, want) {
 				t.Errorf("%s: the kernel allows %v, want %v", name, got, want)

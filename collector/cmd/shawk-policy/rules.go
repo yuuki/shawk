@@ -334,14 +334,17 @@ type rule struct {
 	Translated   bool `json:"translated"`
 	KernelChosen bool `json:"kernel_chosen"`
 	Unattributed bool `json:"unattributed"`
-	// SourcePort tells the other way of a UDP rule: the same peer, with
-	// the port as the source port of the packets. A socket of UDP may both
-	// send and receive first on one port (gossip, NTP between peers, IKE),
-	// and the agent records one direction of it: the rule of what was seen
-	// allows the datagrams to the port, and this one those from it, which
-	// the connection tracking of the kernel knows as replies only for a
-	// while after the last datagram the other way.
-	SourcePort bool `json:"source_port,omitempty"`
+	// SamePort tells the other way of a UDP rule of one port: the same
+	// peer, between that port on both sides. A socket of UDP may both send
+	// and receive first on one port (gossip, NTP between peers, IKE), and
+	// the agent records one direction of it: the rule of what was seen
+	// allows the datagrams to the port, and this one those that the other
+	// side sends first, from that port to that port, which the connection
+	// tracking of the kernel knows as replies only for a while after the
+	// last datagram the other way. It names both ports: the source port
+	// alone would open every port of the host to whoever sends from it,
+	// and every port of the peer to the socket of the host.
+	SamePort bool `json:"same_port,omitempty"`
 }
 
 // Modes of a file of rules.
@@ -359,10 +362,11 @@ func (r *rule) ports() string {
 }
 
 // portsOf is the ports of a rule with its transport, as a reviewer reads
-// them: "8301/udp", or "from 8301/udp" for the other way of a UDP rule.
+// them: "8301/udp", or "8301/udp from 8301" for the other way of a UDP
+// rule.
 func (r *rule) portsOf() string {
-	if r.SourcePort {
-		return "from " + r.ports() + "/" + r.Proto
+	if r.SamePort {
+		return r.ports() + "/" + r.Proto + " from " + r.ports()
 	}
 	return r.ports() + "/" + r.Proto
 }
@@ -545,12 +549,16 @@ func (r *rulesReport) build(flows []flow, ingressMode string) error {
 		if !(host && ru.Direction == ingress && ingressMode == ingressNone) {
 			r.Rules = append(r.Rules, *ru)
 		}
-		if host && ru.Proto == "udp" {
-			// The other way of a UDP rule (see rule.SourcePort). That of
-			// what the host accepts is written whatever -ingress is: it is
-			// of what the host sends.
+		if host && ru.Proto == "udp" && ru.PortFrom == ru.PortTo && !ru.KernelChosen {
+			// The other way of a UDP rule (see rule.SamePort), for the
+			// addresses that were seen, whatever -ingress is: a port that
+			// is open to every source says nothing of where the host
+			// sends. None for a range of ports or a port that the kernel
+			// chose: no exchange keeps such a port on both sides. That of
+			// what the host accepts is written with -ingress none too: it
+			// is of what the host sends.
 			other := *ru
-			other.SourcePort = true
+			other.SamePort, other.AnySource = true, false
 			if ru.Direction == ingress {
 				other.Direction = egress
 				r.Rules = append(r.Rules, other)
@@ -562,7 +570,7 @@ func (r *rulesReport) build(flows []flow, ingressMode string) error {
 	}
 	slices.SortFunc(r.Rules, func(a, b rule) int {
 		return cmp.Or(cmp.Compare(a.Direction, b.Direction), cmp.Compare(a.Proto, b.Proto), cmp.Compare(a.PortFrom, b.PortFrom),
-			cmp.Compare(a.PortTo, b.PortTo), cmp.Compare(a.Peer, b.Peer), cmpBool(a.SourcePort, b.SourcePort))
+			cmp.Compare(a.PortTo, b.PortTo), cmp.Compare(a.Peer, b.Peer), cmpBool(a.SamePort, b.SamePort))
 	})
 	slices.SortFunc(r.Before, func(a, b pastFlow) int {
 		return cmp.Or(cmp.Compare(a.Direction, b.Direction), cmp.Compare(a.Proto, b.Proto), cmp.Compare(a.Port, b.Port),
@@ -653,7 +661,7 @@ func (r *rulesReport) findings() []finding {
 	count := func(match func(*rule) bool) int {
 		n := 0
 		for i := range r.Rules {
-			if !r.Rules[i].SourcePort && match(&r.Rules[i]) {
+			if !r.Rules[i].SamePort && match(&r.Rules[i]) {
 				n++
 			}
 		}
@@ -661,7 +669,7 @@ func (r *rulesReport) findings() []finding {
 	}
 	pinned := 0
 	for _, ru := range r.Rules {
-		if ru.AnySource || ru.SourcePort {
+		if ru.AnySource || ru.SamePort {
 			continue
 		}
 		for _, p := range ru.Addresses {
@@ -707,14 +715,15 @@ func (r *rulesReport) findings() []finding {
 		"be of the unit, so they are allowed", plural(n, "rule comes", "rules come"))
 	n = 0
 	for i := range r.Rules {
-		if r.Rules[i].SourcePort {
+		if r.Rules[i].SamePort {
 			n++
 		}
 	}
-	add("udp_both_ways", n, "%s the other way of a UDP rule, for the same peer and port (the packets from the port, "+
-		"where the rule of what was seen allows those to it): a socket of UDP may send and receive first on one port, "+
-		"and shawk records one direction of it", plural(n, "rule allows", "rules allow"))
-	n = count(func(ru *rule) bool { return ru.Direction == ingress && !ru.AnySource && !ru.SourcePort })
+	add("udp_both_ways", n, "%s the other way of a UDP rule of one port: the same peer, between that port on both "+
+		"sides. A socket of UDP may send and receive first on one port, and shawk records one direction of it. No other "+
+		"port is opened: a peer that sends first from another port, later than the connection tracking remembers the "+
+		"exchange (30 seconds to a few minutes), is not listed", plural(n, "rule allows", "rules allow"))
+	n = count(func(ru *rule) bool { return ru.Direction == ingress && !ru.AnySource && !ru.SamePort })
 	if r.Format != formatSystemd && r.Ingress == ingressSources {
 		add("pinned_sources", n, "%s to the sources that were seen: a client, or an administrator, at "+
 			"another address is refused (-ingress ports opens the ports to every source)",
