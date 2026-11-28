@@ -1959,7 +1959,11 @@ The last six are of the connector, under `job="shawk-connector"`.
   agents of the 20 busiest servers stopped two hours before, and 2.9 s
   after those of 400 hosts did (35600 dependencies whose server is then
   named by its last known listener); the verdicts of the same services
-  take 0.1 s (PostgreSQL 16, one core). The dependencies of the period
+  take 0.1 s (PostgreSQL 16, one core, the tables in memory). The first
+  evaluation after PostgreSQL restarted, which reads the edges from disk,
+  took 38 s there: within the minute, and one that is not is tried again
+  a minute later, with `shawk_baseline_evaluation_failed` at 1 until it
+  succeeds. The dependencies of the period
   are joined with the servers that a listener names by hash
   (`shawk.named_dependencies`, nested loops off): with nested loops the
   second case took 234 s, far beyond the minute of an evaluation, which
