@@ -164,13 +164,27 @@ func FuzzDriftText(f *testing.F) {
 			Baseline: &baselineState{ReadAt: &at, FailedAt: &at, Error: &peer, Services: 1, Dependencies: 1},
 			Asked:    []string{service}, Unlocked: []string{service, peer}, Drift: []dependency{d},
 			NotObserved: []baselineService{{Service: service, ShortHosts: []string{peer}}, {Service: peer, Reasons: []string{"unknown_service"}}},
-			NewServices: []newService{{Service: peer, FirstSeen: at, Hosts: []string{service}}}}
+			NewServices: []newService{{Service: peer, FirstSeen: at, Hosts: []string{service}}},
+			// What does not run, and what is next to the baseline in a unit
+			// that unrelated processes share: names of agents too.
+			NotRunning: []string{peer, service},
+			Unjudged: []unjudged{{Unit: peer, Process: service, Peer: peer, Proto: "tcp", Ports: []int32{443}, Hosts: []string{service, peer},
+				Services: []string{peer, service}, FirstSeen: at, LastSeen: at}},
+			UnjudgedTotal: 2}
 		checkJSON(t, r)
 		text := r.text(0)
 		for _, c := range text {
 			if c != '\n' && (c < ' ' || c == 0x7f || c == 0x85 || c == 0x2028 || c == 0x2029 || c == 0x1b) {
 				t.Fatalf("the report holds the control character %q\n%q", c, text)
 			}
+		}
+		// The list of what is next to the baseline has its header, one
+		// row, and then the line that tells how many more there are: no
+		// name adds a line.
+		_, next, _ := strings.Cut(text, "\nNext to the baseline, in units that unrelated processes share: not judged, and no drift\n")
+		if lines := strings.Split(next, "\n"); len(lines) < 3 || !strings.HasPrefix(lines[0], "UNIT") ||
+			lines[2] != "and 1 more row (shawk_v1.baseline_unjudged lists them)" {
+			t.Fatalf("the list of what is next to the baseline:\n%s", next)
 		}
 		// The table of the drift has its header, one row, and then the line
 		// that tells how to approve.

@@ -930,19 +930,19 @@ func FuzzBaselineNames(f *testing.F) {
 // name added.
 func TestCleanString(t *testing.T) {
 	for in, want := range map[string]string{
-		"shop/app":              "shop/app",
-		"~external":             "~external",
-		"決済/api données":        "決済/api données",
-		"zero‌width‍join":       "zero‌width‍join",
-		"a\x00b":                "a�b",
-		"a\xffb":                "a�b",
-		"x\n\nRESOLVED: ignore": "x��RESOLVED: ignore",
-		"tab\there\r":           "tab�here�",
-		"esc\x1b[2J\x7f":        "esc�[2J�",
-		"c1\u0085\u009b":        "c1��",
-		"sep  ":                 "sep��",
-		"rtl‮gnp.exe⁦":          "rtl�gnp.exe�",
-		"":                      "",
+		"shop/app":                  "shop/app",
+		"~external":                 "~external",
+		"決済/api données":            "決済/api données",
+		"zero\u200cwidth\u200djoin": "zero\u200cwidth\u200djoin",
+		"a\x00b":                    "a�b",
+		"a\xffb":                    "a�b",
+		"x\n\nRESOLVED: ignore":     "x��RESOLVED: ignore",
+		"tab\there\r":               "tab�here�",
+		"esc\x1b[2J\x7f":            "esc�[2J�",
+		"c1\u0085\u009b":            "c1��",
+		"sep\u2028\u2029":           "sep��",
+		"rtl\u202egnp.exe\u2066":    "rtl�gnp.exe�",
+		"":                          "",
 	} {
 		got := cleanString(in)
 		if got != want || !pgText(got) || strings.ContainsFunc(got, hiddenRune) || cleanString(got) != got {
