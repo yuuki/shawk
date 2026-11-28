@@ -251,9 +251,7 @@ func readDrift(ctx context.Context, tx pgx.Tx, c *driftConfig, since, until time
 	if r.Drift, err = pgx.CollectRows(rows, scanDependency); err != nil {
 		return nil, fmt.Errorf("the drift: %w", err)
 	}
-	slices.SortFunc(r.Drift, func(a, b dependency) int {
-		return strings.Compare(a.Service+"\x00"+a.Peer, b.Service+"\x00"+b.Peer)
-	})
+	sortDependencies(r.Drift)
 
 	// The services judged whose hosts were not observed all along: what
 	// they did then is not known. A host whose agent went silent, with
@@ -303,6 +301,7 @@ WHERE status <> 'COMPLETE'`, judged, since, until, r.HostsSince)
 		}); err != nil {
 			return nil, fmt.Errorf("the new services: %w", err)
 		}
+		slices.SortFunc(r.NewServices, func(a, b newService) int { return strings.Compare(a.Service, b.Service) })
 	}
 
 	switch {

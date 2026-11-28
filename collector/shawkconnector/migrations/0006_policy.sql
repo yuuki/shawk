@@ -5,6 +5,13 @@
 -- those of a period that are not among them. Everything is computed here,
 -- in the contract, so that Grafana, psql, the connector and shawk-policy
 -- give the same answer: the command only writes the rules.
+--
+-- Where a function returns its rows, or the items of an array, in an
+-- order, or keeps the first of them, the order is that of the bytes of
+-- the names (COLLATE "C"), whatever the collation of the database: the
+-- same contents give the same lists, files and choices in a database of
+-- en_US.UTF-8, which sorts capitals after small letters and skips marks
+-- such as ~ and -, as in one of C.
 
 -- The baseline ---------------------------------------------------------------
 
@@ -190,7 +197,7 @@ cand AS (
 pick AS MATERIALIZED (
   SELECT DISTINCT ON (c.id) c.id, c.service, c.slurm_job
   FROM cand c
-  ORDER BY c.id, c.via, c.own DESC, c.exact DESC, c.last_seen DESC, c.service
+  ORDER BY c.id, c.via, c.own DESC, c.exact DESC, c.last_seen DESC, c.service COLLATE "C"
 ),
 -- The ports that the kernel chose for a listener in the period, by host:
 -- few, read through their index.
@@ -513,8 +520,8 @@ nd AS MATERIALIZED (
 -- dependencies, and whether the kernel chose the port of a server.
 eg AS MATERIALIZED (
   SELECT e.id,
-         string_agg(DISTINCT d.server_name, ', ') AS peer,
-         string_agg(DISTINCT d.server_host, ', ') AS peer_host,
+         string_agg(DISTINCT d.server_name COLLATE "C", ', ') AS peer,
+         string_agg(DISTINCT d.server_host COLLATE "C", ', ') AS peer_host,
          bool_or(d.dependency_port = 0) AS any_port,
          bool_or(d.kernel_chosen) AS kernel_chosen
   FROM e
@@ -528,8 +535,8 @@ eg AS MATERIALIZED (
 -- The names of the clients of the server edges.
 ig AS MATERIALIZED (
   SELECT e.id,
-         string_agg(DISTINCT d.client_name, ', ') AS peer,
-         string_agg(DISTINCT d.client_host, ', ') AS peer_host
+         string_agg(DISTINCT d.client_name COLLATE "C", ', ') AS peer,
+         string_agg(DISTINCT d.client_host COLLATE "C", ', ') AS peer_host
   FROM e
   JOIN nd d
     ON  d.server_host = policy_flows.target_host AND d.proto = e.proto AND d.server_addr = e.local_addr
@@ -599,7 +606,8 @@ SELECT f.direction, f.in_period, f.service, f.unit, f.proto, f.peer_addr, f.port
        f.peer, f.peer_host, f.translated, bool_or(f.kernel_chosen), min(f.first_seen), max(f.last_seen)
 FROM f
 GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12
-ORDER BY 1, 2 DESC, 5, 7, 6, 3, 4, 10
+ORDER BY f.direction COLLATE "C", f.in_period DESC, f.proto COLLATE "C", f.port, f.peer_addr,
+         f.service COLLATE "C", f.unit COLLATE "C", f.peer COLLATE "C"
 $$;
 
 -- Whether the history tells every flow of policy_flows() over [since,
@@ -767,7 +775,7 @@ CROSS JOIN LATERAL (
   UNION ALL
   SELECT x, 'agent' FROM unnest(r.missing - r.pruned) AS x
 ) g
-ORDER BY r.host_id, lower(g.gap)
+ORDER BY r.host_id COLLATE "C", lower(g.gap)
 $$;
 
 -- Baselines ------------------------------------------------------------------
@@ -806,19 +814,19 @@ RETURNS TABLE (service text, peer text, port integer, proto text,
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
   SELECT d.judged_service, d.server_name, CASE WHEN d.kernel_chosen THEN 0 ELSE d.dependency_port END, d.proto,
          min(d.first_seen), max(d.last_seen),
-         array_agg(DISTINCT d.client_host ORDER BY d.client_host),
+         array_agg(DISTINCT d.client_host COLLATE "C" ORDER BY d.client_host COLLATE "C"),
          (array_agg(DISTINCT coalesce(d.virtual_addr, d.server_addr) ORDER BY coalesce(d.virtual_addr, d.server_addr)))[1:50],
          CASE WHEN bool_or(d.named_by = 'edge') THEN 'edge' WHEN bool_or(d.named_by = 'endpoint') THEN 'endpoint'
               ELSE 'address' END,
          bool_or(d.kernel_chosen),
          (array_agg(DISTINCT coalesce(d.virtual_port, d.port) ORDER BY coalesce(d.virtual_port, d.port)))[1:20],
-         coalesce((array_agg(DISTINCT d.client_service ORDER BY d.client_service)
+         coalesce((array_agg(DISTINCT d.client_service COLLATE "C" ORDER BY d.client_service COLLATE "C")
                    FILTER (WHERE d.client_service <> d.judged_service))[1:20], '{}')
   FROM shawk.named_dependencies(baseline_observed.since, baseline_observed.until, NULL, true, baseline_observed.services,
                                 coalesce(baseline_observed.judged, baseline_observed.services)) d
   WHERE baseline_observed.since < baseline_observed.until
   GROUP BY 1, 2, 3, 4
-  ORDER BY 1, 2, 3, 4
+  ORDER BY d.judged_service COLLATE "C", d.server_name COLLATE "C", 3, d.proto COLLATE "C"
 $$;
 
 -- Whether the history tells every dependency of each service of
@@ -883,7 +891,7 @@ BEGIN
     SELECT b.service,
            count(*)::integer AS hosts,
            min(b.covered) AS covered,
-           (array_agg(b.host ORDER BY b.covered, b.host) FILTER (WHERE b.covered < min_coverage))[1:20] AS short_hosts,
+           (array_agg(b.host ORDER BY b.covered, b.host COLLATE "C") FILTER (WHERE b.covered < min_coverage))[1:20] AS short_hosts,
            (count(*) FILTER (WHERE b.covered < min_coverage))::integer AS unobserved_hosts
     FROM byhost b
     GROUP BY b.service
@@ -892,8 +900,8 @@ BEGIN
   -- the machines that has it is below min_coverage.
   codes AS (
     SELECT x.service,
-           coalesce(array_agg(x.code ORDER BY x.code) FILTER (WHERE x.short), '{}') AS short_codes,
-           coalesce(array_agg(x.code ORDER BY x.code) FILTER (WHERE NOT x.short), '{}') AS other_codes
+           coalesce(array_agg(x.code ORDER BY x.code COLLATE "C") FILTER (WHERE x.short), '{}') AS short_codes,
+           coalesce(array_agg(x.code ORDER BY x.code COLLATE "C") FILTER (WHERE NOT x.short), '{}') AS other_codes
     FROM (
       SELECT sh.service, c.code, bool_or(ob.covered < min_coverage) AS short
       FROM sh
@@ -917,7 +925,7 @@ BEGIN
   FROM asked a
   LEFT JOIN per ON per.service = a.service
   LEFT JOIN codes ON codes.service = a.service
-  ORDER BY a.service;
+  ORDER BY a.service COLLATE "C";
 END
 $$;
 
@@ -962,13 +970,13 @@ RETURNS TABLE (service text, peer text, port integer, proto text,
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
   SELECT d.judged_service, d.server_name, CASE WHEN d.kernel_chosen THEN 0 ELSE d.dependency_port END, d.proto,
          min(d.first_seen), max(d.last_seen),
-         array_agg(DISTINCT d.client_host ORDER BY d.client_host),
+         array_agg(DISTINCT d.client_host COLLATE "C" ORDER BY d.client_host COLLATE "C"),
          (array_agg(DISTINCT coalesce(d.virtual_addr, d.server_addr) ORDER BY coalesce(d.virtual_addr, d.server_addr)))[1:50],
          CASE WHEN bool_or(d.named_by = 'edge') THEN 'edge' WHEN bool_or(d.named_by = 'endpoint') THEN 'endpoint'
               ELSE 'address' END,
          bool_or(d.kernel_chosen),
          (array_agg(DISTINCT coalesce(d.virtual_port, d.port) ORDER BY coalesce(d.virtual_port, d.port)))[1:20],
-         coalesce((array_agg(DISTINCT d.client_service ORDER BY d.client_service)
+         coalesce((array_agg(DISTINCT d.client_service COLLATE "C" ORDER BY d.client_service COLLATE "C")
                    FILTER (WHERE d.client_service <> d.judged_service))[1:20], '{}')
   FROM shawk.named_dependencies(baseline_drift.since, baseline_drift.until, NULL, true, baseline_drift.services,
                                 ARRAY(SELECT s.service FROM shawk.baseline_services s), baseline_drift.members_since) d
@@ -978,7 +986,7 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
       WHERE b.service = d.judged_service AND b.peer = d.server_name AND b.proto = d.proto
         AND b.port IN (0, d.port, d.dependency_port))
   GROUP BY 1, 2, 3, 4
-  ORDER BY 1, 2, 3, 4
+  ORDER BY d.judged_service COLLATE "C", d.server_name COLLATE "C", 3, d.proto COLLATE "C"
 $$;
 
 -- The services without a baseline that were first seen in [since, until]
@@ -993,7 +1001,7 @@ $$;
 CREATE FUNCTION shawk_v1.baseline_new_services(since timestamptz, until timestamptz)
 RETURNS TABLE (service text, first_seen timestamptz, hosts text[])
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
-  SELECT p.service_name, min(p.first_seen), array_agg(DISTINCT h.hostname ORDER BY h.hostname)
+  SELECT p.service_name, min(p.first_seen), array_agg(DISTINCT h.hostname COLLATE "C" ORDER BY h.hostname COLLATE "C")
   FROM shawk.processes p
   JOIN shawk.hosts h ON h.id = p.host_id
   WHERE p.unit NOT LIKE 'slurm/%' AND p.service_name <> '~unknown'
@@ -1001,5 +1009,5 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
   HAVING min(p.first_seen) >= baseline_new_services.since AND min(p.first_seen) <= baseline_new_services.until
      AND NOT EXISTS (SELECT FROM shawk.baseline_services s WHERE s.service = p.service_name)
      AND bool_or(EXISTS (SELECT FROM shawk.edges e WHERE e.process_id = p.id AND e.role = 'client'))
-  ORDER BY 1
+  ORDER BY p.service_name COLLATE "C"
 $$;

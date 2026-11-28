@@ -783,3 +783,60 @@ func TestPGNeedsTheSchema(t *testing.T) {
 		}
 	}
 }
+
+// TestPGOrder: what the command writes is ordered by the bytes of the
+// names, so that two databases with the same contents and different
+// collations (C, or the en_US.UTF-8 of the PostgreSQL image, which sorts
+// capitals after small letters and skips ~ and -) give the same files and
+// the same lists.
+func TestPGOrder(t *testing.T) {
+	f := newFleet(t)
+	for _, host := range []string{"Zeta-01", "alpha-01", "-dash-01"} {
+		f.exec(`INSERT INTO shawk.hosts VALUES ('%[1]s', 'm-%[1]s', '%[1]s', 'k', 'v', %[2]s, %[3]s)`, host, f.at(100*day), f.at(0))
+		f.exec(`INSERT INTO shawk.agent_sessions (host_id, started_at, last_heartbeat, udp_traced, unix_traced, netns_scope, translations_traced)
+		        VALUES ('%s', %s, %s, true, true, 'all', true)`, host, f.at(100*day), f.at(0))
+		for _, service := range []string{"Zeta", "alpha", "~tilde"} {
+			f.exec(`INSERT INTO shawk.processes (host_id, unit, comm, exe, service_name, first_seen, last_seen)
+			        VALUES ('%s', '%s.service', 'c', '', '%s', %s, %s)`, host, service, service, f.at(100*day), f.at(0))
+			f.edge(host, service, "client", "tcp", "10.0.0.1", "10.0.0.9", 80, 20*time.Minute, 0)
+			f.edge(host, service, "client", "tcp", "10.0.0.1", "203.0.113.9", 443, 20*time.Minute, 0)
+		}
+	}
+	f.approve("services:\n  - {service: Zeta, dependencies: []}\n  - {service: alpha, dependencies: []}\n  - {service: ~tilde, dependencies: []}\n")
+	_, out, _ := f.run("drift")
+	_, list, _ := strings.Cut(stable(out), "\nNot in the baseline\n")
+	list, _, _ = strings.Cut(list, "To approve one")
+	want := `SERVICE  PEER  PORT  HOSTS  NAMED BY  FIRST SEEN  LAST SEEN  ADDRESSES  NOTES
+Zeta  ~external  443/tcp  -dash-01, Zeta-01, alpha-01  address  TIME  TIME  203.0.113.9
+Zeta  ~unresolved  80/tcp  -dash-01, Zeta-01, alpha-01  address  TIME  TIME  10.0.0.9
+alpha  ~external  443/tcp  -dash-01, Zeta-01, alpha-01  address  TIME  TIME  203.0.113.9
+alpha  ~unresolved  80/tcp  -dash-01, Zeta-01, alpha-01  address  TIME  TIME  10.0.0.9
+~tilde  ~external  443/tcp  -dash-01, Zeta-01, alpha-01  address  TIME  TIME  203.0.113.9
+~tilde  ~unresolved  80/tcp  -dash-01, Zeta-01, alpha-01  address  TIME  TIME  10.0.0.9
+`
+	if list != want {
+		t.Errorf("the drift is listed as\n%s\nwant\n%s", list, want)
+	}
+	_, out, _ = f.run("baseline", "-all", "-lookback", "1h")
+	_, file, _ := strings.Cut(out, "\n\nservices:\n")
+	wantFile := `  - service: Zeta
+    dependencies:
+      - {peer: ~external, port: 443, proto: tcp}
+      - {peer: ~unresolved, port: 80, proto: tcp}
+  - service: alpha
+    dependencies:
+      - {peer: ~external, port: 443, proto: tcp}
+      - {peer: ~unresolved, port: 80, proto: tcp}
+`
+	if !strings.HasPrefix(file, wantFile) || strings.Index(out, "# Service  Zeta") > strings.Index(out, "# Service  alpha") {
+		t.Errorf("the baseline is written as\n%s", out)
+	}
+	_, out, _ = f.run("rules", "-host", "alpha-01", "-format", "json", "-lookback", "1h")
+	var r rulesReport
+	if err := json.Unmarshal([]byte(out), &r); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if len(r.Rules) != 2 || !slices.Equal(r.Rules[0].Services, []string{"Zeta", "alpha", "~tilde"}) {
+		t.Errorf("the rules of alpha-01: %+v", r.Rules)
+	}
+}

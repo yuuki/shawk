@@ -420,7 +420,7 @@ FROM shawk_v1.policy_verdict($1, $2, $3, $4, $5::numeric, make_interval(secs => 
 	r.Observation = &o
 	rows, err := tx.Query(ctx, `
 SELECT coalesce(machine, ''), gap_start, gap_end, cause
-FROM shawk_v1.policy_gaps($1, $2, $3, make_interval(secs => $4)) ORDER BY gap_start, machine LIMIT $5`,
+FROM shawk_v1.policy_gaps($1, $2, $3, make_interval(secs => $4)) ORDER BY gap_start, machine COLLATE "C" LIMIT $5`,
 		c.host, since, until, tolerance.Seconds(), maxGaps)
 	if err != nil {
 		return nil, fmt.Errorf("the gaps: %w", err)

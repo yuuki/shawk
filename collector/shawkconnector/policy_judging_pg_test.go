@@ -545,3 +545,52 @@ func TestPGBaselineReportShares(t *testing.T) {
 		t.Errorf("with a bound of 1: %v, %d and %d cut", rows, named, unresolved)
 	}
 }
+
+// TestPGPolicyOrder: the order of what the contract returns is that of
+// the bytes of the names, whatever the collation of the database: with
+// en_US.UTF-8, the default of the PostgreSQL image, a capital sorts after
+// the small letters and marks such as ~ and - are skipped at first, so
+// that a list ordered by the database would differ from one database to
+// another with the same contents, and with it the files of shawk-policy
+// and what the connector keeps under its bounds.
+func TestPGPolicyOrder(t *testing.T) {
+	f := newPolicyFixture(t)
+	for _, h := range []string{"Zeta-01", "alpha-01", "-dash-01", "~tilde-01"} {
+		f.host(h, "")
+		f.proc(h, "app.service", "svc")
+		f.proc(h, "Zeta.service", "Zeta")
+		f.proc(h, "alpha.service", "alpha")
+		f.edge(h, "svc", "client", "tcp", "10.0.0.1", "10.0.0.9", 80, 20*time.Minute, 0)
+		f.edge(h, "Zeta", "client", "tcp", "10.0.0.1", "10.0.0.9", 80, 20*time.Minute, 0)
+		f.edge(h, "alpha", "client", "tcp", "10.0.0.1", "203.0.113.9", 80, 20*time.Minute, 0)
+	}
+	hosts := "[-dash-01 Zeta-01 alpha-01 ~tilde-01]"
+	want := []string{"Zeta ~unresolved " + hosts, "alpha ~external " + hosts, "svc ~unresolved " + hosts}
+	if got := f.query(time.Hour, `SELECT service, peer, hosts FROM shawk_v1.baseline_observed($1, $2)`); !slices.Equal(got, want) {
+		t.Errorf("observed:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+	f.approve("services:\n  - {service: Zeta, dependencies: []}\n  - {service: alpha, dependencies: []}\n  - {service: svc, dependencies: []}\n")
+	if got := f.query(time.Hour, `SELECT service, peer, hosts FROM shawk_v1.baseline_drift($1, $2)`); !slices.Equal(got, want) {
+		t.Errorf("drift:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+	// The hosts that were not observed, of which the first are listed.
+	f.exec(`UPDATE shawk.agent_sessions SET last_heartbeat = %s`, f.ago(3*time.Hour))
+	want = []string{"Zeta " + hosts, "alpha " + hosts, "svc " + hosts}
+	if got := f.query(time.Hour, `SELECT service, short_hosts FROM shawk_v1.baseline_verdict(ARRAY['svc', 'alpha', 'Zeta'], $1, $2)`); !slices.Equal(got, want) {
+		t.Errorf("verdicts:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+	if got := f.query(time.Hour, `SELECT (short_hosts)[1:2] FROM shawk_v1.baseline_verdict(ARRAY['svc'], $1, $2)`); !slices.Equal(got, []string{"[-dash-01 Zeta-01]"}) {
+		t.Errorf("the first two hosts that were not observed: %v", got)
+	}
+	// The flows of a host, and the new services.
+	want = []string{"Zeta", "alpha", "svc"}
+	if got := f.query(time.Hour, `SELECT service FROM shawk_v1.policy_flows('alpha-01', $1, $2)`); !slices.Equal(got, want) {
+		t.Errorf("flows: %v, want %v", got, want)
+	}
+	f.approve("services: []\n")
+	f.exec(`UPDATE shawk.processes SET first_seen = %s`, f.ago(30*time.Minute))
+	want = []string{"Zeta " + hosts, "alpha " + hosts, "svc " + hosts}
+	if got := f.query(time.Hour, `SELECT service, hosts FROM shawk_v1.baseline_new_services($1, $2)`); !slices.Equal(got, want) {
+		t.Errorf("new services:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -179,6 +180,16 @@ func scanDependency(row pgx.CollectableRow) (dependency, error) {
 	return d, err
 }
 
+// sortDependencies orders dependencies by the bytes of their service and
+// peer, then by port and transport: the order of a report is the same
+// whatever the collation of the database it was read from.
+func sortDependencies(deps []dependency) {
+	slices.SortFunc(deps, func(a, b dependency) int {
+		return cmp.Or(strings.Compare(a.Service, b.Service), strings.Compare(a.Peer, b.Peer), cmp.Compare(a.Port, b.Port),
+			strings.Compare(a.Proto, b.Proto))
+	})
+}
+
 // note tells what is particular to a dependency, for the line of the file
 // and the tables: its port when the kernel chose it, and the processes of
 // another name that made it.
@@ -273,6 +284,7 @@ func readBaseline(ctx context.Context, tx pgx.Tx, c *baselineConfig, since, unti
 	if err != nil {
 		return nil, fmt.Errorf("the dependencies: %w", err)
 	}
+	sortDependencies(deps)
 	byService := map[string][]dependency{}
 	for _, d := range deps {
 		s := d.Service
